@@ -19,6 +19,18 @@ interface RateLimitedModel {
   regression_stats?: RegressionStats;
 }
 
+// Mirrors backend max_plan_pool._usage_snapshot_summary (additive, may be absent).
+// Utilizations are percentages in [0, 100] or null; resets_at keys are
+// "five_hour" / "seven_day" mapping to ISO-8601 reset timestamps (or null).
+export interface UsageSnapshot {
+  known: boolean;
+  five_hour_utilization: number | null;
+  seven_day_utilization: number | null;
+  resets_at: Record<string, string | null>;
+  probed_at: string | null;
+  stale: boolean;
+}
+
 export interface AccountHealthEntry {
   account_id: string;
   label: string;
@@ -32,6 +44,7 @@ export interface AccountHealthEntry {
   rate_limited_models: RateLimitedModel[];
   failure_class_counts: Partial<Record<string, number>>;
   failure_class_buckets?: { provider?: number; code?: number; infrastructure?: number };
+  usage_snapshot?: UsageSnapshot;
 }
 
 // ---------- constants ----------
@@ -64,6 +77,22 @@ const FAILURE_CLASS_SHORT: Record<string, string> = {
 
 function Skeleton({ className = '' }: { className?: string }) {
   return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+}
+
+// Utilization is "fraction of the window's budget consumed" — higher is worse
+// (closer to exhaustion). null util keeps neutral styling.
+function usageColor(util: number | null): string {
+  if (util == null) return 'text-neutral-400';
+  if (util >= 90) return 'text-red-400';
+  if (util >= 70) return 'text-amber-400';
+  return 'text-emerald-400';
+}
+
+function formatResetAt(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
 }
 
 // ---------- component ----------
@@ -114,6 +143,29 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                   <span className="text-[10px] text-neutral-400" title="24h completions · rate-limit events">
                     {acct.completions_24h}c {acct.rl_events_24h}rl
                   </span>
+                  {acct.usage_snapshot && (
+                    acct.usage_snapshot.known ? (
+                      <span
+                        className="flex items-center gap-1 text-[10px] font-mono"
+                        title={`Usage headroom — 5h / 7d window utilization${acct.usage_snapshot.stale ? ' (stale)' : ''}`}
+                      >
+                        <span className={usageColor(acct.usage_snapshot.five_hour_utilization)}>
+                          5h {acct.usage_snapshot.five_hour_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.five_hour_utilization)}%`}
+                        </span>
+                        <span className={usageColor(acct.usage_snapshot.seven_day_utilization)}>
+                          7d {acct.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.seven_day_utilization)}%`}
+                        </span>
+                        {acct.usage_snapshot.stale && <span className="text-neutral-500" title="Snapshot is stale">~</span>}
+                      </span>
+                    ) : (
+                      <span
+                        className="text-[10px] font-mono text-neutral-500"
+                        title="No usage probe available for this provider/account"
+                      >
+                        usage ?
+                      </span>
+                    )
+                  )}
                   {totalFailures > 0 && (
                     <div className="flex flex-col items-end gap-0.5 ml-auto">
                       {acct.failure_class_buckets && (
@@ -166,6 +218,34 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                   );
                 })}
               </button>
+              {expanded && acct.usage_snapshot && (
+                <div className="mt-2 pt-2 border-t border-neutral-800/50 text-[10px] text-neutral-400 space-y-0.5" title="Usage headroom detail">
+                  {acct.usage_snapshot.known ? (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <span className={`font-mono ${usageColor(acct.usage_snapshot.five_hour_utilization)}`}>
+                          5h {acct.usage_snapshot.five_hour_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.five_hour_utilization)}%`}
+                        </span>
+                        <span className="text-neutral-500">resets {formatResetAt(acct.usage_snapshot.resets_at.five_hour ?? null)}</span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className={`font-mono ${usageColor(acct.usage_snapshot.seven_day_utilization)}`}>
+                          7d {acct.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.seven_day_utilization)}%`}
+                        </span>
+                        <span className="text-neutral-500">resets {formatResetAt(acct.usage_snapshot.resets_at.seven_day ?? null)}</span>
+                      </div>
+                      <div className="text-neutral-500">
+                        probed {formatResetAt(acct.usage_snapshot.probed_at)}{acct.usage_snapshot.stale ? ' · stale' : ''}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-neutral-500">
+                      usage headroom unknown — no probe available for this provider/account
+                      {acct.usage_snapshot.probed_at ? ` (last probed ${formatResetAt(acct.usage_snapshot.probed_at)})` : ''}
+                    </div>
+                  )}
+                </div>
+              )}
               {expanded && acct.rate_limited_models.length > 0 && (
                 <div className="mt-2 pt-2 border-t border-neutral-800/50 flex flex-wrap gap-1">
                   {acct.rate_limited_models.map(m => {

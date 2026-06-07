@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
@@ -351,6 +352,144 @@ async def _check_version_stabilize_stall(
     return True
 
 
+def _deploy_failed_alert_title(version_number: int) -> str:
+    """Deterministic title for the promotion-deploy-failed ERROR alert.
+
+    Shared by the create path (:func:`_alert_promotion_deploy_failed`) and the
+    recovery resolve path (:func:`_resolve_promotion_deploy_failed_alert`) so the
+    title comparison is byte-identical and a recovered version's stale alert is
+    matched and dismissed.
+    """
+    return f"Release v{version_number} promotion deploy FAILED"
+
+
+async def _alert_promotion_deploy_failed(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Emit a loud ERROR alert when a promoted version's deploy never served.
+
+    Fired by the post-promotion serving-confirmation sweep when a promotion is
+    resolved to ``serving_status="deploy_failed"`` — the candidate merged to the
+    promotion target but the deploy never came up healthy (boot crash, rollback,
+    halt, or a SHA mismatch).  Deduped via ``deploy_confirm_alerted_at`` (the
+    standard ``*_alerted_at`` anchor convention on this model): once the anchor
+    is stamped the alert is not re-posted for the same failure.  Does not commit
+    — the alert + anchor ride the caller's commit.  Returns True iff an alert
+    was posted.
+    """
+    if version.deploy_confirm_alerted_at is not None:
+        return False
+
+    reason = version.deploy_failure_reason or "unknown"
+    _reason_text = {
+        "no_new_revision": (
+            "no new healthy production revision booted within the confirmation "
+            "window"
+        ),
+        "rolled_back": "the deploy was ROLLED BACK after the promotion",
+        "halted": "the deploy was HALTED after the promotion",
+        "sha_mismatch": (
+            "the live serving SHA does not match the promoted SHA"
+        ),
+    }.get(reason, reason)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.ERROR,
+            title=_deploy_failed_alert_title(version.version_number),
+            message=(
+                f"Release v{version.version_number} merged to the promotion "
+                f"target (promoted_sha={(version.promoted_sha or '')[:12] or '?'}) "
+                f"but its deploy is NOT serving: {_reason_text} "
+                f"(reason={reason}). The promotion did NOT ship — the version is "
+                f"flagged deploy_failed and must not be treated as live. "
+                f"Investigate the deploy / roll forward a fix."
+            ),
+        )
+    )
+    try:
+        from app.release_promotion import _notify_operator  # noqa: PLC0415
+
+        await _notify_operator(
+            session,
+            version,
+            "promotion_deploy_failed",
+            (
+                f"v{version.version_number} promoted to the production branch but "
+                f"its deploy never confirmed serving ({_reason_text}). This "
+                f"promotion did NOT ship; the version is flagged deploy_failed."
+            ),
+            extra={
+                "reason": reason,
+                "promoted_sha": version.promoted_sha,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post deploy-failed operator message "
+            "for v%d (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    version.deploy_confirm_alerted_at = _utcnow()
+    session.add(version)
+    logger.error(
+        "[RELEASE_QUALIFIER] deploy-failed alert for v%d (reason=%s)",
+        version.version_number,
+        reason,
+    )
+    return True
+
+
+async def _resolve_promotion_deploy_failed_alert(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> int:
+    """Dismiss any open promotion-deploy-failed ERROR alert for a recovered version.
+
+    Companion to :func:`_alert_promotion_deploy_failed`. When a version
+    previously latched to ``serving_status="deploy_failed"`` is later observed to
+    actually serve its promoted SHA, the loud ERROR alert that declared the
+    promotion dead no longer describes a real condition and must be resolved —
+    mirroring how :func:`app.alert_dispatch._resolve_stale_staged_direction_alerts`
+    dismisses its alert once the underlying stall clears.
+
+    Matches the deterministic per-version title built by
+    :func:`_deploy_failed_alert_title`. Only open (``dismissed_at IS NULL``),
+    project-scoped (``task_id IS NULL``) alerts are touched, so this is a safe
+    no-op when none exists and idempotent across repeated calls. Does NOT commit
+    — the dismissal rides the caller's recovery transaction (the same per-version
+    row lock), mirroring ``_alert_promotion_deploy_failed``'s ride-the-caller
+    contract. Returns the number of alerts dismissed.
+    """
+    title = _deploy_failed_alert_title(version.version_number)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == version.project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    logger.info(
+        "[RELEASE_QUALIFIER] resolved %d open deploy-failed alert(s) for "
+        "recovered v%d",
+        len(open_alerts),
+        version.version_number,
+    )
+    return len(open_alerts)
+
+
 async def _check_version_auto_merge_stall(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -530,6 +669,9 @@ async def _check_version_promotion_readiness(
             would_promote_rate=readiness["would_promote_rate"],
             consecutive_clean_passes=readiness["consecutive_clean_passes"],
             reason=readiness["reason"],
+            validated_precision=readiness.get("validated_precision"),
+            resolved_outcome_sample=readiness.get("resolved_outcome_sample", 0),
+            ground_truth_validated=readiness.get("ground_truth_validated", False),
         )
     except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
         logger.warning(

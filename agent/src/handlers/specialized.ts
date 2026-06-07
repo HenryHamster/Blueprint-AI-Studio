@@ -18,11 +18,26 @@ import {
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
+  formatAcceptanceEvidence, formatInvestigateCitationProvenance,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
+import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
+import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
+
+// Provision the read-only ./fetch helper (direction|section|playbook) so a
+// specialized handler can resolve refs trimmed from its launch snapshot.
+// project_id is set for all task types by the backend; when it is absent we
+// provision NOTHING and advertise nothing, so a prompt never promises a helper
+// that wasn't written. Returns the ./fetch guidance block (or '' when missing).
+function provisionFetchHelper(taskId: string, task: Record<string, unknown>): string {
+  const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (!projectId) return '';
+  writeFetchHelper(taskId, projectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  return buildFetchGuidance(PLAN_FETCH_VERBS);
+}
 
 // ── Migration layout resolution ──────────────────────────────────────────────
 // Blueprint's database layout (`backend/alembic/versions/`, `app/models/`,
@@ -79,6 +94,7 @@ export async function handleMigrate(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const migrateFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('migrate');
   const migrateBuildConfig = resolveBuildConfig(task);
 
@@ -121,6 +137,19 @@ export async function handleMigrate(
   const migrateLayout = resolveMigrationLayout(migrateBuildConfig);
   const alembicVersionsPath = `${migrateLayout.versionsDir}/`;
   const migrateModelsPath = `${migrateLayout.modelsDir}/`;
+
+  // If the orchestrator reserved a provisional revision for this task, the agent
+  // must use it verbatim rather than letting autogenerate pick the next number —
+  // that is what lets sibling migration tasks run in parallel without colliding.
+  const migrateReserved = extractReservedMigrationRevision(task);
+  const migrateReservedGuidance = migrateReserved
+    ? buildReservedRevisionGuidance(
+        migrateReserved,
+        alembicVersionsPath,
+        migrateLayout.schemaRevisionFile,
+        migrateLayout.schemaRevisionConst,
+      )
+    : '';
 
   // Schema-revision step. Only emitted when the project declares a schema
   // revision file (Blueprint: backend/app/main.py). A project with no
@@ -183,22 +212,28 @@ CRITICAL RULES:
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  // Shared launch-context block (sibling/queued tasks, the served direction,
+  // quality signals). Degrades to '' when absent, so it is safe even when the
+  // migrate payload carries only partial context. See buildContextPrefix.
+  const migrateContextPrefix = buildContextPrefix(task);
+  const migrateContextSection = migrateContextPrefix ? `${migrateContextPrefix}\n` : '';
   const migrateRetryContext = buildRetryContext(task);
   const migrateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const migrateAcceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
   const migrateFocusBlock = getTaskTypeFocusBlock('migrate', {
     schemaRevisionFile: migrateLayout.schemaRevisionFile,
     schemaRevisionConst: migrateLayout.schemaRevisionConst,
   });
-  const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
-    + migratePrompt + migrateFirstTaskSection
+  const finalMigratePrompt = migrateAcceptanceEvidenceNotice + migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
+    + migrateReservedGuidance + migratePrompt + migrateFirstTaskSection
     + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
   });
@@ -294,6 +329,7 @@ export async function handleSmoketest(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const smoketestFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('smoketest');
 
   const smoketestBuildConfig = (task.build_config ?? {}) as BuildConfig;
@@ -303,7 +339,10 @@ export async function handleSmoketest(
 
   const smoketestRetryContext = buildRetryContext(task);
   const smoketestFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
-  const smoketestPrompt = `${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
+  // Shared launch-context block; degrades to '' when absent (graceful).
+  const smoketestContextPrefix = buildContextPrefix(task);
+  const smoketestContextSection = smoketestContextPrefix ? `${smoketestContextPrefix}\n` : '';
+  const smoketestPrompt = `${smoketestContextSection}${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
@@ -344,7 +383,7 @@ Set top-level "passed" to true only if ALL suites passed and there are no guardr
 
 IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running smoke tests...';
   const smoketestFingerprint = computePromptFingerprint('smoketest', smoketestBuildConfig);
@@ -438,6 +477,7 @@ export async function handleDebug(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const debugFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('debug');
 
   // Gather git context upfront to include in the prompt
@@ -508,7 +548,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   setCurrentPromptFingerprint(debugFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
   const debugParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${debugFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
@@ -550,6 +590,7 @@ export async function handlePerf(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const perfFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('perf');
 
   const perfBuildConfig = resolveBuildConfig(task);
@@ -560,8 +601,11 @@ export async function handlePerf(
   const perfNodeDir = perfNodeDirs.length > 0 ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
   const perfRetryContext = buildRetryContext(task);
   const perfFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  // Shared launch-context block; degrades to '' when absent (graceful).
+  const perfContextPrefix = buildContextPrefix(task);
+  const perfContextSection = perfContextPrefix ? `${perfContextPrefix}\n` : '';
 
-  const perfPrompt = `${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
+  const perfPrompt = `${perfContextSection}${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
@@ -609,7 +653,7 @@ Rules:
   setCurrentPromptFingerprint(perfFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
   const perfParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${perfFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -665,16 +709,29 @@ export async function handleInvestigate(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const investigateFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('investigate');
   const investigateRetryContext = buildRetryContext(task);
   const investigateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const recentChangesSection = formatRecentChanges(payload.recent_changes);
+  // Shared launch-context block; degrades to '' when absent (graceful). This is
+  // the equipping gap vs. the near-twin debug handler, which already includes it.
+  const investigateContextPrefix = buildContextPrefix(task);
+  const investigateContextSection = investigateContextPrefix ? `${investigateContextPrefix}\n` : '';
+  // Bug-report citation provenance carried on the spawned task's context (e.g.
+  // by admin.py / research_completion when the investigation originates from a
+  // bug-report message). Renders the specific cited refs that did not resolve on
+  // HEAD — framed as a stronger discount note for a fully-absent report and a
+  // softer "verify these refs, defect still actionable" note for a partially
+  // grounded one. Empty string when no signal is present (fingerprint-stable).
+  const investigateCtx = task.context as Record<string, unknown> | undefined;
+  const investigateCitationProvenance = formatInvestigateCitationProvenance(investigateCtx);
 
-  const investigatePrompt = `${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
+  const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
 Issue to investigate:
-${userPrompt}${recentChangesSection}
+${userPrompt}${recentChangesSection}${investigateCitationProvenance}
 
 Instructions:
 1. Read relevant source files to understand the codebase and locate the root cause of the issue.
@@ -726,7 +783,7 @@ IMPORTANT:
   setCurrentPromptFingerprint(investigateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
   const investigateParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {

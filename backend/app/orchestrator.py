@@ -70,7 +70,7 @@ from app.orchestrator_filters import (
     filter_rollup_conflicts,
     filter_held_directions,
     filter_pipeline_duplicates,
-    filter_migration_serialization,
+    reserve_migration_revisions,
     filter_scope_empty,
     cap_pipeline_slots,
     reserve_slots_for_types,
@@ -630,7 +630,7 @@ _provision_coroutines: Dict[str, asyncio.Task] = {}
 # Columns the dispatch loop loads for active (PROVISIONING/IN_PROGRESS) tasks.
 # Heavy JSONB (status_log, depends_on, history) stays deferred. Anything a
 # downstream filter touches (e.g. filter_file_conflicts -> context/title,
-# filter_migration_serialization -> payloads via first_payload) MUST be here,
+# reserve_migration_revisions -> payloads via first_payload) MUST be here,
 # or attribute access triggers a sync lazy-load from async context and crashes
 # the whole dispatch cycle. Module-level so tests can mirror the exact set.
 ACTIVE_TASKS_LIGHT_COLUMNS = (
@@ -652,6 +652,49 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
     # reference_load_only_event_listeners.md — any column a downstream filter
     # touches on active tasks MUST be loaded here.
     Task.parent_task_id,
+)
+
+
+# Light column set for the QUEUED candidate scan (Step 2.4 candidate_stmt). Drops
+# heavy JSONB (status_log_data / history blobs) but MUST carry every column a
+# downstream Step-2.5 filter reads on a candidate — including ``title``, because a
+# QUEUED candidate that becomes a senior file-conflict reservation holder is used
+# as ``blocking_task`` and its ``.title`` is read for the deferral message
+# (orchestrator_filters.py). Deferring such a column makes that access a sync
+# lazy-load from async context → MissingGreenlet that crashes the whole cycle.
+CANDIDATE_LIGHT_COLUMNS = (
+    Task.id,
+    Task.status,
+    Task.priority,
+    Task.created_at,
+    Task.requires_approval,
+    Task.retry_after_until,
+    Task.context,
+    Task.depends_on,
+    Task.launched_by_user_id,
+    Task.project_id,
+    Task.payloads,
+    Task.status_log,
+    Task.latest_status_message,
+    Task.parent_task_id,
+    Task.title,
+)
+
+
+# Light column set for parked-BLOCKED file-conflict holders (Step 2.5
+# blocked_conflict_tasks). They are absent from the QUEUED candidate scan but
+# still hold a seniority reservation; ``title`` is required because a parked
+# senior can be the ``blocking_task`` whose ``.title`` is read for the deferral
+# message (orchestrator_filters.py) — deferring it raises MissingGreenlet.
+BLOCKED_CONFLICT_LIGHT_COLUMNS = (
+    Task.id,
+    Task.status,
+    Task.created_at,
+    Task.context,
+    Task.project_id,
+    Task.blocker_kind,
+    Task.parent_task_id,
+    Task.title,
 )
 
 
@@ -1385,7 +1428,7 @@ async def orchestrator_worker():
                 # deferred — the few stale tasks are re-read through task_lock()
                 # before mutation below.
                 # context + title are needed by filter_file_conflicts (Step 2.5).
-                # payloads is needed by filter_migration_serialization (Step 2.72)
+                # payloads is needed by reserve_migration_revisions (Step 2.72)
                 # via _is_migration_task -> task.first_payload.
                 # Without them, attribute access triggers a sync lazy-load from an
                 # async context and crashes the whole dispatch cycle.
@@ -1915,31 +1958,13 @@ async def orchestrator_worker():
                             )
                         ),
                     )
-                    .options(
-                        load_only(
-                            Task.id,
-                            Task.status,
-                            Task.priority,
-                            Task.created_at,
-                            Task.requires_approval,
-                            Task.retry_after_until,
-                            Task.context,
-                            Task.depends_on,
-                            Task.launched_by_user_id,
-                            Task.project_id,
-                            Task.payloads,
-                            Task.status_log,
-                            Task.latest_status_message,
-                            # Round 5 (2026-05-03): include parent_task_id — downstream
-                            # filter_rollup_conflicts at orchestrator_filters.py:184 reads
-                            # candidate.parent_task_id; deferring it triggers MissingGreenlet
-                            # under async and crashes the entire dispatch cycle, freezing
-                            # all QUEUED tasks. Same gotcha class as status_log per memory
-                            # `reference_load_only_event_listeners.md` — load_only that
-                            # excludes columns downstream code reads is fragile.
-                            Task.parent_task_id,
-                        )
-                    )
+                    # CANDIDATE_LIGHT_COLUMNS drops heavy JSONB but carries every
+                    # column a Step-2.5 filter reads on a candidate (status_log,
+                    # parent_task_id, title, ...). Excluding any of them makes the
+                    # downstream access a sync lazy-load from async context →
+                    # MissingGreenlet that crashes the whole dispatch cycle. See the
+                    # constant's docstring and reference_load_only_event_listeners.md.
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
                     .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
                     .limit(max(slots_available * 2, 50))
                 )  # Fetch extra; NULL priority = lowest
@@ -2343,12 +2368,38 @@ async def orchestrator_worker():
                 )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
+                # Parked BLOCKED file-conflict tasks are absent from the QUEUED
+                # candidate scan, but they still hold a seniority reservation on
+                # their contested files (so a stream of newer same-file tasks
+                # cannot grab the lock while a long-waiting task is parked). Load
+                # them light — only the columns filter_file_conflicts reads
+                # (context/parent_task_id/created_at/blocker_kind) — to keep this
+                # async-safe (no MissingGreenlet lazy-load) and cheap.
+                blocked_conflict_tasks = []
+                if eligible_ids:
+                    blocked_conflict_tasks = (
+                        (
+                            await session.execute(
+                                select(Task)
+                                .where(
+                                    Task.status == TaskStatus.BLOCKED,
+                                    Task.blocker_kind == "file_conflict",
+                                )
+                                .options(
+                                    load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
                 eligible_ids = await filter_file_conflicts(
                     eligible_ids,
                     candidate_tasks,
                     active_tasks_result,
                     session,
                     broadcast_to_project,
+                    blocked_conflict_tasks,
                 )
 
                 # Step 2.6: Defer tasks that overlap with pending-rollup files
@@ -2361,14 +2412,17 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
-                # Step 2.72: Serialize migration-producing tasks per project to avoid
-                # duplicate alembic revisions racing on the same down_revision.
-                eligible_ids = await filter_migration_serialization(
+                # Step 2.72: Reserve a provisional alembic revision id for each
+                # migration-producing candidate instead of serializing them. The
+                # allocator locks distinct monotonic ids per project, so siblings
+                # no longer wait behind a holder's full execution/test lifecycle —
+                # the slot releases the moment numbering is locked. Returns
+                # eligible_ids unchanged (no deferral); the reserved id rides the
+                # agent claim and is consumed verbatim.
+                eligible_ids = await reserve_migration_revisions(
                     eligible_ids,
                     candidate_tasks,
-                    active_tasks_result,
                     session,
-                    broadcast_to_project,
                 )
 
                 # Step 2.75: Pre-dispatch dedup safety net for review/fix pipeline
@@ -3251,6 +3305,21 @@ async def orchestrator_worker():
                         model=runtime_model,
                         execution_mode=runtime_execution_mode,
                     )
+
+                    # Launch-time staleness recompute: for finding-derived tasks
+                    # that have been QUEUED while the integration branch advanced,
+                    # re-check whether any cited file changed since the finding was
+                    # generated — against the CURRENT branch tip, not the inert
+                    # ingestion HEAD. Best-effort: the helper never raises and only
+                    # an affirmative change verdict annotates the context, so it can
+                    # never block or delay dispatch. The mutation is persisted by
+                    # the PROVISIONING commit below.
+                    from app.research_completion import recompute_launch_staleness
+
+                    if await recompute_launch_staleness(session, task):
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        flag_modified(task, "context")
 
                     # Mark as PROVISIONING to prevent other workers from picking it up.
                     # last_heartbeat is intentionally NOT set here — it must reflect real

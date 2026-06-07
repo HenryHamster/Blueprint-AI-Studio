@@ -20,6 +20,16 @@ export interface NeedsAttentionItem {
   direction_id?: string | null;
   direction_text?: string | null;
   merge_retries_saved?: number | null;
+  task_type?: string;
+  spend_cap_usd?: number | null;
+  deadline_seconds?: number | null;
+}
+
+function formatDeadline(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  const hours = seconds / 3600;
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
 }
 
 export interface CatchUpNeedsAttentionSectionProps {
@@ -140,6 +150,14 @@ export function CatchUpNeedsAttentionSection({
               }`}>
                 {item.reason === 'failed' ? 'Failed' : 'Approval required'}
               </span>
+              {item.reason === 'approval_required' && item.task_type === 'compute_experiment' && (
+                <span
+                  className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                  title="A compute_experiment launch held for operator approval — approve, adjust the cap, or reject"
+                >
+                  Held compute launch
+                </span>
+              )}
               {item.reason === 'failed' && item.failure_class && FAILURE_CLASS_CONFIG[item.failure_class] && (
                 <span
                   className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${FAILURE_CLASS_CONFIG[item.failure_class].color}`}
@@ -223,6 +241,27 @@ export function CatchUpNeedsAttentionSection({
                 )}
               </div>
             </div>
+            {item.reason === 'approval_required' && item.task_type === 'compute_experiment'
+              && (typeof item.spend_cap_usd === 'number' || typeof item.deadline_seconds === 'number') && (
+              <div className="flex items-center gap-1.5 px-2">
+                {typeof item.spend_cap_usd === 'number' && (
+                  <span
+                    className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-300 border border-purple-500/20"
+                    title="Proposed spend cap for this held compute launch"
+                  >
+                    spend ${item.spend_cap_usd.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  </span>
+                )}
+                {typeof item.deadline_seconds === 'number' && (
+                  <span
+                    className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-300 border border-purple-500/20"
+                    title="Proposed wall-clock deadline for this held compute launch"
+                  >
+                    deadline {formatDeadline(item.deadline_seconds)}
+                  </span>
+                )}
+              </div>
+            )}
             {item.reason === 'approval_required' && item.approval_reason && (
               <div className="flex items-center gap-1.5 px-2">
                 <span className="text-[10px] text-neutral-500 italic truncate">

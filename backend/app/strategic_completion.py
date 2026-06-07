@@ -19,6 +19,11 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_outcomes import verified_merged_count
+# Stopword set reused so the spawn-title redundancy check matches the project's
+# established word-overlap semantics (same tokens ignored: articles,
+# conjunctions, and verb prefixes like "feat"/"fix").
+from app.finding_deduplication import _STOPWORDS as _SPAWN_STOPWORDS
 from app.models import (
     MessageType,
     Project,
@@ -33,6 +38,74 @@ from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def spawn_budget_status(
+    per_review_count: int,
+    window_count: int,
+    *,
+    per_review_cap: int,
+    window_cap: int,
+) -> tuple[bool, str | None, str | None]:
+    """Decide whether one more strategist spawn fits within budget.
+
+    Pure policy helper (no DB) so the bound is independently unit-testable. The
+    handler counts prior spawns and passes them in; this returns whether the
+    next spawn is allowed.
+
+    ``per_review_count`` — strategic_direct spawns already created by THIS review.
+    ``window_count`` — project-wide strategic_direct spawns in the rolling window.
+
+    Returns ``(ok, scope, reason)``:
+      * ``ok`` is False when either count has reached (>=) its cap.
+      * ``scope`` is ``"per_review"`` or ``"window"`` identifying which cap was
+        hit (the per-review cap takes precedence when both are exhausted), else
+        ``None``.
+      * ``reason`` is a short human-readable explanation, or ``None`` when ok.
+
+    A non-positive cap disables that dimension (never blocks).
+    """
+    if per_review_cap > 0 and per_review_count >= per_review_cap:
+        return (
+            False,
+            "per_review",
+            f"Per-review spawn cap reached: {per_review_count}/{per_review_cap}",
+        )
+    if window_cap > 0 and window_count >= window_cap:
+        return (
+            False,
+            "window",
+            f"Rolling-window spawn cap reached: {window_count}/{window_cap}",
+        )
+    return True, None, None
+
+
+def spawn_title_is_redundant(
+    title: str,
+    existing_titles,
+    *,
+    threshold: int,
+) -> str | None:
+    """Return the first existing title that semantically duplicates ``title``.
+
+    Broadens the exact-title idempotency guard to collapse near-duplicate
+    investigations that differ only in wording. Uses the same word-overlap /
+    stopword semantics as ``finding_deduplication.is_duplicate`` (overlap of
+    non-stopword tokens at or above ``threshold`` is a match). Returns the
+    matched existing title, or ``None`` when nothing overlaps enough.
+
+    ``threshold`` must stay >=4 so genuinely distinct single-word-differing
+    titles (e.g. "Investigate A" vs "Investigate B", overlap 1) are not
+    collapsed.
+    """
+    words = set(title.lower().split()) - _SPAWN_STOPWORDS
+    if not words:
+        return None
+    for existing in existing_titles:
+        overlap = words & (set(existing.lower().split()) - _SPAWN_STOPWORDS)
+        if len(overlap) >= threshold:
+            return existing
+    return None
 
 
 async def _record_strategic_task_failure(
@@ -587,10 +660,17 @@ def _build_creation_prediction(
         other_words = set((d.get("text") or "").lower().split()) - _PRED_STOPWORDS
         if len(words) >= 2 and len(words & other_words) >= 3:
             similar_count += 1
+            # Count VERIFIED merges so the creation-difficulty prediction is
+            # primed on work that actually shipped, not degraded/unverified
+            # merges. Legacy fallback handled by verified_merged_count / the
+            # aggregate .get chain.
             for h in d.get("research_history") or []:
-                similar_past_merges_raw += h.get("prs_merged", 0)
+                similar_past_merges_raw += verified_merged_count(h)
             agg = d.get("history_aggregate") or {}
-            similar_past_merges_raw += agg.get("total_prs_merged") or 0
+            similar_past_merges_raw += (
+                agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+                or 0
+            )
     similar_past_merges = round(similar_past_merges_raw * calibration_factor)
     result: Dict[str, Any] = {
         "estimated_difficulty": estimated_difficulty,
@@ -835,7 +915,10 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     if len(history) < 3 or churn_window <= 0:
         return None
     window = history[-churn_window:]
-    merged = sum(e.get("prs_merged", 0) for e in window)
+    # Verification-aware: degraded-unverified merges are excluded from the merge
+    # count (and so count as non-merge finished work) to match the per-task
+    # outcome layer. Benign-unverified and verified merges still count.
+    merged = sum(verified_merged_count(e) for e in window)
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -869,7 +952,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
 
-    window_merged = sum(e.get("prs_merged", 0) for e in history)
+    # Verification-aware merge counts (window + evicted aggregate): degraded
+    # merges are excluded so they don't suppress lifetime non-merge burn.
+    window_merged = sum(verified_merged_count(e) for e in history)
     window_completed = sum(e.get("tasks_completed", 0) for e in history)
     # Correct no-op completions ("deliverable already exists", no PR) are not burn.
     # Subtract them across both the rolling window and the lifetime aggregate. Both
@@ -879,7 +964,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in history
     )
-    agg_merged = agg.get("total_prs_merged", 0)
+    # Legacy aggregates predate total_verified_prs_merged; fall back to
+    # total_prs_merged so old folded data is unchanged.
+    agg_merged = agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
     agg_completed = agg.get("total_tasks_completed", 0)
     agg_no_pr = agg.get("total_tasks_completed_no_pr", 0)
     agg_code_failed = max(
@@ -964,7 +1051,7 @@ def _already_built_signature(direction: dict) -> dict | None:
     window = history[-window_cycles:]
     no_pr = sum(e.get("tasks_completed_no_pr", 0) for e in window)
     completed = sum(e.get("tasks_completed", 0) for e in window)
-    merged = sum(e.get("prs_merged", 0) for e in window)
+    merged = sum(verified_merged_count(e) for e in window)
     code_failed = sum(
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in window
@@ -1031,7 +1118,7 @@ def _check_direction_health(direction: dict) -> str | None:
         # the lifetime non-merge volume — if nothing real finished unmerged, 0 PRs merged
         # is "nothing to merge", not unproductiveness.
         if len(history) >= 5 and not still_productive:
-            total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+            total_merged = sum(verified_merged_count(entry) for entry in history)
             if total_merged == 0:
                 non_merge_real = sum(
                     max(0, entry.get("tasks_completed", 0))
@@ -1078,7 +1165,7 @@ def _check_direction_health(direction: dict) -> str | None:
             total_failed = e.get("tasks_failed", 0)
             infra_failed = e.get("tasks_failed_infra", 0)
             code_failed = max(0, total_failed - infra_failed)
-            return code_failed > 0 and e.get("prs_merged", 0) == 0
+            return code_failed > 0 and verified_merged_count(e) == 0
 
         if all(_cycle_failed(e) for e in recent3):
             return (
@@ -1192,12 +1279,12 @@ def _check_direction_completion(direction: dict) -> str | None:
     history = direction.get("research_history") or []
     if len(history) < 4:
         return None
-    total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+    total_merged = sum(verified_merged_count(entry) for entry in history)
     if total_merged < 3:
         return None
     recent2 = history[-2:]
     recent_created = sum(e.get("tasks_created", 0) for e in recent2)
-    recent_merged = sum(e.get("prs_merged", 0) for e in recent2)
+    recent_merged = sum(verified_merged_count(e) for e in recent2)
     if recent_created <= 2 and recent_merged <= 1:
         return (
             f"Direction appears complete: {total_merged} PRs merged across "
@@ -1361,8 +1448,15 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Verified basis: progress is only credited for merges that reproduced on
+    # HEAD. ``verified_merged_count`` falls back to raw ``prs_merged`` for legacy
+    # entries; the aggregate falls back from ``total_verified_prs_merged`` to
+    # ``total_prs_merged`` for legacy folds (same basis as line ~890 and
+    # ``_check_direction_completion``). The reset baseline in
+    # ``_reset_scaffolding_state_on_outcome_change`` MUST use this same basis so
+    # the ``post_merged = total - reset_merged`` delta math stays consistent.
+    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
+        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
     )
     se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
     success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
@@ -1447,8 +1541,10 @@ def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Verified basis — MUST match ``record_outcome_progress_snapshot`` exactly so
+    # the latch's ``post_merged = total - reset_merged`` delta stays on one basis.
+    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
+        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
     )
     direction["outcome_progress_reset_at_cycle"] = total_cycles
     direction["outcome_progress_reset_at_merged"] = total_merged
@@ -2285,12 +2381,17 @@ async def _handle_strategic_completion(
                 mapped_dirs = [
                     d for d in directions_list if d.get("system_id") == sys_id
                 ]
+                # Verified basis: only merges that reproduced on HEAD upgrade a
+                # system's status, consistent with the completion detector and the
+                # outcome-progress latch. Legacy entries/folds fall back to raw.
                 total_merged = 0
                 for d in mapped_dirs:
                     for h in d.get("research_history", []):
-                        total_merged += h.get("prs_merged", 0)
+                        total_merged += verified_merged_count(h)
                     agg = d.get("history_aggregate", {})
-                    total_merged += agg.get("total_prs_merged", 0)
+                    total_merged += agg.get(
+                        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
+                    )
                 # Only upgrade status, never downgrade what the agent set
                 agent_status = sys.get("status", "planned")
                 STATUS_RANK = {
@@ -2999,6 +3100,21 @@ async def _handle_strategic_completion(
         except ValueError:
             msg_type = MessageType.NOTE
         _msg_ctx = msg_entry.get("context") or {}
+        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
+        # messages: a BUG_REPORT/BLOCKER parsed out of the strategic agent's
+        # output that cites code already fixed/refactored away would re-enter the
+        # strategist inbox fully trusted. Run the SAME conservative grounding the
+        # user/annotation paths use and stash an ``_provenance_warnings`` signal
+        # when a citation is unambiguously absent. Best-effort — indeterminate
+        # never flags, never fails message emission.
+        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            from app.source_ref_validation import compute_message_citation_warning
+
+            warning = await compute_message_citation_warning(
+                session, project, content
+            )
+            if warning:
+                _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,

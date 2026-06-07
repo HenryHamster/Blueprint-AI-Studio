@@ -81,6 +81,9 @@ class VmHeartbeatRequest(BaseModel):
     vm_image_name: str | None = Field(None, max_length=200)
     vm_image_build_ts: int | None = None
     agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+    # Git commit the image was built from (baked AGENT_SOURCE_SHA marker). Same
+    # additive provenance field as HeartbeatRequest; None on pre-marker images.
+    agent_source_sha: str | None = Field(None, pattern="^[0-9a-f]{7,40}$")
     # A taskless pool VM that fails pre-claim auth has no task to attribute the
     # failure to, so it reports the reason here. Surfaced as a WARNING so a
     # bad-credential pool boot is an EXPLAINED death in the logs, not an
@@ -162,6 +165,10 @@ async def vm_heartbeat(
         from app.compute import record_vm_runtime_fingerprint
 
         record_vm_runtime_fingerprint(req.vm_instance_id, req.agent_runtime_fingerprint)
+    if req.agent_source_sha is not None:
+        from app.compute import record_vm_source_sha
+
+        record_vm_source_sha(req.vm_instance_id, req.agent_source_sha)
 
     # Warm-pool readiness signal (efficiency direction d-5fd69fe1). Reached only
     # on a CLEAN heartbeat — the pre_claim_failure branch above returns early, so a
@@ -179,12 +186,30 @@ async def vm_heartbeat(
     from app.warm_pool import is_warm_pool_enabled
 
     if is_warm_pool_enabled():
+        from app.compute import persist_pool_vm_image_state
         from app.database import AsyncSessionLocal
         from app.warm_pool import promote_pool_vm_to_idle
+
+        # Durably mirror the heartbeat-reported image identity onto the PoolVm row
+        # in the SAME session as the IDLE-promotion, so the registry reflects the
+        # actual image/source SHA the warm member is running across restarts. No-op
+        # for non-pool VMs (returns False when there is no PoolVm row).
+        _img_kwargs: dict = {}
+        if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+            _img_kwargs["image_name"] = req.vm_image_name
+            _img_kwargs["build_ts"] = req.vm_image_build_ts
+        if req.agent_runtime_fingerprint is not None:
+            _img_kwargs["runtime_fingerprint"] = req.agent_runtime_fingerprint
+        if req.agent_source_sha is not None:
+            _img_kwargs["source_sha"] = req.agent_source_sha
 
         try:
             async with AsyncSessionLocal() as session:
                 await promote_pool_vm_to_idle(session, req.vm_instance_id)
+                if _img_kwargs:
+                    await persist_pool_vm_image_state(
+                        session, req.vm_instance_id, **_img_kwargs
+                    )
                 await session.commit()
         except Exception:  # noqa: BLE001 — liveness must never 500 on a DB hiccup
             logger.warning(

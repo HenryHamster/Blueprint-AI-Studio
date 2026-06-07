@@ -52,6 +52,7 @@ async def _record_defer_and_maybe_escalate(
     block_code: str,
     threshold: int = _PRECONDITION_ESCALATE_THRESHOLD,
     broadcast_fn: Callable[..., Coroutine[Any, Any, None]] | None = None,
+    reserved_files: list[str] | None = None,
 ) -> None:
     """Track repeated deferral of *candidate* on the same precondition blocker.
 
@@ -94,7 +95,19 @@ async def _record_defer_and_maybe_escalate(
         fb = ctx.get("_blocked_first_at") or {}
         if fb.get("key") != blocker_kind:
             ctx.pop("_blocked_first_at", None)
-    ctx["_precondition_defer"] = {"key": blocker_kind, "count": count}
+    defer_record = {"key": blocker_kind, "count": count}
+    if reserved_files:
+        # Persist the full contested-file set (the blocker key is truncated to
+        # 120 chars and is lossy) so the seniority pass can reserve those files
+        # for this task across cycles. Lifecycle caveat:
+        # reaper_sweeps._clear_blocked_fields wipes _precondition_defer on EVERY
+        # requeue (optimistic OR genuine), so this record does not itself survive
+        # a requeue episode. The reservation still holds across the parked-BLOCKED
+        # window — there _precondition_defer['files'] is intact and the
+        # blocked_conflict_tasks query feeds it to _file_conflict_reserved_files —
+        # and is re-earned on the next deferral after the task requeues to QUEUED.
+        defer_record["files"] = sorted(set(reserved_files))
+    ctx["_precondition_defer"] = defer_record
 
     already_escalated = ctx.get("_precondition_escalated_key") == blocker_kind
     should_escalate = count >= threshold and not already_escalated
@@ -214,6 +227,73 @@ def _prod_files(files) -> set[str]:
     return {f for f in (files or []) if not _is_test_file(f)}
 
 
+# A candidate earns *seniority* over its contested files once it has been
+# deferred on the SAME file-conflict blocker for this many dispatch cycles.
+# Past this point, strictly-newer candidates that would step on those files
+# defer BEHIND it — per-resource FIFO fairness that stops a stream of freshly
+# spawned same-file tasks from starving a long-waiting task (observed
+# 2026-06-06: a fix task sat blocked on models.py for 2h+ while the lock
+# rotated through two newer tasks). Set to one below the BLOCKED-escalation
+# threshold so a task earns the reservation just before it parks, and the
+# reservation then persists through the BLOCKED/requeue cycle.
+_FILE_CONFLICT_SENIORITY_THRESHOLD = 2
+
+
+def _file_conflict_reserved_files(task: Task) -> set[str]:
+    """Production files a file-conflict waiter has earned seniority over.
+
+    Read from the persisted defer bookkeeping written by
+    ``_record_defer_and_maybe_escalate`` (``_precondition_defer['files']``);
+    falls back to parsing the lossy blocker-identity string when the explicit
+    list is absent (older persisted state / the onset stamp).
+    """
+    ctx = task.context or {}
+    defer = ctx.get("_precondition_defer") or {}
+    files = defer.get("files")
+    if isinstance(files, list) and files:
+        return _prod_files(files)
+    # Fallback: parse "file conflict on a.py, b.py, c.py" from the blocker key
+    # (or the preserved onset stamp, which survives the BLOCKED requeue).
+    for src in (defer.get("key"), (ctx.get("_blocked_first_at") or {}).get("key")):
+        if isinstance(src, str) and src.startswith("file conflict on "):
+            raw = src[len("file conflict on "):]
+            return _prod_files([p.strip() for p in raw.split(",") if p.strip()])
+    return set()
+
+
+def _is_senior_file_conflict_waiter(task: Task) -> bool:
+    """True if *task* has waited long enough on a file conflict to earn a
+    seniority reservation over its contested files.
+
+    Qualifies when the task is parked BLOCKED on a file conflict (already past
+    the escalation threshold) OR is still QUEUED but has been deferred on the
+    same file-conflict blocker for ``_FILE_CONFLICT_SENIORITY_THRESHOLD``+
+    cycles.
+    """
+    if task.status == TaskStatus.BLOCKED and task.blocker_kind == "file_conflict":
+        return True
+    defer = (task.context or {}).get("_precondition_defer") or {}
+    key = defer.get("key")
+    return (
+        isinstance(key, str)
+        and key.startswith("file conflict on ")
+        and int(defer.get("count", 0)) >= _FILE_CONFLICT_SENIORITY_THRESHOLD
+    )
+
+
+def _is_more_senior(holder: Task, candidate: Task) -> bool:
+    """True if *holder* outranks *candidate* for contested-resource FIFO order.
+
+    Older ``created_at`` wins; ties (and missing timestamps) break on the
+    stringified id so the ordering is total and deterministic — a reservation
+    chain must be a strict order or two tasks could mutually defer forever.
+    """
+    h, c = holder.created_at, candidate.created_at
+    if h is not None and c is not None and h != c:
+        return h < c
+    return str(holder.id) < str(candidate.id)
+
+
 def rollup_overlap_defers(
     candidate_files: set[str], rollup_files
 ) -> tuple[bool, set[str]]:
@@ -324,12 +404,23 @@ async def filter_file_conflicts(
     active_tasks: list[Task],
     session,
     broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+    blocked_conflict_tasks: list[Task] | None = None,
 ) -> list[uuid.UUID]:
     """Defer candidates that would conflict with currently IN_PROGRESS tasks.
 
     Builds per-project sets of files being modified by IN_PROGRESS tasks, then
     removes from *eligible_ids* any candidate whose related_files overlap
     significantly (large-scope = any overlap; standard = 2+ files AND >= 50%).
+
+    Seniority (contested-resource FIFO): a candidate that has already waited on
+    a file conflict long enough to earn a reservation (see
+    ``_is_senior_file_conflict_waiter``) reserves its contested files. A
+    strictly-NEWER candidate that would step on those files defers behind the
+    senior even when no IN_PROGRESS task currently holds them, so a stream of
+    freshly-spawned same-file tasks cannot keep re-claiming the lock ahead of a
+    long-waiting task. ``blocked_conflict_tasks`` carries the already-parked
+    BLOCKED file-conflict tasks (absent from the QUEUED candidate scan) so their
+    reservations still hold while they are parked.
 
     Updates the candidate's latest_status_message and broadcasts a deferral
     event when a task is deferred.  Returns the filtered list of eligible_ids.
@@ -344,7 +435,15 @@ async def filter_file_conflicts(
                     files
                 )
 
-    if not in_progress_files_by_project:
+    # Build per-project seniority reservations from tasks already waiting on a
+    # file conflict (parked BLOCKED, or QUEUED past the seniority threshold).
+    senior_holders_by_project: dict[uuid.UUID, list[Task]] = {}
+    for t in list(candidate_tasks) + list(blocked_conflict_tasks or ()):
+        if _is_senior_file_conflict_waiter(t) and _file_conflict_reserved_files(t):
+            senior_holders_by_project.setdefault(t.project_id, []).append(t)
+
+    # Nothing in flight and no reservations → no candidate can conflict.
+    if not in_progress_files_by_project and not senior_holders_by_project:
         return eligible_ids
 
     non_conflicting = []
@@ -366,15 +465,30 @@ async def filter_file_conflicts(
         if task_type in READ_ONLY_TASK_TYPES:
             non_conflicting.append(eid)
             continue
-        # Only check conflicts within the same project
-        project_files = in_progress_files_by_project.get(candidate.project_id, set())
-        if not project_files:
-            non_conflicting.append(eid)
-            continue
         candidate_files = _prod_files(
             (candidate.context or {}).get("related_files", [])
         )
         if not candidate_files:
+            non_conflicting.append(eid)
+            continue
+        # Effective blocker file set for THIS candidate (same project only):
+        # files held by IN_PROGRESS work, PLUS files reserved by a MORE-SENIOR
+        # file-conflict waiter (older created_at). The seniority reservation is
+        # what gives a long-deferred task contested-resource FIFO priority over
+        # freshly-spawned same-file tasks. A holder never reserves against
+        # itself, and only strictly-older holders outrank the candidate, so the
+        # reservation chain is a strict order (no mutual deferral).
+        ip_files = in_progress_files_by_project.get(candidate.project_id, set())
+        senior_blockers = [
+            h
+            for h in senior_holders_by_project.get(candidate.project_id, [])
+            if h.id != candidate.id and _is_more_senior(h, candidate)
+        ]
+        reserved_files: set[str] = set()
+        for h in senior_blockers:
+            reserved_files |= _file_conflict_reserved_files(h)
+        project_files = ip_files | reserved_files
+        if not project_files:
             non_conflicting.append(eid)
             continue
         overlap = candidate_files & project_files
@@ -398,6 +512,14 @@ async def filter_file_conflicts(
                 if t.status == TaskStatus.IN_PROGRESS
                 and t.project_id == candidate.project_id
                 and _prod_files((t.context or {}).get("related_files", [])) & overlap
+            ]
+            # Senior reservation holders that overlap also count as blockers so
+            # the cross-parent looseness below evaluates the candidate's parent
+            # relationship against them too (a senior in a different rollup gets
+            # the SAME cross-parent treatment as an in-flight blocker — we never
+            # defer a pairing the normal conflict logic would consider safe).
+            overlapping_blockers += [
+                h for h in senior_blockers if _file_conflict_reserved_files(h) & overlap
             ]
             # Cross-parent looseness: two WRITE tasks under DIFFERENT parents are
             # different features whose PRs target different rollup branches — they
@@ -462,6 +584,7 @@ async def filter_file_conflicts(
                 detail=defer_msg,
                 block_code="file_conflict",
                 broadcast_fn=broadcast_fn,
+                reserved_files=sorted(overlap),
             )
         else:
             non_conflicting.append(eid)
@@ -679,65 +802,65 @@ def _is_migration_task(task: Task) -> bool:
     return False
 
 
-async def filter_migration_serialization(
+async def reserve_migration_revisions(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
-    active_tasks: list[Task],
     session,
-    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
 ) -> list[uuid.UUID]:
-    """Defer migration-producing candidates while another runs in the same project.
+    """Reserve a provisional revision id for each migration-producing candidate.
 
-    Two concurrent migrate tasks (or create tasks that auto-generate alembic
-    revisions) read the same latest revision and each generates the next one,
-    producing duplicate revisions with the same down_revision. Serializing
-    dispatch per project prevents that broken-chain scenario.
+    Replaces the old project-wide IN_PROGRESS serialization. Previously two
+    concurrent migrate tasks (or create tasks that auto-generate alembic
+    revisions) would read the same latest revision and each generate the next
+    one, producing duplicate revisions on the same down_revision — so dispatch
+    held every sibling schema task behind the holder's ENTIRE agent run
+    (authoring + the internal test-fix loop + full Docker test gates), which can
+    last hours.
+
+    Instead, allocate (or idempotently reuse) a persisted
+    :class:`app.models.MigrationReservation` for every dispatchable
+    migration-producing candidate the moment it is selected. The allocator hands
+    out distinct monotonic ids under a per-project lock, so once a candidate's
+    revision number is locked, concurrent siblings can each author a migration in
+    parallel and be linearized at merge time. The slot therefore RELEASES
+    immediately after the number is reserved — this returns ``eligible_ids``
+    UNCHANGED (no deferral). The reserved revision/down_revision rides the agent
+    claim response additively and is consumed verbatim.
+
+    Allocation is best-effort and idempotent: an existing ACTIVE reservation is
+    returned as-is (re-running every cycle never burns a fresh id), and a
+    transient allocation failure is swallowed so it never blocks dispatch — the
+    agent falls back to deriving the next revision locally when no reservation
+    rides the claim.
     """
     if not eligible_ids:
         return eligible_ids
 
-    in_progress_by_project: dict[uuid.UUID, Task] = {}
-    for t in active_tasks:
-        if t.status != TaskStatus.IN_PROGRESS:
-            continue
-        if not _is_migration_task(t):
-            continue
-        in_progress_by_project.setdefault(t.project_id, t)
+    # Deferred import keeps app.migration_reservations (which pulls in
+    # migration_chain + glob) off the orchestrator import path at module load
+    # and mirrors the leaf-import discipline used elsewhere in this module.
+    from app.migration_reservations import (  # noqa: PLC0415
+        allocate_migration_reservation,
+    )
 
-    if not in_progress_by_project:
-        return eligible_ids
-
-    non_blocked = []
     for eid in eligible_ids:
         candidate = next((t for t in candidate_tasks if t.id == eid), None)
         if candidate is None or not _is_migration_task(candidate):
-            non_blocked.append(eid)
             continue
-        blocker = in_progress_by_project.get(candidate.project_id)
-        if blocker is None or blocker.id == candidate.id:
-            non_blocked.append(eid)
-            continue
-        defer_msg = (
-            f"Waiting: serializing migration — task {str(blocker.id)[:8]} "
-            f"is already producing a migration in this project"
-        )
-        if candidate.latest_status_message != defer_msg:
-            candidate.latest_status_message = defer_msg
-            session.add(candidate)
-            try:
-                await broadcast_fn(
-                    str(candidate.project_id),
-                    "task_updated",
-                    {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
-                )
-            except Exception:
-                logger.debug(
-                    f"Failed to broadcast migration deferral for {eid}", exc_info=True
-                )
-        logger.info(
-            f"[DISPATCH] Deferring migration task {eid} — blocked by {blocker.id} in project {candidate.project_id}"
-        )
-    return non_blocked
+        try:
+            await allocate_migration_reservation(session, candidate)
+        except Exception:
+            # Best-effort: a transient allocation failure must not hold a
+            # migration task out of dispatch. The agent derives max+1 locally
+            # when the claim carries no reservation, so correctness degrades
+            # gracefully back to the pre-reservation behavior for this task.
+            logger.warning(
+                "[DISPATCH] Failed to reserve a migration revision for task %s; "
+                "agent will fall back to local numbering",
+                eid,
+                exc_info=True,
+            )
+    return eligible_ids
 
 
 # Task types exempt from SCOPE_EMPTY dispatch pre-emption. A review task

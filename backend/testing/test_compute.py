@@ -7,6 +7,8 @@ Covers:
 """
 
 import asyncio
+import base64
+import json
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
@@ -487,6 +489,224 @@ async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
 
     assert result.started_at == started_at
     assert result.metadata["zone"] == "us-central1-f"
+
+
+def _metrics_marker(payload: object) -> str:
+    return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+def test_gcp_serial_parse_extracts_result_metrics():
+    marker = _metrics_marker({"accuracy": 0.91, "tokens_per_sec": 1234, "ok": True})
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            f"BLUEPRINT_COMPUTE_METRICS={marker}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    # bool coerced to a number; all values numeric.
+    assert status.metrics == {"accuracy": 0.91, "tokens_per_sec": 1234.0, "ok": 1.0}
+
+
+def test_gcp_serial_parse_missing_marker_yields_no_metrics():
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.metrics is None
+
+
+def test_gcp_serial_parse_garbled_marker_is_tolerated():
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            "BLUEPRINT_COMPUTE_METRICS=not-valid-base64-$$$",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.metrics is None
+
+
+def test_decode_result_metrics_filters_non_numeric_and_bounds():
+    # Strings, nulls, and nested structures are dropped; numbers/bools survive.
+    mixed = _metrics_marker(
+        {
+            "accuracy": 0.5,
+            "label": "high",
+            "missing": None,
+            "nested": {"a": 1},
+            "list": [1, 2],
+            "flag": False,
+        }
+    )
+    assert compute_backends_module._decode_result_metrics(mixed) == {
+        "accuracy": 0.5,
+        "flag": 0.0,
+    }
+    # A non-object JSON payload (array) is rejected entirely.
+    assert (
+        compute_backends_module._decode_result_metrics(_metrics_marker([1, 2, 3]))
+        is None
+    )
+    # An all-non-numeric object decodes to no metrics → None.
+    assert (
+        compute_backends_module._decode_result_metrics(_metrics_marker({"x": "y"}))
+        is None
+    )
+    # Oversized decoded payload is rejected wholesale.
+    oversized = _metrics_marker({"m": list(range(10000))})
+    assert compute_backends_module._decode_result_metrics(oversized) is None
+    # Empty / None markers are absent.
+    assert compute_backends_module._decode_result_metrics(None) is None
+    assert compute_backends_module._decode_result_metrics("") is None
+
+
+@pytest.mark.asyncio
+async def test_local_state_file_parse_extracts_result_metrics():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        # Command opts in by writing the designated result file.
+        command='echo \'{"accuracy": 0.88, "loss": 0.12}\' > "$BLUEPRINT_RESULT_FILE"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    for _ in range(60):
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("expected local terminal marker for completed subprocess")
+
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.metrics == {"accuracy": 0.88, "loss": 0.12}
+
+
+@pytest.mark.asyncio
+async def test_local_state_file_parse_no_result_file_yields_no_metrics():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="exit 0",  # writes no result file
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    for _ in range(60):
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("expected local terminal marker for completed subprocess")
+
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.metrics is None
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_persists_result_metrics(db_session, monkeypatch):
+    project = Project(name="Compute Job Metrics", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "fake-job-metrics"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="fake-job-metrics",
+                started_at=datetime.utcnow() - timedelta(seconds=10),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=datetime.utcnow(),
+                message="completed",
+                metrics={"accuracy": 0.97, "tokens_per_sec": 512.0},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.polling_metadata["result_metrics"] == {
+        "accuracy": 0.97,
+        "tokens_per_sec": 512.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -2033,3 +2253,96 @@ class TestBootDiskType:
         )
         # Disk zone must track the machine-type zone (same insert target).
         assert f"zones/{captured['zone']}/" in captured["machine_type"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_session):
+    """Helper sums final_cost_usd for terminal, costed jobs in [since, until)."""
+    project = Project(name="Compute Spend Window", user_id="test-user")
+    other = Project(name="Other Project", user_id="test-user")
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _job(*, proj_id, status, final_cost, completed_at):
+        return ComputeJob(
+            project_id=proj_id,
+            backend="local",
+            machine_type="e2-standard-2",
+            status=status,
+            final_cost_usd=final_cost,
+            accrued_cost_usd=final_cost or 0.0,
+            completed_at=completed_at,
+        )
+
+    jobs = [
+        # In-window terminal jobs with cost — counted.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=0.50,
+            completed_at=today_start + timedelta(hours=1),
+        ),
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.TIMED_OUT,
+            final_cost=0.25,
+            completed_at=today_start + timedelta(hours=2),
+        ),
+        # Running job (in-flight) — ignored even though it accrued cost.
+        ComputeJob(
+            project_id=project.id,
+            backend="local",
+            machine_type="e2-standard-2",
+            status=ComputeJobStatus.RUNNING,
+            accrued_cost_usd=99.0,
+            final_cost_usd=None,
+            completed_at=None,
+        ),
+        # Terminal but no final_cost_usd — ignored.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.FAILED,
+            final_cost=None,
+            completed_at=today_start + timedelta(hours=3),
+        ),
+        # Before the window — ignored.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=7.0,
+            completed_at=today_start - timedelta(hours=1),
+        ),
+        # Different project — ignored when scoped.
+        _job(
+            proj_id=other.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=4.0,
+            completed_at=today_start + timedelta(hours=1),
+        ),
+    ]
+    db_session.add_all(jobs)
+    await db_session.commit()
+
+    total = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session, project_id=project.id, since=today_start
+    )
+    assert total == pytest.approx(0.75)
+
+    # until is exclusive: a window ending before the 2h job drops it.
+    windowed = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session,
+        project_id=project.id,
+        since=today_start,
+        until=today_start + timedelta(hours=2),
+    )
+    assert windowed == pytest.approx(0.50)
+
+    # project_id=None aggregates across projects (0.75 + 4.0).
+    cross = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session, project_id=None, since=today_start
+    )
+    assert cross == pytest.approx(4.75)

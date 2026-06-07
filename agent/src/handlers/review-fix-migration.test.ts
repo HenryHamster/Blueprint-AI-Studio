@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import {
+  detectMigrationConflict,
+  buildMigrationConflictGuidance,
+  extractReservedMigrationRevision,
+  buildReservedRevisionGuidance,
+} from './review-fix-migration.js';
 
 describe('detectMigrationConflict', () => {
   it('returns detected=false when PR has no migration files', () => {
@@ -167,5 +172,90 @@ describe('buildMigrationConflictGuidance', () => {
     expect(buildMigrationConflictGuidance(conflict)).toBe(
       buildMigrationConflictGuidance(conflict, 'backend/alembic/versions/'),
     );
+  });
+
+  it('consumes a reserved revision verbatim instead of deriving max+1', () => {
+    const out = buildMigrationConflictGuidance(
+      {
+        detected: true,
+        prMigrations: ['backend/alembic/versions/0050_add_foo.py'],
+        baseNewMigrations: ['backend/alembic/versions/0051_merged.py'],
+      },
+      'backend/alembic/versions/',
+      'backend/app/main.py',
+      'EXPECTED_SCHEMA_REVISION',
+      { provisionalRevision: '0061', provisionalDownRevision: '0060' },
+    );
+    expect(out).toMatch(/reserved revision/i);
+    // Reserved id is used verbatim — NOT the max+1 ("0052") of the base chain.
+    expect(out).toMatch(/0061_add_foo\.py/);
+    expect(out).toMatch(/revision = "0061"/);
+    expect(out).toMatch(/down_revision = "0060"/);
+    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0061"/);
+    expect(out).not.toMatch(/0052/);
+  });
+});
+
+describe('extractReservedMigrationRevision', () => {
+  it('returns null when no reservation rides the claim', () => {
+    expect(extractReservedMigrationRevision({})).toBeNull();
+    expect(extractReservedMigrationRevision(undefined)).toBeNull();
+    expect(extractReservedMigrationRevision({ migration_reservation: null })).toBeNull();
+  });
+
+  it('parses provisional_revision and provisional_down_revision from the claim', () => {
+    const res = extractReservedMigrationRevision({
+      migration_reservation: {
+        provisional_revision: '0153',
+        provisional_down_revision: '0151',
+      },
+    });
+    expect(res).toEqual({ provisionalRevision: '0153', provisionalDownRevision: '0151' });
+  });
+
+  it('returns null when the revision id is blank', () => {
+    expect(
+      extractReservedMigrationRevision({
+        migration_reservation: { provisional_revision: '   ', provisional_down_revision: '0151' },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('buildReservedRevisionGuidance', () => {
+  it('instructs verbatim use of the reserved id and bans max+1/autogenerate numbering', () => {
+    const out = buildReservedRevisionGuidance({
+      provisionalRevision: '0153',
+      provisionalDownRevision: '0151',
+    });
+    expect(out).toMatch(/Reserved migration revision/);
+    expect(out).toMatch(/backend\/alembic\/versions\/0153_<short_description>\.py/);
+    expect(out).toMatch(/revision = "0153"/);
+    expect(out).toMatch(/down_revision = "0151"/);
+    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0153"/);
+    expect(out).toMatch(/no max\+1/);
+  });
+
+  it('honors a custom versions dir and schema-revision file/const', () => {
+    const out = buildReservedRevisionGuidance(
+      { provisionalRevision: '0153', provisionalDownRevision: '0151' },
+      'svc/db/versions/',
+      'svc/app/config.py',
+      'SCHEMA_REV',
+    );
+    expect(out).toMatch(/svc\/db\/versions\/0153_<short_description>\.py/);
+    expect(out).toMatch(/SCHEMA_REV = "0153"/);
+    expect(out).not.toMatch(/EXPECTED_SCHEMA_REVISION/);
+    expect(out).not.toMatch(/backend\/app\/main\.py/);
+  });
+
+  it('omits the schema-revision step when no gate is declared', () => {
+    const out = buildReservedRevisionGuidance(
+      { provisionalRevision: '0153', provisionalDownRevision: '0151' },
+      'svc/db/versions/',
+      '',
+    );
+    expect(out).not.toMatch(/SCHEMA_REV/);
+    expect(out).not.toMatch(/EXPECTED_SCHEMA_REVISION/);
   });
 });

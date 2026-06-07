@@ -77,6 +77,7 @@ from app.task_lifecycle import (
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
+from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.time_utils import _utcnow, set_retry_after
 from app.agent_status_spawn import (
@@ -194,6 +195,18 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
         daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
 
+    vm_total = daily_total
+
+    # Off-VM compute jobs accrue their own durable spend ledger. Fold today's
+    # settled (terminal, costed) compute-job spend into the daily total so the
+    # ceiling reflects total project spend, not just agent-VM runtime.
+    from app.compute_jobs import get_recent_terminal_compute_spend_usd
+
+    compute_total = await get_recent_terminal_compute_spend_usd(
+        session, project_id=task.project_id, since=today_start
+    )
+    daily_total = vm_total + compute_total
+
     if daily_total <= ceiling:
         return
 
@@ -220,7 +233,10 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         project_id=task.project_id,
         severity=AlertSeverity.WARNING,
         title=alert_title,
-        message=f"Daily VM cost ${daily_total:.2f} exceeds ceiling ${ceiling:.2f}.",
+        message=(
+            f"Daily total spend ${daily_total:.2f} exceeds ceiling ${ceiling:.2f} "
+            f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})."
+        ),
     )
     session.add(alert)
     await broadcast_to_project(
@@ -230,7 +246,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     )
     logger.warning(
         f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
-        f"${daily_total:.2f} > ${ceiling:.2f}"
+        f"total ${daily_total:.2f} > ${ceiling:.2f} "
+        f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})"
     )
     try:
         from app.notification_dispatch import dispatch_external_notification
@@ -293,6 +310,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 {
                     "task_id": str(task.id),
                     "daily_total_usd": round(daily_total, 2),
+                    "daily_vm_cost_usd": round(vm_total, 2),
+                    "daily_compute_cost_usd": round(compute_total, 2),
                     "ceiling_usd": round(ceiling, 2),
                     "direction_text": direction_text[:200],
                     "cost_by_failure_class": cost_by_failure_class,
@@ -1143,6 +1162,19 @@ async def update_agent_status(
         # latest_status_message via the no-artifact branch below.
         ctx = dict(task.context or {})
         ctx["no_op_reason"] = payload.no_op_reason[:2000]
+        task.context = ctx
+        flag_modified(task, "context")
+    if payload.reproduce_verdict:
+        # Durable reproduce-on-HEAD verdict for bug-report-/finding-derived
+        # work. The agent determined whether the cited defect actually
+        # reproduces against HEAD (reproduced / already_resolved /
+        # indeterminate); persist it under a non-underscore key so the
+        # review/fix respawn carry-forward preserves it across iterations and
+        # task-outcome / digest / strategic scoring can consume verified
+        # defect-truth instead of guessing from output text. Additive: older
+        # agents that omit it (sending only no_op_reason) are unaffected.
+        ctx = dict(task.context or {})
+        ctx["reproduce_verdict"] = payload.reproduce_verdict.model_dump()
         task.context = ctx
         flag_modified(task, "context")
     if payload.file_change_details:
@@ -2662,7 +2694,9 @@ async def update_agent_status(
             try:
                 _ctx = dict(task.context or {})
                 _ctx["_first_attempt_succeeded"] = _compute_first_attempt_succeeded(
-                    task.attempt_count, payload.status
+                    task.attempt_count,
+                    payload.status,
+                    merge_verification=_merge_verification_status(task),
                 )
                 _proj = None
                 try:

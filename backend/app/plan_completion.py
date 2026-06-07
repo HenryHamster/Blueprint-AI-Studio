@@ -14,8 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.broadcast import broadcast_to_project
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
-from app.payload_schemas import validate_internal_payload
-from app.task_capabilities import PLAN_SUBTASK_TYPES
+from app.payload_schemas import (
+    parse_acceptance_evidence,
+    read_acceptance_evidence,
+    validate_internal_payload,
+)
+from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -193,6 +197,117 @@ def _inject_build_on_deps(subtasks: List[Dict], label: str = "PLAN") -> List[tup
     return added
 
 
+def _resolve_injected_cycles(
+    subtasks: List[Dict], explicit_deps: Dict[int, List[int]], label: str = "PLAN"
+) -> List[Dict]:
+    """Break dependency cycles by dropping only the INJECTED conflict-prevention
+    edges that close a cycle, preserving explicit declarations and as many
+    injected serialization edges as possible.
+
+    The old behaviour wholesale-discarded EVERY injected edge (same-file
+    chaining + build-on) the moment any combination cycled, so unrelated
+    same-base siblings lost their serialization and could dispatch in parallel
+    and conflict at merge. Instead, we rebuild the graph on top of the explicit
+    declarations and greedily re-add each injected edge; an injected edge is
+    dropped only if adding it would (re)introduce a cycle. Explicit edges are
+    never touched (they are the agent's own declaration, not conflict
+    prevention).
+
+    Returns a list of dropped-edge records (successor/predecessor indices and
+    titles) so the caller can record WHICH edges were removed and WHY, beyond a
+    bare error log.
+    """
+    # Injected edges = whatever the injection passes added on top of explicit.
+    injected: List[tuple] = []
+    for successor, st in enumerate(subtasks):
+        explicit = set(explicit_deps.get(successor, []))
+        for predecessor in st.get("depends_on_indices", []):
+            if predecessor not in explicit:
+                injected.append((successor, predecessor))
+
+    # Reset to the explicit-only baseline, then greedily re-add injected edges.
+    for i, st in enumerate(subtasks):
+        if explicit_deps.get(i):
+            st["depends_on_indices"] = list(explicit_deps[i])
+        else:
+            st.pop("depends_on_indices", None)
+
+    dropped: List[Dict] = []
+    for successor, predecessor in injected:
+        existing = subtasks[successor].setdefault("depends_on_indices", [])
+        if predecessor in existing:
+            continue
+        existing.append(predecessor)
+        if _validate_plan_dependencies(subtasks):
+            continue
+        # This injected edge closes a cycle — drop it and record why.
+        existing.remove(predecessor)
+        if not existing:
+            subtasks[successor].pop("depends_on_indices", None)
+        record = {
+            "successor_index": successor,
+            "predecessor_index": predecessor,
+            "successor": subtasks[successor].get("title", f"#{successor}"),
+            "predecessor": subtasks[predecessor].get("title", f"#{predecessor}"),
+        }
+        dropped.append(record)
+        logger.warning(
+            f"[{label}] Dropped conflict-prevention edge "
+            f"{record['predecessor']!r} → {record['successor']!r}: it would "
+            f"close a dependency cycle with the plan's explicit declarations."
+        )
+    return dropped
+
+
+def _break_dependency_cycles(items: List[Dict], label: str = "PLAN") -> List[Dict]:
+    """Minimally break dependency cycles in declared ``depends_on_indices`` edges.
+
+    Unlike :func:`_resolve_injected_cycles` (which distinguishes injected
+    conflict-prevention edges from explicit declarations), this treats EVERY
+    declared edge as a candidate and drops only the smallest set needed to make
+    the graph acyclic: each edge is greedily re-added on top of an empty
+    baseline and dropped only if it would close a cycle. Valid prerequisite
+    chains elsewhere in the batch survive intact instead of being collapsed by
+    one bad edge.
+
+    Mutates ``items`` in place and returns a list of dropped-edge records
+    (successor/predecessor indices and titles) so the caller can record WHICH
+    edges were removed and WHY.
+    """
+    # Snapshot declared edges, then reset to an empty baseline.
+    declared: List[tuple] = []
+    for successor, item in enumerate(items):
+        for predecessor in item.get("depends_on_indices", []) or []:
+            declared.append((successor, predecessor))
+        item.pop("depends_on_indices", None)
+
+    dropped: List[Dict] = []
+    for successor, predecessor in declared:
+        existing = items[successor].setdefault("depends_on_indices", [])
+        if predecessor in existing:
+            continue
+        existing.append(predecessor)
+        if _validate_plan_dependencies(items):
+            continue
+        # This edge closes a cycle — drop it and record why.
+        existing.remove(predecessor)
+        if not existing:
+            items[successor].pop("depends_on_indices", None)
+        record = {
+            "successor_index": successor,
+            "predecessor_index": predecessor,
+            "successor": items[successor].get("title", f"#{successor}"),
+            "predecessor": items[predecessor].get("title", f"#{predecessor}"),
+        }
+        dropped.append(record)
+        logger.warning(
+            f"[{label}] Dropped dependency edge "
+            f"{record['predecessor']!r} → {record['successor']!r}: it would "
+            f"close a dependency cycle; other declared edges preserved."
+        )
+    return dropped
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     from app.alert_dispatch import _maybe_create_failure_alert
@@ -269,10 +384,72 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     subtasks = plan_data["subtasks"]
 
     if len(subtasks) > 10:
-        subtasks = subtasks[:10]
-        logger.info(
-            f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10"
+        dropped_count = len(subtasks) - 10
+        dropped_subtasks = subtasks[10:]
+        dropped_titles = [st.get("title", f"#{10 + i}") for i, st in enumerate(dropped_subtasks)]
+
+        # Check if any of the kept subtasks depend on a dropped subtask
+        broken_deps = []
+        for i in range(min(10, len(subtasks))):
+            for dep_idx in subtasks[i].get("depends_on_indices", []):
+                if dep_idx >= 10:
+                    broken_deps.append({
+                        "subtask_index": i,
+                        "subtask_title": subtasks[i].get("title", f"#{i}"),
+                        "broken_dep_index": dep_idx,
+                        "broken_dep_title": (
+                            subtasks[dep_idx].get("title", f"#{dep_idx}")
+                            if dep_idx < len(subtasks)
+                            else f"#{dep_idx}"
+                        ),
+                    })
+
+        task.latest_status_message = (
+            f"Plan exceeds 10-subtask limit: {len(subtasks)} subtasks provided, "
+            f"dropped {dropped_count} (indices 10-{len(subtasks)-1}). "
+            f"Kept subtasks have {len(broken_deps)} unsatisfiable "
+            f"dependency/dependencies on dropped subtasks."
+        )[:500]
+        task.status = TaskStatus.FAILED
+        from app.failure_classification import (
+            classify_failure,
+            persist_failure_category,
         )
+        from app.routers.agent_status import record_task_result
+
+        _fc = classify_failure(task)
+        persist_failure_category(task, _fc)
+        record_task_result(
+            success=False,
+            failure_class=_fc,
+            task_id=str(task.id),
+            task_type=task.first_payload.get("type", ""),
+        )
+        ctx = dict(task.context or {})
+        ctx["subtask_cap_exceeded"] = {
+            "total_subtasks": len(subtasks),
+            "limit": 10,
+            "dropped_count": dropped_count,
+            "dropped_indices": list(range(10, len(subtasks))),
+            "dropped_titles": dropped_titles,
+            "broken_dependencies": broken_deps,
+        }
+        task.context = ctx
+        session.add(task)
+        await _maybe_create_failure_alert(
+            task, session, task.latest_status_message
+        )
+        await session.commit()
+        logger.error(
+            "[PLAN] Plan %s failed — decomposition exceeded 10-subtask cap: "
+            "%d subtasks provided, dropped %d. Kept subtasks have %d unsatisfiable "
+            "dependencies on dropped subtasks.",
+            task.id,
+            len(subtasks),
+            dropped_count,
+            len(broken_deps),
+        )
+        return
 
     if not _validate_plan_dependencies(subtasks):
         task.latest_status_message = "Plan has circular dependencies"
@@ -347,10 +524,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
     # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
     # depends on a skipped (non-eligible) producer.
+    # A plan child is eligible if it is a PR-producing implementation subtype OR a
+    # knowledge-prerequisite subtype (web_research / design). The latter spawns AS
+    # ITSELF (no branch/PR) so a downstream implementation child can validly depend
+    # on the knowledge it produces.
+    plan_child_allowlist = PLAN_SUBTASK_TYPES | PLAN_KNOWLEDGE_SUBTASK_TYPES
     skipped_indices = set()
     for i, subtask_def in enumerate(subtasks):
         raw_type = subtask_def.get("type", "create")
-        if raw_type not in PLAN_SUBTASK_TYPES:
+        if raw_type not in plan_child_allowlist:
             skipped_indices.add(i)
 
     for i, subtask_def in enumerate(subtasks):
@@ -408,7 +590,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             raw_type = subtask_def.get("type", "create")
             logger.warning(
                 "[PLAN] Skipping subtask %r with non-eligible type %r "
-                "(not a registered plan-spawnable write task type) in plan %s",
+                "(not a registered plan-spawnable write or knowledge task type) in plan %s",
                 subtask_def.get("title", "Untitled subtask"),
                 raw_type,
                 task.id,
@@ -427,7 +609,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             if related_files
             else prompt_text
         )
-        create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+        # The "create" prompt suffix primes code/PR work; a knowledge-prerequisite
+        # child (web_research / design) produces a knowledge document, not a branch,
+        # so it must NOT receive the implementation suffix.
+        create_suffix = (
+            _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+            if subtask_type in PLAN_SUBTASK_TYPES
+            else None
+        )
         subtask_priority = TASK_PRIORITY_MAP.get(
             subtask_def.get("priority", "medium"), 50
         )
@@ -448,12 +637,35 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_approval_reason = (
             subtask_def.get("approval_reason") if child_risk == "high" else None
         )
+        # Optional plan-time acceptance-evidence contract: propagate it onto the
+        # child context the same way scope/risk/related_files are. Validated via
+        # the shared helper, so an absent or malformed declaration yields None and
+        # the child context is byte-for-byte unchanged from today.
+        child_acceptance_evidence = parse_acceptance_evidence(
+            subtask_def.get("acceptance_evidence")
+        )
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
         # task_type_models pins only; orchestrator resolves per child
         # from routing otherwise.
         subtask_model = _runtime_config.get("task_type_models", {}).get(subtask_type)
+        # Forward-carry a plan-time acceptance_evidence declaration onto the
+        # child payload so the requirement survives decomposition. Pre-validate
+        # leniently here: an LLM-generated declaration is untrusted, and a
+        # malformed one passed straight into the strict validate_internal_payload
+        # below would raise ValueError, aborting the whole spawn loop and rolling
+        # back EVERY child (recovery re-parses the same plan_output, so it fails
+        # deterministically and the decomposition is lost permanently). Degrade a
+        # malformed declaration to 'no declaration' (key omitted) instead.
+        subtask_acceptance_evidence = subtask_def.get("acceptance_evidence")
+        if subtask_acceptance_evidence is not None and (
+            read_acceptance_evidence(
+                {"acceptance_evidence": subtask_acceptance_evidence}
+            )
+            is None
+        ):
+            subtask_acceptance_evidence = None
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
@@ -470,6 +682,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                         **({"effort": subtask_effort} if subtask_effort else {}),
                         **({"prompt_suffix": create_suffix} if create_suffix else {}),
                         **({"hotfix": True} if parent_hotfix else {}),
+                        **(
+                            {"acceptance_evidence": subtask_acceptance_evidence}
+                            if subtask_acceptance_evidence
+                            else {}
+                        ),
                     },
                     f"task_completion:plan_subtask:{subtask_type}",
                 )
@@ -481,6 +698,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "risk": child_risk,
                 "related_files": related_files,
                 "parent_context": plan_parent_context,
+                **(
+                    {"acceptance_evidence": child_acceptance_evidence}
+                    if child_acceptance_evidence
+                    else {}
+                ),
                 **(
                     {"approval_reason": child_approval_reason}
                     if child_approval_reason
@@ -521,14 +743,20 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     _inject_build_on_deps(subtasks, "PLAN")
 
     if not _validate_plan_dependencies(subtasks):
+        # A cycle formed once injected serialization edges combined with the
+        # plan's explicit declarations. Remove only the minimal injected edges
+        # that close a cycle — keep the rest of the conflict-prevention
+        # serialization rather than wholesale-discarding all of it.
+        dropped_edges = _resolve_injected_cycles(subtasks, original_deps, "PLAN")
         logger.error(
-            "[PLAN] Circular dependency after dependency injection — reverting to explicit deps only"
+            "[PLAN] Circular dependency after dependency injection — dropped "
+            f"{len(dropped_edges)} conflict-prevention edge(s) to restore "
+            "acyclicity, preserved the remaining serialization"
         )
-        for i, st in enumerate(subtasks):
-            if original_deps.get(i):
-                st["depends_on_indices"] = original_deps[i]
-            else:
-                st.pop("depends_on_indices", None)
+        ctx = dict(task.context or {})
+        ctx["dropped_serialization_edges"] = dropped_edges
+        task.context = ctx
+        session.add(task)
 
     for i, subtask_def in enumerate(subtasks):
         if child_tasks[i] is None:

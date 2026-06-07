@@ -621,6 +621,190 @@ async def test_design_completion_sets_source_kind(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.COMPLETED
 
 
+@pytest.mark.asyncio
+async def test_compute_experiment_persist_sets_source_kind(
+    db_session, _quiet_broadcast
+):
+    """A persisted compute_experiment verdict records source_kind ==
+    'compute_experiment' and synthesizes its document from the measured verdict
+    (no agent-emitted title/summary/body), sharing the same durable store."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = make_project(name="CErecord")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="compute_experiment: measure X",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "compute_experiment", "experiment": "X→Y", "base_branch": "main"}
+        ],
+        context={"direction_id": "d-xyz"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.42,
+        criterion={
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+            "value": 0.93,
+            "met": True,
+            "measurable": True,
+        },
+        result_reference="https://storage.example.com/jobs/abc/result.json",
+        session=db_session,
+    )
+
+    assert doc is not None
+    assert doc.source_kind == "compute_experiment"
+    assert doc.direction_id == "d-xyz"
+    assert doc.source_citations == [
+        "https://storage.example.com/jobs/abc/result.json"
+    ]
+    assert "accuracy" in doc.body
+
+
+# ── knowledge-prerequisite delivery to dependents ───────────────────────────
+#
+# When a plan commissions a web_research/design prerequisite and makes an
+# implementation task depend on it, the produced document must be delivered to
+# the dependent's launch context. Linkage is established at prerequisite
+# completion (so it survives the dependent dispatching later): a compact pointer
+# is stamped onto each QUEUED dependent's context["knowledge_prerequisites"].
+
+
+async def _make_queued_dependent(db_session, *, project_id, depends_on):
+    """Create a QUEUED implementation task that depends on a prerequisite task."""
+    dep = make_task(
+        project_id=project_id,
+        title="feat: implement X (depends on prereq)",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "implement X", "base_branch": "main"}],
+        depends_on=depends_on,
+    )
+    db_session.add(dep)
+    await db_session.commit()
+    await db_session.refresh(dep)
+    return dep
+
+
+@pytest.mark.asyncio
+async def test_completion_delivers_pointer_to_queued_dependent(
+    db_session, _quiet_broadcast
+):
+    """A web_research prerequisite's completion stamps its document pointer onto a
+    QUEUED dependent that declared it in depends_on."""
+    project, task = await _make_web_research_task(db_session, project_name="WRdeliver")
+    dependent = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(task.id)]
+    )
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get("knowledge_prerequisites")
+    assert isinstance(prereqs, list) and len(prereqs) == 1
+    pointer = prereqs[0]
+    assert pointer["doc_id"] == str(doc.id)
+    assert pointer["source_task_id"] == str(task.id)
+    assert pointer["source_kind"] == "web_research"
+    assert pointer["title"] == document["title"]
+    assert pointer["summary"] == document["summary"]
+    # The dependent stays QUEUED — delivery never advances its lifecycle.
+    assert dependent.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_completion_no_dependents_is_noop(db_session, _quiet_broadcast):
+    """A prerequisite with no declared dependents completes normally and stamps
+    nothing — and an unrelated QUEUED task is untouched."""
+    project, task = await _make_web_research_task(db_session, project_name="WRnodep")
+    unrelated = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(uuid.uuid4())]
+    )
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    await db_session.refresh(unrelated)
+    assert "knowledge_prerequisites" not in (unrelated.context or {})
+
+
+@pytest.mark.asyncio
+async def test_design_completion_also_delivers(db_session, _quiet_broadcast):
+    """The delivery seam is shared: a design prerequisite delivers its pointer to a
+    QUEUED dependent exactly as web_research does."""
+    project, task = await _make_design_task(db_session, project_name="DSGNdeliver")
+    dependent = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(task.id)]
+    )
+
+    document = {
+        "title": "Design for X subsystem",
+        "summary": "A codebase-internal design grounded in file references.",
+        "body": "# X\n\nDetailed design rationale referencing the code.",
+        "citations": ["backend/app/models.py", "docs/design/x.md"],
+        "tags": ["design"],
+        "topic": "X",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get("knowledge_prerequisites")
+    assert isinstance(prereqs, list) and len(prereqs) == 1
+    assert prereqs[0]["doc_id"] == str(doc.id)
+    assert prereqs[0]["source_kind"] == "design"
+
+
 # ── design codebase-grounding probe (file citations resolve to real paths) ──
 #
 # A design document's value is that it is grounded in the ACTUAL code. The
@@ -1632,3 +1816,220 @@ async def test_persist_document_provenance_absent_stores_null(
     doc = docs[0]
     assert doc.authoring_branch is None
     assert doc.head_sha is None
+
+
+# ── build_knowledge_index: compact, bounded, scoped index ────────────────────
+
+
+async def _make_knowledge_doc(
+    db_session,
+    *,
+    project_id,
+    source_task_id,
+    title,
+    summary="A summary.",
+    topic="t",
+    direction_id=None,
+    source_kind="web_research",
+    created_at=None,
+):
+    """Persist one KnowledgeDocument for index tests, with optional explicit
+    created_at so ordering is deterministic within a single transaction."""
+    doc = KnowledgeDocument(
+        project_id=project_id,
+        source_task_id=source_task_id,
+        title=title,
+        summary=summary,
+        body="# Body\n\n" + ("x" * 50),
+        topic=topic,
+        direction_id=direction_id,
+        source_kind=source_kind,
+    )
+    if created_at is not None:
+        doc.created_at = created_at
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_compact_fields_no_body(db_session):
+    """The index carries only the compact navigation fields and never the body."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI1")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Doc A",
+        summary="Summary A",
+        topic="auth",
+        direction_id="d-aaaa1111",
+        source_kind="design",
+    )
+
+    index = await build_knowledge_index(db_session, project.id)
+    assert len(index) == 1
+    entry = index[0]
+    assert set(entry.keys()) == {
+        "id",
+        "title",
+        "summary",
+        "topic",
+        "direction_id",
+        "source_kind",
+        "created_at",
+    }
+    assert "body" not in entry
+    assert entry["title"] == "Doc A"
+    assert entry["summary"] == "Summary A"
+    assert entry["topic"] == "auth"
+    assert entry["direction_id"] == "d-aaaa1111"
+    assert entry["source_kind"] == "design"
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_empty_when_no_documents(db_session):
+    """No documents → empty list (the caller omits the payload field entirely)."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, _task = await _make_web_research_task(db_session, project_name="KI2")
+    assert await build_knowledge_index(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_respects_count_cap(db_session):
+    """The entry count never exceeds the requested limit."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI3")
+    for i in range(5):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project.id,
+            source_task_id=task.id,
+            title=f"Doc {i}",
+        )
+    index = await build_knowledge_index(db_session, project.id, limit=3)
+    assert len(index) == 3
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_truncates_summary(db_session):
+    """Long summaries are collapsed and truncated to summary_chars (with ellipsis)."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI4")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Long",
+        summary="word " * 100,
+    )
+    index = await build_knowledge_index(db_session, project.id, summary_chars=40)
+    assert len(index) == 1
+    summary = index[0]["summary"]
+    assert len(summary) <= 40
+    assert summary.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_newest_first(db_session):
+    """Entries are ordered newest-first by created_at."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI5")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Older",
+        created_at=base,
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Newer",
+        created_at=base + timedelta(hours=1),
+    )
+    index = await build_knowledge_index(db_session, project.id)
+    assert [e["title"] for e in index] == ["Newer", "Older"]
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_direction_scope_first_then_project_fill(
+    db_session,
+):
+    """Direction-scoped docs come first; project-wide docs fill the remainder,
+    with no duplicates and total bounded by the limit."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI6")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    # Two project-wide (no direction) docs, NEWER than the direction-scoped one.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Proj newer 1",
+        direction_id=None,
+        created_at=base + timedelta(hours=5),
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Proj newer 2",
+        direction_id=None,
+        created_at=base + timedelta(hours=4),
+    )
+    # One direction-scoped doc, OLDER than the project-wide ones.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Dir doc",
+        direction_id="d-zzzz9999",
+        created_at=base,
+    )
+
+    index = await build_knowledge_index(
+        db_session, project.id, direction_id="d-zzzz9999"
+    )
+    titles = [e["title"] for e in index]
+    # Direction doc first despite being oldest; then project-wide fill newest-first.
+    assert titles[0] == "Dir doc"
+    assert set(titles) == {"Dir doc", "Proj newer 1", "Proj newer 2"}
+    assert len(titles) == len(set(titles))  # no duplicates
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_excludes_cross_project(db_session):
+    """Documents from other projects are never included."""
+    from app.knowledge_query import build_knowledge_index
+
+    project_a, task_a = await _make_web_research_task(db_session, project_name="KIA")
+    project_b, task_b = await _make_web_research_task(db_session, project_name="KIB")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project_a.id,
+        source_task_id=task_a.id,
+        title="A doc",
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project_b.id,
+        source_task_id=task_b.id,
+        title="B doc",
+    )
+    index_a = await build_knowledge_index(db_session, project_a.id)
+    assert [e["title"] for e in index_a] == ["A doc"]

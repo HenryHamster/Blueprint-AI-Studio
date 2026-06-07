@@ -1,0 +1,132 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { renderHook, act, waitFor, cleanup } from '@testing-library/react';
+import { useDirectionsData } from './useDirectionsData';
+import { apiFetch, fetchVersionLifecycle } from '../api';
+
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(),
+  fetchVersionLifecycle: vi.fn(),
+}));
+
+vi.mock('./useAutonomousConfig', () => ({
+  useAutonomousConfig: () => ({
+    fetchCooldownSetting: vi.fn(),
+    fetchSettings: vi.fn(),
+    configCooldownHours: 24,
+    setConfigCooldownHours: vi.fn(),
+    configIntervalMinutes: 60,
+    setConfigIntervalMinutes: vi.fn(),
+    configMaxParallel: 3,
+    setConfigMaxParallel: vi.fn(),
+    configMaxTotalResearch: 5,
+    setConfigMaxTotalResearch: vi.fn(),
+    configMaxTasksPerHour: 10,
+    setConfigMaxTasksPerHour: vi.fn(),
+    autonomousConfigOpen: false,
+    setAutonomousConfigOpen: vi.fn(),
+    savingConfigField: null,
+    saveConfigField: vi.fn(),
+    cooldownMinutes: 240,
+  }),
+}));
+
+vi.mock('./usePoller', () => ({
+  usePoller: vi.fn(),
+}));
+
+const mockApiFetch = vi.mocked(apiFetch);
+const mockFetchVersionLifecycle = vi.mocked(fetchVersionLifecycle);
+
+function okResponse(data: unknown) {
+  return Promise.resolve({
+    ok: true,
+    json: () => Promise.resolve(data),
+  } as Response);
+}
+
+describe('useDirectionsData addDirection idempotency', () => {
+  beforeEach(() => {
+    cleanup();
+    mockFetchVersionLifecycle.mockResolvedValue({ current_version: null } as Awaited<ReturnType<typeof fetchVersionLifecycle>>);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('rotates the add-form idempotency key when the draft changes after a failed submit', async () => {
+    const postBodies: Array<Record<string, unknown>> = [];
+    let addAttempts = 0;
+
+    mockApiFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const isAddPost =
+        init?.method === 'POST' && url.includes('/directions') && !url.includes('task-counts');
+      if (isAddPost) {
+        postBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+        addAttempts += 1;
+        if (addAttempts === 1) {
+          return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) } as Response);
+        }
+        return okResponse({ direction: { id: 'dir-2' } });
+      }
+      if (url.includes('/directions/task-counts')) {
+        return okResponse({ counts: {}, active_tasks: {} });
+      }
+      if (url.includes('/directions')) {
+        return okResponse({
+          directions: [],
+          autonomous_enabled: false,
+          design_doc: {},
+          problem_model: {},
+          problem_model_size_health: null,
+          running_update: null,
+          running_update_acknowledged_at: null,
+          running_update_reconciliation: null,
+        });
+      }
+      return okResponse({});
+    });
+
+    const { result } = renderHook(() =>
+      useDirectionsData({ selectedProjectId: 'proj-1', addToast: vi.fn() }),
+    );
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/admin/projects/proj-1/directions'),
+      );
+    });
+    mockApiFetch.mockClear();
+
+    act(() => {
+      result.current.form.setNewText('Original direction draft');
+    });
+
+    await act(async () => {
+      await result.current.addDirection();
+    });
+
+    await waitFor(() => {
+      expect(result.current.error).toBe('Failed to add direction. Please try again.');
+    });
+
+    act(() => {
+      result.current.form.setNewText('Edited direction draft');
+    });
+
+    await act(async () => {
+      await result.current.addDirection();
+    });
+
+    await waitFor(() => {
+      expect(postBodies).toHaveLength(2);
+    });
+
+    expect(postBodies[0].text).toBe('Original direction draft');
+    expect(postBodies[1].text).toBe('Edited direction draft');
+    expect(typeof postBodies[0].idempotency_key).toBe('string');
+    expect(typeof postBodies[1].idempotency_key).toBe('string');
+    expect(postBodies[0].idempotency_key).not.toBe(postBodies[1].idempotency_key);
+  });
+});

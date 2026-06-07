@@ -190,6 +190,34 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
     expect(FIX_TASK_FOCUS).toContain('Cross-file consistency');
   });
+
+  it('requires a reproduce-on-HEAD gate before editing', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('Reproduced-on-HEAD gate');
+    expect(FIX_TASK_FOCUS).toContain('still reproduces on current HEAD');
+  });
+
+  it('routes a non-reproducing finding to the already-resolved no-op off-ramp', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('./done --already-done');
+    expect(FIX_TASK_FOCUS).toContain('no-op rather than a false fix');
+  });
+
+  it('keeps the not-reproducible bar high so ambiguity falls through to the fix path', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('not-reproducible bar HIGH');
+  });
+
+  it('names all three canonical reproduce-on-HEAD outcomes and ties the off-ramp to the structured verdict', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('reproduced');
+    expect(FIX_TASK_FOCUS).toContain('already_resolved');
+    expect(FIX_TASK_FOCUS).toContain('indeterminate');
+    // The --already-done off-ramp now emits the structured already_resolved verdict.
+    expect(FIX_TASK_FOCUS).toContain('emits the structured `already_resolved` reproduce verdict');
+    expect(FIX_TASK_FOCUS).toContain('./done --reproduced');
+    expect(FIX_TASK_FOCUS).toContain('./done --indeterminate');
+  });
 });
 
 describe('DOCS_TASK_FOCUS — content invariants', () => {

@@ -47,6 +47,8 @@ from app.strategic_completion import (
     EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
+    spawn_budget_status,
+    spawn_title_is_redundant,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -1702,6 +1704,41 @@ class TestDirectionPredictionCalibration:
         assert pred["similar_direction_count"] == 1
         assert pred["mature_system_count"] == 1
 
+    def test_build_creation_prediction_excludes_degraded_unverified_merges(self):
+        """Similar-past-merges counts VERIFIED merges only (history + aggregate)."""
+        similar = {
+            "id": "d0",
+            "text": "cache invalidation dashboard refresh",
+            "research_history": [
+                # 2 raw merges, 1 verified.
+                {"prs_merged": 2, "verified_prs_merged": 1},
+            ],
+            "history_aggregate": {
+                # 5 raw, 2 verified.
+                "total_prs_merged": 5,
+                "total_verified_prs_merged": 2,
+            },
+        }
+        p = Project(name="P", user_id="u", directions=[similar], vision={})
+        new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
+        pred = _build_creation_prediction(new_d, p)
+        # Verified-only: 1 (history) + 2 (aggregate) = 3, NOT raw 2+5=7.
+        assert pred["similar_past_merges"] == 3
+
+    def test_build_creation_prediction_legacy_aggregate_falls_back(self):
+        """Aggregate predating total_verified_prs_merged uses total_prs_merged."""
+        similar = {
+            "id": "d0",
+            "text": "cache invalidation dashboard refresh",
+            "research_history": [{"prs_merged": 1}],
+            "history_aggregate": {"total_prs_merged": 4},
+        }
+        p = Project(name="P", user_id="u", directions=[similar], vision={})
+        new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
+        pred = _build_creation_prediction(new_d, p)
+        # 1 (legacy history fallback) + 4 (legacy aggregate fallback) = 5.
+        assert pred["similar_past_merges"] == 5
+
     def test_build_retirement_metrics_snapshots_merges_and_cycles(self):
         d = {
             "id": "d1",
@@ -1793,6 +1830,133 @@ class TestRecommendedModeNormalization:
 
         for value in ("nonsense", "", "audit_now", None, 42, []):
             assert _normalize_recommended_mode(value) is None
+
+
+@pytest.mark.asyncio
+async def test_system_status_not_upgraded_on_unverified_merges(db_session, mocker):
+    """A system whose mapped directions have raw merges but ZERO verified
+    merges must NOT be auto-upgraded to functional/in_progress — the upgrade
+    is credited only for merges that reproduced on HEAD."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d1",
+                "system_id": "sys1",
+                # 8 raw merges, none verified -> verified total is 0.
+                "research_history": [
+                    {"prs_merged": 5, "verified_prs_merged": 0},
+                    {"prs_merged": 3, "verified_prs_merged": 0},
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 6,
+                    "total_verified_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "systems": [{"id": "sys1", "status": "planned"}],
+            },
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    sys = next(s for s in project.vision["systems"] if s["id"] == "sys1")
+    # zero verified merges -> NOT promoted to functional even though raw merges
+    # are >= 5. (in_progress still fires from the mapped-direction presence
+    # branch, which is independent of merge counts.)
+    assert sys["status"] != "functional"
+    assert sys["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_system_status_upgraded_on_verified_merges(db_session, mocker):
+    """Verified merges still upgrade a system to functional exactly as before."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d1",
+                "system_id": "sys1",
+                "research_history": [
+                    {"prs_merged": 5, "verified_prs_merged": 5},
+                    {"prs_merged": 3, "verified_prs_merged": 3},
+                ],
+                "history_aggregate": {},
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "systems": [{"id": "sys1", "status": "planned"}],
+            },
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    sys = next(s for s in project.vision["systems"] if s["id"] == "sys1")
+    # 8 verified merges >= 5 -> functional.
+    assert sys["status"] == "functional"
 
 
 @pytest.mark.asyncio
@@ -6314,6 +6478,38 @@ def _no_pr_history(
     ]
 
 
+def _verified_history(
+    n,
+    tasks_created=2,
+    tasks_completed=1,
+    tasks_completed_no_pr=0,
+    tasks_failed=0,
+    tasks_failed_infra=0,
+    prs_merged=1,
+    verified_prs_merged=0,
+):
+    """research_history entries carrying BOTH prs_merged and verified_prs_merged.
+
+    Lets a test model an unverified-degraded merge cycle: prs_merged > 0 (the PR
+    landed) while verified_prs_merged == 0 (the merge went green via a no-CI
+    fall-open where verification was blocked). verified_merged_count() returns 0
+    for such an entry, so direction-level control decisions must treat it as no
+    merge.
+    """
+    return [
+        {
+            "tasks_created": tasks_created,
+            "tasks_completed": tasks_completed,
+            "tasks_completed_no_pr": tasks_completed_no_pr,
+            "tasks_failed": tasks_failed,
+            "tasks_failed_infra": tasks_failed_infra,
+            "prs_merged": prs_merged,
+            "verified_prs_merged": verified_prs_merged,
+        }
+        for _ in range(n)
+    ]
+
+
 class TestDirectionStillProductive:
     def test_false_when_flag_absent(self):
         # Legacy directions never set last_cycle_productive → not gated (rules fire)
@@ -6601,6 +6797,148 @@ class TestAlreadyBuiltSignature:
         assert already_built_completion_suggestion(d) is None
 
 
+class TestVerifiedMergePredicateDrivesDecisions:
+    """Direction-level control decisions count only verified merges.
+
+    A merge that landed in an unverified-degraded state (prs_merged > 0 but
+    verified_prs_merged == 0) must NOT mask a stall or suppress an auto-pause /
+    completion gate. Each case pairs a degraded-only direction (which now trips
+    the rule) with a genuinely-verified direction (which is unaffected), proving
+    the predicate — not the raw count — drives the decision.
+    """
+
+    # --- Rule 2: zero-merge auto-pause ---
+
+    def test_rule2_fires_when_only_merges_are_degraded(self):
+        # 5 cycles, each landed a PR (prs_merged=1) but none verified. Last cycle
+        # fully finished; 2 real (non-no-op) completions per cycle. Raw count would
+        # suppress the pause; verified count is 0 → Unproductive fires.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=2,
+                tasks_completed=2,
+                tasks_failed=0,
+                prs_merged=1,
+                verified_prs_merged=0,
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Unproductive" in result
+
+    def test_rule2_silent_when_merges_are_verified(self):
+        # Same shape, but the merges are genuinely verified → not unproductive.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=2,
+                tasks_completed=2,
+                tasks_failed=0,
+                prs_merged=1,
+                verified_prs_merged=1,
+            )
+        )
+        assert _check_direction_health(d) is None
+
+    # --- Rule 4: recent-stall auto-pause ---
+
+    def test_rule4_stall_fires_with_degraded_merges_and_code_failure(self):
+        # 3 cycles each: 1 code failure AND a degraded merge. The degraded merge
+        # must not count as a merge, so the stall rule fires.
+        d = _direction(
+            research_history=_verified_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=1,
+                verified_prs_merged=0,
+            )
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is True
+
+    def test_rule4_stall_silent_when_merges_verified(self):
+        # Identical except the merges are verified → cycle is not "failed", no stall.
+        d = _direction(
+            research_history=_verified_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=1,
+                verified_prs_merged=1,
+            )
+        )
+        assert _check_direction_health(d) is None
+
+    # --- _check_direction_completion ---
+
+    def test_completion_not_declared_when_merges_all_degraded(self):
+        # 4 cycles each landing 2 unverified-degraded merges + 2 low-yield cycles.
+        # Raw total = 8 (>=3) would declare complete; verified total = 0 → None.
+        history = _verified_history(
+            4, tasks_created=2, tasks_completed=2, prs_merged=2, verified_prs_merged=0
+        ) + _verified_history(
+            2, tasks_created=1, tasks_completed=1, prs_merged=0, verified_prs_merged=0
+        )
+        d = _direction(research_history=history)
+        assert _check_direction_completion(d) is None
+
+    def test_completion_declared_when_merges_verified(self):
+        # Same shape but the early merges are verified → direction reads complete.
+        history = _verified_history(
+            4, tasks_created=2, tasks_completed=2, prs_merged=2, verified_prs_merged=2
+        ) + _verified_history(
+            2, tasks_created=1, tasks_completed=1, prs_merged=0, verified_prs_merged=0
+        )
+        d = _direction(research_history=history)
+        result = _check_direction_completion(d)
+        assert result is not None
+        assert "complete" in result.lower()
+
+    # --- already-built signature ---
+
+    def test_already_built_fires_despite_degraded_merges_above_max(self):
+        # No-op-dominated cycles, no code failures, but 2 (degraded) merges/cycle —
+        # raw merged=10 would exceed max_merged=1 and suppress the signal. Verified
+        # merged=0, so the already-built suggestion still surfaces.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=4,
+                tasks_completed=4,
+                tasks_completed_no_pr=4,
+                tasks_failed=0,
+                prs_merged=2,
+                verified_prs_merged=0,
+            )
+        )
+        sig = _already_built_signature(d)
+        assert sig is not None
+        assert sig["merged"] == 0
+        assert already_built_completion_suggestion(d) is not None
+
+    def test_already_built_suppressed_when_merges_verified(self):
+        # Identical except merges are verified → actively shipping, not already-built.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=4,
+                tasks_completed=4,
+                tasks_completed_no_pr=4,
+                tasks_failed=0,
+                prs_merged=2,
+                verified_prs_merged=2,
+            )
+        )
+        assert _already_built_signature(d) is None
+
+
 # ── Outcome-progress (scaffolding) detector ───────────────────────────────────
 
 
@@ -6803,6 +7141,66 @@ class TestRecordOutcomeProgressSnapshot:
         }
         record_outcome_progress_snapshot(d)
         assert d.get("outcome_progress_ever_met") is True
+
+    def test_snapshot_merged_counts_verified_not_raw(self):
+        # Entries with raw prs_merged but verified_prs_merged=0 must record
+        # ``merged`` on the VERIFIED basis (0), not the raw basis.
+        d = {
+            "research_history": [
+                {"prs_merged": 4, "verified_prs_merged": 0},
+                {"prs_merged": 3, "verified_prs_merged": 1},
+            ],
+            "history_aggregate": {
+                "total_cycles": 0,
+                "total_prs_merged": 5,
+                "total_verified_prs_merged": 2,
+            },
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        # verified history 0 + 1, aggregate verified 2 -> 3 (raw would be 12)
+        assert d["outcome_progress_history"][0]["merged"] == 3
+
+    def test_fully_unverified_direction_does_not_latch_ever_met(self):
+        # All raw merges, none verified -> the cumulative completion heuristic
+        # cannot trip on verified basis, so the stall-exemption latch stays off.
+        history = [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+                "verified_prs_merged": 0,
+            },
+        ]
+        d = {
+            "research_history": history,
+            "history_aggregate": {},
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True
 
 
 class TestCheckOutcomeScaffolding:
@@ -8254,6 +8652,27 @@ class TestResetScaffoldingStateOnOutcomeChange:
         # 3 merged in history + 4 aggregated merged = 7
         assert d["outcome_progress_reset_at_merged"] == 7
 
+    def test_reset_baseline_uses_verified_merges_not_raw(self):
+        # Reset baseline must be stamped on the VERIFIED basis so the latch's
+        # post_merged = total - reset_merged delta math stays consistent with
+        # record_outcome_progress_snapshot.
+        d = {
+            "research_history": [
+                {"prs_merged": 4, "verified_prs_merged": 1},
+                {"prs_merged": 3, "verified_prs_merged": 2},
+            ],
+            "history_aggregate": {
+                "total_cycles": 5,
+                "total_prs_merged": 9,
+                "total_verified_prs_merged": 4,
+            },
+            "outcome_progress_ever_met": True,
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert d["outcome_progress_reset_at_cycle"] == 7
+        # verified history 1 + 2, aggregate verified 4 -> 7 (raw would be 16)
+        assert d["outcome_progress_reset_at_merged"] == 7
+
 
 class TestRecordOutcomeProgressSnapshotPostReset:
     """After an outcome reset, the cumulative completion heuristic must NOT
@@ -9440,3 +9859,328 @@ class TestMessageConvergenceLinkage:
         feed = await _fetch_open_messages(convergence_db, project.id)
         feed_ids = {item["id"] for item in feed}
         assert str(resolved_msg.id) not in feed_ids
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_grounds_emitted_bug_report(db_session, mocker):
+    """A BUG_REPORT parsed from the strategic agent's output that cites code
+    absent on HEAD gets an ``_provenance_warnings`` absent signal on the emitted
+    ProjectMessage — the strategist-authored path runs the same reproduce-on-HEAD
+    grounding as the user/annotation paths."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select as _select
+    from app.strategic_completion import _handle_strategic_completion
+    from app.models import ProjectMessage
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    # The shared reproduce-on-HEAD contract (classify_reproduction) only reports
+    # ``absent`` when a validation backend could actually run; with the branch
+    # context mocked empty, assert the backend is available so a genuinely-broken
+    # citation reaches ``absent`` rather than degrading to ``indeterminate``.
+    mocker.patch(
+        "app.source_ref_validation._has_validation_backend",
+        return_value=True,
+    )
+
+    project = Project(
+        name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "BUG_REPORT",
+                    "content": "The guard regressed in backend/app/gone.py during init.",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "absent"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_present_citation_not_flagged(db_session, mocker):
+    """A strategist-emitted BUG_REPORT whose cited file still exists is NOT flagged."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select as _select
+    from app.strategic_completion import _handle_strategic_completion
+    from app.models import ProjectMessage
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = Project(
+        name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "BUG_REPORT",
+                    "content": "Still reproduces in backend/app/real.py on load.",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert "_provenance_warnings" not in (msg.context or {})
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_mixed_present_citation_is_flagged(
+    db_session, mocker
+):
+    """A partially grounded strategist-emitted BUG_REPORT keeps its mixed refs."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select as _select
+    from app.strategic_completion import _handle_strategic_completion
+    from app.models import ProjectMessage
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+    )
+
+    project = Project(
+        name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "BUG_REPORT",
+                    "content": (
+                        "The crash spans backend/app/gone.py and "
+                        "backend/app/alive.py during init."
+                    ),
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "present"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_note_message_not_grounded(db_session, mocker):
+    """A NOTE-type strategist message is never grounded, even when it cites code."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select as _select
+    from app.strategic_completion import _handle_strategic_completion
+    from app.models import ProjectMessage
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    spy = mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = Project(
+        name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "NOTE",
+                    "content": "Consider refactoring backend/app/gone.py soon.",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert "_provenance_warnings" not in (msg.context or {})
+    spy.assert_not_called()
+
+
+# ── Strategist autonomous spawn-path budget helpers ──────────────────────────
+
+
+def test_spawn_budget_status_under_both_caps_is_ok():
+    ok, scope, reason = spawn_budget_status(
+        3, 5, per_review_cap=12, window_cap=20
+    )
+    assert ok is True
+    assert scope is None
+    assert reason is None
+
+
+def test_spawn_budget_status_per_review_cap_exhausted():
+    ok, scope, reason = spawn_budget_status(
+        12, 5, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "per_review"
+    assert "12/12" in reason
+
+
+def test_spawn_budget_status_window_cap_exhausted():
+    ok, scope, reason = spawn_budget_status(
+        2, 20, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "window"
+    assert "20/20" in reason
+
+
+def test_spawn_budget_status_per_review_takes_precedence():
+    # Both exhausted — per_review reported first.
+    ok, scope, _ = spawn_budget_status(
+        12, 20, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "per_review"
+
+
+def test_spawn_budget_status_nonpositive_cap_disables_dimension():
+    # Per-review disabled (cap<=0) but window still enforced.
+    ok, scope, _ = spawn_budget_status(99, 20, per_review_cap=0, window_cap=20)
+    assert ok is False
+    assert scope == "window"
+    # Both disabled — always ok.
+    ok2, scope2, _ = spawn_budget_status(99, 99, per_review_cap=0, window_cap=0)
+    assert ok2 is True
+    assert scope2 is None
+
+
+def test_spawn_title_is_redundant_overlapping_topic_matches():
+    match = spawn_title_is_redundant(
+        "Investigate the warm pool provisioning ready signal latency",
+        ["Research warm pool provisioning ready signal timing"],
+        threshold=4,
+    )
+    assert match == "Research warm pool provisioning ready signal timing"
+
+
+def test_spawn_title_is_redundant_distinct_topics_not_matched():
+    match = spawn_title_is_redundant(
+        "Investigate A",
+        ["Investigate B"],
+        threshold=4,
+    )
+    assert match is None
+
+
+def test_spawn_title_is_redundant_below_threshold_not_matched():
+    # Only "warm" + "pool" overlap (2 non-stopword words) < threshold 4.
+    match = spawn_title_is_redundant(
+        "warm pool latency under load spikes",
+        ["warm pool image bake duration regression"],
+        threshold=4,
+    )
+    assert match is None
+
+
+def test_spawn_title_is_redundant_empty_title_returns_none():
+    assert spawn_title_is_redundant("", ["anything here at all"], threshold=4) is None

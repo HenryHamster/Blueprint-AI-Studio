@@ -4077,8 +4077,15 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
     assert "_strategic_failures_at" not in vision
 
 
-async def _post_spawn_task(strategic_db, task_id, *, title, prompt, spawn_type="plan"):
-    """POST a strategic spawn_task op against the test app, returning the JSON body."""
+async def _post_spawn_task(
+    strategic_db, task_id, *, title, prompt, spawn_type="plan", expect_status=200
+):
+    """POST a strategic spawn_task op against the test app.
+
+    Returns the parsed JSON body. When ``expect_status`` is the default 200 the
+    JSON is the success body; for an expected error status (e.g. 400) it is the
+    FastAPI error envelope ({"detail": ...}).
+    """
     from httpx import AsyncClient, ASGITransport
     from app.main import app
     from app.database import get_session
@@ -4104,7 +4111,7 @@ async def _post_spawn_task(strategic_db, task_id, *, title, prompt, spawn_type="
                     "data": {"type": spawn_type, "title": title, "prompt": prompt},
                 },
             )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == expect_status, resp.text
         return resp.json()
     finally:
         app.dependency_overrides.pop(get_session, None)
@@ -4217,6 +4224,231 @@ async def test_spawn_task_distinct_title_is_not_deduped(strategic_db):
         )
     ).scalar()
     assert count == 2
+
+
+async def _make_strategic_review(strategic_db):
+    """Helper: create a project + IN_PROGRESS strategic_review task, returning
+    (project, review_id) for spawn_task tests."""
+    project = Project(name="P", user_id="u1")
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(review)
+    await strategic_db.commit()
+    await strategic_db.refresh(review)
+    return project, str(review.id)
+
+
+@pytest.mark.parametrize("spawn_type", ["web_research", "design"])
+@pytest.mark.asyncio
+async def test_spawn_task_allows_registry_knowledge_types(strategic_db, spawn_type):
+    """web_research and design are strategist_spawnable in the registry, so the
+    spawn_task op must accept them end-to-end and create a QUEUED task carrying the
+    expected payload type, created_by, and strategic_direct context."""
+    from sqlmodel import select
+
+    _project, review_id = await _make_strategic_review(strategic_db)
+
+    body = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title=f"Investigate via {spawn_type}",
+        prompt=f"Do {spawn_type} work",
+        spawn_type=spawn_type,
+    )
+    assert body["status"] == "ok"
+    assert body["type"] == spawn_type
+    assert not body.get("deduplicated")
+
+    spawned = (
+        await strategic_db.execute(
+            select(Task).where(Task.id == body["task_id"])
+        )
+    ).scalar_one()
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.created_by == "STRATEGIC_AGENT"
+    assert spawned.first_payload.get("type") == spawn_type
+    ctx = spawned.context or {}
+    assert ctx.get("spawned_by") == "strategic_direct"
+    assert ctx.get("parent_strategic_task_id") == review_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_rejects_non_allowlisted_implementation_type(strategic_db):
+    """An implementation / PR-producing type (create) is not strategist_spawnable,
+    so the spawn_task op must reject it with a 400 listing the allowed types."""
+    from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
+
+    _project, review_id = await _make_strategic_review(strategic_db)
+
+    body = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Should not be allowed",
+        prompt="implement a feature",
+        spawn_type="create",
+        expect_status=400,
+    )
+    # The app's HTTPException handler wraps the detail as {"error": {"message": ...}}.
+    detail = body["error"]["message"]
+    assert "must be one of" in detail
+    assert "create" in detail  # echoes the rejected type
+    # The allowed-types list in the message is the registry-derived sorted set.
+    assert str(sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)) in detail
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_per_review_budget_enforced(strategic_db, mocker):
+    """One strategic review may spawn at most the per-review cap; the next spawn
+    is refused with 429 status='skipped' and an observable budget flag stamped
+    on the review (not a silent swallow)."""
+    from sqlalchemy import func as _f
+    from sqlmodel import select
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"strategist_spawn_per_review_cap": 2, "strategist_spawn_window_cap": 50},
+    )
+
+    project, review_id = await _make_strategic_review(strategic_db)
+
+    # Distinct titles (overlap = 1 < threshold 4) so semantic dedup never fires.
+    for n in ("alpha", "beta"):
+        body = await _post_spawn_task(
+            strategic_db, review_id, title=f"Investigate {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok"
+        assert not body.get("deduplicated")
+
+    refused = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Investigate gamma",
+        prompt="do gamma",
+        expect_status=429,
+    )
+    assert refused["status"] == "skipped"
+    assert refused["scope"] == "per_review"
+
+    # Only the two budgeted tasks exist; the third was not created.
+    count = (
+        await strategic_db.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 2
+
+    # The refusal is observable: the review carries the exhaustion flag.
+    review = (
+        await strategic_db.execute(select(Task).where(Task.id == review_id))
+    ).scalar_one()
+    flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
+    assert flag is not None
+    assert flag["scope"] == "per_review"
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_rolling_window_budget_enforced(strategic_db, mocker):
+    """The rolling-window cap bounds spawns across consecutive reviews: once the
+    project-wide window count is reached, a spawn from a fresh review is refused
+    with scope='window'."""
+    from sqlalchemy import func as _f
+    from sqlmodel import select
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"strategist_spawn_per_review_cap": 50, "strategist_spawn_window_cap": 2},
+    )
+
+    project, review_a = await _make_strategic_review(strategic_db)
+    # Second review in the same project.
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(review)
+    await strategic_db.commit()
+    await strategic_db.refresh(review)
+    review_b = str(review.id)
+
+    # Two spawns from review A fill the window.
+    for n in ("alpha", "beta"):
+        body = await _post_spawn_task(
+            strategic_db, review_a, title=f"Investigate {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok"
+
+    # A spawn from review B (per-review count 0) is still refused by the window.
+    refused = await _post_spawn_task(
+        strategic_db,
+        review_b,
+        title="Investigate gamma",
+        prompt="do gamma",
+        expect_status=429,
+    )
+    assert refused["status"] == "skipped"
+    assert refused["scope"] == "window"
+
+    count = (
+        await strategic_db.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_semantic_duplicate_title_deduped(strategic_db):
+    """A near-duplicate spawn (same review/type, overlapping topic, different
+    wording) collapses to the existing task rather than creating a second one."""
+    from sqlalchemy import func as _f
+    from sqlmodel import select
+
+    project, review_id = await _make_strategic_review(strategic_db)
+
+    first = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Investigate warm pool provisioning ready signal",
+        prompt="look into it",
+    )
+    assert first["status"] == "ok"
+    assert not first.get("deduplicated")
+
+    # Differs only in wording — overlap {warm, pool, provisioning, ready, signal}
+    # = 5 >= threshold 4 → treated as the same logical investigation.
+    second = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Research warm pool provisioning ready signal timing",
+        prompt="look into it differently",
+    )
+    assert second.get("deduplicated") is True
+    assert second["task_id"] == first["task_id"]
+
+    count = (
+        await strategic_db.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 1
 
 
 # ── Direction Starvation Detection ───────────────────────────────────────────

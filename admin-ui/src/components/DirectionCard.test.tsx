@@ -27,6 +27,8 @@ function makeProps(direction: Direction, statusKey = 'active') {
     editPathTags: [],
     editPathInput: '',
     editCompletionCriteria: '',
+    editSuccessEvidence: '',
+    editRetirementCondition: '',
     setEditingId: vi.fn(),
     setEditText: vi.fn(),
     setEditPriority: vi.fn(),
@@ -35,6 +37,8 @@ function makeProps(direction: Direction, statusKey = 'active') {
     setEditPathTags: vi.fn(),
     setEditPathInput: vi.fn(),
     setEditCompletionCriteria: vi.fn(),
+    setEditSuccessEvidence: vi.fn(),
+    setEditRetirementCondition: vi.fn(),
     startEdit: vi.fn(),
     updateDirection: vi.fn(),
     approveProposal: vi.fn(),
@@ -228,6 +232,37 @@ describe('DirectionCard diagnosis/remediation section', () => {
     expect(textarea.value).toBe('Merged across backend/');
     fireEvent.change(textarea, { target: { value: 'All tests passing' } });
     expect(setEditCompletionCriteria).toHaveBeenCalledWith('All tests passing');
+  });
+
+  it('renders acceptance-evidence textareas in edit mode and propagates changes', () => {
+    const d = makeDirection();
+    const setEditSuccessEvidence = vi.fn();
+    const setEditRetirementCondition = vi.fn();
+    const props = {
+      ...makeProps(d),
+      editingId: d.id,
+      editText: d.text,
+      editSuccessEvidence: 'p99 < 200ms',
+      editRetirementCondition: 'one clean cycle',
+      setEditSuccessEvidence,
+      setEditRetirementCondition,
+    };
+    render(<DirectionCard {...props} />);
+    const success = screen.getByPlaceholderText('Success evidence...') as HTMLTextAreaElement;
+    const retirement = screen.getByPlaceholderText('Retirement condition...') as HTMLTextAreaElement;
+    expect(success.value).toBe('p99 < 200ms');
+    expect(retirement.value).toBe('one clean cycle');
+    fireEvent.change(success, { target: { value: 'latency under target' } });
+    expect(setEditSuccessEvidence).toHaveBeenCalledWith('latency under target');
+    fireEvent.change(retirement, { target: { value: 'promotion verified' } });
+    expect(setEditRetirementCondition).toHaveBeenCalledWith('promotion verified');
+  });
+
+  it('shows retirement_condition from context in view mode', () => {
+    const d = makeDirection({ context: { retirement_condition: 'Retire after one promotion cycle' } });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('Retirement condition:')).toBeInTheDocument();
+    expect(screen.getByText('Retire after one promotion cycle')).toBeInTheDocument();
   });
 
   it('renders no diagnosis section when all diagnosis fields are absent', () => {

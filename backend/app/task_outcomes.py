@@ -44,10 +44,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from app.ci_resolution import classify_merge_test_verdict
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
+from app.ci_resolution import (
+    acceptance_test_block,
+    acceptance_test_is_clear_failure,
+    classify_merge_test_verdict,
+)
 from app.direction_outcomes import _counts_as_failure
-from app.landed_signal import is_merged_completion
+from app.landed_signal import (
+    is_merged_completion,
+    merge_verification_status,
+    reproduce_verdict_status,
+)
 from app.models import Task
+from app.payload_schemas import parse_acceptance_evidence
 from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
 
 OutcomeStatus = Literal["success", "neutral", "failure"]
@@ -112,11 +125,45 @@ def _task_type(task: Task) -> str | None:
 def _evaluate_write(task: Task) -> TaskOutcome:
     """Outcome for a write/PR task type.
 
-    ``success`` iff the task is a merged completion, ``failure`` iff it counts
-    as a genuine failure for direction metrics, else ``neutral`` (e.g. a
-    COMPLETED task that opened no PR, or a BLOCKED holding state).
+    ``success`` iff the task is a verified (or benign-unverified) merged
+    completion whose defect claim — when it carries a reproduce-on-HEAD verdict —
+    actually ``reproduced``. ``failure`` iff it counts as a genuine failure for
+    direction metrics, else ``neutral``.
+
+    A merged PR always SHIPS code, but shipping is necessary, not sufficient, to
+    call a *fix* proven:
+
+    * A merge that fell open for a *degraded* reason (environment/setup failure
+      blocked real verification) is ``neutral`` — never verified on HEAD.
+    * A bug-report-/finding-derived task whose reproduce verdict is
+      ``already_resolved`` or ``indeterminate`` is ``neutral`` — the code shipped
+      (and still counts toward shipped/merge-rate metrics, which read
+      :func:`is_merged_completion`/``verified_merged_count``), but the defect was
+      never reproduced, so it must not inflate proven-fix success accounting.
+    * A COMPLETED task that opened no PR, or a BLOCKED holding state, is
+      ``neutral``.
+
+    Tasks with NO reproduce verdict (features/refactors, and any task that
+    predates the verdict) keep the prior merged-PR == success semantics exactly,
+    because :func:`reproduce_verdict_status` returns ``None`` for them.
     """
     if is_merged_completion(task):
+        vs = merge_verification_status(task)
+        if vs == "unverified_degraded":
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
+        if reproduce_verdict_status(task) in ("already_resolved", "indeterminate"):
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
+        # Code-task acceptance gate. A code task that DECLARED acceptance
+        # evidence carries a durable verdict (recorded at merge under
+        # ``code_acceptance_verdict``). When that evidence was declared but is
+        # NOT satisfied — the named test is absent, ran without real
+        # verification, exercised no changed seam, or a declared behavior/artifact
+        # shipped nothing — a bare merge does not prove the claimed behavior, so
+        # score neutral rather than success. Tasks with no recorded verdict
+        # (no declaration, legacy rows) are unaffected and keep merged-success.
+        ctx = _task_local_attr(task, "context") or {}
+        if acceptance_blocks_success(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)):
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
         return TaskOutcome("success", KIND_CODE_MERGE)
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_CODE_MERGE)
@@ -144,16 +191,33 @@ def _findings_list(plan_output: Any) -> list[dict]:
 
 
 def _evaluate_research(task: Task) -> TaskOutcome:
-    """Outcome for a research task — judged on actionable findings produced.
+    """Outcome for a research task — judged on findings that SURVIVED ingestion.
 
-    A research task stores its findings as a bare list on ``plan_output``, each
-    a dict carrying a ``title`` and an ``actionability_grade``. Producing at
-    least one titled finding is the honest success signal; producing none is a
-    terminal-but-empty ``neutral`` (no usable output). A FAILED/CANCELLED
-    research task is a ``failure``.
+    The honest success signal is whether at least one finding survived ingestion
+    validation (citations resolve on HEAD), deduplication, and actionability
+    gating and was routed to work — recorded by the completion handler as
+    ``context['research_surviving_findings']`` (spawned + capacity/health-deferred
+    findings). A cycle whose findings were ALL rejected as stale duplicates,
+    citations absent on HEAD, or low-actionability records ``0`` survivors and is
+    a terminal-but-empty ``neutral`` even though its raw ``plan_output`` still
+    holds every parsed finding for admin visibility.
+
+    When the survivor count is absent (a task whose dispatch predates this signal,
+    or that never reached dispatch) we fall back to the legacy heuristic: at least
+    one titled finding on ``plan_output``. A FAILED/CANCELLED research task is a
+    ``failure``.
     """
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_RESEARCH_QUALITY)
+    context = _task_local_attr(task, "context")
+    if isinstance(context, dict) and "research_surviving_findings" in context:
+        try:
+            survived = int(context.get("research_surviving_findings") or 0)
+        except (TypeError, ValueError):
+            survived = 0
+        if survived > 0:
+            return TaskOutcome("success", KIND_RESEARCH_QUALITY)
+        return TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
     plan_output = _task_local_attr(task, "plan_output")
     actionable = [f for f in _findings_list(plan_output) if f.get("title")]
     if actionable:
@@ -512,14 +576,31 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
         and not probe.get("could_not_run")
         and probe.get("passed") is False
     )
+    # A CLEAR declared-build failure (the operator's OWN build_cmd) blocks the
+    # merge regardless of suite detection — see classify_merge_test_verdict — so a
+    # green suite that also broke the declared build must NOT show a clean "pass".
+    declared_build_failed = probe_failed and isinstance(probe, dict) and probe.get("declared") is True
+    # A CLEAR declared-acceptance-test failure (a promised named test that was
+    # absent or skipped) blocks the merge regardless of suite detection — see
+    # classify_merge_test_verdict — so the summary must read "fail" even when a
+    # unit suite passed, never a clean "pass".
+    acceptance_block = acceptance_test_block(result)
+    acceptance_test_failed = acceptance_test_is_clear_failure(acceptance_block)
     if detected is False:
         # A clear acceptance-probe failure on a no-suite fall-open is a real,
         # merge-blocking verdict (the gate flips it to "fail"); reflect that here
         # so the operator summary matches the gate decision.
         verdict = "fail" if probe_failed else "undetected"
     elif passed:
-        verdict = "pass"
+        # The suite passed, but a declared-build probe that clearly failed blocks
+        # the gate — surface "fail" so the summary cannot read "pass" while the
+        # merge is blocked.
+        verdict = "fail" if declared_build_failed else "pass"
     elif detected is True:
+        verdict = "fail"
+    # A clear declared-acceptance-test failure overrides any non-fail verdict
+    # (it blocks at HIGH precedence regardless of suite detection / pass).
+    if acceptance_test_failed:
         verdict = "fail"
 
     if detected is not None:
@@ -536,6 +617,17 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
             _summary_item(
                 "Acceptance probe",
                 f"{ecosystem + ': ' if ecosystem else ''}{probe_state}",
+            )
+        )
+    if acceptance_block is not None:
+        name = str(
+            acceptance_block.get("selector") or acceptance_block.get("descriptor") or ""
+        ).strip()
+        status_text = str(acceptance_block.get("status") or "unknown").strip()
+        evidence.append(
+            _summary_item(
+                "Declared acceptance test",
+                f"{name + ': ' if name else ''}{status_text}",
             )
         )
     if isinstance(tests, list) and tests:
@@ -760,6 +852,59 @@ def _build_panel_review_summary(
     return _summary_dict(task, verdict, evidence, highlights)
 
 
+def _build_write_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    """Operator summary for a write/PR task — shipped state, merge verification,
+    and the reproduce-on-HEAD verdict for bug-report-/finding-derived work.
+
+    The verdict label distinguishes the scoring outcomes the operator
+    surfaces care about: ``verified_fix`` (merged AND the defect reproduced on
+    HEAD), ``shipped_unproven`` (merged, but the defect was already-resolved /
+    non-reproducing / indeterminate — code shipped, fix not proven),
+    ``shipped_unverified`` (merged via a degraded fall-open, never verified), and
+    a plain ``merged`` for shipped work that carries no defect claim. A
+    non-merged task that still recorded a verdict renders the verdict status
+    directly (an ``already_resolved`` no-op or an ``indeterminate``
+    investigation).
+
+    Returns ``None`` for a write task that neither shipped nor carries a verdict
+    (an in-flight or dropped no-PR write task) so the prior no-summary contract
+    for write types is preserved — this builder only ADDS a summary where there
+    is real signal.
+    """
+    merged = is_merged_completion(task)
+    rv_status = reproduce_verdict_status(task)
+    if not merged and rv_status is None:
+        return None
+
+    evidence: list[dict[str, str]] = []
+    highlights: list[dict[str, str]] = []
+    mvs = merge_verification_status(task) if merged else None
+    if merged:
+        evidence.append(_summary_item("Merge", "landed on integration"))
+        if mvs is not None:
+            evidence.append(_summary_item("Verification", mvs))
+    if rv_status is not None:
+        evidence.append(_summary_item("Reproduce verdict", rv_status))
+        raw_verdict = (task.context or {}).get("reproduce_verdict")
+        reason = raw_verdict.get("reason") if isinstance(raw_verdict, dict) else None
+        if reason:
+            highlights.append(_summary_item("Verdict reason", reason))
+
+    if merged and mvs == "unverified_degraded":
+        verdict = "shipped_unverified"
+    elif merged and rv_status == "reproduced":
+        verdict = "verified_fix"
+    elif merged and rv_status in ("already_resolved", "indeterminate"):
+        verdict = "shipped_unproven"
+    elif merged:
+        verdict = "merged"
+    else:
+        # Not merged but carries a verdict: an affirmative no-op or an
+        # indeterminate investigation. Surface the verdict status as the label.
+        verdict = rv_status or "neutral"
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
 def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
     """Shared builder for the structured-findings task types (security_audit,
     perf, release_audit, …) and the fallback for any unregistered type whose
@@ -848,6 +993,52 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
 }
 
 
+def _declared_acceptance_evidence(task: Task) -> dict | None:
+    """Read the optional plan-time acceptance-evidence declaration off a task.
+
+    Reads it from the task context (deferred-column-safe via
+    :func:`_task_local_attr`) and validates it through the shared helper, so an
+    absent or malformed declaration yields ``None`` and the summary is left
+    exactly as today.
+    """
+    context = _task_local_attr(task, "context") or {}
+    if not isinstance(context, dict):
+        return None
+    return parse_acceptance_evidence(context.get("acceptance_evidence"))
+
+
+def _apply_acceptance_evidence(
+    task: Task, summary: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Surface the declared acceptance evidence on *summary*, uniformly.
+
+    When a well-formed declaration is present, append a single
+    ``Acceptance evidence`` item so reviewers and the strategic layer can read
+    what proof was promised. Applied here (rather than per builder) so it covers
+    every implementation task type — including write types (create/fix/…) whose
+    builder returns ``None`` in the common no-findings case: for those we
+    synthesize a minimal ``declared``-verdict summary carrying only the promised
+    proof, rather than dropping it on the floor. When the declaration is absent
+    or malformed the summary is returned byte-for-byte unchanged (``None`` stays
+    ``None``).
+    """
+    declared = _declared_acceptance_evidence(task)
+    if declared is None:
+        return summary
+    item = _summary_item("Acceptance evidence", declared["descriptor"])
+    if summary is None:
+        return {
+            "status": _summary_status_label(task),
+            "verdict": "declared",
+            "evidence": [item],
+            "highlights": [],
+        }
+    evidence = summary.get("evidence")
+    if isinstance(evidence, list):
+        evidence.append(item)
+    return summary
+
+
 def build_task_evaluation_summary(
     task: Task,
     *,
@@ -865,5 +1056,12 @@ def build_task_evaluation_summary(
     """
     task_type = _task_type(task) or ""
     ctx = SummaryContext(merge_test_result=merge_test_result)
+    # Write/PR task types never carried a dedicated summary (they fell through to
+    # the findings fallback and returned None). Route them to the write-summary
+    # builder so a merged PR's verification + reproduce-on-HEAD verdict are
+    # surfaced — additive: in-flight / no-op write tasks still return None.
+    if task_type in WRITE_TASK_TYPES:
+        return _apply_acceptance_evidence(task, _build_write_summary(task, ctx))
     builder = SUMMARY_BUILDERS.get(task_type, _build_findings_summary)
-    return builder(task, ctx)
+    summary = builder(task, ctx)
+    return _apply_acceptance_evidence(task, summary)

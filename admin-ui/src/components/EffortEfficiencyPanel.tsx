@@ -1,0 +1,278 @@
+import { Fragment, type ReactNode } from 'react';
+import type {
+  EffortModelEfficiency,
+  EfficiencyBucket,
+  EfficiencyResolvedModel,
+  EffortEfficiencyRow,
+  ModelEfficiencyRow,
+} from '../types/digest';
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtRate(rate: number | null): string {
+  return rate != null ? `${Math.round(rate * 100)}%` : '—';
+}
+
+function rateColor(rate: number | null): string {
+  if (rate == null) return 'text-neutral-500';
+  if (rate >= 0.8) return 'text-emerald-400';
+  if (rate >= 0.5) return 'text-amber-400';
+  return 'text-red-400';
+}
+
+function cpmColor(cpm: number | null): string {
+  if (cpm == null) return 'text-neutral-500';
+  if (cpm <= 5) return 'text-emerald-400';
+  if (cpm <= 15) return 'text-amber-400';
+  return 'text-red-400';
+}
+
+function fmtCpm(cpm: number | null): string {
+  return cpm != null ? `$${cpm.toFixed(2)}` : '—';
+}
+
+/**
+ * Headline merge figures for a bucket. The verified-merge count/rate is the
+ * primary signal so degraded no-CI fall-open merges are not presented as
+ * genuine landings; the raw landed count is shown secondarily only when it
+ * diverges. Falls back to the raw landed figures when the backend predates the
+ * verified-merge rollup (verified_* absent), keeping older payloads readable.
+ */
+function mergeFigures(row: EfficiencyBucket): {
+  count: number;
+  rate: number | null;
+  raw: number;
+  rawDiffers: boolean;
+} {
+  const hasVerified = row.verified_landed_count != null;
+  return {
+    count: row.verified_landed_count ?? row.landed_count,
+    rate: hasVerified ? (row.verified_landed_rate ?? null) : row.landed_rate,
+    raw: row.landed_count,
+    rawDiffers: hasVerified && row.verified_landed_count !== row.landed_count,
+  };
+}
+
+/**
+ * Inline, expandable reveal of which ACTUAL models a requested effort tier ran
+ * on (requested-vs-actual divergence). Renders nothing when the tier carries no
+ * resolved-model breakdown (older backends / empty windows). Unpriced resolved
+ * models are flagged, and a tier that ran on more than one model — or any
+ * unpriced model — gets an amber summary so the divergence is obvious at a
+ * glance without expanding.
+ */
+function ResolvedModelsReveal({ models }: { models: EfficiencyResolvedModel[] }) {
+  if (models.length === 0) return null;
+  const diverged = models.length > 1 || models.some((m) => !m.priced);
+  return (
+    <details className="text-[10px] px-1 py-0.5">
+      <summary
+        className={`cursor-pointer select-none ${diverged ? 'text-amber-400/90' : 'text-neutral-500'} hover:text-neutral-300`}
+      >
+        Resolved models ({models.length})
+      </summary>
+      <ul className="mt-1 space-y-0.5 pl-3">
+        {models.map((m) => (
+          <li
+            key={`${m.provider}:${m.model}`}
+            className="flex justify-between gap-2 text-neutral-400"
+          >
+            <span className="break-all">
+              {m.model} · {m.provider}
+              {!m.priced && <span className="text-amber-400/80"> (unpriced)</span>}
+            </span>
+            <span className="tabular-nums whitespace-nowrap text-neutral-500">
+              {m.landed_count}/{m.run_count} landed
+            </span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+/**
+ * A single efficiency sub-table (effort tiers OR actual models). Shares the
+ * mobile-card / `sm:table` desktop idiom used by ProviderCostPanel and
+ * LlmCostBreakdownPanel so the operator dashboard stays compact on both.
+ */
+type SubTableRow = EfficiencyBucket & {
+  _key: string;
+  _label: string;
+  resolved_models?: EfficiencyResolvedModel[];
+};
+
+function EfficiencySubTable({
+  title,
+  caption,
+  rows,
+  label,
+  renderExpansion,
+}: {
+  title: string;
+  // Optional one-line help text shown beneath the title (e.g. clarifying what
+  // the tier label actually measures).
+  caption?: string;
+  rows: SubTableRow[];
+  label: string;
+  // Optional per-row reveal rendered beneath the row (e.g. a tier's resolved
+  // models). Returning null/undefined renders no expansion for that row.
+  renderExpansion?: (row: SubTableRow) => ReactNode;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div className="mb-3 last:mb-0">
+      <h3 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1 px-1">{title}</h3>
+      {caption && (
+        <p className="text-[9px] text-neutral-600 mb-1 px-1 normal-case tracking-normal">{caption}</p>
+      )}
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        {/* Mobile: stacked card layout */}
+        <div className="sm:hidden divide-y divide-neutral-800/30">
+          {rows.map((row) => {
+            const m = mergeFigures(row);
+            const expansion = renderExpansion?.(row);
+            return (
+              <div key={row._key} className="px-3 py-2 text-[10px]">
+                <div className="mb-1 font-medium text-neutral-200 break-words">{row._label}</div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
+                  <span>Runs: <span className="text-neutral-300 tabular-nums">{row.run_count}</span></span>
+                  <span>Landed: <span className={`tabular-nums ${rateColor(m.rate)}`}>{m.count}/{row.run_count} ({fmtRate(m.rate)})</span>{m.rawDiffers && <span className="text-neutral-600"> · raw {m.raw}</span>}</span>
+                  <span>Cost: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
+                  <span>$/Merge: <span className={`font-mono tabular-nums ${cpmColor(row.cost_per_merge)}`}>{fmtCpm(row.cost_per_merge)}</span></span>
+                  <span>Tokens: <span className="text-neutral-300 tabular-nums">{fmtTokens(row.input_tokens + row.output_tokens)}</span></span>
+                </div>
+                {expansion && <div className="mt-1">{expansion}</div>}
+              </div>
+            );
+          })}
+        </div>
+        {/* Desktop: table layout */}
+        <table className="hidden sm:table w-full text-xs">
+          <thead>
+            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+              <th className="text-left px-3 py-2 font-medium">{label}</th>
+              <th className="text-right px-3 py-2 font-medium">Runs</th>
+              <th className="text-right px-3 py-2 font-medium">Landed</th>
+              <th className="text-right px-3 py-2 font-medium">Cost</th>
+              <th className="text-right px-3 py-2 font-medium">$/Merge</th>
+              <th className="text-right px-3 py-2 font-medium">Tokens</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {rows.map((row) => {
+              const m = mergeFigures(row);
+              const expansion = renderExpansion?.(row);
+              return (
+                <Fragment key={row._key}>
+                  <tr>
+                    <td className="px-3 py-2 font-medium text-neutral-200">{row._label}</td>
+                    <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{row.run_count}</td>
+                    <td className={`text-right px-3 py-2 tabular-nums ${rateColor(m.rate)}`}>
+                      {m.count}/{row.run_count} <span className="text-[10px]">({fmtRate(m.rate)})</span>
+                      {m.rawDiffers && <span className="block text-[9px] text-neutral-600 leading-tight">raw {m.raw}</span>}
+                    </td>
+                    <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</td>
+                    <td className={`text-right px-3 py-2 font-mono tabular-nums ${cpmColor(row.cost_per_merge)}`}>{fmtCpm(row.cost_per_merge)}</td>
+                    <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{fmtTokens(row.input_tokens + row.output_tokens)}</td>
+                  </tr>
+                  {expansion && (
+                    <tr>
+                      <td colSpan={6} className="px-3 pb-2 pt-0">{expansion}</td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function effortRows(rows: EffortEfficiencyRow[]) {
+  return rows.map((r) => ({ ...r, _key: r.effort, _label: r.effort }));
+}
+
+function modelRows(rows: ModelEfficiencyRow[]) {
+  return rows.map((r) => ({
+    ...r,
+    _key: `${r.provider}:${r.model}`,
+    _label: r.priced ? `${r.model} · ${r.provider}` : `${r.model} · ${r.provider} (unpriced)`,
+  }));
+}
+
+/**
+ * Operator view of cost & landed/merge-rate attributable by EFFORT tier and by
+ * ACTUAL resolved model. Purely presentational — the rollup rides the digest
+ * payload already fetched by DashboardHome (no extra fetch). Renders nothing
+ * when the rollup is absent or carries no runs, so older backends and empty
+ * windows degrade gracefully.
+ *
+ * Caveats are surfaced explicitly: model-fallback/downgrade runs and unpriced
+ * pricing coverage gaps are shown in an amber banner so understated cost is
+ * visible instead of hidden.
+ */
+export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | null | undefined }) {
+  if (!data) return null;
+  const { by_effort, by_model, totals, unpriced_combos, fallbacks } = data;
+  if ((by_effort?.length ?? 0) === 0 && (by_model?.length ?? 0) === 0) return null;
+  if (totals.run_count === 0) return null;
+
+  const coverage = totals.unpriced_coverage_fraction;
+  const hasUnpricedGap = coverage != null && coverage < 1 && totals.unpriced_run_count > 0;
+  const hasFallbacks = (fallbacks?.total ?? 0) > 0;
+
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        Effort &amp; Model Efficiency
+      </h2>
+
+      {hasFallbacks && (
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+          <span className="font-semibold">{fallbacks.total} run{fallbacks.total === 1 ? '' : 's'} fell back / downgraded</span>
+          {' — '}the requested model differed from the model that actually ran, so per-tier cost reflects the cheaper resolved model.
+          {fallbacks.combos.length > 0 && (
+            <div className="mt-1 text-amber-400/80">
+              {fallbacks.combos.map((c, i) => (
+                <span key={i} className="font-mono mr-2">
+                  {c.requested}&rarr;{c.effective}{c.reason ? ` (${c.reason})` : ''}&times;{c.count}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {hasUnpricedGap && (
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+          <span className="font-semibold">Pricing coverage {fmtRate(coverage)}</span>
+          {' — '}{totals.unpriced_run_count} of {totals.priced_run_count + totals.unpriced_run_count} token-bearing runs have no pricing entry, so reported cost &amp; $/merge are understated.
+          {(unpriced_combos?.length ?? 0) > 0 && (
+            <div className="mt-1 text-amber-400/80">
+              Unpriced: <span className="font-mono">{unpriced_combos.join(', ')}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <EfficiencySubTable
+        title="By Effective Effort Tier"
+        caption="Effective routing effort the dispatcher resolved to select the model (payload → context → task-type → category), not just effort explicitly requested in the payload — so every task type is attributed to the tier that drove its cost."
+        label="Effort"
+        rows={effortRows(by_effort ?? [])}
+        renderExpansion={(row) => {
+          const models = row.resolved_models ?? [];
+          return models.length > 0 ? <ResolvedModelsReveal models={models} /> : null;
+        }}
+      />
+      <EfficiencySubTable title="By Actual Model" label="Provider / Model" rows={modelRows(by_model ?? [])} />
+    </section>
+  );
+}

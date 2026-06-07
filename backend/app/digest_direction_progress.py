@@ -12,8 +12,27 @@ from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.direction_outcomes import verified_merged_count
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
+
+# Task types that never open a PR. These are excluded from the
+# conversion_rate denominator so the metric means the same thing on every
+# surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
+PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
+
+
+def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
+    """Number of PR-ineligible tasks created in one research_history entry.
+
+    Sourced from the entry's ``type_breakdown`` so every consumer computes the
+    conversion-rate denominator (merged PRs / PR-eligible tasks) identically.
+    """
+    type_breakdown = entry.get("type_breakdown") or {}
+    return sum(
+        (type_breakdown.get(ttype) or {}).get("created", 0) or 0
+        for ttype in PR_INELIGIBLE_TASK_TYPES
+    )
 
 
 async def compute_direction_progress(
@@ -29,6 +48,7 @@ async def compute_direction_progress(
     Dict[str, Dict[str, Any]],
     Dict[str, str],
     bool,
+    Dict[str, Any],
 ]:
     """Per-direction progress aggregation for the catch-up digest.
 
@@ -65,6 +85,7 @@ async def compute_direction_progress(
     )
 
     direction_progress_list: List[Dict[str, Any]] = []
+    direction_portfolio_composition: List[Dict[str, Any]] = []
     dir_id_to_text: Dict[str, str] = {}
     scope_conversion_rates: Dict[str, Dict[str, Any]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, Any]] = {}
@@ -75,6 +96,8 @@ async def compute_direction_progress(
         for d in (project.directions or [])
         if d.get("status") in ("active", "held", "auto_paused")
     ]
+    active_count = len(active_directions)
+    self_sufficient_count = 0
 
     # Build direction_id -> text lookup
     for d in active_directions:
@@ -107,9 +130,14 @@ async def compute_direction_progress(
         tasks_created_in_window = sum(
             1 for t in tasks_for_dir if _to_naive_utc(t.created_at) >= window_start
         )
+        quiet_this_window = cycles_in_window == 0 and tasks_created_in_window == 0
 
         # Single pass over research_history: aggregate PR/scope/product/type/taxonomy
         prs_merged = 0
+        # Verification-aware merge count (verified + benign-unverified, excluding
+        # degraded-unverified) — drives conversion_rate so a merge that never
+        # actually verified does not inflate the operator-read rate.
+        verified_prs_merged = 0
         autonomous_prs_merged = 0
         assisted_prs_merged = 0
         operator_action_count = 0
@@ -117,6 +145,7 @@ async def compute_direction_progress(
         generalized_successes = 0
         generalized_terminal_outcomes = 0
         findings_tasks_created = 0
+        pr_ineligible_tasks_created = 0
         merge_time_values: List[float] = []
         dir_scope_agg: Dict[str, Dict[str, Any]] = {}
         prev_dir_scope_agg: Dict[str, Dict[str, Any]] = {}
@@ -147,6 +176,7 @@ async def compute_direction_progress(
                 continue
             if entry_ts >= window_start:
                 prs_merged += entry.get("prs_merged") or 0
+                verified_prs_merged += verified_merged_count(entry)
                 # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
                 autonomous_prs_merged += (
                     entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
@@ -167,6 +197,9 @@ async def compute_direction_progress(
                 dir_reviews_overridden += entry.get("reviews_overridden") or 0
                 dir_user_issues_caught += entry.get("user_issues_caught") or 0
                 findings_tasks_created += entry.get("tasks_created") or 0
+                # Count tasks of types that never open PRs (research, investigate, audit, memo)
+                # to calculate PR-eligible denominator for conversion_rate
+                pr_ineligible_tasks_created += pr_ineligible_created_in_entry(entry)
                 dir_findings_produced += entry.get("findings_produced") or 0
                 dir_batch_cap_applied += entry.get("batch_cap_applied") or 0
                 for _fk, _fv in (entry.get("filter_breakdown") or {}).items():
@@ -292,9 +325,6 @@ async def compute_direction_progress(
                     ):
                         agg[k] += stats.get(k, 0)
 
-        if cycles_in_window == 0 and tasks_created_in_window == 0:
-            continue
-
         last_entry = (
             (d.get("research_history") or [])[-1] if d.get("research_history") else None
         )
@@ -377,6 +407,12 @@ async def compute_direction_progress(
         lifetime_prs_merged = sum(h.get("prs_merged", 0) for h in _history_all) + (
             _agg.get("total_prs_merged") or 0
         )
+        # Verification-aware lifetime merge count for lifetime_conversion_rate:
+        # window entries via verified_merged_count, aggregate via the folded
+        # total_verified_prs_merged (legacy fallback to total_prs_merged).
+        lifetime_verified_prs_merged = sum(
+            verified_merged_count(h) for h in _history_all
+        ) + (_agg.get("total_verified_prs_merged", _agg.get("total_prs_merged")) or 0)
         lifetime_prs_rejected = sum(h.get("prs_rejected", 0) for h in _history_all) + (
             _agg.get("total_prs_rejected") or 0
         )
@@ -387,7 +423,7 @@ async def compute_direction_progress(
             _agg.get("total_tasks_failed") or 0
         )
         lifetime_conversion_rate = (
-            round(lifetime_prs_merged / lifetime_tasks_created, 3)
+            round(lifetime_verified_prs_merged / lifetime_tasks_created, 3)
             if lifetime_tasks_created > 0
             else None
         )
@@ -402,8 +438,20 @@ async def compute_direction_progress(
             lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
         )
         evicted_findings_count = len(_agg.get("evicted_findings") or [])
-
         direction_text = (d.get("text") or d.get("description") or "")[:80]
+
+        direction_portfolio_composition.append(
+            {
+                "direction_id": did,
+                "direction_text": direction_text,
+                "status": d.get("status"),
+                "priority": d.get("priority") or "medium",
+                "quiet_this_window": quiet_this_window,
+            }
+        )
+        if retirement_eligible:
+            self_sufficient_count += 1
+
         total_prs = prs_merged + prs_rejected
         acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
         avg_time_to_merge_hours = (
@@ -411,9 +459,13 @@ async def compute_direction_progress(
             if merge_time_values
             else None
         )
+        # Conversion rate: verified merges / PR-eligible tasks (exclude non-PR
+        # task types). Verification-aware so degraded-unverified merges don't
+        # inflate it, matching the per-task outcome layer.
+        pr_eligible_tasks = findings_tasks_created - pr_ineligible_tasks_created
         conversion_rate = (
-            round(prs_merged / findings_tasks_created, 3)
-            if findings_tasks_created > 0
+            round(verified_prs_merged / pr_eligible_tasks, 3)
+            if pr_eligible_tasks > 0
             else None
         )
         generalized_health_rate = (
@@ -569,89 +621,92 @@ async def compute_direction_progress(
                     )
                 )
 
-        direction_progress_list.append(
-            {
-                "direction_id": did,
-                "direction_text": direction_text,
-                "priority": d.get("priority") or "medium",
-                "cost_budget_usd": cost_budget_usd,
-                "budget_utilization_pct": budget_utilization_pct,
-                "budget_exceeded": budget_exceeded,
-                "cycles_in_window": cycles_in_window,
-                "tasks_created": tasks_created_in_window,
-                "prs_merged": prs_merged,
-                "autonomous_prs_merged": autonomous_prs_merged,
-                "assisted_prs_merged": assisted_prs_merged,
-                "operator_action_count": operator_action_count,
-                "prs_rejected": prs_rejected,
-                "generalized_successes": generalized_successes,
-                "generalized_terminal_outcomes": generalized_terminal_outcomes,
-                "generalized_health_rate": generalized_health_rate,
-                "outcome_kind_breakdown": dir_outcome_kind_breakdown or None,
-                "acceptance_rate": acceptance_rate,
-                "conversion_rate": conversion_rate,
-                "avg_time_to_merge_hours": avg_time_to_merge_hours,
-                "possibly_saturated": bool(d.get("possibly_saturated", False)),
-                "possibly_complete": bool(d.get("possibly_complete", False)),
-                "auto_paused": bool(d.get("auto_paused", False)),
-                "paused_reason": d.get("paused_reason"),
-                "needs_manual_intervention": bool(
-                    d.get("needs_manual_intervention", False)
-                ),
-                "completion_criteria": d.get("completion_criteria"),
-                "completion_suggestion": d.get("completion_suggestion"),
-                "category": d.get("category"),
-                "status": d.get("status"),
-                "added_at": d.get("added_at"),
-                "latest_insights": latest_insights,
-                "recent_finding_titles": recent_finding_titles,
-                "latest_research_at": latest_research_at,
-                "product_ratio": dir_product_ratio,
-                "type_distribution": agg_type_distribution or None,
-                "type_breakdown": agg_type_breakdown or None,
-                "estimated_cost_usd": round(dir_cost, 2),
-                "spot_cost_usd": round(dir_spot_cost, 2),
-                "on_demand_cost_usd": round(dir_on_demand_cost, 2),
-                "cost_by_scope": cost_by_scope or None,
-                "cost_by_status": cost_by_status or None,
-                "cost_by_type": cost_by_type or None,
-                "cost_by_provider_model": cost_by_provider_model or None,
-                "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4)
-                if autonomous_prs_merged > 0
-                else None,
-                "scope_breakdown": dir_scope_agg or None,
-                "taxonomy_summary": dir_taxonomy_summary or None,
-                "stage_dropout": dir_stage_dropout or None,
-                "recent_failure_titles": recent_failed_titles[-3:] or None,
-                "filter_funnel": filter_funnel,
-                "decomposition_summary": decomposition_summary,
-                "first_attempt_success_rate": dir_fa_rate,
-                "first_attempt_sample_size": dir_fa_sample_size,
-                "quality_score": round(_compute_direction_quality_score(d), 3),
-                "lifetime_cycles": lifetime_cycles,
-                "lifetime_prs_merged": lifetime_prs_merged,
-                "lifetime_prs_rejected": lifetime_prs_rejected,
-                "lifetime_tasks_failed": lifetime_tasks_failed,
-                "lifetime_conversion_rate": lifetime_conversion_rate,
-                "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
-                "lifetime_operator_actions": lifetime_operator_actions,
-                "lifetime_generalized_successes": lifetime_generalized_state[
-                    "generalized_successes"
-                ],
-                "lifetime_generalized_health_rate": lifetime_generalized_state[
-                    "generalized_health_rate"
-                ],
-                "retirement_eligible": retirement_eligible,
-                "evicted_findings_count": evicted_findings_count,
-                "review_quality": {
-                    "reviews_dismissed": dir_reviews_dismissed,
-                    "reviews_overridden": dir_reviews_overridden,
-                    "user_issues_caught": dir_user_issues_caught,
-                },
-                "rejection_reasons": rejection_reasons or None,
-                "prompt_quality_hint": prompt_quality_hint,
-            }
-        )
+        if not quiet_this_window:
+            direction_progress_list.append(
+                {
+                    "direction_id": did,
+                    "direction_text": direction_text,
+                    "priority": d.get("priority") or "medium",
+                    "cost_budget_usd": cost_budget_usd,
+                    "budget_utilization_pct": budget_utilization_pct,
+                    "budget_exceeded": budget_exceeded,
+                    "cycles_in_window": cycles_in_window,
+                    "tasks_created": tasks_created_in_window,
+                    "prs_merged": prs_merged,
+                    "verified_prs_merged": verified_prs_merged,
+                    "autonomous_prs_merged": autonomous_prs_merged,
+                    "assisted_prs_merged": assisted_prs_merged,
+                    "operator_action_count": operator_action_count,
+                    "prs_rejected": prs_rejected,
+                    "generalized_successes": generalized_successes,
+                    "generalized_terminal_outcomes": generalized_terminal_outcomes,
+                    "generalized_health_rate": generalized_health_rate,
+                    "outcome_kind_breakdown": dir_outcome_kind_breakdown or None,
+                    "acceptance_rate": acceptance_rate,
+                    "conversion_rate": conversion_rate,
+                    "pr_eligible_tasks_created": pr_eligible_tasks,
+                    "avg_time_to_merge_hours": avg_time_to_merge_hours,
+                    "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                    "possibly_complete": bool(d.get("possibly_complete", False)),
+                    "auto_paused": bool(d.get("auto_paused", False)),
+                    "paused_reason": d.get("paused_reason"),
+                    "needs_manual_intervention": bool(
+                        d.get("needs_manual_intervention", False)
+                    ),
+                    "completion_criteria": d.get("completion_criteria"),
+                    "completion_suggestion": d.get("completion_suggestion"),
+                    "category": d.get("category"),
+                    "status": d.get("status"),
+                    "added_at": d.get("added_at"),
+                    "latest_insights": latest_insights,
+                    "recent_finding_titles": recent_finding_titles,
+                    "latest_research_at": latest_research_at,
+                    "product_ratio": dir_product_ratio,
+                    "type_distribution": agg_type_distribution or None,
+                    "type_breakdown": agg_type_breakdown or None,
+                    "estimated_cost_usd": round(dir_cost, 2),
+                    "spot_cost_usd": round(dir_spot_cost, 2),
+                    "on_demand_cost_usd": round(dir_on_demand_cost, 2),
+                    "cost_by_scope": cost_by_scope or None,
+                    "cost_by_status": cost_by_status or None,
+                    "cost_by_type": cost_by_type or None,
+                    "cost_by_provider_model": cost_by_provider_model or None,
+                    "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4)
+                    if autonomous_prs_merged > 0
+                    else None,
+                    "scope_breakdown": dir_scope_agg or None,
+                    "taxonomy_summary": dir_taxonomy_summary or None,
+                    "stage_dropout": dir_stage_dropout or None,
+                    "recent_failure_titles": recent_failed_titles[-3:] or None,
+                    "filter_funnel": filter_funnel,
+                    "decomposition_summary": decomposition_summary,
+                    "first_attempt_success_rate": dir_fa_rate,
+                    "first_attempt_sample_size": dir_fa_sample_size,
+                    "quality_score": round(_compute_direction_quality_score(d), 3),
+                    "lifetime_cycles": lifetime_cycles,
+                    "lifetime_prs_merged": lifetime_prs_merged,
+                    "lifetime_prs_rejected": lifetime_prs_rejected,
+                    "lifetime_tasks_failed": lifetime_tasks_failed,
+                    "lifetime_conversion_rate": lifetime_conversion_rate,
+                    "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
+                    "lifetime_operator_actions": lifetime_operator_actions,
+                    "lifetime_generalized_successes": lifetime_generalized_state[
+                        "generalized_successes"
+                    ],
+                    "lifetime_generalized_health_rate": lifetime_generalized_state[
+                        "generalized_health_rate"
+                    ],
+                    "retirement_eligible": retirement_eligible,
+                    "evicted_findings_count": evicted_findings_count,
+                    "review_quality": {
+                        "reviews_dismissed": dir_reviews_dismissed,
+                        "reviews_overridden": dir_reviews_overridden,
+                        "user_issues_caught": dir_user_issues_caught,
+                    },
+                    "rejection_reasons": rejection_reasons or None,
+                    "prompt_quality_hint": prompt_quality_hint,
+                }
+            )
 
     direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
 
@@ -674,4 +729,9 @@ async def compute_direction_progress(
         prev_scope_conversion_rates,
         dir_id_to_text,
         budget_alert_fired,
+        {
+            "active_count": active_count,
+            "self_sufficient_count": self_sufficient_count,
+            "composition": direction_portfolio_composition,
+        },
     )

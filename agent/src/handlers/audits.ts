@@ -12,9 +12,37 @@ import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
   PARALLEL_AUDIT_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
+import {
+  writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
+} from './strategic-helpers.js';
 import { resolveBuildConfig } from '../build-config.js';
+
+// Read the read-only mid-run helper guidance for an audit handler. project_id is
+// set for all task types by the backend; when it is absent we provision NOTHING
+// and advertise nothing, so a prompt never promises a helper that wasn't written.
+// Returns the ./fetch guidance block (or '' when project_id is missing); the
+// design-doc advertisement is appended to each prompt unconditionally because
+// writeDesignDocHelper is provisioned alongside it whenever project_id is present.
+function provisionAuditFetchHelpers(
+  taskId: string, task: Record<string, unknown>,
+): string {
+  const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (!projectId) return '';
+  writeFetchHelper(taskId, projectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  return buildFetchGuidance(PLAN_FETCH_VERBS);
+}
+
+// Advertise the read-only ./design-doc CLI in an audit prompt. Gated on the same
+// project_id as the helper write so we never advertise an unwritten helper.
+function designDocAdvertisement(task: Record<string, unknown>): string {
+  const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  return projectId
+    ? '\n\nRead full design-doc section prose on demand with `./design-doc get <key>` (list keys with `./design-doc list`).'
+    : '';
+}
 
 /** Returns true when the project has opted into parallel audit fan-out. */
 export function isParallelAuditEnabled(task: Record<string, unknown>): boolean {
@@ -79,6 +107,7 @@ export async function handleSecurityAudit(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const secFetchGuidance = provisionAuditFetchHelpers(taskId, task);
   const disallowedTools = configureAgentPermissions('security_audit');
 
   const contextPrefix = buildContextPrefix(task);
@@ -131,7 +160,7 @@ Rules:
 - Limit to 20 findings maximum, prioritized by severity
 - For findings without a specific line number, use 0
 - IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
-- Also output the same JSON array as the final output in your logs.`;
+- Also output the same JSON array as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const secBuildConfig = resolveBuildConfig(task);
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -142,7 +171,7 @@ Rules:
   setCurrentPromptFingerprint(secFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
   const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -184,6 +213,7 @@ export async function handleSelfAudit(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const selfAuditFetchGuidance = provisionAuditFetchHelpers(taskId, task);
   const disallowedTools = configureAgentPermissions('self_audit');
 
   const contextPrefix = buildContextPrefix(task);
@@ -272,7 +302,7 @@ Rules:
 - Limit findings to ${maxSystems} systems unless focus_systems was provided (then use all focus_systems)
 - Each finding must cite at least one evidence file from the actual repo
 - IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
-- Also output the same JSON object as the final output in your logs.`;
+- Also output the same JSON object as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const buildConfig = resolveBuildConfig(task);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -283,7 +313,7 @@ Rules:
   setCurrentPromptFingerprint(selfAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
   const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
@@ -499,6 +529,7 @@ export async function handleReleaseAudit(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const releaseAuditFetchGuidance = provisionAuditFetchHelpers(taskId, task);
   const disallowedTools = configureAgentPermissions('release_audit');
 
   const contextPrefix = buildContextPrefix(task);
@@ -564,7 +595,7 @@ Rules:
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
 - IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
-- Do NOT modify any files in the repository.`;
+- Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
   const buildConfig = resolveBuildConfig(task);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -576,7 +607,7 @@ Rules:
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
   const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
 

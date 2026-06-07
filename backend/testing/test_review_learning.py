@@ -2253,13 +2253,13 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tests for resolve_sr_miss_human_truth — three-tier precedence
+# Tests for reviewer_confirmed_categories — canonical precedence
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_resolve_sr_miss_human_truth_prefers_all_iterations():
-    """_all_iterations_rejection_categories wins over review_history and first-attempt."""
-    from app.playbook_learning import resolve_sr_miss_human_truth
+def test_reviewer_confirmed_categories_prefers_all_iterations():
+    """_all_iterations_rejection_categories wins over first-attempt and review history."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
 
     ctx = {
         "_all_iterations_rejection_categories": {"architecture": 1, "correctness": 2},
@@ -2275,16 +2275,31 @@ def test_resolve_sr_miss_human_truth_prefers_all_iterations():
             ]
         },
     }
-    result = resolve_sr_miss_human_truth(ctx)
+    result = reviewer_confirmed_categories(ctx)
     assert result == {"architecture", "correctness"}
 
 
-def test_resolve_sr_miss_human_truth_falls_back_to_review_history():
-    """When _all_iterations absent, keyword-categorised review_history is used."""
-    from app.playbook_learning import resolve_sr_miss_human_truth
+def test_reviewer_confirmed_categories_excludes_other_from_all_iterations():
+    """Persisted ``other`` must not leak into canonical SR ground truth."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
 
     ctx = {
-        "_first_attempt_rejection_categories": {"correctness": 1},
+        "_all_iterations_rejection_categories": {
+            "architecture": 1,
+            "other": 3,
+            "correctness": 2,
+        },
+        "_first_attempt_rejection_categories": {"other": 1},
+    }
+
+    assert reviewer_confirmed_categories(ctx) == {"architecture", "correctness"}
+
+
+def test_reviewer_confirmed_categories_ignores_review_history_only():
+    """Review-history-only data is not canonical truth."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
+
+    ctx = {
         "review_loop": {
             "review_history": [
                 {
@@ -2299,25 +2314,37 @@ def test_resolve_sr_miss_human_truth_falls_back_to_review_history():
             ]
         },
     }
-    result = resolve_sr_miss_human_truth(ctx)
-    assert "regression_risk" in result
+    assert reviewer_confirmed_categories(ctx) == set()
 
 
-def test_resolve_sr_miss_human_truth_falls_back_to_first_attempt():
-    """When neither _all_iterations nor review_history exist, uses first-attempt."""
-    from app.playbook_learning import resolve_sr_miss_human_truth
+def test_reviewer_confirmed_categories_falls_back_to_first_attempt():
+    """When _all_iterations is absent, first-attempt categories are used."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
 
     ctx = {
         "_first_attempt_rejection_categories": {"security": 1, "performance": 1},
     }
-    result = resolve_sr_miss_human_truth(ctx)
+    result = reviewer_confirmed_categories(ctx)
     assert result == {"security", "performance"}
 
 
-def test_resolve_sr_miss_human_truth_empty_ctx():
-    """Returns empty set when no human-truth sources are present."""
-    from app.playbook_learning import resolve_sr_miss_human_truth
+def test_reviewer_confirmed_categories_excludes_other_from_first_attempt_fallback():
+    """First-attempt fallback keeps the same author-emittable category filter."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
 
-    assert resolve_sr_miss_human_truth({}) == set()
+    ctx = {
+        "_first_attempt_rejection_categories": {
+            "security": 1,
+            "other": 2,
+            "performance": 1,
+        },
+    }
+
+    assert reviewer_confirmed_categories(ctx) == {"security", "performance"}
 
 
+def test_reviewer_confirmed_categories_empty_ctx():
+    """Returns empty set when no reviewer-confirmed sources are present."""
+    from app.sr_blind_spots import reviewer_confirmed_categories
+
+    assert reviewer_confirmed_categories({}) == set()

@@ -613,9 +613,9 @@ describe('DashboardHome', () => {
 
       render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-      const pill = await screen.findByTitle(/Cost per merged PR exceeds threshold/);
+      const pill = await screen.findByTitle(/Cost per autonomous merge exceeds threshold/);
       expect(pill).toBeInTheDocument();
-      expect(pill.textContent).toContain('$12.75/PR');
+      expect(pill.textContent).toContain('$12.75/autonomous');
       expect(pill.title).toContain('project median: $3.50');
     });
 
@@ -637,8 +637,8 @@ describe('DashboardHome', () => {
 
       render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-      await screen.findByText(/\$2\.10\/PR/);
-      expect(screen.queryByTitle(/Cost per merged PR exceeds threshold/)).not.toBeInTheDocument();
+      await screen.findByText(/\$2\.10\/autonomous/);
+      expect(screen.queryByTitle(/Cost per autonomous merge exceeds threshold/)).not.toBeInTheDocument();
     });
   });
 
@@ -1261,6 +1261,43 @@ describe('DashboardHome', () => {
 
       // total_operator_actions is undefined → null, so operatorActions === 0 is false → not self-sufficient
       expect(await screen.findByText('Self-sufficient: 0 / 1')).toBeInTheDocument();
+    });
+
+    it('prefers the authoritative direction_portfolio counts when present', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1',
+              direction_text: 'Dir A',
+              priority: 'high',
+              cycles_in_window: 1,
+              tasks_created: 2,
+              prs_merged: 12,
+              possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0, total_operator_actions: 0 },
+            },
+          ],
+          direction_portfolio: {
+            active_count: 3,
+            self_sufficient_count: 2,
+            composition: [
+              { direction_id: 'd1', direction_text: 'Dir A', status: 'active', priority: 'high', quiet_this_window: false },
+              { direction_id: 'd2', direction_text: 'Dir B', status: 'held', priority: 'low', quiet_this_window: true },
+              { direction_id: 'd3', direction_text: 'Dir C', status: 'auto_paused', priority: 'medium', quiet_this_window: true },
+            ],
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 2 / 3')).toBeInTheDocument();
+      expect(screen.getByText('3 directions')).toBeInTheDocument();
+      expect(screen.getByText('2 quiet this window')).toBeInTheDocument();
     });
   });
 
@@ -2284,5 +2321,88 @@ describe('DashboardHome', () => {
     await user.click(backendPill);
     expect(screen.queryByText('backend example 1')).not.toBeInTheDocument();
     expect(screen.getByText('frontend example 1')).toBeInTheDocument();
+  });
+
+  describe('EffortEfficiencyPanel mount', () => {
+    const efficiencyDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+      effort_model_efficiency: {
+        by_effort: [
+          {
+            effort: 'high',
+            run_count: 5,
+            landed_count: 2,
+            landed_rate: 0.4,
+            total_cost_usd: 30,
+            cost_per_merge: 15,
+            input_tokens: 1000,
+            output_tokens: 500,
+            llm_call_count: 12,
+            priced_run_count: 5,
+            unpriced_run_count: 0,
+            unpriced_coverage_fraction: 1,
+            resolved_models: [],
+          },
+        ],
+        by_model: [
+          {
+            provider: 'anthropic',
+            model: 'claude-opus-4-8',
+            priced: true,
+            run_count: 5,
+            landed_count: 2,
+            landed_rate: 0.4,
+            total_cost_usd: 30,
+            cost_per_merge: 15,
+            input_tokens: 1000,
+            output_tokens: 500,
+            llm_call_count: 12,
+            priced_run_count: 5,
+            unpriced_run_count: 0,
+            unpriced_coverage_fraction: 1,
+          },
+        ],
+        totals: {
+          run_count: 5,
+          landed_count: 2,
+          landed_rate: 0.4,
+          total_cost_usd: 30,
+          cost_per_merge: 15,
+          input_tokens: 1000,
+          output_tokens: 500,
+          llm_call_count: 12,
+          priced_run_count: 5,
+          unpriced_run_count: 0,
+          unpriced_coverage_fraction: 1,
+        },
+        unpriced_combos: [],
+        fallbacks: { total: 0, combos: [] },
+      },
+    };
+
+    it('renders the panel when the digest carries the effort/model rollup', async () => {
+      setupApiMocks({ digest: efficiencyDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Effort & Model Efficiency')).toBeInTheDocument();
+    });
+
+    it('omits the panel when the digest has no effort/model rollup', async () => {
+      setupApiMocks({
+        digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByText('Effort & Model Efficiency')).not.toBeInTheDocument();
+    });
   });
 });

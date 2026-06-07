@@ -12,6 +12,7 @@ import {
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass, sensitivePathsFromMetadata } from './standard.js';
+import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
@@ -21,7 +22,7 @@ import {
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, formatAcceptanceEvidence, type PlaybookEntry,
 } from '../prompt.js';
 import {
   formatProjectVision,
@@ -57,7 +58,7 @@ export type { AnnotatedIssue, AnnotatedEntry } from './review-fix-issue-dedup.js
 import type { DriftSignal } from './review-fix-history.js';
 import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
 export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
-import { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
@@ -513,7 +514,20 @@ export async function handleReview(
   const taskTypeFocusHint = origTaskType === 'qa' ? REVIEW_QA_FOCUS_HINT
     : origTaskType === 'migrate' ? REVIEW_MIGRATE_FOCUS_HINT
     : '';
-  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
+
+  // Surface the project vision and strategic intent so reviewers judge changes
+  // against the direction's goals, not just local correctness.
+  const reviewProjectVision = formatProjectVision(
+    task.vision as Record<string, unknown> | undefined,
+  );
+  const reviewStrategicIntent = formatStrategicIntent(
+    task.strategic_intent as Record<string, unknown> | undefined,
+  );
+  const reviewStrategicFraming = [reviewProjectVision, reviewStrategicIntent]
+    .filter(Boolean)
+    .join('\n');
+
+  const reviewPrompt = `${reviewStrategicFraming}${reviewStrategicFraming ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 ${iterationPreamble}
 ${rollupGuidance}
@@ -535,7 +549,13 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   const parallelReviewFlag = reviewProjectMeta?.enable_parallel_review === true;
   const parallelReviewInjected = parallelReviewFlag && shouldFanOutReview(changedFilePathList, reviewBuildConfig);
   const parallelReviewBlock = parallelReviewInjected ? `\n\n${PARALLEL_REVIEW_GUIDANCE}` : '';
-  const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  // Read-only ./fetch (direction, section, playbook) so the reviewer can resolve
+  // by-reference ids and trimmed launch snapshots mid-run. Gate provisioning and
+  // guidance on project_id so we never advertise a helper we did not write.
+  const reviewProjectId = (reviewProjectMeta?.project_id as string | undefined) ?? '';
+  if (reviewProjectId) writeFetchHelper(taskId, reviewProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const reviewFetchGuidance = reviewProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
+  const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const promptFingerprint = computeReviewPromptFingerprint(reviewBuildConfig, {
     branch,
     baseBranch,
@@ -758,10 +778,33 @@ export async function handleFix(
     basePrompt = `${fixSelfReviewSection}${basePrompt}`;
   }
 
+  // Stale-premise/provenance notice for finding-derived fix tasks. Renders the
+  // SAME provenance block as the standard handler — complementary to (not a
+  // replacement for) the merge-conflict-vs-CI stale-premise notice computed
+  // later; if both apply, both render. Prepended early so the agent
+  // reproduces-first before trusting a possibly-stale finding. Empty when no
+  // provenance warnings fired.
+  const fixProvenanceNotice = formatProvenanceWarnings(taskContext);
+  if (fixProvenanceNotice) {
+    basePrompt = `${fixProvenanceNotice}${basePrompt}`;
+  }
+
+  const fixAcceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
+  if (fixAcceptanceEvidenceNotice) {
+    basePrompt = `${fixAcceptanceEvidenceNotice}${basePrompt}`;
+  }
+
   // Parallel fix fan-out gating: per-project flag AND helper-threshold both
   // required. Inject PARALLEL_FIX_GUIDANCE near DEFAULT_TOOL_GUIDANCE so the
   // fingerprint is stable and telemetry can A/B by fingerprint.
   const fixProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
+  // Read-only ./fetch (direction, section, playbook) so the fix agent can
+  // resolve by-reference ids and trimmed launch snapshots mid-run. Gate
+  // provisioning and guidance on project_id so we never advertise a helper we
+  // did not write.
+  const fixProjectId = (fixProjectMetaEarly?.project_id as string | undefined) ?? '';
+  if (fixProjectId) writeFetchHelper(taskId, fixProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const fixFetchGuidance = fixProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const parallelFixFlag = fixProjectMetaEarly?.enable_parallel_fix === true;
   const latestIssuesForFanOut = reviewHistory[reviewHistory.length - 1]?.issues ?? [];
   const reviewIssueFilesForFanOut = latestIssuesForFanOut
@@ -819,6 +862,7 @@ export async function handleFix(
       const guidance = buildMigrationConflictGuidance(
         migrationConflict, versionsDir,
         migrationLayout.schemaRevisionFile, migrationLayout.schemaRevisionConst,
+        extractReservedMigrationRevision(task),
       );
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
       sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);
@@ -1028,7 +1072,7 @@ export async function handleFix(
     }
   }
   const parallelFixBlock = parallelFixInjected ? `\n\n${PARALLEL_FIX_GUIDANCE}` : '';
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${buildCodeChangeHelperGuidance({ buildConfig: fixBuildConfig, owner, repo })}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${buildCodeChangeHelperGuidance({ buildConfig: fixBuildConfig, owner, repo })}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${fixFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),

@@ -3,6 +3,18 @@ import { useState, useCallback } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
 
+type CitationState = 'absent' | 'present' | 'indeterminate';
+
+interface ProvenanceWarnings {
+  citation_state?: CitationState;
+  broken_refs?: string[];
+  ungrounded_refs?: string[];
+}
+
+type ProjectMessageContext = Record<string, unknown> & {
+  _provenance_warnings?: ProvenanceWarnings;
+};
+
 function CopyableMessageRef({ msgId }: { msgId: string }) {
   const [copied, setCopied] = useState(false);
   const shortRef = msgId.slice(0, 8);
@@ -31,7 +43,7 @@ export interface ProjectMessage {
   from_type: string;
   from_task_id: string | null;
   content: string;
-  context: Record<string, unknown>;
+  context: ProjectMessageContext;
   status: string;
   resolution: string | null;
   resolved_at: string | null;
@@ -74,6 +86,76 @@ export function formatFromType(msg: ProjectMessage): string {
 // eslint-disable-next-line react-refresh/only-export-components
 export function isUserMessage(msg: ProjectMessage): boolean {
   return (msg.from_type || '').toLowerCase() === 'user';
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0) : [];
+}
+
+function getProvenanceWarnings(context: ProjectMessageContext): ProvenanceWarnings | null {
+  const raw = context._provenance_warnings;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const citationState = raw.citation_state;
+  return {
+    citation_state: citationState === 'absent' || citationState === 'present' || citationState === 'indeterminate' ? citationState : undefined,
+    broken_refs: asStringArray(raw.broken_refs),
+    ungrounded_refs: asStringArray(raw.ungrounded_refs),
+  };
+}
+
+// Per-state presentation for the citation provenance badge. Each state mirrors the
+// reproduce-on-HEAD tri-state semantics from classify_reproduction:
+//   absent        → nothing cited survives on HEAD (fully stale)
+//   present       → at least one citation survives but some refs are broken/ungrounded (partially grounded)
+//   indeterminate → no validation backend could verify the citations (unverifiable)
+const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: string; labelText: string; refText: string }> = {
+  absent: {
+    label: 'cited code missing on HEAD',
+    container: 'border-amber-500/30 bg-amber-500/10',
+    labelText: 'text-amber-300',
+    refText: 'text-amber-100/80',
+  },
+  present: {
+    label: 'some cited code missing on HEAD',
+    container: 'border-amber-500/20 bg-amber-500/5',
+    labelText: 'text-amber-200',
+    refText: 'text-amber-100/70',
+  },
+  indeterminate: {
+    label: 'citations could not be verified',
+    container: 'border-neutral-500/30 bg-neutral-500/10',
+    labelText: 'text-neutral-300',
+    refText: 'text-neutral-200/80',
+  },
+};
+
+function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
+  if (msg.message_type !== 'BUG_REPORT' && msg.message_type !== 'BLOCKER') return null;
+  const warnings = getProvenanceWarnings(msg.context);
+  const state = warnings?.citation_state;
+  if (!state) return null;
+
+  const refs = [...new Set([...(warnings.broken_refs ?? []), ...(warnings.ungrounded_refs ?? [])])];
+  const refSummary = refs.length > 0 ? refs.join(', ') : null;
+
+  // A partially grounded report only warrants a badge when there is something
+  // broken/ungrounded to inspect; a clean 'present' state stays quiet.
+  if (state === 'present' && !refSummary) return null;
+
+  const cfg = CITATION_BADGE_CONFIG[state];
+  return (
+    <div className={`mt-2 inline-flex max-w-full flex-col gap-1 rounded-xl border px-2.5 py-2 ${cfg.container}`}>
+      <span className={`inline-flex items-center gap-1 text-[11px] font-semibold ${cfg.labelText}`}>
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        {cfg.label}
+      </span>
+      {refSummary && (
+        <span className={`text-[11px] leading-relaxed break-words ${cfg.refText}`}>
+          {refSummary}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function ContextBadges({ context, fromType }: { context: Record<string, unknown>; fromType: string }) {
@@ -173,6 +255,7 @@ export function MessageBubble({
   const Icon = config.icon;
   const userMsg = isUserMessage(msg);
   const isResolving = resolvingId === msg.id;
+  const taskId = msg.from_task_id;
 
   let replyContextMsg: ProjectMessage | null = null;
   if (msg.message_type === 'NOTE' &&
@@ -195,13 +278,13 @@ export function MessageBubble({
             <span className={`text-[11px] font-semibold ${config.color}`}>{config.label}</span>
             <span className="text-[11px] text-neutral-600">
               {formatFromType(msg)}
-              {msg.from_task_id && onOpenTask && (
+              {taskId && onOpenTask && (
                 <button
-                  onClick={() => onOpenTask(msg.from_task_id!)}
+                  onClick={() => onOpenTask(taskId)}
                   className="text-blue-400 hover:text-blue-300 transition-colors ml-1"
-                  title={`Open task ${msg.from_task_id}`}
+                  title={`Open task ${taskId}`}
                 >
-                  ({msg.from_task_id.slice(0, 8)})
+                  ({taskId.slice(0, 8)})
                 </button>
               )}
               <span> · {formatAge(msg.created_at)}</span>
@@ -224,6 +307,7 @@ export function MessageBubble({
           )}
           {/* Content */}
           <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+          <StaleCitationBadge msg={msg} />
           {/* Context badges */}
           <ContextBadges context={msg.context} fromType={msg.from_type} />
         </div>

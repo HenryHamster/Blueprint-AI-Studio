@@ -13,6 +13,7 @@ from app.sr_blind_spots import (
     compute_persistent_sr_blind_spot_hint,
     count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
+    has_reviewer_confirmed_categories,
     is_disallowed_blind_spot,
     stamp_sr_blind_spot_computed_at,
     stamp_sr_catch_rate_computed_at,
@@ -1165,3 +1166,30 @@ def test_stamp_sr_catch_rate_computed_at_no_data_sufficient_omits_fields():
     assert trends["signal_last_computed_at"] == fixed.isoformat()
     assert "data_sufficient" not in trends
     assert "last_sufficient_computed_at" not in trends
+
+
+def test_has_reviewer_confirmed_categories_all_iterations_only():
+    """All-iterations set present (later-iteration confirmation), first-attempt
+    absent → in-sample."""
+    ctx = {"_all_iterations_rejection_categories": {"correctness": 1}}
+    assert has_reviewer_confirmed_categories(ctx) is True
+
+
+def test_has_reviewer_confirmed_categories_first_attempt_only():
+    """First-attempt set present, all-iterations absent → in-sample."""
+    ctx = {"_first_attempt_rejection_categories": {"correctness": 1}}
+    assert has_reviewer_confirmed_categories(ctx) is True
+
+
+def test_has_reviewer_confirmed_categories_neither():
+    """Neither reviewer-confirmed field present (or both empty) → out-of-sample."""
+    assert has_reviewer_confirmed_categories({}) is False
+    assert (
+        has_reviewer_confirmed_categories(
+            {
+                "_all_iterations_rejection_categories": {},
+                "_first_attempt_rejection_categories": {},
+            }
+        )
+        is False
+    )

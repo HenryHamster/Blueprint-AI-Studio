@@ -241,6 +241,34 @@ async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
     )
 
 
+async def acquire_direction_research_spawn_lock(
+    session: AsyncSession,
+    project_id,
+    direction_id: str | None,
+) -> None:
+    """Serialize same-direction research spawns across sessions/processes.
+
+    Research uses a per-direction idempotency claim to close the general
+    duplicate-spawn race, but the deliberate pipelining exception still needs a
+    separate serializer: the pipelined task claims ``...:pipelined`` while a
+    later primary/manual spawn claims ``...``. Without a shared lock around the
+    read-decide-insert window, those different keys can coexist when the later
+    caller's pre-insert scan misses the just-committed pipelined task.
+
+    A transaction-scoped advisory lock keyed by ``project_id`` + ``direction``
+    makes that window structurally serial for both the autonomous loop and the
+    manual ``POST /directions/{id}/research`` endpoint. Non-Postgres dialects
+    no-op; SQLite tests rely on single-process scheduling and explicit
+    regression fixtures for coverage.
+    """
+    if resolve_dialect_name(session) != "postgresql":
+        return
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"research-direction-spawn:{project_id}:{direction_id or 'cross-cutting'}"},
+    )
+
+
 @asynccontextmanager
 async def project_lock(
     session: AsyncSession,

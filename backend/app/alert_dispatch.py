@@ -23,6 +23,10 @@ from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.ci_resolution import (
+    BENIGN_UNVERIFIED_REASONS,
+    DEGRADED_UNVERIFIED_REASONS,
+)
 from app.models import (
     Project,
     Task,  # used in the "Task" string annotation on _maybe_create_failure_alert
@@ -318,6 +322,46 @@ async def _maybe_create_failure_alert(
         logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 
+_SPEND_HOLD_ALERT_TITLE = "Spend/budget approval hold awaiting operator"
+
+
+async def _maybe_create_spend_hold_alert(
+    task: "Task",
+    session: AsyncSession,
+    message: str,
+) -> None:
+    """Create a non-failure WARNING alert when a spend/budget approval hold opens.
+
+    Distinct from ``_maybe_create_failure_alert`` (ERROR / failure semantics): a
+    deliberate spend/budget hold is NOT a failure, so it carries WARNING severity
+    and never records a failed task result. Deduplicates on (task, stable title)
+    so repeated recovery-sweep passes don't create a second row for the same hold.
+    Mirrors the INFO/WARNING alert pattern (e.g. circuit-breaker) — the caller
+    commits the session; this only stages the row and broadcasts ``alert_created``.
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title == _SPEND_HOLD_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_SPEND_HOLD_ALERT_TITLE,
+        message=message,
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
 # Human-readable labels for the no-CI UNVERIFIED-merge reasons. The orchestrator
 # writes the reason KEY into review_loop["unverified_merge_reason"] at the two
 # UNVERIFIED decision sites, so keep these keys stable. The reason is NOT part of
@@ -357,24 +401,27 @@ _UNVERIFIED_REASON_LABELS = {
         "no unit suite ran; a command the PR introduced/documented was "
         "executed and passed"
     ),
+    "documented_command_no_artifact": (
+        "a build command the PR introduced/documented exited cleanly but "
+        "produced no artifact (possible no-op build) -- claim unverified"
+    ),
+    "acceptance_test_not_run": (
+        "the PR declared a named acceptance test but the gate could not confirm "
+        "it ran (no targetable suite/environment failure) -- claim unverified"
+    ),
 }
 
-# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/setup
-# failures escalate to ERROR, benign fall-open reasons stay WARNING.
+# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/
+# setup failures escalate to ERROR, benign fall-open reasons stay WARNING.
+#
+# DERIVED — not hand-listed — from the single source of truth in
+# ``app.ci_resolution`` (``DEGRADED_UNVERIFIED_REASONS`` / ``BENIGN_UNVERIFIED_REASONS``)
+# so the benign-vs-degraded partition lives in exactly one place and the
+# AlertSeverity mapping cannot drift from the success-scoring classifier. The
+# resulting dict is byte-for-byte identical to the former literal.
 _UNVERIFIED_REASON_SEVERITY = {
-    # ERROR (degraded): environment/setup failure prevented verification that was expected
-    "verify_setup_failed": AlertSeverity.ERROR,
-    "undetected_runtime": AlertSeverity.ERROR,
-    "suite_all_skipped": AlertSeverity.ERROR,
-    "probe_could_not_run": AlertSeverity.ERROR,
-    "probe_no_artifact": AlertSeverity.ERROR,
-    "documented_command_could_not_run": AlertSeverity.ERROR,
-    # WARNING (benign): no verification expected or only positive signals obtained
-    "no_detectable_test_command": AlertSeverity.WARNING,
-    "kill_switch_off": AlertSeverity.WARNING,
-    "internal_staging_base": AlertSeverity.WARNING,
-    "probe_passed": AlertSeverity.WARNING,
-    "documented_command_passed": AlertSeverity.WARNING,
+    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},
+    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},
 }
 
 
@@ -386,6 +433,111 @@ def _severity_for_unverified_reason(reason: str) -> AlertSeverity:
     to WARNING for unknown reasons to preserve backward compatibility.
     """
     return _UNVERIFIED_REASON_SEVERITY.get(reason, AlertSeverity.WARNING)
+
+
+# Stable title for the fleet-wide merge-gate degradation alert. Kept CONSTANT
+# (the drifting rate/reason live in the message) so a degradation that persists
+# across reaper ticks dedups to exactly ONE alert per project.
+_MERGE_GATE_DEGRADATION_ALERT_TITLE = (
+    "Fleet merge-gate verification degraded — PRs landing UNVERIFIED"
+)
+
+
+async def _maybe_create_merge_gate_degradation_alerts(
+    session: AsyncSession,
+    *,
+    verification_rate: "float | None",
+    verified_count: int,
+    fell_open_count: int,
+    degraded_project_count: int,
+    project_count: int,
+    most_common_reason: "str | None",
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> int:
+    """Broadcast a deduplicated fleet-wide alert when the no-CI merge gate's
+    verification rate has degraded — i.e. 'done' PRs are increasingly landing
+    without their tests actually being exercised.
+
+    Every other fleet-level health signal (rollbacks, halts, warm-pool payoff,
+    stale staged directions, single unverified merges) raises a proactive alert;
+    this closes that gap for systemic claim-verification erosion. Computed from
+    the already-aggregated :func:`digest_metrics.compute_merge_gate_fleet_health`.
+
+    Mirrors the fleet-broadcast convention of :func:`_create_rollback_alerts`:
+    creates one alert per project (so it surfaces in every operator's Alerts
+    banner) and deduplicates on a STABLE title so a degradation that persists
+    across reaper ticks raises exactly ONE alert per project. The drifting
+    numbers (rate, degraded-project count, dominant fall-open reason) live in the
+    MESSAGE so a moving metric never defeats dedup. Caller owns the commit.
+
+    Returns the number of NEW alerts created across the fleet.
+    """
+    reason_label = (
+        _UNVERIFIED_REASON_LABELS.get(most_common_reason, most_common_reason)
+        if most_common_reason
+        else "no dominant reason recorded"
+    )
+    rate_pct = (
+        f"{verification_rate * 100:.0f}%" if verification_rate is not None else "n/a"
+    )
+    title = _MERGE_GATE_DEGRADATION_ALERT_TITLE
+    msg = (
+        f"Fleet-wide no-CI merge-gate verification has degraded: {verified_count} "
+        f"of {verified_count + fell_open_count} recent merges actually ran tests "
+        f"({rate_pct} verified), and {degraded_project_count} of {project_count} "
+        f"projects are degraded. Dominant fall-open reason: {reason_label}. "
+        f"'Done' PRs are increasingly merging without their claims being exercised."
+    )[:1000]
+
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_maybe_create_merge_gate_degradation_alerts: project_ids capped at %d",
+            global_limit,
+        )
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    created = 0
+    for pid in project_ids:
+        if pid in projects_with_alert:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=severity,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        created += 1
+        await broadcast_to_project(
+            str(pid),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": severity.value,
+                "title": alert.title,
+            },
+        )
+    return created
 
 
 async def _maybe_create_unverified_merge_alert(
@@ -640,6 +792,81 @@ async def _maybe_create_pool_payoff_alert(
         f"(current {_fmt_metric(supporting.get('cost_incl_idle_current'))} vs "
         f"baseline {_fmt_metric(supporting.get('cost_baseline'))}). "
         f"{recommended_action}"
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
+# Stable per-project title for the unpriced-LLM-models coverage alert. The
+# drifting numbers (unpriced share, affected combos) live in the MESSAGE so a
+# degradation that persists across snapshot ticks dedups to exactly ONE alert
+# per project. Keep the prefix stable.
+_UNPRICED_MODELS_ALERT_TITLE_PREFIX = "LLM spend on unpriced models"
+
+
+async def _maybe_create_unpriced_models_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    unpriced_combos: list,
+    unpriced_task_count: int,
+    attributed_task_count: int,
+    unpriced_share: float,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a meaningful share of a
+    project's recent LLM-bearing tasks ran on (provider, model) combinations
+    that have NO entry in the cost-analytics pricing table.
+
+    Unpriced tasks contribute ``0.0`` to the headline cost economics
+    (cost-per-merge, total spend), so spend silently leaks into a zero-cost
+    bucket until someone adds a price entry. The only place an operator could
+    previously notice this was the LLM cost-breakdown panel's pricing-coverage
+    caveat — there was no proactive signal. This mirrors the warm-pool payoff
+    alert: it names the unpriced combinations and the affected coverage so the
+    operator learns a price entry is missing without polling the panel.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` on a STABLE
+    title — so a coverage gap that persists across many snapshot ticks raises
+    exactly ONE alert per project. The drifting numbers (share, combos) live in
+    the message so a moving metric never defeats dedup. Caller owns the
+    transition-edge gating; this helper only enforces title-level dedup and
+    commits its own ``Alert`` row.
+    """
+    title = f"{_UNPRICED_MODELS_ALERT_TITLE_PREFIX} on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    combos_label = ", ".join(unpriced_combos) if unpriced_combos else "(none recorded)"
+    message = (
+        f"{unpriced_task_count} of {attributed_task_count} recently attributed "
+        f"LLM-bearing tasks ({unpriced_share * 100:.0f}%) ran on (provider, "
+        f"model) combinations with no entry in the cost pricing table, so their "
+        f"spend is counted as $0 and understates cost-per-merge and total spend. "
+        f"Unpriced combinations: {combos_label}. Add a price entry for these "
+        f"models to LLM_TOKEN_PRICING to restore accurate cost analytics."
     )[:1000]
     alert = Alert(
         project_id=project_id,

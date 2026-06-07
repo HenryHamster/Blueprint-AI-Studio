@@ -9,6 +9,7 @@ from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.direction_outcomes import verified_merged_count
 from app.failure_classification import (
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
@@ -24,6 +25,11 @@ _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
     "total_prs_merged": 0,
+    # Verification-aware lifetime merge count: total_prs_merged minus merges
+    # whose verification was degraded (blocked by an environment/setup failure).
+    # _compute_lifetime_burn_metrics reads this so a degraded merge does not
+    # suppress lifetime non-merge burn even after its cycle is evicted.
+    "total_verified_prs_merged": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
     "total_tasks_failed_infra": 0,
@@ -318,6 +324,11 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_cycles"] += 1
         agg["total_tasks_created"] += ev.get("tasks_created", 0)
         agg["total_prs_merged"] += ev.get("prs_merged", 0)
+        # Legacy fallback: pre-verification entries have no verified_prs_merged;
+        # treat all merges as verified so lifetime burn is unchanged for old data.
+        agg["total_verified_prs_merged"] += ev.get(
+            "verified_prs_merged", ev.get("prs_merged", 0)
+        )
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
         agg["total_tasks_failed_infra"] += ev.get("tasks_failed_infra", 0)
@@ -433,8 +444,11 @@ def _compute_difficulty_index(d: dict) -> float:
     total_tasks = sum(e.get("tasks_created", 0) for e in history) + (
         agg.get("total_tasks_created") or 0
     )
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Tasks-per-merge counts VERIFIED merges: a degraded/unverified merge did not
+    # actually ship, so it must not make a direction look easier than it is.
+    # Legacy fallback handled by verified_merged_count / the aggregate .get chain.
+    total_merged = sum(verified_merged_count(e) for e in history) + (
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
     )
     if total_merged <= 0:
         return 1.0
@@ -452,8 +466,12 @@ def _compute_productivity_score(d: dict) -> float:
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Both the lifetime and recent merge totals count VERIFIED merges only: a
+    # degraded/unverified merge never actually shipped and must not inflate a
+    # direction's productivity. Legacy fallback handled by verified_merged_count /
+    # the aggregate .get chain.
+    total_merged = sum(verified_merged_count(e) for e in history) + (
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
     )
     total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (
         agg.get("total_prs_rejected") or 0
@@ -467,7 +485,7 @@ def _compute_productivity_score(d: dict) -> float:
     recent = history[-3:]
     if not recent:
         return lifetime_rate
-    recent_merged = sum(e.get("prs_merged", 0) for e in recent)
+    recent_merged = sum(verified_merged_count(e) for e in recent)
     recent_rejected = sum(e.get("prs_rejected", 0) for e in recent)
     recent_rate = (recent_merged - 0.5 * recent_rejected) / len(recent)
     return (recent_rate * 3 + lifetime_rate) / 4

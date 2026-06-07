@@ -6,7 +6,6 @@ related quality signals. Imported and re-exported by digest_metrics so
 existing call sites keep working without changes.
 """
 
-import statistics
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -14,7 +13,9 @@ from app.models import Task
 from app.review_learning import _categorize_review_issues
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
+    has_reviewer_confirmed_categories,
     is_skipped_sr_outcome,
+    reviewer_confirmed_categories,
 )
 from app.time_utils import _to_naive_utc
 
@@ -144,6 +145,8 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     by_type: Dict[str, Dict[str, int]] = {}
     for t in code_change_tasks:
         ttype = (t.first_payload or {}).get("type")
+        if not isinstance(ttype, str):
+            continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
         is_skip = _is_skipped_sr_outcome(sro)
@@ -193,6 +196,8 @@ def _compute_sr_disallowed_blind_spot_rate(
     by_type: Dict[str, Dict[str, int]] = {}
     for t in code_change_tasks:
         ttype = (t.first_payload or {}).get("type")
+        if not isinstance(ttype, str):
+            continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome") or {}
         has_violation = (sro.get("_filtered_blind_spots_count") or 0) > 0
@@ -226,7 +231,7 @@ def _compute_fresh_reviewer_effectiveness(
     terminal_tasks: List[Task],
 ) -> "Dict[str, Any]":
     """Compute fresh-reviewer pass effectiveness: approval rate lift and per-category
-    hit rate (did human confirm what fresh-reviewer flagged?). Always returns a dict
+    hit rate (did reviewer-LLM confirm what fresh-reviewer flagged?). Always returns a dict
     so callers can check sample_size before trusting rates.
     """
     code_change_tasks = [
@@ -261,7 +266,7 @@ def _compute_fresh_reviewer_effectiveness(
     tasks_with_both = [
         t
         for t in tasks_with_reviewer
-        if "_first_attempt_rejection_categories" in (t.context or {})
+        if has_reviewer_confirmed_categories(t.context or {})
     ]
     cat_flagged: Dict[str, int] = {}
     cat_confirmed: Dict[str, int] = {}
@@ -269,7 +274,7 @@ def _compute_fresh_reviewer_effectiveness(
     for t in tasks_with_both:
         ctx = t.context or {}
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
         agent_failed = _author_sr_failed_categories(check_results)
         for finding in findings:
@@ -277,9 +282,9 @@ def _compute_fresh_reviewer_effectiveness(
             if not cat:
                 continue
             cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
-            if cat in human_cats:
+            if cat in reviewer_confirmed_cats:
                 cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
-            if cat not in agent_failed and cat in human_cats:
+            if cat not in agent_failed and cat in reviewer_confirmed_cats:
                 cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
 
     return {
@@ -495,8 +500,17 @@ def _compute_edges_considered_metrics(
 def compute_sr_prediction_accuracy(
     tasks_with_both: List[Task],
 ) -> "Dict[str, Any] | None":
-    """Compute self-review prediction accuracy from tasks that have both
-    _self_review_outcome.check_results and _first_attempt_rejection_categories.
+    """Compute self-review prediction accuracy from the sampled task set.
+
+    The sample is tasks that have both ``_self_review_outcome.check_results``
+    AND reviewer-confirmed categories on *any* review iteration (the
+    :func:`has_reviewer_confirmed_categories` predicate — i.e.
+    ``_all_iterations_rejection_categories`` non-empty, falling back to
+    ``_first_attempt_rejection_categories``). Including later-iteration-only
+    confirmations keeps the sampled set aligned with the reviewer-confirmed
+    truth the scorer reads via :func:`reviewer_confirmed_categories`; a task
+    first approved then rejected on a later iteration is in-sample, not
+    dropped.
     Returns None when sample size < 5.
     """
     if len(tasks_with_both) < 5:
@@ -508,16 +522,20 @@ def compute_sr_prediction_accuracy(
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        # All-iterations reviewer-confirmed truth set (falls back to the
+        # first-attempt set only when absent) — shared with the sibling FP
+        # surfaces so a later-iteration confirmation is not scored as a false
+        # alarm and all "false alarm" figures reconcile.
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         sr_failed = _author_sr_failed_categories(check_results)
-        total_human += len(human_cats)
-        total_overlap += len(human_cats & sr_failed)
-        total_missed += len(human_cats - sr_failed)
-        total_false += len(sr_failed - human_cats)
+        total_human += len(reviewer_confirmed_cats)
+        total_overlap += len(reviewer_confirmed_cats & sr_failed)
+        total_missed += len(reviewer_confirmed_cats - sr_failed)
+        total_false += len(sr_failed - reviewer_confirmed_cats)
         total_sr_failed += len(sr_failed)
-        if human_cats:
+        if reviewer_confirmed_cats:
             tasks_with_rejections += 1
-            if human_cats & sr_failed:
+            if reviewer_confirmed_cats & sr_failed:
                 self_flagged_task_count += 1
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: Dict[str, int] = {}
@@ -535,7 +553,7 @@ def compute_sr_prediction_accuracy(
                 cat_weights[cat] = max(
                     _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
                 )
-        for cat in human_cats:
+        for cat in reviewer_confirmed_cats:
             w = cat_weights.get(cat, 1)
             if cat in sr_failed:
                 w_caught += w
@@ -560,65 +578,6 @@ def compute_sr_prediction_accuracy(
         )
         if tasks_with_rejections > 0
         else None,
-    }
-
-
-def _compute_parallel_review_effectiveness(
-    terminal_tasks: List[Task],
-) -> Dict[str, Any] | None:
-    """Compare approval rates between parallelized and serial review tasks.
-
-    Buckets review tasks by review_was_parallelized from task.context and
-    returns per-bucket metrics. Returns None when either bucket has <3 tasks.
-    """
-    review_tasks = [
-        t
-        for t in terminal_tasks
-        if (t.first_payload or {}).get("type") == "review"
-        and (t.context or {}).get("blueprint_review_verdict") is not None
-    ]
-
-    parallel = [
-        t for t in review_tasks if (t.context or {}).get("review_was_parallelized")
-    ]
-    serial = [
-        t for t in review_tasks if not (t.context or {}).get("review_was_parallelized")
-    ]
-
-    if len(parallel) < 3 or len(serial) < 3:
-        return None
-
-    def _approval_rate(tasks):
-        approvals = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
-        )
-        return round(approvals / len(tasks), 2)
-
-    def _mean_issues(tasks):
-        # issues_count is not always stored; use 0 when absent
-        counts = [(t.context or {}).get("issues_count", 0) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    def _mean_iterations(tasks):
-        counts = [(t.context or {}).get("iteration_count", 1) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    return {
-        "parallel": {
-            "count": len(parallel),
-            "approval_rate": _approval_rate(parallel),
-            "mean_issues_per_iteration": _mean_issues(parallel),
-            "mean_iterations": _mean_iterations(parallel),
-        },
-        "serial": {
-            "count": len(serial),
-            "approval_rate": _approval_rate(serial),
-            "mean_issues_per_iteration": _mean_issues(serial),
-            "mean_iterations": _mean_iterations(serial),
-        },
-        "sample_sizes": {"parallel": len(parallel), "serial": len(serial)},
     }
 
 
@@ -703,14 +662,13 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         t
         for t in terminal_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-        and "_first_attempt_rejection_categories" in (t.context or {})
+        and has_reviewer_confirmed_categories(t.context or {})
     ]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
     fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
     edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
-    parallel_review_effectiveness = _compute_parallel_review_effectiveness(
-        terminal_tasks
-    )
+    # Retired: parallel_review_effectiveness measured review-task parallelization,
+    # but had no consumer and two placeholder subfields never had real inputs.
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
@@ -718,5 +676,4 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         "review_accuracy": review_accuracy,
         "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
         "edges_considered_metrics": edges_considered_metrics,
-        "parallel_review_effectiveness": parallel_review_effectiveness,
     }

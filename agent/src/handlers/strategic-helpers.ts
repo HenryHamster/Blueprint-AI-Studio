@@ -78,30 +78,128 @@ echo ""
 `;
 }
 
-function generateFetchScript(projectIdRaw: string): string {
+// The full read-only fetch vocabulary. Each verb maps to a GET endpoint under
+// /api/agent/projects/{project_id}/... — all share the standard agent auth and
+// are callable by any of the project's agent tokens, so the helper works for
+// every task type, not just strategic-cycle agents.
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge';
+
+// Canonical order of the full vocabulary. STRATEGIC provisions all of these.
+// `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
+// distinct from the single-id project-path verbs that precede it; it is appended
+// last so the historical path-verb ordering is otherwise preserved.
+export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge',
+];
+
+// Read-only verb subsets for non-strategic agents. Research resolves directions,
+// the problem-model, and gaps it was handed by reference; plan resolves
+// directions, design-doc sections, and playbook entries for architectural
+// grounding; design-doc curation resolves directions, design-doc sections,
+// playbook entries, gaps, and operator messages for architecture review.
+// All subsets are strictly read-only (every verb is a GET).
+export const RESEARCH_FETCH_VERBS: FetchVerb[] = ['direction', 'problem-model', 'gap', 'knowledge'];
+export const PLAN_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'knowledge'];
+export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'gap', 'message', 'knowledge'];
+
+// Exact case-statement body for each PATH-SUFFIX verb. The spacing is preserved
+// verbatim so the path-verb arms stay byte-identical to the original. `knowledge`
+// is intentionally absent here — it is SEARCH-shaped (its own base URL, optional
+// query filters, no project path) and gets a self-contained arm below.
+const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
+  'problem-model': 'problem-model) PATH_SUFFIX="problem-model"',
+  'direction':     'direction)  PATH_SUFFIX="directions/$ID"',
+  'playbook':      'playbook)   PATH_SUFFIX="playbook/$ID"',
+  'gap':           'gap)        PATH_SUFFIX="gaps/$ID"',
+  'message':       'message)    PATH_SUFFIX="messages/$ID"',
+  'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
+};
+
+// Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
+// path-suffix verbs it hits the token-scoped /api/agent/knowledge-documents
+// endpoint directly (project resolved from the token, not the URL): a bare
+// positional id pulls one document's full body, otherwise optional
+// --topic/--direction/--q/--source-kind/--tag flags become URL-encoded query
+// params on the list/search endpoint. It does its own curl and exits, so it
+// never falls through to the project-path fetch below.
+const KNOWLEDGE_FETCH_CASE = `  knowledge)
+    shift
+    if [ -n "\${1:-}" ] && [ "\${1#--}" = "$1" ]; then
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 \\
+        -X GET "$API/api/agent/knowledge-documents/$1" \\
+        -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
+    else
+      QARGS=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --topic)       QARGS+=(--data-urlencode "topic=\${2:-}"); shift 2 ;;
+          --direction)   QARGS+=(--data-urlencode "direction=\${2:-}"); shift 2 ;;
+          --source-kind) QARGS+=(--data-urlencode "source_kind=\${2:-}"); shift 2 ;;
+          --q)           QARGS+=(--data-urlencode "q=\${2:-}"); shift 2 ;;
+          --tag)         QARGS+=(--data-urlencode "tag=\${2:-}"); shift 2 ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--tag or a document id)" >&2; exit 1 ;;
+        esac
+      done
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \\
+        "\${QARGS[@]}" "$API/api/agent/knowledge-documents" \\
+        -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
+    fi
+    kcode=$(printf '%s' "$kresp" | tail -n1)
+    kbody=$(printf '%s' "$kresp" | head -n -1)
+    if [ "$kcode" -ge 200 ] && [ "$kcode" -lt 300 ]; then printf '%s' "$kbody"; echo ""; exit 0; fi
+    printf '%s' "$kbody" >&2
+    echo "[ERROR] fetch knowledge failed (HTTP $kcode)" >&2
+    exit 1
+    ;;`;
+
+// One-line description of what each verb resolves, for the prompt guidance block.
+const FETCH_VERB_HELP: Record<FetchVerb, string> = {
+  'problem-model': '`./fetch problem-model` — the full current problem model (no id)',
+  'direction':     '`./fetch direction <id>` — full detail for a direction',
+  'playbook':      '`./fetch playbook <key>` — a full playbook entry',
+  'gap':           '`./fetch gap <id>` — a full gap record',
+  'message':       '`./fetch message <ref>` — an operator message (short ref or UUID)',
+  'section':       '`./fetch section <key>` — a full design-doc section',
+  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
+};
+
+function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
   const projectId = shellEscapeDoubleQuoted(projectIdRaw);
+  // Partition the full vocabulary against the granted subset in canonical order
+  // so output is deterministic regardless of the order verbs are passed in.
+  const granted = STRATEGIC_FETCH_VERBS.filter(v => verbs.includes(v));
+  const rejected = STRATEGIC_FETCH_VERBS.filter(v => !verbs.includes(v));
+  const verbList = granted.join('|');
+  const caseBody = [
+    ...granted.map(v => v === 'knowledge'
+      ? KNOWLEDGE_FETCH_CASE
+      : `  ${FETCH_VERB_CASE[v]} ;;`),
+    // Verbs in the full vocabulary that are NOT granted here get an explicit
+    // "not permitted in this workspace" reject (mirrors writeDesignDocHelper's
+    // read-only reject) rather than a generic "unknown kind". For the full set
+    // this list is empty, so the strategic script stays byte-identical.
+    ...(rejected.length > 0
+      ? [`  ${rejected.join('|')}) echo "Error: ./fetch '$KIND' is not permitted in this workspace (allowed: ${verbList})." >&2; exit 1 ;;`]
+      : []),
+    `  *) echo "Unknown kind: $KIND (use ${verbList})" >&2; exit 1 ;;`,
+  ].join('\n');
   return `#!/bin/bash
-# Strategic-context fetch tool — pull detail for items the packer trimmed.
-# Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.
-KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap|message|section [id]}"
+# Read-only context fetch tool — pull full detail for items shipped trimmed,
+# summarized, or only by reference. Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from
+# env. project_id is baked in. All endpoints are GET (strictly read-only).
+KIND="\${1:?Usage: fetch ${verbList} [id]}"
 ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
-[ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
+[ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
 # problem-model takes no id; everything else requires one. For "message" the
 # id may be a short ref (first 8+ hex chars of the message UUID — the same ref
 # operators see in the admin UI) or a full UUID; the backend resolves it and
 # fails loudly on ambiguous/missing refs.
 case "$KIND" in
-  problem-model) PATH_SUFFIX="problem-model" ;;
-  direction)  PATH_SUFFIX="directions/$ID" ;;
-  playbook)   PATH_SUFFIX="playbook/$ID" ;;
-  gap)        PATH_SUFFIX="gaps/$ID" ;;
-  message)    PATH_SUFFIX="messages/$ID" ;;
-  section)    PATH_SUFFIX="design-doc/$ID" ;;
-  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap|message|section)" >&2; exit 1 ;;
+${caseBody}
 esac
 
 if [ "$KIND" != "problem-model" ] && [ -z "$ID" ]; then
@@ -144,12 +242,45 @@ exit 1
 `;
 }
 
+// Write the read-only ./fetch helper into a workspace, baking ONLY the granted
+// verbs into the script's case statement. Disallowed full-vocabulary verbs are
+// rejected with a clear "not permitted in this workspace" message. taskId is
+// accepted for call-site symmetry with the other writers (the fetch script is
+// project-scoped, not task-scoped, so it is not baked into the script).
+export function writeFetchHelper(
+  _taskId: string,
+  projectId: string,
+  workspace: string,
+  opts: { verbs: FetchVerb[] },
+): void {
+  const fetchScript = generateFetchScript(projectId, opts.verbs);
+  fs.writeFileSync(`${workspace}/fetch`, fetchScript, { mode: 0o755 });
+  excludeAgentHelpers();
+}
+
+// Render a short prompt block telling the agent the read-only ./fetch helper
+// exists, listing ONLY the verbs provisioned for it and when to reach for it.
+// Returns '' when no verbs are granted so callers can interpolate it
+// unconditionally. Shared by the research and plan handlers.
+export function buildFetchGuidance(verbs: FetchVerb[]): string {
+  const granted = STRATEGIC_FETCH_VERBS.filter(v => verbs.includes(v));
+  if (granted.length === 0) return '';
+  const lines = granted.map(v => `- ${FETCH_VERB_HELP[v]}`).join('\n');
+  return `# MID-RUN FETCH (./fetch)
+You were launched from a context snapshot that may have trimmed, summarized, or only referenced some items. When a direction, design-doc section, playbook entry, problem-model, or gap you need was shipped trimmed/summarized or only by id, run \`./fetch <verb> [id]\` to pull its full current content before acting on it. Read-only and project-scoped.
+Available verbs in this workspace:
+${lines}
+
+`;
+}
+
 export function writeStrategicHelpers(taskId: string, projectId: string, workspace: string): void {
   const strategicScript = generateStrategicScript(taskId);
   fs.writeFileSync(`${workspace}/strategic`, strategicScript, { mode: 0o755 });
 
-  const fetchScript = generateFetchScript(projectId);
-  fs.writeFileSync(`${workspace}/fetch`, fetchScript, { mode: 0o755 });
+  // Strategic agents get the FULL verb set so their ./fetch is byte-identical
+  // to the historical output.
+  writeFetchHelper(taskId, projectId, workspace, { verbs: STRATEGIC_FETCH_VERBS });
 
   // Write the ./design-doc CLI via the shared, durable generator (prompt.ts)
   // so strategic_review tasks get the same 429/5xx-retrying set/delete writes

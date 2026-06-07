@@ -30,14 +30,14 @@ from __future__ import annotations
 
 import json
 import logging
-import operator
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.acceptance_gate import CRITERION_OPS, coerce_number, criterion_met
 from app.models import Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
@@ -191,6 +191,15 @@ class MetricStrategy:
     outcome" check the per-type forward gate exists to enforce. Budget/deadline
     kills are honest terminal outcomes (they carry an ``outcome`` and a cost),
     so they PASS the gate — the experiment did its measured job.
+
+    On top of the presence check, when the experiment DECLARED a
+    ``success_criterion`` (a numeric metric/operator/threshold goal) the gate
+    ENFORCES it against the reported result: a criterion whose metric is present
+    as a numeric value in the COMPUTE_RESULT (a reserved cost/operational field
+    OR a command-reported experiment metric the agent flattens to a top-level
+    key) must actually be met to PASS; a declared metric that is absent or
+    non-numeric in the result FAILS CLOSED, never silently passing as
+    "unmeasurable".
     """
 
     key = "metric"
@@ -257,21 +266,15 @@ class MetricStrategy:
         outcome, cost = result
 
         # Goal-level acceptance probe: when the experiment declared WHAT success
-        # means, check the reported result against it. A declared-but-unmet goal
-        # fails the gate honestly; no declared criterion preserves the
-        # presence-based pass above.
+        # means, ENFORCE it against the reported result. A declared metric that
+        # the result reports numerically (a reserved cost field OR a flattened
+        # command-reported experiment metric) must actually be met to pass; a
+        # metric absent / non-numeric in the result fails CLOSED (the goal was
+        # declared but the experiment reported nothing to check it against).
+        # ``met`` is False in BOTH cases, and ``_format_unmet_criterion``
+        # distinguishes them in the operator-readable reason. No declared
+        # criterion preserves the presence-based pass above.
         criterion = evaluate_compute_success_criterion(task, artifact_text)
-        if criterion is not None and not criterion["measurable"]:
-            # The criterion names an experiment-domain metric (accuracy, loss,
-            # throughput, …) that the terminal COMPUTE_RESULT structurally never
-            # carries — there is no channel from the experiment to the gate for
-            # it. Gating on it would silently bury an otherwise-successful run as
-            # FAILED forever. Surface the unenforceable criterion explicitly and
-            # let the presence-based pass stand (the run reached a terminal,
-            # costed outcome and did its measured job).
-            return EvaluationVerdict(
-                True, _format_unmeasurable_criterion(criterion, outcome, cost), self.key
-            )
         if criterion is not None and not criterion["met"]:
             return EvaluationVerdict(False, _format_unmet_criterion(criterion), self.key)
 
@@ -424,17 +427,10 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     return parsed if isinstance(parsed, list) else None
 
 
-def _coerce_number(value: Any) -> float | None:
-    """Return ``value`` as a float when it is a real number, else ``None``.
-
-    ``bool`` is a subclass of ``int`` in Python, so it is explicitly rejected —
-    ``True``/``False`` is never a valid cost measurement.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+# Alias the shared fail-closed numeric core (now owned by app.acceptance_gate so
+# the compute success-criterion gate and the code acceptance gate share ONE
+# core). Existing references in this module keep their underscored names.
+_coerce_number = coerce_number
 
 
 def _extract_compute_measurement(
@@ -464,25 +460,21 @@ def _extract_compute_measurement(
     return outcome.strip(), cost
 
 
-# Closed, bounded set of comparison operators a compute success criterion may
-# declare — no general expression framework, just a single numeric/threshold
-# goal. Mirrors the ``Literal`` operator set on ``ComputeSuccessCriterion``.
-_CRITERION_OPS: dict[str, Callable[[float, float], bool]] = {
-    ">=": operator.ge,
-    "<=": operator.le,
-    ">": operator.gt,
-    "<": operator.lt,
-    "==": operator.eq,
-    "!=": operator.ne,
-}
+# The comparison-operator table is the shared fail-closed core, now owned by
+# app.acceptance_gate. Aliased here so the compute success-criterion gate and the
+# code acceptance gate compare numbers identically.
+_CRITERION_OPS = CRITERION_OPS
 
 # The terminal COMPUTE_RESULT artifact (agent/src/handlers/compute-experiment.ts)
-# only ever carries these numeric, job-level fields. A success_criterion can be
-# evaluated end-to-end ONLY against one of these keys: the compute substrate has
-# no channel for experiment-domain metrics (accuracy, loss, throughput, …), so a
-# criterion naming any other metric is structurally unmeasurable and must NOT be
-# allowed to permanently fail an otherwise-successful experiment.
-_MEASURABLE_COMPUTE_METRICS: frozenset[str] = frozenset(
+# always carries these numeric, job-level fields. It ALSO now carries any
+# command-reported experiment metric (accuracy, loss, throughput, …): the agent
+# reads ComputeJob.polling_metadata.result_metrics and flattens each numeric one
+# to a top-level key alongside the cost fields. So a success_criterion is
+# MEASURABLE whenever its metric is present as a numeric value in the result —
+# whether a reserved cost/operational field below OR a reported experiment
+# metric. These reserved keys are the always-present job-level fields, listed
+# for documentation and so reported metrics never collide with them.
+_RESERVED_COMPUTE_RESULT_KEYS: frozenset[str] = frozenset(
     {"final_cost_usd", "accrued_cost_usd", "spend_cap_usd", "poll_attempts"}
 )
 
@@ -522,27 +514,31 @@ def evaluate_compute_success_criterion(
     ``{metric, operator, threshold, value, met, measurable}`` describing whether
     the reported result met the declared goal, or ``None`` when no criterion is
     declared (callers then fall back to presence-based behavior). ``measurable``
-    is False when the metric names a field the terminal COMPUTE_RESULT can never
-    carry (an experiment-domain metric) — callers must NOT fail-close on an
-    unmeasurable metric, since doing so would permanently bury a successful run.
-    ``value`` is the numeric metric read by name out of the terminal result
-    object; ``met`` is False when the metric is absent/non-numeric (fail-closed)
-    or when the comparison does not hold.
+    now means simply "the metric is present as a numeric value in the terminal
+    COMPUTE_RESULT" — true for a reserved cost field OR a command-reported
+    experiment metric the agent flattened to a top-level key. A declared metric
+    that is absent/non-numeric is NOT measurable and is a FAIL-CLOSED outcome
+    (``met`` is False), not a free pass. ``value`` is the numeric metric read by
+    name out of the terminal result object; ``met`` is False when the metric is
+    absent/non-numeric (fail-closed) or when the comparison does not hold.
     """
     criterion = _declared_success_criterion(task)
     if criterion is None:
         return None
     metric, op, threshold = criterion
     obj = _extract_json_object(artifact_text) or {}
-    value = _coerce_number(obj.get(metric))
-    met = value is not None and _CRITERION_OPS[op](value, threshold)
+    raw_value = obj.get(metric)
+    value = _coerce_number(raw_value)
+    # Shared fail-closed core: a metric absent/non-numeric in the result is never
+    # "met" (and ``criterion_met`` enforces that identically for the code gate).
+    met = criterion_met(raw_value, op, threshold)
     return {
         "metric": metric,
         "operator": op,
         "threshold": threshold,
         "value": value,
         "met": met,
-        "measurable": metric in _MEASURABLE_COMPUTE_METRICS,
+        "measurable": value is not None,
     }
 
 
@@ -553,31 +549,18 @@ def _format_unmet_criterion(criterion: dict) -> str:
     threshold = criterion["threshold"]
     value = criterion["value"]
     if value is None:
+        # Fail CLOSED: the goal was declared but the experiment reported no
+        # numeric value to check it against (the metric is absent or non-numeric
+        # in the terminal COMPUTE_RESULT). An undeclared metric never reaches
+        # here; an unreported declared metric must NOT pass as "unmeasurable".
         return (
-            f"declared success criterion not evaluable: result carries no "
-            f"numeric {metric!r} metric to check against {op} {threshold}"
+            f"declared success criterion not evaluable: declared "
+            f"{metric} {op} {threshold} but the experiment reported no "
+            f"numeric {metric!r} in its result"
         )
     return (
         f"declared success criterion not met: {metric}={value} "
         f"(required {op} {threshold})"
-    )
-
-
-def _format_unmeasurable_criterion(criterion: dict, outcome: str, cost: float) -> str:
-    """Operator-readable reason for a PASS whose criterion names an unmeasurable metric.
-
-    The experiment reached a terminal, costed outcome (so it passes the
-    presence-based gate), but its declared criterion gates on a metric the
-    terminal COMPUTE_RESULT structurally cannot carry, so the goal could not be
-    enforced. The message names the offending metric and the measurable set so
-    the operator knows the criterion was a no-op rather than silently satisfied.
-    """
-    measurable = ", ".join(sorted(_MEASURABLE_COMPUTE_METRICS))
-    return (
-        f"compute experiment reached terminal outcome {outcome!r} at measured "
-        f"cost ${cost}; declared success criterion NOT enforced — metric "
-        f"{criterion['metric']!r} is not reported in the terminal compute result "
-        f"(measurable metrics: {measurable})"
     )
 
 

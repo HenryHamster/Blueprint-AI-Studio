@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import uuid
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2484,6 +2485,18 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
+    # Default the finalize-time scratch-DB migration-APPLY gate to CLEAN.
+    # _finalize_qualification calls run_migration_apply_gate, which in production
+    # reproduces the candidate's upgrade against production's recorded state on
+    # an isolated Postgres scratch DB. The test session is SQLite, so the real
+    # gate would 'defer' (non-Postgres bind) and HOLD every finalize as an infra
+    # failure. Defaulting it to ("ok", None) keeps migration-apply safety
+    # incidental for the majority of tests; tests exercising the gate re-patch
+    # this in their own body (block / defer); the later patch wins.
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(return_value=("ok", None)),
+    )
 
 
 # ===========================================================================
@@ -2918,6 +2931,81 @@ async def test_run_qualification_already_pending_is_noop(db_session, mocker):
         .all()
     )
     assert len(tasks) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker):
+    """A version whose audit PASSED and now has an open promotion PR
+    auto-merging (status='pending' + a promotion_pending sub-key, children
+    terminal) must NOT be re-qualified: doing so would spawn a fresh heavy
+    audit/smoketest pair and clobber the promotion-pending provenance.
+    run_qualification refuses with promotion_in_flight, spawns nothing, and
+    leaves the record untouched — consistent with the version-cut lever."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Both children already terminal — by the child-task definition this is NOT
+    # "in flight", and 'pending' is not a conclusive verdict, so only the
+    # promotion-in-flight guard catches it.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-promo",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "feed" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 4242,
+            "pr_url": "https://github.com/o/r/pull/4242",
+            "auto_merge_enabled": True,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "promotion_in_flight"
+    assert result["promotion_pr_number"] == 4242
+    assert result["promotion_pr_url"] == "https://github.com/o/r/pull/4242"
+    # The pre-lock guard fired before any GitHub I/O (no SHA snapshot).
+    sha_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    # The promotion-pending record is untouched; attempts NOT bumped.
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 4242
+    assert version.last_qualification["candidate_sha"] == "feed" * 10
+    assert version.qualification_attempts == attempts_before
+
+    # Still exactly the one original child — no fresh audit/smoketest pair.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
 
 
 @pytest.mark.asyncio
@@ -3713,6 +3801,239 @@ async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, moc
     assert version.status == "open"
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
+    """The scratch-DB migration-apply gate is a SECOND deterministic dimension:
+    when it returns 'block' (the candidate's chain, replayed against production's
+    real recorded schema, leaves a required object uncreated — the v5 computejob
+    renumber-skip class) an otherwise-clean candidate is HARD-blocked. Confidence
+    forced to 0, promote False, blocker migration_apply_drift, and the verdict
+    record carries migration_apply_safety='block' with the specific detail.
+
+    The filename-identity gate stays CLEAN here (autouse default), isolating the
+    apply gate as the sole blocker — proving the two dimensions are distinct."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The apply gate reports deploy-fatal drift: a required table is uncreated
+    # when the candidate's chain is applied against production's recorded state.
+    apply_detail = (
+        "candidate migrations applied against production's recorded revision "
+        "'0375' leave the schema missing required object(s) (deploy-fatal "
+        "drift): table 'computejob'"
+    )
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(return_value=("block", apply_detail)),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "migration_apply_drift"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "migration_apply_drift"
+    assert lq["confidence"] == 0.0
+    assert version.phase == "stabilize"
+    # The new fields are recorded alongside (not replacing) the existing
+    # migration-identity fields — the identity gate stayed clean here.
+    assert lq["migration_safety"] == "ok"
+    assert lq["migration_apply_safety"] == "block"
+    assert lq["migration_apply_safety_detail"] == apply_detail
+    assert "computejob" in lq["migration_apply_safety_detail"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
+    """Fail-safe: when the apply gate cannot determine safety (prod state
+    unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
+    'defer'. Migration-apply safety is UNKNOWN, so the release is HELD as an
+    infra failure (no quality verdict, returned to stabilize) — never waved
+    through, mirroring the identity gate's defer path."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(
+            return_value=("defer", "could not read production's recorded state")
+        ),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "migration_apply_check_unavailable"
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_apply_gate_ok_does_not_block_promotion(db_session, mocker):
+    """When the apply gate returns 'ok' (the autouse default) qualification
+    proceeds normally — the new dimension is inert on a clean candidate and the
+    verdict records migration_apply_safety='ok'. This is the complement of the
+    block/defer cases above: an 'ok' apply gate never perturbs the promotion
+    path."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Leave the autouse ("ok", None) apply-gate default in place. The candidate
+    # is otherwise pristine, so it clears every dimension and reaches promote();
+    # the apply gate never blocks it.
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Reaching promote() at all proves the apply gate did not block; the verdict
+    # record threaded into promote carries the clean apply-safety fields.
+    promote_spy.assert_called_once()
+    base_record = promote_spy.call_args.kwargs["base_record"]
+    assert base_record["migration_apply_safety"] == "ok"
+    assert base_record["migration_apply_safety_detail"] is None
+    assert base_record["blocker"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_threads_snapshotted_candidate_sha_into_apply_gate(
+    db_session, mocker
+):
+    """The finalize path must drive migration-apply from last_qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = "cafe" * 10
+    version.last_qualification = {
+        **(version.last_qualification or {}),
+        "candidate_sha": candidate_sha,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    observed = {}
+
+    async def _fake_apply_gate(**kwargs):
+        observed["candidate_ref"] = kwargs["candidate_ref"]
+        return ("ok", None)
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(side_effect=_fake_apply_gate),
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert observed["candidate_ref"] == candidate_sha
+    promote_spy.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -11421,6 +11742,202 @@ async def test_readiness_healthy_streak_ready(db_session):
 
 
 @pytest.mark.asyncio
+async def test_readiness_is_framed_as_self_approval_not_trustworthy(db_session):
+    """The ready signal must NOT claim the qualifier is 'trustworthy' — there is
+    no recorded post-promotion ground truth, so it is a self-approval rate only.
+    The verdict reason and the structured caveat fields must say so."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is True, out["reason"]
+    # No unvalidated "trustworthy" claim; framed honestly as self-approval.
+    assert "trustworthy" not in out["reason"].lower()
+    assert "self-approval" in out["reason"].lower()
+    # Structured caveat fields are present so every consumer states it honestly.
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_empty_carries_ground_truth_caveat(db_session):
+    """Even the no-verdicts (not-ready) summary carries the ground-truth caveat
+    fields so the UI/strategic payloads never imply a validated signal."""
+    project, _version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["verdicts_evaluated"] == 0
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+async def _seed_promoted_verdict(
+    db_session,
+    project_id,
+    version_id,
+    *,
+    seq: int,
+    post_promotion_outcome: str | None,
+):
+    """Insert ONE promoted QualificationVerdict with a resolved (or NULL/unconfirmed)
+    post-promotion serving outcome, for ground-truth precision tests."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    row = QualificationVerdict(
+        project_id=project_id,
+        release_version_id=version_id,
+        candidate_sha="cd" * 20,
+        confidence=0.95,
+        sub_scores={"audit": 1.0},
+        blocker=None,
+        would_promote=True,
+        promotion_enabled=True,
+        terminal_status="promoted",
+        threshold=0.9,
+        post_promotion_outcome=post_promotion_outcome,
+        created_at=_utcnow() + timedelta(minutes=seq),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_none_when_no_resolved_outcomes(db_session):
+    """Only dry-run verdicts (no resolved promoted outcomes) → validated_precision
+    null, sample 0, ground_truth_validated False; self-approval framing intact."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["validated_precision"] is None
+    assert out["resolved_outcome_sample"] == 0
+    assert out["serving_confirmed_count"] == 0
+    assert out["deploy_failed_count"] == 0
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+    # Self-approval rate is still reported independently.
+    assert out["would_promote_rate"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_from_resolved_outcomes(db_session):
+    """A mixed serving_confirmed/deploy_failed sample at/above the minimum computes
+    the correct precision and flips ground_truth_validated True; unconfirmed/NULL
+    rows are ignored. The self-approval rate is still reported independently."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Self-approval window (dry-run regime) — separate signal.
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+    # Resolved promoted outcomes: 4 serving_confirmed, 1 deploy_failed → 0.80.
+    outcomes = (
+        ["serving_confirmed"] * 4
+        + ["deploy_failed"]
+        + ["unconfirmed", None]  # ignored
+    )
+    for j, outcome in enumerate(outcomes):
+        await _seed_promoted_verdict(
+            db_session, project.id, version.id, seq=100 + j,
+            post_promotion_outcome=outcome,
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["serving_confirmed_count"] == 4
+    assert out["deploy_failed_count"] == 1
+    assert out["resolved_outcome_sample"] == 5
+    assert out["validated_precision"] == pytest.approx(0.8)
+    assert out["ground_truth_validated"] is True
+    assert "validated precision" in out["caveat"]
+    # The self-approval rate is augmented, never replaced.
+    assert out["would_promote_rate"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_below_min_keeps_unvalidated(db_session):
+    """A resolved sample below the minimum reports the precision but keeps
+    ground_truth_validated False and the self-approval-only caveat."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Only 2 resolved outcomes — below _READINESS_MIN_RESOLVED_OUTCOMES (5).
+    await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=100,
+        post_promotion_outcome="serving_confirmed",
+    )
+    await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=101,
+        post_promotion_outcome="deploy_failed",
+    )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["resolved_outcome_sample"] == 2
+    assert out["validated_precision"] == pytest.approx(0.5)
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_self_corrects_on_deploy_failed_recovery(db_session):
+    """(c) When a deploy_failed verdict is later recovered (its
+    post_promotion_outcome flips deploy_failed -> serving_confirmed because the
+    promoted SHA finally served), the readiness validated_precision sample
+    self-corrects on the next compute — the false-negative deploy_failed no longer
+    depresses precision. release_readiness needs no logic change: it derives the
+    precision directly from QualificationVerdict.post_promotion_outcome."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # 4 serving_confirmed + 1 deploy_failed → precision 0.80 over 5 resolved.
+    confirmed_rows = [
+        await _seed_promoted_verdict(
+            db_session, project.id, version.id, seq=100 + i,
+            post_promotion_outcome="serving_confirmed",
+        )
+        for i in range(4)
+    ]
+    failed_row = await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=200,
+        post_promotion_outcome="deploy_failed",
+    )
+
+    before = await rq.compute_promotion_readiness(db_session, project.id)
+    assert before["serving_confirmed_count"] == 4
+    assert before["deploy_failed_count"] == 1
+    assert before["validated_precision"] == pytest.approx(0.8)
+
+    # Recovery flips the verdict outcome exactly as
+    # _recover_serving_confirmed does (deploy_failed -> serving_confirmed).
+    failed_row.post_promotion_outcome = "serving_confirmed"
+    db_session.add(failed_row)
+    await db_session.commit()
+
+    after = await rq.compute_promotion_readiness(db_session, project.id)
+    assert after["serving_confirmed_count"] == 5
+    assert after["deploy_failed_count"] == 0
+    assert after["validated_precision"] == pytest.approx(1.0)
+    # The false-negative no longer depresses the precision sample.
+    assert after["validated_precision"] > before["validated_precision"]
+    assert len(confirmed_rows) == 4
+
+
+@pytest.mark.asyncio
 async def test_readiness_recurring_blocker_not_ready(db_session):
     """A recurring hard blocker in the history blocks readiness even when the
     most-recent streak, evaluated count and would-promote rate all clear their
@@ -11493,6 +12010,81 @@ async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
 
     assert out["verdicts_evaluated"] == 5
     assert out["ready"] is True, out["reason"]
+    # Pre-go-live (promotion disabled): this IS current readiness.
+    assert out["regime"] == "pre_go_live_calibration"
+    assert out["is_current_readiness"] is True
+
+
+@pytest.mark.asyncio
+async def test_readiness_post_go_live_is_historical_not_current(db_session):
+    """Once promotion is effectively enabled, the dry-run window stops receiving
+    verdicts and is frozen pre-go-live history. The summary must relabel itself as
+    a historical calibration window (regime='live', is_current_readiness=False)
+    and NOT present a stale 'ready' streak as current readiness — otherwise the
+    panel freezes on aging dry-runs while claiming to be current."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # A healthy dry-run streak that WOULD read as ready pre-go-live...
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    # ...but promotion is now live for this project.
+    out = await rq.compute_promotion_readiness(
+        db_session, project.id, promotion_enabled=True
+    )
+
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["promotion_enabled"] is True
+    # The stale dry-run streak must NOT surface as a live 'ready' signal.
+    assert out["ready"] is False
+    assert "pre-go-live" in out["reason"]
+    # The underlying dry-run evidence is still carried (now labeled historical).
+    assert out["verdicts_evaluated"] == 6
+
+
+@pytest.mark.asyncio
+async def test_readiness_post_go_live_empty_window_is_historical(db_session):
+    """The 'collapsed to no verdicts' post-go-live state is also relabeled as
+    historical rather than presenting a bare not-ready current-readiness number."""
+    project, _version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(
+        db_session, project.id, promotion_enabled=True
+    )
+
+    assert out["verdicts_evaluated"] == 0
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_resolves_promotion_enabled_from_runtime_config(db_session):
+    """When promotion_enabled is not passed, the regime is resolved from the
+    effective per-project promotion gate (so the panel endpoint, which omits the
+    arg, gets the live relabeling automatically once promotion is enabled)."""
+    from app import shared_state
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    try:
+        out = await rq.compute_promotion_readiness(db_session, project.id)
+    finally:
+        shared_state.runtime_config["promotion_enabled"] = False
+
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["ready"] is False
 
 
 @pytest.mark.asyncio
@@ -13049,7 +13641,9 @@ async def test_get_latest_release_audit_report_none_when_no_audit_task(db_sessio
     """No release_audit task → None (a fresh project has no audit history)."""
     project, _version = await _make_project_and_version(db_session)
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is None
 
@@ -13093,7 +13687,9 @@ async def test_get_latest_release_audit_report_returns_parsed_report(db_session)
     )
     await db_session.commit()
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is not None
     assert result["audit_task_id"] == str(audit_task.id)
@@ -13114,12 +13710,15 @@ async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_s
         title="crashed audit",
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.FAILED,
+        context={"candidate_sha": "feed" * 10},
     )
     db_session.add(audit_task)
     await db_session.commit()
     await db_session.refresh(audit_task)
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is not None
     assert result["audit_task_id"] == str(audit_task.id)
@@ -13128,15 +13727,15 @@ async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_s
 
 
 @pytest.mark.asyncio
-async def test_get_latest_release_audit_report_picks_most_recent(db_session):
-    """With several release_audit tasks, the most recent (by created_at) wins —
-    so a re-qualification's audit supersedes the prior attempt's."""
+async def test_get_latest_release_audit_report_scopes_to_candidate_sha(db_session):
+    """With several release_audit tasks, the latest matching candidate SHA wins."""
     from datetime import timedelta
 
     from app.time_utils import _utcnow
 
     project, _version = await _make_project_and_version(db_session)
     base = _utcnow()
+    candidate_sha = "feed" * 10
 
     old_task = Task(
         project_id=project.id,
@@ -13144,6 +13743,7 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_at=base - timedelta(hours=2),
+        context={"candidate_sha": candidate_sha},
     )
     new_task = Task(
         project_id=project.id,
@@ -13151,6 +13751,7 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_at=base,
+        context={"candidate_sha": "beef" * 10},
     )
     # A non-audit task that must be ignored even though it is the newest.
     other_task = Task(
@@ -13162,21 +13763,250 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
     )
     db_session.add_all([old_task, new_task, other_task])
     await db_session.commit()
-    await db_session.refresh(new_task)
+    await db_session.refresh(old_task)
     db_session.add(
         Artifact(
-            task_id=new_task.id,
+            task_id=old_task.id,
             artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
             logs=json.dumps({"audit_score": 0.91}),
         )
     )
     await db_session.commit()
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha=candidate_sha
+    )
 
     assert result is not None
-    assert result["audit_task_id"] == str(new_task.id)
+    assert result["audit_task_id"] == str(old_task.id)
     assert result["report"] == {"audit_score": 0.91}
+
+
+# ---------------------------------------------------------------------------
+# resolve_lifecycle_audit_evidence / _select_lifecycle_audit — version-scoped
+# audit evidence
+#
+# The lifecycle view must only show audit evidence belonging to the open
+# version's evaluated candidate.  These cover the pure selector's classification
+# (current / stale / none) plus the version-scoped DB resolver.
+# ---------------------------------------------------------------------------
+
+
+def test_select_lifecycle_audit_matching_candidate_is_current():
+    """The newest row whose candidate_sha equals the evaluated SHA → current."""
+    rows = [
+        {"candidate_sha": "newc" * 10},
+        {"candidate_sha": "0ld0" * 10},
+    ]
+    sel = rq._select_lifecycle_audit(rows, "newc" * 10)
+    assert sel["state"] == "current"
+    assert sel["current"] is rows[0]
+    assert sel["stale"] is None
+
+
+def test_select_lifecycle_audit_only_prior_candidate_is_stale():
+    """Audits exist but none match the evaluated SHA → newest is stale."""
+    rows = [
+        {"candidate_sha": "0ld0" * 10},
+        {"candidate_sha": "evnoldr" * 5 + "00000"},
+    ]
+    sel = rq._select_lifecycle_audit(rows, "newc" * 10)
+    assert sel["state"] == "stale"
+    assert sel["current"] is None
+    assert sel["stale"] is rows[0]
+
+
+def test_select_lifecycle_audit_empty_is_none():
+    """No audit rows → none, regardless of evaluated SHA."""
+    sel = rq._select_lifecycle_audit([], "newc" * 10)
+    assert sel == {"state": "none", "current": None, "stale": None}
+
+
+def test_select_lifecycle_audit_no_evaluated_sha_is_stale():
+    """Rows present but no evaluated SHA to match → newest treated as stale."""
+    rows = [{"candidate_sha": "0ld0" * 10}]
+    sel = rq._select_lifecycle_audit(rows, None)
+    assert sel["state"] == "stale"
+    assert sel["stale"] is rows[0]
+
+
+async def _add_release_audit_task(
+    db_session,
+    project,
+    *,
+    version_id,
+    candidate_sha,
+    created_at=None,
+    report=None,
+    status=TaskStatus.COMPLETED,
+):
+    """Insert a release_audit Task scoped to a version (+ optional report)."""
+    kwargs = {}
+    if created_at is not None:
+        kwargs["created_at"] = created_at
+    task = Task(
+        project_id=project.id,
+        title="release audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=status,
+        context={
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+        },
+        **kwargs,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    if report is not None:
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(report),
+            )
+        )
+        await db_session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_matching_candidate(db_session):
+    """An audit pinned to the open version's evaluated candidate → current."""
+    project, version = await _make_project_and_version(db_session)
+    candidate = "feed" * 10
+    version.last_qualification = {"status": "pending", "candidate_sha": candidate}
+    db_session.add(version)
+    await db_session.commit()
+
+    report = {"audit_score": 0.8, "findings": []}
+    task = await _add_release_audit_task(
+        db_session, project, version_id=version.id, candidate_sha=candidate, report=report
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "current"
+    assert result["stale_audit"] is None
+    assert result["latest_audit"] is not None
+    assert result["latest_audit"]["audit_task_id"] == str(task.id)
+    assert result["latest_audit"]["candidate_sha"] == candidate
+    assert result["latest_audit"]["report"] == report
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_stale_prior_candidate(db_session):
+    """Only an audit against an OLDER candidate exists → stale provenance, no
+    current report (the prior findings must not be presented as current)."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "newc" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    report = {"audit_score": 0.5, "findings": [{"severity": "high"}]}
+    task = await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=version.id,
+        candidate_sha="0ld0" * 10,
+        report=report,
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "stale"
+    assert result["latest_audit"] is None
+    assert result["stale_audit"] is not None
+    assert result["stale_audit"]["audit_task_id"] == str(task.id)
+    assert result["stale_audit"]["candidate_sha"] == "0ld0" * 10
+    assert result["stale_audit"]["report"] == report
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_excludes_other_version(db_session):
+    """An audit belonging to a DIFFERENT release version is never attached —
+    a fresh version with no audit of its own returns the explicit none state."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "feed" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    other_version_id = uuid.uuid4()
+    await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=other_version_id,
+        candidate_sha="feed" * 10,
+        report={"audit_score": 0.9},
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "none"
+    assert result["latest_audit"] is None
+    assert result["stale_audit"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_none_when_no_audit(db_session):
+    """No release_audit task for the version → explicit none state."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "feed" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result == {"state": "none", "latest_audit": None, "stale_audit": None}
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_current_report_none_no_artifact(
+    db_session,
+):
+    """A matching audit that crashed without a report → current with a null
+    report body but provenance present (state stays current, not none)."""
+    project, version = await _make_project_and_version(db_session)
+    candidate = "feed" * 10
+    version.last_qualification = {"status": "pending", "candidate_sha": candidate}
+    db_session.add(version)
+    await db_session.commit()
+
+    task = await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=version.id,
+        candidate_sha=candidate,
+        status=TaskStatus.FAILED,
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "current"
+    assert result["latest_audit"] is not None
+    assert result["latest_audit"]["audit_task_id"] == str(task.id)
+    assert result["latest_audit"]["task_status"] == "FAILED"
+    assert result["latest_audit"]["report"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_none_when_candidate_missing(db_session):
+    """No open-version candidate SHA means there is no comparable audit scope."""
+    project, _version = await _make_project_and_version(db_session)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="candidate-scoped audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": "feed" * 10},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -13980,3 +14810,396 @@ def test_reaper_sweep_seam_reexported_from_release_qualifier():
         assert getattr(rq, name) is getattr(rqs, name), (
             f"{name} re-export must be identical to the canonical impl"
         )
+
+
+# ===========================================================================
+# Post-promotion serving confirmation — promotion-time stamping.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_record_promotion_success_stamps_unconfirmed_for_self_repo(db_session):
+    """A self-repo promotion is PROVISIONAL: serving_status='unconfirmed' and a
+    bounded deploy_confirm_deadline are stamped at promotion time."""
+    from app.release_promotion import (
+        _DEPLOY_CONFIRM_WINDOW_SECONDS,
+        _record_promotion_success,
+    )
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Self-Repo",
+        user_id="sr-user",
+        github_owner="acme",
+        github_repo="self",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    before = _utcnow()
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        candidate_sha="c" * 40,
+        base_record={"confidence": 0.9, "status": "promoted"},
+        pr_url="http://pr/1",
+        promoted_sha="p" * 40,
+        lock_released=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.serving_status == "unconfirmed"
+    assert version.served_sha is None
+    assert version.deploy_confirm_deadline is not None
+    elapsed = (version.deploy_confirm_deadline - before).total_seconds()
+    # Deadline lands roughly one window from now (allow generous slack).
+    assert 0 < elapsed <= _DEPLOY_CONFIRM_WINDOW_SECONDS + 120
+
+
+@pytest.mark.asyncio
+async def test_record_promotion_success_leaves_serving_null_for_non_self_repo(
+    db_session,
+):
+    """A non-self-repo promotion leaves serving_status NULL (NA) — the deploy is
+    not observable via the DeploymentState singleton, so the sweep never strands
+    it waiting on a signal it cannot read."""
+    from app.release_promotion import _record_promotion_success
+
+    project = Project(
+        name="Other-Repo",
+        user_id="or-user",
+        github_owner="acme",
+        github_repo="other",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        candidate_sha="c" * 40,
+        base_record={"confidence": 0.9, "status": "promoted"},
+        pr_url="http://pr/1",
+        promoted_sha="p" * 40,
+        lock_released=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.serving_status is None
+    assert version.deploy_confirm_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_non_self_repo_promotions_without_artifact_rows(
+    db_session, mocker
+):
+    """Non-self-repo promotions stay out of the serving-confirmation sweep when
+    they have NULL serving scalars and no artifact registry participation."""
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Other-Repo",
+        user_id="or-user-2",
+        github_owner="acme",
+        github_repo="other-2",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = _utcnow()
+    version.promoted_sha = "p" * 40
+    version.last_qualification = {"status": "promoted", "promoted_sha": "p" * 40}
+    db_session.add(version)
+    await db_session.commit()
+
+    confirm = mocker.patch(
+        "app.release_qualifier_sweep._confirm_serving_or_fail",
+        new=AsyncMock(return_value=False),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 0
+    confirm.assert_not_called()
+    await db_session.refresh(version)
+    assert version.serving_status is None
+    assert version.deploy_confirm_deadline is None
+
+
+# ---------------------------------------------------------------------------
+# Per-attempt evidence mirroring onto QualificationVerdict (durable history).
+#
+# release_qualifier overwrites ReleaseVersion.last_qualification on every
+# re-qualification, so the richer per-attempt evidence (migration-safety
+# verdicts, findings, gate detail, promotion-failure context) was lost there.
+# These tests assert that evidence is durably mirrored onto the immutable
+# QualificationVerdict row and survives a subsequent last_qualification
+# overwrite.
+# ---------------------------------------------------------------------------
+
+
+async def _load_only_verdict(db_session, version):
+    """Return the single QualificationVerdict row for ``version`` (asserts one)."""
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.release_version_id == version.id)
+                .order_by(QualificationVerdict.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
+    """A not_promoted (blocked) attempt mirrors migration-safety + findings onto
+    the immutable verdict row, and that evidence survives a later
+    re-qualification that overwrites last_qualification."""
+    from app import release_promotion as rp
+
+    project, version = await _make_project_and_version(db_session)
+
+    base_record = {
+        "candidate_sha": "abc123",
+        "confidence": 0.42,
+        "threshold": 0.75,
+        "blocker": "migration_unsafe",
+        "status": "not_promoted",
+        "migration_safety": "block",
+        "migration_safety_detail": "candidate renumber-skip leaves table uncreated",
+        "migration_apply_safety": "block",
+        "migration_apply_safety_detail": "chain does not apply on prod schema",
+        "audit_findings": [{"id": "f1", "severity": "high"}],
+        "excluded_audit_findings": [{"id": "f2", "reason": "stale"}],
+        "test_erosion_detail": {"deleted_test_files": ["t.py"]},
+        "smoketest_detail": {"passed": False},
+        "audit_reconciliation": {"reconciled": False},
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "not_promoted"
+    assert row.migration_safety == "block"
+    assert row.migration_safety_detail == (
+        "candidate renumber-skip leaves table uncreated"
+    )
+    assert row.migration_apply_safety == "block"
+    assert row.migration_apply_safety_detail == "chain does not apply on prod schema"
+    assert row.audit_findings == [{"id": "f1", "severity": "high"}]
+    assert row.excluded_audit_findings == [{"id": "f2", "reason": "stale"}]
+    assert row.test_erosion_detail == {"deleted_test_files": ["t.py"]}
+    assert row.smoketest_detail == {"passed": False}
+    assert row.audit_reconciliation == {"reconciled": False}
+    # Promotion-attempt columns stay NULL on a non-promotion attempt.
+    assert row.promotion_pr_url is None
+    assert row.promotion_conflict is None
+    assert row.promotion_error_detail is None
+
+    # A subsequent re-qualification overwrites last_qualification with a NEW
+    # (e.g. now-passing) evidence set — the first verdict row must keep its own.
+    next_record = {
+        "candidate_sha": "def456",
+        "confidence": 0.91,
+        "threshold": 0.75,
+        "status": "not_promoted",
+        "migration_safety": "pass",
+        "migration_safety_detail": "clean",
+    }
+    version.last_qualification = dict(next_record)
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        next_record,
+        terminal_status="not_promoted",
+        would_promote=True,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 2
+    first, second = rows
+    # The original blocked attempt's evidence is untouched by the overwrite.
+    assert first.migration_safety == "block"
+    assert first.migration_safety_detail == (
+        "candidate renumber-skip leaves table uncreated"
+    )
+    assert first.audit_findings == [{"id": "f1", "severity": "high"}]
+    # The new attempt carries its own (different) evidence.
+    assert second.migration_safety == "pass"
+    assert second.migration_safety_detail == "clean"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_attempt_persists_promotion_context(db_session):
+    """A promotion_failed attempt mirrors the merge PR url / conflict / error
+    context onto the immutable verdict row alongside migration-safety."""
+    from app import release_promotion as rp
+
+    project, version = await _make_project_and_version(db_session)
+
+    base_record = {
+        "candidate_sha": "abc123",
+        "confidence": 0.88,
+        "threshold": 0.75,
+        "status": "promotion_failed",
+        "migration_safety": "pass",
+        "migration_safety_detail": "clean",
+        "audit_findings": [],
+        # Promotion-failure context folded in by _record_promotion_failure.
+        "pr_url": "https://github.com/acme/widget/pull/42",
+        "conflict": True,
+        "error": "merge_conflict",
+        "detail": "automain → main had conflicts",
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="promotion_failed",
+        would_promote=True,
+        promotion_enabled=True,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "promotion_failed"
+    assert row.migration_safety == "pass"
+    assert row.promotion_pr_url == "https://github.com/acme/widget/pull/42"
+    assert row.promotion_conflict is True
+    assert row.promotion_error_detail == "merge_conflict: automain → main had conflicts"
+
+
+def test_format_verdict_for_api_surfaces_durable_evidence():
+    """format_verdict_for_api exposes the per-attempt evidence columns so
+    operators read the attempt's own migration-safety/findings, not just the
+    latest last_qualification overwrite."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.1,
+        blocker="migration_unsafe",
+        audit_missing_reason=None,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        threshold=0.9,
+        migration_safety="block",
+        migration_safety_detail="renumber-skip leaves table uncreated",
+        migration_apply_safety="block",
+        migration_apply_safety_detail="diverged from prod schema",
+        audit_findings=[{"severity": "high", "summary": "x"}],
+        excluded_audit_findings=[{"severity": "low", "summary": "y"}],
+        test_erosion_detail={"removed": 2},
+        smoketest_detail={"passed": False},
+        audit_reconciliation={"reconciled": True},
+        promotion_pr_url="https://example.com/pr/7",
+        promotion_conflict=True,
+        promotion_error_detail="merge conflict",
+    )
+
+    out = rq.format_verdict_for_api(verdict)
+
+    # Existing keys remain.
+    assert out["candidate_sha"] == "abc123"
+    assert out["blocker"] == "migration_unsafe"
+    assert out["audit_missing_reason"] is None
+    # New durable evidence keys.
+    assert out["migration_safety"] == "block"
+    assert out["migration_safety_detail"] == "renumber-skip leaves table uncreated"
+    assert out["migration_apply_safety"] == "block"
+    assert out["migration_apply_safety_detail"] == "diverged from prod schema"
+    assert out["audit_findings"] == [{"severity": "high", "summary": "x"}]
+    assert out["excluded_audit_findings"] == [{"severity": "low", "summary": "y"}]
+    assert out["test_erosion_detail"] == {"removed": 2}
+    assert out["smoketest_detail"] == {"passed": False}
+    assert out["audit_reconciliation"] == {"reconciled": True}
+    assert out["promotion_pr_url"] == "https://example.com/pr/7"
+    assert out["promotion_conflict"] is True
+    assert out["promotion_error_detail"] == "merge conflict"
+
+
+def test_get_latest_qualification_audit_findings_prefers_verdict_row():
+    """The findings helper prefers the durable verdict row's audit_findings and
+    falls back to last_qualification only when no verdict is supplied."""
+    import uuid
+
+    version = rv.ReleaseVersion(
+        project_id=uuid.uuid4(),
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={"audit_findings": [{"severity": "low", "summary": "stale"}]},
+    )
+    verdict = QualificationVerdict(
+        project_id=version.project_id,
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.1,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        audit_findings=[{"severity": "high", "summary": "durable"}],
+    )
+
+    # Verdict row takes precedence.
+    from_verdict = rq.get_latest_qualification_audit_findings(version, verdict)
+    assert from_verdict == [{"severity": "high", "summary": "durable"}]
+
+    # Fallback to last_qualification when no verdict carries findings.
+    fallback = rq.get_latest_qualification_audit_findings(version)
+    assert fallback == [{"severity": "low", "summary": "stale"}]

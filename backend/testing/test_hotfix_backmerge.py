@@ -1761,11 +1761,11 @@ async def test_backmerge_collision_with_linear_descendant_embeds_full_plan(
     Integration branch (automain): ``0001_init`` + ``0002_feature`` +
     ``0003_more`` (a linear descendant chaining onto 0002). The back-merge PR
     adds main's ``0002_hotfix`` (rev 0002, down 0001), colliding with automain's
-    own ``0002_feature``. The planner renumbers ``0002_feature`` to ``0004``
-    (next free above every existing revision), rechained onto the promotion-
-    target head ``0002``; the descendant ``0003_more`` is renumbered to ``0005``
-    (monotonically above ``0004``), its ``down_revision`` moving from ``0002`` to
-    ``0004``; the reconciled single head is ``0005`` (the numeric maximum).
+    own ``0002_feature``. The planner renumbers ``0002_feature`` to ``0003``
+    (the next free revision above the promotion-target head ``0002``), rechained
+    onto that head; the descendant ``0003_more`` is renumbered to ``0004``
+    (monotonically above ``0003``), its ``down_revision`` moving from ``0002`` to
+    ``0003``; the reconciled single head is ``0004`` (the numeric maximum).
     """
     project = await _make_project(db_session)
     _create_mock, merge_mock = _patch_github(
@@ -1843,16 +1843,16 @@ async def test_backmerge_collision_with_linear_descendant_embeds_full_plan(
     # (c) The stored structured plan is the FULL two-file shape.
     plan = resolver.context["backmerge_renumber_plan"]
     assert plan is not None
-    # The colliding 0002_feature renumbers to the next free revision (0004),
+    # The colliding 0002_feature renumbers to the next free revision (0003),
     # rechained onto the promotion-target head 0002.
-    assert plan["new_revision"] == "0004"
+    assert plan["new_revision"] == "0003"
     assert plan["new_down_revision"] == "0002"
     assert plan["old_revision"] == "0002"
     assert plan["old_path"] == "backend/alembic/versions/0002_feature.py"
-    assert plan["new_path"] == "backend/alembic/versions/0004_feature.py"
-    # The reconciled single head is 0005 — the descendant is renumbered too, so
+    assert plan["new_path"] == "backend/alembic/versions/0003_feature.py"
+    # The reconciled single head is 0004 — the descendant is renumbered too, so
     # the numeric maximum revision is the head (monotonic chain).
-    assert plan["expected_schema_revision"] == "0005"
+    assert plan["expected_schema_revision"] == "0004"
     # ``deletes`` names BOTH old integration paths being renamed away (chain order).
     assert plan["deletes"] == [
         "backend/alembic/versions/0002_feature.py",
@@ -1861,39 +1861,39 @@ async def test_backmerge_collision_with_linear_descendant_embeds_full_plan(
     # ``upserts`` contains BOTH rewritten files: the renamed+renumbered colliding
     # migration AND the renumbered+rechained descendant.
     assert set(plan["upserts"].keys()) == {
-        "backend/alembic/versions/0004_feature.py",
-        "backend/alembic/versions/0005_more.py",
+        "backend/alembic/versions/0003_feature.py",
+        "backend/alembic/versions/0004_more.py",
     }
     # The stored plan matches the independently-derived planner output exactly.
     assert plan == expected_plan
 
     # The renamed+renumbered colliding migration carries the new revision id and
     # is rechained onto the unified promotion-target head.
-    renamed_source = plan["upserts"]["backend/alembic/versions/0004_feature.py"]
-    assert "revision = '0004'" in renamed_source
+    renamed_source = plan["upserts"]["backend/alembic/versions/0003_feature.py"]
+    assert "revision = '0003'" in renamed_source
     assert "down_revision = '0002'" in renamed_source
-    # The descendant is renumbered to 0005 and rechains onto 0004.
-    descendant_source = plan["upserts"]["backend/alembic/versions/0005_more.py"]
-    assert "revision = '0005'" in descendant_source
-    assert "down_revision = '0004'" in descendant_source
+    # The descendant is renumbered to 0004 and rechains onto 0003.
+    descendant_source = plan["upserts"]["backend/alembic/versions/0004_more.py"]
+    assert "revision = '0004'" in descendant_source
+    assert "down_revision = '0003'" in descendant_source
 
-    # The reconciled integration set resolves to exactly one head (0005), and the
+    # The reconciled integration set resolves to exactly one head (0004), and the
     # numeric-max revision IS that head (monotonicity).
     reconciled = {
-        "backend/alembic/versions/0004_feature.py": renamed_source,
-        "backend/alembic/versions/0005_more.py": descendant_source,
+        "backend/alembic/versions/0003_feature.py": renamed_source,
+        "backend/alembic/versions/0004_more.py": descendant_source,
     }
     reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
-    assert find_heads(reconciled_chain) == ["0005"]
+    assert find_heads(reconciled_chain) == ["0004"]
     assert max(reconciled_chain, key=int) == find_heads(reconciled_chain)[0]
 
     # (d) The full plan is embedded in the resolver prompt.
     prompt = resolver.first_payload["prompt"]
     assert "Known-good renumber plan" in prompt
     # The correct new revision and down_revision are rendered.
-    assert "0004" in prompt  # the new revision id
+    assert "0003" in prompt  # the new revision id
     assert "0002_feature.py" in prompt  # the file being renamed
-    assert "0005_more.py" in prompt  # the renumbered+rechained descendant
+    assert "0004_more.py" in prompt  # the renumbered+rechained descendant
     assert "EXPECTED_SCHEMA_REVISION" in prompt
     # BOTH rewritten migration bodies are embedded verbatim — every rewritten
     # source in expected_plan['upserts'] appears in the prompt.

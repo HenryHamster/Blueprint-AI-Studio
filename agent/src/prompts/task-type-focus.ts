@@ -106,6 +106,34 @@ export const FIX_TASK_FOCUS = `
 Fix tasks most commonly introduce regression risk on the surface that was already
 failing, and scope creep into unrelated files. Apply these additional checks:
 
+0. **Reproduced-on-HEAD gate (do this FIRST, before editing)** — a bug-fix task is
+   spawned from a finding that asserts a defect at a cited location, but that finding
+   can be stale: the bug was already fixed by an intervening merge, the cited code was
+   refactored away, or the report was simply wrong. Before changing code, confirm the
+   reported defect still reproduces on current HEAD via at least one of: a failing test,
+   an observable symptom, or the cited buggy pattern still present at the cited
+   code/symbol. Classify the outcome into exactly one of the three canonical
+   reproduce-on-HEAD verdicts and act on it:
+   - **reproduced** — the defect still reproduces. Take the normal fix path below and
+     record the reproduction evidence under \`correctness\`
+     (e.g. \`"issue": "reproduced: cited pattern foo() still present at bar.py:42"\`).
+     When you ship the fix, close with
+     \`./done --reproduced "<what reproduced on HEAD and what you fixed>"\` so the
+     terminal payload upgrades the durable reproduce verdict from the seeded
+     baseline to \`reproduced\`.
+   - **already_resolved / non-reproducing** — the cited code/symbol is absent, or a
+     reproduction attempt you wrote down demonstrably no longer fails. Take the
+     already-resolved off-ramp \`./done --already-done "<reason naming the cited location
+     and what you checked>"\` INSTEAD of producing a speculative change; that path now
+     emits the structured \`already_resolved\` reproduce verdict so the outcome is scored
+     as a verified no-op rather than a false fix.
+   - **indeterminate** — you genuinely cannot tell (ambiguous symptom, a still-present
+     cited pattern you cannot exercise). Keep the not-reproducible bar HIGH: ambiguity
+     does NOT earn the off-ramp — fall through to the normal fix path below and note the
+     uncertainty under \`correctness\`. If you still cannot prove reproduction by the
+     time you ship, close with
+     \`./done --indeterminate "<why reproduce-on-HEAD remained ambiguous>"\` so the
+     terminal payload preserves the neutral outcome explicitly.
 1. **Regression surface** — identify the specific code path that was failing before
    your fix. Confirm the fix targets ONLY that path and does not silently change
    adjacent behavior. Record in \`regression_risk\` even when passing:

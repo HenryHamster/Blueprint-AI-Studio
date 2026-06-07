@@ -582,6 +582,26 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(opts.noChangesMessage).toBe('No migration changes generated.');
   });
 
+  it('prepends the acceptance-evidence block when declared', async () => {
+    await handleMigrate(
+      TASK_ID,
+      {
+        ...BASE_PAYLOAD,
+        prompt: 'Add user_role column',
+        acceptance_evidence: {
+          kind: 'downstream_artifact',
+          artifact_id: 'release-deploy-artifact-registry',
+        },
+      },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('release-deploy-artifact-registry');
+    expect(prompt).toContain('real, non-empty diff');
+  });
+
   it('forwards a custom base_branch and disables tests-on-main accordingly', async () => {
     await handleMigrate(
       TASK_ID,
@@ -781,6 +801,37 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     const prompt = capturedMigratePrompt();
     expect(prompt).toContain('Add user_role column');
     expect(prompt).toContain('Task: Migration: user roles');
+  });
+
+  it('injects reserved-revision guidance when the claim carries a reservation', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      {
+        ...BASE_TASK,
+        migration_reservation: {
+          provisional_revision: '0153',
+          provisional_down_revision: '0151',
+        },
+      },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('Reserved migration revision');
+    expect(prompt).toContain('revision = "0153"');
+    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('0153_<short_description>.py');
+    expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
+  });
+
+  it('omits reserved-revision guidance when no reservation rides the claim', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).not.toContain('Reserved migration revision');
   });
 
   it('throws when no prompt is provided in payload or task', async () => {
@@ -1226,6 +1277,59 @@ describe('specialized handler task-specific content contracts', () => {
       expect(p).toContain('known-incomplete pipeline step');
       // Don't fabricate fixes when not_a_regression
       expect(p).toContain('do NOT fabricate a fix');
+    });
+
+    it('renders the ABSENT discount note + stale refs when citation_state is absent', async () => {
+      const absentTask = {
+        ...BASE_TASK,
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/gone.py'],
+            ungrounded_refs: ['backend/app/x.py:vanished_fn'],
+          },
+        },
+      };
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, absentTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('Citation-provenance notice');
+      expect(p).toContain('ABSENT on the current');
+      expect(p).toContain('discount its actionability');
+      // The specific stale refs reach the agent.
+      expect(p).toContain('backend/app/gone.py');
+      expect(p).toContain('backend/app/x.py:vanished_fn');
+      // The absent note must NOT tell the agent the defect remains actionable.
+      expect(p).not.toContain('NOT presumed resolved');
+    });
+
+    it('renders the PARTIAL note + stale refs when grounded but some refs are broken', async () => {
+      const partialTask = {
+        ...BASE_TASK,
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: ['backend/app/moved.py'],
+            ungrounded_refs: ['backend/app/y.py:renamed_fn'],
+          },
+        },
+      };
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, partialTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('Citation-provenance notice');
+      expect(p).toContain('PARTIALLY grounded');
+      expect(p).toContain('NOT presumed resolved');
+      expect(p).toContain('remains actionable');
+      // The specific stale refs reach the agent.
+      expect(p).toContain('backend/app/moved.py');
+      expect(p).toContain('backend/app/y.py:renamed_fn');
+      // The partial note must NOT use the stronger absent discount framing.
+      expect(p).not.toContain('discount its actionability');
+    });
+
+    it('omits the provenance notice entirely when no _provenance_warnings on context', async () => {
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).not.toContain('Citation-provenance notice');
     });
   });
 

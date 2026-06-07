@@ -15,7 +15,22 @@ from sqlalchemy import select
 
 from app import github, release_version
 from app.database import AsyncSessionLocal
-from app.models import Project
+from app.models import (
+    DeploymentState,
+    DeploymentStatus,
+    Project,
+    QualificationVerdict,
+)
+from app.release_artifacts import (
+    BACKEND_REVISION_ARTIFACT_KIND,
+    aggregate_required_artifact_status,
+    apply_serving_decision,
+    artifact_is_unconfirmed,
+    get_or_create_release_deploy_artifact,
+    is_backend_revision_artifact,
+    iter_release_artifact_providers,
+    project_backend_revision_artifact,
+)
 from app.release_promotion import (
     _candidate_already_on_main,
     _idempotent_pr_url,
@@ -58,6 +73,79 @@ logger = logging.getLogger(__name__)
 # the 4h stall alert and any realistic CI duration so it only fires on a
 # genuinely wedged promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+
+
+async def _refresh_release_artifact_rows(
+    session,
+    version: release_version.ReleaseVersion,
+    now: datetime,
+    *,
+    recheck_failed_required: bool = False,
+) -> tuple[
+    list[tuple[object, object]],
+    bool,
+    bool,
+    object | None,
+]:
+    """Refresh artifact rows from provider checks without mutating version scalars.
+
+    ``_confirm_serving_or_fail`` projects the backend artifact onto the legacy
+    ``ReleaseVersion`` scalars while the multi-artifact registry is still
+    unresolved, but recovery/admin clear paths cannot do that: they start from a
+    latched aggregate ``deploy_failed`` scalar and must not transiently rewrite
+    it back to backend-only truth before every required artifact re-confirms.
+    This helper centralizes the provider sweep and returns the backend artifact
+    for the caller to project or consume explicitly.
+    """
+
+    provider_rows = []
+    had_required_unconfirmed = False
+    mutated = False
+    backend_artifact = None
+
+    for provider in iter_release_artifact_providers():
+        artifact, created = await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            provider.artifact_kind,
+            confirmation_deadline=version.deploy_confirm_deadline,
+        )
+        if created:
+            mutated = True
+        if provider.required and artifact_is_unconfirmed(artifact):
+            had_required_unconfirmed = True
+
+        should_check = artifact_is_unconfirmed(artifact) or (
+            recheck_failed_required
+            and provider.required
+            and artifact.serving_status == "deploy_failed"
+        )
+        if should_check:
+            outcome = await provider.check(session, version, artifact, now)
+            if outcome is not None:
+                if apply_serving_decision(artifact, outcome, now=now):
+                    mutated = True
+                session.add(artifact)
+        provider_rows.append((provider, artifact))
+        if is_backend_revision_artifact(provider.artifact_kind):
+            backend_artifact = artifact
+
+    return provider_rows, had_required_unconfirmed, mutated, backend_artifact
+
+
+def _aggregate_non_backend_required_artifact_status(
+    provider_rows,
+) -> tuple[str, str | None]:
+    """Aggregate required artifacts excluding backend_revision."""
+
+    return aggregate_required_artifact_status(
+        [
+            (provider, artifact)
+            for provider, artifact in provider_rows
+            if provider.required
+            and not is_backend_revision_artifact(provider.artifact_kind)
+        ]
+    )
 
 
 def _promotion_pending_timeout_seconds() -> float:
@@ -379,7 +467,10 @@ async def _reconcile_if_pending_auto_merge_landed(
             if await _candidate_already_on_main(
                 token, owner, repo, candidate_sha, version, project=project
             ):
-                alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+                (
+                    alembic_status,
+                    alembic_reason,
+                ) = await _validate_migration_chain_post_merge(
                     token,
                     owner,
                     repo,
@@ -672,6 +763,518 @@ async def _reconcile_if_promotion_pending_timed_out(
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
                     "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Post-promotion serving confirmation
+# ---------------------------------------------------------------------------
+
+
+def _to_naive_utc(dt: datetime | None) -> datetime | None:
+    """Strip tzinfo so comparisons against the naive-UTC DeploymentState match."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
+def _classify_serving_outcome(
+    ds: DeploymentState | None,
+    promoted_at: datetime | None,
+    promoted_sha: str | None,
+    deadline: datetime | None,
+    now: datetime,
+) -> tuple[str, str | None, datetime | None] | None:
+    """Derive a post-promotion serving outcome from the deploy-health signal.
+
+    Pure function (no I/O) so the decision is directly unit-testable.  Returns:
+
+      * ``None`` — no decision yet: still inside the confirmation window and no
+        new healthy revision has booted (keep waiting).
+      * ``("serving_confirmed", served_sha, served_at)`` — a new revision booted
+        AFTER ``promoted_at``, is STABLE, and its live serving SHA was
+        INDEPENDENTLY observed to match ``promoted_sha``.  ``served_sha`` is
+        always that observed value, never a ``promoted_sha`` stand-in.
+      * ``("deploy_failed", reason)`` (third element ``None``) — the deploy did
+        not come up healthy: a ROLLED_BACK/HALTED state arose after the promotion
+        (``reason`` ``rolled_back``/``halted``), the observed serving SHA does
+        not match the promoted SHA (``sha_mismatch``), no new healthy revision
+        appeared by ``deadline`` (``no_new_revision``), or a new revision did go
+        STABLE but its serving SHA could never be independently observed before
+        the deadline (``serving_sha_unobservable``).
+    """
+    promoted_at = _to_naive_utc(promoted_at)
+    deadline = _to_naive_utc(deadline)
+    now = _to_naive_utc(now) or now
+
+    # A new revision went STABLE after the promotion, but its live serving SHA
+    # could not be independently observed (Cloud Run lookup degraded to no
+    # value).  Tracked so the deadline path lands a distinct, honest failure
+    # reason instead of confirming with a fabricated served SHA.
+    serving_sha_unobservable = False
+
+    if ds is not None:
+        deployed_at = _to_naive_utc(ds.deployed_at)
+        halted_at = _to_naive_utc(getattr(ds, "halted_at", None))
+        status = ds.status
+        revision_after_promotion = (
+            deployed_at is not None
+            and promoted_at is not None
+            and deployed_at > promoted_at
+        )
+
+        # A HALT or ROLLBACK that occurred at/after the promotion is a hard
+        # failure regardless of the deadline — the deploy actively went bad.
+        if status == DeploymentStatus.HALTED:
+            ref = halted_at or deployed_at
+            if ref is not None and promoted_at is not None and ref >= promoted_at:
+                return ("deploy_failed", "halted", None)
+        if (
+            status == DeploymentStatus.ROLLED_BACK
+            and deployed_at is not None
+            and promoted_at is not None
+            and deployed_at >= promoted_at
+        ):
+            return ("deploy_failed", "rolled_back", None)
+
+        # SERVING CONFIRMED: a new revision booted after the promotion and the
+        # monitoring window passed (STABLE).  Confirm ONLY when the live serving
+        # SHA was INDEPENDENTLY observed AND matches the promoted SHA — never
+        # echo the promoted (merged) SHA as a stand-in.  When the serving SHA is
+        # unobservable, do NOT confirm: keep waiting within the window, and let
+        # the deadline land a distinct ``serving_sha_unobservable`` failure.
+        if status == DeploymentStatus.STABLE and revision_after_promotion:
+            current_sha = ds.current_sha or None
+            if current_sha and promoted_sha:
+                if current_sha == promoted_sha:
+                    return ("serving_confirmed", current_sha, deployed_at)
+                return ("deploy_failed", "sha_mismatch", None)
+            # New revision is STABLE but the live serving SHA (or the promoted
+            # SHA to match it against) cannot be observed — not confirmable.
+            serving_sha_unobservable = True
+
+    # No confirmation yet — deploy-failed only once the bounded window elapses.
+    if deadline is not None and now >= deadline:
+        if serving_sha_unobservable:
+            return ("deploy_failed", "serving_sha_unobservable", None)
+        return ("deploy_failed", "no_new_revision", None)
+    return None
+
+
+async def _record_post_promotion_outcome(
+    session,
+    version: release_version.ReleaseVersion,
+    outcome: str,
+    now: datetime,
+) -> None:
+    """Best-effort: stamp ``post_promotion_outcome`` on the version's verdict row.
+
+    Records the resolved serving outcome on the immutable
+    ``QualificationVerdict`` history (the row written when the version promoted)
+    without mutating any prior immutable field.  Mirrors
+    ``_record_qualification_verdict``'s SAVEPOINT discipline: the caller's
+    already-staged ReleaseVersion mutations are flushed into the outer
+    transaction first, then the verdict update runs inside ``begin_nested`` so a
+    failure (e.g. no verdict row) rolls back only the nested savepoint and never
+    the serving-status write.
+    """
+    try:
+        verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == version.id,
+                        QualificationVerdict.terminal_status == "promoted",
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if verdict is None:
+            return
+        await session.flush()
+        async with session.begin_nested():
+            verdict.post_promotion_outcome = outcome
+            verdict.post_promotion_outcome_at = now
+            session.add(verdict)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to record post-promotion outcome for v%s "
+            "(non-fatal — additive history only): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+
+async def _confirm_serving_or_fail(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+    now: datetime | None = None,
+) -> bool:
+    """Resolve a provisional (``serving_status="unconfirmed"``) promotion.
+
+    For a ``promoted`` version still awaiting serving confirmation, derive the
+    outcome from the DeploymentState singleton (the existing deploy-health
+    serving signal) and either confirm it serving or land a distinct loud
+    deploy-failed state.  Runs in its own dedicated session under a row lock —
+    the same per-version isolation pattern as the reconcile loops above — so a
+    failure on one version cannot touch another's committed work.
+
+    Returns True iff the version transitioned out of ``unconfirmed`` this call.
+    """
+    factory = session_factory or AsyncSessionLocal
+    _now = now or _utcnow()
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            # Re-check under the lock: a concurrent sweep may have resolved it.
+            if version.status != "promoted":
+                return False
+            (
+                provider_rows,
+                had_required_unconfirmed,
+                mutated,
+                backend_artifact,
+            ) = await _refresh_release_artifact_rows(session, version, _now)
+
+            if not provider_rows:
+                return False
+
+            if not had_required_unconfirmed:
+                if mutated:
+                    await session.commit()
+                return False
+
+            if backend_artifact is not None:
+                if project_backend_revision_artifact(version, backend_artifact):
+                    mutated = True
+                session.add(version)
+
+            aggregate_status, aggregate_reason = aggregate_required_artifact_status(
+                provider_rows
+            )
+            if aggregate_status == "unconfirmed":
+                if mutated:
+                    await session.commit()
+                return False
+
+            if aggregate_status == "serving_confirmed":
+                version.serving_status = "serving_confirmed"
+                version.deploy_failure_reason = None
+                session.add(version)
+                await _record_post_promotion_outcome(
+                    session, version, "serving_confirmed", _now
+                )
+                await session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] serving confirmed for promoted v%d "
+                    "(served_sha=%s)",
+                    version.version_number,
+                    (version.served_sha or "")[:12],
+                )
+                return True
+
+            version.serving_status = "deploy_failed"
+            version.deploy_failure_reason = aggregate_reason
+            session.add(version)
+            await _record_post_promotion_outcome(
+                session, version, "deploy_failed", _now
+            )
+            # Loud operator alert (ERROR), deduped via deploy_confirm_alerted_at.
+            try:
+                from app.release_stall_alerts import _alert_promotion_deploy_failed
+
+                await _alert_promotion_deploy_failed(session, version)
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] deploy-failed alert raised for v%d "
+                    "(non-fatal)",
+                    version.version_number,
+                )
+            # Wake the strategist now instead of leaving it to discover the
+            # failed deploy on its next natural cycle (gated behind the
+            # strategic-spawn cooldown). A failed production deploy is the
+            # loudest release signal, so arm the same coalescing refresh marker
+            # the post-qualification path uses. Best-effort and non-fatal:
+            # request_strategic_refresh swallows its own errors, does NOT commit
+            # (rides this transaction), and the single-slot marker coalesces, so
+            # arming can never abort the deploy-failed write and a re-scanned
+            # version cannot re-fire (the serving_status!=unconfirmed guard above
+            # means this branch runs exactly once per version).
+            try:
+                from app.strategic_trigger import request_strategic_refresh
+
+                await request_strategic_refresh(
+                    session,
+                    version.project_id,
+                    f"promotion_deploy_failed:{aggregate_reason}",
+                )
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] strategic refresh arm raised for v%d "
+                    "(non-fatal)",
+                    version.version_number,
+                )
+            await session.commit()
+            logger.error(
+                "[RELEASE_QUALIFIER] promotion deploy FAILED for v%d "
+                "(reason=%s) — promoted SHA never confirmed serving",
+                version.version_number,
+                aggregate_reason,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] serving-confirmation: unexpected error for "
+                "version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] serving-confirmation: rollback failed "
+                    "for version %s",
+                    version_id,
+                )
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Post-promotion deploy-failure recovery
+# ---------------------------------------------------------------------------
+#
+# A ``serving_status="deploy_failed"`` latch is NOT terminal-by-construction.  A
+# deploy that boot-crashed and then recovered, or that was merely slow to come up
+# past the bounded confirmation window (the real v5 pattern: promoted 14:58 UTC,
+# only began serving at 19:51 UTC), would otherwise be rendered permanently
+# untrue across every surface — version status, the operator deploy-failed ERROR
+# alert, the strategist "recover the failed deploy" crisis directive, and the
+# QualificationVerdict.post_promotion_outcome precision sample.  When such a
+# version is later observed to ACTUALLY serve its promoted SHA, the recovery path
+# reconciles it back to a truthful serving_confirmed state and clears every
+# derived failure surface — bounded by a recovery window so a genuinely dead
+# deploy still stays loudly failed forever.
+_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT = 24 * 3600
+
+
+async def _recover_serving_confirmed(
+    session,
+    version: release_version.ReleaseVersion,
+    served_sha: str,
+    served_at: datetime | None,
+    now: datetime,
+) -> None:
+    """Flip a deploy_failed version back to serving_confirmed and clear surfaces.
+
+    Shared mutation helper for the deploy-failure recovery path.  Given a version
+    whose promoted SHA is now INDEPENDENTLY observed serving, it:
+
+      * flips ``serving_status`` ``deploy_failed`` -> ``serving_confirmed``,
+      * stamps ``served_sha`` / ``served_at`` from the confirmed observation,
+      * clears ``deploy_failure_reason``,
+      * updates the ``QualificationVerdict.post_promotion_outcome`` to
+        ``serving_confirmed`` (reusing ``_record_post_promotion_outcome``'s
+        SAVEPOINT discipline so the immutable verdict history is appended-to, not
+        mutated, and a verdict failure never rolls back the serving-status write),
+      * resolves the open promotion-deploy-failed operator alert, and
+      * arms a coalescing strategic refresh so the crisis directive recomputes
+        against the now-true serving_confirmed state this cycle.
+
+    Runs entirely on the caller's already-locked session; does NOT commit (the
+    caller commits under the SAME per-version row lock).
+    """
+    backend_artifact, _created = await get_or_create_release_deploy_artifact(
+        session,
+        version,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        confirmation_deadline=version.deploy_confirm_deadline,
+    )
+    apply_serving_decision(
+        backend_artifact,
+        ("serving_confirmed", served_sha, served_at),
+        now=now,
+    )
+    session.add(backend_artifact)
+    project_backend_revision_artifact(version, backend_artifact)
+    version.deploy_failure_reason = None
+    session.add(version)
+    await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
+    # Resolve the loud deploy-failed operator alert — it no longer describes a
+    # real condition once the promoted SHA is confirmed serving.  Best-effort and
+    # non-fatal: a resolve failure must never abort the recovery write.
+    try:
+        from app.release_stall_alerts import _resolve_promotion_deploy_failed_alert
+
+        await _resolve_promotion_deploy_failed_alert(session, version)
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] deploy-failed alert resolve raised for "
+            "recovered v%d (non-fatal)",
+            version.version_number,
+        )
+    # Wake the strategist so the "recover the failed deploy" crisis directive
+    # recomputes against the now-true serving_confirmed state instead of waiting
+    # for the next natural cycle.  Best-effort and non-fatal:
+    # request_strategic_refresh swallows its own errors, does NOT commit (rides
+    # this transaction), and the single-slot marker coalesces.
+    try:
+        from app.strategic_trigger import request_strategic_refresh
+
+        await request_strategic_refresh(
+            session,
+            version.project_id,
+            "promotion_deploy_recovered",
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] strategic refresh arm raised for recovered "
+            "v%d (non-fatal)",
+            version.version_number,
+        )
+
+
+async def _reconcile_if_deploy_failed_recovered(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+    now: datetime | None = None,
+    recovery_window_seconds: float = _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT,
+) -> bool:
+    """Recover a ``deploy_failed`` version whose promoted SHA is now serving.
+
+    For a ``promoted`` version latched to ``serving_status="deploy_failed"`` still
+    inside the recovery window, re-run the pure ``_classify_serving_outcome``
+    against the live DeploymentState.  When the promoted SHA is now INDEPENDENTLY
+    observed serving (a STABLE new revision booted after ``promoted_at`` whose
+    live ``current_sha`` matches ``promoted_sha``) flip it back to a truthful
+    ``serving_confirmed`` state via ``_recover_serving_confirmed`` and clear every
+    derived failure surface.  Any other classifier verdict (still failed,
+    rolled-back, sha-mismatch, or no decision) leaves the version deploy_failed.
+
+    Beyond the recovery window — anchored on when the failure was recorded
+    (``deploy_confirm_alerted_at``, falling back to ``deploy_confirm_deadline`` /
+    ``promoted_at``) — a genuinely dead deploy is no longer re-checked and stays
+    failed forever.
+
+    Runs in its own dedicated session under a row lock — the same per-version
+    isolation pattern as ``_confirm_serving_or_fail`` — so a failure on one
+    version cannot touch another's committed work.  Returns True iff the version
+    recovered this call.
+    """
+    factory = session_factory or AsyncSessionLocal
+    _now = now or _utcnow()
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            # Re-check under the lock: a concurrent sweep may have resolved it.
+            if version.status != "promoted":
+                return False
+            if version.serving_status != "deploy_failed":
+                return False
+
+            # Bound recovery: beyond the window a genuinely dead deploy stays
+            # loudly failed forever.  Anchor on when the failure was recorded.
+            anchor = _to_naive_utc(
+                version.deploy_confirm_alerted_at
+                or version.deploy_confirm_deadline
+                or version.promoted_at
+            )
+            now_naive = _to_naive_utc(_now) or _now
+            if (
+                anchor is not None
+                and recovery_window_seconds > 0
+                and (now_naive - anchor).total_seconds() > recovery_window_seconds
+            ):
+                return False
+
+            (
+                provider_rows,
+                _,
+                mutated,
+                backend_artifact,
+            ) = await _refresh_release_artifact_rows(
+                session,
+                version,
+                _now,
+                recheck_failed_required=True,
+            )
+            aggregate_status, _ = aggregate_required_artifact_status(provider_rows)
+            backend_is_serving = (
+                backend_artifact is not None
+                and backend_artifact.serving_status == "serving_confirmed"
+                and backend_artifact.served_identifier is not None
+            )
+            # Recovery now means the FULL required-artifact registry has
+            # reconfirmed, not merely the backend-revision artifact. Commit any
+            # artifact-row truth we learned even when the aggregate version state
+            # must remain deploy_failed.
+            if aggregate_status != "serving_confirmed" or not backend_is_serving:
+                if mutated:
+                    await session.commit()
+                return False
+            await _recover_serving_confirmed(
+                session,
+                version,
+                backend_artifact.served_identifier,
+                backend_artifact.served_at,
+                _now,
+            )
+            await session.commit()
+            logger.info(
+                "[RELEASE_QUALIFIER] deploy-failed RECOVERED for promoted v%d "
+                "(served_sha=%s) — promoted SHA confirmed serving after a prior "
+                "deploy_failed latch",
+                version.version_number,
+                (version.served_sha or "")[:12],
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] deploy-failed recovery: unexpected error "
+                "for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] deploy-failed recovery: rollback failed "
+                    "for version %s",
                     version_id,
                 )
             return False

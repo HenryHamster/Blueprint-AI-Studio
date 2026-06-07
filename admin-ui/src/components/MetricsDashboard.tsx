@@ -328,7 +328,7 @@ function AxisSparkline({ history, favorableDirection }: {
 }
 
 const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
-  { key: 'cost_per_merged_pr', label: 'Cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'cost_per_merged_pr', label: 'Cost per autonomous merge', unit: '$', favorableDirection: 'lower' },
   { key: 'vm_cold_start_p50_ms', label: 'VM cold-start p50', unit: 'ms', favorableDirection: 'lower' },
   { key: 'vm_reuse_rate', label: 'VM reuse rate', unit: '%', favorableDirection: 'higher' },
   { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },

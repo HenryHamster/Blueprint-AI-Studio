@@ -11,6 +11,7 @@ from app.providers.base import (
     FileMaterial,
     LLMProvider,
     SecretMaterial,
+    UsageSnapshot,
     ValidationResult,
     parse_json_secret,
     tier_model_from_runtime_config,
@@ -539,6 +540,21 @@ class GeminiProvider(LLMProvider):
             settings_files=tuple(settings_files),
             unsupported=tuple(unsupported),
         )
+
+    async def probe_usage(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> UsageSnapshot:
+        """No clean usage-headroom source for Gemini → always unknown.
+
+        Gemini's API-key and service-account surfaces don't expose a documented
+        per-window utilization endpoint comparable to Anthropic's OAuth usage
+        probe. We resolve to unknown so selection behaves exactly as today for
+        Gemini accounts rather than scraping a flaky signal.
+        """
+        return UsageSnapshot.unknown()
 
     async def list_available_models(
         self,

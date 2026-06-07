@@ -50,9 +50,9 @@ from app.sr_blind_spots import (
     is_disallowed_blind_spot,
     is_skipped_sr_outcome as _is_skipped_sr_outcome,
     _REVIEWER_ORIGINS,
+    reviewer_confirmed_categories,
 )
 from app.research_completion import lookup_findings_by_source_ref
-from app.playbook_learning import resolve_sr_miss_human_truth
 from app.research_actionability import (
     _MAX_ACTIONABILITY_CYCLES,
     _aggregate_actionability_extended,
@@ -203,11 +203,11 @@ async def list_sr_missed_retrospectives(
         check_results = sr_outcome.get("check_results") or {}
         if not check_results:
             continue
-        human_cats = resolve_sr_miss_human_truth(ctx)
-        if not human_cats:
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
+        if not reviewer_confirmed_cats:
             continue
         sr_failed = _author_sr_failed_categories(check_results)
-        missed = human_cats - sr_failed
+        missed = reviewer_confirmed_cats - sr_failed
         if not missed:
             continue
         t_type = (t.first_payload or {}).get("type")
@@ -249,7 +249,7 @@ async def list_sr_missed_retrospectives(
         if current_index < page_start or current_index >= page_end:
             continue
 
-        caught = human_cats & sr_failed
+        caught = reviewer_confirmed_cats & sr_failed
         sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
         page_items.append(
             {
@@ -1100,7 +1100,7 @@ async def get_sr_recent_misses(
         .order_by(Task.created_at.desc())
     )
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     matched_task_ids: list[uuid.UUID] = []
     total_matched = 0
     task_stream = await session.stream(stmt)
@@ -1109,12 +1109,12 @@ async def get_sr_recent_misses(
         sr_outcome = ctx.get("_self_review_outcome")
         if not sr_outcome:
             continue
-        human_cats = resolve_sr_miss_human_truth(ctx)
-        if not human_cats:
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
+        if not reviewer_confirmed_cats:
             continue
         check_results = sr_outcome.get("check_results") or {}
         sr_failed = _author_sr_failed_categories(check_results)
-        missed = human_cats - sr_failed
+        missed = reviewer_confirmed_cats - sr_failed
         if not missed:
             continue
         if category and category not in missed:
@@ -1131,7 +1131,7 @@ async def get_sr_recent_misses(
                     "task_type": fp.get("type") or ctx.get("type"),
                     "created_at": t.created_at.isoformat() if t.created_at else None,
                     "missed_categories": sorted(missed),
-                    "caught_categories": sorted(human_cats & sr_failed),
+                    "caught_categories": sorted(reviewer_confirmed_cats & sr_failed),
                     "sr_check_results": sr_check_results,
                     "reviewer_findings": reviewer_findings,
                     "pr_url": None,

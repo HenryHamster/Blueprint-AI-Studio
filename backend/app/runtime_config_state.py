@@ -144,6 +144,16 @@ runtime_config: Dict = {
     # default cascade-killed otherwise-recoverable children during operator-
     # intervention windows; bumped to 48h while silent-death stabilizes.
     "evaluating_fail_hours": int(os.getenv("EVALUATING_FAIL_HOURS", "48")),
+    # Recovery-sweep window for DELIBERATE spend/budget approval holds
+    # (tasks held with requires_approval=True AND
+    # context.approval_hold_reason="spend_budget"). Distinct from the review-
+    # escalation 2h hard-FAIL: an out-of-band cost decision an operator simply
+    # has not reached is not a pipeline failure, so this window is longer and,
+    # on expiry, resolves to a CLEAN NON-FAILURE CANCELLED terminal (not FAILED).
+    # Default 24h; PATCH endpoint validates 1..168.
+    "spend_approval_timeout_hours": int(
+        os.getenv("SPEND_APPROVAL_TIMEOUT_HOURS", "24")
+    ),
     # Total research tasks (any non-terminal state, *including* EVALUATING)
     # allowed per project. Distinct from max_parallel_research_per_project,
     # which counts only QUEUED/PROVISIONING/IN_PROGRESS — that cap controls
@@ -328,6 +338,20 @@ runtime_config: Dict = {
     # decision cadence. 0 disables the fallback. Cooldown still gates duplicates.
     "strategic_max_interval_minutes": 180,
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
+    # Budget on the strategist's autonomous spawn_task path (research / plan /
+    # web_research / design tasks created directly from a strategic review). Each
+    # such task jumps the queue at elevated priority and can carry real per-job
+    # cost, so an unbounded review could flood the pipeline. These caps are sized
+    # generously so normal steering never trips them — they exist solely to
+    # contain runaway spawning. per_review caps one strategic review; window caps
+    # the rolling time window across consecutive reviews; dedup_overlap_threshold
+    # is the word-overlap count above which a new spawn title is treated as a
+    # semantic duplicate of a recent same-type spawn (must stay >=4 so distinct
+    # investigations like "Investigate A"/"Investigate B" are not collapsed).
+    "strategist_spawn_per_review_cap": 12,
+    "strategist_spawn_window_minutes": 60,
+    "strategist_spawn_window_cap": 20,
+    "strategist_spawn_dedup_overlap_threshold": 4,
     "max_active_directions": 10,
     # Staleness threshold (days) for staged directions whose target version has
     # NOT yet promoted. A staged direction is inert work that only begins when
@@ -347,6 +371,15 @@ runtime_config: Dict = {
     "max_retained_images": 10,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    # Proposed compute_experiment spend cap (USD) above which an autonomously
+    # authored launch is HELD for operator approval (requires_approval=True at
+    # spawn) rather than dispatched. A per-direction override is honored when a
+    # direction dict carries its own "compute_experiment_spend_threshold_usd"
+    # key (directions are flat JSON dicts that already hold per-direction floats
+    # like cost_budget_usd — no new column/migration). This sits ABOVE the hard
+    # global clamp in compute_jobs.py (MAX_COMPUTE_JOB_SPEND_CAP_USD), which
+    # remains an untouched backstop. <=0 means hold every positive-cap launch.
+    "compute_experiment_spend_threshold_usd": 10.0,
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
     # During degraded operation only, tasks whose P(success) falls below this floor
     # are skipped this dispatch cycle (remain QUEUED) so scarce slots go to higher-
@@ -629,6 +662,30 @@ runtime_config: Dict = {
     # Global orchestrator safety cap, not per-project. Operator-tunable via
     # runtime_config_json; persisted across restarts.
     "project_broadcast_limit": 1000,
+    # Proactive account-usage headroom (advisory). When enabled, the max_plan
+    # pool consults a per-account, ~60s-cached provider usage-probe snapshot to
+    # (a) skip near-exhausted accounts for long-running task types at claim time
+    # and (b) prefer more remaining headroom in selection ranking. Ships DARK
+    # (default OFF) — when disabled, selection behaves exactly as before and no
+    # usage probing happens. The probe is advisory: any failure/unknown snapshot
+    # makes selection behave as it does today, and the reactive rate-limit
+    # cooldowns remain the backstop. Tunable via /api/admin/settings, no deploy.
+    "usage_headroom_gate_enabled": False,
+    # Utilization percentage (5h OR 7d) at/above which an account is skipped for
+    # long-running task types when the gate is enabled. 0..100.
+    "usage_headroom_threshold_pct": 90,
+    # Task types the claim-time gate applies to (long-running work that burns a
+    # large share of an account's budget if it dies mid-run and restarts). The
+    # headroom RANKING preference applies to all task types when enabled; only
+    # the skip-gate is scoped to this set.
+    "usage_headroom_long_running_task_types": [
+        "create",
+        "refactor",
+        "migrate",
+        "research",
+        "plan",
+        "security_audit",
+    ],
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -939,6 +996,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "daily_cost_ceiling_usd",
                         float(config_json["daily_cost_ceiling_usd"]),
                     )
+                if "compute_experiment_spend_threshold_usd" in config_json:
+                    _set(
+                        "compute_experiment_spend_threshold_usd",
+                        float(config_json["compute_experiment_spend_threshold_usd"]),
+                    )
                 if "auto_archive_enabled" in config_json:
                     _set(
                         "auto_archive_enabled",
@@ -974,6 +1036,22 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_retarget_enabled",
                         bool(config_json["warm_retarget_enabled"]),
                     )
+                if "usage_headroom_gate_enabled" in config_json:
+                    _set(
+                        "usage_headroom_gate_enabled",
+                        bool(config_json["usage_headroom_gate_enabled"]),
+                    )
+                if "usage_headroom_long_running_task_types" in config_json:
+                    raw_types = config_json["usage_headroom_long_running_task_types"]
+                    if isinstance(raw_types, str):
+                        raw_types = raw_types.split(",")
+                    if isinstance(raw_types, (list, tuple, set)):
+                        _set(
+                            "usage_headroom_long_running_task_types",
+                            sorted(
+                                {str(t).strip() for t in raw_types if str(t).strip()}
+                            ),
+                        )
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -1044,6 +1122,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "evaluating_pipeline_timeout_minutes",
                     "ci_backstop_timeout_minutes",
                     "evaluating_fail_hours",
+                    "spend_approval_timeout_hours",
                     "max_total_research_per_project",
                     "productive_direction_cooldown_minutes",
                     "next_role_poll_timeout_secs",
@@ -1070,6 +1149,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_cycle_halt_cooldown_seconds",
                     "reaper_half_open_probe_limit",
                     "reaper_max_orphans_per_cycle",
+                    "usage_headroom_threshold_pct",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))

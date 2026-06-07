@@ -831,6 +831,10 @@ async def recut_dependent_base_from_integration(task, project, session) -> str:
         code; the dependent is safe to dispatch.
       * ``"conflict"``  — the merge would conflict; the caller must NOT dispatch
         and should hold for follow-up (a fix task / operator).
+      * ``"missing"``   — the dependent's base (or the integration head) no
+        longer exists on GitHub (HTTP 404). This is a PERMANENT, non-transient
+        condition (the staging base was cleaned up after its rollup merged, or
+        never existed); the caller must NOT retry it forever as if transient.
       * ``"error"``     — a transient GitHub / credential error; retry next
         cycle (the dependent stays held).
 
@@ -882,6 +886,10 @@ async def recut_dependent_base_from_integration(task, project, session) -> str:
         return "ok"
     if result.get("conflict"):
         return "conflict"
+    if result.get("missing"):
+        # A deleted/absent base or head branch (HTTP 404) is PERMANENT — never
+        # fold it into the transient "error" bucket that retries forever.
+        return "missing"
     return "error"
 
 

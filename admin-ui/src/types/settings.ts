@@ -53,6 +53,10 @@ export interface DeployState {
   deployed_at: string;
   last_known_good_revision: string;
   last_known_good_sha: string;
+  // SHA the live revision was rolled back FROM (the bad revision), preserved
+  // as provenance after a manual/auto rollback advances current_sha to the
+  // rolled-back target. Optional/nullable so older payloads still type-check.
+  rolled_back_from_sha?: string | null;
   rollback_reason: string | null;
   rollback_count: number;
   pause_reason: string | null;
@@ -65,6 +69,10 @@ export interface DeployState {
   gcp_project_id: string;
   health_recovery_streak: number;
   health_recovery_streak_required: number;
+  // True when the auto-resume gate raised the required healthy-probe count
+  // because the pipeline has been flapping (repeatedly auto-pausing/resuming).
+  // Optional/additive so older payloads still type-check.
+  health_recovery_flap_escalated?: boolean;
   health_recovery_history?: boolean[];
   health_recovery_history_size?: number;
   health_failure_streak: number;

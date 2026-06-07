@@ -25,6 +25,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
+from app.migration_reservations import allocate_migration_reservation
 from app.models import Project, Task, TaskStatus, ArtifactType, Alert, AlertSeverity
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
@@ -4219,7 +4220,16 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
         project.id,
         task_type="create",
         status=TaskStatus.IN_PROGRESS,
-        context={"scope": "small", "direction_id": direction_id},
+        context={
+            "scope": "small",
+            "direction_id": direction_id,
+            "review_loop": {
+                "head_sha": "deadbeef",
+                "polls_since_pr_fetch": 1,
+                "mergeable_state": "clean",
+                "last_merge_msg": "old merge result",
+            },
+        },
     )
     task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
     session.add(task)
@@ -4272,6 +4282,104 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
     await session.refresh(task)
     assert task.status == TaskStatus.EVALUATING
     assert "dual-head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
+    tl_db, mocker
+):
+    """Small-scope auto-approve rewrites a reserved provisional migration and
+    requeues CI instead of attempting the stale merge."""
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    direction_id = "dir-auto-finalize"
+    project.directions = [{"id": direction_id, "title": "d"}]
+    session.add(project)
+    await session.commit()
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    await allocate_migration_reservation(session, task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "small clean diff"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new_callable=AsyncMock,
+        return_value=(False, "dual-head: duplicate migration revision"),
+    )
+    finalization_mock = mocker.patch(
+        "app.rollup_management.attempt_pr_migration_finalization",
+        new_callable=AsyncMock,
+        return_value={
+            "pr_number": 77,
+            "branch": "blueprint/task-aa",
+            "old_revision": "0153",
+            "finalized_revision": "0152",
+            "finalized_down_revision": "0151",
+            "expected_schema_revision": "0152",
+        },
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-aa",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_approved") is True
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is False
+    assert review_loop.get("head_sha") == ""
+    assert review_loop.get("polls_since_pr_fetch") == 999
+    assert "mergeable_state" not in review_loop
+    assert "last_merge_msg" not in review_loop
+    assert review_loop.get("pr_number") == 77
+    finalization = (task.context or {}).get("_migration_finalization")
+    assert finalization is not None
+    assert finalization["old_revision"] == "0153"
+    assert finalization["finalized_revision"] == "0152"
+    finalization_mock.assert_awaited_once()
+    assert finalization_mock.await_args.kwargs["promotion_target"] == "main"
+    assert "auto-finalized provisional alembic migration" in (
+        task.latest_status_message or ""
+    ).lower()
 
 
 @pytest.mark.asyncio

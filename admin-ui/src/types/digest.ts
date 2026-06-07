@@ -23,7 +23,6 @@
 // `DirectionProgress`. `DigestData` is therefore generic in that element type so
 // each consumer keeps its own strict typing without an unsafe widen/downcast.
 
-import type { OutcomeKindBreakdown } from '../utils/outcomeKinds';
 import type { EdgesTrend } from '../components/SrTrendBreakdown';
 import type { SrTrendWithFixIterations } from '../components/ReviewQualitySection';
 import type { ActiveTask } from '../components/CatchUpInProgressSection';
@@ -100,6 +99,20 @@ export interface RecentFailure {
   scope?: string | null;
 }
 
+export interface DirectionPortfolioCompositionEntry {
+  direction_id: string;
+  direction_text: string;
+  status: string | null;
+  priority: string;
+  quiet_this_window: boolean;
+}
+
+export interface DirectionPortfolio {
+  active_count: number;
+  self_sufficient_count: number;
+  composition: DirectionPortfolioCompositionEntry[];
+}
+
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
 
 /**
@@ -109,11 +122,214 @@ type ScopeConversionRates = Record<string, { created: number; merged: number; ca
  * `DP` defaults to `unknown` so consumers that never read `direction_progress`
  * (e.g. SystemStatusCard) can use the bare `DigestData`.
  */
+// Fleet-wide no-CI merge-gate verification health (read-only observability;
+// never influences a merge decision). Mirrors the backend
+// `compute_merge_gate_fleet_health` return shape.
+export interface MergeGateFleetHealth {
+  verified_count: number;
+  fell_open_count: number;
+  verification_rate: number | null;
+  most_common_reason: string | null;
+  degraded_project_count: number;
+  project_count: number;
+}
+
+export interface FindingStructuralGiveUpItem {
+  task_id: string;
+  title: string;
+  reason: string;
+  direction_id?: string | null;
+}
+
+// Per-effort-tier / per-actual-model LLM efficiency rollup (read-only).
+// Mirrors the backend `compute_effort_model_efficiency` payload
+// (efficiency_snapshot.py): each row carries run/landed counts + rate, priced
+// LLM cost, cost-per-merge, token volume, and priced/unpriced coverage so an
+// understated (unpriced) cost is visible rather than silently folded into the
+// priced total.
+export interface EfficiencyBucket {
+  run_count: number;
+  landed_count: number;
+  landed_rate: number | null;
+  // Verified-merge payoff alongside the RAW landed figures: degraded (no-CI
+  // fall-open) merges stay in landed_count/landed_rate but are EXCLUDED here, so
+  // a fall-open merge is not presented as a genuine landing. Optional so older
+  // backends (predating the verified-merge rollup) degrade gracefully — the
+  // panel falls back to the raw landed figures when these are absent.
+  verified_landed_count?: number;
+  verified_landed_rate?: number | null;
+  total_cost_usd: number;
+  // Priced LLM dollars per VERIFIED PR that landed; null when nothing
+  // verified-landed (or the bucket is unpriced).
+  cost_per_merge: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  llm_call_count: number;
+  // Token-bearing ("priceable") runs split by whether the (provider, model)
+  // combo has a pricing entry. Unpriced runs contribute 0 cost.
+  priced_run_count: number;
+  unpriced_run_count: number;
+  unpriced_coverage_fraction: number | null;
+}
+
+// Which actual models a requested effort tier ran on (requested-vs-actual
+// divergence — e.g. a high-effort run that fell back to a cheaper model).
+export interface EfficiencyResolvedModel {
+  provider: string;
+  model: string;
+  run_count: number;
+  landed_count: number;
+  priced: boolean;
+}
+
+export interface EffortEfficiencyRow extends EfficiencyBucket {
+  effort: string;
+  resolved_models: EfficiencyResolvedModel[];
+}
+
+export interface ModelEfficiencyRow extends EfficiencyBucket {
+  provider: string;
+  model: string;
+  priced: boolean;
+}
+
+// Aggregated model-fallback (downgrade) records: a requested model resolved to
+// a different effective model (preview->GA, rate-limit fallback, etc.).
+export interface EfficiencyFallbackCombo {
+  requested: string;
+  effective: string;
+  provider: string;
+  reason: string;
+  count: number;
+}
+
+export interface EffortModelEfficiency {
+  by_effort: EffortEfficiencyRow[];
+  by_model: ModelEfficiencyRow[];
+  totals: EfficiencyBucket;
+  unpriced_combos: string[];
+  fallbacks: {
+    total: number;
+    combos: EfficiencyFallbackCombo[];
+  };
+}
+
+// Dependency/foundation-resolution observability (read-only). Mirrors the
+// backend `compute_dependency_health_signals` return shape: parked blockers
+// (BLOCKED/held tasks pushed off the recovery queue), duplicate-foundation
+// candidates (two tasks independently building the same files), and
+// unresumable cancellations (blocked dependents given up on). Each block
+// carries a total plus a capped list for operator drill-down.
+export interface ParkedBlockerTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  blocker_kind: string | null;
+  blocked_reason: string | null;
+  blocked_at: string | null;
+  recheck_after: string | null;
+  direction_id?: string | null;
+}
+export interface DuplicateFoundationCandidate {
+  task_ids: string[];
+  overlap_ratio: number;
+  shared_files: string[];
+}
+export interface UnresumableCancellationTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  give_up_class: string;
+  need?: string | null;
+  direction_id?: string | null;
+  at: string | null;
+}
+// Live currently-BLOCKED population — the healthy waiting set (includes
+// not-yet-escalated dependents). Mirrors backend compute_live_blocked_summary.
+export interface LiveBlockedTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  blocker_kind: string | null;
+  blocked_reason: string | null;
+  blocked_at: string | null;
+  age_bucket: string;
+  direction_id?: string | null;
+}
+// A blocked dependent that successfully RESUMED when its foundation landed.
+// Mirrors backend compute_blocked_resume_summary.
+export interface BlockedResumeTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  resolved_by: string;
+  foundation?: string | null;
+  direction_id?: string | null;
+  at: string | null;
+}
+export interface DependencyHealthSignals {
+  parked_blockers: { total: number; tasks: ParkedBlockerTask[] };
+  duplicate_foundation_candidates: { total: number; candidates: DuplicateFoundationCandidate[] };
+  unresumable_cancellations: {
+    total: number;
+    by_class?: Record<string, number>;
+    by_direction?: Record<string, number>;
+    tasks: UnresumableCancellationTask[];
+  };
+  // Affirmative health signals (additive). live_blocked: the current BLOCKED
+  // population with coarse age bucketing; resumes: successful blocked-dependent
+  // resumes over the digest window with an edge-vs-completed breakdown.
+  live_blocked?: {
+    total: number;
+    by_age?: Record<string, number>;
+    tasks: LiveBlockedTask[];
+  };
+  resumes?: {
+    total: number;
+    by_resolved_by?: Record<string, number>;
+    by_direction?: Record<string, number>;
+    tasks: BlockedResumeTask[];
+  };
+  finding_structural_give_up?: {
+    total: number;
+    by_reason: Record<string, number>;
+    by_direction: Record<string, number>;
+    findings: FindingStructuralGiveUpItem[];
+  };
+  // Stranded capability/foundation prerequisites surfaced as missing-foundation
+  // demand. Mirrors backend compute_missing_capability_demand_summary: distinct
+  // demand total, the still_blocked-vs-already_cancelled split, a per-direction
+  // demand count, and a bounded largest-demand-first sample.
+  missing_capability_demand?: {
+    total: number;
+    still_blocked: number;
+    already_cancelled: number;
+    by_direction: Record<string, number>;
+    demands: MissingCapabilityDemand[];
+  };
+}
+
+// A single stranded capability/foundation prerequisite aggregated across the
+// dependents that need it. Mirrors a capability_demand demand entry.
+export interface MissingCapabilityDemand {
+  kind: string;
+  ref: string | null;
+  label: string | null;
+  dependent_count: number;
+  still_blocked: number;
+  already_cancelled: number;
+  sample_task_ids: string[];
+  direction_ids: string[];
+  oldest_blocked_at: string | null;
+  max_parked_reevals: number;
+}
+
 export interface DigestData<DP = unknown> {
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
   pending_approval_count: number;
   direction_progress?: DP[];
+  direction_portfolio?: DirectionPortfolio;
   recent_completions?: RecentCompletion[];
   failure_groups?: FailureGroup[];
 
@@ -149,14 +365,6 @@ export interface DigestData<DP = unknown> {
   overall_product_ratio?: number | null;
   pipeline_conversion_rate?: number | null;
   pipeline_acceptance_rate?: number | null;
-  // Generalized (cross-task-type) success rolled up across all directions.
-  // `pipeline_generalized_successes` counts every evaluator-positive terminal
-  // outcome (code merges + research/audit/memo/verification successes);
-  // `pipeline_generalized_health_rate` is successes / terminal outcomes. The
-  // per-kind breakdown drives the dual-metric summary alongside PR merges.
-  pipeline_generalized_successes?: number | null;
-  pipeline_generalized_health_rate?: number | null;
-  pipeline_outcome_kind_breakdown?: OutcomeKindBreakdown | null;
   overall_type_distribution?: Record<string, number> | null;
   narrative_summary?: string | null;
   latest_cycle?: LatestCycle | null;
@@ -180,6 +388,22 @@ export interface DigestData<DP = unknown> {
   cost_by_failure_class?: Record<string, number> | null;
   total_failed_cost_usd?: number | null;
   median_cost_per_merged_pr?: number | null;
+  // Per-task-type cost-per-merge attribution: total VM cost / merged-PR count
+  // for each task type, with exceeds_threshold flagging types whose CPM runs
+  // far above the per-type median. Consumed by CatchUpCostDiagnosticsSection.
+  cost_per_merge_by_type?: Record<
+    string,
+    {
+      total_cost_usd: number;
+      merged_count: number;
+      cost_per_merge: number | null;
+      exceeds_threshold: boolean;
+    }
+  > | null;
+  median_cost_per_merge_by_type?: number | null;
+  // Per-effort-tier / per-actual-model efficiency rollup (additive; absent on
+  // older backends that predate compute_effort_model_efficiency).
+  effort_model_efficiency?: EffortModelEfficiency | null;
 
   // ----- scope conversion -----
   scope_conversion_rates?: ScopeConversionRates | null;
@@ -232,6 +456,8 @@ export interface DigestData<DP = unknown> {
   } | null;
 
   // ----- operational health (catch-up) -----
+  merge_gate_fleet_health?: MergeGateFleetHealth | null;
+  dependency_health_signals?: DependencyHealthSignals | null;
   migration_health?: {
     current_schema_revision: string | null;
     migration_tasks_in_window: number;
@@ -239,6 +465,23 @@ export interface DigestData<DP = unknown> {
     migration_tasks_failed: number;
     migration_errors_in_window: number;
     auto_generated_migrations: number;
+    migration_slot_contention?: {
+      status: 'idle' | 'held' | 'contention' | 'elevated';
+      severity: 'info' | 'warning' | 'critical';
+      holder: {
+        task_id: string;
+        title: string | null;
+        started_at: string | null;
+        hold_seconds: number | null;
+      } | null;
+      deferred_count: number;
+      longest_wait: {
+        task_id: string;
+        title: string | null;
+        waiting_since: string | null;
+        wait_seconds: number | null;
+      } | null;
+    };
   } | null;
   prevention_efficacy?: {
     preventive_tasks_created: number;

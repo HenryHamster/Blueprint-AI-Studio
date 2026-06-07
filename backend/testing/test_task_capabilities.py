@@ -15,6 +15,7 @@ from app.task_capabilities import (
     EVALUATION_STRATEGY_BY_TASK_TYPE,
     FILTER_VISIBLE_TASK_TYPES,
     PERIODIC_TASK_TYPES,
+    PLAN_KNOWLEDGE_SUBTASK_TYPES,
     PLAN_SUBTASK_TYPES,
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
@@ -61,6 +62,7 @@ def test_task_capability_ui_subsets_only_reference_known_types():
         "research",
         "migrate",
         "refactor",
+        "investigate",
         "web_research",
         "design",
     )
@@ -351,6 +353,35 @@ def test_plan_subtask_types_derived_from_registry():
     from app import plan_completion
 
     assert plan_completion.PLAN_SUBTASK_TYPES is PLAN_SUBTASK_TYPES
+
+
+def test_plan_knowledge_subtask_types_derived_from_registry():
+    """PLAN_KNOWLEDGE_SUBTASK_TYPES is the single source of truth for the
+    plan-decomposition KNOWLEDGE-prerequisite child allowlist. It must be
+    registry-derived from ``plan_knowledge_prereq_eligible``, equal exactly
+    {web_research, design}, be DISJOINT from PLAN_SUBTASK_TYPES (knowledge
+    prereqs are NOT PR-producing implementation subtypes), and neither type may
+    appear in WRITE_TASK_TYPES or PRODUCT_TASK_TYPES."""
+    expected = {
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.plan_knowledge_prereq_eligible
+    }
+    assert frozenset(expected) == PLAN_KNOWLEDGE_SUBTASK_TYPES
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES == {"web_research", "design"}
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES.issubset(ALL_TASK_TYPES)
+    # Disjoint from the PR-producing implementation allowlist — knowledge
+    # prereqs must NOT be classified as PR-producing subtypes.
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES.isdisjoint(PLAN_SUBTASK_TYPES)
+    # Neither type produces a branch/PR or ships product value.
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES.isdisjoint(PRODUCT_TASK_TYPES)
+    # The plan-completion handler gates on this exact registry object.
+    from app import plan_completion
+
+    assert (
+        plan_completion.PLAN_KNOWLEDGE_SUBTASK_TYPES is PLAN_KNOWLEDGE_SUBTASK_TYPES
+    )
 
 
 def test_task_capability_contract_covers_every_registered_type():

@@ -29,7 +29,7 @@ unchanged.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -38,6 +38,10 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
 from app.models import Project, QualificationVerdict
+from app.release_artifacts import (
+    BACKEND_REVISION_ARTIFACT_KIND,
+    get_or_create_release_deploy_artifact,
+)
 from app.notification_dispatch import post_event_message
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -46,6 +50,19 @@ from app.shared_state import (
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+# Post-promotion serving-confirmation window.  A promotion is recorded the
+# instant the candidate merges, but it stays PROVISIONAL (serving_status=
+# "unconfirmed") until deploy_health confirms the promoted SHA is actually
+# serving.  This bounds how long the confirmation sweep waits before declaring
+# the deploy failed.  It composes with the two existing backstops: it is well
+# inside the 24h promotion-pending cap and the 6h qualification-timeout, and is
+# set just past the deploy_health MONITORING→STABLE window
+# (``_DEPLOY_MONITORING_DEFER_WINDOW`` = 30 min) so a healthy new revision has
+# time to boot and stabilize before the deadline, while a boot-crashed deploy
+# surfaces as a loud failure within an hour.
+_DEPLOY_CONFIRM_WINDOW_SECONDS = 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +278,16 @@ async def _record_qualification_verdict(
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
+        # Promotion-attempt context (set only on the promotion_failed / promoted
+        # paths, where _record_promotion_failure/_success fold pr_url / conflict
+        # / error / detail into the record before passing it here).
+        conflict = base_record.get("conflict")
+        error = base_record.get("error")
+        detail = base_record.get("detail")
+        if error and detail:
+            promotion_error_detail = f"{error}: {detail}"
+        else:
+            promotion_error_detail = detail or error or None
         verdict = QualificationVerdict(
             project_id=version.project_id,
             release_version_id=version.id,
@@ -285,6 +312,25 @@ async def _record_qualification_verdict(
             ),
             started_at=_parse_iso_dt(base_record.get("started_at")),
             finalized_at=_parse_iso_dt(base_record.get("finalized_at")),
+            # Per-attempt evidence mirrored from last_qualification — durably
+            # retained so a re-qualification overwrite of last_qualification no
+            # longer drops the blocked/held attempt's migration-safety verdicts,
+            # findings, and gate detail.  Keys match _finalize_qualification's
+            # base_record exactly.
+            migration_safety=base_record.get("migration_safety"),
+            migration_safety_detail=base_record.get("migration_safety_detail"),
+            migration_apply_safety=base_record.get("migration_apply_safety"),
+            migration_apply_safety_detail=base_record.get(
+                "migration_apply_safety_detail"
+            ),
+            audit_findings=base_record.get("audit_findings"),
+            excluded_audit_findings=base_record.get("excluded_audit_findings"),
+            test_erosion_detail=base_record.get("test_erosion_detail"),
+            smoketest_detail=base_record.get("smoketest_detail"),
+            audit_reconciliation=base_record.get("audit_reconciliation"),
+            promotion_pr_url=base_record.get("pr_url"),
+            promotion_conflict=(conflict if isinstance(conflict, bool) else None),
+            promotion_error_detail=promotion_error_detail,
         )
         # Flush the caller's staged mutations into the outer transaction first,
         # so the savepoint below isolates ONLY the verdict INSERT.
@@ -1521,6 +1567,29 @@ async def _record_promotion_success(
     version.status = "promoted"
     version.promoted_at = now
     version.promoted_sha = effective_sha
+    # Post-promotion serving confirmation: the merge landed, but the promotion
+    # is PROVISIONAL until deploy_health confirms the promoted SHA is actually
+    # serving in production.  Mark it "unconfirmed" and stamp a bounded
+    # confirmation deadline; the periodic release sweep resolves it to
+    # "serving_confirmed" or "deploy_failed".  Only the self-repo's deploy is
+    # observable via the DeploymentState singleton — for other projects leave
+    # serving_status NULL (NA) so the sweep never strands them waiting on a
+    # signal it cannot read.
+    if getattr(_record_project, "is_self_repo", False):
+        version.serving_status = "unconfirmed"
+        version.served_sha = None
+        version.served_at = None
+        version.deploy_failure_reason = None
+        version.deploy_confirm_alerted_at = None
+        version.deploy_confirm_deadline = now + timedelta(
+            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+        )
+        await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            BACKEND_REVISION_ARTIFACT_KIND,
+            confirmation_deadline=version.deploy_confirm_deadline,
+        )
     session.add(version)
     # Phase 4: durable verdict-history row for a successful promotion.  This
     # only ever runs with promotion enabled (the dry_run branch returns earlier).

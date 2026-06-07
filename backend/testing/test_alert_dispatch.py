@@ -320,3 +320,91 @@ async def test_unverified_merge_alert_dispatches_external_notification(
     assert args[1] == "MERGE_UNVERIFIED"
     assert args[2]["pr_number"] == 99
     assert args[2]["reason"] == "kill_switch_off"
+
+
+# ── Fleet-wide merge-gate verification degradation alert ─────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _MERGE_GATE_DEGRADATION_ALERT_TITLE,
+    _maybe_create_merge_gate_degradation_alerts,
+)
+
+
+async def _degradation_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title == _MERGE_GATE_DEGRADATION_ALERT_TITLE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_degradation_alert_creates_and_broadcasts(db_session, mocker):
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_merge_gate_degradation_alerts(
+        db_session,
+        verification_rate=0.3,
+        verified_count=3,
+        fell_open_count=7,
+        degraded_project_count=4,
+        project_count=5,
+        most_common_reason="verify_setup_failed",
+        severity=AlertSeverity.ERROR,
+    )
+    await db_session.commit()
+
+    alerts = await _degradation_alerts(db_session, project.id)
+    assert created == 1
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    # Dominant fall-open reason is rendered via its human-readable label.
+    assert _UNVERIFIED_REASON_LABELS["verify_setup_failed"] in alerts[0].message
+    assert "30% verified" in alerts[0].message
+    assert "4 of 5 projects are degraded" in alerts[0].message
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_degradation_alert_dedups_on_stable_title(db_session, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await _maybe_create_merge_gate_degradation_alerts(
+        db_session,
+        verification_rate=0.3,
+        verified_count=3,
+        fell_open_count=7,
+        degraded_project_count=4,
+        project_count=5,
+        most_common_reason="verify_setup_failed",
+        severity=AlertSeverity.ERROR,
+    )
+    await db_session.commit()
+    # A later tick with DIFFERENT drifting numbers must still dedup on the
+    # stable title — a moving metric never defeats dedup.
+    second = await _maybe_create_merge_gate_degradation_alerts(
+        db_session,
+        verification_rate=0.25,
+        verified_count=2,
+        fell_open_count=8,
+        degraded_project_count=6,
+        project_count=7,
+        most_common_reason="no_detectable_test_command",
+        severity=AlertSeverity.WARNING,
+    )
+    await db_session.commit()
+
+    assert first == 1
+    assert second == 0  # deduped on stable title
+    alerts = await _degradation_alerts(db_session, project.id)
+    assert len(alerts) == 1

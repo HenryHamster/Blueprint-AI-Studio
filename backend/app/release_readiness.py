@@ -2,6 +2,25 @@
 
 Provides the operator-facing readiness verdict (whether promotion is ready) based
 on recent dry-run qualification history, plus formatting helpers for API responses.
+
+GROUND-TRUTH: the ``would_promote_rate`` signal is a *self-approval* track
+record — ``would_promote`` is the qualifier's own confidence >= threshold, so
+that rate is just how often the qualifier approved itself. It is NOT a measured
+precision on its own.
+
+A real ground truth IS now recorded, however: each promoted verdict's deploy is
+resolved post-promotion and stamped onto ``QualificationVerdict.post_promotion_outcome``
+(``serving_confirmed`` | ``deploy_failed`` | ``unconfirmed``) by
+release_reconciliation. From the resolved subset
+(``terminal_status == "promoted"`` and outcome in {serving_confirmed,
+deploy_failed}) we derive ``validated_precision = serving_confirmed /
+(serving_confirmed + deploy_failed)`` — a true post-promotion precision that
+augments (never replaces) the self-approval rate. It is surfaced alongside the
+self-approval keys, and ``ground_truth_validated`` flips True ONLY once the
+resolved-outcome sample reaches ``_READINESS_MIN_RESOLVED_OUTCOMES``. Below that
+the validated precision is still reported but ``ground_truth_validated`` stays
+False and the ``caveat`` keeps the honest "self-approval only" framing so no
+consumer over-claims on a thin sample.
 """
 
 from __future__ import annotations
@@ -13,6 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import QualificationVerdict, ReleaseVersion
+from app.shared_state import resolve_project_promotion_enabled
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -40,6 +60,116 @@ _READINESS_RECURRING_BLOCKER_MIN = 2
 # a hard readiness gate).
 _READINESS_CONFIDENCE_STDEV_MAX = 0.15
 
+# Honest framing of what this signal can and cannot assert. ``would_promote`` is
+# the qualifier's own confidence >= threshold, so the rate is self-referential:
+# no post-promotion outcome is recorded against which a true precision could be
+# computed. Surfaced to every consumer so none of them claims "trustworthy".
+_READINESS_GROUND_TRUTH_CAVEAT = (
+    "self-approval only — no post-promotion serving outcome has resolved yet, "
+    "so this is the rate at which the qualifier approved itself, not a measured "
+    "precision"
+)
+
+# Minimum number of RESOLVED post-promotion outcomes (serving_confirmed or
+# deploy_failed) before the derived ``validated_precision`` is trusted as a real
+# ground truth. Below this the precision is still reported but
+# ``ground_truth_validated`` stays False and the caveat keeps self-approval framing.
+_READINESS_MIN_RESOLVED_OUTCOMES = 5
+
+
+def _readiness_caveat(validated: dict[str, Any]) -> str:
+    """Build the ground-truth caveat from the validated-precision aggregate.
+
+    Keeps the honest "self-approval only" framing until enough post-promotion
+    outcomes have resolved; once validated, states the measured precision.
+    """
+    sample = validated["resolved_outcome_sample"]
+    if validated["ground_truth_validated"]:
+        return (
+            f"ground-truth validated — post-promotion serving outcome is "
+            f"recorded; validated precision "
+            f"{validated['validated_precision']:.2f} over {sample} resolved "
+            f"promotion(s) ({validated['serving_confirmed_count']} "
+            f"serving-confirmed, {validated['deploy_failed_count']} "
+            f"deploy-failed), augmenting the qualifier self-approval rate"
+        )
+    if sample > 0:
+        return (
+            f"self-approval only for now — post-promotion outcome IS recorded "
+            f"but only {sample} resolved promotion(s) so far (need >= "
+            f"{_READINESS_MIN_RESOLVED_OUTCOMES} to validate precision); the "
+            f"would-promote rate is the qualifier approving itself, not yet a "
+            f"measured precision"
+        )
+    return _READINESS_GROUND_TRUTH_CAVEAT
+
+
+async def _compute_validated_precision(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, Any]:
+    """Derive ground-truth qualifier precision from resolved post-promotion outcomes.
+
+    Considers only verdicts that actually promoted
+    (``terminal_status == "promoted"``) whose serving outcome has RESOLVED to
+    ``serving_confirmed`` or ``deploy_failed`` (``unconfirmed``/NULL ignored).
+    Returns the precision, the resolved sample size, the per-outcome counts, and
+    a ``ground_truth_validated`` flag set only when the sample meets the minimum.
+
+    NOTE: this query is intentionally NOT restricted to the dry-run regime —
+    promoted verdicts are recorded with ``promotion_enabled`` True, and the
+    post-promotion precision is precisely the live-regime signal the dry-run
+    window cannot see.
+    """
+    stmt = select(QualificationVerdict.post_promotion_outcome).where(
+        QualificationVerdict.project_id == project_id,
+        QualificationVerdict.terminal_status == "promoted",
+        QualificationVerdict.post_promotion_outcome.in_(
+            ("serving_confirmed", "deploy_failed")
+        ),
+    )
+    outcomes = list((await session.execute(stmt)).scalars().all())
+    serving_confirmed = sum(1 for o in outcomes if o == "serving_confirmed")
+    deploy_failed = sum(1 for o in outcomes if o == "deploy_failed")
+    sample = serving_confirmed + deploy_failed
+    validated_precision = round(serving_confirmed / sample, 4) if sample else None
+    return {
+        "validated_precision": validated_precision,
+        "resolved_outcome_sample": sample,
+        "serving_confirmed_count": serving_confirmed,
+        "deploy_failed_count": deploy_failed,
+        "ground_truth_validated": sample >= _READINESS_MIN_RESOLVED_OUTCOMES,
+    }
+
+# The readiness window is hardcoded to DRY-RUN-regime verdicts (promotion_enabled
+# is False) — sensible pre-go-live calibration, but stale once promotion goes
+# live, because live promote/promotion-failed verdicts are recorded with
+# promotion ENABLED and never enter this window. So once promotion is effectively
+# enabled for the project, this summary is pre-go-live history, NOT current
+# readiness, and must be labeled as such instead of frozen on aging dry-runs.
+_READINESS_LIVE_REGIME_NOTE = (
+    "promotion is live for this project — this is a pre-go-live dry-run "
+    "calibration window, not current readiness; it stopped receiving verdicts "
+    "when promotion was enabled (live outcomes are recorded with promotion on)"
+)
+
+
+def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, Any]:
+    """Stamp the promotion regime onto a readiness summary.
+
+    ``is_current_readiness`` is True only in the dry-run (pre-go-live) regime the
+    window actually measures. Once promotion is effectively enabled the window is
+    frozen on stale dry-runs, so we relabel it as a pre-go-live calibration window
+    and force ``ready`` False — a stale dry-run streak must never read as a live
+    'ready' signal.
+    """
+    out["promotion_enabled"] = promotion_enabled
+    out["regime"] = "live" if promotion_enabled else "pre_go_live_calibration"
+    out["is_current_readiness"] = not promotion_enabled
+    if promotion_enabled:
+        out["ready"] = False
+        out["reason"] = _READINESS_LIVE_REGIME_NOTE
+    return out
+
 
 def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     """Return an operator-facing summary of a ``last_qualification`` record."""
@@ -57,7 +187,16 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
-    """Return an operator-facing dict for a single QualificationVerdict row."""
+    """Return an operator-facing dict for a single QualificationVerdict row.
+
+    Surfaces the durable per-attempt evidence columns (migration-safety
+    verdicts + detail, audit findings, excluded findings, erosion / smoketest /
+    reconciliation detail, and promotion-attempt context) directly from the
+    immutable verdict row, so operators read the attempt's own evidence instead
+    of whatever survives in the latest ``last_qualification`` overwrite.  All
+    evidence keys are additive and may be ``None`` on legacy rows that predate
+    the evidence columns.
+    """
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -65,6 +204,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "confidence": verdict.confidence,
         "sub_scores": verdict.sub_scores,
         "blocker": verdict.blocker,
+        "audit_missing_reason": verdict.audit_missing_reason,
         "would_promote": verdict.would_promote,
         "promotion_enabled": verdict.promotion_enabled,
         "terminal_status": verdict.terminal_status,
@@ -77,6 +217,28 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         if verdict.finalized_at
         else None,
         "created_at": verdict.created_at.isoformat(),
+        # Post-promotion serving outcome — how this verdict's promotion actually
+        # played out (serving_confirmed / deploy_failed / unconfirmed); null
+        # until recorded.
+        "post_promotion_outcome": verdict.post_promotion_outcome,
+        "post_promotion_outcome_at": (
+            verdict.post_promotion_outcome_at.isoformat()
+            if verdict.post_promotion_outcome_at
+            else None
+        ),
+        # --- Durable per-attempt evidence (additive; nullable on legacy rows) --
+        "migration_safety": verdict.migration_safety,
+        "migration_safety_detail": verdict.migration_safety_detail,
+        "migration_apply_safety": verdict.migration_apply_safety,
+        "migration_apply_safety_detail": verdict.migration_apply_safety_detail,
+        "audit_findings": verdict.audit_findings,
+        "excluded_audit_findings": verdict.excluded_audit_findings,
+        "test_erosion_detail": verdict.test_erosion_detail,
+        "smoketest_detail": verdict.smoketest_detail,
+        "audit_reconciliation": verdict.audit_reconciliation,
+        "promotion_pr_url": verdict.promotion_pr_url,
+        "promotion_conflict": verdict.promotion_conflict,
+        "promotion_error_detail": verdict.promotion_error_detail,
     }
 
 
@@ -85,8 +247,23 @@ def _empty_readiness(
     *,
     infra_failure_count: int = 0,
     consecutive_infra_errors: int = 0,
+    validated: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The not-ready summary returned when there is no verdict history yet."""
+    """The not-ready summary returned when there is no verdict history yet.
+
+    ``validated`` carries the ground-truth post-promotion precision aggregate
+    (see :func:`_compute_validated_precision`); the no-history self-approval
+    window is empty, but resolved post-promotion outcomes may still exist, so the
+    validated keys are surfaced here too to keep the dict shape stable.
+    """
+    if validated is None:
+        validated = {
+            "validated_precision": None,
+            "resolved_outcome_sample": 0,
+            "serving_confirmed_count": 0,
+            "deploy_failed_count": 0,
+            "ground_truth_validated": False,
+        }
     return {
         "ready": False,
         "reason": "no qualification verdicts recorded yet — nothing to evaluate",
@@ -106,14 +283,35 @@ def _empty_readiness(
         "recurring_blockers": {},
         "blocker_counts": {},
         "thresholds": thresholds,
+        "validated_precision": validated["validated_precision"],
+        "resolved_outcome_sample": validated["resolved_outcome_sample"],
+        "serving_confirmed_count": validated["serving_confirmed_count"],
+        "deploy_failed_count": validated["deploy_failed_count"],
+        "ground_truth_validated": validated["ground_truth_validated"],
+        "caveat": _readiness_caveat(validated),
+        "promotion_enabled": False,
+        "regime": "pre_go_live_calibration",
+        "is_current_readiness": True,
     }
 
 
 async def compute_promotion_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    promotion_enabled: bool | None = None,
 ) -> dict[str, Any]:
-    """Summarize the dry-run qualification track record into a readiness verdict."""
+    """Summarize the dry-run qualification track record into a readiness verdict.
+
+    ``promotion_enabled`` is the project's EFFECTIVE live-promotion gate; it is
+    resolved from runtime config when not supplied. The dry-run window this
+    function evaluates only reflects *current* readiness while promotion is OFF —
+    once it is on, the window is frozen pre-go-live history (see
+    :func:`_annotate_regime`), so callers get ``regime``/``is_current_readiness``
+    flags and a relabeled, not-ready summary rather than a stale 'ready' number.
+    """
+    if promotion_enabled is None:
+        promotion_enabled = resolve_project_promotion_enabled(project_id)
     thresholds: dict[str, Any] = {
         "min_verdicts": _READINESS_MIN_VERDICTS,
         "min_clean_streak": _READINESS_MIN_CLEAN_STREAK,
@@ -159,18 +357,21 @@ async def compute_promotion_readiness(
     )
     verdicts = list((await session.execute(stmt)).scalars().all())
 
+    validated = await _compute_validated_precision(session, project_id)
+
     evaluated = len(verdicts)
     if evaluated == 0:
         out = _empty_readiness(
             thresholds,
             infra_failure_count=infra_failure_count,
             consecutive_infra_errors=consecutive_infra_errors,
+            validated=validated,
         )
         if infra_failure_count:
             out["reason"] = (
                 "recent qualifications have been infrastructure failures, not quality findings"
             )
-        return out
+        return _annotate_regime(out, promotion_enabled)
 
     would_promote_count = sum(1 for v in verdicts if v.would_promote)
     would_promote_rate = round(would_promote_count / evaluated, 4)
@@ -228,14 +429,16 @@ async def compute_promotion_readiness(
     ready = not reasons
     if ready:
         reason = (
-            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
-            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
-            f"consecutive clean passes, no recurring blockers"
+            f"qualifier self-approval streak clears thresholds: "
+            f"{would_promote_count}/{evaluated} would-promote "
+            f"(self-approval rate {would_promote_rate:.2f}), {consecutive_clean} "
+            f"consecutive clean passes, no recurring blockers. "
+            f"NOTE: {_readiness_caveat(validated)}"
         )
     else:
         reason = "; ".join(reasons)
 
-    return {
+    return _annotate_regime({
         "ready": ready,
         "reason": reason,
         "verdicts_evaluated": evaluated,
@@ -254,4 +457,10 @@ async def compute_promotion_readiness(
         "recurring_blockers": recurring_blockers,
         "blocker_counts": blocker_counts,
         "thresholds": thresholds,
-    }
+        "validated_precision": validated["validated_precision"],
+        "resolved_outcome_sample": validated["resolved_outcome_sample"],
+        "serving_confirmed_count": validated["serving_confirmed_count"],
+        "deploy_failed_count": validated["deploy_failed_count"],
+        "ground_truth_validated": validated["ground_truth_validated"],
+        "caveat": _readiness_caveat(validated),
+    }, promotion_enabled)

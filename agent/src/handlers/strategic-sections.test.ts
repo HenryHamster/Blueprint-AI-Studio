@@ -573,6 +573,117 @@ describe('buildOpenMessagesText', () => {
     expect(result).toContain('id: x1');
     expect(result).toContain('hello');
   });
+
+  it('renders a STALE warning naming broken and ungrounded refs for an absent-citation bug report', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'b1',
+        type: 'BUG_REPORT',
+        content: 'something is broken',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'absent',
+        broken_refs: ['backend/app/x.py'],
+        ungrounded_refs: ['backend/app/y.py:foo'],
+      },
+    ]);
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('files backend/app/x.py');
+    expect(result).toContain('symbols backend/app/y.py:foo');
+    expect(result).toContain('do NOT route into a fix/investigation');
+    // base line still rendered unchanged
+    expect(result).toContain('[BUG_REPORT]');
+    expect(result).toContain('id: b1');
+  });
+
+  it('does NOT render a STALE warning for a message with no citation_state', () => {
+    const result = buildOpenMessagesText([
+      { id: 'x2', type: 'BUG_REPORT', content: 'still broken', from: 'agent', created_at: new Date().toISOString() },
+    ]);
+    expect(result).not.toContain('STALE');
+    expect(result).toContain('[BUG_REPORT]');
+  });
+
+  it('does NOT render a STALE warning for a present citation_state', () => {
+    const result = buildOpenMessagesText([
+      { id: 'x3', type: 'BUG_REPORT', content: 'present', from: 'agent', created_at: new Date().toISOString(), citation_state: 'present' },
+    ]);
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders a PARTIALLY GROUNDED advisory (not STALE) for a mixed present-citation report with refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm1',
+        type: 'BUG_REPORT',
+        content: 'partially grounded',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'present',
+        broken_refs: ['backend/app/x.py'],
+        ungrounded_refs: ['backend/app/y.py:foo'],
+      },
+    ]);
+    expect(result).toContain('⚠ PARTIALLY GROUNDED');
+    expect(result).toContain('files backend/app/x.py');
+    expect(result).toContain('symbols backend/app/y.py:foo');
+    // Mixed reports stay actionable — no stale-discount language.
+    expect(result).not.toContain('STALE');
+    expect(result).not.toContain('do NOT route');
+    expect(result).toContain('routing is allowed');
+  });
+
+  it('renders a PARTIALLY GROUNDED advisory for an indeterminate report with refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm2',
+        type: 'BLOCKER',
+        content: 'could not verify some refs',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'indeterminate',
+        broken_refs: ['backend/app/z.py'],
+      },
+    ]);
+    expect(result).toContain('⚠ PARTIALLY GROUNDED');
+    expect(result).toContain('files backend/app/z.py');
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders no advisory for a present citation_state with no refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm3',
+        type: 'BUG_REPORT',
+        content: 'fully grounded',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'present',
+        broken_refs: [],
+        ungrounded_refs: [],
+      },
+    ]);
+    expect(result).not.toContain('STALE');
+    expect(result).not.toContain('PARTIALLY GROUNDED');
+  });
+
+  it('renders the STALE marker without a ref list when ref arrays are empty', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'b2',
+        type: 'BLOCKER',
+        content: 'gone',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'absent',
+        broken_refs: [],
+        ungrounded_refs: [],
+      },
+    ]);
+    expect(result).toContain('⚠ STALE — cited code gone on HEAD.');
+    expect(result).not.toContain('files ');
+    expect(result).not.toContain('symbols ');
+  });
 });
 
 describe('buildDirSummaryText', () => {
@@ -683,5 +794,71 @@ describe('buildDirHealthSummary', () => {
     ];
     const result = buildDirHealthSummary(dirs, 10);
     expect(result).toContain('Paused: 2 (1 auto, 1 user)');
+  });
+
+  it('anchors headline count and slots on authoritative count when list is dropped', () => {
+    // directions_summary fully dropped under budget, but the authoritative
+    // count says 12 active against a real ceiling of 15.
+    const result = buildDirHealthSummary([], 15, { active: 12, paused: 1 });
+    expect(result).toContain('Active: 12/15 slots used (3 available)');
+    expect(result).not.toContain('BELOW_MINIMUM');
+    // Cannot prove product absence / saturation from an empty list — suppressed.
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+    expect(result).toContain('Showing 0 of 12 active directions');
+    expect(result).toContain('Paused: 1');
+  });
+
+  it('does not emit BELOW_MINIMUM when authoritative count >= 3 but list trimmed below it', () => {
+    // Only 2 detail rows shipped, but the true active count is 8.
+    const dirs = [
+      { status: 'active', category: 'product', possibly_saturated: false },
+      { status: 'active', category: 'structural', possibly_saturated: false },
+    ];
+    const result = buildDirHealthSummary(dirs, 15, { active: 8, paused: 0 });
+    expect(result).toContain('Active: 8/15 slots used (7 available)');
+    expect(result).not.toContain('BELOW_MINIMUM');
+    expect(result).toContain('Showing 2 of 8 active directions');
+  });
+
+  it('still flags BELOW_MINIMUM when authoritative count is genuinely low', () => {
+    const result = buildDirHealthSummary([], 15, { active: 1, paused: 0 });
+    expect(result).toContain('Active: 1/15');
+    expect(result).toContain('BELOW_MINIMUM');
+  });
+
+  it('falls back to shipped list when authoritative count is absent', () => {
+    const dirs = [
+      { status: 'active', category: 'product', possibly_saturated: false },
+      { status: 'active', category: 'structural', possibly_saturated: false },
+      { status: 'active', category: 'product', possibly_saturated: false },
+    ];
+    const result = buildDirHealthSummary(dirs, 10);
+    expect(result).toContain('3/10 slots used (7 available)');
+    expect(result).not.toContain('Showing');
+  });
+});
+
+describe('buildDirSummaryText authoritative count', () => {
+  it('does not render "No directions exist yet." when count>0 but list dropped', () => {
+    const result = buildDirSummaryText([], 9);
+    expect(result).not.toContain('No directions exist yet.');
+    expect(result).toContain('9 active direction(s) exist');
+    expect(result).toContain('./fetch direction');
+  });
+
+  it('renders "No directions exist yet." when count is genuinely zero', () => {
+    expect(buildDirSummaryText([], 0)).toBe('No directions exist yet.');
+    expect(buildDirSummaryText([])).toBe('No directions exist yet.');
+  });
+
+  it('shows trimmed "M of N" header when list shorter than authoritative count', () => {
+    const dirs = [
+      { id: 'd1', status: 'active', text: 'Dir one', total_cycles: 1 },
+      { id: 'd2', status: 'active', text: 'Dir two', total_cycles: 1 },
+    ];
+    const result = buildDirSummaryText(dirs, 9);
+    expect(result).toContain('Showing 2 of 9 active directions');
+    expect(result).toContain('Dir one');
   });
 });

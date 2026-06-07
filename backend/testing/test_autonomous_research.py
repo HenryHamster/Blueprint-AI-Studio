@@ -34,6 +34,8 @@ from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+from app.capability_demand import collect_missing_capability_demand
+from app.payload_schemas import validate_internal_payload
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -183,6 +185,162 @@ async def _make_research_task(
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. _spawn_research_task — Circuit Breaker Guards
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_research_payload_includes_knowledge_index_scoped_to_direction(
+    db_session,
+):
+    """A spawned research task carries the compact knowledge index, with the
+    chosen direction's documents surfaced first."""
+    from app.models import KnowledgeDocument
+
+    project = Project(
+        name="Knowledge Index Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-ki-research")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src = Task(
+        project_id=project.id,
+        title="src",
+        payloads=[{"type": "web_research", "topic": "t", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(src)
+    await db_session.commit()
+    await db_session.refresh(src)
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=src.id,
+            title="Existing knowledge",
+            summary="A prior document.",
+            body="# Body\n\n" + ("x" * 50),
+            topic="auth",
+            direction_id="d-ki-research",
+            source_kind="web_research",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    assert "knowledge_index" in payload
+    entry = payload["knowledge_index"][0]
+    assert entry["title"] == "Existing knowledge"
+    assert entry["direction_id"] == "d-ki-research"
+    assert "body" not in entry
+
+
+@pytest.mark.asyncio
+async def test_autonomous_research_stamps_idempotency_key(db_session):
+    """A spawned directed research task carries the shared direction-scoped
+    idempotency key; an undirected (cross-cutting) cycle carries the undirected
+    key namespace — so the partial unique index dedups both across spawn paths."""
+    from app.autonomous_research import research_idempotency_key
+
+    project = Project(
+        name="Idem Key Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-idem-key1")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    task = research[0]
+    direction_id = task.first_payload.get("current_direction_id")
+    if direction_id:
+        assert task.idempotency_key == research_idempotency_key(
+            project.id, direction_id
+        )
+    else:
+        # Undirected cycle: key lives in the undirected namespace.
+        assert task.idempotency_key == research_idempotency_key(project.id, None)
+    # Either way, a key is always stamped — the DB index is the authoritative guard.
+    assert task.idempotency_key is not None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_batch_skips_duplicate_direction(db_session):
+    """When one of several chosen directions already has an active task holding
+    its idempotency slot, the per-task savepoint rolls back ONLY that direction's
+    insert and skips it — the other directions still spawn."""
+    from app.autonomous_research import research_idempotency_key
+
+    dir_a = _active_direction("d-batch-aa1", text="Direction A")
+    dir_b = _active_direction("d-batch-bb2", text="Direction B")
+    project = Project(
+        name="Batch Skip Dup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[dir_a, dir_b],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-occupy direction A's idempotency slot with an in-flight task.
+    blocker = Task(
+        project_id=project.id,
+        title="Research: pre-existing on A",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [dir_a],
+                "current_direction_id": "d-batch-aa1",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        idempotency_key=research_idempotency_key(project.id, "d-batch-aa1"),
+    )
+    db_session.add(blocker)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    # Active research tasks keyed per direction.
+    keys = {t.idempotency_key for t in research}
+    # Direction A's slot is held by exactly one task (the pre-existing blocker);
+    # no duplicate was inserted for it.
+    a_key = research_idempotency_key(project.id, "d-batch-aa1")
+    a_tasks = [t for t in research if t.idempotency_key == a_key]
+    assert len(a_tasks) == 1
+    assert a_tasks[0].id == blocker.id
+    # The batch still produced at least one task for a different slot (direction B
+    # or an undirected fallback) — a single collision did not nuke the whole cycle.
+    assert any(k != a_key for k in keys)
 
 
 @pytest.mark.asyncio
@@ -1868,6 +2026,167 @@ async def test_pipelined_spawn_claims_distinct_key_alongside_stuck_parent(db_ses
     ), (
         "The pipelined cycle must claim the direction under the :pipelined key "
         "(the stuck EVALUATING parent still holds the primary claim)"
+    )
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="direction-spawn advisory lock coverage requires PostgreSQL",
+)
+@pytest.mark.asyncio
+async def test_pipelined_holder_blocks_later_primary_claim_under_direction_lock(
+    db_session,
+):
+    """Regression for the remaining primary-vs-pipelined race: once a
+    pipelined research task has committed under ``...:pipelined``, a later
+    primary claimant on the same direction must serialize on the shared
+    direction lock and re-read current state before inserting.
+
+    This models the manual ``POST /research`` / autonomous-primary
+    read-before-write path after a pipelined child exists but no active primary
+    claim-holder remains. Without the lock, the later primary insert can miss
+    the already-committed pipelined task and create a duplicate active cycle
+    because ``ux_task_active_idempotency_key`` only compares exact key strings.
+    """
+    import asyncio
+
+    from app.autonomous_research import research_direction_claim_key
+    from app.task_locking import acquire_direction_research_spawn_lock
+
+    # IMPORTANT: import the canonical pytest-loaded module, not
+    # testing.conftest; see test_concurrent_spawn_ticks_create_exactly_one_...
+    from conftest import TestingSessionLocal
+
+    project = Project(
+        name="Pipelined Holder Blocks Primary",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipelock1")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    holder_has_lock = asyncio.Event()
+    release_holder = asyncio.Event()
+    commit_finished = asyncio.Event()
+
+    async def _commit_pipelined_holder():
+        async with TestingSessionLocal() as session:
+            await acquire_direction_research_spawn_lock(
+                session, project.id, "d-pipelock1"
+            )
+            holder = Task(
+                project_id=project.id,
+                title="Research: pipelined holder",
+                payloads=[
+                    {
+                        "type": "research",
+                        "directions": [],
+                        "base_branch": "main",
+                        "current_direction_id": "d-pipelock1",
+                    }
+                ],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                idempotency_key=research_direction_claim_key(
+                    project.id, "d-pipelock1", pipelined=True
+                ),
+            )
+            session.add(holder)
+            await session.flush()
+            holder_has_lock.set()
+            await release_holder.wait()
+            await session.commit()
+            commit_finished.set()
+
+    async def _manual_like_primary_attempt() -> str:
+        async with TestingSessionLocal() as session:
+            await acquire_direction_research_spawn_lock(
+                session, project.id, "d-pipelock1"
+            )
+            active_rows = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.project_id == project.id,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                    TaskStatus.BLOCKED,
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            same_direction = [
+                task
+                for task in active_rows
+                if task.first_payload.get("type") == "research"
+                and task.first_payload.get("current_direction_id") == "d-pipelock1"
+            ]
+            if same_direction:
+                await session.rollback()
+                return "blocked"
+            session.add(
+                Task(
+                    project_id=project.id,
+                    title="Research: primary claimant",
+                    payloads=[
+                        {
+                            "type": "research",
+                            "directions": [],
+                            "base_branch": "main",
+                            "current_direction_id": "d-pipelock1",
+                        }
+                    ],
+                    status=TaskStatus.QUEUED,
+                    created_by="USER",
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    idempotency_key=research_direction_claim_key(
+                        project.id, "d-pipelock1"
+                    ),
+                )
+            )
+            await session.commit()
+            return "inserted"
+
+    holder_task = asyncio.create_task(_commit_pipelined_holder())
+    await holder_has_lock.wait()
+
+    primary_task = asyncio.create_task(_manual_like_primary_attempt())
+    await asyncio.sleep(0.1)
+    release_holder.set()
+
+    result = await primary_task
+    await commit_finished.wait()
+    await holder_task
+
+    assert result == "blocked"
+
+    rows = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    research = [
+        task
+        for task in rows.scalars().all()
+        if task.first_payload.get("type") == "research"
+        and task.first_payload.get("current_direction_id") == "d-pipelock1"
+    ]
+    assert len(research) == 1, (
+        "A committed pipelined holder must block a later primary claimant on "
+        "the same direction under the shared advisory lock."
+    )
+    assert research[0].idempotency_key == research_direction_claim_key(
+        project.id, "d-pipelock1", pipelined=True
     )
 
 
@@ -11752,3 +12071,113 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         assert len(steering) == 0, "qualification-origin marker must stay silent"
     finally:
         _shared_state.circuit_breakers.pop(str(project.id), None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Missing-foundation demand injected into the research spawn payload
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _blocked_dependent(project_id, need, *, direction_id="d-other"):
+    """A BLOCKED dependent waiting on a single capability/foundation need.
+
+    Uses a non-research task type on a DIFFERENT direction than the active
+    research lane so it contributes demand without occupying the lane the
+    autonomous loop wants to (re)spawn research on.
+    """
+    return Task(
+        project_id=project_id,
+        title="create: needs a missing foundation",
+        payloads=[{"type": "create", "prompt": "build feature", "base_branch": "main"}],
+        status=TaskStatus.BLOCKED,
+        blocked_at=datetime.utcnow() - timedelta(hours=4),
+        context={
+            "direction_id": direction_id,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": need.get("ref"),
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+                "needs": [need],
+            },
+        },
+        created_by="ORCHESTRATOR",
+    )
+
+
+async def _spawn_tactical_research(db_session, directions):
+    """Build a project that spawns a tactical (directed) research task and return it."""
+    project = Project(
+        name="Demand Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=directions,
+        # purpose present + an active direction → force_strategic is False;
+        # _research_spawn_count=1 is NOT divisible by strategic_frequency (6),
+        # so this is a tactical research cycle, not a strategic one.
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_research_payload_includes_missing_capability_demand(db_session):
+    """When a stranded dependent declares a capability prerequisite no task
+    provides, the spawned research payload carries the aggregated demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research1", "Active research lane")]
+    )
+    need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth subsystem"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1  # sanity: the fixture really produces demand
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1, "exactly one tactical research task should spawn"
+    payload = research[0].first_payload
+
+    # The demand field is present and matches what the collector returns.
+    assert "missing_capability_demand" in payload
+    assert payload["missing_capability_demand"] == expected
+    assert payload["missing_capability_demand"]["demands"][0]["ref"] == "auth-subsystem"
+    # The advisory prompt hint frames the demand as something to act on.
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    # Payload still validates cleanly with the new optional field present.
+    validate_internal_payload(dict(payload), "test_research_demand")
+
+
+@pytest.mark.asyncio
+async def test_research_payload_omits_demand_when_none(db_session):
+    """With no stranded dependents the research payload omits the demand field
+    entirely (and no advisory hint is appended) yet still validates."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research2", "Active research lane")]
+    )
+
+    # Sanity: collector reports no demand for this project.
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 0
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+
+    assert "missing_capability_demand" not in payload
+    assert "Missing-foundation demand" not in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_research_no_demand")

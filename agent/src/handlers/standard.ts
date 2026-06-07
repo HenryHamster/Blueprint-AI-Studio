@@ -17,8 +17,18 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
+  formatProvenanceWarnings, formatAcceptanceEvidence,
 } from '../prompt.js';
+import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
+import {
+  fetchKnowledgeDocumentById,
+  buildPrerequisiteKnowledgeSection,
+  type PrerequisiteKnowledgePointer,
+  type PrereqKnowledgeDoc,
+} from './prior-knowledge.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
+import { resolveMigrationLayout } from './specialized.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -259,11 +269,38 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const prTitlePrefixNote = prTitlePrefix
     ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
     : '';
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  // A reserved provisional revision rides the claim only for migration-producing
+  // tasks (a create that touches models.py / an alembic file). When present, the
+  // agent must consume the locked id verbatim instead of deriving max+1, so
+  // concurrent schema work does not collide on the same revision number.
+  const reservedRevision = extractReservedMigrationRevision(task);
+  const migrationLayout = resolveMigrationLayout(buildConfig);
+  const reservedRevisionGuidance = reservedRevision
+    ? buildReservedRevisionGuidance(
+        reservedRevision,
+        `${migrationLayout.versionsDir}/`,
+        migrationLayout.schemaRevisionFile,
+        migrationLayout.schemaRevisionConst,
+      )
+    : '';
+  // Read-only ./fetch (direction, section, playbook) so a create/refactor agent
+  // can resolve by-reference ids and trimmed launch snapshots mid-run. Gate both
+  // provisioning and guidance on project_id so the prompt never advertises a
+  // helper that was not written.
+  const stdProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  const stdFetchGuidance = stdProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
+  const acceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
+  // Stale-premise/provenance notice for finding-derived tasks (create/refactor/
+  // docs/qa/deps). Rendered early/prominently so the agent reproduces-first
+  // before trusting a possibly-stale finding. Empty string when no warnings
+  // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
+  const provenanceNotice = formatProvenanceWarnings(ctx);
+  const finalPrompt = acceptanceEvidenceNotice + claudeMdPrefix + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  if (stdProjectId) writeFetchHelper(taskId, stdProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
   // ── SCOPE_EMPTY pre-flight (auto-decomposed cluster siblings) ────────────
@@ -493,7 +530,38 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.${callerSection}\n\n`;
   }
 
-  const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
+  // ── Commissioned prerequisite knowledge ──────────────────────────────────
+  // When a plan made this implementation task depend on a web_research/design
+  // prerequisite, the backend stamps a durable pointer onto
+  // ctx.knowledge_prerequisites when that prerequisite completes. Resolve each
+  // pointer to its full document body at launch (fail-soft) and frame it as
+  // commissioned input so the agent builds ON it. Empty string when none, so the
+  // prompt is byte-unchanged for tasks with no prerequisites.
+  let prerequisiteKnowledgeSection = '';
+  const rawPrereqs = ctx.knowledge_prerequisites;
+  const prereqPointers: PrerequisiteKnowledgePointer[] = Array.isArray(rawPrereqs)
+    ? (rawPrereqs as unknown[])
+        .filter((p): p is Record<string, unknown> => !!p && typeof p === 'object')
+        .map((p) => ({
+          doc_id: strVal(p.doc_id),
+          source_task_id: strVal(p.source_task_id),
+          source_kind: strVal(p.source_kind),
+          title: strVal(p.title),
+          summary: strVal(p.summary),
+        }))
+        .filter((p) => p.doc_id)
+    : [];
+  if (prereqPointers.length > 0) {
+    const resolved = new Map<string, PrereqKnowledgeDoc>();
+    for (const p of prereqPointers) {
+      const doc = await fetchKnowledgeDocumentById(p.doc_id);
+      if (doc) resolved.set(p.doc_id, doc);
+    }
+    prerequisiteKnowledgeSection = buildPrerequisiteKnowledgeSection(prereqPointers, resolved);
+    sendLog(ws, `[PrereqKnowledge] Injected ${resolved.size}/${prereqPointers.length} commissioned knowledge document(s).\n`);
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + finalPrompt;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });

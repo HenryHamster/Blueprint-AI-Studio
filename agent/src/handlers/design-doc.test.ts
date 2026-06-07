@@ -93,6 +93,26 @@ describe('handleDesignDocUpdate', () => {
     expect(helperCall[2]).toEqual({ mode: 0o755 });
   });
 
+  it('writes the ./fetch helper and advertises design-doc fetch guidance when project_id exists', async () => {
+    await handleDesignDocUpdate(
+      TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const fetchCall = vi.mocked(fs.writeFileSync).mock.calls.find(
+      c => typeof c[0] === 'string' && c[0] === '/tmp/workspace/fetch',
+    );
+    if (!fetchCall) throw new Error('fetch helper script was not written');
+    const content = fetchCall[1] as string;
+    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
+    expect(content).toContain('messages/$ID');
+    expect(content).toContain('design-doc/$ID');
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    expect(prompt).toContain('`./fetch section <key>`');
+    expect(prompt).toContain('`./fetch message <ref>`');
+  });
+
   it('reports COMPLETED when runClaudeCode exits 0 and project has design_doc pages', async () => {
     vi.mocked(apiGet).mockResolvedValue({
       design_doc: { summary: '"proj"', 'systems/sys-auth': {} },
@@ -146,6 +166,23 @@ describe('handleDesignDocUpdate', () => {
     expect(runClaudeCode).toHaveBeenCalledTimes(1);
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
+  });
+
+  it('omits ./fetch provisioning and guidance when project_metadata has no project_id', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: {} });
+    const taskWithoutProjectId = { title: 'Test Task', description: '', context: {} };
+
+    await handleDesignDocUpdate(
+      TASK_ID, BASE_PAYLOAD, taskWithoutProjectId, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const fetchCall = vi.mocked(fs.writeFileSync).mock.calls.find(
+      c => typeof c[0] === 'string' && c[0] === '/tmp/workspace/fetch',
+    );
+    expect(fetchCall).toBeUndefined();
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(prompt).not.toContain('`./fetch section <key>`');
   });
 
   it('reports FAILED with failure_category "claude_code_failed" when runClaudeCode exits non-zero', async () => {

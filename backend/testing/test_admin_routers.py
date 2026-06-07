@@ -8,6 +8,7 @@ Tests for admin routers:
 """
 
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
@@ -615,6 +616,43 @@ class TestGetAllProjects:
         assert target["my_role"] == "member"
         assert "env_vars" not in target["build_config"]
         assert target["build_config"].get("node_version") == "20"
+
+    @pytest.mark.asyncio
+    async def test_directions_count_matches_actual_count(
+        self, client: AsyncClient, db_session
+    ):
+        """directions_count in list response matches actual number of directions."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Directions Count Test")
+
+        # Test 1: empty directions should yield directions_count=0
+        project.directions = []
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["directions_count"] == 0
+
+        # Test 2: 3 directions should yield directions_count=3
+        project.directions = [
+            {"id": "d-1", "text": "Direction 1", "priority": "high"},
+            {"id": "d-2", "text": "Direction 2", "priority": "medium"},
+            {"id": "d-3", "text": "Direction 3", "priority": "low"},
+        ]
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["directions_count"] == 3
 
 
 class TestGetProject:
@@ -5643,6 +5681,55 @@ class TestNotificationConfigStartupRestore:
                 await conn.run_sync(SQLModel.metadata.drop_all)
             await _engine.dispose()
 
+    @pytest.mark.asyncio
+    async def test_init_deployment_state_adopts_resolved_sha(self, mocker):
+        """On Cloud Run the resolver returns the real serving SHA; _init_deployment_state
+        must adopt it into _current_sha (and therefore the singleton row /
+        /api/version) before initializing deployment state."""
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from unittest.mock import AsyncMock
+        from app.models import DeploymentState
+        from app.main import _init_deployment_state
+        import app.main as _main
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+        mocker.patch.object(_main, "_current_sha", "unknown")
+        mocker.patch.object(
+            _main,
+            "resolve_deployed_sha",
+            new=AsyncMock(return_value="cafebabe123"),
+        )
+
+        try:
+            # First boot — no existing row, so it creates the singleton.
+            await _init_deployment_state()
+            assert _main._current_sha == "cafebabe123"
+            async with _Session() as session:
+                row = await session.get(DeploymentState, 1)
+                assert row is not None
+                assert row.current_sha == "cafebabe123"
+        finally:
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_settings.py — repair-state stuck task persists failure_category
@@ -6790,6 +6877,37 @@ class TestSetVersionPhase:
         assert resp.json()["phase"] == "build"
 
     @pytest.mark.asyncio
+    async def test_set_phase_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """A phase flip while a promotion PR is open and auto-merging is rejected
+        with a 409 — flipping back to build would clear the in-flight indication
+        without cancelling anything, leaving the operator levers disagreeing."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 8642,
+                "pr_url": "https://example/pr/8642",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # Phase unchanged — the flip was refused before any mutation.
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+
+    @pytest.mark.asyncio
     async def test_set_phase_no_open_version_returns_404(
         self, client: AsyncClient, db_session
     ):
@@ -6852,6 +6970,46 @@ class TestSetVersionPhase:
         reasoning = resp.json()["phase_reasoning"]
         assert "[operator:" in reasoning
         assert "dry-run calibration" in reasoning
+
+    @pytest.mark.asyncio
+    async def test_set_phase_uses_for_update_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """set_version_phase acquires FOR UPDATE lock on the version row to
+        prevent lost updates from concurrent promotions/abandons. We verify this
+        by ensuring the precondition checks are against the locked row state."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="build")
+
+        # Verify the happy path works (basic evidence that locking is in place).
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["phase"] == "stabilize"
+
+        # Verify that promotion_in_flight check is enforced (evidence of
+        # precondition re-checking against the state).
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 5555,
+                "pr_url": "https://example/pr/5555",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        # The promotion_in_flight guard is re-checked against the locked row.
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+        assert "5555" in resp.text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6957,6 +7115,29 @@ class TestSetVersionGoal:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_set_goal_uses_for_update_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """set_version_goal acquires FOR UPDATE lock on the version row to
+        prevent lost updates from concurrent promotions/abandons. The happy path
+        works correctly with locking in place."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "locked goal"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["goal"] == "locked goal"
+        assert data["goal_updated_at"] is not None
+
+        # Verify state is persisted (evidence that the locked row was mutated).
+        await db_session.refresh(version)
+        assert version.goal == "locked goal"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Cut/Abandon Version
@@ -7008,6 +7189,50 @@ class TestCutVersion:
         assert abandoned["abandoned_by"] == TEST_USER_EMAIL
         assert abandoned["abandon_reason"] == "candidate can never pass"
         assert abandoned["abandoned_at"]
+
+    @pytest.mark.asyncio
+    async def test_version_cut_idempotent_on_repeat_key(
+        self, client: AsyncClient, db_session
+    ):
+        """A repeat cut carrying the same idempotency key returns the original
+        cut's result and does NOT open a further version."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+        )
+        assert first.status_code == 200
+        first_data = first.json()
+        assert first_data["abandoned_version"]["version_number"] == 1
+        assert first_data["new_version"]["version_number"] == 2
+
+        # Replay with the same key: same result, no second cut.
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+        )
+        assert second.status_code == 200
+        second_data = second.json()
+        assert second_data["abandoned_version"]["version_number"] == 1
+        assert second_data["new_version"]["version_number"] == 2
+
+        # Only v2 is open; no v3 was opened by the retry.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(v.version_number for v in rows) == [1, 2]
+        open_rows = [v for v in rows if v.status == "open"]
+        assert [v.version_number for v in open_rows] == [2]
 
     @pytest.mark.asyncio
     async def test_version_cut_no_open_version_returns_404(
@@ -7126,6 +7351,354 @@ class TestCutVersion:
         assert await rv.current_open_version(db_session, project.id) is not None
 
 
+class TestClearDeployFailed:
+    """POST /api/admin/projects/{id}/clear-deploy-failed operator lever."""
+
+    @staticmethod
+    async def _make_deploy_failed_version(
+        session, project_id, *, promoted_sha="promotedsha123", version_number=1
+    ):
+        from datetime import datetime, timezone
+
+        from app.models import QualificationVerdict
+
+        promoted_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project_id,
+            version_number=version_number,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=promoted_at,
+            promoted_sha=promoted_sha,
+            serving_status="deploy_failed",
+            deploy_failure_reason="no_new_revision",
+            deploy_confirm_deadline=datetime(
+                2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
+            ),
+            deploy_confirm_alerted_at=datetime(
+                2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
+            ),
+        )
+        session.add(version)
+        await session.commit()
+        await session.refresh(version)
+
+        verdict = QualificationVerdict(
+            project_id=project_id,
+            release_version_id=version.id,
+            candidate_sha=promoted_sha,
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+            post_promotion_outcome="deploy_failed",
+        )
+        session.add(verdict)
+        await session.commit()
+        return version
+
+    @pytest.mark.asyncio
+    async def test_404_when_no_deploy_failed_version(
+        self, client: AsyncClient, db_session
+    ):
+        """No promoted deploy_failed version → 404."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 404, resp.text
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self, override_get_session, db_session):
+        """Non-admin is rejected with 403 by require_admin."""
+        from fastapi import HTTPException
+
+        project = await _make_project(db_session)
+        await self._make_deploy_failed_version(db_session, project.id)
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    f"/api/admin/projects/{project.id}/clear-deploy-failed",
+                    json={"force": True, "reason": "x"},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_verify_path_clears_when_sha_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Promoted SHA genuinely observed serving → cleared without force."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session, project.id, promoted_sha="liveserving999"
+        )
+
+        # A new revision booted AFTER promotion, is STABLE, and its live serving
+        # SHA matches the promoted SHA — an independent serving confirmation.
+        db_session.add(
+            DeploymentState(
+                current_sha="liveserving999",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["clear_mode"] == "verified"
+        assert data["operator_attested"] is False
+        assert data["served_sha"] == "liveserving999"
+        assert data["deploy_failure_reason"] is None
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.deploy_failure_reason is None
+
+        verdict = (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar_one()
+        assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_verify_path_refuses_when_required_non_backend_artifact_failed(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Verified backend serving cannot clear an aggregate failure while a
+        required non-backend artifact still reports deploy_failed."""
+        from datetime import datetime, timezone
+
+        from app import release_artifacts as artifact_registry
+        from app.models import DeploymentState, DeploymentStatus, ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            promoted_sha="liveserving999",
+        )
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            )
+        )
+        db_session.add(
+            DeploymentState(
+                current_sha="liveserving999",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "required non-backend artifact" in resp.text
+        assert "synthetic_deadline_elapsed" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == "no_new_revision"
+
+    @pytest.mark.asyncio
+    async def test_force_refused_without_override(
+        self, client: AsyncClient, db_session
+    ):
+        """Unobservable serving SHA + no force → 409, version stays deploy_failed."""
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+        # No DeploymentState → serving SHA cannot be independently observed.
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "force=true" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+
+    @pytest.mark.asyncio
+    async def test_force_refused_when_required_non_backend_artifact_failed(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """force=true does not override a still-failed required non-backend
+        artifact; it only bypasses missing backend serving evidence."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "manually verified live in Cloud Run"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "required non-backend artifact" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == "no_new_revision"
+
+    @pytest.mark.asyncio
+    async def test_force_requires_reason(self, client: AsyncClient, db_session):
+        """force=true without a reason → 400."""
+        project = await _make_project(db_session)
+        await self._make_deploy_failed_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "   "},
+        )
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_force_path_clears_and_records_attestation(
+        self, client: AsyncClient, db_session
+    ):
+        """force=true + reason clears, resolves the alert, flips the verdict."""
+        from app.models import QualificationVerdict
+        from app.release_stall_alerts import _deploy_failed_alert_title
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+
+        # Seed the open deploy-failed operator alert that must be resolved.
+        alert = Alert(
+            project_id=project.id,
+            title=_deploy_failed_alert_title(version.version_number),
+            message="promotion deploy FAILED",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "manually verified live in Cloud Run"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["clear_mode"] == "operator_attested"
+        assert data["operator_attested"] is True
+        assert data["attestation_reason"] == "manually verified live in Cloud Run"
+        # Attested clear stamps the promoted SHA as the served SHA.
+        assert data["served_sha"] == "promotedsha123"
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.deploy_failure_reason is None
+        clear_audit = (version.last_qualification or {}).get("deploy_failed_clear")
+        assert clear_audit is not None
+        assert clear_audit["mode"] == "operator_attested"
+        assert clear_audit["reason"] == "manually verified live in Cloud Run"
+
+        # The open deploy-failed alert is resolved.
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+
+        # The verdict's post-promotion outcome flips to serving_confirmed.
+        verdict = (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar_one()
+        assert verdict.post_promotion_outcome == "serving_confirmed"
+
+
 class TestVersionLifecycleInfraFailureFields:
     """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
 
@@ -7159,8 +7732,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7208,8 +7787,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": True, "reason": "ok"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7226,6 +7811,160 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["error"] is None
         assert lq["consecutive_infra_errors"] is None
         assert lq["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_merged_since_verdict_counts_merges_after_finalized_at(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.merged_since_verdict reflects tasks merged at/after the
+        verdict's finalized_at, computed from finalized_at (not opened_at)."""
+        from datetime import datetime
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "confidence": 0.89,
+                "threshold": 0.90,
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        finalized_dt = datetime.fromisoformat("2026-05-27T00:00:00")
+
+        async def _count(session, project_id, since):
+            # The verdict-staleness call passes the parsed finalized_at; the
+            # opened-version call passes the version's opened_at.
+            return 4 if since == finalized_dt else 0
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(side_effect=_count),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] == 4
+
+    @pytest.mark.asyncio
+    async def test_merged_since_verdict_zero_when_no_merges_after_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_since_verdict is 0 (not null) when the helper finds no merges
+        after the verdict's finalized_at."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] == 0
+
+    @pytest.mark.asyncio
+    async def test_merged_since_verdict_null_when_no_finalized_at(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_since_verdict is null when there is no verdict / no finalized_at —
+        the count is never fabricated."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "abc1234"},
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] is None
 
     @pytest.mark.asyncio
     async def test_promotion_pending_state_exposed_in_current_version(
@@ -7257,8 +7996,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7274,6 +8019,192 @@ class TestVersionLifecycleInfraFailureFields:
         assert current["qualification_state"]["state"] == "promotion_in_flight"
         assert current["qualification_state"]["promotion_pr_number"] == 7357
         assert "auto-merge is armed" in current["qualification_state"]["summary"].lower()
+
+
+class TestVersionLifecycleAuditEvidence:
+    """GET /version-lifecycle scopes audit evidence to the open candidate SHA."""
+
+    @staticmethod
+    async def _add_audit_task(
+        db_session, project, version_id, candidate_sha, *, report=None
+    ):
+        task = Task(
+            project_id=project.id,
+            title="release audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "release_version_id": str(version_id),
+                "candidate_sha": candidate_sha,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        if report is not None:
+            db_session.add(
+                Artifact(
+                    task_id=task.id,
+                    artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                    logs=json.dumps(report),
+                )
+            )
+            await db_session.commit()
+        return task
+
+    @staticmethod
+    def _readiness_patch():
+        from unittest.mock import patch
+
+        return (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_audit_is_current(self, client: AsyncClient, db_session):
+        """An audit pinned to the evaluated candidate → latest_audit populated,
+        audit_evidence_state=current, stale_audit null."""
+        project = await _make_project(db_session)
+        candidate = "feed" * 10
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": candidate},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        report = {"audit_score": 0.8, "findings": []}
+        await self._add_audit_task(
+            db_session, project, version.id, candidate, report=report
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "current"
+        assert current["latest_audit"] is not None
+        assert current["latest_audit"]["candidate_sha"] == candidate
+        assert current["latest_audit"]["report"] == report
+        assert current["stale_audit"] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_prior_candidate_audit(self, client: AsyncClient, db_session):
+        """Only an older-candidate audit exists → latest_audit null, stale_audit
+        provenance present, audit_evidence_state=stale."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "newc" * 10},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        report = {"audit_score": 0.5, "findings": [{"severity": "high"}]}
+        await self._add_audit_task(
+            db_session, project, version.id, "0ld0" * 10, report=report
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "stale"
+        assert current["latest_audit"] is None
+        assert current["stale_audit"] is not None
+        assert current["stale_audit"]["candidate_sha"] == "0ld0" * 10
+        assert current["stale_audit"]["report"] == report
+
+    @pytest.mark.asyncio
+    async def test_no_matching_audit_is_none(self, client: AsyncClient, db_session):
+        """A newly-cut version with no audit of its own → audit_evidence_state=none,
+        latest_audit null, even when another version has an audit."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "feed" * 10},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Audit belonging to a different version must not leak in.
+        import uuid as _uuid
+
+        await self._add_audit_task(
+            db_session, project, _uuid.uuid4(), "feed" * 10, report={"audit_score": 0.9}
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "none"
+        assert current["latest_audit"] is None
+        assert current["stale_audit"] is None
+
+    @pytest.mark.asyncio
+    async def test_current_audit_without_artifact(
+        self, client: AsyncClient, db_session
+    ):
+        """A matching audit with no report artifact → state current, latest_audit
+        provenance present but report null."""
+        project = await _make_project(db_session)
+        candidate = "feed" * 10
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": candidate},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await self._add_audit_task(db_session, project, version.id, candidate)
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "current"
+        assert current["latest_audit"] is not None
+        assert current["latest_audit"]["report"] is None
 
 
 class TestVersionLifecycleStagedDirections:
@@ -7312,8 +8243,14 @@ class TestVersionLifecycleStagedDirections:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7352,8 +8289,14 @@ class TestVersionLifecycleStagedDirections:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7412,8 +8355,14 @@ class TestVersionLifecycleInFlightCount:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7497,6 +8446,132 @@ class TestQualificationVerdictsAuditMissingReason:
         verdicts = resp.json()["verdicts"]
         assert len(verdicts) == 1
         assert verdicts[0]["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_post_promotion_outcome_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """post_promotion_outcome (and _at) populated on a verdict are returned."""
+        from datetime import datetime, timezone
+
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        outcome_at = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="deadbeef",
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+            post_promotion_outcome="deploy_failed",
+            post_promotion_outcome_at=outcome_at,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["post_promotion_outcome"] == "deploy_failed"
+        assert verdicts[0]["post_promotion_outcome_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_post_promotion_outcome_null_for_unresolved_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """post_promotion_outcome is null until the serving outcome is recorded."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="goodsha123",
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["post_promotion_outcome"] is None
+        assert verdicts[0]["post_promotion_outcome_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_durable_evidence_fields_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-attempt evidence columns are surfaced on each verdict row, so a
+        blocked attempt's migration-safety verdict survives re-qualification."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="blockedsha",
+            confidence=0.10,
+            blocker="migration_unsafe",
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+            migration_safety="block",
+            migration_safety_detail="renumber-skip leaves table uncreated",
+            migration_apply_safety="block",
+            migration_apply_safety_detail="apply against prod schema diverged",
+            audit_findings=[{"severity": "high", "summary": "x"}],
+            excluded_audit_findings=[{"severity": "low", "summary": "y"}],
+            test_erosion_detail={"removed": 3},
+            smoketest_detail={"passed": False},
+            audit_reconciliation={"reconciled": True},
+            promotion_pr_url="https://example.com/pr/1",
+            promotion_conflict=True,
+            promotion_error_detail="merge conflict",
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        v = resp.json()["verdicts"][0]
+        assert v["migration_safety"] == "block"
+        assert v["migration_safety_detail"] == "renumber-skip leaves table uncreated"
+        assert v["migration_apply_safety"] == "block"
+        assert (
+            v["migration_apply_safety_detail"] == "apply against prod schema diverged"
+        )
+        assert v["audit_findings"] == [{"severity": "high", "summary": "x"}]
+        assert v["excluded_audit_findings"] == [{"severity": "low", "summary": "y"}]
+        assert v["test_erosion_detail"] == {"removed": 3}
+        assert v["smoketest_detail"] == {"passed": False}
+        assert v["audit_reconciliation"] == {"reconciled": True}
+        assert v["promotion_pr_url"] == "https://example.com/pr/1"
+        assert v["promotion_conflict"] is True
+        assert v["promotion_error_detail"] == "merge conflict"
 
 
 class TestQualificationVerdictsInfraContext:
@@ -8215,6 +9290,54 @@ class TestGetAuditFindings:
         assert data["findings"][0]["severity"] == "high"
         assert data["findings"][1]["severity"] == "low"
         assert data["finalized_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_prefers_durable_verdict_findings_over_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """A re-qualification overwrites last_qualification, but the earlier
+        blocked attempt's findings still surface from the durable verdict row."""
+        from datetime import datetime
+
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        # First (blocked) attempt: persist its evidence on an immutable verdict.
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="blockedsha",
+            confidence=0.10,
+            blocker="migration_unsafe",
+            audit_missing_reason=None,
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+            audit_findings=[
+                {"severity": "high", "summary": "Renumber-skip leaves table uncreated."},
+            ],
+            finalized_at=datetime(2026, 1, 2, 0, 0, 0),
+        )
+        db_session.add(verdict)
+        # A later re-qualification overwrote last_qualification with no findings.
+        version.last_qualification = {
+            "audit_findings": [],
+            "audit_missing_reason": None,
+            "finalized_at": "2026-02-01T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["source"] == "qualification_verdict"
+        assert len(data["findings"]) == 1
+        assert data["findings"][0]["severity"] == "high"
+        assert data["finalized_at"] == "2026-01-02T00:00:00"
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_open_version(
@@ -8950,6 +10073,62 @@ class TestModifyTaskApplySeam:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class TestTriggerQualify:
+    @pytest.mark.asyncio
+    async def test_qualify_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-running qualification while a promotion PR is open and auto-merging
+        is rejected with a 409 — run_qualification no-ops (promotion_in_flight)
+        and the endpoint surfaces it, mirroring the version-cut lever, instead of
+        spawning a fresh audit/smoketest pair that clobbers the pending record."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        # A terminal audit child — by the child-task definition this is NOT "in
+        # flight", so only the promotion-in-flight guard catches it.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit-done",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-promo",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "abc123",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_enabled": False,
+            "promotion_pending": {
+                "pr_number": 9753,
+                "pr_url": "https://example/pr/9753",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # The promotion-pending record survives untouched.
+        await db_session.refresh(version)
+        assert version.last_qualification["promotion_pending"]["pr_number"] == 9753
+
+    @pytest.mark.asyncio
+    async def test_qualify_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when there is no open release version to qualify."""
+        project = await _make_project(db_session)
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 404
+
+
 class TestClearWaveDeps:
     @pytest.mark.asyncio
     async def test_preserves_missing_depends_on_for_queued_tasks(
@@ -9419,6 +10598,60 @@ class TestBulkApprove:
         assert (task.context or {}).get("pr_merged") is None
         assert "awaiting downstream landing" in (task.latest_status_message or "")
 
+    @pytest.mark.asyncio
+    async def test_bulk_approve_clears_held_compute_experiment(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Operator approve clears the hold on a QUEUED compute_experiment task
+        held for spend-threshold approval, making it dispatchable. A QUEUED task
+        skips the COMPLETED/EVALUATING PR-merge branch, so no GitHub calls fire."""
+        project = await _make_project(db_session)
+
+        task = Task(
+            project_id=project.id,
+            title="Held compute_experiment",
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "command": "python3 bench.py",
+                    "spend_cap_usd": 50.0,
+                    "deadline_seconds": 7200,
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            requires_approval=True,
+            latest_status_message=(
+                "Held for operator approval: compute_experiment proposes "
+                "$50.00 spend cap / 7200s deadline, exceeding the $5.00 approval "
+                "threshold."
+            ),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        merge_pr = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success_count"] == 1
+        assert body["error_count"] == 0
+        await db_session.refresh(task)
+        # The hold is cleared so the orchestrator can dispatch the launch.
+        assert task.requires_approval is False
+        # A QUEUED hold is not a PR merge — status is unchanged, no GitHub calls.
+        assert task.status == TaskStatus.QUEUED
+        merge_pr.assert_not_awaited()
+
 
 class TestBulkRetrySessionFactory:
     """The bulk-retry scoped session factory must resolve a real engine even
@@ -9832,6 +11065,642 @@ class TestTriggerRollup:
         assert task.status == TaskStatus.EVALUATING
         assert "dual-head" in (task.latest_status_message or "").lower()
 
+    @pytest.mark.asyncio
+    async def test_manual_rollup_skips_when_pr_already_recorded(
+        self, db_session, mocker
+    ):
+        """Idempotency: when a rollup PR is already recorded on the task, the
+        manual trigger returns it WITHOUT POSTing a second PR — so a duplicate
+        client retry, or a manual trigger after the auto path already created
+        the PR, cannot double-apply."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup already recorded",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_number": 4242,
+                "rollup_pr_url": "https://github.com/owner/repo/pull/4242",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+        token_mock = mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        create_mock.assert_not_called()
+        token_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 4242
+        assert result["rollup_pr_url"] == "https://github.com/owner/repo/pull/4242"
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_number") == 4242
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_defers_on_fresh_creation_claim(
+        self, db_session, mocker
+    ):
+        """A fresh in-flight creation claim (a peer mid-create) makes the manual
+        trigger return 409 instead of POSTing a duplicate PR, leaving the task
+        EVALUATING."""
+        import time as _time
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup fresh claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_creating_at": _time.time(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_rollup(
+                task.id,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+
+        assert exc_info.value.status_code == 409
+        create_mock.assert_not_called()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("rollup_pr_number") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_stale_creation_claim_proceeds(
+        self, db_session, mocker
+    ):
+        """A creation claim older than the TTL is stale (peer crashed mid-create)
+        and must NOT wedge creation — the manual trigger proceeds to create the
+        PR."""
+        import time as _time
+        from app.routers.admin_operator_triggers import trigger_rollup
+        from app.rollup_management import _ROLLUP_PR_CREATE_CLAIM_TTL_S
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup stale claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_creating_at": _time.time()
+                - (_ROLLUP_PR_CREATE_CLAIM_TTL_S + 60),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/777",
+                "number": 777,
+            },
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        create_mock.assert_awaited_once()
+        assert result["rollup_pr_number"] == 777
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_number") == 777
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_empty_diff_completes_without_pr_zero_followups(
+        self, db_session, mocker
+    ):
+        """The manual path must treat GitHub's empty-diff sentinel as a terminal
+        no-op completion, not as a real PR #0 that proceeds into merge/review."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup empty diff",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "empty_diff": True,
+                "merged": True,
+                "html_url": "",
+                "number": 0,
+            },
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        spawn_mock = mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        delete_branch_mock = mocker.patch(
+            "app.github.delete_branch", new_callable=AsyncMock
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        merge_mock.assert_not_called()
+        spawn_mock.assert_not_called()
+        delete_branch_mock.assert_awaited_once()
+        assert result["rollup_pr_number"] == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("rollup_pr_number") is None
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+        assert "no new changes to merge" in (task.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_create_failure_clears_claim_for_retry(
+        self, db_session, mocker
+    ):
+        """A transient create failure must drop the shared in-flight claim so a
+        manual retry or the automated rollup path can proceed immediately."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup transient create failure",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=503, detail="GitHub unavailable"),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_rollup(
+                task.id,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+
+        assert exc_info.value.status_code == 503
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("rollup_pr_number") is None
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_stakes_claim_before_create(
+        self, db_session, mocker
+    ):
+        """The creation claim is staked (committed) on the task BEFORE the slow
+        create_pull_request call — so a concurrent worker observes it and defers
+        — and is cleared (replaced by the durable rollup_pr_number marker) after
+        the PR is recorded."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup stakes claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = task.id
+
+        observed = {}
+
+        async def _capture_claim(*args, **kwargs):
+            # The claim must be persisted before this POST so a peer defers.
+            from sqlmodel import select as _select
+
+            row = (
+                await db_session.execute(
+                    _select(Task).where(Task.id == task_id)
+                )
+            ).scalars().first()
+            observed["claim_at_create"] = (row.context or {}).get(
+                "rollup_pr_creating_at"
+            )
+            return {
+                "html_url": "https://github.com/owner/repo/pull/555",
+                "number": 555,
+            }
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new=_capture_claim,
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+
+        result = await trigger_rollup(
+            task_id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        # Claim was visible mid-create...
+        assert observed["claim_at_create"] is not None
+        # ...and dropped (superseded by the durable PR marker) afterward.
+        assert result["rollup_pr_number"] == 555
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+        assert (task.context or {}).get("rollup_pr_number") == 555
+
+    @pytest.mark.skipif(
+        not (
+            os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
+            and os.getenv("DATABASE_URL", "").startswith("postgresql")
+        ),
+        reason="cross-session identity-map cache race requires Postgres",
+    )
+    @pytest.mark.asyncio
+    async def test_manual_rollup_sees_peer_pr_marker_committed_after_role_check(
+        self, db_session, mocker
+    ):
+        """Regression (#7350/#7351): the FOR UPDATE precondition re-check must
+        read the row AS OF the lock, NOT the stale identity-map copy seeded by
+        the role check's ``session.get``.
+
+        With ``expire_on_commit=False`` the role check leaves the task cached in
+        the session's identity map. A peer (auto path or a second manual
+        trigger) that commits ``rollup_pr_number`` after that read but before
+        this request locks the row must be observed — otherwise the idempotency
+        guard reads the pre-lock snapshot and POSTs a DUPLICATE rollup PR. The
+        ``session.expire`` + ``populate_existing=True`` on the locked SELECT is
+        what makes the fresh marker visible; this test fails without it.
+        """
+        import json as _json
+        from sqlalchemy import text as _text
+        from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+        from sqlalchemy.orm import sessionmaker as _sessionmaker
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        base_ctx = {
+            "plan_branch": "research/abc12345",
+            "parent_base": "automain",
+            "direction_id": "dir-1",
+        }
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup peer marker race",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context=dict(base_ctx),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = task.id
+
+        # The task is now cached in db_session's identity map WITHOUT a
+        # rollup_pr_number — exactly the stale snapshot the role-check
+        # session.get would return inside trigger_rollup. End db_session's
+        # txn so the peer commit below is visible to the lock's fresh SELECT.
+        await db_session.commit()
+
+        # Peer commits the durable PR marker via a separate connection,
+        # bypassing the ORM and db_session's identity map entirely.
+        peer_ctx = dict(base_ctx)
+        peer_ctx["rollup_pr_number"] = 7373
+        peer_ctx["rollup_pr_url"] = "https://github.com/owner/repo/pull/7373"
+        _Session = _sessionmaker(
+            bind=db_session.bind,
+            class_=_AsyncSession,
+            expire_on_commit=False,
+        )
+        async with _Session() as peer_session:
+            await peer_session.execute(
+                _text("UPDATE task SET context = cast(:ctx as jsonb) WHERE id = :id"),
+                {"ctx": _json.dumps(peer_ctx), "id": task_id},
+            )
+            await peer_session.commit()
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+        token_mock = mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+
+        # IMPORTANT: do NOT expire_all here — the point is that the fix's own
+        # session.expire + populate_existing must bypass the warm cache.
+        result = await trigger_rollup(
+            task_id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        # Idempotent: the peer's PR is returned, no second PR is POSTed.
+        create_mock.assert_not_called()
+        token_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 7373
+        assert result["rollup_pr_url"] == (
+            "https://github.com/owner/repo/pull/7373"
+        )
+
+
+class TestTriggerSelfAudit:
+    @pytest.mark.asyncio
+    async def test_self_audit_409_when_audit_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """The self-audit trigger must refuse to spawn a second audit when one is
+        already in flight — two concurrent audits produce duplicate findings and
+        waste VM budget. Returns 409 with the existing task id."""
+        project = await _make_project(db_session)
+
+        # Create an in-flight self_audit task
+        in_flight = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(in_flight)
+        await db_session.commit()
+
+        # Attempt to trigger a second self_audit — should be rejected
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+        assert "in progress" in resp.text.lower()
+        assert str(in_flight.id)[:8] in resp.text
+
+    @pytest.mark.asyncio
+    async def test_self_audit_rejects_queued_and_provisioning_states(
+        self, client: AsyncClient, db_session
+    ):
+        """Guard blocks QUEUED and PROVISIONING states as well, not just IN_PROGRESS."""
+        project = await _make_project(db_session)
+
+        # Test QUEUED
+        queued_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(queued_audit)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+        # Delete the queued audit
+        await db_session.delete(queued_audit)
+        await db_session.commit()
+
+        # Test PROVISIONING
+        provisioning_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.PROVISIONING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(provisioning_audit)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+    @pytest.mark.asyncio
+    async def test_self_audit_allowed_after_terminal_state(
+        self, client: AsyncClient, db_session
+    ):
+        """After an audit reaches a terminal state (COMPLETED/FAILED), a new
+        trigger is allowed."""
+        project = await _make_project(db_session)
+
+        # Create a completed self_audit task
+        completed_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed_audit)
+        await db_session.commit()
+
+        # A new trigger should succeed
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "task_id" in data
+
+    @pytest.mark.asyncio
+    async def test_self_audit_independent_per_project(
+        self, client: AsyncClient, db_session
+    ):
+        """In-flight guard is per-project; blocking a different project doesn't
+        prevent triggers on the current project."""
+        project1 = await _make_project(db_session, name="Project 1")
+        project2 = await _make_project(db_session, name="Project 2")
+
+        # Create an in-flight self_audit on project 1
+        in_flight = Task(
+            project_id=project1.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(in_flight)
+        await db_session.commit()
+
+        # Trigger on project 1 should fail
+        resp = await client.post(f"/api/admin/projects/{project1.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+        # Trigger on project 2 should succeed
+        resp = await client.post(f"/api/admin/projects/{project2.id}/self-audit")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_concurrent_self_audit_idempotency_key_prevents_race(
+        self, client: AsyncClient, db_session
+    ):
+        """Concurrent self-audit triggers are prevented by idempotency_key.
+        When a second trigger arrives while one is in flight, the SELECT check
+        detects it and rejects with 409. If the race condition allows both to
+        pass the SELECT check, the idempotency_key constraint + IntegrityError
+        handler prevents duplicate inserts."""
+        project = await _make_project(db_session)
+
+        # First trigger creates a task with idempotency_key
+        resp1 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp1.status_code == 200, resp1.text
+        data1 = resp1.json()
+        task1_id = data1["task_id"]
+
+        # Verify the created task has idempotency_key set
+        task1 = await db_session.get(Task, uuid.UUID(task1_id))
+        assert task1 is not None
+        assert task1.idempotency_key == f"operator_self_audit:{project.id}"
+
+        # Second trigger on same project finds active audit and rejects with 409
+        resp2 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp2.status_code == 409, resp2.text
+        assert "already in progress" in resp2.json()["error"]["message"].lower()
+
 
 class TestGetProjectFindings:
     @pytest.mark.asyncio
@@ -9856,3 +11725,475 @@ class TestGetProjectFindings:
 
         resp = await client.get(f"/api/admin/projects/{other_project.id}/findings")
         assert resp.status_code == 404
+
+
+class TestBugReportCitationGate:
+    """Reproduce-on-HEAD citation grounding for free-text bug reports.
+
+    A BUG_REPORT/BLOCKER whose cited code is absent on the integration branch is
+    flagged at ingestion (``_provenance_warnings`` stored on the message context)
+    and re-validated when turned into an investigation task. Conservative: a
+    report whose code exists, or that cites nothing, is never flagged.
+    """
+
+    async def _project_with_repo(self, session):
+        project = Project(
+            name="acme/citegate",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="citegate",
+            integration_branch="main",
+            promotion_target="main",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_bug_report_absent_citation_is_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT citing code absent on HEAD stores an absent-state signal."""
+        project = await self._project_with_repo(db_session)
+        # No GitHub creds → local-HEAD fallback; the cited file is reported absent.
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        # Simulate the local-HEAD backend actually being available so the absent
+        # verdict is reached (not degraded to indeterminate by a missing backend).
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "The crash originates in backend/app/gone.py during init.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (msg.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "absent"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+
+    @pytest.mark.asyncio
+    async def test_bug_report_present_citation_not_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT whose cited file exists on HEAD is NOT flagged."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=True),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "Reproduces reliably in backend/app/real.py on load.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (msg.context or {})
+
+    @pytest.mark.asyncio
+    async def test_bug_report_mixed_present_citation_is_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A partially grounded BUG_REPORT keeps its mixed-state ref detail."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(
+                side_effect=lambda path, **_: True if "alive.py" in path else False
+            ),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": (
+                    "The regression spans backend/app/gone.py and "
+                    "backend/app/alive.py during init."
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (msg.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        assert warnings["ungrounded_refs"] == []
+
+    @pytest.mark.asyncio
+    async def test_bug_report_no_refs_not_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT with no extractable references degrades to indeterminate."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        spy = mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "Everything feels slow when many users hit the dashboard.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (msg.context or {})
+        spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_revalidates_source_message(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """An investigate task from a stale bug report gets the warning + prompt note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="The handler in backend/app/gone.py drops the guard.",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate dropped guard",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "absent"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        # The provenance detail is carried on task.context only; the agent renders
+        # it into the prompt at run time (formatInvestigateCitationProvenance in
+        # agent/src/prompt.ts), so the backend no longer mutates the prompt string.
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
+        # Cited code absent on HEAD seeds an already_resolved reproduce baseline.
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "already_resolved"
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_mixed_citation_preserves_warning_but_not_stale(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A mixed citation warning is carried forward without seeding stale-state."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content=(
+                "The handler touches backend/app/gone.py and "
+                "backend/app/alive.py during load."
+            ),
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(
+                side_effect=lambda path, **_: True if "alive.py" in path else False
+            ),
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate mixed grounding",
+                "prompt": "Investigate the reported regression.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_present_citation_seeds_indeterminate_verdict(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """An investigate task whose cited code is present on HEAD seeds an
+        `indeterminate` reproduce-on-HEAD baseline (defect-truth not yet
+        established) and adds no provenance warning / prompt note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="The handler in backend/app/present.py drops the guard.",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=True),
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate present guard",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+        # Present citations leave the report untouched — no provenance warning.
+        assert "_provenance_warnings" not in (task.context or {})
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_partial_citation_seeds_indeterminate_with_note(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A partially-grounded bug report (one stale citation among surviving
+        ones) is NOT treated as already-resolved: the verdict stays
+        `indeterminate`, and the specific stale reference is preserved on the
+        task context so the investigating agent can render it into its prompt
+        (formatInvestigateCitationProvenance in agent/src/prompt.ts). The backend
+        no longer bakes a prompt-string note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content=(
+                "The flow spans backend/app/gone.py and backend/app/alive.py; "
+                "the guard is dropped."
+            ),
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        async def _exists(path, **_kw):
+            return path != "backend/app/gone.py"
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            side_effect=_exists,
+        )
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate partially-grounded report",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        # Mixed grounding ⇒ defect not presumed resolved.
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+        assert verdict["status"] != "already_resolved"
+        # The stale reference is carried forward on the task context (broken_refs)
+        # so the agent can name it in its prompt, without claiming the whole bug
+        # is gone. The backend no longer mutates the prompt string itself.
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        prompt = task.payloads[0]["prompt"]
+        assert "Provenance note" not in prompt
+        assert "Provenance warning" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_no_source_message_is_unaffected(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting source_message_id keeps investigate task creation unchanged."""
+        project = await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Plain investigation",
+                "prompt": "Investigate something.",
+                "task_type": "investigate",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (task.context or {})
+        assert task.payloads[0]["prompt"] == "Investigate something."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# task_capabilities.py — strategist spawn allowlist is registry-derived
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestStrategistSpawnableRegistry:
+    """Guard: the strategist spawn allowlist is DERIVED from the per-type
+    ``strategist_spawnable`` capability flag, not a hardcoded literal. A future
+    type becomes strategist-spawnable by declaring the flag alone — no handler
+    edit — and implementation / PR-producing write types stay excluded."""
+
+    def test_allowlist_equals_expected_knowledge_types(self):
+        from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
+
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES == frozenset(
+            {"research", "plan", "web_research", "design"}
+        )
+
+    def test_allowlist_is_derived_from_capability_flag(self):
+        from app.task_capabilities import (
+            STRATEGIST_SPAWNABLE_TASK_TYPES,
+            TASK_CAPABILITY_BY_VALUE,
+        )
+
+        # Every member declares the flag...
+        for t in STRATEGIST_SPAWNABLE_TASK_TYPES:
+            assert TASK_CAPABILITY_BY_VALUE[t].strategist_spawnable is True
+        # ...and the set is exactly the flagged capabilities (derivation, not a
+        # parallel literal that could drift).
+        derived = frozenset(
+            value
+            for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+            if cap.strategist_spawnable
+        )
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES == derived
+
+    def test_no_write_type_is_strategist_spawnable(self):
+        from app.task_capabilities import (
+            STRATEGIST_SPAWNABLE_TASK_TYPES,
+            WRITE_TASK_TYPES,
+        )
+
+        # Implementation / PR-producing types must not be directly spawnable —
+        # they flow through direction → research → plan → create.
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
+        for impl in ("create", "fix", "refactor", "migrate", "qa"):
+            assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES

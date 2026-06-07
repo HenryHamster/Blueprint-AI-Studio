@@ -107,4 +107,31 @@ describe('SystemHealthCard', () => {
     );
     expect(screen.queryByText('All systems healthy')).not.toBeInTheDocument();
   });
+
+  it('marks the verdict stale when served_stale is true even at a recent age', () => {
+    // The compute-failure bug: a recent (age 30s) payload that was actually
+    // served from the last-good fallback must NOT be shown as a live verdict.
+    const servedStale: HealthOverviewResponse = {
+      ...mockHealthyResponse,
+      precompute_age_seconds: 30, // under SNAPSHOT_STALE_AFTER_SECONDS (120)
+      served_stale: true,
+    };
+    render(
+      <SystemHealthCard data={servedStale} loading={false} tasks={[]} onViewTask={mockOnViewTask} />
+    );
+    const asOf = screen.getByText(/as of/);
+    expect(asOf.textContent).toContain('stale');
+    expect(asOf.className).toContain('text-amber-400');
+    // The card body dims/desaturates so the reading reads as not-live.
+    expect(document.querySelector('.opacity-60.saturate-50')).toBeInTheDocument();
+  });
+
+  it('does not mark stale when served_stale is false and age is recent', () => {
+    render(
+      <SystemHealthCard data={mockHealthyResponse} loading={false} tasks={[]} onViewTask={mockOnViewTask} />
+    );
+    const asOf = screen.getByText(/as of/);
+    expect(asOf.textContent).not.toContain('stale');
+    expect(document.querySelector('.opacity-60.saturate-50')).not.toBeInTheDocument();
+  });
 });

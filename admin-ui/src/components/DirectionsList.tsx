@@ -155,6 +155,8 @@ export function DirectionsList(props: DirectionsListProps) {
                         editPathTags={form.editPathTags}
                         editPathInput={form.editPathInput}
                         editCompletionCriteria={form.editCompletionCriteria}
+                        editSuccessEvidence={form.editSuccessEvidence}
+                        editRetirementCondition={form.editRetirementCondition}
                         setEditingId={form.setEditingId}
                         setEditText={form.setEditText}
                         setEditPriority={form.setEditPriority}
@@ -163,6 +165,8 @@ export function DirectionsList(props: DirectionsListProps) {
                         setEditPathTags={form.setEditPathTags}
                         setEditPathInput={form.setEditPathInput}
                         setEditCompletionCriteria={form.setEditCompletionCriteria}
+                        setEditSuccessEvidence={form.setEditSuccessEvidence}
+                        setEditRetirementCondition={form.setEditRetirementCondition}
                         startEdit={form.startEdit}
                         updateDirection={props.updateDirection}
                         approveProposal={props.approveProposal}

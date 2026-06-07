@@ -250,10 +250,10 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   <span
                     className={`text-[9px] px-1.5 py-0.5 rounded font-mono border ${dp.cost_per_merge_exceeds_threshold ? 'bg-red-900/30 text-red-400 border-red-500/30' : 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30'}`}
                     title={dp.cost_per_merge_exceeds_threshold
-                      ? `Cost per merged PR exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
-                      : 'Average cost per merged PR'}
+                      ? `Cost per autonomous merge exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
+                      : 'Cost per autonomous merge — operator-assisted merges are excluded from the denominator'}
                   >
-                    {dp.cost_per_merge_exceeds_threshold && '⚠ '}${dp.cost_per_merged_pr.toFixed(2)}/PR
+                    {dp.cost_per_merge_exceeds_threshold && '⚠ '}${dp.cost_per_merged_pr.toFixed(2)}/autonomous
                   </span>
                 )}
                 {typeof dp.avg_time_to_merge_hours === 'number' && dp.avg_time_to_merge_hours > 0 && (

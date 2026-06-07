@@ -760,6 +760,20 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               </span>
             );
           }
+          const ctx = task.context as Record<string, unknown> | undefined;
+          const landedOnIntegration = ctx?.landed_on_integration;
+          const nonMergeReason = ctx?._non_merge_unblock_reason as string | undefined;
+          if (landedOnIntegration === false || nonMergeReason) {
+            return (
+              <span
+                className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/20 text-neutral-400"
+                title={nonMergeReason ? `Completed without merge: ${nonMergeReason}` : 'PR closed without merge'}
+              >
+                <X className="w-3 h-3 mr-1 shrink-0" />
+                Closed
+              </span>
+            );
+          }
           return (
             <span
               className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/20 text-emerald-400"

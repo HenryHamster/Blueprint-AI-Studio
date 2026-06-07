@@ -631,6 +631,7 @@ async def lifespan(app):
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_alert_pool_payoff_transition,
+            maybe_alert_unpriced_models_coverage,
             maybe_write_daily_snapshot,
         )
 
@@ -683,6 +684,31 @@ async def lifespan(app):
                                 "[EFFICIENCY_SNAPSHOT] project=%s payoff-alert error=%s",
                                 project_id,
                                 alert_exc,
+                            )
+                        # Unpriced-models coverage alert: same hourly tick, edge-
+                        # triggered, so spend leaking onto unpriced (provider,
+                        # model) combos pages the operator instead of silently
+                        # zero-costing. Best-effort — isolated try/except + commit.
+                        try:
+                            unpriced_fired = (
+                                await maybe_alert_unpriced_models_coverage(
+                                    scan_session, project_id
+                                )
+                            )
+                            await scan_session.commit()
+                            if unpriced_fired:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s unpriced-"
+                                    "models alert fired",
+                                    project_id,
+                                )
+                        except Exception as unpriced_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s unpriced-alert "
+                                "error=%s",
+                                project_id,
+                                unpriced_exc,
                             )
             except asyncio.CancelledError:
                 raise

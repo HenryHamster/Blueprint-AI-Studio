@@ -97,6 +97,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
+        "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
         "drift_over_claim_consistency_threshold",
@@ -133,12 +134,17 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
         "smoketest_enabled",
+        "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
         "task_type_categories",
         "task_type_model_preferences",
         "task_type_provider_overrides",
         "task_type_routing",
+        # Proactive account-usage headroom (advisory; ships dark by default).
+        "usage_headroom_gate_enabled",
+        "usage_headroom_long_running_task_types",
+        "usage_headroom_threshold_pct",
         # Side-effect-only key: fires a test webhook, never stored.
         "test_notification",
         "warm_backlog_reuse_enabled",
@@ -250,6 +256,8 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
                 "MERGE_UNVERIFIED",
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -331,6 +339,15 @@ async def get_settings(
             "task_type_provider_overrides", {}
         ),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
+        "usage_headroom_gate_enabled": bool(
+            _runtime_config.get("usage_headroom_gate_enabled", False)
+        ),
+        "usage_headroom_threshold_pct": _runtime_config.get(
+            "usage_headroom_threshold_pct", 90
+        ),
+        "usage_headroom_long_running_task_types": _runtime_config.get(
+            "usage_headroom_long_running_task_types", []
+        ),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get(
             "autonomous_periodic_tasks", {}
@@ -351,6 +368,9 @@ async def get_settings(
             "evaluating_pipeline_timeout_minutes", 120
         ),
         "evaluating_fail_hours": _runtime_config.get("evaluating_fail_hours", 48),
+        "spend_approval_timeout_hours": _runtime_config.get(
+            "spend_approval_timeout_hours", 24
+        ),
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
         ),
@@ -435,6 +455,9 @@ async def get_settings(
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+        "compute_experiment_spend_threshold_usd": _runtime_config.get(
+            "compute_experiment_spend_threshold_usd", 10.0
+        ),
         "auto_debug_enabled": _runtime_config.get("auto_debug_enabled", True),
         "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
         "auto_archive_terminal_after_days": _runtime_config.get(
@@ -470,6 +493,8 @@ async def get_settings(
                         "RESIDUAL_FIX_ESCALATED",
                         "DIRECTION_BURN_PAUSE",
                         "MERGE_UNVERIFIED",
+                        "SPEND_HOLD_CREATED",
+                        "SPEND_HOLD_EXPIRING",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -689,6 +714,42 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "usage_headroom_gate_enabled" in payload:
+        val = payload["usage_headroom_gate_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_gate_enabled must be a boolean",
+            )
+        _runtime_config["usage_headroom_gate_enabled"] = val
+    if "usage_headroom_threshold_pct" in payload:
+        try:
+            val = int(payload["usage_headroom_threshold_pct"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_threshold_pct must be a number",
+            )
+        # A utilization percentage in [1, 100]. 0 would gate out every probed
+        # account (defeating the advisory intent); >100 is unreachable.
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_threshold_pct must be between 1 and 100",
+            )
+        _runtime_config["usage_headroom_threshold_pct"] = val
+    if "usage_headroom_long_running_task_types" in payload:
+        raw = payload["usage_headroom_long_running_task_types"]
+        if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "usage_headroom_long_running_task_types must be a list of "
+                    "task-type strings"
+                ),
+            )
+        cleaned_types = sorted({t.strip() for t in raw if t.strip()})
+        _runtime_config["usage_headroom_long_running_task_types"] = cleaned_types
     if "promotion_enabled_by_project" in payload:
         raw = payload["promotion_enabled_by_project"]
         # Per-project live-promotion overrides: a mapping of project-id strings to
@@ -794,6 +855,23 @@ async def _apply_settings(
                 detail="evaluating_fail_hours must be between 1 and 168",
             )
         _runtime_config["evaluating_fail_hours"] = val
+    if "spend_approval_timeout_hours" in payload:
+        try:
+            val = int(payload["spend_approval_timeout_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="spend_approval_timeout_hours must be a number",
+            )
+        # Deliberate spend/budget holds get a longer, out-of-band window than
+        # the review-escalation 2h gate. Cap at 168h (1 week) like
+        # evaluating_fail_hours; min 1h.
+        if not (1 <= val <= 168):
+            raise HTTPException(
+                status_code=400,
+                detail="spend_approval_timeout_hours must be between 1 and 168",
+            )
+        _runtime_config["spend_approval_timeout_hours"] = val
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])
@@ -1616,6 +1694,23 @@ async def _apply_settings(
                 detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)",
             )
         _runtime_config["daily_cost_ceiling_usd"] = val
+    if "compute_experiment_spend_threshold_usd" in payload:
+        try:
+            val = float(payload["compute_experiment_spend_threshold_usd"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="compute_experiment_spend_threshold_usd must be a number",
+            )
+        if not (0 <= val <= 100000):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "compute_experiment_spend_threshold_usd must be between 0 and "
+                    "100000 (<=0 holds every positive-cap launch for approval)"
+                ),
+            )
+        _runtime_config["compute_experiment_spend_threshold_usd"] = val
     if "auto_debug_enabled" in payload:
         # #8528 added this key to _KNOWN_SETTINGS_KEYS (the auto-debug spawn
         # kill-switch read in agent_status.should_auto_debug) but shipped no
@@ -1861,6 +1956,13 @@ async def _apply_settings(
                 # fallback). The operator who turned off required CI checks needs to
                 # know when a merge proceeds without tests, so it is default-on.
                 "MERGE_UNVERIFIED",
+                # A task was held out of dispatch for a DELIBERATE spend/budget
+                # decision (requires_approval + approval_hold_reason="spend_budget").
+                # CREATED fires when the hold is first seen; EXPIRING fires once as
+                # the configured spend_approval_timeout_hours window nears its end.
+                # Both are operator-actionable, so they join the default-on list.
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ]
         )
         enabled_events = val.get(
@@ -1874,6 +1976,8 @@ async def _apply_settings(
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
                 "MERGE_UNVERIFIED",
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -2024,6 +2128,9 @@ async def _apply_settings(
                     "daily_cost_ceiling_usd": _runtime_config.get(
                         "daily_cost_ceiling_usd", 0
                     ),
+                    "compute_experiment_spend_threshold_usd": _runtime_config.get(
+                        "compute_experiment_spend_threshold_usd", 10.0
+                    ),
                     "max_provision_retries": _runtime_config.get(
                         "max_provision_retries", 3
                     ),
@@ -2064,6 +2171,9 @@ async def _apply_settings(
                     ),
                     "ci_backstop_timeout_minutes": _runtime_config.get(
                         "ci_backstop_timeout_minutes", 60
+                    ),
+                    "spend_approval_timeout_hours": _runtime_config.get(
+                        "spend_approval_timeout_hours", 24
                     ),
                     "max_total_research_per_project": _runtime_config.get(
                         "max_total_research_per_project", 5
@@ -2185,6 +2295,8 @@ async def _apply_settings(
                                 "RESIDUAL_FIX_ESCALATED",
                                 "DIRECTION_BURN_PAUSE",
                                 "MERGE_UNVERIFIED",
+                                "SPEND_HOLD_CREATED",
+                                "SPEND_HOLD_EXPIRING",
                             ],
                             "throttle_seconds": 30,
                         },

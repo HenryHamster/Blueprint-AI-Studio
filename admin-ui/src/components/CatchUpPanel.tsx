@@ -571,6 +571,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 prevScopeConversionRates={digest.prev_scope_conversion_rates}
                 scopeMismatchSummary={digest.scope_mismatch_summary}
                 rejectionPatternSummary={digest.rejection_pattern_summary}
+                costPerMergeByType={digest.cost_per_merge_by_type}
+                medianCostPerMergeByType={digest.median_cost_per_merge_by_type}
                 trendHistory={digest.trend_history}
                 activeTaxonomyFilter={activeTaxonomyFilter}
                 activeStageFilter={activeStageFilter}

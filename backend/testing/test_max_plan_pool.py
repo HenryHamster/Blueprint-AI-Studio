@@ -5,12 +5,15 @@ dicts directly and pass an explicit `now` where the function supports it,
 keeping assertions deterministic without fixtures or locks.
 """
 
+import asyncio
 import time
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.providers.base import UsageSnapshot
 from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
@@ -18,9 +21,13 @@ from app.max_plan_pool import (
     _OUTCOME_WINDOW_SECONDS,
     _QUARANTINE_COOLDOWN_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
+    _USAGE_HEADROOM_NEUTRAL,
+    _USAGE_SNAPSHOT_TTL_SECONDS,
     _account_at_cap,
     _account_available_for_model,
     _account_by_id,
+    _apply_usage_gate,
+    _cached_usage_snapshot,
     _check_quarantine_trigger,
     _compute_avg_duration_24h,
     _compute_health_score,
@@ -29,17 +36,25 @@ from app.max_plan_pool import (
     _effective_success_rate,
     _cooldown_seconds_for_info,
     _daily_reset_if_elapsed,
+    _max_plan_pool_lock,
     _max_plan_pools,
+    _maybe_schedule_usage_refresh,
     _normalize_rl_model,
     _pending_rl_persists,
     _prune_health_events,
+    _refresh_usage_snapshot,
     _serialize_disabled_model_info,
+    _usage_gate_should_skip,
+    _usage_headroom_rank,
+    _usage_headroom_settings,
+    _usage_snapshot_summary,
     cascade_disabled_models,
     describe_pool_blockage,
     disable_account_for_auth,
     disable_account_model,
     get_account_health_stats,
     get_all_account_health_summaries,
+    select_max_plan_account,
     select_max_plan_account_balanced,
     summarize_pool_state,
 )
@@ -2082,3 +2097,422 @@ class TestDbPoolWideRateLimitCooldownScoping:
 
         result = await db_pool_wide_rate_limit_cooldown(providers=["anthropic"])
         assert result is True
+
+
+# ── Proactive account-usage headroom (advisory) ─────────────────────────────
+
+
+def _known_snap(five, seven, *, probed_at="2026-06-06T00:00:00"):
+    return UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": five, "seven_day": seven},
+        resets_at={"five_hour": None, "seven_day": None},
+        probed_at=probed_at,
+    )
+
+
+def _acct_usage(acct, snap, *, at):
+    acct["usage_snapshot"] = snap
+    acct["usage_snapshot_at"] = at
+    return acct
+
+
+class TestCachedUsageSnapshot:
+    def test_fresh_snapshot_returned(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), _known_snap(10.0, 20.0), at=now)
+        assert _cached_usage_snapshot(acct, now) is not None
+
+    def test_stale_snapshot_treated_as_unknown(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(10.0, 20.0),
+            at=now - timedelta(seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1),
+        )
+        assert _cached_usage_snapshot(acct, now) is None
+
+    def test_missing_snapshot_is_none(self):
+        assert _cached_usage_snapshot(_acct(), datetime.utcnow()) is None
+
+    def test_non_snapshot_value_is_none(self):
+        now = datetime.utcnow()
+        acct = _acct(usage_snapshot={"not": "a snapshot"}, usage_snapshot_at=now)
+        assert _cached_usage_snapshot(acct, now) is None
+
+
+class TestUsageGateShouldSkip:
+    def test_five_hour_over_threshold_skips(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), _known_snap(95.0, 10.0), at=now)
+        assert _usage_gate_should_skip(acct, now, 90.0) is True
+
+    def test_seven_day_over_threshold_skips(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), _known_snap(10.0, 92.0), at=now)
+        assert _usage_gate_should_skip(acct, now, 90.0) is True
+
+    def test_under_threshold_not_skipped(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), _known_snap(80.0, 85.0), at=now)
+        assert _usage_gate_should_skip(acct, now, 90.0) is False
+
+    def test_unknown_snapshot_never_skipped(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), UsageSnapshot.unknown("t"), at=now)
+        assert _usage_gate_should_skip(acct, now, 90.0) is False
+
+    def test_stale_snapshot_never_skipped(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(99.0, 99.0),
+            at=now - timedelta(seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1),
+        )
+        assert _usage_gate_should_skip(acct, now, 90.0) is False
+
+
+class TestUsageHeadroomRank:
+    def test_known_rank_is_100_minus_max_util(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), _known_snap(20.0, 60.0), at=now)
+        assert _usage_headroom_rank(acct, now) == 40.0
+
+    def test_unknown_ranks_neutral(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(_acct(), UsageSnapshot.unknown("t"), at=now)
+        assert _usage_headroom_rank(acct, now) == _USAGE_HEADROOM_NEUTRAL
+
+    def test_missing_ranks_neutral(self):
+        assert (
+            _usage_headroom_rank(_acct(), datetime.utcnow())
+            == _USAGE_HEADROOM_NEUTRAL
+        )
+
+    def test_stale_ranks_neutral(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(20.0, 60.0),
+            at=now - timedelta(seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1),
+        )
+        assert _usage_headroom_rank(acct, now) == _USAGE_HEADROOM_NEUTRAL
+
+
+class TestUsageHeadroomSettings:
+    def test_defaults_when_empty(self):
+        enabled, threshold, long_types = _usage_headroom_settings({})
+        assert enabled is False
+        assert threshold == 90.0
+        assert "create" in long_types
+
+    def test_parses_enabled_threshold_and_types(self):
+        enabled, threshold, long_types = _usage_headroom_settings(
+            {
+                "usage_headroom_gate_enabled": True,
+                "usage_headroom_threshold_pct": 75,
+                "usage_headroom_long_running_task_types": ["create", "research"],
+            }
+        )
+        assert enabled is True
+        assert threshold == 75.0
+        assert long_types == frozenset({"create", "research"})
+
+    def test_malformed_threshold_falls_back(self):
+        _, threshold, _ = _usage_headroom_settings(
+            {"usage_headroom_threshold_pct": "not-a-number"}
+        )
+        assert threshold == 90.0
+
+    def test_malformed_types_falls_back_to_default(self):
+        _, _, long_types = _usage_headroom_settings(
+            {"usage_headroom_long_running_task_types": "not-a-list"}
+        )
+        assert "create" in long_types
+
+
+class TestApplyUsageGate:
+    def test_filters_over_threshold_when_alternatives_remain(self):
+        now = datetime.utcnow()
+        hot = _acct_usage(_acct(id="hot"), _known_snap(95.0, 10.0), at=now)
+        cool = _acct_usage(_acct(id="cool"), _known_snap(10.0, 10.0), at=now)
+        result = _apply_usage_gate(
+            [hot, cool], now=now, threshold_pct=90.0, acct_getter=lambda a: a
+        )
+        assert result == [cool]
+
+    def test_keeps_all_when_every_candidate_exhausted(self):
+        now = datetime.utcnow()
+        a = _acct_usage(_acct(id="a"), _known_snap(95.0, 10.0), at=now)
+        b = _acct_usage(_acct(id="b"), _known_snap(92.0, 10.0), at=now)
+        result = _apply_usage_gate(
+            [a, b], now=now, threshold_pct=90.0, acct_getter=lambda a: a
+        )
+        assert result == [a, b]  # no deadlock — never empties the set
+
+    def test_single_candidate_unchanged(self):
+        now = datetime.utcnow()
+        only = _acct_usage(_acct(id="only"), _known_snap(99.0, 99.0), at=now)
+        result = _apply_usage_gate(
+            [only], now=now, threshold_pct=90.0, acct_getter=lambda a: a
+        )
+        assert result == [only]
+
+
+class TestUsageSnapshotSummary:
+    def test_known_summary_shape(self):
+        now = datetime.utcnow()
+        snap = UsageSnapshot(
+            known=True,
+            window_utilizations={"five_hour": 28.0, "seven_day": 64.0},
+            resets_at={"five_hour": "2026-06-06T00:00:00Z", "seven_day": None},
+            probed_at="2026-06-06T01:00:00",
+        )
+        acct = _acct_usage(_acct(), snap, at=now)
+        out = _usage_snapshot_summary(acct, now)
+        assert out["known"] is True
+        assert out["five_hour_utilization"] == 28.0
+        assert out["seven_day_utilization"] == 64.0
+        assert out["resets_at"]["five_hour"] == "2026-06-06T00:00:00Z"
+        assert out["probed_at"] == "2026-06-06T01:00:00"
+        assert out["stale"] is False
+
+    def test_missing_summary_is_unknown(self):
+        out = _usage_snapshot_summary(_acct(), datetime.utcnow())
+        assert out["known"] is False
+        assert out["five_hour_utilization"] is None
+        assert out["stale"] is True
+
+    def test_stale_flag_set(self):
+        now = datetime.utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(10.0, 10.0),
+            at=now - timedelta(seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1),
+        )
+        out = _usage_snapshot_summary(acct, now)
+        assert out["stale"] is True
+        # Stale-but-known still reports its last values for operator visibility.
+        assert out["known"] is True
+
+
+def _healthy_acct(acct_id, **kw):
+    acct = _acct(id=acct_id, name=acct_id, provider="anthropic", auth_mode="oauth")
+    acct.update(kw)
+    return acct
+
+
+class TestSelectionUsageGate:
+    _USER = "u"
+    _GATE_CFG: ClassVar[dict] = {
+        "usage_headroom_gate_enabled": True,
+        "usage_headroom_threshold_pct": 90,
+        "usage_headroom_long_running_task_types": ["create"],
+    }
+
+    def _setup(self, accounts):
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+        _max_plan_pools[self._USER] = list(accounts)
+        for a in accounts:
+            _account_by_id[a["id"]] = a
+
+    async def test_long_running_skips_exhausted_even_when_better_ranked(self):
+        now = datetime.utcnow()
+        # `hot` ranks first on health_score but is over the usage threshold.
+        hot = _healthy_acct(
+            "hot",
+            completion_events=[
+                {"at": now - timedelta(minutes=5), "duration_seconds": 60.0}
+                for _ in range(3)
+            ],
+        )
+        _acct_usage(hot, _known_snap(95.0, 10.0), at=now)
+        cool = _healthy_acct("cool")
+        _acct_usage(cool, _known_snap(10.0, 10.0), at=now)
+        self._setup([hot, cool])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config=self._GATE_CFG,
+        )
+        assert account["id"] == "cool"
+
+    async def test_non_long_running_type_does_not_skip(self):
+        now = datetime.utcnow()
+        hot = _healthy_acct(
+            "hot",
+            completion_events=[
+                {"at": now - timedelta(minutes=5), "duration_seconds": 60.0}
+                for _ in range(3)
+            ],
+        )
+        _acct_usage(hot, _known_snap(95.0, 10.0), at=now)
+        cool = _healthy_acct("cool")
+        _acct_usage(cool, _known_snap(10.0, 10.0), at=now)
+        self._setup([hot, cool])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="review",  # not in long-running set
+            runtime_config=self._GATE_CFG,
+        )
+        # `review` isn't gated; health_score wins, so the exhausted account stays.
+        assert account["id"] == "hot"
+
+    async def test_unknown_account_not_skipped(self):
+        now = datetime.utcnow()
+        unknown = _healthy_acct("unk")
+        _acct_usage(unknown, UsageSnapshot.unknown("t"), at=now)
+        hot = _healthy_acct("hot")
+        _acct_usage(hot, _known_snap(99.0, 99.0), at=now)
+        self._setup([unknown, hot])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config=self._GATE_CFG,
+        )
+        # `hot` is skipped (>= threshold); `unk` is unknown → eligible.
+        assert account["id"] == "unk"
+
+    async def test_disabled_gate_is_noop(self):
+        now = datetime.utcnow()
+        # hot has fewer active tasks; with the gate OFF, load-balancing picks it
+        # despite high utilization (headroom ignored entirely).
+        hot = _healthy_acct("hot", active_tasks=0)
+        _acct_usage(hot, _known_snap(99.0, 99.0), at=now)
+        cool = _healthy_acct("cool", active_tasks=5)
+        _acct_usage(cool, _known_snap(5.0, 5.0), at=now)
+        self._setup([hot, cool])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config={"usage_headroom_gate_enabled": False},
+        )
+        assert account["id"] == "hot"
+
+    async def test_ranking_prefers_more_headroom(self):
+        now = datetime.utcnow()
+        # Equal health/success/duration/active_tasks → headroom decides.
+        more = _healthy_acct("more")
+        _acct_usage(more, _known_snap(20.0, 20.0), at=now)  # headroom 80
+        less = _healthy_acct("less")
+        _acct_usage(less, _known_snap(80.0, 80.0), at=now)  # headroom 20
+        self._setup([more, less])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config=self._GATE_CFG,
+        )
+        assert account["id"] == "more"
+
+    async def test_unknown_ranks_neutrally_between_high_and_low(self):
+        now = datetime.utcnow()
+        # Unknown (neutral 50) should beat a low-headroom account (20)…
+        unknown = _healthy_acct("unk")
+        _acct_usage(unknown, UsageSnapshot.unknown("t"), at=now)
+        low = _healthy_acct("low")
+        _acct_usage(low, _known_snap(80.0, 80.0), at=now)  # headroom 20
+        self._setup([unknown, low])
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config=self._GATE_CFG,
+        )
+        assert account["id"] == "unk"
+
+
+class TestNoIOUnderLock:
+    _USER = "u"
+
+    async def test_selection_reads_only_cache_no_probe(self, monkeypatch):
+        now = datetime.utcnow()
+        acct = _healthy_acct("a")
+        _acct_usage(acct, _known_snap(10.0, 10.0), at=now)  # fresh → no refresh
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+        _max_plan_pools[self._USER] = [acct]
+        _account_by_id["a"] = acct
+
+        called = {"probe": False}
+
+        class _Boom:
+            async def probe_usage(self, *a, **k):
+                called["probe"] = True
+                raise AssertionError("selection must not probe under the lock")
+
+        monkeypatch.setattr("app.max_plan_pool.get_provider", lambda *_a, **_k: _Boom())
+        account = await select_max_plan_account(
+            self._USER,
+            model=OPUS,
+            task_type="create",
+            runtime_config={
+                "usage_headroom_gate_enabled": True,
+                "usage_headroom_threshold_pct": 90,
+                "usage_headroom_long_running_task_types": ["create"],
+            },
+        )
+        assert account["id"] == "a"
+        assert called["probe"] is False
+
+    async def test_refresh_probes_outside_lock_and_caches(self, monkeypatch):
+        acct = _healthy_acct("a")  # no snapshot → refresh will probe
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+        _account_by_id["a"] = acct
+
+        observed = {"lock_held_during_probe": None}
+
+        class _Probe:
+            async def probe_usage(self, *a, **k):
+                observed["lock_held_during_probe"] = _max_plan_pool_lock.locked()
+                return _known_snap(30.0, 40.0)
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.get_provider", lambda *_a, **_k: _Probe()
+        )
+        await _refresh_usage_snapshot("a")
+        # The network probe ran WITHOUT the pool lock held…
+        assert observed["lock_held_during_probe"] is False
+        # …and the result was cached under the lock afterward.
+        assert isinstance(acct.get("usage_snapshot"), UsageSnapshot)
+        assert acct["usage_snapshot"].window_utilizations["five_hour"] == 30.0
+        assert acct.get("usage_probe_inflight") is None
+
+    async def test_refresh_caches_unknown_on_probe_error(self, monkeypatch):
+        acct = _healthy_acct("a")
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+        _account_by_id["a"] = acct
+
+        class _Broken:
+            async def probe_usage(self, *a, **k):
+                raise RuntimeError("provider blew up")
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.get_provider", lambda *_a, **_k: _Broken()
+        )
+        await _refresh_usage_snapshot("a")
+        # A blown probe still caches an (unknown) snapshot so we don't hammer it.
+        assert isinstance(acct.get("usage_snapshot"), UsageSnapshot)
+        assert acct["usage_snapshot"].known is False
+
+    async def test_maybe_schedule_fires_background_refresh(self, monkeypatch):
+        acct = _healthy_acct("a")  # no snapshot → stale
+        _account_by_id.clear()
+        _account_by_id["a"] = acct
+        ran = {"count": 0}
+
+        async def _fake_refresh(acct_id):
+            ran["count"] += 1
+
+        monkeypatch.setattr("app.max_plan_pool._refresh_usage_snapshot", _fake_refresh)
+        _maybe_schedule_usage_refresh(acct, datetime.utcnow())
+        assert acct.get("usage_probe_inflight") is True
+        await asyncio.sleep(0)  # let the fire-and-forget task run
+        assert ran["count"] == 1

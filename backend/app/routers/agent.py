@@ -185,6 +185,17 @@ _AGENT_INACTIVE_TASK_STATUSES = (
     TaskStatus.BLOCKED,
 )
 
+# Peer code-change and analysis task types that do real code/analysis work and
+# therefore benefit from the same baseline launch context (concurrent/sibling/
+# queued task awareness, recent completions, lessons, and direction
+# goal/contract/narrative) that create/fix/refactor/research/plan/review get.
+# Single source of truth for the two claim-path context gates below. These reuse
+# the existing per-project queries — no new heavy computation on the hot claim
+# path; the expensive review-only analytics stay gated to their narrower sets.
+_PEER_CODE_ANALYSIS_TYPES = frozenset(
+    {"qa", "migrate", "debug", "perf", "investigate"}
+)
+
 # Issue M3 (warm-VM continuity audit): JWTs for terminated tasks remain valid
 # for the JWT's full TTL (1h). The is_idempotent_path branch accepts these
 # terminal-task tokens on /next-role and /vm-heartbeat so a legitimate warm
@@ -853,7 +864,31 @@ async def claim_task(
     task_capability = agent_capability_slice(task_type)
     if task_capability is not None:
         response["task_capability"] = task_capability
-    if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
+
+    # Surface a reserved provisional Alembic revision (if the orchestrator
+    # allocated one for this migration-producing task) so the agent consumes the
+    # locked id verbatim instead of racing to derive max+1 against the live
+    # chain. Additive: a claim with no reservation simply omits the key and the
+    # agent falls back to local numbering, preserving backward compatibility for
+    # tasks queued before the reservation rollout.
+    from app.migration_reservations import (
+        get_migration_reservation_for_task,
+    )
+
+    _migration_reservation = await get_migration_reservation_for_task(
+        session, task_id=task.id
+    )
+    if _migration_reservation is not None:
+        response["migration_reservation"] = {
+            "provisional_revision": _migration_reservation.provisional_revision,
+            "provisional_down_revision": (
+                _migration_reservation.provisional_down_revision
+            ),
+        }
+    if (
+        task_type in ("research", "plan", "create", "fix", "refactor", "review")
+        or task_type in _PEER_CODE_ANALYSIS_TYPES
+    ):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
         # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
         # Reads below: id, title, first_payload (payloads), status, context.
@@ -3057,8 +3092,8 @@ async def claim_task(
                     Task.status == TaskStatus.COMPLETED,
                     # Task has no `completed_at` column — that name is a property
                     # on the strategic-cycle model, not Task. For a COMPLETED
-                    # task, created_at bounds the recent-window scan (mirrors
-                    # sr_blind_spots._scan_fp_stats, the sibling 14-day SR scan).
+                    # task, created_at bounds the recent-window scan (the standard
+                    # bounded recent-task SR scan pattern).
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
@@ -3292,13 +3327,16 @@ async def claim_task(
     if (
         direction_id
         and project_for_playbook
-        and task_type
-        in (
-            "create",
-            "fix",
-            "refactor",
-            "research",
-            "plan",
+        and (
+            task_type
+            in (
+                "create",
+                "fix",
+                "refactor",
+                "research",
+                "plan",
+            )
+            or task_type in _PEER_CODE_ANALYSIS_TYPES
         )
     ):
         _narrative_direction = next(
@@ -3323,6 +3361,13 @@ async def claim_task(
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["contract"] = contract
+            # Surface the direction goal/title so peer code-change and analysis
+            # agents (qa/migrate/debug/perf/investigate) launch knowing which
+            # direction they serve, not just its narrative/contract bodies.
+            if narrative or contract:
+                response["direction_context"].setdefault(
+                    "title", _narrative_direction.get("title", "")
+                )
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
@@ -3868,6 +3913,38 @@ async def agent_heartbeat(
             token.get("vm_instance_id"), req.agent_runtime_fingerprint
         )
 
+    # Record the source git SHA baked into the image so a running VM maps back to
+    # its exact build commit. Additive provenance; no-ops when the field is absent
+    # (older images / local dev that never baked the AGENT_SOURCE_SHA marker).
+    if req.agent_source_sha is not None:
+        from app.compute import record_vm_source_sha
+
+        record_vm_source_sha(token.get("vm_instance_id"), req.agent_source_sha)
+
+    # Mirror the heartbeat-reported image identity onto the durable PoolVm row
+    # when this VM is a warm-pool member, so fleet / release-artifact checks
+    # survive an orchestrator restart (the in-memory caches above do not). No-op
+    # for non-pool task VMs (persist_pool_vm_image_state returns False when there
+    # is no PoolVm row). Gated on is_warm_pool_enabled() so a dark pool issues no
+    # extra query; shares the task heartbeat's session + commit below.
+    from app.warm_pool import is_warm_pool_enabled
+
+    if is_warm_pool_enabled():
+        from app.compute import persist_pool_vm_image_state
+
+        _img_kwargs: dict = {}
+        if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+            _img_kwargs["image_name"] = req.vm_image_name
+            _img_kwargs["build_ts"] = req.vm_image_build_ts
+        if req.agent_runtime_fingerprint is not None:
+            _img_kwargs["runtime_fingerprint"] = req.agent_runtime_fingerprint
+        if req.agent_source_sha is not None:
+            _img_kwargs["source_sha"] = req.agent_source_sha
+        if _img_kwargs:
+            await persist_pool_vm_image_state(
+                session, token.get("vm_instance_id"), **_img_kwargs
+            )
+
     session.add(task)
     await session.commit()
 
@@ -4120,6 +4197,8 @@ async def agent_list_knowledge_documents(
     q: str | None = Query(default=None, description="Full-text search term"),
     topic: str | None = Query(default=None, description="Exact topic filter"),
     tag: str | None = Query(default=None, description="Exact tag filter"),
+    direction: str | None = Query(default=None, description="Exact direction_id filter"),
+    source_kind: str | None = Query(default=None, description="Exact source_kind filter"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -4128,14 +4207,24 @@ async def agent_list_knowledge_documents(
     """List / search knowledge documents for the authenticated task's project.
 
     Mirrors the operator list endpoint (``q`` over title/summary/body/topic/tags,
-    exact ``topic`` / ``tag`` filters, newest-first, limit/offset paginated) but
-    scopes to the token's task project — never a URL-supplied project — so an
-    agent cannot read another project's documents. The list shape omits the
-    markdown body; use get-by-id for the full document.
+    exact ``topic`` / ``tag`` / ``direction`` / ``source_kind`` filters,
+    newest-first, limit/offset paginated) but scopes to the token's task project
+    — never a URL-supplied project — so an agent cannot read another project's
+    documents. The list shape omits the markdown body; use get-by-id for the
+    full document. The new ``direction`` / ``source_kind`` filters are additive:
+    omitting them preserves the prior behavior and response shape exactly.
     """
     project_id = await _resolve_token_project_id(session, token)
     return await kq_list_knowledge_documents(
-        session, project_id, q=q, topic=topic, tag=tag, limit=limit, offset=offset
+        session,
+        project_id,
+        q=q,
+        topic=topic,
+        tag=tag,
+        direction=direction,
+        source_kind=source_kind,
+        limit=limit,
+        offset=offset,
     )
 
 

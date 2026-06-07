@@ -151,6 +151,34 @@ describe('MessagesPanel — viewport regression', () => {
     }, { waitMs: 50 });
   });
 
+  test('stale citation warning chip does not overflow at 375px', async () => {
+    const msgs = [
+      makeMsg({
+        id: 'msg-stale',
+        message_type: 'BUG_REPORT',
+        status: 'open',
+        content: 'Reported bug with stale file references',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: [
+              'backend/app/research_completion.py:_staleness_provenance_warning',
+              'backend/app/strategic_spawning.py:spawn_investigation_task_from_message',
+            ],
+          },
+        },
+      }),
+    ];
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    });
+  });
+
   test('time dividers render without overflow when messages span days', async () => {
     const today = new Date();
     const yesterday = new Date(today);

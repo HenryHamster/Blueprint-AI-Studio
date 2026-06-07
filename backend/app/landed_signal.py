@@ -20,12 +20,14 @@ integration branch" signal used by analytics.
 """
 
 import logging
+from typing import Literal
 
 from sqlalchemy import and_, cast, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
+from app.ci_resolution import is_degraded_unverified_reason
 from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus
 
@@ -36,6 +38,30 @@ logger = logging.getLogger(__name__)
 LANDED_SIGNAL_KEY = "pr_merged"
 LANDED_ON_INTEGRATION_KEY = "landed_on_integration"
 NON_MERGE_UNBLOCK_REASON_KEY = "_non_merge_unblock_reason"
+
+# Where the no-CI merge gate stamps WHY a PR merged without real test
+# verification. Lives under ``task.context["review_loop"]``; absent on a
+# verified/normal merge. The reason KEYS are minted in ``ci_resolution`` and
+# classified benign-vs-degraded there (the single source of truth).
+REVIEW_LOOP_KEY = "review_loop"
+UNVERIFIED_MERGE_REASON_KEY = "unverified_merge_reason"
+
+# Task-level verified-merge classification consumed by success-scoring analytics
+# (task_outcomes / direction_outcomes / pipeline_health).
+MergeVerificationStatus = Literal[
+    "verified", "unverified_benign", "unverified_degraded"
+]
+
+# Where the durable reproduce-on-HEAD verdict is persisted for
+# bug-report-/finding-derived work. Written by the agent terminal-status path
+# (``routers/agent_status``) and seeded by research/bug-report ingestion. The
+# canonical defect-truth signal success scoring reads to tell a *proven* fix
+# from a merely-shipped one. Mirrors ``schemas.ReproduceVerdict``.
+REPRODUCE_VERDICT_KEY = "reproduce_verdict"
+ReproduceVerdictStatus = Literal["reproduced", "already_resolved", "indeterminate"]
+_REPRODUCE_VERDICT_STATUSES = frozenset(
+    ("reproduced", "already_resolved", "indeterminate")
+)
 
 
 def has_merge_unblock_signal(task: Task) -> bool:
@@ -76,6 +102,98 @@ def is_merged_completion(task: Task) -> bool:
 def is_unblocked_completion(task: Task) -> bool:
     """True when a completed task should no longer block rollup convergence."""
     return task.status == TaskStatus.COMPLETED and has_merge_unblock_signal(task)
+
+
+def _unverified_merge_reason(task: Task) -> str | None:
+    """Read ``review_loop["unverified_merge_reason"]`` defensively.
+
+    Returns the stable reason KEY a no-CI fall-open stamped, or ``None`` when the
+    merge was verified (no reason) or the context shape is missing/malformed.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return None
+    reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
+    return reason if isinstance(reason, str) and reason else None
+
+
+def merge_verification_status(task: Task) -> "MergeVerificationStatus | None":
+    """Classify HOW a merged completion's PR was verified, for success scoring.
+
+    A PR merging onto the integration branch is necessary but NOT sufficient to
+    call a done/fixed claim *proven*: the no-CI merge gate legitimately "falls
+    open" and merges some PRs WITHOUT running real tests, recording why in
+    ``review_loop["unverified_merge_reason"]``. This predicate reads that reason
+    and returns one of:
+
+      - ``"verified"`` — merged completion with NO fall-open reason: a real CI /
+        test verdict gated the merge.
+      - ``"unverified_benign"`` — merged via a fall-open whose reason is benign
+        (the project has no runnable suite, or only positive execution signals
+        were obtained). A benign project must NOT be penalized for having no tests.
+      - ``"unverified_degraded"`` — merged via a fall-open whose reason is
+        *degraded* (verification was expected but an environment/setup failure
+        blocked it) per :func:`ci_resolution.is_degraded_unverified_reason`.
+
+    Returns ``None`` for any task that is not a merged completion (the question
+    does not apply), so callers can cheaply skip non-shipped tasks. Reuses
+    :func:`is_merged_completion` so the "shipped" definition stays identical to
+    the rest of analytics; an unknown / unclassified reason key defaults to
+    ``"unverified_benign"`` (mirroring the WARNING severity default).
+    """
+    if not is_merged_completion(task):
+        return None
+    reason = _unverified_merge_reason(task)
+    if reason is None:
+        return "verified"
+    if is_degraded_unverified_reason(reason):
+        return "unverified_degraded"
+    return "unverified_benign"
+
+
+def is_verified_merge(task: Task) -> bool:
+    """True iff *task* is a merged completion whose PR was really verified.
+
+    Convenience wrapper over :func:`merge_verification_status`: only the
+    ``"verified"`` status counts. Both unverified buckets and non-merged tasks
+    return False, so success-scoring can gate a "proven fix" credit on this.
+    """
+    return merge_verification_status(task) == "verified"
+
+
+def reproduce_verdict_status(task: Task) -> "ReproduceVerdictStatus | None":
+    """Read the canonical reproduce-on-HEAD verdict status off *task*, or None.
+
+    Returns the persisted ``task.context["reproduce_verdict"]["status"]`` when it
+    is one of the canonical values (``reproduced`` / ``already_resolved`` /
+    ``indeterminate``), else ``None``. ``None`` deliberately covers three cases
+    that must all fall back to merge-based scoring: a task that predates the
+    verdict (historical), a task that is not bug-report-/finding-derived (no
+    defect claim to prove), and any malformed/partial context shape. Mirrors the
+    defensive nested-read of :func:`_unverified_merge_reason`.
+    """
+    verdict = (task.context or {}).get(REPRODUCE_VERDICT_KEY)
+    if not isinstance(verdict, dict):
+        return None
+    status = verdict.get("status")
+    return status if status in _REPRODUCE_VERDICT_STATUSES else None
+
+
+def suppresses_redispatch(task: Task) -> bool:
+    """True when a non-shipping completion affirmatively determined its defect is
+    already resolved / non-reproducing on HEAD, so its source finding must NOT be
+    re-dispatched.
+
+    The canonical signal is a reproduce verdict of ``already_resolved``. The
+    legacy ``no_op_reason`` marker (stamped by ``./done --already-done`` before
+    the verdict existed) is honored as a fallback so historical no-op completions
+    keep suppressing re-dispatch. An ``indeterminate`` verdict is deliberately
+    NOT suppressed — the defect could not be ruled out, so the finding stays
+    eligible for retry.
+    """
+    if reproduce_verdict_status(task) == "already_resolved":
+        return True
+    return bool((task.context or {}).get("no_op_reason"))
 
 
 def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
@@ -208,6 +326,22 @@ def apply_merged_landed_signal(
         )
     if landed_on_integration:
         mark_landed_on_integration(task)
+        # Augment the merge with the code-task acceptance gate: when the task
+        # DECLARED acceptance evidence, evaluate it now (the changed files and
+        # merge-verification reason are both on the task) and stamp the verdict
+        # durably so success scoring can consume it. Fail-safe: no declaration =>
+        # no key written, scoring unchanged. Lazy import avoids a module cycle
+        # (acceptance_gate imports this module for its constants).
+        try:
+            from app.acceptance_gate import record_code_acceptance_verdict
+
+            record_code_acceptance_verdict(task)
+        except Exception:  # noqa: BLE001 — gating must never undo a real merge
+            logger.warning(
+                "[LANDED] code-acceptance verdict recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration

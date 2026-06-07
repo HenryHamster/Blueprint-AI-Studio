@@ -38,6 +38,7 @@ import {
   buildReviewMasterPreamble,
   buildReviewSeverityGuideSection,
 } from '../prompts/review-prompt.js';
+import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 
 export const PANEL_REVIEW_LENSES = [
   {
@@ -197,6 +198,9 @@ type PanelReviewLensBodyArgs = {
   prTitle: string;
   prBody: string;
   buildConfig?: BuildConfig;
+  // Read-only ./fetch guidance block (or '' when project_id is absent). Gated so
+  // a prompt never advertises a helper that wasn't written into the workspace.
+  fetchGuidance: string;
 };
 
 /**
@@ -220,6 +224,7 @@ function buildPanelReviewLensBody(args: PanelReviewLensBodyArgs): string {
     prTitle,
     prBody,
     buildConfig,
+    fetchGuidance,
   } = args;
   const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
   return `${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
@@ -268,7 +273,7 @@ IMPORTANT:
 - The file must contain ONLY the JSON object, with no markdown fence or commentary.
 - Do not write to /tmp/review_verdict_${taskId}.json; this task has its own structured verdict channel.
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${fetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 function buildPanelReviewLensPrompt(args: PanelReviewLensBodyArgs & {
@@ -298,6 +303,7 @@ function buildPanelReviewParentPrompt(args: {
   projectContext: string;
   playbookSection: string;
   claudeMdPrefix: string;
+  fetchGuidance: string;
 }): string {
   const {
     lensArgs,
@@ -308,6 +314,7 @@ function buildPanelReviewParentPrompt(args: {
     projectContext,
     playbookSection,
     claudeMdPrefix,
+    fetchGuidance,
   } = args;
   const lensBlocks = lensArgs
     .map((lensArg, index) => {
@@ -331,7 +338,7 @@ ${lensBlocks}
 
 When every sub-agent has completed, confirm that all ${lensArgs.length} \`/tmp/panel_review_lens_*_${taskId}.json\` verdict files exist (the deterministic code-side synthesis fails the whole panel closed if any is missing). You are done once all ${lensArgs.length} verdict files are written; do not modify any repository files.
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${fetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 export async function handlePanelReview(
@@ -392,6 +399,13 @@ export async function handlePanelReview(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  // Provision the read-only ./fetch helper (direction|section|playbook) so each
+  // lens reviewer can resolve refs trimmed from its launch snapshot. project_id
+  // is set for all task types by the backend; if it is absent we provision
+  // NOTHING and advertise nothing, so a prompt never promises an unwritten helper.
+  const panelProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (panelProjectId) writeFetchHelper(taskId, panelProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const panelFetchGuidance = panelProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const disallowedTools = configureAgentPermissions('panel_review');
   const buildConfig = resolveBuildConfig(task);
 
@@ -460,6 +474,7 @@ export async function handlePanelReview(
     prTitle,
     prBody,
     buildConfig,
+    fetchGuidance: panelFetchGuidance,
   }));
   const projectContextSection = projectContext ? `${projectContext}\n\n` : '';
 
@@ -502,6 +517,7 @@ export async function handlePanelReview(
       projectContext: projectContextSection,
       playbookSection,
       claudeMdPrefix,
+      fetchGuidance: panelFetchGuidance,
     });
 
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(

@@ -353,7 +353,10 @@ async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
     assert result["current_finding_count"] == 5
     assert result["previous_finding_count"] == 5
     cat = result["categories"]["test-coverage"]
+    assert cat["current_reviewer_finding_count"] == 5
+    assert cat["previous_reviewer_finding_count"] == 5
     assert cat["current_human_count"] == 5
+    assert cat["previous_human_count"] == 5
     # 5 findings == _MIN_SR_FINDINGS, so not low-confidence
     assert cat["low_confidence_finding_count"] is False
 
@@ -2194,110 +2197,6 @@ async def test_reasoning_engagement_populated_for_stable_categories(
 
 
 @pytest.mark.asyncio
-async def test_reasoning_quality_scoring(db_session: AsyncSession):
-    """Reasoning quality score rewards file paths, test names, and word count."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-
-    # Current window: 5 tasks with varying reasoning quality.
-    # Empty reasoning: no quality score
-    t = _make_sr_task(
-        project.id,
-        age_days=2,
-        human_cats={"correctness": 1},
-        sr_failed_cats=[],
-        sr_passed_cats_with_reasoning={"correctness": ""},
-    )
-    db_session.add(t)
-    tasks.append(t)
-
-    # Low quality: "looks ok" (3 words, no signals) → score ≈ 0.0
-    t = _make_sr_task(
-        project.id,
-        age_days=2,
-        human_cats={"correctness": 1},
-        sr_failed_cats=[],
-        sr_passed_cats_with_reasoning={"correctness": "looks ok here"},
-    )
-    db_session.add(t)
-    tasks.append(t)
-
-    # Medium quality: "looks fine to me — checked the diff" (8 words, no signals) → score ≈ 0.34
-    t = _make_sr_task(
-        project.id,
-        age_days=2,
-        human_cats={"correctness": 1},
-        sr_failed_cats=[],
-        sr_passed_cats_with_reasoning={
-            "correctness": "looks fine to me checked the diff"
-        },
-    )
-    db_session.add(t)
-    tasks.append(t)
-
-    # High quality: file path + test name + word count → score = 1.0
-    t = _make_sr_task(
-        project.id,
-        age_days=2,
-        human_cats={"correctness": 1},
-        sr_failed_cats=[],
-        sr_passed_cats_with_reasoning={
-            "correctness": "verified backend/app/foo.py handles the empty list case via test_foo.py::test_empty"
-        },
-    )
-    db_session.add(t)
-    tasks.append(t)
-
-    # Medium-high: file path + word count → score ≈ 0.67
-    t = _make_sr_task(
-        project.id,
-        age_days=2,
-        human_cats={"correctness": 1},
-        sr_failed_cats=[],
-        sr_passed_cats_with_reasoning={
-            "correctness": "checked the logic in backend/app/utils.py and verified all edge cases are correct"
-        },
-    )
-    db_session.add(t)
-    tasks.append(t)
-
-    # Previous window: 5 tasks (same pattern to keep trend stable)
-    for reasoning in [
-        "",
-        "looks ok here",
-        "looks fine to me checked the diff",
-        "verified backend/app/foo.py handles the empty list case via test_foo.py::test_empty",
-        "checked the logic in backend/app/utils.py and verified all edge cases are correct",
-    ]:
-        t = _make_sr_task(
-            project.id,
-            age_days=20,
-            human_cats={"correctness": 1},
-            sr_failed_cats=[],
-            sr_passed_cats_with_reasoning={"correctness": reasoning},
-        )
-        db_session.add(t)
-        tasks.append(t)
-
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    cat = result["categories"].get("correctness")
-    assert cat is not None
-
-    # Verify quality_rate is present and non-zero (average across all tasks)
-    assert "reasoning_quality_rate" in cat
-    quality_rate = cat["reasoning_quality_rate"]
-    assert quality_rate is not None
-    assert quality_rate > 0.0, "quality rate should be > 0 with mixed-quality inputs"
-    # With the mixed inputs, quality_rate should be moderately good
-    assert quality_rate >= 0.3
-
-
-@pytest.mark.asyncio
 async def test_pass_reasoning_thinning_alert_fires_for_non_regressing_category(
     db_session: AsyncSession,
 ):
@@ -3907,7 +3806,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
     project = await _make_project(db_session)
     tasks = []
     # Current window (5 tasks): SR passes everything.
-    # First-attempt human truth: test-coverage only (iteration 0).
+    # First-attempt reviewer-confirmed truth: test-coverage only (iteration 0).
     # All-iterations truth: test-coverage + correctness (flagged in iteration 2).
     for _ in range(5):
         task = Task(
@@ -3973,13 +3872,20 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
 async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
     db_session: AsyncSession,
 ):
-    """When _all_iterations_rejection_categories is absent and review_history is empty,
-    all_iterations_catch_rate falls back to the first-attempt categories so existing
-    tasks continue to produce a non-None all_iterations value."""
+    """When _all_iterations_rejection_categories is absent, review_history-only
+    categories are ignored and all_iterations_catch_rate falls back to first-attempt."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
+    review_history = [
+        {
+            "iteration": 2,
+            "issues": [
+                {"description": "architecture issue in docs", "severity": "MAJOR"}
+            ],
+        }
+    ]
     # 5 current tasks: only _first_attempt_rejection_categories, no all-iterations field
     for _ in range(5):
         t = _make_sr_task(
@@ -3988,6 +3894,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
+        t.context["review_loop"] = {"review_history": review_history}
         db_session.add(t)
         tasks.append(t)
     # 5 previous tasks: same
@@ -3998,6 +3905,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
+        t.context["review_loop"] = {"review_history": review_history}
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4011,6 +3919,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
     assert cat["all_iterations_catch_rate"] is not None
     assert cat["current_hit_rate"] == cat["all_iterations_catch_rate"]
     assert cat["all_iterations_miss_rate"] is not None
+    assert "architecture" not in result["categories"]
 
 
 # ---------------------------------------------------------------------------
@@ -4095,11 +4004,17 @@ async def test_sr_false_positive_rate_human_confirms_is_zero(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_sr_false_positive_rate_review_history_confirms_not_fp(
+async def test_sr_false_positive_rate_review_history_only_is_not_confirmation(
     db_session: AsyncSession,
 ):
-    """SR fails test-coverage; review_history (iter 2) contains a 'missing test' issue
-    that keyword-matches test-coverage → not counted as a false positive."""
+    """SR fails test-coverage; the only reviewer signal is a review_history (iter 2)
+    'missing test' issue with no persisted rejection-category record.
+
+    The reviewer-confirmed truth set is now the persisted
+    ``_all_iterations_rejection_categories`` / ``_first_attempt_rejection_categories``
+    (see :func:`app.sr_blind_spots.reviewer_confirmed_categories`); review_history is
+    no longer reconstructed into confirmed categories. With no persisted record for
+    test-coverage, the SR failure is therefore counted as a false positive."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
@@ -4148,9 +4063,10 @@ async def test_sr_false_positive_rate_review_history_confirms_not_fp(
 
     assert result is not None
     cat = result["categories"]["test-coverage"]
-    # review_history confirmed the SR failure → fp_count == 0
-    assert cat["false_positive_rate"] == 0.0, (
-        "review_history keyword-matched test-coverage → SR failure is confirmed, not a FP"
+    # review_history is not a confirmation source → SR failure is a false positive
+    assert cat["false_positive_rate"] == 1.0, (
+        "review_history-only (no persisted rejection category) does not confirm the "
+        "SR failure → it is counted as a false positive"
     )
 
 
@@ -5558,6 +5474,7 @@ def _make_fr_task(
     age_days: float,
     reviewer_findings=None,
     human_cats=None,
+    all_iteration_cats=None,
     sr_failed_cats=None,
     first_attempt_succeeded: bool = True,
     task_type: str = "create",
@@ -5575,6 +5492,8 @@ def _make_fr_task(
         ctx["_self_review_outcome"] = {"check_results": check_results}
     if human_cats is not None:
         ctx["_first_attempt_rejection_categories"] = human_cats
+    if all_iteration_cats is not None:
+        ctx["_all_iterations_rejection_categories"] = all_iteration_cats
     task = Task(
         project_id=project_id,
         title="FR task",
@@ -5845,6 +5764,39 @@ async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession
     av = result["added_value"]["correctness"]
     assert av["current"] == 3
     assert av["previous"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_uses_any_iteration_confirmed_truth(
+    db_session: AsyncSession,
+):
+    """Later-iteration-only confirmations must count in hit rate and added value."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for window_age in (2, 20):
+        for _ in range(5):
+            t = _make_fr_task(
+                project.id,
+                age_days=window_age,
+                reviewer_findings=[{"category": "correctness"}],
+                all_iteration_cats=["correctness"],
+                sr_failed_cats=[],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["per_category_hit_rate"]["correctness"]
+    assert cat["current"] == 1.0
+    assert cat["previous"] == 1.0
+    av = result["added_value"]["correctness"]
+    assert av["current"] == 5
+    assert av["previous"] == 5
 
 
 @pytest.mark.asyncio
@@ -6498,7 +6450,10 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert a["reviewer_rescue_sample_size"] == 1
     assert a["reviewer_rescue_rate"] == 1.0
     assert a["sr_false_positive_sample_size"] == 4
-    assert a["sr_false_positive_rate"] == 0.25
+    # test-coverage is confirmed only by review_history (no persisted rejection
+    # category), which is no longer a confirmation source — so it now counts as a
+    # false positive alongside performance: 2 FPs / 4 sampled = 0.5.
+    assert a["sr_false_positive_rate"] == 0.5
     fp_by_cat = {
         entry["category"]: (entry["fp_count"], entry["tp_count"])
         for entry in a["sr_false_positive_rate_by_category"]
@@ -6506,7 +6461,8 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert fp_by_cat["architecture"] == (0, 1)
     assert fp_by_cat["correctness"] == (0, 1)
     assert fp_by_cat["performance"] == (1, 0)
-    assert fp_by_cat["test-coverage"] == (0, 1)
+    # review_history-only confirmation no longer suppresses the false positive.
+    assert fp_by_cat["test-coverage"] == (1, 0)
     disagreements = {
         entry["category"]: (
             entry["reviewer_overrode_sr_count"],

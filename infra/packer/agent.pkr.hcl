@@ -32,6 +32,15 @@ variable "cache_repo" {
   default = "HenryHamster/BlueprintAIStudio"
 }
 
+# Git commit this image is built from. Defaults to GITHUB_SHA, which GitHub
+# Actions exposes in the build environment. Empty on a local/dev bake — the
+# label and on-disk marker both fall back to `unknown` so the bake never fails
+# on a missing commit; the backend / agent then simply report no SHA.
+variable "source_git_sha" {
+  type    = string
+  default = env("GITHUB_SHA")
+}
+
 # Rebuild trigger: memo handler fixes from PR #5792 (extractCodexAgentMessageText,
 # lastResultText full-text capture) and PR #5921 (deferred_findings + memo reopen
 # continuation retry). Extractor hardening: extractJsonObjectDetailed now validates
@@ -55,6 +64,14 @@ source "googlecompute" "agent_image" {
   image_name          = "blueprint-agent-v2-{{timestamp}}"
   image_family        = "blueprint-agent-v2"
   ssh_username        = "packer"
+  # Record the source git commit AS metadata on the image so the backend can map
+  # a baked image back to its commit via the GCP image API with no VM cooperation
+  # (compute.get_image_source_git_sha). GCP label values must match
+  # [a-z0-9_-]{0,63}; a 40-char lowercase hex SHA fits. Fall back to `unknown`
+  # when the variable is empty so the bake never fails on a missing label value.
+  image_labels = {
+    "source-git-sha" = var.source_git_sha != "" ? var.source_git_sha : "unknown"
+  }
 }
 
 build {
@@ -138,6 +155,10 @@ build {
       "# heartbeats and stale-image diagnostics can identify exactly which runtime",
       "# revision is running, independent of image name or build timestamp.",
       "AGENT_FINGERPRINT=$(find /opt/agent/src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | awk '{print $1}') && echo \"AGENT_RUNTIME_FINGERPRINT=$AGENT_FINGERPRINT\" | sudo tee /opt/agent/AGENT_RUNTIME_FINGERPRINT && echo PACKER_FINGERPRINT_OK",
+      "# Bake the source git commit as an on-disk marker the agent reads at boot",
+      "# and reports in its heartbeat (signal b, complementing the image label).",
+      "# Tolerate an empty/unknown value so a local/dev bake never fails here.",
+      "SOURCE_SHA='${var.source_git_sha}'; [ -n \"$SOURCE_SHA\" ] || SOURCE_SHA=unknown; echo \"AGENT_SOURCE_SHA=$SOURCE_SHA\" | sudo tee /opt/agent/AGENT_SOURCE_SHA && echo PACKER_SOURCE_SHA_OK",
       "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",
       "sudo chmod 644 /etc/agent.env",
@@ -211,6 +232,11 @@ build {
       "# file written earlier in the bake. Catches drift between the write line in",
       "# this HCL and the strict regex in agent/src/index.ts before the image tags.",
       "sudo -u agent -H bash -c 'cd /opt/agent && node --import tsx ./src/fingerprint-bake-smoke.ts && echo PACKER_FINGERPRINT_READBACK_OK'",
+      "# Exercise the production readAgentSourceSha() reader against the",
+      "# AGENT_SOURCE_SHA marker written above. Catches drift between the write",
+      "# line in this HCL and the strict regex in agent/src/index.ts before the",
+      "# image tags. Passes on the baked 'unknown' fallback (dev build).",
+      "sudo -u agent -H bash -c 'cd /opt/agent && node --import tsx ./src/agent-source-sha-bake-smoke.ts && echo PACKER_SOURCE_SHA_READBACK_OK'",
       "# Exercise the shipped memo handler through the runtime TS entrypoint with a",
       "# deterministic dispatcher memo payload and a localhost fetch stub.",
       "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke.ts && echo PACKER_MEMO_SMOKE_OK'",

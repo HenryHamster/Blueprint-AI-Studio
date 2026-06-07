@@ -679,10 +679,10 @@ async def commit_file_changes(
             {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
         )
     # Deletions: a tree entry with sha null removes the path.
-    for path in deletes:
-        tree_entries.append(
-            {"path": path, "mode": "100644", "type": "blob", "sha": None}
-        )
+    tree_entries.extend(
+        {"path": path, "mode": "100644", "type": "blob", "sha": None}
+        for path in deletes
+    )
 
     # 4. New tree on top of the existing base tree.
     tree_resp = await _github_request(
@@ -746,6 +746,8 @@ from app.github_checks import (  # noqa: F401
     update_check_run,
     _unique,
     get_check_runs,
+    get_workflow_run_for_sha,
+    AGENT_BAKE_WORKFLOW_FILE,
     invalidate_check_runs_cache,
     get_check_runs_cached,
     _CHECK_RUNS_CACHE_TTL_S,
@@ -775,6 +777,8 @@ from app.github_refs import (  # noqa: F401
     list_pull_requests_for_commit,
     is_ancestor_of,
     get_files_changed_between_refs,
+    agent_image_rebake_expected,
+    AGENT_IMAGE_BAKE_PATHS,
 )
 from app.github_pulls import (  # noqa: F401
     pr_is_not_behind,

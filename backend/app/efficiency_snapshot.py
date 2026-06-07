@@ -33,7 +33,11 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
-from app.landed_signal import has_merge_unblock_signal, is_merged_completion
+from app.landed_signal import (
+    has_merge_unblock_signal,
+    is_merged_completion,
+    is_verified_merge,
+)
 from app.models import (
     PoolIdleCostLedger,
     PoolVm,
@@ -42,6 +46,7 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
+    get_task_current_attempt_llm_totals,
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
@@ -134,6 +139,17 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("gemini", "gemini-3.1-flash-lite-preview"): (0.10e-6, 0.40e-6),
 }
 
+# Provider/model combos priced at a proxy rate (closest GA equivalent or published
+# rate) because the exact model/variant has no separately published API pricing.
+# These combos are priced and contribute to cost normally, but are flagged as
+# approximate in the cost breakdown so operators know the rate is estimated.
+LLM_APPROXIMATE_PRICED: set[tuple[str, str]] = {
+    ("openai", "gpt-5.3-codex-spark"),  # ChatGPT-Pro-only variant
+    ("gemini", "gemini-3.1-pro-preview"),  # Preview variant
+    ("gemini", "gemini-3-flash-preview"),  # Preview variant
+    ("gemini", "gemini-3.1-flash-lite-preview"),  # Preview variant
+}
+
 DESIGN_DOC_KEY = "efficiency_baseline"
 
 # Sub-key under the efficiency_baseline container recording the last warm-pool
@@ -142,6 +158,21 @@ DESIGN_DOC_KEY = "efficiency_baseline"
 # current verdict against this marker so it fires once per decision-boundary
 # crossing rather than every hourly tick.
 LAST_ALERTED_PAYOFF_KEY = "last_alerted_payoff_verdict"
+
+# Sub-key under the efficiency_baseline container recording whether the last
+# unpriced-models coverage check alerted on a degraded state. The per-project
+# transition check (:func:`maybe_alert_unpriced_models_coverage`) compares the
+# current degraded/healthy state against this marker so it fires once per
+# degradation crossing rather than every tick, and re-arms on recovery.
+LAST_ALERTED_UNPRICED_KEY = "last_alerted_unpriced_coverage"
+
+# Fire the unpriced-models alert when at least this share of attributed
+# (provider+model+token-bearing) tasks ran on combos absent from the pricing
+# table, and at least this many such tasks exist (so a single stray task on a
+# tiny sample never pages the operator). Tasks with no tokens or no resolved
+# provider/model are excluded from the attributed denominator and never count.
+UNPRICED_ALERT_SHARE_THRESHOLD = 0.20
+UNPRICED_ALERT_MIN_TASKS = 3
 
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
@@ -817,12 +848,12 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
-        if (input_tokens > 0 or output_tokens > 0) and t.provider and t.model:
-            pricing = LLM_TOKEN_PRICING.get((t.provider.lower(), t.model.lower()))
-            if pricing:
-                input_rate, output_rate = pricing
-                total_cost += input_tokens * input_rate + output_tokens * output_rate
+        for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(t):
+            if provider and model:
+                pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+                if pricing:
+                    input_rate, output_rate = pricing
+                    total_cost += input_tokens * input_rate + output_tokens * output_rate
         if is_merged_completion(t):
             merged += 1
     if not merged:
@@ -831,6 +862,53 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
 
 
 _UNPRICED_COMBOS_CAP = 10
+
+
+def _task_ran_on_fallback(t: Task) -> bool:
+    """True when the task's runtime selection diverged from its intended routing.
+
+    Reads the markers stamped by max_plan_pool's selection path:
+    ``routing_fallback`` (cross-provider / synthetic no-account) and
+    ``model_fallback`` (same-provider preview→GA downgrade). Either marker means
+    the resolved provider/model the cost breakdown attributes to is NOT
+    necessarily the routing the operator configured, so the bucket should be
+    caveated.
+    """
+    ctx = getattr(t, "context", None) or {}
+    if not isinstance(ctx, dict):
+        return False
+    return bool(ctx.get("routing_fallback") or ctx.get("model_fallback"))
+
+
+def _llm_attempt_nonnegative_int(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
+
+
+def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, int, int]]:
+    history = task.attempt_history or []
+    if not history:
+        input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
+        return (
+            [(task.provider, task.model, input_tokens, output_tokens, call_count)]
+            if input_tokens > 0 or output_tokens > 0
+            else []
+        )
+    attempts = [
+        (
+            attempt.get("provider") or task.provider,
+            attempt.get("model") or task.model,
+            _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
+            _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
+            _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+        )
+        for attempt in history
+    ]
+    current_input, current_output, current_calls = get_task_current_attempt_llm_totals(
+        task
+    )
+    if current_input > 0 or current_output > 0:
+        attempts.append((task.provider, task.model, current_input, current_output, current_calls))
+    return attempts
 
 
 def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
@@ -842,14 +920,28 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
       - ``totals``: aggregate totals plus priced/unpriced task counts.
       - ``unpriced_combos``: capped list of ``provider:model`` strings that
         have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
+      - ``approximate_priced_combos``: capped list of ``provider:model`` strings
+        that are priced at a proxy rate (closest GA equivalent) with no
+        separately published API rate.
 
-    A task contributes to a bucket when it has a non-null provider, non-null
-    model, and non-zero aggregate tokens across the banked retry totals plus
-    the live ``api_call_summary`` snapshot. Unpriced (provider, model) combos
-    are still counted in ``task_count`` and feed
+    A task contributes one or more attempt rows to a bucket when it has a
+    non-null provider, non-null model, and non-zero aggregate tokens across
+    its banked retry history plus the live ``api_call_summary`` snapshot.
+    Unpriced (provider, model) combos are still counted in ``task_count`` and feed
     ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
     are rounded to 6 decimals and shares to 4 decimals, matching the rest of
     this module.
+
+    Each provider/model row also carries the merge outcome of its tasks:
+    ``merged_count`` (tasks landed on the integration branch per
+    :func:`is_merged_completion`), ``merge_rate`` (``merged_count /
+    task_count``, ``None`` only when the bucket has no tasks), plus
+    ``verified_merged_count`` / ``verified_merge_rate`` using
+    :func:`is_verified_merge`. ``cost_per_merge`` now divides by the verified
+    merge count so degraded fall-open merges do not make spend look cheaper.
+    It stays ``None`` for unpriced buckets (cost is understated) and for zero-
+    verified-merge buckets (no divide-by-zero, reads as "0 of N verified"
+    via the count/rate fields instead).
     """
     from collections import defaultdict
 
@@ -859,6 +951,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
+            "merged_count": 0,
+            "verified_merged_count": 0,
             "cost_usd": 0.0,
         }
     )
@@ -868,68 +962,141 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
+            "merged_count": 0,
+            "verified_merged_count": 0,
             "cost_usd": 0.0,
         }
     )
     priced_combos: set[tuple[str, str]] = set()
+    unpriced_providers: set[str] = set()
     unpriced_combos: list[str] = []
+    approximate_priced_combos: list[str] = []
     priced_task_count = 0
     unpriced_task_count = 0
+    fallback_task_count = 0
+    fallback_cost_usd = 0.0
     total_input = 0
     total_output = 0
     total_cost = 0.0
     total_task_count = 0
+    total_merged_count = 0
+    total_verified_merged_count = 0
 
     for t in tasks:
-        input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
-        if input_tokens <= 0 and output_tokens <= 0:
-            continue
-        if not t.provider or not t.model:
-            provider = "unattributed"
-            model = "unknown"
-        else:
-            provider = t.provider.lower()
-            model = t.model.lower()
-        key = (provider, model)
-        pricing = LLM_TOKEN_PRICING.get(key)
-        if pricing:
-            input_rate, output_rate = pricing
-            cost = input_tokens * input_rate + output_tokens * output_rate
-            priced_combos.add(key)
-            priced_task_count += 1
-        else:
-            cost = 0.0
-            unpriced_task_count += 1
-            combo = f"{provider}:{model}"
-            if (
-                combo not in unpriced_combos
-                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
-            ):
-                unpriced_combos.append(combo)
+        merged = is_merged_completion(t)
+        verified = is_verified_merge(t)
+        is_fallback = _task_ran_on_fallback(t)
+        # Tokens/cost/task_count accumulate per attempt-row (automain
+        # convention), but a task's merge is a single TASK-level outcome: it
+        # must be credited at most ONCE per distinct bucket it touched, never
+        # once per attempt-row. Collect the distinct buckets this task
+        # contributed a row to, then credit the merge after the attempt loop.
+        task_model_keys: set[tuple[str, str]] = set()
+        task_provider_keys: set[str] = set()
+        task_contributed = False
+        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider = "unattributed"
+                model = "unknown"
+            else:
+                provider = provider.lower()
+                model = model.lower()
+            key = (provider, model)
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+                priced_combos.add(key)
+                priced_task_count += 1
+                # Track approximate-priced combos (proxy rate, not exactly published).
+                if key in LLM_APPROXIMATE_PRICED:
+                    combo = f"{provider}:{model}"
+                    if (
+                        combo not in approximate_priced_combos
+                        and len(approximate_priced_combos) < _UNPRICED_COMBOS_CAP
+                    ):
+                        approximate_priced_combos.append(combo)
+            else:
+                cost = 0.0
+                unpriced_task_count += 1
+                unpriced_providers.add(provider)
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
 
-        mb = model_buckets[key]
-        mb["input_tokens"] += int(input_tokens)
-        mb["output_tokens"] += int(output_tokens)
-        mb["llm_call_count"] += call_count
-        mb["task_count"] += 1
-        mb["cost_usd"] += cost
+            # fallback_cost_usd is per-attempt (each fallback attempt's spend
+            # counts); fallback_task_count is per-task, credited once below.
+            if is_fallback:
+                fallback_cost_usd += cost
 
-        pb = provider_buckets[provider]
-        pb["input_tokens"] += int(input_tokens)
-        pb["output_tokens"] += int(output_tokens)
-        pb["llm_call_count"] += call_count
-        pb["task_count"] += 1
-        pb["cost_usd"] += cost
+            mb = model_buckets[key]
+            mb["input_tokens"] += int(input_tokens)
+            mb["output_tokens"] += int(output_tokens)
+            mb["llm_call_count"] += call_count
+            mb["task_count"] += 1
+            mb["cost_usd"] += cost
 
-        total_input += int(input_tokens)
-        total_output += int(output_tokens)
-        total_cost += cost
-        total_task_count += 1
+            pb = provider_buckets[provider]
+            pb["input_tokens"] += int(input_tokens)
+            pb["output_tokens"] += int(output_tokens)
+            pb["llm_call_count"] += call_count
+            pb["task_count"] += 1
+            pb["cost_usd"] += cost
+
+            total_input += int(input_tokens)
+            total_output += int(output_tokens)
+            total_cost += cost
+            total_task_count += 1
+
+            task_model_keys.add(key)
+            task_provider_keys.add(provider)
+            task_contributed = True
+
+        # Credit the task's merge once per distinct bucket it touched, and once
+        # to the grand total — so multi-attempt and multi-model merged tasks
+        # never inflate merged_count beyond the actual merged-task count.
+        if merged and task_contributed:
+            for key in task_model_keys:
+                model_buckets[key]["merged_count"] += 1
+            for provider in task_provider_keys:
+                provider_buckets[provider]["merged_count"] += 1
+            total_merged_count += 1
+
+        if verified and task_contributed:
+            for key in task_model_keys:
+                model_buckets[key]["verified_merged_count"] += 1
+            for provider in task_provider_keys:
+                provider_buckets[provider]["verified_merged_count"] += 1
+            total_verified_merged_count += 1
+
+        # Count each fallback task once (cost already accumulated per-attempt).
+        if is_fallback and task_contributed:
+            fallback_task_count += 1
 
     def _share(cost: float) -> Optional[float]:
         if total_cost <= 0:
             return None
         return round(cost / total_cost, 4)
+
+    def _merge_rate(merged: float, count: float) -> Optional[float]:
+        if count <= 0:
+            return None
+        return round(merged / count, 4)
+
+    def _cost_per_merge(
+        cost: float, verified_merged: float, priced: bool
+    ) -> Optional[float]:
+        # Only present a confident cost-per-merge when cost is fully known.
+        # Unpriced buckets understate cost, so the figure would mislead; a
+        # zero-verified-merge bucket would divide by zero.
+        if not priced or verified_merged <= 0:
+            return None
+        return round(cost / verified_merged, 6)
 
     by_provider = [
         {
@@ -943,6 +1110,18 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "share_of_total_cost": _share(pb["cost_usd"]),
             "task_count": int(pb["task_count"]),
             "llm_call_count": int(pb["llm_call_count"]),
+            "merged_count": int(pb["merged_count"]),
+            "merge_rate": _merge_rate(pb["merged_count"], pb["task_count"]),
+            "verified_merged_count": int(pb["verified_merged_count"]),
+            "verified_merge_rate": _merge_rate(
+                pb["verified_merged_count"], pb["task_count"]
+            ),
+            "priced": provider not in unpriced_providers,
+            "cost_per_merge": _cost_per_merge(
+                pb["cost_usd"],
+                pb["verified_merged_count"],
+                provider not in unpriced_providers,
+            ),
         }
         for provider, pb in sorted(
             provider_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -961,7 +1140,19 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "share_of_total_cost": _share(mb["cost_usd"]),
             "task_count": int(mb["task_count"]),
             "llm_call_count": int(mb["llm_call_count"]),
+            "merged_count": int(mb["merged_count"]),
+            "merge_rate": _merge_rate(mb["merged_count"], mb["task_count"]),
+            "verified_merged_count": int(mb["verified_merged_count"]),
+            "verified_merge_rate": _merge_rate(
+                mb["verified_merged_count"], mb["task_count"]
+            ),
             "priced": (provider, model) in priced_combos,
+            "approximate_priced": (provider, model) in LLM_APPROXIMATE_PRICED,
+            "cost_per_merge": _cost_per_merge(
+                mb["cost_usd"],
+                mb["verified_merged_count"],
+                (provider, model) in priced_combos,
+            ),
         }
         for (provider, model), mb in sorted(
             model_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -979,11 +1170,24 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "total_output_tokens": total_output,
             "total_cost_usd": round(total_cost, 6),
             "task_count": total_task_count,
+            "merged_count": total_merged_count,
+            "merge_rate": round(total_merged_count / total_task_count, 4)
+            if total_task_count
+            else None,
+            "verified_merged_count": total_verified_merged_count,
+            "verified_merge_rate": round(
+                total_verified_merged_count / total_task_count, 4
+            )
+            if total_task_count
+            else None,
             "priced_task_count": priced_task_count,
             "unpriced_task_count": unpriced_task_count,
             "unpriced_coverage_fraction": unpriced_coverage_fraction,
+            "fallback_task_count": fallback_task_count,
+            "fallback_cost_usd": round(fallback_cost_usd, 6),
         },
         "unpriced_combos": unpriced_combos,
+        "approximate_priced_combos": approximate_priced_combos,
     }
 
 
@@ -1030,6 +1234,353 @@ def _compute_llm_cost_pricing_coverage(
         "unattributed_tasks": unattributed,
         "coverage_fraction": coverage_fraction,
         "unpriced_combos": unpriced_combos,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-effort-tier and per-actual-model efficiency rollup (operator payoff view)
+# ---------------------------------------------------------------------------
+# Agent runs are scaled along an effort ladder (low->haiku, medium->sonnet,
+# high/max->opus) where higher effort selects a more capable AND more expensive
+# model. The existing cost surfaces break spend down by task TYPE and give a
+# per-MODEL cost breakdown, but neither answers the direction question: does
+# paying for a higher effort tier (or a pricier resolved model) actually earn
+# its money in LANDED PRs? This rollup attributes LLM token cost — reusing the
+# same LLM_TOKEN_PRICING table and the same is_merged_completion "shipped"
+# predicate the other cost surfaces use, so its totals reconcile with
+# compute_llm_cost_breakdown — to BOTH:
+#   * the REQUESTED effort tier (task.first_payload["effort"]), and
+#   * the ACTUAL resolved (provider, model),
+# alongside run count, landed/merge rate, cost-per-merge, and token volume.
+#
+# Honesty rules (mirrors compute_llm_cost_breakdown):
+#   * Unpriced (provider, model) combos contribute 0 cost but are still counted
+#     in run/token totals and surfaced in ``unpriced_combos`` +
+#     ``unpriced_coverage_fraction`` — never silently folded into priced totals.
+#   * Requested-vs-actual divergence is made explicit: each effort row carries a
+#     ``resolved_models`` breakdown (which models a given requested tier actually
+#     ran on), and the top-level ``fallbacks`` block aggregates the
+#     ``context.model_fallback`` downgrade records (preview->GA etc.).
+
+# Canonical effort-ladder ordering for stable, low->max row sorting. Unknown /
+# unspecified efforts sort last (alphabetically among themselves).
+_EFFORT_TIER_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "max": 3}
+_EFFORT_UNSPECIFIED = "unspecified"
+# Cap on the surfaced model-fallback divergence list so a noisy window never
+# bloats the digest payload.
+_FALLBACK_LIST_CAP = 20
+
+
+def _new_efficiency_bucket() -> Dict[str, Any]:
+    return {
+        "run_count": 0,
+        "landed_count": 0,
+        # Verified landings only (is_verified_merge) — degraded fall-open merges
+        # count in landed_count but NOT here, mirroring compute_llm_cost_breakdown.
+        "verified_landed_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "llm_call_count": 0,
+        "cost_usd": 0.0,
+        # Among token-bearing ("priceable") attempt-rows only — mirrors
+        # compute_llm_cost_breakdown's priced/unpriced attempt accounting so
+        # coverage fractions reconcile.
+        "priced_run_count": 0,
+        "unpriced_run_count": 0,
+    }
+
+
+def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+    run_count = int(b["run_count"])
+    landed_count = int(b["landed_count"])
+    verified_landed_count = int(b["verified_landed_count"])
+    cost = round(float(b["cost_usd"]), 6)
+    priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
+    out: Dict[str, Any] = {
+        "run_count": run_count,
+        "landed_count": landed_count,
+        "landed_rate": round(landed_count / run_count, 4) if run_count else None,
+        # Verified payoff alongside the raw landed figures: degraded (no-CI
+        # fall-open) merges are kept in landed_count/landed_rate but excluded here.
+        "verified_landed_count": verified_landed_count,
+        "verified_landed_rate": (
+            round(verified_landed_count / run_count, 4) if run_count else None
+        ),
+        "total_cost_usd": cost,
+        # Cost-per-merge is the headline payoff number: priced LLM dollars spent
+        # per VERIFIED PR that landed, so degraded fall-open merges do not make
+        # spend look cheaper. None when nothing verified-landed (no denominator).
+        "cost_per_merge": (
+            round(cost / verified_landed_count, 6) if verified_landed_count else None
+        ),
+        "input_tokens": int(b["input_tokens"]),
+        "output_tokens": int(b["output_tokens"]),
+        "llm_call_count": int(b["llm_call_count"]),
+        "priced_run_count": int(b["priced_run_count"]),
+        "unpriced_run_count": int(b["unpriced_run_count"]),
+        "unpriced_coverage_fraction": (
+            round(b["priced_run_count"] / priceable, 4) if priceable else None
+        ),
+    }
+    out.update(extra)
+    return out
+
+
+def compute_effort_model_efficiency(
+    tasks: list[Task],
+    runtime_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Per-effort-tier and per-actual-model efficiency rollup over finished tasks.
+
+    Pure function — no DB calls. For each task it resolves the EFFECTIVE routing
+    effort — the same effort the dispatcher resolves to select the model — via
+    :func:`max_plan_pool.resolve_effective_effort`, reading the SQL-projected
+    ``task.first_payload`` (type + payload effort) and ``task.context`` (never
+    ``task.payloads``, which is deferred under the digest projection). This
+    attributes EVERY terminal task to the tier that actually drove its cost —
+    not just the scope-aware implementation types that stamp an explicit payload
+    effort — so review/strategic (opus) and ops (haiku) tasks land in their
+    category tier instead of collapsing into ``unspecified``. Explicit payload
+    effort still wins as the most-specific layer, so previously-bucketed tasks
+    are unaffected. ``runtime_config`` defaults to the shared
+    :data:`shared_state.runtime_config` (mirrors :func:`estimate_pool_hit_rate`).
+
+    It then splits the task across its banked
+    attempt history (:func:`_task_llm_attempts`) so each attempt's tokens are
+    priced at the (provider, model) that attempt actually ran on — exactly as
+    :func:`compute_llm_cost_breakdown` does. A task that retried on a different
+    model therefore lands its tokens/cost in each attempt's own model bucket, so
+    the total AND the per-model breakdown reconcile with the sibling cost surface.
+    The landed/merge status comes from :func:`is_merged_completion` (raw landings)
+    and :func:`is_verified_merge` (verified landings). LLM cost is priced with the
+    shared :data:`LLM_TOKEN_PRICING` table.
+
+    Run counts and landed counts stay PER-TASK — credited once per task (and once
+    per distinct model bucket the task touched), never once per attempt-row — so a
+    multi-attempt task never inflates run/landed counts.
+
+    Returns a dict with:
+      - ``by_effort``: rows keyed by effective routing effort tier (low->max,
+        then ``unspecified`` for tasks with no projected first payload at all).
+        Each row carries run count, landed count + rate,
+        verified landed count + rate, priced LLM cost, cost-per-merge (over the
+        verified count), token volume, priced/unpriced coverage, and a
+        ``resolved_models`` breakdown exposing which actual models that requested
+        tier ran on (requested-vs-actual divergence).
+      - ``by_model``: rows keyed by actual (provider, model) with a ``priced``
+        flag, sorted by cost desc. Unpriced combos appear with 0 cost.
+      - ``totals``: aggregate run/landed/verified/cost/token totals + priced/
+        unpriced coverage.
+      - ``unpriced_combos``: capped list of ``provider:model`` strings with
+        non-zero tokens but no pricing entry (never folded into priced cost).
+      - ``fallbacks``: aggregate of ``context.model_fallback`` downgrade records
+        (requested != effective resolved model), with a capped per-combo list.
+    """
+    from collections import defaultdict  # noqa: PLC0415
+
+    from app import max_plan_pool  # noqa: PLC0415
+
+    if runtime_config is None:
+        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+        runtime_config = _rc
+
+    effort_buckets: Dict[str, Dict[str, Any]] = defaultdict(_new_efficiency_bucket)
+    # effort -> (provider, model) -> {run_count, landed_count}
+    effort_models: Dict[str, Dict[tuple[str, str], Dict[str, Any]]] = defaultdict(dict)
+    model_buckets: Dict[tuple[str, str], Dict[str, Any]] = defaultdict(
+        _new_efficiency_bucket
+    )
+    priced_model_keys: set[tuple[str, str]] = set()
+    unpriced_combos: list[str] = []
+
+    totals = _new_efficiency_bucket()
+
+    # Model-fallback (requested-vs-actual divergence) aggregation.
+    fallback_total = 0
+    fallback_combos: Dict[tuple[str, str, str, str], int] = defaultdict(int)
+
+    def _accumulate_attempt(
+        b: Dict[str, Any],
+        input_tokens: int,
+        output_tokens: int,
+        call_count: int,
+        cost: float,
+        priced: bool,
+    ) -> None:
+        b["input_tokens"] += int(input_tokens)
+        b["output_tokens"] += int(output_tokens)
+        b["llm_call_count"] += int(call_count)
+        b["cost_usd"] += cost
+        # Each token-bearing attempt-row is one priceable unit (mirrors the
+        # sibling's per-attempt priced/unpriced accounting).
+        if priced:
+            b["priced_run_count"] += 1
+        else:
+            b["unpriced_run_count"] += 1
+
+    for t in tasks:
+        landed = is_merged_completion(t)
+        verified = is_verified_merge(t)
+        # Bucket by the EFFECTIVE routing effort the dispatcher resolves (the
+        # tier that actually selected the model and drove cost), not just the
+        # explicit payload effort that only scope-aware types carry. Read the
+        # SQL-projected first payload + context — never t.payloads (deferred
+        # under the digest load_only projection). 'unspecified' now holds only
+        # genuinely unresolvable tasks: those with no projected first payload.
+        first_payload = t.first_payload or {}
+        if first_payload:
+            effort_resolved = max_plan_pool.resolve_effective_effort(
+                first_payload, t.context, first_payload.get("type"), runtime_config
+            )
+            effort = str(effort_resolved) if effort_resolved else _EFFORT_UNSPECIFIED
+        else:
+            effort = _EFFORT_UNSPECIFIED
+        eff_bucket = effort_buckets[effort]
+
+        # Distinct model buckets this task contributed a token-bearing row to.
+        # Per-task run/landed credit is applied once per distinct bucket below,
+        # never per attempt-row.
+        task_model_keys: set[tuple[str, str]] = set()
+
+        for provider, model, input_tokens, output_tokens, call_count in (
+            _task_llm_attempts(t)
+        ):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider, model = "unattributed", "unknown"
+            else:
+                provider, model = provider.lower(), model.lower()
+            key = (provider, model)
+
+            pricing = LLM_TOKEN_PRICING.get(key)
+            priced = pricing is not None
+            if priced:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+                priced_model_keys.add(key)
+            else:
+                cost = 0.0
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
+
+            _accumulate_attempt(
+                eff_bucket, input_tokens, output_tokens, call_count, cost, priced
+            )
+            _accumulate_attempt(
+                model_buckets[key], input_tokens, output_tokens, call_count, cost, priced
+            )
+            _accumulate_attempt(
+                totals, input_tokens, output_tokens, call_count, cost, priced
+            )
+            task_model_keys.add(key)
+
+        # Per-task crediting. A task that burned no LLM tokens still counts as a
+        # run (and lands its merge) under its resolved final (provider, model) so
+        # it is not dropped from the model surface.
+        if task_model_keys:
+            credit_keys = task_model_keys
+        elif t.provider and t.model:
+            credit_keys = {(t.provider.lower(), t.model.lower())}
+        else:
+            credit_keys = {("unattributed", "unknown")}
+
+        # Effort is a TASK-level attribute: credit its bucket and the grand total
+        # once per task. Model buckets are credited once per distinct bucket the
+        # task touched, so a multi-attempt/multi-model task never inflates counts.
+        eff_bucket["run_count"] += 1
+        totals["run_count"] += 1
+        if landed:
+            eff_bucket["landed_count"] += 1
+            totals["landed_count"] += 1
+        if verified:
+            eff_bucket["verified_landed_count"] += 1
+            totals["verified_landed_count"] += 1
+        for key in credit_keys:
+            mb = model_buckets[key]
+            mb["run_count"] += 1
+            if landed:
+                mb["landed_count"] += 1
+            if verified:
+                mb["verified_landed_count"] += 1
+            em = effort_models[effort].setdefault(
+                key, {"run_count": 0, "landed_count": 0}
+            )
+            em["run_count"] += 1
+            if landed:
+                em["landed_count"] += 1
+
+        fallback = (t.context or {}).get("model_fallback")
+        if isinstance(fallback, dict) and fallback.get("requested"):
+            fallback_total += 1
+            fcombo = (
+                str(fallback.get("requested") or ""),
+                str(fallback.get("effective") or ""),
+                str(fallback.get("provider") or ""),
+                str(fallback.get("reason") or ""),
+            )
+            fallback_combos[fcombo] += 1
+
+    def _resolved_models(effort: str) -> list[Dict[str, Any]]:
+        rows = [
+            {
+                "provider": prov,
+                "model": mdl,
+                "run_count": int(v["run_count"]),
+                "landed_count": int(v["landed_count"]),
+                "priced": (prov, mdl) in priced_model_keys,
+            }
+            for (prov, mdl), v in effort_models.get(effort, {}).items()
+        ]
+        rows.sort(key=lambda r: (-r["run_count"], r["provider"], r["model"]))
+        return rows
+
+    by_effort = [
+        _finalize_efficiency_bucket(
+            effort_buckets[effort], effort=effort, resolved_models=_resolved_models(effort)
+        )
+        for effort in sorted(
+            effort_buckets, key=lambda e: (_EFFORT_TIER_ORDER.get(e, 99), e)
+        )
+    ]
+    by_model = [
+        _finalize_efficiency_bucket(
+            model_buckets[key],
+            provider=key[0],
+            model=key[1],
+            priced=key in priced_model_keys,
+        )
+        for key in sorted(
+            model_buckets, key=lambda k: (-model_buckets[k]["cost_usd"], k[0], k[1])
+        )
+    ]
+    fallback_list = [
+        {
+            "requested": req,
+            "effective": eff,
+            "provider": prov,
+            "reason": reason,
+            "count": count,
+        }
+        for (req, eff, prov, reason), count in sorted(
+            fallback_combos.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:_FALLBACK_LIST_CAP]
+    ]
+
+    return {
+        "by_effort": by_effort,
+        "by_model": by_model,
+        "totals": _finalize_efficiency_bucket(totals),
+        "unpriced_combos": unpriced_combos,
+        "fallbacks": {
+            "total": fallback_total,
+            "combos": fallback_list,
+        },
     }
 
 
@@ -1718,6 +2269,92 @@ async def maybe_alert_pool_payoff_transition(
         severity.value,
     )
     return state
+
+
+async def maybe_alert_unpriced_models_coverage(
+    session: AsyncSession, project_id: uuid.UUID
+) -> Optional[bool]:
+    """Raise an operator Alert when a project's recent LLM spend runs on
+    unpriced (provider, model) combinations, edge-triggered and deduplicated.
+
+    The cost-analytics surface prices each task's tokens from a hardcoded
+    pricing table; a task on a (provider, model) absent from that table is
+    counted as $0, silently understating cost-per-merge and total spend. This
+    recurs naturally — the pipeline adopts newer models faster than the table is
+    updated. The only prior signal was the cost-breakdown panel's coverage
+    caveat; this proactively pages the operator instead.
+
+    Reuses :func:`_compute_llm_cost_pricing_coverage` as the source of truth for
+    coverage rather than re-deriving it. The alert fires when the unpriced share
+    of *attributed* token-bearing tasks crosses
+    :data:`UNPRICED_ALERT_SHARE_THRESHOLD` with at least
+    :data:`UNPRICED_ALERT_MIN_TASKS` unpriced tasks. Token-less and
+    unattributed (no provider/model) tasks are excluded from the denominator and
+    never trip it.
+
+    Edge-triggered against ``last_alerted_unpriced_coverage`` in the
+    efficiency-baseline container (locked read-modify-write, mirroring
+    :func:`maybe_alert_pool_payoff_transition`): fires once when coverage crosses
+    into degraded, does not re-fire while it stays degraded, and re-arms when
+    coverage recovers. Runs every hourly snapshot tick for every project.
+    Returns ``True`` when an alert fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_unpriced_models_alert  # noqa: PLC0415
+    from app.models import AlertSeverity  # noqa: PLC0415
+    from app.task_locking import with_design_doc_locked  # noqa: PLC0415
+
+    tasks = await _load_recent_tasks(session, project_id)
+    coverage = _compute_llm_cost_pricing_coverage(tasks)
+    priced = int(coverage.get("priced_tasks") or 0)
+    unpriced = int(coverage.get("unpriced_tasks") or 0)
+    attributed = priced + unpriced
+    unpriced_share = (unpriced / attributed) if attributed else 0.0
+    degraded = (
+        unpriced >= UNPRICED_ALERT_MIN_TASKS
+        and unpriced_share >= UNPRICED_ALERT_SHARE_THRESHOLD
+    )
+
+    # Transition edge: fire only when crossing into degraded from a non-degraded
+    # marker; re-arm the marker on recovery so a future degradation alerts again.
+    # Locked read-modify-write via the canonical design_doc helper so a
+    # concurrent snapshot writer cannot clobber the marker; the lock is held
+    # until the alert helper commits so the marker advance and the Alert row land
+    # atomically.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        prev = container.get(LAST_ALERTED_UNPRICED_KEY)
+        new_state = "degraded" if degraded else "healthy"
+        if prev == new_state:
+            return  # no transition — leave the marker untouched
+        container[LAST_ALERTED_UNPRICED_KEY] = new_state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = degraded  # only the degraded crossing raises an alert
+
+    await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if not changed["fire"]:
+        return None
+
+    await _maybe_create_unpriced_models_alert(
+        project_id,
+        session,
+        unpriced_combos=list(coverage.get("unpriced_combos") or []),
+        unpriced_task_count=unpriced,
+        attributed_task_count=attributed,
+        unpriced_share=unpriced_share,
+        severity=AlertSeverity.WARNING,
+    )
+    logger.info(
+        "[UNPRICED_MODELS_ALERT] project=%s unpriced=%d/%d share=%.2f",
+        project_id,
+        unpriced,
+        attributed,
+        unpriced_share,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

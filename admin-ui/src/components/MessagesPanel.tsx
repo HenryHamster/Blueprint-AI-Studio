@@ -18,17 +18,14 @@ import { MessagesComposer } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+import { generateIdempotencyKey } from '../utils/idempotencyKey';
 
 const DEFAULT_VIEW_ID = '__default__';
 
-// Generate a client idempotency key for a message send. Prefers the native
-// UUID generator and falls back to a timestamp+random token for older runtimes
-// (and JSDOM, where crypto.randomUUID may be absent).
-function generateIdempotencyKey(): string {
-  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
-  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
+// Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
+// messages that grow without bound, and blocking stale receipts from resurfacing after
+// an operator cancels a fresh steer.
+const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
 
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
@@ -145,6 +142,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // them to one logical message; cleared after a successful send so the next
   // distinct message gets a fresh key.
   const idempotencyKeyRef = useRef<string | null>(null);
+  // Per-message idempotency identity for the feedback→direction conversion.
+  // Keyed by source message id so a retried (or batch-replayed) convert of the
+  // same message reuses one key and the backend collapses it to a single
+  // direction; cleared only after the message is resolved/created so a failed
+  // attempt keeps its key for the retry.
+  const directionIdempotencyKeysRef = useRef<Map<string, string>>(new Map());
 
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -658,7 +661,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
-      // After consumption, shows a receipt via last_fired_at only if it was operator-origin.
+      // After consumption, shows a receipt via last_fired_at only if it was operator-origin
+      // AND fired within STEER_RECEIPT_MAX_AGE_MS (prevents stale receipts that grow without
+      // bound, and prevents a just-cancelled steer from showing an old "picked up" receipt).
       // Non-critical: errors leave the prior marker state untouched.
       try {
         const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
@@ -667,12 +672,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           const marker = proj.vision?._strategic_refresh;
           const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
           const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
-          // Build marker state: include pending marker if present, or add receipt if it was operator-origin
+          // Build marker state: include pending marker if present, or add receipt if it was
+          // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
           if (marker && typeof marker === 'object') {
             setStrategicRefresh(marker);
           } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-            // No pending marker, but show receipt of prior operator-origin consumption
-            setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+            const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
+            if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+              setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+            } else {
+              setStrategicRefresh(null);
+            }
           } else {
             setStrategicRefresh(null);
           }
@@ -865,19 +875,31 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setCreatingDirectionIds(prev => new Set(prev).add(msg.id));
     try {
       const text = msg.content.slice(0, 2000);
+      // Reuse one idempotency identity per source message so a retry / batch
+      // replay of the same conversion collapses to a single direction; a
+      // duplicate replay returns the existing direction as a clean success.
+      let idemKey = directionIdempotencyKeysRef.current.get(msg.id);
+      if (!idemKey) {
+        idemKey = generateIdempotencyKey();
+        directionIdempotencyKeysRef.current.set(msg.id, idemKey);
+      }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/directions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, priority: 'medium' }),
+        body: JSON.stringify({ text, priority: 'medium', idempotency_key: idemKey }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const directionId: string = data.direction?.id ?? '';
-      await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
+      const resolveRes = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolution: `Direction created: ${directionId}` }),
       });
+      if (!resolveRes.ok) throw new Error(`HTTP ${resolveRes.status}`);
+      // Resolved/created cleanly — drop the per-message key so a genuinely
+      // distinct future convert of the same message id mints a fresh identity.
+      directionIdempotencyKeysRef.current.delete(msg.id);
       if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
       return true;
@@ -903,6 +925,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           github_repo: githubRepo,
           title,
           prompt,
+          source_message_id: msg.id,
           ...(defaultBranch ? { base_branch: defaultBranch } : {}),
           task_type: 'investigate',
         }),
@@ -1077,8 +1100,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                     <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
                   </>
                 )}
-                {strategicRefresh.count && strategicRefresh.count > 1 && (
-                  <> · +{strategicRefresh.count - 1} {strategicRefresh.count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
+                {strategicRefresh.operator_count && strategicRefresh.operator_count > 1 && (
+                  <> · +{strategicRefresh.operator_count - 1} {strategicRefresh.operator_count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
                 )}
                 {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
               </>

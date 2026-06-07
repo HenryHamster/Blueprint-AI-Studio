@@ -37,6 +37,7 @@ import app.shared_state as _shared_state
 from app import services
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.database import resolve_dialect_name
+from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
 from app.landed_signal import (
     apply_merged_landed_signal,
     mark_landed_on_integration,
@@ -475,6 +476,70 @@ async def _attempt_ci_backstop_recovery(
         return False
 
 
+def _dispatch_spend_hold_notification(
+    task: Task,
+    event_type: str,
+    window_hours: int,
+    hours_remaining: float | None = None,
+) -> None:
+    """Fire-and-forget external notification for a spend/budget approval hold.
+
+    ``event_type`` is ``SPEND_HOLD_CREATED`` or ``SPEND_HOLD_EXPIRING``. Never
+    raises — notification failure must never block recovery. Idempotency is the
+    caller's responsibility (guarded by context flags so a hold notifies once).
+    """
+    try:
+        from app.notification_dispatch import dispatch_external_notification
+
+        payload = {
+            "task_id": str(task.id),
+            "task_title": task.title or str(task.id)[:8],
+            "task_type": (task.first_payload or {}).get("type", ""),
+            "approval_hold_reason": (task.context or {}).get(
+                "approval_hold_reason", ""
+            ),
+            "window_hours": window_hours,
+        }
+        if hours_remaining is not None:
+            payload["hours_remaining"] = hours_remaining
+        asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
+            dispatch_external_notification(task.project_id, event_type, payload)
+        )
+    except Exception as _ne:
+        logger.warning(
+            "[SPEND HOLD] %s dispatch setup failed for %s: %r",
+            event_type,
+            str(task.id)[:8],
+            _ne,
+        )
+
+
+async def _emit_spend_hold_created_signals(
+    task: Task, session, *, window_hours: int
+) -> None:
+    """Make a newly-seen spend/budget hold LOUD: WARNING alert + notification.
+
+    The alert is a NON-FAILURE WARNING (the hold is a deliberate cost decision,
+    not a pipeline failure), staged on the caller's session and deduped per task.
+    """
+    from app.alert_dispatch import _maybe_create_spend_hold_alert
+
+    message = (
+        f"Task '{task.title or str(task.id)[:8]}' is held for spend/budget "
+        f"approval. If not approved within {window_hours}h it will be declined "
+        f"(CANCELLED, not counted as a failure)."
+    )
+    try:
+        await _maybe_create_spend_hold_alert(task, session, message)
+    except Exception as _ae:
+        logger.warning(
+            "[SPEND HOLD] WARNING-alert create failed for %s: %r",
+            str(task.id)[:8],
+            _ae,
+        )
+    _dispatch_spend_hold_notification(task, "SPEND_HOLD_CREATED", window_hours)
+
+
 async def _check_evaluating_timeouts(progress_cb=None):
     """Detect EVALUATING tasks that are stuck and recover or fail them.
 
@@ -530,6 +595,20 @@ async def _check_evaluating_timeouts(progress_cb=None):
     # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
     # to approve/deny independent of the configured wall-clock.
     APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
+    # Deliberate spend/budget approval holds (requires_approval=True AND
+    # context.approval_hold_reason == "spend_budget") get their OWN longer,
+    # operator-configurable window and resolve to a CLEAN NON-FAILURE CANCELLED
+    # terminal on expiry — a cost decision an operator simply has not reached is
+    # not a pipeline failure. Defensive read mirrors evaluating_fail_hours: a
+    # corrupted runtime_config_json must not abort the whole sweep cycle.
+    try:
+        _spend_hours_raw = _runtime_config.get("spend_approval_timeout_hours", 24)
+        _spend_hours = int(_spend_hours_raw)
+        if not (1 <= _spend_hours <= 168):
+            _spend_hours = 24
+    except (ValueError, TypeError):
+        _spend_hours = 24
+    SPEND_APPROVAL_FAIL_SECONDS = _spend_hours * 3600
     # BLOCKED is treated as terminal-for-now in this EVALUATING-timeout sweep:
     # (a) a BLOCKED child must NOT be cascade-CANCELLED on a CI-backstop timeout
     # (that would destroy its durable blocked state — it stays parked exactly as
@@ -1146,13 +1225,38 @@ async def _check_evaluating_timeouts(progress_cb=None):
                 # remain in EVALUATING waiting for human approval; the
                 # evaluating_fail_hours backstop can be deferred by an active
                 # pipeline chain, so approval-gated parents need their own
-                # shorter companion timeout.
+                # companion timeout.
+                #
+                # TWO disposition paths, keyed on context.approval_hold_reason:
+                #  - DELIBERATE spend/budget hold (== "spend_budget"): a longer,
+                #    operator-configurable window resolving to a CLEAN NON-FAILURE
+                #    CANCELLED terminal (a cost decision an operator has not
+                #    reached is not a pipeline failure). NEVER records a failed
+                #    task result / failure category / failure alert.
+                #  - Everything else (no marker / review-escalation churn): the
+                #    EXACT current 2h → FAILED behavior, unchanged.
                 if task.requires_approval:
+                    from sqlalchemy.orm.attributes import flag_modified
+
+                    is_spend_hold = (
+                        ctx.get("approval_hold_reason")
+                        == SPEND_BUDGET_APPROVAL_HOLD_REASON
+                    )
+
                     approval_set_at = ctx.get("_approval_set_at")
                     if not approval_set_at:
-                        from sqlalchemy.orm.attributes import flag_modified
-
-                        task.context = {**ctx, "_approval_set_at": now.isoformat()}
+                        new_ctx = {**ctx, "_approval_set_at": now.isoformat()}
+                        # MAKE THE HOLD LOUD: when a spend/budget hold is first
+                        # seen, fire the created notification + a non-failure
+                        # WARNING alert, exactly once (guarded by the flag).
+                        if is_spend_hold and not ctx.get(
+                            "_spend_hold_created_notified"
+                        ):
+                            await _emit_spend_hold_created_signals(
+                                task, session, window_hours=_spend_hours
+                            )
+                            new_ctx["_spend_hold_created_notified"] = True
+                        task.context = new_ctx
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
@@ -1162,6 +1266,73 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         approval_elapsed = (now - approval_since).total_seconds()
                     except (ValueError, TypeError):
                         approval_elapsed = 0.0
+
+                    if is_spend_hold:
+                        # Fire the EXPIRING warning once, within the lead window
+                        # (last 20% of the configured window, min 1h) before the
+                        # hold expires — so the operator gets an active nudge.
+                        warn_lead = max(SPEND_APPROVAL_FAIL_SECONDS * 0.2, 3600.0)
+                        if (
+                            not ctx.get("_spend_hold_expiring_notified")
+                            and SPEND_APPROVAL_FAIL_SECONDS - warn_lead
+                            <= approval_elapsed
+                            < SPEND_APPROVAL_FAIL_SECONDS
+                        ):
+                            hours_remaining = round(
+                                (SPEND_APPROVAL_FAIL_SECONDS - approval_elapsed)
+                                / 3600,
+                                1,
+                            )
+                            _dispatch_spend_hold_notification(
+                                task,
+                                "SPEND_HOLD_EXPIRING",
+                                _spend_hours,
+                                hours_remaining=hours_remaining,
+                            )
+                            task.context = {
+                                **ctx,
+                                "_spend_hold_expiring_notified": True,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            continue
+                        if approval_elapsed > SPEND_APPROVAL_FAIL_SECONDS:
+                            hours = round(approval_elapsed / 3600, 1)
+                            logger.info(
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} "
+                                f"spend/budget approval not granted in {hours}h — "
+                                f"declining (CANCELLED, not a failure)"
+                            )
+                            task.status = TaskStatus.CANCELLED
+                            task.latest_status_message = (
+                                "Spend/budget approval not granted in time — "
+                                "declined (not a failure)"
+                            )
+                            # Clear the hold so it leaves the digest needs-
+                            # attention list; the task is terminal now. This path
+                            # deliberately does NOT call record_task_result /
+                            # classify_failure / _maybe_create_failure_alert — it
+                            # must not be counted as a task failure.
+                            task.requires_approval = False
+                            task.context = {**ctx, "spend_approval_declined": True}
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            await services.broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(task.id),
+                                    "status": TaskStatus.CANCELLED,
+                                },
+                            )
+                            continue
+                        # Within window, not yet at the warning lead — leave
+                        # EVALUATING for a later sweep. A spend/budget hold never
+                        # falls through to the review-escalation FAILED path.
+                        continue
+
                     if approval_elapsed > APPROVAL_GATE_FAIL_SECONDS:
                         hours = round(approval_elapsed / 3600, 1)
                         logger.error(

@@ -28,6 +28,7 @@ from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
 _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
+_REVIEWER_CONFIRMED_CATEGORY_EXCLUSIONS = frozenset({"other"})
 
 # Patterns matching blind_spot entries that agents must NOT emit (per prompt.ts).
 # These describe the intended-design pipeline split — agents run a targeted
@@ -293,94 +294,54 @@ async def aggregate_sr_blind_spot_themes(
     ]
 
 
-async def _scan_fp_stats(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int,
-) -> Dict[str, Dict[str, int]]:
-    """Return per-category {sr_failed, fp_count, hit_count} counts.
+def reviewer_confirmed_categories(ctx: Dict[str, Any]) -> set:
+    """Canonical reviewer-LLM-confirmed category truth set for one task.
 
-    A false positive: SR marks category C as FAILED but no human review
-    iteration ever confirmed C (checked via _all_iterations_rejection_categories
-    falling back to _first_attempt_rejection_categories).
-    A hit: SR marks C as FAILED and a human confirmed C in any iteration.
+    The reviewer-confirmed truth set is persisted in task context, not
+    reconstructed from review history: a category is "confirmed" when some
+    reviewer iteration rejected the work for it. Prefers the all-iterations
+    superset
+    (``_all_iterations_rejection_categories``, stamped on every rejection
+    iteration) and falls back to the first-attempt set
+    (``_first_attempt_rejection_categories``) only when the all-iterations
+    field is absent.
+
+    Shared by every SR false-positive surface — the blind-spot FP scan
+    (:func:`_scan_fp_stats`) and the prediction-accuracy
+    false-alarm/hit/miss computation — so a category the author flagged that
+    the reviewer confirmed only on a *later* iteration is never miscounted as a
+    false alarm, and the surfaces agree by construction.
+
+    ``other`` is deliberately excluded even if persisted in the rejection
+    categories. The author self-review vocabulary cannot emit ``other``, so
+    treating it as canonical reviewer-confirmed truth would create impossible
+    misses/false alarms and depress catch-rate denominators across every shared
+    analytics surface.
     """
-    cutoff = _utcnow() - timedelta(days=days)
-    stmt = (
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
-        )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
-        .order_by(Task.created_at.desc())
-        .limit(_TASK_SCAN_CAP)
-    )
-    result = await session.execute(stmt)
-    all_tasks = result.scalars().all()
-
-    cat_stats: Dict[str, Dict[str, int]] = defaultdict(
-        lambda: {"sr_failed": 0, "fp_count": 0, "hit_count": 0}
-    )
-    for t in all_tasks:
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        check_results = sro.get("check_results") or {}
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
-        if not sr_failed:
-            continue
-        all_human = set(ctx.get("_all_iterations_rejection_categories") or {})
-        if not all_human:
-            all_human = set(ctx.get("_first_attempt_rejection_categories") or {})
-        for cat in sr_failed:
-            cat_stats[cat]["sr_failed"] += 1
-            if cat in all_human:
-                cat_stats[cat]["hit_count"] += 1
-            else:
-                cat_stats[cat]["fp_count"] += 1
-    return cat_stats
+    confirmed = set(ctx.get("_all_iterations_rejection_categories") or {})
+    if not confirmed:
+        confirmed = set(ctx.get("_first_attempt_rejection_categories") or {})
+    return confirmed - _REVIEWER_CONFIRMED_CATEGORY_EXCLUSIONS
 
 
-async def aggregate_sr_fp_rates(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int,
-) -> Dict[str, Dict[str, Any]]:
-    """Per-category false-positive rates for self-review check_results.
+def has_reviewer_confirmed_categories(ctx: Dict[str, Any]) -> bool:
+    """Sample-membership predicate for prediction-accuracy scoring.
 
-    For each category where SR emitted at least one FAILED verdict:
-    - ``false_positive_rate``: fraction of SR-fails with no human confirmation
-    - ``hit_rate``: fraction of SR-fails confirmed by a human reviewer
-    - ``precision``: hit_count / (hit_count + fp_count); None when both are 0
+    Returns True when :func:`reviewer_confirmed_categories` would return a
+    non-empty set. This is the single source of the "is this task part of the
+    self-review prediction-accuracy sample?" contract: a task belongs to the
+    sample iff its reviewer-confirmed truth set (the same set the scorer reads)
+    is non-empty.
 
-    Skipped/fallback SR envelopes are excluded. Categories with zero
-    SR-failed tasks are omitted.
+    Mirrors the prefer-all-iterations / fall-back-to-first-attempt logic of
+    :func:`reviewer_confirmed_categories` so the sample filter and the scorer's
+    ground truth cannot drift. In particular a task whose reviewer-confirmed
+    categories appear *only* on a later iteration
+    (``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) is in-sample — it must not be
+    dropped just because the first review approved.
     """
-    cat_stats = await _scan_fp_stats(session, project_id, days=days)
-    result: Dict[str, Dict[str, Any]] = {}
-    for cat, stats in cat_stats.items():
-        sr_failed = stats["sr_failed"]
-        if sr_failed == 0:
-            continue
-        fp_count = stats["fp_count"]
-        hit_count = stats["hit_count"]
-        precision = (
-            hit_count / (hit_count + fp_count) if (hit_count + fp_count) > 0 else None
-        )
-        result[cat] = {
-            "sr_failed_count": sr_failed,
-            "fp_count": fp_count,
-            "hit_count": hit_count,
-            "false_positive_rate": round(fp_count / sr_failed, 4),
-            "hit_rate": round(hit_count / sr_failed, 4),
-            "precision": round(precision, 4) if precision is not None else None,
-        }
-    return result
+    return bool(reviewer_confirmed_categories(ctx))
 
 
 async def aggregate_sr_blind_spot_envelope(
@@ -423,63 +384,8 @@ _EXECUTION_EVIDENCE_CATEGORIES = (
     "typecheck_executed_cleanly",
 )
 
-
-async def aggregate_sr_execution_evidence_miss_rates(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int,
-) -> Dict[str, Dict[str, Any]]:
-    """Aggregate miss-rates for execution-evidence SR categories from the DB.
-
-    For each task's ``_self_review_outcome.check_results``, counts presence
-    and failures for tests_executed_cleanly, lint_executed_cleanly, and
-    typecheck_executed_cleanly. Returns miss_rate, miss_count, sample_count
-    per category; omits categories with zero samples. Skipped/fallback SR
-    envelopes are excluded.
-    """
-    cutoff = _utcnow() - timedelta(days=days)
-    stmt = (
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
-        )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
-        .order_by(Task.created_at.desc())
-        .limit(_TASK_SCAN_CAP)
-    )
-    result = await session.execute(stmt)
-    all_tasks = result.scalars().all()
-
-    totals: Dict[str, Dict[str, int]] = {}
-    for t in all_tasks:
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        check_results = sro.get("check_results") or {}
-        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
-            entry = check_results.get(cat)
-            if entry is None:
-                continue
-            if cat not in totals:
-                totals[cat] = {"sample_count": 0, "miss_count": 0}
-            totals[cat]["sample_count"] += 1
-            if not entry.get("passed", True):
-                totals[cat]["miss_count"] += 1
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for cat, s in totals.items():
-        if s["sample_count"] == 0:
-            continue
-        out[cat] = {
-            "miss_rate": round(s["miss_count"] / s["sample_count"], 3),
-            "miss_count": s["miss_count"],
-            "sample_count": s["sample_count"],
-        }
-    return out
+# Retired: DB-backed execution-evidence miss rates over tests/lint/typecheck
+# check_results had no real consumer beyond compatibility shims.
 
 
 # Mirror playbook_learning._MIN_SR_SAMPLE — update both if the threshold changes.

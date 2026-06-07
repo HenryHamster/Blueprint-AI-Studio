@@ -2247,3 +2247,44 @@ async def test_remediation_result_message_raises_when_project_missing_and_no_bra
             fix_task,
             result="failed",
         )
+
+
+# ---------------------------------------------------------------------------
+# post_version_promotion_readiness_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_version_promotion_readiness_message_includes_self_approval_caveat(
+    db_session,
+):
+    """post_version_promotion_readiness_message includes the self-approval caveat
+    so the operator sees it's the qualifier's own approval rate, not validated
+    against post-promotion outcomes."""
+    from app.notification_dispatch import post_version_promotion_readiness_message
+
+    project = Project(name="Promotion Readiness", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    msg = await post_version_promotion_readiness_message(
+        db_session,
+        project.id,
+        version_number=5,
+        version_id="vid-readiness",
+        verdicts_evaluated=10,
+        would_promote_rate=0.90,
+        consecutive_clean_passes=5,
+        reason="qualifier self-approval streak clears thresholds",
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "promotion_readiness_reached"
+    assert msg.context["version_number"] == 5
+    assert msg.context["version_id"] == "vid-readiness"
+    assert msg.context["would_promote_rate"] == 0.90
+    assert "self-approval streak clears thresholds" in msg.content
+    assert "90% self-approval rate" in msg.content
+    assert "self-approval" in msg.content.lower()
+    assert "post-promotion outcome" in msg.content.lower()
+    assert msg in db_session

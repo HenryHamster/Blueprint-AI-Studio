@@ -3,7 +3,7 @@
 import uuid
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -25,7 +25,11 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
-from app.task_locking import lock_project_or_429, with_directions_locked
+from app.task_locking import (
+    acquire_direction_research_spawn_lock,
+    lock_project_or_429,
+    with_directions_locked,
+)
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.problem_model import compute_model_size_signal, ProblemModel
@@ -42,8 +46,8 @@ COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
-def _compute_direction_merge_rate(d: dict) -> Any:
-    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+def _compute_direction_merges_per_cycle(d: dict) -> Any:
+    """Return merged-PRs-per-cycle for a direction. Returns None if never researched."""
     history: list[dict[str, Any]] = list(d.get("research_history") or [])
     agg: dict[str, Any] = dict(d.get("history_aggregate") or {})
     total_cycles = float(len(history) + int(agg.get("total_cycles") or 0))
@@ -52,7 +56,7 @@ def _compute_direction_merge_rate(d: dict) -> Any:
         + float(agg.get("total_prs_merged") or 0)
     )
     if total_cycles == 0:
-        return 0.5
+        return None
     return total_merged / total_cycles
 
 
@@ -113,6 +117,25 @@ class DirectionPayload(BaseModel):
             "Client-generated idempotency key. When supplied, a repeat add "
             "(double-click / network retry) carrying the same key returns the "
             "existing direction instead of creating a duplicate."
+        ),
+    )
+    success_evidence: Optional[str] = Field(
+        default=None,
+        max_length=DIRECTION_CONTEXT_FIELD_MAX,
+        description=(
+            "Acceptance evidence: the observable signal that proves this "
+            "direction succeeded. Stored under context['success_evidence'], "
+            "matching the PATCH/update convention."
+        ),
+    )
+    retirement_condition: Optional[str] = Field(
+        default=None,
+        max_length=DIRECTION_CONTEXT_FIELD_MAX,
+        description=(
+            "Retirement condition: the explicit state under which this "
+            "direction may be retired. Stored under "
+            "context['retirement_condition'], matching the PATCH/update "
+            "convention."
         ),
     )
 
@@ -203,7 +226,7 @@ async def get_directions(
         enriched.append(
             {
                 **d,
-                "merge_rate": _compute_direction_merge_rate(d),
+                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
                 "quality_score": round(_compute_direction_quality_score(d), 3),
                 "generalized_successes": generalized_state["generalized_successes"],
                 "generalized_health_rate": generalized_state[
@@ -323,6 +346,19 @@ async def add_direction(
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
     if idem_key:
         direction["idempotency_key"] = idem_key
+    # Acceptance-evidence contract: stamp success_evidence / retirement_condition
+    # into the nested context dict exactly the way update_direction (PATCH) does,
+    # so create and patch produce identical shapes. Only set keys that were
+    # provided, and only attach `context` at all when at least one is present —
+    # an omitted field introduces no empty context entry. Pydantic's max_length
+    # already enforces the 500-char cap that PATCH checks manually.
+    context: Dict[str, Any] = {}
+    if payload.success_evidence is not None:
+        context["success_evidence"] = payload.success_evidence
+    if payload.retirement_condition is not None:
+        context["retirement_condition"] = payload.retirement_condition
+    if context:
+        direction["context"] = context
 
     existing_direction: list = []  # Will be populated if we find a duplicate
 
@@ -961,6 +997,12 @@ async def create_direction_research_task(
         get_project_integration_branch as _get_project_integration_branch,
     )
     from app.shared_state import runtime_config as _runtime_config
+    from app.autonomous_research import research_direction_claim_key
+
+    # Serialize same-direction spawns before the in-flight scan so a
+    # concurrently-committing pipelined research task can never slip between
+    # the read guard and this handler's insert under a different claim key.
+    await acquire_direction_research_spawn_lock(session, project.id, direction_id)
 
     # In-flight guard: never spawn a second research on a direction that already
     # has one in progress. Two concurrent research cycles produce two rollup PRs
@@ -981,6 +1023,7 @@ async def create_direction_research_task(
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
                             TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
                         ]
                     ),
                 )
@@ -1050,8 +1093,12 @@ async def create_direction_research_task(
         },
         "directions:research",
     )
-    from app.autonomous_research import research_direction_claim_key
-
+    # Atomic per-direction claim — the SAME key the autonomous loop stamps, so
+    # a manual spawn and a concurrent autonomous tick (or a double-click) can
+    # never BOTH create an active research cycle on this direction. The in-app
+    # scan above is only the friendly fast path; the partial unique index
+    # ux_task_active_idempotency_key is the concurrency-safe backstop.
+    idempotency_key = research_direction_claim_key(project.id, direction_id)
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text[:200]}",
@@ -1061,29 +1108,41 @@ async def create_direction_research_task(
         status=TaskStatus.QUEUED,
         created_by="USER",
         requires_approval=False,
-        # Atomic per-direction claim — the SAME key the autonomous loop stamps,
-        # so a manual spawn and a concurrent autonomous tick (or a double-click)
-        # can never BOTH create an active research cycle on this direction. The
-        # in-flight SELECT guard above is non-transactional; the partial unique
-        # index ux_task_active_idempotency_key is the concurrency-safe backstop
-        # (same TOCTOU shape as the self-audit trigger fix, #8239).
-        idempotency_key=research_direction_claim_key(project.id, direction_id),
+        idempotency_key=idempotency_key,
     )
     session.add(new_task)
     try:
         await session.commit()
     except IntegrityError:
-        # A concurrent spawn (autonomous tick or duplicate submission) claimed
-        # the direction between the in-flight read above and this insert.
+        # Concurrent spawn (another manual request or the autonomous loop) won
+        # the active idempotency slot for this direction between our scan and
+        # this insert. Coalesce onto the in-flight research rather than spawning
+        # a second VM-backed cycle or erroring — mirrors trigger_self_audit.
         await session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Research is already in progress on this direction "
-                "(a concurrent spawn claimed it first). "
-                "Cancel it before starting another."
-            ),
-        ) from None
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == idempotency_key,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                        ]
+                    ),
+                )
+            )
+        ).scalars().first()
+        detail = (
+            f"Research is already in progress on this direction "
+            f"(task {str(existing.id)[:8]}, status {existing.status}). "
+            f"Cancel it before starting another."
+            if existing is not None
+            else "Research is already in progress on this direction."
+        )
+        raise HTTPException(status_code=409, detail=detail)
     await session.refresh(new_task)
 
     history = TaskHistory(
@@ -1272,12 +1331,28 @@ async def create_message(
         if existing is not None:
             return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
 
+    # Reproduce-on-HEAD citation grounding for free-text bug reports: validate
+    # any file/symbol the report cites against the project's real integration
+    # branch and stash an ``_provenance_warnings`` signal when a citation is
+    # unambiguously absent, so a stale report is discounted rather than trusted.
+    # Best-effort and conservative — indeterminate never flags, never fails create.
+    msg_context: Optional[Dict[str, Any]] = None
+    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        from app.source_ref_validation import compute_message_citation_warning
+
+        warning = await compute_message_citation_warning(
+            session, project, payload.content.strip()
+        )
+        if warning:
+            msg_context = {"_provenance_warnings": warning}
+
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
         from_type="user",
         content=payload.content.strip(),
         idempotency_key=idem_key,
+        **({"context": msg_context} if msg_context else {}),
     )
     session.add(msg)
     # Concurrency backstop: two simultaneous sends sharing the same key both

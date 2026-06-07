@@ -17,7 +17,7 @@ import logging
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.task_capabilities import ALL_TASK_TYPES, TaskType
 
@@ -100,6 +100,203 @@ class BasePayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Acceptance evidence — the general declaration contract
+# ---------------------------------------------------------------------------
+
+
+# Normalized placeholder tokens that an always-true / trivial declaration tends
+# to use. Compared after lower-casing and whitespace-collapsing, so "Assert
+# True" and "assert  true" both match. Kept deliberately small and literal — the
+# point is to reject obviously-gameable boilerplate, not to police phrasing.
+_TRIVIAL_EVIDENCE_TOKENS: frozenset[str] = frozenset(
+    {
+        "test",
+        "test_true",
+        "test_truth",
+        "test_always_true",
+        "always_true",
+        "assert true",
+        "assert_true",
+        "asserttrue",
+        "assert true == true",
+        "true",
+        "pass",
+        "test_pass",
+        "noop",
+        "test_noop",
+        "placeholder",
+        "test_placeholder",
+        "dummy",
+        "test_dummy",
+        "todo",
+        "tbd",
+        "n/a",
+        "na",
+        "none",
+    }
+)
+
+# Directory components that mark a path as living in a test tree, and a basename
+# pattern matching the repo's test-file naming conventions across the languages
+# in this codebase (pytest, vitest/jest, go, ruby, elixir).
+_TEST_DIR_SEGMENTS: frozenset[str] = frozenset(
+    {"tests", "testing", "test", "__tests__", "__test__", "spec"}
+)
+_TEST_FILE_BASENAME_RE = re.compile(
+    r"""^(?:
+        test_.*\.py |          # pytest:   test_foo.py
+        .*_test\.py |          # pytest:   foo_test.py
+        .*\.test\.[cm]?[jt]sx? |  # vitest/jest: foo.test.ts(x)/.mts
+        .*\.spec\.[cm]?[jt]sx? |  # jasmine/jest: foo.spec.js(x)
+        .*_test\.go |          # go:       foo_test.go
+        .*_test\.exs? |        # elixir:   foo_test.exs
+        .*_spec\.rb |          # rspec:    foo_spec.rb
+        test_.*\.rb            # ruby:     test_foo.rb
+    )$""",
+    re.VERBOSE,
+)
+
+
+def _normalize_evidence_token(value: str) -> str:
+    """Lower-case and collapse whitespace for placeholder comparison."""
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _is_trivial_evidence(value: str) -> bool:
+    """True when *value* is an obviously trivial / always-true placeholder."""
+    return _normalize_evidence_token(value) in _TRIVIAL_EVIDENCE_TOKENS
+
+
+def _looks_like_test_file(path: str) -> bool:
+    """True when *path* plausibly names a real test file.
+
+    A path qualifies when it lives under a tests/testing-style directory OR its
+    basename matches the repo's test-file naming. Requires the basename to carry
+    a file extension so a bare placeholder like ``"test"`` is rejected.
+    """
+    candidate = path.strip()
+    if not candidate:
+        return False
+    segments = [seg for seg in candidate.replace("\\", "/").split("/") if seg]
+    if not segments:
+        return False
+    basename = segments[-1]
+    if "." not in basename:
+        return False
+    in_test_dir = any(seg.lower() in _TEST_DIR_SEGMENTS for seg in segments[:-1])
+    name_matches = bool(_TEST_FILE_BASENAME_RE.match(basename.lower()))
+    return in_test_dir or name_matches
+
+
+class AcceptanceEvidence(BaseModel):
+    """A small, closed declaration of what would prove a code task's claim true.
+
+    Generalizes :class:`ComputeSuccessCriterion` beyond compute. A task declares
+    ONE ``kind`` of forward acceptance evidence at plan time:
+
+      * ``named_test`` — a test that exercises the changed seam end-to-end.
+        ``test_path`` must name a plausibly-real test target (under a
+        tests/testing directory or matching the repo's test-file naming);
+        ``test_id`` optionally pins a node like ``test_fn`` (you may also embed
+        it inline as ``path::test_fn`` in ``test_path``).
+      * ``observable_behavior`` — a concise ``description`` of a behavior that
+        should be exercised.
+      * ``downstream_artifact`` — an ``artifact_id`` a later task consumes.
+
+    Deliberately minimal — no expression framework, mirroring
+    ``ComputeSuccessCriterion``'s extra-field discipline (``extra='forbid'``).
+    This validates only that the DECLARATION is well-formed and substantive; the
+    gate-time check that the named test actually touches the CHANGED code is the
+    evaluation lane's job, not this schema's. Trivial / always-true declarations
+    (empty descriptions, a ``test`` path that is not a test file, placeholders
+    like ``test_true`` / ``assert True``) are rejected here, fail-closed, so the
+    declaration cannot be gamed at validation time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["named_test", "observable_behavior", "downstream_artifact"]
+    # named_test
+    test_path: str | None = None
+    test_id: str | None = None
+    # observable_behavior
+    description: str | None = None
+    # downstream_artifact
+    artifact_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_kind_shape(self) -> AcceptanceEvidence:
+        if self.kind == "named_test":
+            path_part, _, node_part = (self.test_path or "").partition("::")
+            if not _looks_like_test_file(path_part):
+                raise ValueError(
+                    "named_test acceptance_evidence requires test_path to name a "
+                    "real test file (under a tests/testing directory or matching "
+                    f"the repo's test-file naming); got {self.test_path!r}"
+                )
+            # The test reference is the node id — either inline (path::node) or
+            # in test_id. It is optional, but if given it must be substantive.
+            for ref in (node_part, self.test_id):
+                if ref and _is_trivial_evidence(ref):
+                    raise ValueError(
+                        f"named_test acceptance_evidence has a placeholder test "
+                        f"reference {ref!r}; name a real test target"
+                    )
+        elif self.kind == "observable_behavior":
+            description = (self.description or "").strip()
+            if len(description) < 10 or _is_trivial_evidence(description):
+                raise ValueError(
+                    "observable_behavior acceptance_evidence requires a "
+                    "substantive description of the behavior to exercise; got "
+                    f"{self.description!r}"
+                )
+        elif self.kind == "downstream_artifact":
+            artifact_id = (self.artifact_id or "").strip()
+            if not artifact_id or _is_trivial_evidence(artifact_id):
+                raise ValueError(
+                    "downstream_artifact acceptance_evidence requires a "
+                    f"non-trivial artifact_id; got {self.artifact_id!r}"
+                )
+        return self
+
+
+class _AcceptanceEvidenceMixin(BaseModel):
+    """Mix-in adding the optional, backward-compatible acceptance_evidence field.
+
+    Prepended to each code/PR-producing payload's bases so the declaration stays
+    DRY and additive. Optionality + ``exclude_none=True`` on dump means existing
+    payloads with no acceptance_evidence validate and round-trip identically.
+    """
+
+    acceptance_evidence: AcceptanceEvidence | None = None
+
+
+def read_acceptance_evidence(first_payload: dict | None) -> AcceptanceEvidence | None:
+    """Read a task's declared acceptance_evidence from its ``first_payload``.
+
+    The single accessor downstream subtasks reuse — analogous to how the compute
+    ``success_criterion`` is read from the payload. Fail-soft: returns ``None``
+    when the field is absent OR the declared shape is malformed, so a consumer
+    keeps its default behavior rather than crash on an uninterpretable
+    declaration. (The strict, raising validation runs at ingestion via
+    ``validate_task_payload``; this read path stays lenient by design.)
+    """
+    if not isinstance(first_payload, dict):
+        return None
+    raw = first_payload.get("acceptance_evidence")
+    if raw is None:
+        return None
+    if isinstance(raw, AcceptanceEvidence):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return AcceptanceEvidence.model_validate(raw)
+    except Exception:  # noqa: BLE001 — malformed declaration reads as absent
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Types that require `prompt`
 # ---------------------------------------------------------------------------
 
@@ -108,11 +305,11 @@ class _PromptRequired(BasePayload):
     prompt: str = Field(..., min_length=1)
 
 
-class CreatePayload(_PromptRequired):
+class CreatePayload(_AcceptanceEvidenceMixin, _PromptRequired):
     pass
 
 
-class RefactorPayload(_PromptRequired):
+class RefactorPayload(_AcceptanceEvidenceMixin, _PromptRequired):
     pass
 
 
@@ -120,7 +317,7 @@ class PlanPayload(_PromptRequired):
     pass
 
 
-class MigratePayload(_PromptRequired):
+class MigratePayload(_AcceptanceEvidenceMixin, _PromptRequired):
     pass
 
 
@@ -155,7 +352,7 @@ class PanelReviewPayload(ReviewPayload):
 # ---------------------------------------------------------------------------
 
 
-class FixPayload(BasePayload):
+class FixPayload(_AcceptanceEvidenceMixin, BasePayload):
     prompt: str = Field(..., min_length=1)
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
@@ -184,6 +381,13 @@ class ResearchPayload(_SystemPopulated):
     anomaly_signals: list[dict[str, Any]] | None = None
     project_name: str | None = None
     design_doc: dict[str, Any] | None = None
+    # Aggregated missing-foundation demand (capability/foundation prerequisites
+    # declared by dependents that no task provides) computed at spawn time by
+    # app.capability_demand.collect_missing_capability_demand. Optional + default
+    # None so older payloads without it still validate; injected only when demand
+    # is non-empty so the research agent can propose/create the missing foundation
+    # or recommend retirement of the stranded demand.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
@@ -209,6 +413,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # records.
     recommended_mode: str | None = None
     max_active_directions: int | None = None
+    # Trim-proof authoritative direction counts (active/paused/total/max_active)
+    # computed from the full untrimmed direction set before packing, so the agent
+    # views anchor on the true active count even when directions_summary is
+    # trimmed/dropped under budget. Shipped at critical tier by the packer.
+    direction_counts: dict[str, Any] | None = None
     rejected_proposals: list[dict[str, Any]] | None = None
     anomaly_summary: dict[str, Any] | None = None
     playbook_summary: dict[str, Any] | None = None
@@ -236,6 +445,10 @@ class StrategicReviewPayload(_SystemPopulated):
     # direction_text, consecutive_failures, last_failure_class,
     # dominant_error_fingerprint, recent_failure_messages}.
     held_directions: list[dict[str, Any]] | None = None
+    # Aggregated missing-foundation demand (see ResearchPayload) so the strategist
+    # can open a foundation direction or record an explicit retirement. Optional +
+    # default None; injected only when demand is non-empty.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -246,6 +459,10 @@ class DesignDocUpdatePayload(_SystemPopulated):
     project_name: str | None = None
     proposed_changes: list[dict[str, Any]] | None = None
     shipped_changes_manifest: list[dict[str, Any]] | None = None
+    # Aggregated missing-foundation demand (see ResearchPayload) so the strategist
+    # can open a foundation direction or record an explicit retirement. Optional +
+    # default None; injected only when demand is non-empty.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class SecurityAuditPayload(_SystemPopulated):
@@ -265,15 +482,15 @@ class ReleaseAuditPayload(_SystemPopulated):
     prompt: str | None = None
 
 
-class QAPayload(_SystemPopulated):
+class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
 
-class DepsPayload(_SystemPopulated):
+class DepsPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
 
-class DocsPayload(_SystemPopulated):
+class DocsPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
 
@@ -337,6 +554,14 @@ class ComputeSuccessCriterion(BaseModel):
     Deliberately minimal — no expression framework, just enough to express a
     single numeric/threshold goal the metric gate can check at completion. When
     absent, the gate keeps its presence-only behavior (terminal outcome + cost).
+
+    The ``metric`` may name a reserved job-level field (final_cost_usd, …) OR
+    any experiment-domain metric the command reports (accuracy, tokens_per_sec,
+    final_loss, …): the compute substrate now carries reported metrics through
+    ``ComputeJob.polling_metadata.result_metrics``, which the agent flattens to
+    top-level numeric keys on the COMPUTE_RESULT, so the gate enforces them by
+    name. A declared metric the experiment does not report fails the gate
+    closed at completion (it is not silently treated as unmeasurable).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -344,6 +569,61 @@ class ComputeSuccessCriterion(BaseModel):
     metric: str
     operator: Literal[">=", "<=", ">", "<", "==", "!="]
     threshold: float
+
+
+class PlanAcceptanceEvidence(BaseModel):
+    """An optional, structured proof descriptor that travels on the task CONTEXT.
+
+    Distinct from the payload-borne :class:`AcceptanceEvidence` (which the merge
+    gate consumes): this lighter ``{kind, descriptor[, selector]}`` shape is the
+    human-readable proof the agent renders in its prompt and best-effort runs —
+    see :func:`parse_acceptance_evidence` and the agent's acceptance-test probe.
+
+    Closed vocabulary aligned with the finding ``claims``/``verification_basis``
+    fields and the direction-level ``success_evidence`` concept (do NOT invent a
+    parallel vocabulary):
+      * ``kind="test"`` — a named test or test-selector that exercises the seam
+        end-to-end.
+      * ``kind="behavior"`` — an observable runtime behavior.
+      * ``kind="artifact"`` — an artifact a downstream task consumes.
+
+    Purely additive: it establishes/propagates/records a contract and never
+    blocks a merge. ``extra='forbid'`` (mirroring :class:`ComputeSuccessCriterion`)
+    so a malformed declaration — a typo'd kind or an extra key — is rejected by
+    :func:`parse_acceptance_evidence` rather than silently carried.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["test", "behavior", "artifact"]
+    descriptor: str
+    selector: str | None = None
+
+
+def parse_acceptance_evidence(raw: Any) -> dict | None:
+    """Validate an arbitrary raw acceptance-evidence value into a normalized dict.
+
+    The single source of truth for the acceptance-evidence vocabulary. Returns a
+    plain dict (``{kind, descriptor[, selector]}``) when *raw* is a well-formed
+    declaration, or ``None`` when it is absent or malformed (missing/bad kind,
+    empty descriptor, extra keys, wrong type). NEVER raises — it mirrors the
+    defensive read in ``task_evaluators._declared_success_criterion`` so an
+    invalid declaration degrades to today's exact behavior rather than failing a
+    decomposition or summary path.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        evidence = PlanAcceptanceEvidence.model_validate(raw)
+    except Exception:  # noqa: BLE001 — any validation error means treat as absent
+        return None
+    descriptor = evidence.descriptor.strip()
+    if not descriptor:
+        return None
+    result: dict[str, Any] = {"kind": evidence.kind, "descriptor": descriptor}
+    if evidence.selector is not None:
+        result["selector"] = evidence.selector
+    return result
 
 
 class ComputeExperimentPayload(_SystemPopulated):

@@ -54,6 +54,23 @@ from app.sr_analytics_common import (
 logger = logging.getLogger(__name__)
 
 
+def _reviewer_finding_count(category_data: dict[str, Any], prefix: str) -> int:
+    """Read reviewer-grounded category counts with legacy fallbacks.
+
+    Canonical payload fields are ``{prefix}_reviewer_finding_count``. Older
+    payloads may still expose ``{prefix}_finding_count`` or
+    ``{prefix}_human_count``.
+    """
+
+    canonical_key = f"{prefix}_reviewer_finding_count"
+    if canonical_key in category_data:
+        return int(category_data.get(canonical_key) or 0)
+    finding_key = f"{prefix}_finding_count"
+    if finding_key in category_data:
+        return int(category_data.get(finding_key) or 0)
+    return int(category_data.get(f"{prefix}_human_count") or 0)
+
+
 async def _compute_sr_catch_rate_trends_impl(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -382,6 +399,8 @@ async def _compute_sr_catch_rate_trends_impl(
         categories[cat] = {
             "current_hit_rate": current_hit_rate,
             "previous_hit_rate": previous_hit_rate,
+            "current_reviewer_finding_count": curr_findings,
+            "previous_reviewer_finding_count": prev_findings,
             "current_human_count": int(curr.get("human_count") or 0),
             "previous_human_count": int(prev.get("human_count") or 0),
             "low_confidence_finding_count": curr_findings < _MIN_SR_FINDINGS,
@@ -479,7 +498,6 @@ async def _compute_sr_catch_rate_trends_impl(
     eng = _compute_reasoning_engagement(current_window_tasks, all_cats)
     for cat, cat_eng in eng.items():
         categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
-        categories[cat]["reasoning_quality_rate"] = cat_eng["reasoning_quality_rate"]
         categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
@@ -502,17 +520,68 @@ async def _compute_sr_catch_rate_trends_impl(
         fp_data = cat_fp_stats.get(cat) or {}
         fp = fp_data.get("fp", 0)
         tp = fp_data.get("tp", 0)
+        curr_total = fp + tp
         data["fp_count"] = fp
         data["tp_count"] = tp
         data["false_positive_rate"] = (
-            round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+            round(fp / curr_total, 3) if curr_total > 0 else None
         )
+        # precision = 1 - fpr by construction (same fp/tp basis)
+        data["precision"] = round(tp / curr_total, 3) if curr_total > 0 else None
         prev_fp_data = prev_cat_fp_stats.get(cat) or {}
         prev_fp = prev_fp_data.get("fp", 0)
         prev_tp = prev_fp_data.get("tp", 0)
+        prev_total = prev_fp + prev_tp
         data["previous_fp_rate"] = (
-            round(prev_fp / (prev_fp + prev_tp), 3) if (prev_fp + prev_tp) > 0 else None
+            round(prev_fp / prev_total, 3) if prev_total > 0 else None
         )
+        prev_precision = round(prev_tp / prev_total, 3) if prev_total > 0 else None
+        # Recompute fp_trend from the same basis
+        curr_fpr = data["false_positive_rate"]
+        prev_fpr = data["previous_fp_rate"]
+        if curr_fpr is not None and prev_fpr is not None:
+            fp_delta = curr_fpr - prev_fpr
+            fp_sig = (
+                curr_total >= _MIN_SR_FINDINGS
+                and prev_total >= _MIN_SR_FINDINGS
+                and _is_trend_significant(curr_fpr, curr_total, prev_fpr, prev_total)
+            )
+            if fp_sig and fp_delta >= _TREND_DELTA_THRESHOLD:
+                data["fp_trend"] = "increasing"
+            elif fp_sig and fp_delta <= -_TREND_DELTA_THRESHOLD:
+                data["fp_trend"] = "decreasing"
+            else:
+                data["fp_trend"] = "stable"
+        else:
+            data["fp_trend"] = "stable"
+        # Recompute precision_delta and precision_recall_quadrant from consistent basis
+        precision_delta_new: Optional[float] = (
+            round(data["precision"] - prev_precision, 3)
+            if data["precision"] is not None and prev_precision is not None
+            else None
+        )
+        data["precision_delta"] = precision_delta_new
+        recall_delta = data.get("recall_delta")
+        if recall_delta is not None and precision_delta_new is not None:
+            q = _PRECISION_RECALL_QUADRANT_THRESHOLD
+            p_up = precision_delta_new >= q
+            p_down = precision_delta_new <= -q
+            r_up = recall_delta >= q
+            r_down = recall_delta <= -q
+            if p_up and r_up:
+                data["precision_recall_quadrant"] = "healthy"
+            elif p_up and r_down:
+                data["precision_recall_quadrant"] = "conservative_shift"
+            elif p_down and r_up:
+                data["precision_recall_quadrant"] = "noisy_shift"
+            elif p_down and r_down:
+                data["precision_recall_quadrant"] = "both_declining"
+            elif not p_up and not p_down and not r_up and not r_down:
+                data["precision_recall_quadrant"] = "flat"
+            else:
+                data["precision_recall_quadrant"] = "mixed"
+        else:
+            data["precision_recall_quadrant"] = data.get("precision_recall_quadrant")
 
     sev_cal = _compute_cat_severity_calibration(current_window_tasks)
     for cat, data in categories.items():
@@ -741,28 +810,28 @@ async def _compute_sr_catch_rate_trends_impl(
         }
 
     current_total_hits = 0
-    current_total_humans = 0
+    current_total_reviewers = 0
     previous_total_hits = 0
-    previous_total_humans = 0
+    previous_total_reviewers = 0
     for data in categories.values():
         curr_hit_rate = data.get("current_hit_rate")
-        curr_human_count = data.get("current_human_count", 0)
+        curr_reviewer_count = _reviewer_finding_count(data, "current")
         prev_hit_rate = data.get("previous_hit_rate")
-        prev_human_count = data.get("previous_human_count", 0)
-        if curr_hit_rate is not None and curr_human_count > 0:
-            current_total_hits += round(curr_hit_rate * curr_human_count)
-            current_total_humans += curr_human_count
-        if prev_hit_rate is not None and prev_human_count > 0:
-            previous_total_hits += round(prev_hit_rate * prev_human_count)
-            previous_total_humans += prev_human_count
+        prev_reviewer_count = _reviewer_finding_count(data, "previous")
+        if curr_hit_rate is not None and curr_reviewer_count > 0:
+            current_total_hits += round(curr_hit_rate * curr_reviewer_count)
+            current_total_reviewers += curr_reviewer_count
+        if prev_hit_rate is not None and prev_reviewer_count > 0:
+            previous_total_hits += round(prev_hit_rate * prev_reviewer_count)
+            previous_total_reviewers += prev_reviewer_count
     overall_hit_rate = (
-        round(current_total_hits / current_total_humans, 3)
-        if current_total_humans > 0
+        round(current_total_hits / current_total_reviewers, 3)
+        if current_total_reviewers > 0
         else None
     )
     previous_overall_hit_rate = (
-        round(previous_total_hits / previous_total_humans, 3)
-        if previous_total_humans > 0
+        round(previous_total_hits / previous_total_reviewers, 3)
+        if previous_total_reviewers > 0
         else None
     )
 
@@ -819,16 +888,16 @@ async def _compute_sr_catch_rate_trends_impl(
     overall_data_sufficient = (
         overall_hit_rate is not None
         and previous_overall_hit_rate is not None
-        and current_total_humans >= _MIN_SR_FINDINGS
-        and previous_total_humans >= _MIN_SR_FINDINGS
+        and current_total_reviewers >= _MIN_SR_FINDINGS
+        and previous_total_reviewers >= _MIN_SR_FINDINGS
     )
     if overall_data_sufficient:
         overall_delta = overall_hit_rate - previous_overall_hit_rate
         overall_sig = _is_trend_significant(
             overall_hit_rate,
-            current_total_humans,
+            current_total_reviewers,
             previous_overall_hit_rate,
-            previous_total_humans,
+            previous_total_reviewers,
         )
         if overall_sig and overall_delta >= _TREND_DELTA_THRESHOLD:
             overall_trend_verdict: str = "improving"

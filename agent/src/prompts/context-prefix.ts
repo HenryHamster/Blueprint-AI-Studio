@@ -296,6 +296,39 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
   }
 
+  // Existing knowledge documents — a compact, body-omitted index of
+  // web_research / design output so the strategist / research agent knows what
+  // knowledge already exists (and can fetch full bodies on demand) instead of
+  // re-commissioning research it already paid for. Rendered only when the
+  // backend shipped a non-empty index; absent otherwise (clean omission).
+  const knowledgeIndex = Array.isArray(payload?.knowledge_index)
+    ? payload.knowledge_index as Array<Record<string, unknown>>
+    : [];
+  if (knowledgeIndex.length > 0) {
+    const kdLines: string[] = ['## Existing knowledge documents'];
+    kdLines.push(
+      'Knowledge already produced by prior web_research / design work. Build on it — fetch the full body on demand with `./fetch knowledge <id>` rather than re-deriving it.',
+    );
+    for (const entry of knowledgeIndex) {
+      const id = strVal(entry.id);
+      const title = strVal(entry.title);
+      if (!id || !title) continue;
+      const meta: string[] = [];
+      const topic = strVal(entry.topic);
+      if (topic) meta.push(`topic: ${topic}`);
+      const directionId = strVal(entry.direction_id);
+      if (directionId) meta.push(`direction: ${directionId}`);
+      const sourceKind = strVal(entry.source_kind);
+      if (sourceKind) meta.push(sourceKind);
+      const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
+      kdLines.push(`- [${id}] ${title}${metaSuffix}`);
+      const summary = strVal(entry.summary);
+      if (summary) kdLines.push(`  ${summary}`);
+    }
+    kdLines.push('');
+    prefix += kdLines.join('\n') + '\n';
+  }
+
   if (projectCtx) {
     const hasData = Object.keys(projectCtx).some(k => {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
@@ -753,6 +786,35 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
     scopeLines.push('');
     prefix += scopeLines.join('\n') + '\n';
+  }
+
+  // Acceptance Evidence — the proof a planned task declared at plan time that
+  // would show its claim is true. The backend validates the declaration and
+  // stamps it onto this child task's context.acceptance_evidence (closed shape:
+  // kind ∈ {test, behavior, artifact}, descriptor, optional selector). Presence
+  // gated: when absent the prompt is byte-identical to today. This names the
+  // proof to AIM for; it does NOT gate merge.
+  const acceptanceEvidence = taskContext?.acceptance_evidence as Record<string, unknown> | undefined;
+  if (acceptanceEvidence && typeof acceptanceEvidence === 'object') {
+    const kind = strVal(acceptanceEvidence.kind);
+    const descriptor = strVal(acceptanceEvidence.descriptor);
+    if (kind || descriptor) {
+      const aeLines: string[] = ['## Acceptance Evidence'];
+      aeLines.push(
+        'This task declared, at plan time, the proof that would show its claim is true. Aim to produce it — this is the evidence the work should demonstrate, not a merge gate.',
+      );
+      const kindLabels: Record<string, string> = {
+        test: 'test (a named test or selector exercising the seam end-to-end)',
+        behavior: 'behavior (an observable runtime behavior)',
+        artifact: 'artifact (an artifact a downstream task consumes)',
+      };
+      if (kind) aeLines.push(`- Kind: ${kindLabels[kind] ?? kind}`);
+      if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
+      const selector = strVal(acceptanceEvidence.selector);
+      if (selector) aeLines.push(`- Selector: ${selector}`);
+      aeLines.push('');
+      prefix += aeLines.join('\n') + '\n';
+    }
   }
 
   // Append hidden-signal section surfacing backend-computed quality signals

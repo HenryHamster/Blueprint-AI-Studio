@@ -1,0 +1,483 @@
+"""Tests for the pre-promotion scratch-DB migration-apply gate.
+
+The gate reproduces what Alembic would actually do on the LIVE database and
+catches the deploy-fatal renumber-skip class (prod incident 2026-06-04) BEFORE
+promotion — the class CI structurally cannot see because CI builds a fresh DB
+from the candidate's own migrations.
+
+The end-to-end cases (block / clean / seed) require a real migration-applying
+Postgres path — the renumber-skip is only meaningful when Alembic genuinely
+skips an already-stamped revision against a seeded scratch DB. They are SKIPPED
+on the local SQLite harness, mirroring
+``test_deploy_smoketest.test_no_schema_drift_against_migrated_head``. The
+fail-safe / determinism cases that need no scratch DB run everywhere.
+"""
+
+import contextlib
+import os
+from unittest.mock import AsyncMock
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from app.migration_apply_gate import (
+    ephemeral_postgres_database,
+    run_migration_apply_gate,
+)
+
+# Same Postgres-vs-SQLite selection conftest uses. The scratch-DB cases need a
+# server we can CREATE DATABASE on (CI's `test` user is a superuser).
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
+
+requires_postgres = pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="scratch-DB migration-apply gate requires a real Postgres server "
+    "(USE_TEST_POSTGRES=true); the renumber-skip is not reproducible on SQLite",
+)
+
+
+def _base_url():
+    return make_url(os.environ["DATABASE_URL"])
+
+
+# --- Synthetic candidate migration chains ----------------------------------
+# A minimal three-revision chain. ``a02`` creates the ``computejob`` table — the
+# stand-in for the table the real renumber-skip dropped. ``a01`` seeds a
+# pre-existing table; ``a03`` is an unrelated later migration.
+
+_MIG_A01 = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a01"
+down_revision = None
+
+
+def upgrade():
+    op.create_table("widget", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade():
+    op.drop_table("widget")
+"""
+
+_MIG_A02_COMPUTEJOB = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a02"
+down_revision = "a01"
+
+
+def upgrade():
+    op.create_table("computejob", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade():
+    op.drop_table("computejob")
+"""
+
+_MIG_A03 = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a03"
+down_revision = "a02"
+
+
+def upgrade():
+    op.create_table("audit_entry", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade():
+    op.drop_table("audit_entry")
+"""
+
+_CANDIDATE_SOURCES = {
+    "a01_widget.py": _MIG_A01,
+    "a02_computejob.py": _MIG_A02_COMPUTEJOB,
+    "a03_audit.py": _MIG_A03,
+}
+
+
+def _required_metadata():
+    """What the candidate's code requires: every table the chain should create."""
+    meta = sa.MetaData()
+    for name in ("widget", "computejob", "audit_entry"):
+        sa.Table(name, meta, sa.Column("id", sa.Integer, primary_key=True))
+    return meta
+
+
+async def _seed_prod_sim(prod_engine, tables: dict[str, bool], revision: str | None):
+    """Stand up a prod-sim DB: create each table in *tables* whose value is True,
+    and stamp ``alembic_version`` to *revision* (omit the row when None)."""
+
+    def _seed(sync_conn):
+        for name, present in tables.items():
+            if present:
+                sync_conn.execute(
+                    sa.text(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+                )
+        sync_conn.execute(
+            sa.text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        )
+        if revision is not None:
+            sync_conn.execute(
+                sa.text("INSERT INTO alembic_version (version_num) VALUES (:r)"),
+                {"r": revision},
+            )
+
+    async with prod_engine.begin() as conn:
+        await conn.run_sync(_seed)
+
+
+# --- End-to-end (Postgres) -------------------------------------------------
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_renumber_skip_is_blocked_naming_missing_table():
+    """REGRESSION (v5 computejob renumber-skip): prod is stamped at ``a02`` but
+    the ``a02`` body was skipped, so ``computejob`` is ABSENT. Applying the
+    candidate chain re-runs only ``a03`` (Alembic sees ``a02`` already applied
+    and skips it), so ``computejob`` is STILL never created — the gate must
+    ``block`` and name the missing ``computejob`` table.
+
+    This is the exact mechanic of the 2026-06-04 incident: the live DB stamped
+    ahead of its real schema, a required table silently never created."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        # Renumber-skip live state: widget present, computejob ABSENT, stamped a02.
+        await _seed_prod_sim(
+            prod_engine, {"widget": True, "computejob": False}, revision="a02"
+        )
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            required_metadata=_required_metadata(),
+        )
+
+    assert verdict == "block", detail
+    assert "computejob" in detail
+    assert "a02" in detail
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_derived_reference_schema_blocks_renumber_skip_without_injected_metadata():
+    """Same renumber-skip as above, but with NO injected ``required_metadata``: the
+    gate must DERIVE the required schema from the candidate's own migration chain
+    (applied to a fresh DB) and still ``block`` on the missing ``computejob``.
+
+    This exercises :func:`_build_candidate_reference_schema` end-to-end — proving
+    the full deploy-target schema is captured from migrations alone, with no
+    in-process exec of candidate model modules."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(
+            prod_engine, {"widget": True, "computejob": False}, revision="a02"
+        )
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            # required_metadata omitted on purpose — derived from candidate chain.
+        )
+
+    assert verdict == "block", detail
+    assert "computejob" in detail
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_clean_candidate_is_ok():
+    """A healthy live DB stamped at ``a01`` (computejob legitimately not yet
+    created) — applying the candidate chain runs ``a02`` (creates computejob)
+    and ``a03``, so every required table is present and the gate returns ``ok``."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(
+            prod_engine, {"widget": True, "computejob": False}, revision="a01"
+        )
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            required_metadata=_required_metadata(),
+        )
+
+    assert verdict == "ok", detail
+    assert detail is None
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_indeterminate_prod_state_defers():
+    """Production has no recorded Alembic revision (empty ``alembic_version``) —
+    the gate cannot reproduce the deploy, so it HOLDS (defer), never ``ok``."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(prod_engine, {"widget": True}, revision=None)
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            required_metadata=_required_metadata(),
+        )
+
+    assert verdict == "defer", detail
+    assert "alembic_version" in detail or "recorded" in detail
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_scratch_db_is_isolated_from_prod(monkeypatch):
+    """ISOLATION SAFETY: the gate must never apply DDL to production. After a full
+    run, the prod-sim DB still has ONLY its seeded tables — no candidate table
+    (computejob / audit_entry) leaked into it."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(
+            prod_engine, {"widget": True, "computejob": False}, revision="a01"
+        )
+        await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            required_metadata=_required_metadata(),
+        )
+
+        def _tables(sync_conn):
+            return set(sa.inspect(sync_conn).get_table_names())
+
+        async with prod_engine.connect() as conn:
+            tables = await conn.run_sync(_tables)
+
+    # The candidate chain ran ONLY on the scratch DB; prod-sim is untouched.
+    assert "audit_entry" not in tables
+    assert "computejob" not in tables
+    assert "widget" in tables
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_fetch_failure_defers(monkeypatch):
+    """A GitHub fetch failure for the candidate's migration list must HOLD
+    (defer), never wave through — a fetch error is not 'no migrations'."""
+    import app.migration_apply_gate as gate_mod
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("GitHub unreachable")
+
+    monkeypatch.setattr(gate_mod.github, "list_versions_at_ref", _boom)
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(prod_engine, {"widget": True}, revision="a01")
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="deadbeef",
+            required_metadata=_required_metadata(),
+        )
+
+    assert verdict == "defer", detail
+    assert "deadbeef" in detail
+
+
+# --- Fail-safe cases that need no scratch DB (run everywhere) ---------------
+
+
+@pytest.mark.asyncio
+async def test_non_postgres_bind_defers():
+    """A non-Postgres production bind cannot reproduce the deploy; the gate HOLDS
+    (defer) rather than waving the release through. Runs on any harness."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            required_metadata=_required_metadata(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "PostgreSQL" in detail
+
+
+@pytest.mark.asyncio
+async def test_missing_github_coords_defers():
+    """No injected sources AND incomplete GitHub coordinates => defer (never run
+    a half-configured gate to a wave-through)."""
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            # repo/candidate_ref missing
+            required_metadata=_required_metadata(),
+        )
+    finally:
+        await engine.dispose()
+
+    # Prod-state read fails to connect (no such DB) OR coords are incomplete —
+    # either way the verdict must be a HOLD, never 'ok'/'block'.
+    assert verdict == "defer", detail
+
+
+@pytest.mark.asyncio
+async def test_required_metadata_derived_from_candidate_reference_not_live_metadata(
+    monkeypatch,
+):
+    """The required schema must be the candidate-pinned reference (its own migration
+    chain applied to a fresh DB), NOT the live process's ``SQLModel.metadata``.
+
+    A stale backend/head mismatch (automain advancing while a run is in flight)
+    must not grade the candidate against newer process-local metadata. The gate
+    derives ``required_metadata`` via :func:`_build_candidate_reference_schema`,
+    which reflects a clean apply of the candidate's migrations — no candidate
+    Python is exec'd in-process, so no event listeners/mappers leak."""
+    import app.migration_apply_gate as gate_mod
+
+    # The schema the candidate's OWN migration chain would produce on a fresh DB.
+    candidate_reference_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+    sa.Table(
+        "computejob",
+        candidate_reference_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+
+    observed = {}
+
+    async def _fake_build_candidate_reference_schema(_base_url, _candidate_sources):
+        return candidate_reference_meta
+
+    async def _fake_build_candidate_required_metadata(**_kwargs):
+        return candidate_reference_meta
+
+    async def _fake_reflect_scratch_drift(_scratch_engine, required_metadata):
+        observed["required_metadata"] = required_metadata
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _fake_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        _fake_build_candidate_required_metadata,
+    )
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", _fake_reflect_scratch_drift)
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="candidate-sha",
+            project_id="p",
+            candidate_sources={"0001_init.py": "revision = '0001'"},
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    assert observed["required_metadata"] is candidate_reference_meta
+
+
+@pytest.mark.asyncio
+async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
+    monkeypatch,
+):
+    """When ``required_metadata`` is omitted, the gate must still catch a code
+    change whose migration was forgotten.
+
+    The candidate-pinned migration reference remains the scratch-drift target,
+    but the default path must ALSO compare that reference schema against the
+    candidate code's required metadata and hard-block any object the code expects
+    that the migration chain never creates."""
+    import app.migration_apply_gate as gate_mod
+
+    candidate_reference_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+
+    candidate_required_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_required_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+    sa.Table(
+        "computejob",
+        candidate_required_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        AsyncMock(return_value=candidate_reference_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=candidate_required_meta),
+    )
+    reflect_scratch_drift = AsyncMock(return_value=[])
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", reflect_scratch_drift)
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="candidate-sha",
+            project_id="p",
+            candidate_sources={"0001_init.py": "revision = '0001'"},
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", detail
+    assert "missing migration" in detail
+    assert "computejob" in detail
+    reflect_scratch_drift.assert_not_called()

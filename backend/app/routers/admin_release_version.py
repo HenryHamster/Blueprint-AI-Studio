@@ -15,7 +15,7 @@ from app.models import (
     StrategicCycle,
     QualificationVerdict,
 )
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.shared_state import (
     promotion_enabled_by_project_map,
@@ -137,7 +137,7 @@ async def get_version_lifecycle(
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
-        get_latest_release_audit_report,
+        resolve_lifecycle_audit_evidence,
     )
     from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
@@ -173,11 +173,39 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
-        qual_state = _release_version.summarize_qualification_state(qual)
-        # Surface the latest release_audit's actual findings/score so a verdict
-        # is explainable (the verdict record only keeps the composite, and the
+        # Verdict-staleness signal: how many tasks merged AT/AFTER the open
+        # version's last qualification verdict was finalized. Each verdict is
+        # evaluated against one candidate commit; merges landing after
+        # ``finalized_at`` mean the displayed confidence/sub-scores no longer
+        # reflect the current tree. Computed from the verdict's ``finalized_at``
+        # (NOT the version's ``opened_at``). ``None`` when there is no verdict or
+        # no parseable ``finalized_at`` — never fabricate a count.
+        merged_since_verdict: Optional[int] = None
+        finalized_at_raw = qual.get("finalized_at")
+        if finalized_at_raw:
+            try:
+                from datetime import datetime  # noqa: PLC0415
+
+                finalized_at_dt = datetime.fromisoformat(finalized_at_raw)
+            except (ValueError, TypeError):
+                finalized_at_dt = None
+            if finalized_at_dt is not None:
+                merged_since_verdict = await count_merged_since(
+                    session, project_id, finalized_at_dt
+                )
+        qual_state = _release_version.summarize_qualification_state(
+            qual, open_row.serving_status, open_row.deploy_failure_reason
+        )
+        # Surface the open version's audit findings/score so a verdict is
+        # explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
-        latest_audit = await get_latest_release_audit_report(session, project_id)
+        # Scoped to THIS version's evaluated candidate so a fresh/newly-cut
+        # version never inherits another version's findings: ``latest_audit`` is
+        # populated only when the newest scoped audit matches the evaluated
+        # candidate SHA; otherwise the audit is surfaced as ``stale_audit``
+        # provenance and ``audit_evidence_state`` explains which case applies.
+        audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
+        latest_audit = audit_evidence["latest_audit"]
 
         # Fetch live current_focus from the project's problem_model
         live_current_focus = None
@@ -201,6 +229,9 @@ async def get_version_lifecycle(
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # Tasks merged AT/AFTER the last qualification verdict's finalized_at
+            # (verdict-staleness signal). None when no verdict/finalized_at.
+            "merged_since_verdict": merged_since_verdict,
             # In-flight (non-terminal) tasks that a version cut will NOT stop —
             # they keep running and land against the freshly-opened next version.
             # Surfaced so the cut confirmation can disclose this consequence.
@@ -208,6 +239,24 @@ async def get_version_lifecycle(
             "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
+            # Provenance for version-scoped audit evidence (additive). When the
+            # newest scoped audit was run against an OLDER candidate than the one
+            # under evaluation, its report is surfaced here (not as latest_audit)
+            # so the UI can mark the findings historical. ``audit_evidence_state``
+            # is ``current`` | ``stale`` | ``none``.
+            "audit_evidence_state": audit_evidence["state"],
+            "stale_audit": audit_evidence["stale_audit"],
+            # Post-promotion serving confirmation (additive; NULL until the open
+            # version is itself promoted — normally NULL for a still-open one).
+            "serving_status": open_row.serving_status,
+            "served_sha": open_row.served_sha,
+            "served_at": open_row.served_at.isoformat()
+            if open_row.served_at
+            else None,
+            "deploy_failure_reason": open_row.deploy_failure_reason,
+            "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
+            if open_row.deploy_confirm_deadline
+            else None,
         }
 
     history_rows = (
@@ -240,6 +289,15 @@ async def get_version_lifecycle(
                 "last_qualification": _format_qualification(v.last_qualification)
                 if v.last_qualification
                 else None,
+                # Post-promotion serving confirmation — disambiguates a merged
+                # promotion from one that actually shipped (additive fields).
+                "serving_status": v.serving_status,
+                "served_sha": v.served_sha,
+                "served_at": v.served_at.isoformat() if v.served_at else None,
+                "deploy_failure_reason": v.deploy_failure_reason,
+                "qualification_state": _release_version.summarize_qualification_state(
+                    v.last_qualification, v.serving_status, v.deploy_failure_reason
+                ),
                 "abandoned_at": (
                     (v.last_qualification or {}).get("abandoned_at")
                     if v.status == "abandoned"
@@ -308,12 +366,56 @@ async def set_version_phase(
         project_id, current_user["user_id"], session, "member"
     )
 
-    open_ver = await _release_version.current_open_version(session, project_id)
+    # Acquire the open version under FOR UPDATE lock, then re-check preconditions
+    # against the freshly-locked row. Between the initial read and this lock,
+    # a concurrent promotion/abandon could have changed the version's state.
+    open_ver = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
     if open_ver is None:
         raise HTTPException(
             status_code=404,
             detail="No open release version found for this project.",
         )
+
+    # Refuse a phase flip while a promotion is in flight (audit passed, promotion
+    # PR open and auto-merging).  Flipping back to build here clears the
+    # "promotion in flight" indication in the panel even though nothing was
+    # cancelled — leaving the operator levers disagreeing about the version's
+    # real state.  Mirrors the version-cut lever's 409 refusal on the same
+    # predicate. (Only the operator endpoint guards this — the internal
+    # set_version_phase helper stays open for finalize/sweep/promotion flows that
+    # legitimately flip phase mid-promotion.)
+    # Re-check this against the LOCKED row's last_qualification, not a stale read.
+    _qual_state = _release_version.summarize_qualification_state(
+        open_ver.last_qualification
+    )
+    if _qual_state and _qual_state.get("state") == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before changing the phase"
+        )
+        pr_number = _qual_state.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number}"
+            pr_url = _qual_state.get("promotion_pr_url")
+            if pr_url:
+                detail += f" {pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail)
 
     operator_id = current_user.get("email") or current_user["user_id"]
     full_reasoning = (
@@ -358,7 +460,25 @@ async def set_version_goal(
         project_id, current_user["user_id"], session, "member"
     )
 
-    open_ver = await _release_version.current_open_version(session, project_id)
+    # Acquire the open version under FOR UPDATE lock, then re-check preconditions
+    # against the freshly-locked row. Between the initial read and this lock,
+    # a concurrent promotion/abandon could have changed the version's state.
+    open_ver = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
     if open_ver is None:
         raise HTTPException(
             status_code=404,
@@ -384,6 +504,11 @@ async def set_version_goal(
 
 class _AbandonVersionBody(BaseModel):
     reason: str | None = _Field(default=None, max_length=500)
+    # Client-generated idempotency key. When supplied, a repeat cut (double-click
+    # / lost-response retry) carrying the same key returns the original cut's
+    # result instead of abandoning the freshly-opened next version a second time,
+    # mirroring the message and direction composers.
+    idempotency_key: str | None = _Field(default=None, max_length=255)
 
 
 @router.post("/projects/{project_id}/version-cut")
@@ -414,6 +539,7 @@ async def cut_version(
             project_id,
             reason=payload.reason,
             operator_id=operator_id,
+            idempotency_key=payload.idempotency_key,
         )
     except _release_version.VersionCutBlockedByPromotion as exc:
         detail = (
@@ -522,12 +648,19 @@ async def get_audit_findings(
 ) -> Dict[str, Any]:
     """Return the latest qualification's audit findings for a project.
 
-    Read-only; viewer+ role required. Surfaces the ``audit_findings`` list
-    carried into ``last_qualification`` by ``_finalize_qualification`` so
-    operators can see which specific issues drove a low audit sub-score.
-    Returns an empty list when no open version exists or no qualification
-    has run yet.
+    Read-only; viewer+ role required. Prefers the durable per-attempt evidence
+    on the latest immutable ``QualificationVerdict`` row for the open version
+    (its ``audit_findings`` column survives re-qualification overwrites), and
+    falls back to the mutable ``last_qualification.audit_findings`` blob only
+    when no verdict row carries findings (e.g. legacy rows predating the
+    evidence columns).  The ``source`` field reflects which store was used
+    (``qualification_verdict`` vs ``last_qualification``).  Returns an empty
+    list when no open version exists or no qualification has run yet.
     """
+    from app.release_qualifier import (  # noqa: PLC0415
+        get_latest_qualification_audit_findings,
+    )
+
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
@@ -550,12 +683,38 @@ async def get_audit_findings(
     if open_row is None:
         return {"findings": [], "source": "no_open_version"}
 
+    # Prefer the latest durable verdict row that carries audit findings for this
+    # version — it survives the next re-qualification's last_qualification
+    # overwrite, so a blocked attempt's findings are not lost.
+    verdict = (
+        (
+            await session.execute(
+                select(QualificationVerdict)
+                .where(
+                    QualificationVerdict.release_version_id == open_row.id,
+                    QualificationVerdict.audit_findings.is_not(None),
+                )
+                .order_by(QualificationVerdict.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if verdict is not None:
+        return {
+            "findings": get_latest_qualification_audit_findings(open_row, verdict),
+            "audit_missing_reason": verdict.audit_missing_reason,
+            "finalized_at": verdict.finalized_at.isoformat()
+            if verdict.finalized_at
+            else None,
+            "source": "qualification_verdict",
+        }
+
     qual = open_row.last_qualification or {}
-    findings = qual.get("audit_findings") or []
-    if not isinstance(findings, list):
-        findings = []
     return {
-        "findings": findings,
+        "findings": get_latest_qualification_audit_findings(open_row),
         "audit_missing_reason": qual.get("audit_missing_reason"),
         "finalized_at": qual.get("finalized_at"),
         "source": "last_qualification",
@@ -582,7 +741,10 @@ async def list_qualification_verdicts(
     'no recent verdicts because qualifier never ran' from 'qualifier has been
     thrashing on infrastructure failures'.
     """
-    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
+    from app.release_qualifier import (  # noqa: PLC0415
+        compute_promotion_readiness,
+        format_verdict_for_api,
+    )
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
@@ -599,28 +761,193 @@ async def list_qualification_verdicts(
     readiness = await compute_promotion_readiness(session, project_id)
 
     return {
-        "verdicts": [
-            {
-                "id": str(v.id),
-                "release_version_id": str(v.release_version_id),
-                "candidate_sha": v.candidate_sha,
-                "confidence": v.confidence,
-                "sub_scores": v.sub_scores,
-                "blocker": v.blocker,
-                "audit_missing_reason": v.audit_missing_reason,
-                "would_promote": v.would_promote,
-                "promotion_enabled": v.promotion_enabled,
-                "terminal_status": v.terminal_status,
-                "threshold": v.threshold,
-                "started_at": v.started_at.isoformat() if v.started_at else None,
-                "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
-                "created_at": v.created_at.isoformat(),
-            }
-            for v in rows
-        ],
+        "verdicts": [format_verdict_for_api(v) for v in rows],
         "total": len(rows),
         "infra_context": {
             "infra_failure_count": readiness.get("infra_failure_count", 0),
             "consecutive_infra_errors": readiness.get("consecutive_infra_errors", 0),
         },
+    }
+
+
+class _ClearDeployFailedBody(BaseModel):
+    # Operator override: clear a stale deploy_failed even when the live serving
+    # SHA is unobservable (the pre-Cloud-Run-API interim). Without it, the clear
+    # only proceeds when the deploy is independently confirmed serving.
+    force: bool = _Field(default=False)
+    # Recorded attestation reason — REQUIRED for the force path so the durable
+    # audit trail records WHY an unverifiable deploy was declared live.
+    reason: str | None = _Field(default=None, max_length=500)
+
+
+def _record_deploy_failed_clear_attestation(
+    version: ReleaseVersion,
+    operator_id: str,
+    reason: str,
+    now,
+) -> None:
+    """Stamp an operator-attested deploy_failed clear onto the version audit trail.
+
+    The recovery helper clears ``deploy_failure_reason``; this records the durable
+    provenance (operator identity, reason, timestamp, mode) of an attested clear
+    that was NOT independently verified live, so the audit trail never silently
+    loses the fact that a human declared the deploy serving. Reassigns
+    ``last_qualification`` (rather than mutating in place) so SQLAlchemy detects
+    the JSON change.
+    """
+    qual = dict(version.last_qualification or {})
+    qual["deploy_failed_clear"] = {
+        "mode": "operator_attested",
+        "operator": operator_id,
+        "reason": reason,
+        "attested_at": now.isoformat(),
+    }
+    version.last_qualification = qual
+
+
+@router.post("/projects/{project_id}/clear-deploy-failed")
+async def clear_deploy_failed(
+    project_id: uuid.UUID,
+    payload: _ClearDeployFailedBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Acknowledge and clear a stale post-promotion ``deploy_failed`` serving state.
+
+    Admin-gated (matching the deploy operator levers). Targets the latest
+    ``promoted`` version whose ``serving_status`` is ``deploy_failed`` for the
+    project, under a per-version ``with_for_update`` row lock.
+
+    Behavior:
+
+    * FIRST refresh the required-artifact registry. A clear is only legal when
+      every REQUIRED non-backend artifact is already ``serving_confirmed``.
+    * If the backend-revision artifact is independently observed serving, clear
+      via the shared ``_recover_serving_confirmed`` helper (flip to
+      serving_confirmed, stamp the observed served_sha/served_at, clear
+      deploy_failure_reason, update the verdict outcome, resolve the alert, arm
+      a strategic refresh).
+    * If the backend serving SHA is unobservable or does not yet match (the
+      pre-Cloud-Run-API interim), require an explicit ``force=true`` plus a
+      recorded operator ``reason``, then clear via the SAME helper using the
+      promoted SHA as the attested served SHA and record the operator
+      attestation in the version audit trail. The force path only attests the
+      backend-serving signal; it does NOT override any still-failed required
+      non-backend artifact.
+    * Without the override and without an independent confirmation, return 409
+      explaining the deploy could not be independently verified live.
+
+    Returns 404 when no promoted deploy_failed version exists for the project.
+    """
+    from app.release_reconciliation import (  # noqa: PLC0415
+        _aggregate_non_backend_required_artifact_status,
+        _recover_serving_confirmed,
+        _refresh_release_artifact_rows,
+    )
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                    ReleaseVersion.serving_status == "deploy_failed",
+                )
+                .order_by(ReleaseVersion.promoted_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No promoted version in deploy_failed state for this project.",
+        )
+
+    now = _utcnow()
+    (
+        provider_rows,
+        _,
+        _,
+        backend_artifact,
+    ) = await _refresh_release_artifact_rows(
+        session,
+        version,
+        now,
+        recheck_failed_required=True,
+    )
+    non_backend_status, non_backend_reason = (
+        _aggregate_non_backend_required_artifact_status(provider_rows)
+    )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+
+    if non_backend_status != "serving_confirmed":
+        detail = (
+            "deploy could not be cleared because a required non-backend artifact "
+            "is not serving_confirmed"
+        )
+        if non_backend_reason:
+            detail = f"{detail}: {non_backend_reason}"
+        raise HTTPException(status_code=409, detail=detail)
+
+    if (
+        backend_artifact is not None
+        and backend_artifact.serving_status == "serving_confirmed"
+        and backend_artifact.served_identifier is not None
+    ):
+        # Independently confirmed serving — clear with the OBSERVED served SHA.
+        await _recover_serving_confirmed(
+            session,
+            version,
+            backend_artifact.served_identifier,
+            backend_artifact.served_at,
+            now,
+        )
+        clear_mode = "verified"
+        attestation_reason = None
+    else:
+        # Live serving SHA is unobservable or does not yet match — refuse unless
+        # the operator explicitly overrides AND records a reason.
+        if not payload.force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "deploy could not be independently verified live — the promoted "
+                    "SHA is not observed serving. Re-submit with force=true and a "
+                    "reason to attest the deploy is live."
+                ),
+            )
+        attestation_reason = (payload.reason or "").strip()
+        if not attestation_reason:
+            raise HTTPException(
+                status_code=400,
+                detail="A force clear requires a non-empty operator reason.",
+            )
+        # Operator attestation: clear using the promoted SHA as the served SHA and
+        # record the provenance in the durable audit trail.
+        await _recover_serving_confirmed(
+            session, version, version.promoted_sha, now, now
+        )
+        _record_deploy_failed_clear_attestation(
+            version, operator_id, attestation_reason, now
+        )
+        clear_mode = "operator_attested"
+
+    await session.commit()
+    await session.refresh(version)
+    return {
+        "version_number": version.version_number,
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "clear_mode": clear_mode,
+        "operator_attested": clear_mode == "operator_attested",
+        "attestation_reason": attestation_reason,
     }

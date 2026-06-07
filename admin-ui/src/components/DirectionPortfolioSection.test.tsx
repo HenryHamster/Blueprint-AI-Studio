@@ -18,6 +18,7 @@ vi.mock('../api', () => ({
 }));
 
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
+import type { DirectionPortfolio } from '../types/digest';
 
 function makeDirection(overrides: Partial<DirectionProgress> = {}): DirectionProgress {
   return {
@@ -28,6 +29,23 @@ function makeDirection(overrides: Partial<DirectionProgress> = {}): DirectionPro
     tasks_created: 3,
     prs_merged: 2,
     possibly_saturated: false,
+    ...overrides,
+  };
+}
+
+function makePortfolio(overrides: Partial<DirectionPortfolio> = {}): DirectionPortfolio {
+  return {
+    active_count: 1,
+    self_sufficient_count: 0,
+    composition: [
+      {
+        direction_id: 'dir-1',
+        direction_text: 'Improve retry handling',
+        status: 'active',
+        priority: 'high',
+        quiet_this_window: false,
+      },
+    ],
     ...overrides,
   };
 }
@@ -70,6 +88,89 @@ describe('DirectionPortfolioSection', () => {
     );
 
     expect(screen.getByText('No active directions')).toBeInTheDocument();
+  });
+
+  it('uses authoritative active-count and renders quiet placeholders when present', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[
+          makeDirection({ direction_id: 'dir-busy', direction_text: 'Busy direction' }),
+        ]}
+        directionPortfolio={makePortfolio({
+          active_count: 2,
+          self_sufficient_count: 2,
+          composition: [
+            {
+              direction_id: 'dir-busy',
+              direction_text: 'Busy direction',
+              status: 'active',
+              priority: 'high',
+              quiet_this_window: false,
+            },
+            {
+              direction_id: 'dir-quiet',
+              direction_text: 'Quiet direction',
+              status: 'held',
+              priority: 'low',
+              quiet_this_window: true,
+            },
+          ],
+        })}
+        loading={false}
+        productPct={null}
+        totalDirPRs={3}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={2}
+      />,
+    );
+
+    expect(screen.getByText('2 directions')).toBeInTheDocument();
+    expect(screen.getByText('Self-sufficient: 2 / 2')).toBeInTheDocument();
+    expect(screen.getByText('1 quiet this window')).toBeInTheDocument();
+    expect(screen.getByText('Quiet direction')).toBeInTheDocument();
+    expect(screen.queryByText('No active directions')).not.toBeInTheDocument();
+  });
+
+  it('does not show an empty state when all active directions are quiet', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[]}
+        directionPortfolio={makePortfolio({
+          active_count: 2,
+          self_sufficient_count: 0,
+          composition: [
+            {
+              direction_id: 'dir-quiet-a',
+              direction_text: 'Quiet direction A',
+              status: 'active',
+              priority: 'medium',
+              quiet_this_window: true,
+            },
+            {
+              direction_id: 'dir-quiet-b',
+              direction_text: 'Quiet direction B',
+              status: 'held',
+              priority: 'low',
+              quiet_this_window: true,
+            },
+          ],
+        })}
+        loading={false}
+        productPct={null}
+        totalDirPRs={0}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={0}
+      />,
+    );
+
+    expect(screen.queryByText('No active directions')).not.toBeInTheDocument();
+    expect(screen.getByText('2 directions')).toBeInTheDocument();
+    expect(screen.getByText('Quiet direction A')).toBeInTheDocument();
+    expect(screen.getByText('Quiet direction B')).toBeInTheDocument();
   });
 
   it('renders direction cards with priority badge and direction text', () => {

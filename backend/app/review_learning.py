@@ -271,17 +271,6 @@ def _categorize_review_issues(
     return _categorize_review_issues_keyword(review_history)
 
 
-def resolve_sr_miss_human_truth(ctx: dict) -> set[str]:
-    """Return the best available set of human-flagged review categories for a task."""
-    stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
-    if stored_all_iter:
-        return set(stored_all_iter.keys())
-    rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
-    if rev_hist:
-        return set(_categorize_review_issues_keyword(rev_hist).keys())
-    return set(ctx.get("_first_attempt_rejection_categories") or {})
-
-
 async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dict]]:
     """LLM-backed categorizer with keyword fallback."""
     if os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1":
@@ -995,7 +984,6 @@ __all__ = [
     "_update_module_feedback_profiles",
     "_accumulate_direction_first_attempt",
     "_maybe_auto_playbook_from_first_attempt",
-    "resolve_sr_miss_human_truth",
     "categorize_review_issues_llm",
     "cache_first_attempt_classification",
     "compute_recurring_first_review_descriptions",

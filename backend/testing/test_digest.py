@@ -55,6 +55,7 @@ async def test_digest_empty_window(client: AsyncClient):
     assert data["needs_attention"] == []
     assert data["recent_failures"] == []
     assert data["recent_completions"] == []
+    assert "parallel_review_effectiveness" not in data
 
 
 @pytest.mark.asyncio
@@ -206,57 +207,227 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_migration_health(client: AsyncClient, db_session):
-    """migration_health surfaces migrate-task counts, MIGRATION_ERROR failures, and auto-generated migrations."""
-    from app.main import EXPECTED_SCHEMA_REVISION
+async def test_digest_merge_gate_fleet_health_verified(client: AsyncClient, db_session):
+    """Fleet with verified merges: verified_count matches, verification_rate is
+    correct, degraded_project_count is 0 (no fall-opens)."""
+    now_iso = _utcnow().isoformat()
+    p1 = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    p2 = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add_all([p1, p2])
+    await db_session.commit()
 
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg["verified_count"] == 3
+    assert mg["fell_open_count"] == 0
+    assert mg["verification_rate"] == 1.0
+    assert mg["most_common_reason"] is None
+    assert mg["degraded_project_count"] == 0
+    assert mg["project_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_fell_open(client: AsyncClient, db_session):
+    """Fleet with fell-open merges: fell_open_count and most_common_reason are
+    correct, degraded_project_count reflects projects with falls."""
+    now_iso = _utcnow().isoformat()
+    # Degraded project: 1 verified + 2 fell-open (probe_passed dominates).
+    degraded = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": False,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+                {"at": now_iso, "verified": False, "reason": "probe_passed"},
+                {"at": now_iso, "verified": False, "reason": "suite_all_skipped"},
+            ],
+            "unverified_reason_counts": {"probe_passed": 2, "suite_all_skipped": 1},
+        }
+    )
+    # Healthy project: all verified, contributes no fall-opens.
+    healthy = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add_all([degraded, healthy])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg["verified_count"] == 2
+    assert mg["fell_open_count"] == 2
+    assert mg["verification_rate"] == 0.5
+    assert mg["most_common_reason"] == "probe_passed"
+    assert mg["degraded_project_count"] == 1
+    assert mg["project_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_empty(client: AsyncClient, db_session):
+    """Empty fleet (no projects with gate data): signal is present with zero
+    counts and does not crash; legacy/malformed records are tolerated."""
+    # A project with no merge_gate_runtime at all, plus one with a legacy
+    # four-key-only record (no recent_outcomes) and one with a malformed value.
+    p_none = make_project()
+    p_legacy = make_project(
+        merge_gate_runtime={
+            "last_run_at": _utcnow().isoformat(),
+            "executed_real_tests": True,
+        }
+    )
+    p_malformed = make_project(merge_gate_runtime={"recent_outcomes": "not-a-list"})
+    db_session.add_all([p_none, p_legacy, p_malformed])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg == {
+        "verified_count": 0,
+        "fell_open_count": 0,
+        "verification_rate": None,
+        "most_common_reason": None,
+        "degraded_project_count": 0,
+        "project_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_digest_dependency_health_surfaces_finding_structural_give_up(
+    client: AsyncClient, db_session
+):
+    """The admin digest wires through the finding-level structural give-up signal."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add_all(
-        [
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "migrate"}],
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                payloads=[{"type": "migrate"}],
-                context={"failure_class": "MIGRATION_ERROR"},
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-                context={
-                    "related_files": [
-                        "backend/alembic/versions/0099_x.py",
-                        "backend/app/models.py",
-                    ]
-                },
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-            ),
-        ]
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="research cycle with give-up",
+        context={
+            "finding_structural_give_up": {
+                "at": "2026-06-04T12:00:00",
+                "total": 1,
+                "by_reason": {"prereq_deferred_same_cycle": 1},
+                "by_direction": {"d-aaa": 1},
+                "sample": [
+                    {
+                        "title": "Use shared helper",
+                        "reason": "prereq_deferred_same_cycle",
+                        "direction_id": "d-aaa",
+                    }
+                ],
+            }
+        },
     )
+    db_session.add(task)
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
-    mh = response.json()["migration_health"]
-    assert mh["current_schema_revision"] == EXPECTED_SCHEMA_REVISION
-    assert mh["migration_tasks_in_window"] == 2
-    assert mh["migration_tasks_succeeded"] == 1
-    assert mh["migration_tasks_failed"] == 1
-    assert mh["migration_errors_in_window"] == 1
-    assert mh["auto_generated_migrations"] == 1
+    give_up = response.json()["dependency_health_signals"]["finding_structural_give_up"]
+    assert give_up["total"] == 1
+    assert give_up["by_reason"] == {"prereq_deferred_same_cycle": 1}
+    assert give_up["by_direction"] == {"d-aaa": 1}
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_window_filters_stale(
+    client: AsyncClient, db_session
+):
+    """recent_outcomes entries older than the digest window are excluded; only
+    in-window entries count toward verified/fell-open totals."""
+    now_iso = _utcnow().isoformat()
+    stale_iso = (_utcnow() - timedelta(days=30)).isoformat()
+    project = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": stale_iso, "verified": False, "reason": "probe_passed"},
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    # The stale fell-open entry is filtered out by the window; only the recent
+    # verified entry remains.
+    assert mg["verified_count"] == 1
+    assert mg["fell_open_count"] == 0
+    assert mg["project_count"] == 1
+    assert mg["degraded_project_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_reason_respects_window(
+    client: AsyncClient, db_session
+):
+    """The most_common_reason reflects only in-window fall-opens, not stale
+    all-time tallies. A project with an old fall-open for reason A and a new
+    fall-open for reason B should report B as most_common when the old one is
+    outside the window."""
+    now_iso = _utcnow().isoformat()
+    stale_iso = (_utcnow() - timedelta(days=30)).isoformat()
+    project = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                # Stale fall-open with reason A (outside window)
+                {"at": stale_iso, "verified": False, "reason": "probe_passed"},
+                # In-window fall-open with reason B (inside window)
+                {"at": now_iso, "verified": False, "reason": "suite_all_skipped"},
+            ],
+            # All-time tally shows probe_passed dominates historically
+            "unverified_reason_counts": {"probe_passed": 5, "suite_all_skipped": 1},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    # The in-window entry shows 1 fall-open with suite_all_skipped reason.
+    assert mg["verified_count"] == 0
+    assert mg["fell_open_count"] == 1
+    # most_common_reason must reflect the in-window reason (suite_all_skipped),
+    # not the all-time dominant (probe_passed). This is the fix: the windowed
+    # reason should not be masked by historical counts.
+    assert mg["most_common_reason"] == "suite_all_skipped"
+    assert mg["project_count"] == 1
+    assert mg["degraded_project_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -773,6 +944,270 @@ async def test_digest_recurring_patterns_remediation_status_investigating(
 
 
 @pytest.mark.asyncio
+async def test_digest_recurring_patterns_remediation_status_fix_verified(
+    client: AsyncClient, db_session
+):
+    """A verified merged completion with no 48h recurrence marks status=fix_verified."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-ver-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-ver-001 pattern",
+        },
+    }
+    try:
+        # Landed AND verified (pr_merged with no unverified_merge_reason), and no
+        # recent failed task with this fingerprint → fix_verified.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Verified fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-ver-001",
+                    "pr_merged": True,
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "fix_verified"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_fix_shipped_when_recurs(
+    client: AsyncClient, db_session
+):
+    """A landed+verified merge still recurring in 48h marks fix_shipped, not fix_verified."""
+    from app import shared_state as _ss
+    from app.anomaly_detection import _error_fingerprint
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    actual_fp = _error_fingerprint("boom: shipped but recurring")
+    _ss.persistent_anomalies[proj_key] = {
+        f"CrossDirectionFingerprint_{actual_fp}": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "recurring pattern",
+        },
+    }
+    try:
+        # Verified merged completion for this fingerprint...
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Shipped fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={"error_fingerprint": actual_fp, "pr_merged": True},
+            )
+        )
+        # ...but the same failure recurred within the last 48h → recurrence gate
+        # downgrades fix_verified to fix_shipped.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Recurred again",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={"direction_id": "dir-recur"},
+                latest_status_message="boom: shipped but recurring",
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        entry = next(p for p in patterns if p["fingerprint"] == actual_fp)
+        assert entry["remediation_status"] == "fix_shipped"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_fix_shipped_not_verified_when_unverified(
+    client: AsyncClient, db_session
+):
+    """A landed merge with a degraded unverified-merge reason is fix_shipped, never fix_verified."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-unv-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-unv-001 pattern",
+        },
+    }
+    try:
+        # Landed (pr_merged) but the no-CI gate fell open in a *degraded* way, so
+        # the verification standard is NOT met even with no recurrence.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Unverified shipped fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-unv-001",
+                    "pr_merged": True,
+                    "review_loop": {
+                        "unverified_merge_reason": "verify_setup_failed"
+                    },
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "fix_shipped"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_completed_pr_url_only_is_unaddressed(
+    client: AsyncClient, db_session
+):
+    """A completed task with only a pr_url (no landed signal) no longer counts as merged."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-url-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-url-001 pattern",
+        },
+    }
+    try:
+        # COMPLETED with a PR URL but NO landed signal — the old loose proxy would
+        # have marked this fix_shipped; the canonical predicates do not.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Completed but never landed",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-url-001",
+                    "pr_url": "https://github.com/example/repo/pull/1",
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "unaddressed"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_early_warnings_affected_direction_count_per_class(
+    client: AsyncClient, db_session
+):
+    """early_warnings affected_direction_count reflects dirs affected by that specific warning, not global total."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    # Two distinct FailureRateMomentum anomalies with different affected_directions.
+    _ss.persistent_anomalies[proj_key] = {
+        "FailureRateMomentum": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 10% → 20% → 30% across last 3x24h windows",
+            "affected_directions": ["dir-a", "dir-b"],
+        },
+        "FailureRateMomentum_db": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 5% → 15% → 25% across last 3x24h windows",
+            "affected_directions": ["dir-c"],
+        },
+    }
+    try:
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+
+        warnings = data["early_warnings"]
+        # Both FailureRateMomentum entries have occurrence_count >= 2, so both should appear.
+        assert len(warnings) == 2
+
+        # Find warnings by failure_class and verify affected_direction_count matches
+        # the actual affected_directions for each warning, not a global total.
+        warning_1 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum")
+        warning_2 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum_db")
+
+        assert warning_1["affected_direction_count"] == 2  # affects dir-a, dir-b
+        assert warning_2["affected_direction_count"] == 1  # affects dir-c only
+
+        # Ensure they have different counts (the bug was that they were the same).
+        assert warning_1["affected_direction_count"] != warning_2["affected_direction_count"]
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
 async def test_digest_approval_task_direction_attribution(
     client: AsyncClient, db_session
 ):
@@ -839,6 +1274,62 @@ async def test_digest_with_pending_approval(client: AsyncClient, db_session):
     assert len(approval_items) == 1
     assert approval_items[0]["task_id"] == str(task.id)
     assert approval_items[0]["title"] == "Approval Task"
+
+
+@pytest.mark.asyncio
+async def test_digest_approval_compute_experiment_enriched(
+    client: AsyncClient, db_session
+):
+    """A held compute_experiment task surfaces its proposed spend cap and
+    deadline plus task_type in its needs_attention entry; a plain approval
+    task omits the compute-specific fields."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    compute_task = make_task(
+        project_id=project.id,
+        title="Held compute launch",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "spend_cap_usd": 42.5,
+                "deadline_seconds": 7200,
+            }
+        ],
+    )
+    plain_task = make_task(
+        project_id=project.id,
+        title="Plain approval",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(compute_task)
+    db_session.add(plain_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {
+        a["task_id"]: a
+        for a in data["needs_attention"]
+        if a["reason"] == "approval_required"
+    }
+    compute_entry = by_id[str(compute_task.id)]
+    assert compute_entry["task_type"] == "compute_experiment"
+    assert compute_entry["spend_cap_usd"] == 42.5
+    assert compute_entry["deadline_seconds"] == 7200
+
+    plain_entry = by_id[str(plain_task.id)]
+    assert plain_entry["task_type"] == "create"
+    assert "spend_cap_usd" not in plain_entry
+    assert "deadline_seconds" not in plain_entry
 
 
 @pytest.mark.asyncio
@@ -910,6 +1401,62 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     titles = [c["title"] for c in data["recent_completions"]]
     assert "Task A" in titles
     assert "Task B" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
+    client: AsyncClient, db_session
+):
+    """Cancelled terminal runs contribute spend to the efficiency rollup but do
+    not count as landed PRs."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "high"}],
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            payloads=[{"type": "create", "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 500,
+                "total_output_tokens": 500,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    efficiency = data["effort_model_efficiency"]
+    assert efficiency["totals"]["run_count"] == 2
+    assert efficiency["totals"]["landed_count"] == 1
+    assert efficiency["totals"]["total_cost_usd"] == pytest.approx(0.135)
+    assert efficiency["totals"]["cost_per_merge"] == pytest.approx(0.135)
+    by_effort = {row["effort"]: row for row in efficiency["by_effort"]}
+    assert by_effort["high"]["run_count"] == 2
+    assert by_effort["high"]["landed_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -3804,6 +4351,8 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
             "diagnosis_task_id": str(inv_done.id),
             "direction_id": "d1",
             "trigger_failure_class": "CODE_ERROR",
+            "pr_merged": True,
+            "landed_on_integration": True,
         },
         status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
     )
@@ -3815,7 +4364,12 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create"}],
         created_at=now - timedelta(hours=2),
-        context={"diagnosis_task_id": str(inv_fallback.id), "direction_id": "d1"},
+        context={
+            "diagnosis_task_id": str(inv_fallback.id),
+            "direction_id": "d1",
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
         status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
     )
     rem_failed = make_task(
@@ -3922,12 +4476,29 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
             "diagnosis_task_id": str(inv_done.id),
             "direction_id": "d1",
             "trigger_failure_class": "CODE_ERROR",
+            "pr_merged": True,
+            "landed_on_integration": True,
         },
         status_log=[
             {"t": (now - timedelta(hours=1)).isoformat(), "status": "completed"}
         ],
     )
-    db_session.add(rem_merged)
+    # COMPLETED remediation whose PR never landed on the integration branch:
+    # spawned, but NOT merged. It must inflate "spawned" without inflating
+    # "merged" (the name-vs-definition mismatch this test guards).
+    rem_completed_not_landed = make_task(
+        project_id=project.id,
+        title="remediation A2 (completed, not landed)",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "diagnosis_task_id": str(inv_done.id),
+            "direction_id": "d1",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+    )
+    db_session.add_all([rem_merged, rem_completed_not_landed])
     await db_session.commit()
 
     sentinel_residual = {"spawned": 7, "marker": "residual-stays-here"}
@@ -3942,7 +4513,9 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
     assert funnel["investigations_completed"] == 1
     assert funnel["investigations_with_diagnosis"] == 1
     assert funnel["active_investigations"] == 1
-    assert funnel["remediations_spawned"] == 1
+    # Both completed remediations are spawned, but only the one that actually
+    # landed on the integration branch counts as merged.
+    assert funnel["remediations_spawned"] == 2
     assert funnel["remediations_merged"] == 1
     assert funnel["remediations_failed"] == 0
     assert funnel["merged_remediations_by_trigger_class"] == {"CODE_ERROR": 1}
@@ -6062,8 +6635,10 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
         "success_rate",
         "trend",
         "narrative_summary",
+        "direction_portfolio",
         "total_estimated_cost_usd",
         "migration_health",
+        "merge_gate_fleet_health",
         "failure_groups",
         "recurring_error_clusters",
         "recurring_patterns",
@@ -6082,6 +6657,52 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
     missing = required - data.keys()
     assert not missing, f"Missing dashboard keys: {missing}"
     assert isinstance(data["tasks_truncated"], bool)
+
+
+@pytest.mark.asyncio
+async def test_digest_migration_health_includes_slot_contention(client: AsyncClient, db_session):
+    """The digest surfaces migration-slot contention with holder and wait-time detail."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    now = _utcnow()
+
+    holder = make_task(
+        project_id=project.id,
+        title="Author migration",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "migrate"}],
+        started_at=now - timedelta(hours=3, minutes=15),
+    )
+    waiter = make_task(
+        project_id=project.id,
+        title="Queued migration waiter",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "create",
+                "related_files": ["backend/app/models.py"],
+            }
+        ],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(hours=1, minutes=45),
+        updated_at=now - timedelta(hours=1, minutes=30),
+    )
+    db_session.add(holder)
+    db_session.add(waiter)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    contention = data["migration_health"]["migration_slot_contention"]
+    assert contention["status"] == "elevated"
+    assert contention["severity"] == "critical"
+    assert contention["deferred_count"] == 1
+    assert contention["holder"]["task_id"] == str(holder.id)
+    assert contention["longest_wait"]["task_id"] == str(waiter.id)
 
 
 @pytest.mark.asyncio
@@ -6119,67 +6740,10 @@ async def test_digest_needs_attention_approval_before_failed(
     assert items[1]["reason"] == "failed"
 
 
-@pytest.mark.asyncio
-async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
-    """pipeline_autonomous_prs_merged, pipeline_assisted_prs_merged, pipeline_operator_action_count
-    are sums across active directions in the window."""
-    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-
-    project = make_project(
-        directions=[
-            {
-                "id": "dir-a",
-                "text": "Direction A",
-                "status": "active",
-                "research_history": [
-                    {
-                        "timestamp": recent_ts,
-                        "prs_merged": 2,
-                        "autonomous_prs_merged": 2,
-                        "assisted_prs_merged": 0,
-                        "operator_action_count": 1,
-                    },
-                ],
-            },
-            {
-                "id": "dir-b",
-                "text": "Direction B",
-                "status": "active",
-                "research_history": [
-                    {
-                        "timestamp": recent_ts,
-                        "prs_merged": 1,
-                        "autonomous_prs_merged": 0,
-                        "assisted_prs_merged": 1,
-                        "operator_action_count": 2,
-                    },
-                ],
-            },
-        ]
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    for did in ["dir-a", "dir-b"]:
-        db_session.add(
-            make_task(
-                project_id=project.id,
-                title=f"Task {did}",
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "research"}],
-                context={"direction_id": did},
-            )
-        )
-    await db_session.commit()
-
-    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["pipeline_autonomous_prs_merged"] == 2
-    assert data["pipeline_assisted_prs_merged"] == 1
-    assert data["pipeline_operator_action_count"] == 3
+# Retired: test_digest_pipeline_autonomy_totals — it asserted the window-level
+# pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+# pipeline_operator_action_count digest keys, which were consumer-less duplicates
+# of the per-direction outcome fields and have been removed from the payload.
 
 
 @pytest.mark.asyncio
@@ -6222,13 +6786,15 @@ async def test_digest_pipeline_autonomy_legacy_fallback(
     data = response.json()
 
     dp = data["direction_progress"][0]
-    # Legacy fallback: autonomous = prs_merged, assisted = 0
+    # Legacy fallback: autonomous = prs_merged, assisted = 0. The per-direction
+    # fields remain consumed (DirectionCard); the window-level pipeline_* rollups
+    # that summed them were retired as consumer-less.
     assert dp["autonomous_prs_merged"] == 4
     assert dp["assisted_prs_merged"] == 0
     assert dp["operator_action_count"] == 0
-    assert data["pipeline_autonomous_prs_merged"] == 4
-    assert data["pipeline_assisted_prs_merged"] == 0
-    assert data["pipeline_operator_action_count"] == 0
+    assert "pipeline_autonomous_prs_merged" not in data
+    assert "pipeline_assisted_prs_merged" not in data
+    assert "pipeline_operator_action_count" not in data
 
 
 @pytest.mark.asyncio
@@ -7895,3 +8461,52 @@ async def test_narrative_suppresses_convergence_verdict_on_thin_window(
 
     assert "Review/fix churn" not in narrative
     assert "non-converged PR chains" not in narrative
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
+    client: AsyncClient, db_session
+):
+    """When sr_false_attestation_trends is in project.design_doc, it appears in digest."""
+    project = make_project()
+    project.design_doc = {
+        "sr_false_attestation_trends": {
+            "computed_at": "2026-06-05T10:00:00",
+            "bucket_mode": "by_cycle",
+            "per_category": {
+                "tests_executed_cleanly": {
+                    "false_attestation_rate": 0.05,
+                    "previous_false_attestation_rate": 0.08,
+                    "delta": -0.03,
+                    "trend": "improving",
+                    "ci_confirmed": 10,
+                    "false_attested": 1,
+                    "ci_data_missing": 0,
+                }
+            },
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "sr_false_attestation_trends" in data
+    assert data["sr_false_attestation_trends"] is not None
+    assert (
+        data["sr_false_attestation_trends"]["computed_at"]
+        == "2026-06-05T10:00:00"
+    )
+    assert (
+        "tests_executed_cleanly"
+        in data["sr_false_attestation_trends"]["per_category"]
+    )
+    assert (
+        data["sr_false_attestation_trends"]["per_category"][
+            "tests_executed_cleanly"
+        ]["false_attestation_rate"]
+        == 0.05
+    )

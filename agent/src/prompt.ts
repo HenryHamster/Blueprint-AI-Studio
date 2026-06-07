@@ -155,11 +155,11 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'release_audit': 'You are running on the LTS / promotion branch and reviewing the incoming diff against that branch\'s standards. Run `git diff <diff_range>` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
   'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, `./check` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.',
-  'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done`. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
+  'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. REPRODUCE FIRST: if this task asks you to fix a reported defect/bug from a finding, your FIRST step is to confirm the defect still reproduces on current HEAD — a failing test, an observable symptom, or the cited buggy pattern still present at the cited code/symbol. If it does NOT reproduce (the cited code/symbol is absent, or a reproduction attempt you wrote down demonstrably no longer fails), do NOT fabricate a speculative change: terminate via `./done --already-done "<reason naming the cited location and what you checked>"` — that path now reports the structured `already_resolved` reproduce-on-HEAD verdict so the outcome is scored as a verified no-op rather than a false fix. Distinguish the three canonical outcomes: reproduced → normal fix path and finish with `./done --reproduced "<what reproduced on HEAD and what you fixed>"`; non-reproducing/already-resolved → the `--already-done` off-ramp; indeterminate → keep the bar high and fall through to the normal fix, then if you still cannot prove repro at ship time finish with `./done --indeterminate "<why reproduce-on-HEAD remained ambiguous>"`. Keep the not-reproducible bar high — ambiguity or a still-present cited pattern means proceed with the normal fix. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done` with the appropriate reproduce verdict flag when this is a finding-derived fix. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
   'docs': 'Read the existing README and documentation files first. Understand the current documentation structure before making changes.',
   'deps': 'Check for breaking changes in major version bumps. Run the full test suite after updating to verify compatibility.',
   'refactor': 'Run the full test suite BEFORE and AFTER changes via `./check test`. Zero test regressions allowed. Do not change external behavior. After refactoring + verifying via `./check`, run `./pr open --title "refactor: ..." --body "..."` and `./done`. Use `./fail` if the refactor proves not feasible.',
-  'investigate': 'This is a read-only investigation. Do NOT modify any files. Search for known issues related to error patterns you discover. Write your findings to the output JSON only.',
+  'investigate': 'This is a read-only investigation. Do NOT modify any files. Search for known issues related to error patterns you discover. Write your findings to the output JSON only. If you are investigating a reported defect from a finding, classify it against the canonical reproduce-on-HEAD verdict — reproduced, non-reproducing/already-resolved, or indeterminate — and state which outcome holds (and the evidence) in your findings, rather than reporting free-text rationale alone.',
   'debug': 'Search for known issues related to error patterns you discover. Use WebSearch to look up specific error messages or stack traces when local context is insufficient.',
 };
 
@@ -1587,4 +1587,227 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   }
   lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * Render a "## Stale-premise notice" provenance block from a finding-derived
+ * task's `_provenance_warnings`. Research findings spawn implementing tasks
+ * (create/fix/refactor/docs/qa/deps and review→fix) that often run long after
+ * the finding was generated — by which time the cited code may have moved, the
+ * citations may have been broken/ungrounded at ingestion, or the integration
+ * branch may have advanced. This block names which signals fired and instructs
+ * the agent to REPRODUCE-FIRST against the current checkout before implementing.
+ *
+ * Returns '' when `_provenance_warnings` is absent or empty, so the prompt (and
+ * its fingerprint) is byte-unchanged for tasks that carry no warnings. Reads
+ * every field defensively — the dict is optional and duck-typed, and every key
+ * inside it is optional.
+ */
+export function formatProvenanceWarnings(
+  context: Record<string, unknown> | undefined,
+): string {
+  const warnings = context?._provenance_warnings;
+  if (!warnings || typeof warnings !== 'object' || Array.isArray(warnings)) return '';
+  const w = warnings as Record<string, unknown>;
+
+  const signals: string[] = [];
+
+  if (w.cited_files_changed_since_generation === true) {
+    signals.push(
+      '- **Cited files changed since the finding was generated.** The integration branch ' +
+      'has advanced — the code this finding points at may have moved, been refactored, or ' +
+      'already been fixed.',
+    );
+  }
+
+  const brokenCount = typeof w.broken_source_ref_count === 'number' ? w.broken_source_ref_count : 0;
+  const brokenRefs = Array.isArray(w.broken_refs)
+    ? (w.broken_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  if (brokenCount > 0 || brokenRefs.length > 0) {
+    const n = brokenCount || brokenRefs.length;
+    const refList = brokenRefs.length > 0 ? `: ${brokenRefs.slice(0, 20).join(', ')}` : '';
+    signals.push(
+      `- **${n} broken/missing citation(s)${refList}.** ` +
+      'These references did not resolve to real code when the research was ingested.',
+    );
+  }
+
+  const ungroundedCount = typeof w.ungrounded_claim_count === 'number' ? w.ungrounded_claim_count : 0;
+  const ungroundedRefs = Array.isArray(w.ungrounded_refs)
+    ? (w.ungrounded_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  if (ungroundedCount > 0 || ungroundedRefs.length > 0) {
+    const n = ungroundedCount || ungroundedRefs.length;
+    const refList = ungroundedRefs.length > 0 ? `: ${ungroundedRefs.slice(0, 20).join(', ')}` : '';
+    signals.push(
+      `- **${n} ungrounded claim(s)${refList}.** ` +
+      'These assertions were not tied to verifiable source when the research was ingested.',
+    );
+  }
+
+  if (signals.length === 0) return '';
+
+  return (
+    `## Stale-premise notice\n` +
+    `This task was derived from a research finding whose provenance was flagged. ` +
+    `The finding's premise may no longer hold against the current checkout:\n\n` +
+    `${signals.join('\n')}\n\n` +
+    `**REPRODUCE-FIRST against the current HEAD before implementing.** Verify the cited code ` +
+    `still exists and that the finding's problem actually reproduces now. If it does, implement ` +
+    `the fix as described. If the premise no longer holds — the cited code is gone, already ` +
+    `fixed, or the problem cannot be reproduced — do NOT fabricate a change to match the finding: ` +
+    `cleanly no-op with \`./done --already-done "<what you verified>"\`, or pivot to the real ` +
+    `current issue if one is evident. A stale finding is a signal to investigate, not a mandate ` +
+    `to invent a diff.\n\n`
+  );
+}
+
+/**
+ * Render a citation-provenance note for an INVESTIGATE task spawned from a
+ * bug-report message. The originating message's reproduce-on-HEAD grounding
+ * signal is carried onto the task's `context._provenance_warnings` as
+ * `{citation_state, broken_refs, ungrounded_refs}`. The strategist inbox, the
+ * strategist prompt, and the admin message UI already surface this signal; this
+ * brings the investigating agent to the same standard so it can see exactly
+ * which cited refs did not resolve on HEAD at the decision-critical moment.
+ *
+ * Two framings, by `citation_state`:
+ *  - `absent` (every cited ref gone): a STRONGER discount note — the defect may
+ *    already be fixed/refactored away; verify it still reproduces before
+ *    investing and discount actionability.
+ *  - non-absent with broken/ungrounded refs (partially grounded): a SOFTER note
+ *    — the defect is NOT presumed resolved and remains actionable; verify these
+ *    specific refs during reproduce-first and treat them as stale.
+ *
+ * Returns '' when no signal is present (no `_provenance_warnings`, or a clean
+ * verdict with no stale refs), so the static investigate prompt fingerprint is
+ * unaffected. Reads every field defensively — the dict and its keys are
+ * optional and duck-typed. This is a read-only task (the agent writes a JSON
+ * report, not a diff), so there is no `./done --already-done` off-ramp.
+ */
+export function formatInvestigateCitationProvenance(
+  context: Record<string, unknown> | undefined,
+): string {
+  const warnings = context?._provenance_warnings;
+  if (!warnings || typeof warnings !== 'object' || Array.isArray(warnings)) return '';
+  const w = warnings as Record<string, unknown>;
+
+  const brokenRefs = Array.isArray(w.broken_refs)
+    ? (w.broken_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  const ungroundedRefs = Array.isArray(w.ungrounded_refs)
+    ? (w.ungrounded_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  const staleRefs = [...brokenRefs, ...ungroundedRefs];
+
+  if (w.citation_state === 'absent') {
+    const refList = staleRefs.length > 0 ? ` (${staleRefs.slice(0, 20).join(', ')})` : '';
+    return (
+      `\n\n## Citation-provenance notice\n` +
+      `The originating bug report cites code that is ABSENT on the current ` +
+      `integration branch${refList}. The defect may already be fixed or ` +
+      `refactored away — verify it still reproduces on HEAD before investing, ` +
+      `and discount its actionability accordingly.\n`
+    );
+  }
+
+  if (staleRefs.length > 0) {
+    const refList = staleRefs.slice(0, 20).join(', ');
+    return (
+      `\n\n## Citation-provenance notice\n` +
+      `The originating bug report is only PARTIALLY grounded on the current ` +
+      `integration branch: some cited references are stale (${refList}). The ` +
+      `defect itself is NOT presumed resolved — it remains actionable. Verify ` +
+      `these specific references during reproduce-first and treat them as ` +
+      `outdated, but do not discount the defect on their account.\n`
+    );
+  }
+
+  return '';
+}
+
+const ACCEPTANCE_TEST_DIR_SEGMENTS = new Set([
+  'tests',
+  'testing',
+  'test',
+  '__tests__',
+  '__test__',
+  'spec',
+]);
+
+const ACCEPTANCE_TEST_FILE_BASENAME_RE = /^(?:test_.*\.py|.*_test\.py|.*\.test\.[cm]?[jt]sx?|.*\.spec\.[cm]?[jt]sx?|.*_test\.go|.*_test\.exs?|.*_spec\.rb|test_.*\.rb)$/i;
+
+function looksLikeAcceptanceTestFile(path: string): boolean {
+  const candidate = path.trim();
+  if (!candidate) return false;
+  const segments = candidate.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  const basename = segments[segments.length - 1];
+  if (!basename.includes('.')) return false;
+  const inTestDir = segments.slice(0, -1).some(seg => ACCEPTANCE_TEST_DIR_SEGMENTS.has(seg.toLowerCase()));
+  return inTestDir || ACCEPTANCE_TEST_FILE_BASENAME_RE.test(basename.toLowerCase());
+}
+
+function formatAcceptanceNamedTest(evidence: Record<string, unknown>): string {
+  const rawTestPath = typeof evidence.test_path === 'string' ? evidence.test_path.trim() : '';
+  if (!rawTestPath) return '';
+  const [declaredPath, inlineTestId = ''] = rawTestPath.split('::', 2);
+  if (!looksLikeAcceptanceTestFile(declaredPath)) return '';
+
+  const explicitTestId = typeof evidence.test_id === 'string' ? evidence.test_id.trim() : '';
+  const testId = explicitTestId || inlineTestId.trim();
+  const target = testId ? ` and target \`${testId}\`` : '';
+
+  return (
+    `- named_test: add or modify \`${declaredPath}\`${target}. ` +
+    `The test must run green under a real merge-test verdict, and the PR must also ` +
+    `change non-test production code that the test exercises. A test-only diff fails ` +
+    `the gate; an always-true assertion in isolation fails.`
+  );
+}
+
+/**
+ * Render a concrete acceptance-evidence obligation block from the first payload.
+ *
+ * Returns '' when the field is absent or malformed so the prompt stays byte-for-
+ * byte identical for tasks that do not declare acceptance evidence.
+ */
+export function formatAcceptanceEvidence(
+  firstPayload: Record<string, unknown> | undefined,
+): string {
+  if (!firstPayload || typeof firstPayload !== 'object' || Array.isArray(firstPayload)) return '';
+  const rawEvidence = firstPayload.acceptance_evidence;
+  if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) return '';
+
+  const evidence = rawEvidence as Record<string, unknown>;
+  const kind = typeof evidence.kind === 'string' ? evidence.kind.trim() : '';
+  if (!kind) return '';
+
+  if (kind === 'named_test') {
+    const namedTest = formatAcceptanceNamedTest(evidence);
+    if (!namedTest) return '';
+    return `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n${namedTest}\n\n`;
+  }
+
+  if (kind === 'observable_behavior') {
+    const description = typeof evidence.description === 'string' ? evidence.description.trim() : '';
+    if (description.length < 10) return '';
+    return (
+      `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n` +
+      `- observable_behavior: deliver the described behavior: \`${description}\`. The PR must ` +
+      `ship a real, non-empty diff.\n\n`
+    );
+  }
+
+  if (kind === 'downstream_artifact') {
+    const artifactId = typeof evidence.artifact_id === 'string' ? evidence.artifact_id.trim() : '';
+    if (!artifactId) return '';
+    return (
+      `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n` +
+      `- downstream_artifact: produce or deliver \`${artifactId}\`. The PR must ship a real, non-empty diff.\n\n`
+    );
+  }
+
+  return '';
 }

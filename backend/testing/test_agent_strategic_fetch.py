@@ -9,6 +9,7 @@ into its own router seam; behavior and contracts are unchanged.
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.auth import create_agent_token
@@ -949,3 +950,183 @@ async def test_strategic_resolve_message_by_short_ref_links_bug(
     assert body["linked_to"] == {"kind": "direction", "id": "dir-99"}
     await db_session.refresh(msg)
     assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_absent_citation_is_flagged(
+    client: AsyncClient, db_session, mocker
+):
+    """A strategist-authored BUG_REPORT citing absent code stores an absent signal.
+
+    The agent ``strategic`` create_message op now runs the SAME conservative
+    reproduce-on-HEAD grounding the user/annotation paths use, so a
+    strategist-emitted bug report that points at code already refactored away
+    re-enters the inbox discounted rather than fully trusted.
+    """
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    # The shared reproduce-on-HEAD contract (classify_reproduction) only reports
+    # ``absent`` when a validation backend could actually run; with the branch
+    # context mocked empty, assert the backend is available so a genuinely-broken
+    # citation reaches ``absent`` rather than degrading to ``indeterminate``.
+    mocker.patch(
+        "app.source_ref_validation._has_validation_backend",
+        return_value=True,
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "BUG_REPORT",
+                "content": "The guard regressed in backend/app/gone.py during init.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "absent"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_present_citation_not_flagged(
+    client: AsyncClient, db_session, mocker
+):
+    """A strategist BUG_REPORT whose cited file still exists is NOT flagged."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=True),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "BUG_REPORT",
+                "content": "Still reproduces in backend/app/real.py on load.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert "_provenance_warnings" not in (msg.context or {})
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_mixed_present_citation_is_flagged(
+    client: AsyncClient, db_session, mocker
+):
+    """A partially grounded strategist BUG_REPORT keeps its mixed ref detail."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "BUG_REPORT",
+                "content": (
+                    "The crash spans backend/app/gone.py and "
+                    "backend/app/alive.py during init."
+                ),
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "present"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_note_type_not_grounded(
+    client: AsyncClient, db_session, mocker
+):
+    """A NOTE-type strategist message is never grounded, even if it cites code."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    spy = mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Consider refactoring backend/app/gone.py soon.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert "_provenance_warnings" not in (msg.context or {})
+    spy.assert_not_called()

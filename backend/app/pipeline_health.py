@@ -21,7 +21,9 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.landed_signal import is_merged_completion
+from app.direction_outcomes import verified_merged_count
+from app.digest_direction_progress import pr_ineligible_created_in_entry
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
     Task,
     TaskStatus,
@@ -32,6 +34,7 @@ from app.models import (
 )
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
+from app.sr_blind_spots import has_reviewer_confirmed_categories
 from app.sr_review_quality_metrics import (
     _compute_edges_considered_metrics,
     _serialize_sr_catch_rate_trends,
@@ -398,8 +401,10 @@ async def compute_pipeline_health_summary(
                 continue
 
             prs_merged = 0
+            verified_merged = 0
             prs_rejected = 0
             tasks_created_total = 0
+            pr_ineligible_total = 0
             sd_totals: Dict[str, int] = {}
             for entry in d.get("research_history") or []:
                 try:
@@ -408,16 +413,21 @@ async def compute_pipeline_health_summary(
                     )
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        verified_merged += verified_merged_count(entry)
                         prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
+                        pr_ineligible_total += pr_ineligible_created_in_entry(entry)
                         for k, v in (entry.get("stage_dropout") or {}).items():
                             sd_totals[k] = sd_totals.get(k, 0) + (v or 0)
                 except (ValueError, TypeError):
                     pass
 
+            # Conversion is verification-aware (verified_merged) and uses PR-eligible
+            # denominator (excludes non-PR task types) to agree with pipeline-level rate.
+            pr_eligible_total = tasks_created_total - pr_ineligible_total
             dir_conversion_rate = (
-                round(prs_merged / tasks_created_total, 3)
-                if tasks_created_total > 0
+                round(verified_merged / pr_eligible_total, 3)
+                if pr_eligible_total > 0
                 else None
             )
             acceptance_denom = prs_merged + prs_rejected
@@ -447,22 +457,31 @@ async def compute_pipeline_health_summary(
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
 
-    # Pipeline-level conversion rate: total prs_merged / total tasks_created across all directions
+    # Pipeline-level conversion rate: total prs_merged / total PR-eligible tasks
+    # created across all directions. The denominator excludes PR-ineligible task
+    # types (research/audit/memo/investigate) so it is not diluted by non-PR work.
     _pipeline_total_created = sum(
         entry.get("tasks_created") or 0
         for d in (project.directions or [] if project else [])
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
-    _pipeline_total_merged = sum(
-        entry.get("prs_merged") or 0
+    _pipeline_total_ineligible = sum(
+        pr_ineligible_created_in_entry(entry)
         for d in (project.directions or [] if project else [])
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
+    _pipeline_total_merged = sum(
+        verified_merged_count(entry)
+        for d in (project.directions or [] if project else [])
+        for entry in (d.get("research_history") or [])
+        if _safe_ts_in_window(entry.get("timestamp"), window_start)
+    )
+    _pipeline_eligible_created = _pipeline_total_created - _pipeline_total_ineligible
     pipeline_conversion_rate = (
-        round(_pipeline_total_merged / _pipeline_total_created, 3)
-        if _pipeline_total_created > 0
+        round(_pipeline_total_merged / _pipeline_eligible_created, 3)
+        if _pipeline_eligible_created > 0
         else None
     )
 
@@ -476,17 +495,31 @@ async def compute_pipeline_health_summary(
     def _first_attempt_rate(tasks):
         if not tasks:
             return None
-        first_success = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("_first_attempt_succeeded") is True
-        )
         # Only count tasks that have the metric recorded
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
             return None
         first_success = sum(
             1 for t in measured if t.context["_first_attempt_succeeded"]
+        )
+        return round(first_success / len(measured), 2)
+
+    def _verified_first_attempt_rate(tasks):
+        """Like _first_attempt_rate but excludes degraded-unverified merges.
+
+        A task with _first_attempt_succeeded=True whose PR fell open for a
+        degraded reason (environment/setup failure blocked verification) is NOT
+        a proven fix — exclude it from the verified count.  Benign fall-opens
+        (no suite, kill-switch off) still count as successes.
+        """
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        first_success = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
         )
         return round(first_success / len(measured), 2)
 
@@ -753,6 +786,11 @@ async def compute_pipeline_health_summary(
         "without_measurements": _first_attempt_rate(tasks_without_measurements)
         if tasks_without_measurements
         else None,
+        # verified_overall: excludes degraded-unverified merges (environment/setup
+        # failures that blocked real test verification). Aligned with the
+        # merge-gate-health verified-vs-fell-open split so strategic scoring is
+        # not misled by unproven fixes. Additive — does not replace "overall".
+        "verified_overall": _verified_first_attempt_rate(terminal_tasks_24h),
     }
 
     # First-review approval rate: of create/refactor tasks that merged, what fraction
@@ -1009,12 +1047,15 @@ async def compute_pipeline_health_summary(
             project.design_doc, hours=24
         )
 
-    # Self-review prediction accuracy: compare self-review check_results against human rejection categories
+    # Self-review prediction accuracy: compare self-review check_results
+    # against reviewer-confirmed rejection categories on ANY iteration (shared
+    # has_reviewer_confirmed_categories predicate — matches the scorer's ground
+    # truth so later-iteration-only confirmations are sampled, not dropped).
     tasks_with_both_24h = [
         t
         for t in terminal_tasks_24h
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-        and "_first_attempt_rejection_categories" in (t.context or {})
+        and has_reviewer_confirmed_categories(t.context or {})
     ]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(
         tasks_with_both_24h

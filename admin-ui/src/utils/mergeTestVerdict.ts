@@ -13,7 +13,9 @@
 // fields and changes no backend/agent behavior.
 
 // The cheap goal-level acceptance probe ("does the changed code still
-// compile/build?"), attached only on a detected=false fall-open.
+// compile/build?"). Attached on the detected=false fall-open paths (declared OR
+// generic) and, for the operator's DECLARED build_cmd only, on the detected=true
+// + passed path so a green suite cannot mask a broken declared build.
 export interface ProbeBlock {
   ran?: boolean;
   ecosystem?: string;
@@ -297,9 +299,12 @@ export function documentedCommandIsClearFailure(
  *   1. A CLEAR documented-command failure BLOCKS — higher precedence than the
  *      unit suite, even when detected && passed.
  *   2. `partialSetupFailed` BLOCKS.
- *   3. When detected===false, a CLEAR probe failure BLOCKS (declared build vs
- *      generic probe framing); otherwise this is the undetected fall-open.
- *   4. Otherwise passed => Passed; else => detected-suite Failed.
+ *   3. PR self-suppression (newly disabled tests + non-verifying suite) BLOCKS.
+ *   4. A CLEAR DECLARED-build failure BLOCKS regardless of detected/passed — a
+ *      green suite must not mask a broken declared build.
+ *   5. When detected===false, a CLEAR generic probe failure BLOCKS; otherwise
+ *      this is the undetected fall-open.
+ *   6. Otherwise passed => Passed; else => detected-suite Failed.
  */
 export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResult {
   // 1. HIGH precedence: a documented / PR-introduced command that CLEARLY failed.
@@ -347,22 +352,30 @@ export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResu
         `skipped), so the suite was made green by skipping rather than by passing${suffix}.`,
     };
   }
-  // 4. No unit suite detected.
+  // 4. HIGH precedence: the operator's OWN declared build command CLEARLY failed.
+  // A green unit suite must NOT mask a broken declared build, so this BLOCKS
+  // regardless of detected/passed — mirroring classify_merge_test_verdict. Generic
+  // (non-declared) probe failures keep the detected===false-only handling below.
+  if (verdict.probe?.declared === true && probeIsClearFailure(verdict.probe)) {
+    const probe = verdict.probe as ProbeBlock;
+    const output = asString(probe.output).trim();
+    const label = asString(probe.label).trim();
+    const prefix = label
+      ? `Declared build command \`${label}\` failed: `
+      : 'Declared build command failed: ';
+    return {
+      outcome: 'blocked',
+      reason: 'declared_build_failed',
+      detail: output ? prefix + output : prefix + 'the declared build did not succeed.',
+    };
+  }
+  // 5. No unit suite detected.
   if (verdict.detected === false) {
     if (probeIsClearFailure(verdict.probe)) {
+      // A declared-build clear failure was handled at HIGH precedence above;
+      // only a GENERIC compile/build probe failure reaches here.
       const probe = verdict.probe as ProbeBlock;
       const output = asString(probe.output).trim();
-      if (probe.declared) {
-        const label = asString(probe.label).trim();
-        const prefix = label
-          ? `Declared build command \`${label}\` failed: `
-          : 'Declared build command failed: ';
-        return {
-          outcome: 'blocked',
-          reason: 'declared_build_failed',
-          detail: output ? prefix + output : prefix + 'the declared build did not succeed.',
-        };
-      }
       return {
         outcome: 'blocked',
         reason: 'probe_failed',
@@ -371,7 +384,7 @@ export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResu
     }
     return { outcome: 'undetected', reason: 'undetected', detail: '' };
   }
-  // 5. A suite was detected.
+  // 6. A suite was detected.
   if (verdict.passed) {
     // Visibility only: a passing suite whose tests were mostly skipped stays a
     // PASS, but the reason distinguishes it so the panel can flag it.

@@ -168,6 +168,96 @@ async def test_digest_direction_progress_excludes_no_activity(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_authoritative_portfolio_includes_quiet(
+    client: AsyncClient, db_session
+):
+    """Quiet active directions stay in direction_portfolio even when dropped from direction_progress."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-busy",
+                "text": "Busy direction",
+                "status": "active",
+                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 11}],
+                "history_aggregate": {"total_operator_actions": 0},
+            },
+            {
+                "id": "dir-quiet",
+                "text": "Quiet direction",
+                "status": "held",
+                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 12}],
+                "history_aggregate": {"total_operator_actions": 0},
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Task for busy",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-busy"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert [dp["direction_id"] for dp in data["direction_progress"]] == ["dir-busy"]
+    portfolio = data["direction_portfolio"]
+    assert portfolio["active_count"] == 2
+    assert portfolio["self_sufficient_count"] == 2
+    assert portfolio["composition"] == [
+        {
+            "direction_id": "dir-busy",
+            "direction_text": "Busy direction",
+            "status": "active",
+            "priority": "medium",
+            "quiet_this_window": False,
+        },
+        {
+            "direction_id": "dir-quiet",
+            "direction_text": "Quiet direction",
+            "status": "held",
+            "priority": "medium",
+            "quiet_this_window": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_authoritative_portfolio_all_quiet(
+    client: AsyncClient, db_session
+):
+    """When every active direction is quiet, direction_progress can be empty while direction_portfolio stays truthful."""
+    project = make_project(
+        directions=[
+            {"id": "dir-a", "text": "Quiet A", "status": "active"},
+            {"id": "dir-b", "text": "Quiet B", "status": "auto_paused"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["direction_progress"] == []
+    portfolio = data["direction_portfolio"]
+    assert portfolio["active_count"] == 2
+    assert portfolio["self_sufficient_count"] == 0
+    assert [entry["quiet_this_window"] for entry in portfolio["composition"]] == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_session):
     """prs_merged is summed from research_history entries within the time window."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
@@ -207,6 +297,57 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
     assert len(data["direction_progress"]) == 1
     assert data["direction_progress"][0]["prs_merged"] == 3  # only the recent entry
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_verified_prs_merged(
+    client: AsyncClient, db_session
+):
+    """The per-direction output dict exposes verified_prs_merged (summed via
+    verified_merged_count), which excludes unverified-degraded merges while the
+    raw prs_merged key still counts them."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction with degraded merge",
+                "status": "active",
+                "research_history": [
+                    # 3 merged this window, but only 2 verified (1 degraded).
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    assert dp["prs_merged"] == 3  # raw count still includes the degraded merge
+    assert dp["verified_prs_merged"] == 2  # verified count excludes it
 
 
 @pytest.mark.asyncio
@@ -1961,6 +2102,121 @@ async def test_digest_direction_progress_tz_aware_timestamp_counted(
     # prs_merged/tasks_created should be counted from the tz-aware entry
     assert dp["prs_merged"] == 3
     assert dp["conversion_rate"] == 0.5  # 3 merged / 6 created
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_excludes_non_pr_task_types(
+    client: AsyncClient, db_session
+):
+    """Conversion rate denominator excludes research/investigate/audit/memo tasks that never open PRs."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-mixed-types",
+                "text": "Direction with mixed task types",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "tasks_created": 8,
+                        # 8 total tasks: 3 create (PR-eligible), 2 research + 2 audit + 1 memo (non-PR)
+                        "type_breakdown": {
+                            "create": {"created": 3, "merged": 3, "failed": 0},
+                            "research": {"created": 2, "merged": 0, "failed": 0},
+                            "audit": {"created": 2, "merged": 0, "failed": 0},
+                            "memo": {"created": 1, "merged": 0, "failed": 0},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-mixed-types"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # conversion_rate should be 3 merged / 3 PR-eligible (create tasks only)
+    # Not 3 / 8 (which would be the old incorrect behavior)
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 1.0  # 3 merged / 3 PR-eligible
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merges(
+    client: AsyncClient, db_session
+):
+    """Conversion (window + lifetime) excludes degraded-unverified merges.
+
+    3 PRs merged from 4 created, but only 2 verified (1 degraded-unverified).
+    conversion_rate must be 2/4=0.5, not 3/4=0.75 — matching the per-task layer.
+    The raw prs_merged count stays 3 (back-compat).
+    """
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-degraded",
+                "text": "Direction with a degraded-unverified merge",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                        "tasks_created": 4,
+                    }
+                ],
+                "history_aggregate": {
+                    "total_cycles": 1,
+                    "total_prs_merged": 3,
+                    "total_verified_prs_merged": 2,
+                    "total_tasks_created": 4,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-degraded"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 0.5  # 2 verified / 4 created
+    assert dp["lifetime_conversion_rate"] == 0.5  # window + aggregate verified
 
 
 @pytest.mark.asyncio

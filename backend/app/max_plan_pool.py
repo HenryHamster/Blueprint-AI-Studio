@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Mapping
 
 from app.database import AsyncSessionLocal
 from app.models import LLMAuthMode, LLMProviderName
-from app.providers.base import merge_settings
+from app.providers.base import UsageSnapshot, merge_settings
 from app.providers.registry import get_provider
 from app.time_utils import _utcnow
 
@@ -297,10 +297,22 @@ def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
     return _migrate_legacy_provider_config(dict(runtime_config))
 
 
-def resolve_task_routing(
-    task: Any, runtime_config: Mapping[str, Any]
+def _resolve_routing_core(
+    payload: Any,
+    context: Any,
+    task_type: str,
+    runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve ``{providers, effort}`` for a task, most-specific first.
+    """Core layered routing resolution over already-extracted projected fields.
+
+    Operates purely on ``(payload, context, task_type)`` so callers can drive
+    it from SQL-projected fields (the first payload dict, the context dict, and
+    the task type) without touching ``task.payloads`` — which would trigger a
+    deferred JSONB load under the digest's ``load_only`` projection.
+
+    :func:`resolve_task_routing` (the task-driven entry point) and
+    :func:`resolve_effective_effort` (the projection-safe effort-only entry
+    point) both delegate here, so the two can never drift.
 
     Order:
       1. payload.provider_preference / payload.effort — per-task explicit
@@ -317,12 +329,8 @@ def resolve_task_routing(
     providers: list[str] | None = None
     effort: str | None = None
 
-    ctx = _task_context(task)
-    payloads = getattr(task, "payloads", None) or []
-    payload = payloads[0] if payloads else {}
-
     # Layer 1+2: per-task payload/context — payload wins.
-    for source in (payload if isinstance(payload, Mapping) else None, ctx):
+    for source in (payload if isinstance(payload, Mapping) else None, context):
         if not isinstance(source, Mapping):
             continue
         if providers is None:
@@ -333,8 +341,6 @@ def resolve_task_routing(
             raw = source.get("effort")
             if isinstance(raw, str) and raw.strip():
                 effort = raw.strip()
-
-    task_type = _task_type(task)
 
     # Layer 3: task_type_routing[task_type]
     task_routing_all = runtime_config.get("task_type_routing", {}) or {}
@@ -364,6 +370,49 @@ def resolve_task_routing(
         "providers": providers if providers is not None else list(ALL_PROVIDERS),
         "effort": effort if effort is not None else DEFAULT_EFFORT_LEVEL,
     }
+
+
+def resolve_task_routing(
+    task: Any, runtime_config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve ``{providers, effort}`` for a task, most-specific first.
+
+    Thin wrapper: extracts ``(payload, context, task_type)`` from the task and
+    delegates to :func:`_resolve_routing_core`. Reads ``task.payloads`` — use
+    :func:`resolve_effective_effort` instead on the digest projection path,
+    where ``task.payloads`` is deferred.
+    """
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    task_type = _task_type(task)
+    return _resolve_routing_core(payload, ctx, task_type, runtime_config)
+
+
+def resolve_effective_effort(
+    payload: Any,
+    context: Any,
+    task_type: Any,
+    runtime_config: Mapping[str, Any],
+) -> str:
+    """Resolve the EFFECTIVE routing effort from already-projected fields.
+
+    This is the projection-safe counterpart to :func:`resolve_task_routing`:
+    it takes the first payload dict, the context dict, and the task type
+    directly (callers read them from SQL-projected fields) and reuses the same
+    :func:`_resolve_routing_core` layered fall-through, so the resolved effort
+    is identical to what the dispatcher would compute — without ever touching
+    ``task.payloads``.
+
+    ``task_type`` falls back to ``"create"`` (the dispatcher's default) when
+    absent, matching :func:`_task_type`.
+    """
+    tt = (
+        task_type.strip()
+        if isinstance(task_type, str) and task_type.strip()
+        else "create"
+    )
+    return _resolve_routing_core(payload, context, tt, runtime_config)["effort"]
 
 
 def resolve_task_provider_preference(
@@ -1246,6 +1295,10 @@ def get_all_account_health_summaries(
                 "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
                 "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
                 "rate_limited_models": rate_limited_models,
+                # Additive: latest cached proactive usage-headroom snapshot
+                # (5h/7d utilization, reset times, probed_at, known/stale).
+                # "known": False covers never-probed and probe-unknown states.
+                "usage_snapshot": _usage_snapshot_summary(acct, now),
             }
         )
     return results
@@ -1548,6 +1601,52 @@ def _record_model_fallback(
         )
 
 
+def _record_routing_fallback(
+    task: Any,
+    *,
+    intended_provider: str | None,
+    intended_model: str | None,
+    effective_provider: str,
+    effective_model: str | None,
+    reason: str,
+) -> None:
+    """Record a provider/tier routing divergence on task.context.
+
+    Companion to :func:`_record_model_fallback` (same-provider preview→GA
+    downgrade). Covers the cross-provider fallback (the intended provider had no
+    usable account, so selection landed on a later-preference provider) and the
+    synthetic no-account path (no account could be reserved at all). Keeps the
+    divergence visible so downstream cost-by-model attribution can caveat that
+    the spend reflects a fallback rather than the intended routing.
+
+    Best-effort — never raises and never changes which account is chosen.
+
+    Shape:
+        context.routing_fallback = {
+            "intended_provider": "anthropic", "intended_model": "claude-opus-4-8",
+            "effective_provider": "openai", "effective_model": "gpt-...",
+            "reason": "cross_provider" | "no_account",
+            "at": "2026-06-05T...",
+        }
+    """
+    try:
+        ctx = dict(getattr(task, "context", {}) or {})
+        ctx["routing_fallback"] = {
+            "intended_provider": intended_provider,
+            "intended_model": intended_model,
+            "effective_provider": effective_provider,
+            "effective_model": effective_model,
+            "reason": reason,
+            "at": _utcnow().isoformat(),
+        }
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[LLM_SELECT] Failed to record routing_fallback on task %s",
+            getattr(task, "id", "?"),
+        )
+
+
 def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> str:
     ctx = _task_context(task)
     payloads = getattr(task, "payloads", None) or []
@@ -1631,11 +1730,246 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
         _queue_rate_limit_persist_retry(acct_id)
 
 
+# --- Proactive account-usage headroom (advisory) ---
+#
+# A provider usage-probe snapshot is cached per in-memory pool entry under
+# ``usage_snapshot`` (a UsageSnapshot) + ``usage_snapshot_at`` (datetime). The
+# selection functions READ ONLY the cached snapshot — they NEVER probe under the
+# pool lock. A missing/stale snapshot is treated as "unknown" for the current
+# decision and triggers a non-blocking background refresh.
+#
+# Everything here is advisory: an unknown snapshot makes selection behave
+# exactly as it did before this feature. The reactive rate-limit cooldowns
+# (disable_account_model / _account_state_for_model) remain the backstop.
+_USAGE_SNAPSHOT_TTL_SECONDS = 60
+# Neutral headroom rank for accounts whose snapshot is unknown — the midpoint of
+# the [0, 100] headroom scale, mirroring how sparse success-rate falls back to
+# 0.5. Keeps unprobed accounts from being either starved or unduly preferred.
+_USAGE_HEADROOM_NEUTRAL = 50.0
+# Conservative default set of "long-running" task types the claim-time gate
+# applies to (kept in sync with runtime_config_state defaults). Used only as a
+# fallback when runtime_config omits the key.
+_DEFAULT_LONG_RUNNING_TASK_TYPES: tuple[str, ...] = (
+    "create",
+    "refactor",
+    "migrate",
+    "research",
+    "plan",
+    "security_audit",
+)
+
+# Strong refs to in-flight probe tasks so fire-and-forget refreshes aren't
+# garbage-collected mid-flight. Entries are discarded on completion.
+_usage_probe_tasks: set = set()
+
+
+def _runtime_config_snapshot() -> Mapping[str, Any]:
+    """Best-effort read of the process-global runtime_config (advisory only).
+
+    Lazy import avoids a module-load cycle with app.shared_state. Returns an
+    empty mapping if config is unavailable so callers degrade to "feature off".
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        return _rc if isinstance(_rc, Mapping) else {}
+    except Exception:  # noqa: BLE001 — advisory; absence means feature off
+        return {}
+
+
+def _usage_headroom_settings(
+    runtime_config: Mapping[str, Any] | None,
+) -> tuple[bool, float, frozenset[str]]:
+    """Resolve (enabled, threshold_pct, long_running_task_types) from config.
+
+    Tolerant of malformed values — any bad field degrades to the conservative
+    default rather than raising in the hot path.
+    """
+    cfg = runtime_config if isinstance(runtime_config, Mapping) else _runtime_config_snapshot()
+    enabled = bool(cfg.get("usage_headroom_gate_enabled", False))
+    raw_threshold = cfg.get("usage_headroom_threshold_pct", 90)
+    try:
+        threshold = float(raw_threshold)
+    except (TypeError, ValueError):
+        threshold = 90.0
+    raw_types = cfg.get("usage_headroom_long_running_task_types")
+    if isinstance(raw_types, (list, tuple, set)):
+        long_types = frozenset(
+            str(t).strip() for t in raw_types if str(t).strip()
+        )
+    else:
+        long_types = frozenset(_DEFAULT_LONG_RUNNING_TASK_TYPES)
+    return enabled, threshold, long_types
+
+
+def _cached_usage_snapshot(
+    acct: Dict[str, Any], now: datetime
+) -> UsageSnapshot | None:
+    """Return the account's cached snapshot iff fresh, else None (→ unknown).
+
+    None is returned for a missing OR a stale (TTL-expired) snapshot. Callers
+    treat None exactly as an unknown snapshot.
+    """
+    snap = acct.get("usage_snapshot")
+    at = acct.get("usage_snapshot_at")
+    if not isinstance(snap, UsageSnapshot) or at is None:
+        return None
+    if (now - at).total_seconds() >= _USAGE_SNAPSHOT_TTL_SECONDS:
+        return None
+    return snap
+
+
+def _usage_gate_should_skip(
+    acct: Dict[str, Any], now: datetime, threshold_pct: float
+) -> bool:
+    """True iff a fresh, KNOWN snapshot shows 5h OR 7d util >= threshold.
+
+    Unknown / stale / missing snapshots return False (never skipped) so an
+    account without a probe is never gated out.
+    """
+    snap = _cached_usage_snapshot(acct, now)
+    if snap is None:
+        return False
+    return any(util >= threshold_pct for util in snap.load_bearing_utilizations())
+
+
+def _usage_headroom_rank(acct: Dict[str, Any], now: datetime) -> float:
+    """Remaining-headroom rank (higher = more headroom; 0..100).
+
+    Unknown / stale / missing snapshots rank at the neutral midpoint so
+    unprobed accounts are never starved (mirrors sparse success-rate → 0.5).
+    """
+    snap = _cached_usage_snapshot(acct, now)
+    if snap is None:
+        return _USAGE_HEADROOM_NEUTRAL
+    utils = snap.load_bearing_utilizations()
+    if not utils:
+        return _USAGE_HEADROOM_NEUTRAL
+    return 100.0 - max(utils)
+
+
+async def _refresh_usage_snapshot(acct_id: str) -> None:
+    """Probe one account's usage OUTSIDE the pool lock and cache the result.
+
+    Advisory + total: never raises. On any failure the snapshot is cached as
+    unknown with a fresh timestamp, so a broken account isn't re-probed every
+    selection for the TTL window. Writes the cache under the pool lock; the
+    network probe itself runs lock-free.
+    """
+    acct = _account_by_id.get(acct_id)
+    if acct is None:
+        return
+    snapshot: UsageSnapshot
+    try:
+        provider_name = (
+            _normalize_provider_name(acct.get("provider"))
+            or LLMProviderName.ANTHROPIC.value
+        )
+        auth_mode_raw = (
+            _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+        )
+        secret = acct.get("oauth_token") or acct.get("runtime_secret")
+        provider = get_provider(provider_name)
+        snapshot = await provider.probe_usage(
+            secret, LLMAuthMode(auth_mode_raw), acct.get("provider_metadata") or {}
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory; cache unknown on failure
+        logger.debug("[POOL] usage probe errored for %s: %s", acct_id, exc)
+        snapshot = UsageSnapshot.unknown()
+    async with _max_plan_pool_lock:
+        live = _account_by_id.get(acct_id)
+        if live is not None:
+            live["usage_snapshot"] = snapshot
+            live["usage_snapshot_at"] = _utcnow()
+            live.pop("usage_probe_inflight", None)
+
+
+def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
+    """Fire-and-forget a background usage refresh for an account.
+
+    MUST be called under the pool lock (reads/sets the in-flight flag). Network
+    I/O happens later in the scheduled task, after the lock is released. A no-op
+    when a refresh is already in flight or no event loop is running.
+    """
+    if acct.get("usage_probe_inflight"):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    acct["usage_probe_inflight"] = True
+    task = loop.create_task(_refresh_usage_snapshot(acct["id"]))
+    _usage_probe_tasks.add(task)
+    task.add_done_callback(_usage_probe_tasks.discard)
+
+
+def _maybe_schedule_usage_refresh(acct: Dict[str, Any], now: datetime) -> None:
+    """Schedule a refresh only when the cached snapshot is missing/stale."""
+    if _cached_usage_snapshot(acct, now) is None:
+        _schedule_usage_refresh(acct)
+
+
+def _apply_usage_gate(
+    candidates: List[Any],
+    *,
+    now: datetime,
+    threshold_pct: float,
+    acct_getter,
+) -> List[Any]:
+    """Soft-skip candidates whose KNOWN util >= threshold, only if some remain.
+
+    Mirrors the health-score disqualification idiom: never empties the candidate
+    set (no deadlock / no claim blocked) — if every candidate is over threshold
+    the original set is returned unchanged. Unknown snapshots are never skipped.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    not_exhausted = [
+        c
+        for c in candidates
+        if not _usage_gate_should_skip(acct_getter(c), now, threshold_pct)
+    ]
+    return not_exhausted if not_exhausted else candidates
+
+
+def _usage_snapshot_summary(
+    acct: Dict[str, Any], now: datetime
+) -> Dict[str, Any]:
+    """JSON-safe per-account usage snapshot for the admin health endpoint.
+
+    Always returns a dict (additive field). ``known=False`` covers the
+    never-probed and probe-unknown states; ``stale`` flags a snapshot older
+    than the selection TTL (selection treats stale as unknown).
+    """
+    snap = acct.get("usage_snapshot")
+    at = acct.get("usage_snapshot_at")
+    stale = at is None or (now - at).total_seconds() >= _USAGE_SNAPSHOT_TTL_SECONDS
+    if not isinstance(snap, UsageSnapshot) or not snap.known:
+        probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
+        return {
+            "known": False,
+            "five_hour_utilization": None,
+            "seven_day_utilization": None,
+            "resets_at": {},
+            "probed_at": probed_at,
+            "stale": stale,
+        }
+    return {
+        "known": True,
+        "five_hour_utilization": snap.window_utilizations.get("five_hour"),
+        "seven_day_utilization": snap.window_utilizations.get("seven_day"),
+        "resets_at": dict(snap.resets_at),
+        "probed_at": snap.probed_at,
+        "stale": stale,
+    }
+
+
 async def select_max_plan_account_balanced(
     user_id: str,
     provider_models: List[tuple[str, str | None]],
     blacklist: List[str] | None = None,
     task_type: str | None = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -1691,6 +2025,32 @@ async def select_max_plan_account_balanced(
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
 
+        # Proactive usage-headroom (advisory; no I/O under this lock). When
+        # enabled, warm the per-account snapshot cache for every candidate and
+        # apply the claim-time gate for long-running task types. Unknown/stale
+        # snapshots are never gated and rank neutrally.
+        gate_enabled, gate_threshold, gate_long_types = _usage_headroom_settings(
+            runtime_config
+        )
+        if gate_enabled:
+            for c in candidates_healthy:
+                _maybe_schedule_usage_refresh(c[0], now)
+            for c in candidates_probing:
+                _maybe_schedule_usage_refresh(c[0], now)
+            if task_type in gate_long_types:
+                candidates_healthy = _apply_usage_gate(
+                    candidates_healthy,
+                    now=now,
+                    threshold_pct=gate_threshold,
+                    acct_getter=lambda c: c[0],
+                )
+                candidates_probing = _apply_usage_gate(
+                    candidates_probing,
+                    now=now,
+                    threshold_pct=gate_threshold,
+                    acct_getter=lambda c: c[0],
+                )
+
         winner: tuple[Dict[str, Any], str, str | None] | None = None
         if candidates_healthy:
             # Gate decisively-negative accounts when alternatives exist — but
@@ -1729,13 +2089,15 @@ async def select_max_plan_account_balanced(
                             candidates_healthy = preferred
             winner = min(
                 candidates_healthy,
-                # Primary: fewest active_tasks. Secondary: higher 7d success rate
-                # (task-type-scoped when confident, aggregate fallback, None → 0.5
-                # so sparse accounts aren't penalised).
-                # Tertiary: faster avg duration (None → neutral 0 penalty so sparse
-                # accounts aren't penalised). Tiebreak: deterministic by id.
+                # Primary: fewest active_tasks. When usage-headroom is enabled,
+                # prefer more remaining headroom next (advisory; unknown ranks
+                # neutrally so unprobed accounts aren't starved). Then higher 7d
+                # success rate (task-type-scoped when confident, aggregate
+                # fallback, None → 0.5 so sparse accounts aren't penalised), then
+                # faster avg duration (None → neutral 0). Tiebreak: by id.
                 key=lambda c: (
                     c[0].get("active_tasks", 0),
+                    -_usage_headroom_rank(c[0], now) if gate_enabled else 0.0,
                     -(_effective_success_rate(c[0], task_type, now) or 0.5),
                     _compute_avg_duration_24h(c[0], now) or 0.0,
                     c[0]["id"],
@@ -1764,6 +2126,7 @@ async def select_max_plan_account(
     blacklist: List[str] | None = None,
     provider: str | LLMProviderName | None = None,
     task_type: str | None = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -1808,6 +2171,32 @@ async def select_max_plan_account(
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
 
+        # Proactive usage-headroom (advisory; no I/O under this lock). When
+        # enabled, warm the per-account snapshot cache for every candidate and
+        # apply the claim-time gate for long-running task types. Unknown/stale
+        # snapshots are never gated and rank neutrally.
+        gate_enabled, gate_threshold, gate_long_types = _usage_headroom_settings(
+            runtime_config
+        )
+        if gate_enabled:
+            for a in healthy:
+                _maybe_schedule_usage_refresh(a, now)
+            for a in probing:
+                _maybe_schedule_usage_refresh(a, now)
+            if task_type in gate_long_types:
+                healthy = _apply_usage_gate(
+                    healthy,
+                    now=now,
+                    threshold_pct=gate_threshold,
+                    acct_getter=lambda a: a,
+                )
+                probing = _apply_usage_gate(
+                    probing,
+                    now=now,
+                    threshold_pct=gate_threshold,
+                    acct_getter=lambda a: a,
+                )
+
         if healthy:
             # Exclude decisively-negative-health-score accounts when alternatives exist.
             # This prevents chronically rate-limited accounts from receiving new tasks
@@ -1823,13 +2212,17 @@ async def select_max_plan_account(
                     healthy = qualified
             # Rank by health score, then 7d success rate (task-type-scoped when
             # confident, aggregate fallback), then latency (faster is better;
-            # None → 0.0 so sparse accounts get no penalty), then fewest active tasks.
+            # None → 0.0 so sparse accounts get no penalty). When usage-headroom
+            # is enabled, prefer more remaining headroom before the active_tasks
+            # tiebreak (advisory; unknown ranks neutrally so unprobed accounts
+            # aren't starved). Finally fewest active tasks.
             account = max(
                 healthy,
                 key=lambda a: (
                     _compute_health_score(a, now),
                     _effective_success_rate(a, task_type, now) or 0.0,
                     -(_compute_avg_duration_24h(a, now) or 0.0),
+                    _usage_headroom_rank(a, now) if gate_enabled else 0.0,
                     -a.get("active_tasks", 0),
                 ),
             )
@@ -1911,6 +2304,7 @@ async def select_llm_runtime_for_task(
                 blacklist=blacklist,
                 provider=provider_name,
                 task_type=routing_task_type,
+                runtime_config=runtime_config,
             )
             if account:
                 return LLMSelectionResult(
@@ -1940,6 +2334,16 @@ async def select_llm_runtime_for_task(
         # first configured provider only until mappings are updated.
         provider_preference = provider_preference[:1]
 
+    # The intended routing is the most-preferred provider and its tier/explicit
+    # model. Captured here (after provider_preference is finalized) so every
+    # selection outcome below can be compared against it to detect a fallback.
+    intended_provider = provider_preference[0] if provider_preference else explicit_provider
+    intended_model = explicit_model
+    if intended_model is None and intended_provider:
+        intended_model = get_provider(intended_provider).tier_to_model(
+            quality_tier, runtime_config
+        )
+
     # Balanced mode: pool all listed providers' accounts and pick globally by
     # (health, -load). An explicit per-task provider/model still pins the
     # selection (handled above via trimmed provider_preference), so this only
@@ -1967,9 +2371,19 @@ async def select_llm_runtime_for_task(
                 provider_models=provider_models,
                 blacklist=blacklist,
                 task_type=routing_task_type,
+                runtime_config=runtime_config,
             )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
+                if intended_provider and provider_name != intended_provider:
+                    _record_routing_fallback(
+                        task,
+                        intended_provider=intended_provider,
+                        intended_model=intended_model,
+                        effective_provider=provider_name,
+                        effective_model=chosen_model,
+                        reason="cross_provider",
+                    )
                 return LLMSelectionResult(
                     provider=provider_name,
                     auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2012,8 +2426,18 @@ async def select_llm_runtime_for_task(
             blacklist=blacklist,
             provider=provider_name,
             task_type=routing_task_type,
+            runtime_config=runtime_config,
         )
         if account:
+            if intended_provider and provider_name != intended_provider:
+                _record_routing_fallback(
+                    task,
+                    intended_provider=intended_provider,
+                    intended_model=intended_model,
+                    effective_provider=provider_name,
+                    effective_model=model,
+                    reason="cross_provider",
+                )
             return LLMSelectionResult(
                 provider=provider_name,
                 auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2041,6 +2465,7 @@ async def select_llm_runtime_for_task(
                 blacklist=blacklist,
                 provider=provider_name,
                 task_type=routing_task_type,
+                runtime_config=runtime_config,
             )
             if account:
                 logger.warning(
@@ -2070,6 +2495,14 @@ async def select_llm_runtime_for_task(
                 )
 
     if explicit_provider and explicit_model:
+        _record_routing_fallback(
+            task,
+            intended_provider=intended_provider,
+            intended_model=intended_model,
+            effective_provider=explicit_provider,
+            effective_model=explicit_model,
+            reason="no_account",
+        )
         return LLMSelectionResult(
             provider=explicit_provider,
             auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,
@@ -2086,6 +2519,14 @@ async def select_llm_runtime_for_task(
         provider = get_provider(fallback_provider)
         fallback_model = explicit_model or provider.tier_to_model(
             quality_tier, runtime_config
+        )
+        _record_routing_fallback(
+            task,
+            intended_provider=intended_provider,
+            intended_model=intended_model,
+            effective_provider=fallback_provider,
+            effective_model=fallback_model,
+            reason="no_account",
         )
         return LLMSelectionResult(
             provider=fallback_provider,

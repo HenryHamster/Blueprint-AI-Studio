@@ -16,6 +16,9 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    DeploymentState,
+    DeploymentStatus,
+    KnowledgeDocument,
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
@@ -66,6 +69,66 @@ def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
         "SR contract fixture not found in any candidate path: "
         + ", ".join(str(c) for c in candidates)
     )
+
+
+@pytest.fixture
+def deploy_health_state_guard():
+    """Snapshot deploy-health globals and shared state that these endpoint tests mutate."""
+    import copy
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    snapshot = {
+        "external_health": copy.deepcopy(shared_state.external_health),
+        "deploy_monitoring": copy.deepcopy(shared_state.deploy_monitoring),
+        "pause_failure_streak": deploy_health._pause_failure_streak,
+        "health_recovery_history": list(deploy_health._health_recovery_history),
+        "last_auto_resume_at": deploy_health._last_auto_resume_at,
+        "recent_auto_resumes": list(deploy_health._recent_auto_resumes),
+        "last_resume_was_forced": deploy_health._last_resume_was_forced,
+        "consecutive_force_resumes": deploy_health._consecutive_force_resumes,
+    }
+    yield
+    shared_state.external_health.clear()
+    shared_state.external_health.update(snapshot["external_health"])
+    shared_state.deploy_monitoring.clear()
+    shared_state.deploy_monitoring.update(snapshot["deploy_monitoring"])
+    deploy_health._pause_failure_streak = snapshot["pause_failure_streak"]
+    deploy_health._health_recovery_history.clear()
+    deploy_health._health_recovery_history.extend(snapshot["health_recovery_history"])
+    deploy_health._last_auto_resume_at = snapshot["last_auto_resume_at"]
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(snapshot["recent_auto_resumes"])
+    deploy_health._last_resume_was_forced = snapshot["last_resume_was_forced"]
+    deploy_health._consecutive_force_resumes = snapshot["consecutive_force_resumes"]
+
+
+async def _seed_deploy_state(
+    db_session,
+    *,
+    status: str = DeploymentStatus.PAUSED,
+    pause_reason: str = "External dependency down: dispatch_api",
+    pre_pause_max_vms: int | None = 4,
+    runtime_max_concurrent_vms: int | None = 4,
+    paused_at: datetime | None = None,
+) -> DeploymentState:
+    state = DeploymentState(
+        id=1,
+        current_revision="rev-test-1",
+        current_sha="a" * 40,
+        deployed_at=datetime.utcnow() - timedelta(minutes=10),
+        status=status,
+        last_known_good_revision="rev-good-1",
+        last_known_good_sha="b" * 40,
+        pause_reason=pause_reason,
+        paused_at=paused_at or (datetime.utcnow() - timedelta(minutes=3)),
+        pre_pause_max_vms=pre_pause_max_vms,
+        runtime_max_concurrent_vms=runtime_max_concurrent_vms,
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await db_session.refresh(state)
+    return state
 
 
 @pytest.mark.smoketest
@@ -148,6 +211,77 @@ async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, d
     data = resp.json()
     expected = {entry["id"]: entry for entry in task_type_catalog()}["create"]
     assert data["task_capability"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_surfaces_reserved_migration_revision(
+    client: AsyncClient, db_session
+):
+    """A migration task with an ACTIVE reservation surfaces it on the claim.
+
+    Proves the reserved identifiers reach the agent end to end: the orchestrator
+    locks a provisional revision, and the claim response carries it verbatim so
+    the agent consumes it instead of deriving max+1 locally.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Reservation Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "migrate", "cmd": "ls"}],
+        vm_instance_id="agent-vm-reservation",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=task.id,
+        provisional_revision="0153",
+        provisional_down_revision="0151",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-reservation")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["migration_reservation"] == {
+        "provisional_revision": "0153",
+        "provisional_down_revision": "0151",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_session):
+    """A task with no reservation omits the key (backward-compatible claim)."""
+    project = Project(name="Agent Claim No Reservation", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "migrate", "cmd": "ls"}],
+        vm_instance_id="agent-vm-no-reservation",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-reservation")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "migration_reservation" not in resp.json()
 
 
 @pytest.mark.asyncio
@@ -5119,6 +5253,174 @@ async def test_claim_does_not_inject_direction_context_for_review_task(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_includes_full_project_context_for_qa_task(
+    client: AsyncClient, db_session
+):
+    """A qa task receives the same baseline project_context as create/fix/refactor
+    — active_tasks, lessons, and recently_completed_tasks — not just the
+    lightweight pipeline_health summary handed to other peripheral types."""
+    project = Project(name="QA Launch Context", user_id="test-user-qa")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A sibling task already in flight (should show up under active_tasks).
+    active_task = Task(
+        project_id=project.id,
+        title="Active sibling create",
+        payloads=[{"type": "create", "prompt": "Build the validator"}],
+        vm_instance_id="agent-vm-qa-active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/main.py"]},
+    )
+    db_session.add(active_task)
+    # A recently completed task (should show up under recently_completed_tasks).
+    completed_task = Task(
+        project_id=project.id,
+        title="Completed groundwork",
+        payloads=[{"type": "create", "prompt": "Lay groundwork"}],
+        vm_instance_id="agent-vm-qa-done",
+        status=TaskStatus.COMPLETED,
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(completed_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="QA the validator",
+        payloads=[{"type": "qa", "prompt": "Write tests for the validator"}],
+        vm_instance_id="agent-vm-qa-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-qa-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pc = resp.json().get("project_context", {})
+    # Baseline keys (not just pipeline_health) must be present for qa.
+    assert "active_tasks" in pc, list(pc.keys())
+    assert "lessons" in pc, list(pc.keys())
+    assert "recently_completed_tasks" in pc, list(pc.keys())
+    assert any(t["title"] == "Active sibling create" for t in pc["active_tasks"])
+    assert any(
+        t["title"] == "Completed groundwork" for t in pc["recently_completed_tasks"]
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_includes_project_context_for_migrate_task(
+    client: AsyncClient, db_session
+):
+    """A migrate task sees sibling/active migrate tasks already in flight — the
+    concrete revision-collision / duplicate-schema risk the baseline context
+    is meant to surface."""
+    project = Project(name="Migrate Launch Context", user_id="test-user-migrate")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_migrate = Task(
+        project_id=project.id,
+        title="Active sibling migration",
+        payloads=[{"type": "migrate", "prompt": "Add column to models"}],
+        vm_instance_id="agent-vm-mig-active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/models.py"]},
+    )
+    db_session.add(active_migrate)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Add another migration",
+        payloads=[{"type": "migrate", "prompt": "Add index to models"}],
+        vm_instance_id="agent-vm-mig-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-mig-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pc = resp.json().get("project_context", {})
+    active_tasks = pc.get("active_tasks", [])
+    assert any(t["title"] == "Active sibling migration" for t in active_tasks), (
+        f"migrate task should see sibling migrations, got: {active_tasks}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_direction_context_narrative_contract_for_investigate_task(
+    client: AsyncClient, db_session
+):
+    """An investigate task working inside a direction receives the direction's
+    narrative, contract, and title — the same trajectory/goal context that
+    create/fix/refactor get — so it does not re-diagnose resolved work blind."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Investigate Direction Context", user_id="test-user-inv")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Harden the claim path",
+            "priority": "high",
+            "completion_criteria": "Claim latency stays bounded under load.",
+            "research_context": (
+                "## Established Findings\n"
+                "- The hot claim path reuses per-project queries.\n"
+                "## Open Questions\n"
+                "- Does adding peer types regress latency?\n"
+            ),
+            "context": {
+                "success_evidence": "A before/after delta on claim latency.",
+                "retirement_condition": "All peer types launch well-equipped.",
+            },
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "Diagnose the claim latency"}],
+        vm_instance_id="agent-vm-inv",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-inv")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context") or {}
+    assert "narrative" in dc, dc
+    assert "contract" in dc, dc
+    assert dc.get("title") == "Harden the claim path", dc
+    assert (
+        "The hot claim path reuses per-project queries."
+        in dc["narrative"]["established_findings"]
+    )
+    assert (
+        dc["contract"]["completion_criteria"]
+        == "Claim latency stays bounded under load."
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_injects_saturation_signals_for_research_task(
     client: AsyncClient, db_session
 ):
@@ -9761,6 +10063,81 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
         )
     ).scalars().all()
     assert all(a.artifact_type != ArtifactType.PULL_REQUEST for a in artifacts)
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_persists_reproduce_verdict(
+    client: AsyncClient, db_session, mocker
+):
+    """A terminal status carrying reproduce_verdict persists it into task.context.
+
+    The agent determined the cited defect's reproduce-on-HEAD truth; the status
+    endpoint must durably store the verdict (status + reason + evidence) under
+    the non-underscore key task.context["reproduce_verdict"] so task-outcome /
+    digest / strategic scoring can consume verified defect-truth.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(name="Reproduce Verdict", user_id="test-user-repro-verdict")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "verify reported NPE reproduces"}],
+        vm_instance_id="agent-vm-repro-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repro-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "reproduce_verdict": {
+                "status": "reproduced",
+                "reason": "NPE reproduced on HEAD at handler.py:42",
+                "evidence": {"file": "handler.py", "line": 42},
+            },
+            "logs": "Investigation complete: defect reproduces on HEAD.",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    verdict = (task.context or {}).get("reproduce_verdict")
+    assert verdict is not None
+    assert verdict["status"] == "reproduced"
+    assert verdict["reason"] == "NPE reproduced on HEAD at handler.py:42"
+    assert verdict["evidence"] == {"file": "handler.py", "line": 42}
+
+
+def test_reproduce_verdict_schema_validation():
+    """AgentStatusPayload.reproduce_verdict accepts the three canonical statuses,
+    is optional (older agents omit it), and rejects unknown status values."""
+    from app.schemas import AgentStatusPayload
+
+    base = {"task_id": str(uuid.uuid4()), "status": "COMPLETED"}
+    # Optional — absent payloads behave identically to today.
+    assert AgentStatusPayload(**base).reproduce_verdict is None
+    for status in ("reproduced", "already_resolved", "indeterminate"):
+        parsed = AgentStatusPayload(
+            **base, reproduce_verdict={"status": status, "reason": "x"}
+        )
+        assert parsed.reproduce_verdict.status == status
+    # Reason/evidence are optional.
+    minimal = AgentStatusPayload(**base, reproduce_verdict={"status": "reproduced"})
+    assert minimal.reproduce_verdict.reason is None
+    # Unknown status is rejected.
+    with pytest.raises(Exception):
+        AgentStatusPayload(**base, reproduce_verdict={"status": "maybe"})
 
 
 @pytest.mark.asyncio
@@ -16752,3 +17129,400 @@ def test_cold_start_manifest_issues_bootstrap_ttl():
     assert abs(ttl - AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600) <= 5, (
         f"cold-start manifest must mint the long bootstrap TTL; got {ttl}s"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flapping", "expected_required", "expected_escalated"),
+    [(False, 3, False), (True, 5, True)],
+)
+async def test_deploy_state_payload_reports_dynamic_recovery_threshold(
+    client: AsyncClient,
+    db_session,
+    deploy_health_state_guard,
+    flapping: bool,
+    expected_required: int,
+    expected_escalated: bool,
+):
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = []
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True])
+    deploy_health._recent_auto_resumes.clear()
+    if flapping:
+        now = datetime.utcnow()
+        deploy_health._recent_auto_resumes.extend(
+            [
+                now - timedelta(minutes=15),
+                now - timedelta(minutes=10),
+                now - timedelta(minutes=5),
+            ]
+        )
+
+    resp = await client.get("/api/admin/deploy-state")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["health_recovery_streak"] == 3
+    assert payload["health_recovery_history"] == [True, True, True]
+    assert payload["health_recovery_history_size"] == 5
+    assert payload["health_recovery_streak_required"] == expected_required
+    assert payload["health_recovery_flap_escalated"] is expected_escalated
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_broadcast_matches_polled_payload(
+    client: AsyncClient, db_session, deploy_health_state_guard, mocker
+):
+    from app import shared_state
+    from app.deploy_health import broadcast_deploy_state
+    import app.deploy_health as deploy_health
+
+    await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = []
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True, True, True])
+    now = datetime.utcnow()
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(
+        [
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=2),
+        ]
+    )
+    broadcast_mock = AsyncMock()
+    mocker.patch("app.deploy_health.manager.broadcast_to_all", new=broadcast_mock)
+
+    poll_resp = await client.get("/api/admin/deploy-state")
+    assert poll_resp.status_code == 200, poll_resp.text
+    polled_payload = poll_resp.json()
+
+    await broadcast_deploy_state()
+
+    broadcast_mock.assert_awaited_once()
+    event_name, broadcast_payload = broadcast_mock.await_args.args
+    assert event_name == "deploy_state"
+    assert broadcast_payload == polled_payload
+
+
+@pytest.mark.asyncio
+async def test_reset_health_clears_flap_escalation_state(
+    client: AsyncClient, db_session, deploy_health_state_guard
+):
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    state = await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = ["dispatch_api"]
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._pause_failure_streak = 3
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True, True])
+    now = datetime.utcnow()
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(
+        [
+            now - timedelta(minutes=18),
+            now - timedelta(minutes=12),
+            now - timedelta(minutes=6),
+        ]
+    )
+    deploy_health._last_resume_was_forced = True
+    deploy_health._consecutive_force_resumes = 2
+
+    reset_resp = await client.post("/api/admin/deploy-state/reset-health")
+
+    assert reset_resp.status_code == 200, reset_resp.text
+    reset_payload = reset_resp.json()
+    assert reset_payload["status"] == DeploymentStatus.STABLE
+    assert reset_payload["health_recovery_streak_required"] == 3
+    assert reset_payload["health_recovery_flap_escalated"] is False
+    assert reset_payload["health_recovery_history"] == []
+    assert list(deploy_health._recent_auto_resumes) == []
+    assert deploy_health._last_resume_was_forced is False
+    assert deploy_health._consecutive_force_resumes == 0
+
+    await db_session.refresh(state)
+    assert state.zone_health_state is not None
+    assert state.zone_health_state["_recent_auto_resumes"] == []
+    assert state.zone_health_state["_last_resume_was_forced"] is False
+    assert state.zone_health_state["_consecutive_force_resumes"] == 0
+
+    state.status = DeploymentStatus.PAUSED
+    state.pause_reason = "External dependency down: dispatch_api"
+    state.pre_pause_max_vms = 4
+    state.paused_at = datetime.utcnow() - timedelta(minutes=2)
+    db_session.add(state)
+    await db_session.commit()
+
+    followup_resp = await client.get("/api/admin/deploy-state")
+    assert followup_resp.status_code == 200, followup_resp.text
+    followup_payload = followup_resp.json()
+    assert followup_payload["health_recovery_streak_required"] == 3
+    assert followup_payload["health_recovery_flap_escalated"] is False
+
+
+async def _seed_knowledge_doc(
+    db_session,
+    *,
+    project_id,
+    source_task_id,
+    title,
+    source_kind,
+    direction_id=None,
+    topic=None,
+):
+    """Persist one KnowledgeDocument for the agent-fetch endpoint tests."""
+    doc = KnowledgeDocument(
+        project_id=project_id,
+        source_task_id=source_task_id,
+        title=title,
+        summary=f"summary of {title}",
+        body=f"# {title}\n\nfull body",
+        source_kind=source_kind,
+        direction_id=direction_id,
+        topic=topic,
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_agent_knowledge_documents_direction_and_source_kind_filters(
+    client: AsyncClient, db_session
+):
+    """The agent list endpoint honors the new direction / source_kind filters and
+    stays project-scoped to the token's task, never leaking cross-project docs."""
+    project = Project(name="Knowledge Fetch", user_id="test-user-knowledge")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+        vm_instance_id="agent-vm-knowledge",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Another project + task whose documents must NEVER appear for our token.
+    other_project = Project(name="Other Knowledge", user_id="test-user-other")
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+    other_task = Task(
+        project_id=other_project.id,
+        payloads=[{"type": "plan"}],
+        vm_instance_id="agent-vm-other-knowledge",
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+    await db_session.refresh(other_task)
+
+    web_doc = await _seed_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Web research on caching",
+        source_kind="web_research",
+        direction_id="d-aaa111",
+    )
+    design_doc = await _seed_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Design for cache layer",
+        source_kind="design",
+        direction_id="d-bbb222",
+    )
+    # A cross-project doc that matches the filters but belongs to another project.
+    await _seed_knowledge_doc(
+        db_session,
+        project_id=other_project.id,
+        source_task_id=other_task.id,
+        title="Foreign web research",
+        source_kind="web_research",
+        direction_id="d-aaa111",
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-knowledge")
+    headers = {"x-agent-token": token}
+
+    # No filters: both project docs, no cross-project doc, body omitted.
+    resp = await client.get("/api/agent/knowledge-documents", headers=headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 2
+    titles = {d["title"] for d in data["documents"]}
+    assert titles == {"Web research on caching", "Design for cache layer"}
+    assert all("body" not in d for d in data["documents"])
+
+    # source_kind filter narrows to a single origin.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?source_kind=design", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["documents"][0]["title"] == "Design for cache layer"
+    assert data["documents"][0]["id"] == str(design_doc.id)
+
+    # direction filter narrows to the motivating direction.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?direction=d-aaa111", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["documents"][0]["id"] == str(web_doc.id)
+
+    # Combined filters that match nothing return an empty, well-formed page.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?direction=d-bbb222&source_kind=web_research",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 0
+    assert data["documents"] == []
+
+    # Get-by-id returns the full body for an in-project document.
+    resp = await client.get(
+        f"/api/agent/knowledge-documents/{web_doc.id}", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    body_doc = resp.json()
+    assert body_doc["id"] == str(web_doc.id)
+    assert "full body" in body_doc["body"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_image_state_to_pool_member(
+    client: AsyncClient, db_session
+):
+    """A task heartbeat from a warm-pool member durably mirrors the reported
+    image/source identity onto its PoolVm row, so fleet checks survive a
+    restart of the orchestrator (the in-memory caches do not)."""
+    from app.models import PoolVmState
+    from app.shared_state import runtime_config as _runtime_config
+    from app.warm_pool import register_pool_vm
+
+    project = Project(name="HB Image Persist", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-hb-persist"
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(member)
+
+    prior = _runtime_config.get("warm_pool_enabled", False)
+    _runtime_config["warm_pool_enabled"] = True
+    try:
+        token = create_agent_token(str(task.id), vm_id)
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status_message": "running",
+            "vm_image_name": "blueprint-agent-v2-20260606",
+            "vm_image_build_ts": 1749168000,
+            "agent_runtime_fingerprint": "a" * 64,
+            "agent_source_sha": "0123456789abcdef",
+        }
+        resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+        assert resp.status_code == 200
+    finally:
+        _runtime_config["warm_pool_enabled"] = prior
+
+    await db_session.refresh(member)
+    assert member.agent_image_name == "blueprint-agent-v2-20260606"
+    assert member.agent_image_build_ts == 1749168000
+    assert member.agent_runtime_fingerprint == "a" * 64
+    assert member.agent_source_sha == "0123456789abcdef"
+    assert member.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_image_persist_skipped_when_pool_disabled(
+    client: AsyncClient, db_session
+):
+    """With the warm pool dark (the default), the heartbeat issues no PoolVm
+    write — the durable columns stay untouched so a dark pool keeps today's
+    zero-extra-query heartbeat."""
+    from app.models import PoolVmState
+    from app.shared_state import runtime_config as _runtime_config
+    from app.warm_pool import register_pool_vm
+
+    project = Project(name="HB Image Persist Off", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-hb-persist-off"
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prior = _runtime_config.get("warm_pool_enabled", False)
+    _runtime_config["warm_pool_enabled"] = False
+    try:
+        token = create_agent_token(str(task.id), vm_id)
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "vm_image_name": "blueprint-agent-v2-20260606",
+            "vm_image_build_ts": 1749168000,
+        }
+        resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+        assert resp.status_code == 200
+    finally:
+        _runtime_config["warm_pool_enabled"] = prior
+
+    await db_session.refresh(member)
+    assert member.agent_image_name is None
+    assert member.agent_image_build_ts is None

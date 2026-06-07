@@ -15,6 +15,7 @@ vi.mock('../index.js', () => ({
   resolveBaseBranch: () => 'main',
   setCurrentPromptFingerprint: vi.fn(),
   sendHeartbeatSync: vi.fn(),
+  apiGet: vi.fn().mockResolvedValue({ documents: [] }),
 }));
 
 vi.mock('../workspacePrep.js', () => ({
@@ -38,6 +39,12 @@ vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
     existsSync: vi.fn().mockReturnValue(false),
+    // handleDesign now provisions the read-only ./design-doc and ./fetch
+    // helpers (writeDesignDocHelper / writeFetchHelper), which write files; the
+    // helper exclusion path appends to .git/info/exclude. Mock the writers so
+    // provisioning is a no-op rather than throwing on the bare fs mock.
+    writeFileSync: vi.fn(),
+    appendFileSync: vi.fn(),
   },
 }));
 
@@ -51,7 +58,7 @@ vi.mock('child_process', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import fs from 'fs';
 import { handleDesign, groundDesignCitations } from './design.js';
-import { runClaudeCode, persistAndPostStatus, readHandlerOutput } from '../index.js';
+import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -180,6 +187,64 @@ describe('handleDesign', () => {
     const disallowed = vi.mocked(runClaudeCode).mock.calls[0][5] as string[];
     expect(disallowed).toContain('Write');
     expect(disallowed).toContain('Edit');
+  });
+
+  it('injects a Prior Knowledge section with prior-doc ids/titles/summaries when docs exist', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockResolvedValue({
+      documents: [
+        { id: 'doc-aaa', title: 'Earlier reaper design', summary: 'A prior sweep design.', topic: 'reaper' },
+        { id: 'doc-bbb', title: 'Blocked-task lifecycle', summary: 'How tasks block.' },
+      ],
+    });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work', topic: 'reaper' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Query uses the topic (preferred over prompt) and hits the agent endpoint.
+    const calledPath = vi.mocked(apiGet).mock.calls[0][0];
+    expect(calledPath).toContain('/api/agent/knowledge-documents');
+    expect(calledPath).toContain(`q=${encodeURIComponent('reaper')}`);
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Prior Knowledge');
+    expect(prompt).toContain('doc-aaa');
+    expect(prompt).toContain('Earlier reaper design');
+    expect(prompt).toContain('A prior sweep design.');
+    expect(prompt).toContain('doc-bbb');
+    // Explicit build-on / supersede / cite instruction.
+    expect(prompt).toContain('supersede');
+    expect(prompt).toContain('cite');
+  });
+
+  it('omits the Prior Knowledge section when the fetch returns no documents', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockResolvedValue({ documents: [] });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work', topic: 'reaper' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Prior Knowledge');
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+  });
+
+  it('completes normally (no Prior Knowledge, no failure) when the knowledge fetch throws', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockRejectedValue(new Error('knowledge endpoint unreachable'));
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work', topic: 'reaper' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Prior Knowledge');
+    expect(lastPostedPayload().status).toBe('COMPLETED');
   });
 
   it('surfaces a citation-less / empty output for the gate to reject (FAILED on non-zero exit)', async () => {

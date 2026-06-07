@@ -9,6 +9,7 @@ from app.migration_chain import (
     find_heads,
     find_roots,
     main,
+    next_revision,
     parse_revision_identifiers,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
@@ -45,6 +46,30 @@ def _added_file_diff(path: str, revision: str, down_revision: str | None) -> str
 
 
 # ── Pure helper ─────────────────────────────────────────────────────────────
+
+
+def test_next_revision_is_max_plus_one_padded():
+    # Max + 1, zero-padded to the widest existing id's width.
+    assert next_revision(["0151", "0149", "0150"]) == "0152"
+    assert next_revision(["0151"]) == "0152"
+    # Order independent; a single id still increments.
+    assert next_revision(["0009"]) == "0010"
+
+
+def test_next_revision_preserves_width():
+    # The pad width follows the WIDEST existing id, not the value's natural width.
+    assert next_revision(["0099"]) == "0100"
+    assert next_revision(["00099"]) == "00100"
+    # A wider id in the set widens the result even if it is not the max.
+    assert next_revision(["123", "0007"]) == "0124"
+
+
+def test_next_revision_empty_and_non_numeric():
+    # No numeric ids → the conventional first revision.
+    assert next_revision([]) == "0001"
+    assert next_revision(["abc", "head"]) == "0001"
+    # Non-numeric ids (branch labels) are ignored; numbering follows the digits.
+    assert next_revision(["0151", "branch_label"]) == "0152"
 
 
 def test_parse_revision_identifiers():
@@ -568,22 +593,21 @@ def test_plan_reconciliation_collision_renumbers_and_rechains():
 
 def test_plan_reconciliation_stale_anchor_rechains():
     """A single migration anchored to a no-longer-head revision is rechained
-    onto the current head and renumbered into the contiguous block strictly
-    above every existing revision (the unified ``max(all)+1`` rule shared with
-    the back-merge planner), so the renumber can never collide with the added
-    migration's own slot."""
+    onto the current head; when its provisional revision already equals the
+    next free slot above the live head, merge-time finalization only rewrites
+    ``down_revision`` and preserves the authored revision id."""
     existing = ["0136_prev.py", "0137_other.py"]
     added = {
         "backend/alembic/versions/0138_new.py": _migration_src("0138", "0136"),
     }
     plan = plan_migration_reconciliation(existing, added)
     assert plan is not None
-    # max(existing | added) == 0138, so the root renumbers to 0139, rechained
-    # onto the current head 0137.
-    assert plan["new_revision"] == "0139"
+    assert plan["new_revision"] == "0138"
     assert plan["new_down_revision"] == "0137"
     rev, down = parse_revision_identifiers(plan["new_source"])
-    assert (rev, down) == ("0139", "0137")
+    assert (rev, down) == ("0138", "0137")
+    assert plan["deletes"] == []
+    assert set(plan["upserts"]) == {"backend/alembic/versions/0138_new.py"}
 
 
 def test_plan_reconciliation_already_valid_returns_none():
@@ -622,12 +646,13 @@ def test_plan_reconciliation_multi_migration_collision_renumbers_full_tail_monot
     }
     plan = plan_migration_reconciliation(existing, added)
     assert plan is not None
-    # Root 0124 renumbered to max(all)+1 == 0126, rechained onto the head 0124.
+    # Root 0124 finalizes into the next free live slot 0125, rechained onto the
+    # head 0124; the full tail becomes the contiguous block 0125, 0126.
     assert plan["old_revision"] == "0124"
-    assert plan["new_revision"] == "0126"
+    assert plan["new_revision"] == "0125"
     assert plan["new_down_revision"] == "0124"
     assert plan["old_path"] == "backend/alembic/versions/0124_a.py"
-    assert plan["new_path"] == "backend/alembic/versions/0126_a.py"
+    assert plan["new_path"] == "backend/alembic/versions/0125_a.py"
     # deletes: BOTH old paths being renamed away (in chain order).
     assert plan["deletes"] == [
         "backend/alembic/versions/0124_a.py",
@@ -635,18 +660,18 @@ def test_plan_reconciliation_multi_migration_collision_renumbers_full_tail_monot
     ]
     # upserts: BOTH renamed/renumbered files — the full tail moved up.
     assert set(plan["upserts"]) == {
-        "backend/alembic/versions/0126_a.py",
-        "backend/alembic/versions/0127_b.py",
+        "backend/alembic/versions/0125_a.py",
+        "backend/alembic/versions/0126_b.py",
     }
     root_rev, root_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0126_a.py"]
+        plan["upserts"]["backend/alembic/versions/0125_a.py"]
     )
-    assert (root_rev, root_down) == ("0126", "0124")
+    assert (root_rev, root_down) == ("0125", "0124")
     tail_rev, tail_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0127_b.py"]
+        plan["upserts"]["backend/alembic/versions/0126_b.py"]
     )
-    assert (tail_rev, tail_down) == ("0127", "0126")
-    assert plan["expected_schema_revision"] == "0127"
+    assert (tail_rev, tail_down) == ("0126", "0125")
+    assert plan["expected_schema_revision"] == "0126"
     # The full reconciled added set revalidates clean against the target.
     reconciled = {
         p: s for p, s in added.items() if p not in plan["deletes"]
@@ -759,6 +784,76 @@ def test_plan_reconciliation_stale_anchor_to_none_rechains():
     assert (rev, down) == ("0138", "0137")
 
 
+def test_plan_reconciliation_out_of_order_merge_fills_abandoned_hole():
+    """A later-merged provisional migration fills the abandoned live gap instead
+    of preserving its authored reservation number."""
+    existing = ["0150_prev.py", "0151_head.py"]
+    added = {
+        "backend/alembic/versions/0153_feature.py": _migration_src("0153", "0151"),
+    }
+
+    plan = plan_migration_reconciliation(existing, added)
+
+    assert plan is not None
+    assert plan["old_revision"] == "0153"
+    assert plan["new_revision"] == "0152"
+    assert plan["new_down_revision"] == "0151"
+    assert plan["new_path"] == "backend/alembic/versions/0152_feature.py"
+    rev, down = parse_revision_identifiers(plan["new_source"])
+    assert (rev, down) == ("0152", "0151")
+    assert plan["expected_schema_revision"] == "0152"
+
+
+def test_plan_reconciliation_multi_migration_fills_gap_contiguously():
+    """A provisional tail that started above a now-abandoned reservation is
+    finalized into the earliest contiguous live block with no dangling anchors."""
+    existing = ["0122_prev.py", "0123_head.py"]
+    added = {
+        "backend/alembic/versions/0125_a.py": _migration_src("0125", "0123"),
+        "backend/alembic/versions/0126_b.py": _migration_src("0126", "0125"),
+    }
+
+    plan = plan_migration_reconciliation(existing, added)
+
+    assert plan is not None
+    assert set(plan["upserts"]) == {
+        "backend/alembic/versions/0124_a.py",
+        "backend/alembic/versions/0125_b.py",
+    }
+    first_rev, first_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0124_a.py"]
+    )
+    second_rev, second_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0125_b.py"]
+    )
+    assert (first_rev, first_down) == ("0124", "0123")
+    assert (second_rev, second_down) == ("0125", "0124")
+    assert plan["expected_schema_revision"] == "0125"
+
+
+def test_plan_reconciliation_skips_gap_reserved_on_promotion_target():
+    """A gap visible on the target branch is NOT reused when a divergent
+    promotion target already stamped that revision to another migration."""
+    existing = ["0141_prev.py", "0142_head.py"]
+    added = {
+        "backend/alembic/versions/0144_feature.py": _migration_src("0144", "0141"),
+    }
+
+    plan = plan_migration_reconciliation(
+        existing,
+        added,
+        protected_revisions={"0143"},
+    )
+
+    assert plan is not None
+    assert plan["old_revision"] == "0144"
+    assert plan["new_revision"] == "0144"
+    assert plan["new_down_revision"] == "0142"
+    assert plan["new_path"] == "backend/alembic/versions/0144_feature.py"
+    rev, down = parse_revision_identifiers(plan["new_source"])
+    assert (rev, down) == ("0144", "0142")
+
+
 # ── plan_integration_side_renumber (back-merge mirror planner) ──────────────
 
 
@@ -803,12 +898,13 @@ def test_plan_integration_collision_linear_tail_renumbers_full_tail_monotonic():
     }
     plan = plan_integration_side_renumber(target, integration)
     assert plan is not None
-    # C renumbered to max(all)+1 == 0140, anchored to the unified head 0137.
+    # C finalizes into the earliest free live slot 0138, anchored to the
+    # unified head 0137.
     assert plan["old_revision"] == "0137"
-    assert plan["new_revision"] == "0140"
+    assert plan["new_revision"] == "0138"
     assert plan["new_down_revision"] == "0137"
     assert plan["old_path"] == "backend/alembic/versions/0137_feat.py"
-    assert plan["new_path"] == "backend/alembic/versions/0140_feat.py"
+    assert plan["new_path"] == "backend/alembic/versions/0138_feat.py"
     # deletes: ALL three old paths being renamed away (in chain order).
     assert plan["deletes"] == [
         "backend/alembic/versions/0137_feat.py",
@@ -817,26 +913,26 @@ def test_plan_integration_collision_linear_tail_renumbers_full_tail_monotonic():
     ]
     # upserts: ALL three renamed/renumbered files — the full tail moved up.
     assert set(plan["upserts"]) == {
-        "backend/alembic/versions/0140_feat.py",
-        "backend/alembic/versions/0141_b.py",
-        "backend/alembic/versions/0142_c.py",
+        "backend/alembic/versions/0138_feat.py",
+        "backend/alembic/versions/0139_b.py",
+        "backend/alembic/versions/0140_c.py",
     }
-    # C 0137 -> 0140 <- unified head 0137.
+    # C 0137 -> 0138 <- unified head 0137.
     c_rev, c_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0140_feat.py"]
+        plan["upserts"]["backend/alembic/versions/0138_feat.py"]
     )
-    assert (c_rev, c_down) == ("0140", "0137")
-    # D 0138 -> 0141 <- renumbered C (0140).
+    assert (c_rev, c_down) == ("0138", "0137")
+    # D 0138 -> 0139 <- renumbered C (0138).
     d_rev, d_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0141_b.py"]
+        plan["upserts"]["backend/alembic/versions/0139_b.py"]
     )
-    assert (d_rev, d_down) == ("0141", "0140")
-    # E 0139 -> 0142 <- renumbered D (0141); the highest revision == the head.
+    assert (d_rev, d_down) == ("0139", "0138")
+    # E 0139 -> 0140 <- renumbered D (0139); the highest revision == the head.
     e_rev, e_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0142_c.py"]
+        plan["upserts"]["backend/alembic/versions/0140_c.py"]
     )
-    assert (e_rev, e_down) == ("0142", "0141")
-    assert plan["expected_schema_revision"] == "0142"
+    assert (e_rev, e_down) == ("0140", "0139")
+    assert plan["expected_schema_revision"] == "0140"
     # The full reconciled integration set revalidates clean.
     reconciled = {
         p: s

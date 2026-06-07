@@ -593,6 +593,9 @@ async def _plan_rollup_migration_reconciliation(
     repo: str,
     pr_number: int,
     target_branch: str | None,
+    *,
+    promotion_target: str | None = None,
+    project_id: str | None = None,
 ) -> dict | None:
     """Plan an automatic renumber for a rollup blocked by a head collision.
 
@@ -617,11 +620,28 @@ async def _plan_rollup_migration_reconciliation(
         return None
     try:
         existing_filenames = await github.list_versions_at_ref(
-            gh_token, owner, repo, target_branch
+            gh_token, owner, repo, target_branch, project_id=project_id
         )
     except Exception:
         return None
-    return plan_migration_reconciliation(existing_filenames, added_sources)
+    protected_revisions: set[str] = set()
+    if promotion_target and promotion_target != target_branch:
+        try:
+            promotion_filenames = await github.list_versions_at_ref(
+                gh_token, owner, repo, promotion_target, project_id=project_id
+            )
+        except Exception:
+            return None
+        protected_revisions = {
+            rev
+            for fn in promotion_filenames
+            if (rev := _filename_revision_prefix(fn)) is not None
+        }
+    return plan_migration_reconciliation(
+        existing_filenames,
+        added_sources,
+        protected_revisions=protected_revisions,
+    )
 
 
 async def _plan_backmerge_migration_reconciliation(

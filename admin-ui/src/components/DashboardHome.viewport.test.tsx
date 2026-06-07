@@ -75,6 +75,7 @@ let versionLifecycleResponse: unknown = {
       status: 'dry_run',
       confidence: 0.78,
       threshold: 0.80,
+      candidate_sha: 'abcdef1234567890',
       sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
       blocker: null,
       finalized_at: '2026-05-20T11:00:00Z',
@@ -267,6 +268,16 @@ vi.mock('../api', () => ({
     abandoned_version: { version_number: 42, status: 'abandoned' },
     new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
   })),
+  clearDeployFailed: vi.fn(async () => ({
+    version_number: 42,
+    serving_status: 'serving',
+    served_sha: 'abc1234def56',
+    served_at: '2026-05-20T12:00:00Z',
+    deploy_failure_reason: null,
+    clear_mode: 'verified',
+    operator_attested: false,
+    attestation_reason: null,
+  })),
   patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
   setProjectPromotionEnabled: vi.fn(async () => ({
     project_id: 'p1',
@@ -295,8 +306,13 @@ vi.mock('../api', () => ({
       priced_task_count: 0,
       unpriced_task_count: 0,
       unpriced_coverage_fraction: null,
+      merged_count: 0,
+      verified_merged_count: 0,
+      merge_rate: null,
+      verified_merge_rate: null,
     },
     unpriced_combos: [],
+    approximate_priced_combos: [],
   })),
   // DashboardHome renders OuterReviewLoopConvergenceWidget, which imports these
   // from '../api'. The complete mock must provide them or the browser-mode test

@@ -9,11 +9,13 @@ project's findings. Each route resolves the project/task with a role check via
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import List
 import uuid
 import logging
+import time
 
 from app.database import get_session
 from app.depends_on_provenance import has_structural_depends_on
@@ -41,6 +43,44 @@ from app import release_qualifier, release_version
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
+
+
+async def _clear_manual_rollup_create_claim(
+    session: AsyncSession,
+    *,
+    task_id: uuid.UUID,
+    claim_ts: float,
+    pre_create_snapshot: dict | None,
+    task_in_session: Task | None,
+) -> Task | None:
+    """Best-effort cleanup for this request's manual rollup create claim.
+
+    Only removes the claim when the task still carries THIS request's
+    ``rollup_pr_creating_at`` value and no durable ``rollup_pr_number`` marker
+    exists, so a retry-safe cleanup never clobbers a peer's newer claim or an
+    already-recorded PR.
+    """
+    from app.rollup_locking import _relock_parent
+
+    task = await _relock_parent(
+        session,
+        task_id,
+        pre_create_snapshot,
+        parent_in_session=task_in_session,
+    )
+    if task is None:
+        return None
+
+    ctx = task.context or {}
+    if ctx.get("rollup_pr_number") or ctx.get("rollup_pr_creating_at") != claim_ts:
+        return task
+
+    task.context = {
+        k: v for k, v in ctx.items() if k != "rollup_pr_creating_at"
+    }
+    session.add(task)
+    await session.commit()
+    return task
 
 
 def _record_failure_result(task: Task, failure_class: str) -> None:
@@ -91,6 +131,10 @@ async def trigger_self_audit(
     """Enqueue a self_audit task for this project.
 
     Members and above can trigger a maturity audit. Returns the new task_id.
+    Rejects with 409 if a self_audit is already in flight for this project.
+    Idempotent: concurrent/duplicate submissions use idempotency_key to prevent
+    duplicate audit spawns — a second near-simultaneous trigger coalesces onto
+    the in-flight audit instead of spawning a second one.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
@@ -113,6 +157,44 @@ async def trigger_self_audit(
     if body and body.focus_systems:
         title_suffix = f" ({', '.join(body.focus_systems[:3])}{'...' if len(body.focus_systems) > 3 else ''})"
 
+    # Check for any active self_audit tasks (including legacy tasks without idempotency_key).
+    # This check is non-transactional but will be backed by the idempotency_key constraint
+    # if two concurrent requests both pass this check — the database constraint prevents
+    # duplicate inserts and forces coalesce via IntegrityError handling below.
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(active_statuses),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for audit_task in active_tasks:
+        if (audit_task.first_payload or {}).get("type") == "self_audit":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Self-audit is already in progress for this project "
+                    f"(task {str(audit_task.id)[:8]}, status {audit_task.status}). "
+                    f"Wait for it to complete before starting another."
+                ),
+            )
+
+    # Use idempotency_key to prevent concurrent duplicates. The key is project-scoped
+    # so concurrent triggers on the same project use the same key; the database
+    # partial unique index ux_task_active_idempotency_key prevents duplicate inserts.
+    idempotency_key = f"operator_self_audit:{project.id}"
+
     new_task = Task(
         project_id=project.id,
         title=f"Self audit{title_suffix}"[:200],
@@ -122,9 +204,38 @@ async def trigger_self_audit(
         status=TaskStatus.QUEUED,
         created_by="USER",
         requires_approval=False,
+        idempotency_key=idempotency_key,
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Concurrent submission: another request inserted a task with the same
+        # idempotency_key before this one committed. Fetch the existing active audit
+        # and return it instead of raising an error — coalesce onto the in-flight audit.
+        await session.rollback()
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == idempotency_key,
+                    Task.status.in_(active_statuses),
+                )
+            )
+        ).scalars().first()
+        if existing is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Self-audit is already in progress for this project.",
+            )
+        logger.info(
+            f"[ADMIN] Concurrent self-audit trigger for project {project.id} "
+            f"coalesced onto existing audit {existing.id}"
+        )
+        return {
+            "task_id": str(existing.id),
+            "project_id": str(project.id),
+            "status": existing.status,
+        }
     await session.refresh(new_task)
 
     history = TaskHistory(
@@ -170,6 +281,24 @@ async def trigger_qualify(
         session, project_id, open_version
     )
     await session.commit()
+    # Promotion-in-flight: the audit passed and a promotion PR is open and
+    # auto-merging.  Re-qualifying would spawn a fresh heavy audit/smoketest pair
+    # and clobber the promotion-pending provenance, so run_qualification refuses
+    # (no-op).  Surface that to the operator as a 409, mirroring the version-cut
+    # lever, so all the levers over an in-flight promotion agree.
+    if result.get("status") == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before re-qualifying"
+        )
+        pr_number = result.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number}"
+            pr_url = result.get("promotion_pr_url")
+            if pr_url:
+                detail += f" {pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail)
     return result
 
 
@@ -321,14 +450,75 @@ async def trigger_rollup(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Manually trigger rollup PR for an EVALUATING parent task."""
+    """Manually trigger rollup PR for an EVALUATING parent task.
+
+    Idempotent and mutually exclusive with the automated rollup path
+    (``rollup_management._check_and_trigger_rollup``). Both coordinate through
+    the parent-row ``FOR UPDATE`` lock and the SHARED rollup markers
+    (``rollup_pr_creating_at`` / ``rollup_pr_number``), so a manual trigger
+    fired while the background path is mid-create — or two manual triggers, or
+    a manual trigger after the PR already exists — cannot POST a duplicate
+    rollup PR:
+
+    * the parent row is re-fetched ``FOR UPDATE`` (the role check above does an
+      unlocked read), so a held row → 409 ``rollup already in progress``;
+    * a recorded ``rollup_pr_number`` short-circuits and returns that PR
+      idempotently — no second POST/merge;
+    * a FRESH ``rollup_pr_creating_at`` claim (peer mid-create) → 409;
+    * otherwise the creation claim is staked UNDER the lock and committed
+      before the slow ``create_pull_request`` call, releasing the lock around
+      it so a concurrent worker observes the claim and defers (mirrors the
+      auto path's marker discipline — incident #7350/#7351).
+    """
     from app.routers.agent import get_github_token_for_task
     from app.review_pipeline import _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
+    from app.rollup_management import (
+        _build_rollup_pr_body,
+        _ROLLUP_PR_CREATE_CLAIM_TTL_S,
+    )
+    from app.rollup_state import _clear_rollup_transient_state
+    from app.rollup_locking import _release_parent_lock, _relock_parent
 
-    task = await _get_user_task_with_role(
+    # Role check is an unlocked read; re-fetch the parent UNDER A ROW LOCK so
+    # the precondition re-check and claim-stake below race neither the
+    # automated rollup path nor a second concurrent manual trigger.
+    #
+    # _get_user_task_with_role loaded the row via session.get, so it now lives
+    # in this session's identity map. With expire_on_commit=False the FOR
+    # UPDATE re-SELECT below would otherwise return that CACHED instance
+    # WITHOUT refreshing its attributes — ctx/existing_pr/_claim_ts would all
+    # evaluate against the pre-lock snapshot and miss a peer that committed
+    # rollup_pr_number/rollup_pr_creating_at after the role check. Expire the
+    # cached instance and force populate_existing on the locked SELECT so the
+    # precondition re-check reads the row AS OF the lock (mirrors
+    # rollup_locking._relock_parent / _lock_original_task).
+    cached_task = await _get_user_task_with_role(
         task_id, current_user["user_id"], session, "member"
     )
+    try:
+        session.expire(cached_task)
+    except InvalidRequestError:
+        session.expire_all()
+    task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if task is None:
+        # Row held by the automated rollup path or a concurrent manual trigger
+        # mid-create — defer rather than racing into a duplicate PR.
+        raise HTTPException(
+            status_code=409,
+            detail="A rollup is already in progress for this task — try again shortly.",
+        )
     if task.status != TaskStatus.EVALUATING:
         raise HTTPException(
             status_code=400, detail=f"Task is {task.status}, not EVALUATING"
@@ -343,6 +533,36 @@ async def trigger_rollup(
             status_code=400, detail="Task has no staging/target branch info in context"
         )
 
+    # ── Idempotency guard: a rollup PR is already recorded for this task. ──
+    # Return it instead of POSTing a second PR (the auto path may have created
+    # it, or this is a duplicate client retry).
+    existing_pr = ctx.get("rollup_pr_number")
+    if existing_pr:
+        return {
+            "rollup_pr_url": ctx.get("rollup_pr_url", ""),
+            "rollup_pr_number": existing_pr,
+            "target": target_branch,
+            "status": task.status,
+        }
+
+    # ── Duplicate-create guard: a FRESH creation claim is in flight. ──
+    # A peer (auto path or another manual trigger) staked the claim under the
+    # lock and released it around its own create_pull_request; observing a
+    # fresh claim with no recorded PR means a duplicate POST is imminent, so
+    # defer. A claim older than the TTL is stale (peer crashed mid-create) and
+    # falls through so creation is never wedged.
+    _claim_ts = ctx.get("rollup_pr_creating_at")
+    if isinstance(_claim_ts, (int, float)) and (
+        time.time() - _claim_ts
+    ) < _ROLLUP_PR_CREATE_CLAIM_TTL_S:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A rollup PR creation is already in progress for this task "
+                "— try again shortly."
+            ),
+        )
+
     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
 
     # Count children
@@ -351,8 +571,6 @@ async def trigger_rollup(
         .scalars()
         .all()
     )
-
-    from app.rollup_management import _build_rollup_pr_body
 
     _project = await session.get(Project, task.project_id)
     _prefix = _get_project_pr_title_prefix(_project)
@@ -367,17 +585,132 @@ async def trigger_rollup(
         children=list(children),
     )
 
-    pr_result = await create_pull_request(
-        gh_token,
-        owner,
-        repo,
-        title=pr_title,
-        head=staging_branch,
-        base=target_branch,
-        body=pr_body,
+    # Stake the creation claim UNDER the lock, then release it (commit) around
+    # the slow create_pull_request call so a concurrent worker observes the
+    # claim and defers instead of POSTing a duplicate rollup PR.
+    claim_ts = time.time()
+    task.context = {**ctx, "rollup_pr_creating_at": claim_ts}
+    pre_create_snapshot = await _release_parent_lock(
+        task, session, context_dirty=True
     )
+
+    try:
+        pr_result = await create_pull_request(
+            gh_token,
+            owner,
+            repo,
+            title=pr_title,
+            head=staging_branch,
+            base=target_branch,
+            body=pr_body,
+        )
+    except Exception:
+        await _clear_manual_rollup_create_claim(
+            session,
+            task_id=task_id,
+            claim_ts=claim_ts,
+            pre_create_snapshot=pre_create_snapshot,
+            task_in_session=task,
+        )
+        raise
     rollup_pr_url = pr_result.get("html_url", "")
     rollup_pr_number = pr_result.get("number")
+    empty_diff = bool(pr_result.get("empty_diff"))
+
+    # Re-acquire the lock and record the durable marker, dropping the now
+    # superseded creation claim. The marker is the crash-recovery signal both
+    # paths key on, so persist it before any other writer can observe an empty
+    # marker on an EVALUATING parent.
+    task = await _relock_parent(
+        session, task_id, pre_create_snapshot, parent_in_session=task
+    )
+    if task is None:
+        # A peer mutated the parent during PR creation. For a real PR, persist
+        # the durable marker best-effort so it is not orphaned. For the empty-
+        # diff sentinel there is no PR to rescue, so never stamp PR #0.
+        session.expire_all()
+        fresh = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if fresh is not None:
+            if empty_diff:
+                fresh_ctx = fresh.context or {}
+                if not fresh_ctx.get("rollup_pr_number"):
+                    fresh.status = TaskStatus.COMPLETED
+                    fresh.context = _clear_rollup_transient_state(fresh_ctx)
+                    fresh.latest_status_message = (
+                        f"✓ All {len(children)} subtasks completed — no new changes "
+                        f"to merge (fixes already on {target_branch})"
+                    )[:500]
+                    session.add(fresh)
+                    await session.commit()
+                    try:
+                        await delete_branch(gh_token, owner, repo, staging_branch)
+                    except Exception as e:
+                        logger.warning(
+                            f"[ADMIN] Failed to delete staging branch '{staging_branch}' "
+                            f"for task {task_id}: {e}"
+                        )
+            else:
+                fctx = {
+                    k: v
+                    for k, v in (fresh.context or {}).items()
+                    if k != "rollup_pr_creating_at"
+                }
+                fresh.context = {
+                    **fctx,
+                    "rollup_pr_number": rollup_pr_number,
+                    "rollup_pr_url": rollup_pr_url,
+                }
+                session.add(fresh)
+                await session.commit()
+        return {
+            "rollup_pr_url": rollup_pr_url,
+            "rollup_pr_number": rollup_pr_number,
+            "target": target_branch,
+            "status": fresh.status if fresh is not None else TaskStatus.EVALUATING,
+        }
+
+    if empty_diff:
+        task.status = TaskStatus.COMPLETED
+        task.context = _clear_rollup_transient_state(task.context)
+        task.latest_status_message = (
+            f"✓ All {len(children)} subtasks completed — no new changes "
+            f"to merge (fixes already on {target_branch})"
+        )[:500]
+        session.add(task)
+        await session.commit()
+        try:
+            await delete_branch(gh_token, owner, repo, staging_branch)
+        except Exception as e:
+            logger.warning(
+                f"[ADMIN] Failed to delete staging branch '{staging_branch}' "
+                f"for task {task.id}: {e}"
+            )
+        return {
+            "rollup_pr_url": "",
+            "rollup_pr_number": rollup_pr_number,
+            "target": target_branch,
+            "status": task.status,
+        }
+
+    ctx = {
+        k: v for k, v in (task.context or {}).items() if k != "rollup_pr_creating_at"
+    }
+    task.context = {
+        **ctx,
+        "rollup_pr_number": rollup_pr_number,
+        "rollup_pr_url": rollup_pr_url,
+    }
+    ctx = task.context
 
     is_target_intermediate = _project is not None and _project.is_staging_branch(
         target_branch

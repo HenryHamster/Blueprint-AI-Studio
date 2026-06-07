@@ -33,23 +33,38 @@ vi.mock('./AutonomousConfigSection', () => ({
   AutonomousConfigSection: () => <div>AutonomousConfig</div>,
 }));
 
-vi.mock('../hooks/useDirectionForm', () => ({
-  useDirectionForm: () => ({
+// Stable form mock with a persistent addIdempotencyKeyRef so retries observed
+// by the panel reuse one key (resetAddForm clears it, mirroring the real hook).
+const formMock = vi.hoisted(() => {
+  const addIdempotencyKeyRef = { current: null as string | null };
+  return {
     newText: 'Test direction',
     setNewText: vi.fn(),
     newPriority: 'medium',
     setNewPriority: vi.fn(),
+    newCategory: null,
+    setNewCategory: vi.fn(),
     newPathTags: [],
     setNewPathTags: vi.fn(),
     newPathInput: '',
     setNewPathInput: vi.fn(),
     newCompletionCriteria: 'Done when merged',
     setNewCompletionCriteria: vi.fn(),
+    newStaged: false,
+    setNewStaged: vi.fn(),
+    addIdempotencyKeyRef,
+    markAddAttemptFailed: vi.fn(),
+    newSuccessEvidence: 'Latency p99 < 200ms in prod',
+    setNewSuccessEvidence: vi.fn(),
+    newRetirementCondition: 'One clean promotion cycle',
+    setNewRetirementCondition: vi.fn(),
     editingId: null,
     setEditingId: vi.fn(),
     editText: '',
     editPriority: 'medium',
     editStatus: 'active',
+    editCategory: null,
+    setEditCategory: vi.fn(),
     editPathTags: [],
     editPathInput: '',
     setEditText: vi.fn(),
@@ -59,9 +74,19 @@ vi.mock('../hooks/useDirectionForm', () => ({
     setEditPathInput: vi.fn(),
     editCompletionCriteria: '',
     setEditCompletionCriteria: vi.fn(),
+    editSuccessEvidence: '',
+    setEditSuccessEvidence: vi.fn(),
+    editRetirementCondition: '',
+    setEditRetirementCondition: vi.fn(),
     startEdit: vi.fn(),
-    resetAddForm: vi.fn(),
-  }),
+    resetAddForm: vi.fn(() => {
+      addIdempotencyKeyRef.current = null;
+    }),
+  };
+});
+
+vi.mock('../hooks/useDirectionForm', () => ({
+  useDirectionForm: () => formMock,
 }));
 
 vi.mock('../hooks/useAutonomousConfig', () => ({
@@ -120,6 +145,7 @@ describe('DirectionsPanel', () => {
     console.error = vi.fn();
     fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
+    formMock.addIdempotencyKeyRef.current = null;
   });
 
   afterEach(() => {
@@ -257,6 +283,78 @@ describe('DirectionsPanel', () => {
     if (!postCall) throw new Error('test setup: expected POST call');
     const body = JSON.parse((postCall[1] as RequestInit).body as string);
     expect(body.completion_criteria).toBe('Done when merged');
+    expect(body.success_evidence).toBe('Latency p99 < 200ms in prod');
+    expect(body.retirement_condition).toBe('One clean promotion cycle');
+    // Every create now carries a client idempotency identity.
+    expect(typeof body.idempotency_key).toBe('string');
+    expect(body.idempotency_key.length).toBeGreaterThan(0);
+  });
+
+  it('reuses one idempotency_key when a failed add is retried', async () => {
+    const user = userEvent.setup();
+    // First POST fails (non-2xx), every other route is OK.
+    fetchSpy.mockImplementation((url: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = url.toString();
+      const isAddPost =
+        init?.method === 'POST' && urlStr.includes('/directions') && !urlStr.includes('task-counts');
+      if (isAddPost && !(fetchSpy as unknown as { _added?: boolean })._added) {
+        (fetchSpy as unknown as { _added?: boolean })._added = true;
+        return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) } as Response);
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
+    });
+
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    const input = await screen.findByPlaceholderText('New direction...');
+    const addBtn = input.parentElement?.querySelector('button');
+    if (!addBtn) throw new Error('test setup: expected add button');
+
+    await user.click(addBtn); // fails — key retained
+    await user.click(addBtn); // retry — same key
+
+    await waitFor(() => {
+      const posts = fetchSpy.mock.calls.filter(
+        (c) => (c[1] as RequestInit | undefined)?.method === 'POST' && c[0].toString().includes('/directions') && !c[0].toString().includes('task-counts'),
+      );
+      expect(posts.length).toBe(2);
+      const keys = posts.map((c) => JSON.parse((c[1] as RequestInit).body as string).idempotency_key);
+      expect(keys[0]).toBeTruthy();
+      expect(keys[0]).toBe(keys[1]);
+    });
+  });
+
+  it('treats a status:"duplicate" add response as a clean success (no error)', async () => {
+    const user = userEvent.setup();
+    const addToast = vi.fn();
+    fetchSpy.mockImplementation((url: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = url.toString();
+      const isAddPost =
+        init?.method === 'POST' && urlStr.includes('/directions') && !urlStr.includes('task-counts');
+      if (isAddPost) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ direction: { id: 'd-1' }, status: 'duplicate' }),
+        } as Response);
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
+    });
+
+    render(<DirectionsPanel onClose={vi.fn()} addToast={addToast} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    const input = await screen.findByPlaceholderText('New direction...');
+    const addBtn = input.parentElement?.querySelector('button');
+    if (!addBtn) throw new Error('test setup: expected add button');
+
+    await user.click(addBtn);
+
+    await waitFor(() => {
+      const posts = fetchSpy.mock.calls.filter(
+        (c) => (c[1] as RequestInit | undefined)?.method === 'POST' && c[0].toString().includes('/directions') && !c[0].toString().includes('task-counts'),
+      );
+      expect(posts.length).toBe(1);
+    });
+    // Duplicate replay routes to success — the add form is reset, no error toast.
+    expect(formMock.resetAddForm).toHaveBeenCalled();
+    expect(addToast).not.toHaveBeenCalledWith(expect.anything(), 'error');
   });
 
   it('renders the strategist-working indicator when strategistActive is true', async () => {

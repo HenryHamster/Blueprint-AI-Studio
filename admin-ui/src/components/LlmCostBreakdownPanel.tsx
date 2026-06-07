@@ -12,6 +12,16 @@ function fmtShare(share: number | null): string {
   return share != null ? `${Math.round(share * 100)}%` : '—';
 }
 
+function fmtMergeRate(rate: number | null): string {
+  return rate != null ? `${Math.round(rate * 100)}%` : '—';
+}
+
+// Cost-per-merge is null for unpriced (understated cost) or zero-merge buckets;
+// render an em-dash there rather than a confident-but-misleading dollar figure.
+function fmtCostPerMerge(cost: number | null): string {
+  return cost != null ? `$${cost.toFixed(2)}` : '—';
+}
+
 /**
  * Per-model LLM token-spend breakdown for the selected project, over a rolling
  * window (default 7 days). Surfaces which model drives token cost and warns when
@@ -39,7 +49,7 @@ export function LlmCostBreakdownPanel({
   if (!selectedProjectId || state?.projectId !== selectedProjectId) return null;
   const data = state.data;
 
-  const { by_model, totals, unpriced_combos } = data;
+  const { by_model, totals, unpriced_combos, approximate_priced_combos } = data;
   const coverage = totals.unpriced_coverage_fraction;
   const fullCoverage = coverage == null || coverage >= 1;
 
@@ -49,7 +59,7 @@ export function LlmCostBreakdownPanel({
     </h2>
   );
 
-  if (totals.total_cost_usd <= 0 || by_model.length === 0) {
+  if (by_model.length === 0) {
     return (
       <section>
         {Header}
@@ -60,10 +70,17 @@ export function LlmCostBreakdownPanel({
     );
   }
 
-  const coverageWarning = !fullCoverage && (
+  const allUnpriced = totals.total_cost_usd <= 0 && totals.unpriced_task_count > 0;
+  const coverageWarning = (allUnpriced || !fullCoverage) && (
     <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
-      <span className="font-semibold">Pricing coverage {fmtShare(coverage)}</span>
-      {' — '}{totals.unpriced_task_count} of {totals.priced_task_count + totals.unpriced_task_count} priceable tasks have no pricing entry, so reported cost is understated.
+      <span className="font-semibold">
+        {allUnpriced ? 'Cost data unavailable' : `Pricing coverage ${fmtShare(coverage)}`}
+      </span>
+      {' — '}
+      {allUnpriced
+        ? `All ${totals.unpriced_task_count} token-bearing tasks have no pricing entry, so actual cost is unknown.`
+        : `${totals.unpriced_task_count} of ${totals.priced_task_count + totals.unpriced_task_count} priceable tasks have no pricing entry, so reported cost is understated.`
+      }
       {unpriced_combos.length > 0 && (
         <div className="mt-1 text-amber-400/80">
           Unpriced: <span className="font-mono">{unpriced_combos.join(', ')}</span>
@@ -72,10 +89,31 @@ export function LlmCostBreakdownPanel({
     </div>
   );
 
+  const fallbackWarning = totals.fallback_task_count > 0 && (
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+      <span className="font-semibold">
+        {totals.fallback_task_count} fallback {totals.fallback_task_count === 1 ? 'task' : 'tasks'}
+      </span>
+      {' — '}ran on a different provider/model than the intended routing (${totals.fallback_cost_usd.toFixed(2)} of spend), so by-model attribution folds these into the resolved model rather than the configured one.
+    </div>
+  );
+
+  const approximateWarning = approximate_priced_combos.length > 0 && (
+    <div className="mb-2 rounded border border-blue-500/30 bg-blue-500/10 px-2.5 py-1.5 text-[10px] text-blue-300">
+      <span className="font-semibold">Approximate pricing</span>
+      {' — '}some combos are priced at a proxy rate (closest GA-tier equivalent) as no separately published API rate exists.
+      <div className="mt-1 text-blue-400/80">
+        <span className="font-mono">{approximate_priced_combos.join(', ')}</span>
+      </div>
+    </div>
+  );
+
   return (
     <section>
       {Header}
       {coverageWarning}
+      {fallbackWarning}
+      {approximateWarning}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
@@ -85,6 +123,7 @@ export function LlmCostBreakdownPanel({
                 <span className="font-medium text-neutral-200 break-words">
                   {row.model}
                   {!row.priced && <span className="ml-1 text-amber-400">(unpriced)</span>}
+                  {row.approximate_priced && <span className="ml-1 text-blue-400">(approx)</span>}
                 </span>
                 <span className="text-neutral-500 shrink-0">{row.provider}</span>
               </div>
@@ -93,6 +132,9 @@ export function LlmCostBreakdownPanel({
                 <span>Share: <span className="text-neutral-300 tabular-nums">{fmtShare(row.share_of_total_cost)}</span></span>
                 <span>Cost: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
                 <span>$/Task: <span className="text-neutral-300 font-mono tabular-nums">${row.mean_cost_per_task.toFixed(3)}</span></span>
+                <span>Merged: <span className="text-neutral-300 tabular-nums">{row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})</span></span>
+                <span>Verified: <span className="text-neutral-300 tabular-nums">{row.verified_merged_count}/{row.task_count} ({fmtMergeRate(row.verified_merge_rate)})</span></span>
+                <span>$/Verified Merge: <span className="text-neutral-300 font-mono tabular-nums">{fmtCostPerMerge(row.cost_per_merge)}</span></span>
               </div>
             </div>
           ))}
@@ -105,6 +147,9 @@ export function LlmCostBreakdownPanel({
               <th className="text-right px-3 py-2 font-medium">In / Out Tokens</th>
               <th className="text-right px-3 py-2 font-medium">Cost</th>
               <th className="text-right px-3 py-2 font-medium">$/Task</th>
+              <th className="text-right px-3 py-2 font-medium">Merged</th>
+              <th className="text-right px-3 py-2 font-medium">Verified</th>
+              <th className="text-right px-3 py-2 font-medium">$/Verified Merge</th>
               <th className="text-right px-3 py-2 font-medium">Share</th>
             </tr>
           </thead>
@@ -115,6 +160,7 @@ export function LlmCostBreakdownPanel({
                   <span className="font-medium text-neutral-200">{row.model}</span>
                   <span className="text-neutral-500 ml-1.5 text-[10px]">{row.provider}</span>
                   {!row.priced && <span className="ml-1.5 text-[10px] text-amber-400">unpriced</span>}
+                  {row.approximate_priced && <span className="ml-1.5 text-[10px] text-blue-400">approx</span>}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
                   {fmtTokens(row.total_input_tokens)} / {fmtTokens(row.total_output_tokens)}
@@ -124,6 +170,15 @@ export function LlmCostBreakdownPanel({
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
                   ${row.mean_cost_per_task.toFixed(3)}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.verified_merged_count}/{row.task_count} ({fmtMergeRate(row.verified_merge_rate)})
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
+                  {fmtCostPerMerge(row.cost_per_merge)}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
                   {fmtShare(row.share_of_total_cost)}

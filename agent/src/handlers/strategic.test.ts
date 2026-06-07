@@ -86,7 +86,14 @@ vi.mock('./research-plan.js', () => ({
   buildMemoCitationsSection: () => '',
   resolveMemoHandles: () => [],
   buildEfficiencySnapshotSection: () => '',
-  buildPortfolioComposition: () => '',
+  // Echo the authoritative active-total arg so wiring tests can assert the
+  // handler threads payload.direction_counts.active through.
+  buildPortfolioComposition: (
+    _a: unknown,
+    _b: unknown,
+    _c: unknown,
+    authoritativeActiveTotal?: number,
+  ) => `PORTFOLIO(auth=${authoritativeActiveTotal})`,
 }));
 
 vi.mock('./strategic-sections.js', () => ({
@@ -104,8 +111,15 @@ vi.mock('./strategic-sections.js', () => ({
   buildConversationThreadSection: () => '',
   buildFeedbackSection: () => '',
   buildOpenMessagesText: () => '',
-  buildDirSummaryText: () => '',
-  buildDirHealthSummary: () => '',
+  // Echo the authoritative count args so wiring tests can assert the handler
+  // threads payload.direction_counts through to these builders.
+  buildDirSummaryText: (_d: unknown, authoritativeActiveCount?: number) =>
+    `DIRSUMMARY(auth=${authoritativeActiveCount})`,
+  buildDirHealthSummary: (
+    _d: unknown,
+    maxActiveDirections: number,
+    authoritative?: { active: number; paused: number },
+  ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
 }));
 
 import {
@@ -379,6 +393,46 @@ describe('handleStrategic cycle_start_reconciliation wiring', () => {
     await handleStrategic('task-recon-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
 
     expect(capturedThinkerParams?.cycleStartReconciliationSection).toBe('');
+  });
+});
+
+describe('handleStrategic authoritative direction_counts wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('anchors direction views on direction_counts when directions_summary is empty', async () => {
+    // directions_summary dropped under budget; direction_counts (critical) carries
+    // the true active count + real ceiling.
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      directions_summary: [],
+      direction_counts: { active: 12, paused: 1, total: 13, max_active: 15 },
+      max_active_directions: 15,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dc', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const p = capturedThinkerParams;
+    // The handler threads the authoritative active count (12) and the real
+    // ceiling (15) into all three direction builders.
+    expect(String(p?.dirHealthSummary)).toBe('DIRHEALTH(max=15,auth=12)');
+    expect(String(p?.portfolioCompositionText)).toBe('PORTFOLIO(auth=12)');
+    expect(String(p?.dirSummaryText)).toBe('DIRSUMMARY(auth=12)');
+  });
+
+  it('falls back to undefined authoritative count + default ceiling when direction_counts absent', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      directions_summary: [],
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dc-absent', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const p = capturedThinkerParams;
+    expect(String(p?.dirHealthSummary)).toBe('DIRHEALTH(max=10,auth=undefined)');
+    expect(String(p?.portfolioCompositionText)).toBe('PORTFOLIO(auth=undefined)');
+    expect(String(p?.dirSummaryText)).toBe('DIRSUMMARY(auth=undefined)');
   });
 });
 

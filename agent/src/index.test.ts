@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -5478,19 +5478,55 @@ describe('fetchVmImageIdentity', () => {
   });
 });
 
+describe('readAgentSourceSha', () => {
+  afterEach(() => {
+    mockReadFileSync.mockReset();
+  });
+
+  it('parses a valid AGENT_SOURCE_SHA marker', () => {
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567\n');
+    expect(readAgentSourceSha()).toBe('0123456789abcdef0123456789abcdef01234567');
+  });
+
+  it('accepts an abbreviated 7-hex SHA', () => {
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
+    expect(readAgentSourceSha()).toBe('abc1234');
+  });
+
+  it('returns null for the unknown fallback', () => {
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=unknown');
+    expect(readAgentSourceSha()).toBeNull();
+  });
+
+  it('returns null for an empty value', () => {
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=');
+    expect(readAgentSourceSha()).toBeNull();
+  });
+
+  it('returns null when the marker file is absent', () => {
+    mockReadFileSync.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    expect(readAgentSourceSha()).toBeNull();
+  });
+});
+
 describe('agent runtime fingerprint heartbeats', () => {
   let fetchMock: FetchMock;
   const runtimeFingerprint = 'a'.repeat(64);
+  const sourceSha = 'abc1234def5678';
 
   beforeEach(() => {
     fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     _setAgentRuntimeFingerprintForTesting(runtimeFingerprint);
+    _setAgentSourceShaForTesting(sourceSha);
   });
 
   afterEach(() => {
     _stopHeartbeatForTesting();
     _setAgentRuntimeFingerprintForTesting(null);
+    _setAgentSourceShaForTesting(null);
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
@@ -5527,8 +5563,9 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(typeof vmHeartbeatBody).toBe('string');
     const body = JSON.parse(
       defined(typeof vmHeartbeatBody === 'string' ? vmHeartbeatBody : undefined),
-    ) as { agent_runtime_fingerprint?: string };
+    ) as { agent_runtime_fingerprint?: string; agent_source_sha?: string };
     expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+    expect(body.agent_source_sha).toBe(sourceSha);
   });
 
   it('includes agent_runtime_fingerprint in /api/agent/heartbeat payloads', async () => {
@@ -5548,9 +5585,10 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(typeof heartbeatBody).toBe('string');
     const body = JSON.parse(
       defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
-    ) as { task_id?: string; agent_runtime_fingerprint?: string };
+    ) as { task_id?: string; agent_runtime_fingerprint?: string; agent_source_sha?: string };
     expect(body.task_id).toBe('task-runtime-fp');
     expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+    expect(body.agent_source_sha).toBe(sourceSha);
   });
 });
 

@@ -15,17 +15,20 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.landed_signal import has_landed_signal
+from app.database import resolve_dialect_name
+from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
     Alert,
+    Project,
     Task,
     TaskStatus,
     ReleaseVersion,
 )
+from app.time_utils import _coerce_naive_utc, _utcnow
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
 # module. Re-exported here so existing import paths are unchanged.
 from app.digest_remediation import (  # noqa: F401
@@ -36,6 +39,12 @@ from app.digest_remediation import (  # noqa: F401
 # Per-direction progress aggregation (the single largest analytic) relocated to
 # its own module. Re-exported here so existing import paths are unchanged.
 from app.digest_direction_progress import compute_direction_progress  # noqa: F401
+
+# Per-effort-tier / per-actual-model efficiency rollup lives next to the shared
+# LLM pricing table in efficiency_snapshot (so its totals reconcile with the
+# per-model cost breakdown). Re-exported here so the digest consumer and tests
+# import it from the same module as the other digest metrics.
+from app.efficiency_snapshot import compute_effort_model_efficiency  # noqa: F401
 
 # SR/review-quality metrics cluster relocated to its own module.
 # Re-exported here so existing import paths are unchanged.
@@ -57,7 +66,6 @@ from app.sr_review_quality_metrics import (  # noqa: F401
     _reviewer_caught_author_miss,
     _compute_edges_considered_metrics,
     compute_sr_prediction_accuracy,
-    _compute_parallel_review_effectiveness,
     compute_review_quality_metrics,
 )
 from app.failure_classification import (
@@ -80,6 +88,7 @@ from app.failure_classification import (
 logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
+_MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD = timedelta(hours=2)
 
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
@@ -97,6 +106,8 @@ _FAILURE_CLASS_LABELS = {
     REASSIGNED: "Agent Reassigned",
     NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
 }
+
+_FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
 
 
 def _compute_first_attempt_breakdowns(
@@ -179,8 +190,27 @@ def _compute_first_attempt_breakdowns(
             for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
         }
 
+    # verified_overall: excludes degraded-unverified merges from the success
+    # count.  A task with _first_attempt_succeeded=True whose PR merged via a
+    # degraded fall-open (environment/setup failure blocked verification) is not
+    # a proven fix on HEAD and should not inflate the success rate.  Benign
+    # fall-opens (no detectable suite, kill-switch off) still count.  Additive
+    # — does not replace "overall".
+    def _fa_verified_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
+        )
+        return round(succ / len(measured), 2)
+
     return {
         "overall": overall,
+        "verified_overall": _fa_verified_rate(terminal_tasks),
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
         "with_arch_context": _fa_rate(with_arch),
@@ -1239,6 +1269,20 @@ _FOUNDATION_OVERLAP_THRESHOLD = 0.5
 # Defensive caps on the surfaced lists so a large backlog never bloats the digest.
 _PARKED_BLOCKER_LIST_LIMIT = 100
 _DUPLICATE_FOUNDATION_LIST_LIMIT = 50
+# Unresumable-cancellation aggregate: how far back to count terminal give-ups,
+# and the cap on the surfaced per-task list.
+_UNRESUMABLE_CANCEL_WINDOW = timedelta(days=7)
+_UNRESUMABLE_CANCEL_LIST_LIMIT = 100
+# Live blocked-population aggregate: cap on the surfaced per-task drill-down list,
+# and the coarse age buckets (in hours) the waiting population is bucketed into.
+_LIVE_BLOCKED_LIST_LIMIT = 100
+# Blocked-resume aggregate: how far back to count successful resumes, and the cap
+# on the surfaced per-task list. Same window as the symmetric give-up signal.
+_BLOCKED_RESUME_WINDOW = timedelta(days=7)
+_BLOCKED_RESUME_LIST_LIMIT = 100
+# Missing-capability-demand aggregate: cap on the surfaced per-demand list
+# (the producer is already largest-demand-first, so this preserves the top tail).
+_MISSING_DEMAND_LIST_LIMIT = 50
 
 
 def _task_related_files(t: "Task") -> set:
@@ -1359,6 +1403,233 @@ def compute_duplicate_foundation_signal(
     }
 
 
+def compute_unresumable_cancellation_summary(
+    cancelled_tasks: List["Task"],
+    *,
+    window_start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Count blocked dependents terminally CANCELLED because they can never resume.
+
+    Pure function — no database calls. Reads the durable
+    ``reaper_sweeps.UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker stamped by
+    ``_cancel_blocker_as_dead`` when the resume system gives up on a blocked
+    dependent (its foundation died, or its need outlived the bounded parked
+    re-evaluations). This give-up IS the failure mode of structural gating, so its
+    rate is the single best health signal — a spike (e.g. from a resume-matcher
+    regression stranding finding-hash/capability needs) is otherwise invisible in
+    aggregate.
+
+    Tasks with no marker are skipped. When ``window_start`` is given, a marker
+    whose ``at`` timestamp is older (or unparseable) is skipped, so the count
+    reflects only a recent window. Returns the total plus breakdowns by give-up
+    class and by originating direction, and a capped newest-first task list.
+    """
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+
+    rows: List[Dict[str, Any]] = []
+    by_class: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    window_iso = window_start.isoformat() if window_start else None
+
+    for t in cancelled_tasks:
+        marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+        if not isinstance(marker, dict):
+            continue
+        at = marker.get("at")
+        # ISO-8601 strings from a common naive-UTC source sort lexicographically,
+        # so a string compare is a correct, cheap window filter.
+        if window_iso and (not isinstance(at, str) or at < window_iso):
+            continue
+        give_up_class = marker.get("give_up_class") or "unknown"
+        direction_id = marker.get("direction_id") or "(none)"
+        by_class[give_up_class] += 1
+        by_direction[direction_id] += 1
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "give_up_class": give_up_class,
+                "need": marker.get("need"),
+                "direction_id": marker.get("direction_id"),
+                "at": at,
+            }
+        )
+
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_class": dict(by_class),
+        "by_direction": dict(by_direction),
+        "tasks": rows[:_UNRESUMABLE_CANCEL_LIST_LIMIT],
+    }
+
+
+def compute_live_blocked_summary(blocked_tasks: List["Task"]) -> Dict[str, Any]:
+    """Summarize the CURRENT BLOCKED population — the healthy waiting set.
+
+    Pure function — no database calls. Unlike ``compute_parked_blocker_summary``
+    (which deliberately counts ONLY parked/escalated blockers — the unhealthy tail),
+    this counts EVERY currently-BLOCKED task, including not-yet-escalated dependents
+    that are healthily waiting for a foundation to land. A regression where resumes
+    stall shows up here as a growing population with ageing waits, which the
+    parked-only and give-up signals cannot see until escalation.
+
+    Buckets each task by how long it has been blocked (derived from ``blocked_at``):
+    ``<1h``, ``1-6h``, ``6-24h``, ``>24h`` (``unknown`` when ``blocked_at`` is
+    missing). Returns the total, the bucket histogram, and a capped newest-blocked-
+    first task list for drill-down.
+    """
+    now = _utcnow()
+    rows: List[Dict[str, Any]] = []
+    by_age: Dict[str, int] = defaultdict(int)
+    for t in blocked_tasks:
+        blocked_at = getattr(t, "blocked_at", None)
+        if blocked_at is None:
+            bucket = "unknown"
+        else:
+            # blocked_at is naive-UTC like _utcnow(); guard tz-aware just in case.
+            age_hours = (now - blocked_at).total_seconds() / 3600.0
+            if age_hours < 1:
+                bucket = "<1h"
+            elif age_hours < 6:
+                bucket = "1-6h"
+            elif age_hours < 24:
+                bucket = "6-24h"
+            else:
+                bucket = ">24h"
+        by_age[bucket] += 1
+        ctx = t.context or {}
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "blocker_kind": getattr(t, "blocker_kind", None),
+                "blocked_reason": getattr(t, "blocked_reason", None)
+                or t.latest_status_message,
+                "blocked_at": blocked_at.isoformat() if blocked_at else None,
+                "age_bucket": bucket,
+                "direction_id": ctx.get("direction_id"),
+            }
+        )
+    rows.sort(key=lambda r: r["blocked_at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_age": dict(by_age),
+        "tasks": rows[:_LIVE_BLOCKED_LIST_LIMIT],
+    }
+
+
+def compute_blocked_resume_summary(
+    resumed_tasks: List["Task"],
+    *,
+    window_start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Count blocked dependents that successfully RESUMED when their foundation landed.
+
+    Pure function — no database calls. The positive, symmetric counterpart to
+    ``compute_unresumable_cancellation_summary``: reads the durable
+    ``reaper_sweeps.RESUME_MARKER_CONTEXT_KEY`` marker stamped by
+    ``_apply_needs_disposition`` when a blocked dependent is requeued (status →
+    QUEUED). The transient status message and the in-memory ``requeued`` counter do
+    not survive, so without this marker a regression where resumes stall looks
+    identical to 'all healthy'.
+
+    Tasks with no marker are skipped. When ``window_start`` is given, a marker whose
+    ``at`` timestamp is older (or unparseable) is skipped, so the count reflects only
+    a recent window. Returns the total plus a breakdown by ``resolved_by`` (``edge``
+    vs ``completed``) and by originating direction, and a capped newest-first task
+    list. NOTE: resumed tasks advance past QUEUED through IN_PROGRESS to terminal
+    states while keeping the marker, so the DB query that feeds this MUST be
+    status-agnostic.
+    """
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    rows: List[Dict[str, Any]] = []
+    by_resolved_by: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    window_iso = window_start.isoformat() if window_start else None
+
+    for t in resumed_tasks:
+        marker = (t.context or {}).get(RESUME_MARKER_CONTEXT_KEY)
+        if not isinstance(marker, dict):
+            continue
+        at = marker.get("at")
+        # Naive-UTC ISO-8601 strings sort lexicographically — a cheap window filter.
+        if window_iso and (not isinstance(at, str) or at < window_iso):
+            continue
+        resolved_by = marker.get("resolved_by") or "unknown"
+        direction_id = marker.get("direction_id") or "(none)"
+        by_resolved_by[resolved_by] += 1
+        by_direction[direction_id] += 1
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "resolved_by": resolved_by,
+                "foundation": marker.get("foundation"),
+                "direction_id": marker.get("direction_id"),
+                "at": at,
+            }
+        )
+
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_resolved_by": dict(by_resolved_by),
+        "by_direction": dict(by_direction),
+        "tasks": rows[:_BLOCKED_RESUME_LIST_LIMIT],
+    }
+
+
+def _compute_finding_structural_give_up_summary(
+    research_tasks: List["Task"],
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    by_reason: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    for t in research_tasks:
+        marker = (t.context or {}).get("finding_structural_give_up")
+        if not isinstance(marker, dict):
+            continue
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "at": marker.get("at") or _coerce_naive_utc(t.updated_at).isoformat(),
+                "sample": list(marker.get("sample") or []),
+                "total": _coerce_count(marker.get("total")) or 0,
+            }
+        )
+        for reason, count in (marker.get("by_reason") or {}).items():
+            by_reason[reason or "unknown"] += _coerce_count(count) or 0
+        for direction_id, count in (marker.get("by_direction") or {}).items():
+            by_direction[direction_id or "(none)"] += _coerce_count(count) or 0
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    sample: List[Dict[str, Any]] = []
+    for row in rows:
+        for item in row["sample"]:
+            sample.append({"task_id": row["task_id"], **item})
+            if len(sample) >= _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT:
+                break
+        if len(sample) >= _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT:
+            break
+    return {
+        "total": sum(row["total"] for row in rows),
+        "by_reason": dict(by_reason),
+        "by_direction": dict(by_direction),
+        "findings": sample,
+    }
+
+
 # Action-confidence threshold for *converging* (serializing) a pair — strictly
 # ABOVE the observability threshold. Strong overlap alone is intentionally NOT
 # enough: the pipeline lets independent tasks edit shared-infrastructure files in
@@ -1397,6 +1668,8 @@ def _genuine_duplicate_reason(ti: "Task", fi: set, tj: "Task", fj: set):
 
 def compute_foundation_convergence_actions(
     active_write_tasks: List[Task],
+    *,
+    exclude_same_parent: bool = True,
 ) -> List[Dict[str, Any]]:
     """High-confidence genuine duplicate-foundation pairs to serialize. Pure.
 
@@ -1407,6 +1680,18 @@ def compute_foundation_convergence_actions(
     builds-on instead of rebuilding. Earlier-is-canonical ordering keeps the edge
     direction deterministic and the wired graph acyclic by construction. The
     caller still applies a self-edge / cycle guard before wiring.
+
+    ``exclude_same_parent`` (default ``True``) skips pairs that share a non-null
+    ``parent_task_id`` — coordinated decomposition siblings that reconcile at
+    merge. The reaper Step 15 sweep and the observability signal keep this on
+    (cross-decomposition tasks have distinct parents). The spawn-time path passes
+    ``exclude_same_parent=False``: a just-spawned batch's children all share the
+    one research-task parent, so the coarse parent check would mask EVERY
+    within-batch genuine duplicate. There the finer "already gated by explicit
+    ``depends_on``" exclusion is enforced downstream by the apply-with-guards
+    helper instead — an already-linked or cycle-closing edge is refused — so
+    coordinated siblings are still left alone while undeclared genuine duplicates
+    converge.
     """
     enriched = [
         (t, _task_related_files(t))
@@ -1424,7 +1709,7 @@ def compute_foundation_convergence_actions(
         for j in range(i + 1, len(enriched)):
             tj, fj = enriched[j]
             pj = getattr(tj, "parent_task_id", None)
-            if pi is not None and pi == pj:
+            if exclude_same_parent and pi is not None and pi == pj:
                 continue
             reason = _genuine_duplicate_reason(ti, fi, tj, fj)
             if reason is None:
@@ -1439,6 +1724,116 @@ def compute_foundation_convergence_actions(
                 }
             )
     return actions
+
+
+async def compute_missing_capability_demand_summary(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Summarize stranded capability/foundation prerequisites as operator demand.
+
+    Thin reshape over ``capability_demand.collect_missing_capability_demand`` — does
+    NOT reimplement the aggregation. The producer scans BLOCKED dependents (unresolved
+    foundation needs, ``still_blocked``) and recently give-up-CANCELLED dependents
+    retired as missing-foundation (``already_cancelled``), folding both by normalized
+    ``(kind, ref)`` identity, largest-demand-first. This stranded demand IS the
+    feedback signal the missing-foundation loop acts on; surfacing it next to the
+    give-up and resume metrics lets an operator see unmet prerequisites that are about
+    to be (or already were) abandoned without a foundation ever being commissioned.
+
+    Returns the distinct-demand ``total``, the ``still_blocked`` vs
+    ``already_cancelled`` split summed across demands, a ``by_direction`` count of how
+    many demands each originating direction carries, and a bounded ``demands`` sample
+    that preserves the producer's largest-first order. Read-only — no DB writes.
+    Tolerant of the producer's empty ``{"total": 0, "demands": []}`` shape.
+    """
+    from app import capability_demand
+
+    demand = await capability_demand.collect_missing_capability_demand(
+        session, project_id, now=now
+    )
+    demands = demand.get("demands") or []
+
+    still_blocked = 0
+    already_cancelled = 0
+    by_direction: Dict[str, int] = defaultdict(int)
+    for entry in demands:
+        still_blocked += int(entry.get("still_blocked", 0) or 0)
+        already_cancelled += int(entry.get("already_cancelled", 0) or 0)
+        for direction_id in entry.get("direction_ids") or []:
+            by_direction[str(direction_id)] += 1
+
+    return {
+        "total": demand.get("total", len(demands)),
+        "still_blocked": still_blocked,
+        "already_cancelled": already_cancelled,
+        "by_direction": dict(by_direction),
+        "demands": demands[:_MISSING_DEMAND_LIST_LIMIT],
+    }
+
+
+def apply_foundation_convergence_action(
+    action: Dict[str, Any],
+    by_id: Dict[str, "Task"],
+    candidates: List["Task"],
+    *,
+    logger=None,
+) -> "Task | None":
+    """Wire ONE convergence action's ``depends_on`` edge with the shared guards.
+
+    Looks up the dependent and canonical foundation in ``by_id`` and, applying the
+    SAME guards the reaper Step 15 sweep uses, refuses a self-edge, a duplicate
+    edge, or any edge that would close a ``depends_on`` cycle
+    (``blocked_need_resolution._would_create_cycle`` over ``candidates``). On
+    success it appends the edge, records its structural provenance, and stamps the
+    dependent's ``_foundation_converged`` context marker so an operator can see why
+    the task was serialized. Returns the mutated dependent task when an edge was
+    wired (the caller still does ``session.add`` / logging / broadcast), else
+    ``None``.
+
+    Both the spawn-time path (``research_completion``) and the reaper Step 15
+    sweep (``reaper_sweeps.sweep_converge_duplicate_foundations``) call this, so
+    the wiring-and-guards step can never drift from the predicate that emitted the
+    action.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.blocked_need_resolution import _would_create_cycle
+    from app.depends_on_provenance import remember_structural_depends_on
+
+    dependent = by_id.get(action["dependent_id"])
+    foundation = by_id.get(action["foundation_id"])
+    if dependent is None or foundation is None:
+        return None
+    found_id = str(foundation.id)
+    if found_id == str(dependent.id):  # defensive self-edge guard
+        return None
+    existing = [str(d) for d in (dependent.depends_on or [])]
+    if found_id in existing:
+        return None
+    if _would_create_cycle(dependent, foundation, candidates):
+        if logger is not None:
+            logger.info(
+                "[CONVERGE] skipped converging %s -> %s — edge would close a "
+                "depends_on cycle",
+                dependent.id,
+                found_id,
+            )
+        return None
+    dependent.depends_on = existing + [found_id]
+    remember_structural_depends_on(dependent, found_id)
+    ctx = dependent.context or {}
+    ctx["_foundation_converged"] = {
+        "foundation_id": found_id,
+        "reason": action["reason"],
+        "shared_files": action["shared_files"],
+    }
+    dependent.context = ctx
+    flag_modified(dependent, "depends_on")
+    flag_modified(dependent, "context")
+    return dependent
 
 
 async def compute_dependency_health_signals(
@@ -1459,13 +1854,22 @@ async def compute_dependency_health_signals(
     Without the ``_recut_escalated`` arm the summarizer's re-cut branch would be
     unreachable in production.
     """
-    parked_predicate = or_(
-        and_(
-            Task.status == TaskStatus.BLOCKED,
-            Task.context["_blocked_escalated"].astext == "true",
-        ),
-        Task.context["_recut_escalated"].astext == "true",
-    )
+    if resolve_dialect_name(session) == "sqlite":
+        parked_predicate = or_(
+            and_(
+                Task.status == TaskStatus.BLOCKED,
+                func.json_extract(Task.context, "$._blocked_escalated").is_not(None),
+            ),
+            func.json_extract(Task.context, "$._recut_escalated").is_not(None),
+        )
+    else:
+        parked_predicate = or_(
+            and_(
+                Task.status == TaskStatus.BLOCKED,
+                Task.context["_blocked_escalated"].astext == "true",
+            ),
+            Task.context["_recut_escalated"].astext == "true",
+        )
     blocked_filters = [parked_predicate]
     if project_id is not None:
         blocked_filters.append(Task.project_id == project_id)
@@ -1488,11 +1892,268 @@ async def compute_dependency_health_signals(
         .all()
     )
 
+    # Terminal give-up cancellations of blocked dependents over a recent window.
+    # Cheaply pre-filtered by updated_at (advances on the CANCELLED transition);
+    # the summarizer refines by the marker's own ``at`` and buckets the counts.
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+    from app.time_utils import _utcnow
+
+    window_start = _utcnow() - _UNRESUMABLE_CANCEL_WINDOW
+    # Key-existence on ``Task.context``: ``has_key`` compiles to the Postgres
+    # JSONB ``?`` operator (fails on the SQLite smoke gate with a parameter
+    # placeholder error), so branch the SQLite path through ``json_extract``,
+    # which resolves the marker to NULL only when the key is absent.
+    if resolve_dialect_name(session) == "sqlite":
+        marker_present = func.json_extract(
+            Task.context, f"$.{UNRESUMABLE_CANCEL_CONTEXT_KEY}"
+        ).is_not(None)
+    else:
+        marker_present = Task.context.has_key(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    cancel_filters = [
+        Task.status == TaskStatus.CANCELLED,
+        marker_present,
+        Task.updated_at >= window_start,
+    ]
+    if project_id is not None:
+        cancel_filters.append(Task.project_id == project_id)
+    cancelled = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*cancel_filters)
+                .limit(_UNRESUMABLE_CANCEL_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Live BLOCKED population — the healthy waiting set the parked-only signal
+    # deliberately excludes. Status-scoped (BLOCKED) so it counts every dependent
+    # currently waiting, escalated or not.
+    live_blocked_filters = [Task.status == TaskStatus.BLOCKED]
+    if project_id is not None:
+        live_blocked_filters.append(Task.project_id == project_id)
+    live_blocked = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*live_blocked_filters)
+                .limit(_LIVE_BLOCKED_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Successful blocked-dependent resumes over a recent window. The marker
+    # persists past the QUEUED transition into IN_PROGRESS/terminal states, so this
+    # query is STATUS-AGNOSTIC — it filters ONLY on marker presence and the
+    # updated_at pre-filter, then the summarizer refines by the marker's own ``at``.
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    resume_window_start = _utcnow() - _BLOCKED_RESUME_WINDOW
+    if resolve_dialect_name(session) == "sqlite":
+        resume_marker_present = func.json_extract(
+            Task.context, f"$.{RESUME_MARKER_CONTEXT_KEY}"
+        ).is_not(None)
+    else:
+        resume_marker_present = Task.context.has_key(RESUME_MARKER_CONTEXT_KEY)
+    resume_filters = [
+        resume_marker_present,
+        Task.updated_at >= resume_window_start,
+    ]
+    if project_id is not None:
+        resume_filters.append(Task.project_id == project_id)
+    resumed = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*resume_filters)
+                .limit(_BLOCKED_RESUME_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if resolve_dialect_name(session) == "sqlite":
+        give_up_present = func.json_extract(
+            Task.context, "$.finding_structural_give_up"
+        ).is_not(None)
+    else:
+        give_up_present = Task.context.has_key("finding_structural_give_up")
+    give_up_filters = [Task.updated_at >= window_start, give_up_present]
+    if project_id is not None:
+        give_up_filters.append(Task.project_id == project_id)
+    finding_give_up = (
+        (
+            await session.execute(
+                select(Task).where(*give_up_filters).limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     return {
         "parked_blockers": compute_parked_blocker_summary(list(blocked)),
         "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
             list(active)
         ),
+        "unresumable_cancellations": compute_unresumable_cancellation_summary(
+            list(cancelled), window_start=window_start
+        ),
+        "finding_structural_give_up": _compute_finding_structural_give_up_summary(
+            list(finding_give_up)
+        ),
+        "live_blocked": compute_live_blocked_summary(list(live_blocked)),
+        "resumes": compute_blocked_resume_summary(
+            list(resumed), window_start=resume_window_start
+        ),
+        "missing_capability_demand": await compute_missing_capability_demand_summary(
+            session, project_id
+        ),
+    }
+
+
+def _coerce_count(value: Any) -> "int | None":
+    """Best-effort int coercion for a JSONB tally value; ``None`` when the value
+    is missing or non-numeric. Lives outside the aggregation loop so the
+    per-entry try/except does not incur the PERF203 in-loop overhead."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_gate_outcome_in_window(
+    outcome: Dict[str, Any], window_start: "datetime"
+) -> bool:
+    """True when a ``recent_outcomes`` entry's ``at`` timestamp is at/after
+    ``window_start``. Defensive: a missing/non-string/unparseable ``at`` is
+    treated as out-of-window (dropped) rather than raising.
+    """
+    at = outcome.get("at")
+    if not isinstance(at, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (ValueError, TypeError):
+        return False
+    return _coerce_naive_utc(parsed) >= window_start
+
+
+async def compute_merge_gate_fleet_health(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+    window_start: "datetime | None" = None,
+) -> Dict[str, Any]:
+    """Fleet-wide no-CI merge-gate verification health — a READ-ONLY observability
+    signal that NEVER influences any merge decision.
+
+    Answers the systemic question no per-project view can: across every project
+    whose no-CI merge gate has run, what fraction of merges actually ran real
+    tests vs. fell open to an UNVERIFIED merge, which fall-open reason dominates,
+    and how many projects have a degraded gate. A systemically-broken gate (e.g.
+    broken provisioning) merges UNVERIFIED at scale while each project looks
+    individually unremarkable; this surfaces that aggregate.
+
+    Data source: per-project ``Project.merge_gate_runtime`` (written by
+    ``ci_resolution.record_no_ci_gate_runtime``) which carries ``recent_outcomes``
+    (a list capped at 20 of ``{"at": iso, "verified": bool, "reason": key|None}``)
+    and the all-time ``unverified_reason_counts`` tally. When ``window_start`` is
+    provided, ``recent_outcomes`` is Python-filtered to entries at/after it (the
+    list is small, so an in-memory filter is cheap and avoids JSONB date math).
+
+    Scoped to ``project_id`` when provided, else fleet-wide. Defensive against a
+    null / legacy four-key-only / malformed ``merge_gate_runtime`` so it can never
+    raise. Returns all-zero counts and ``None`` rates/reason when no project has
+    any gate data.
+    """
+    stmt = select(Project)
+    if project_id is not None:
+        stmt = stmt.where(Project.id == project_id)
+    projects = (await session.execute(stmt)).scalars().all()
+
+    verified_count = 0
+    fell_open_count = 0
+    degraded_project_count = 0
+    project_count = 0
+    reason_histogram: Dict[str, int] = {}
+    windowed_reason_histogram: Dict[str, int] = {}
+
+    for project in projects:
+        raw = getattr(project, "merge_gate_runtime", None)
+        if not isinstance(raw, dict) or not raw:
+            continue
+
+        # Aggregate the all-time per-reason fall-open tally across the fleet so
+        # the dominant fall-open reason can be surfaced regardless of window.
+        raw_counts = raw.get("unverified_reason_counts")
+        if isinstance(raw_counts, dict):
+            for reason_key, count in raw_counts.items():
+                coerced = _coerce_count(count)
+                if coerced is not None:
+                    reason_histogram[str(reason_key)] = (
+                        reason_histogram.get(str(reason_key), 0) + coerced
+                    )
+
+        raw_outcomes = raw.get("recent_outcomes")
+        if not isinstance(raw_outcomes, list):
+            # Legacy four-key-only record (no rolling history) — no window
+            # activity to count.
+            continue
+        outcomes = [o for o in raw_outcomes if isinstance(o, dict)]
+        if window_start is not None:
+            outcomes = [
+                o for o in outcomes if _merge_gate_outcome_in_window(o, window_start)
+            ]
+        if not outcomes:
+            continue
+
+        project_count += 1
+        proj_verified = sum(1 for o in outcomes if o.get("verified"))
+        proj_fell_open = len(outcomes) - proj_verified
+        verified_count += proj_verified
+        fell_open_count += proj_fell_open
+        if proj_fell_open > 0:
+            degraded_project_count += 1
+
+        # Tally windowed fall-open reasons for the dominant reason when a
+        # window is provided. Each outcome carries its own reason, so we
+        # can derive the windowed dominant reason directly without using
+        # the all-time tally.
+        if window_start is not None:
+            for outcome in outcomes:
+                if not outcome.get("verified"):
+                    reason = outcome.get("reason")
+                    if reason is not None:
+                        reason_key = str(reason)
+                        windowed_reason_histogram[reason_key] = (
+                            windowed_reason_histogram.get(reason_key, 0) + 1
+                        )
+
+    total = verified_count + fell_open_count
+    verification_rate = (verified_count / total) if total > 0 else None
+    most_common_reason = None
+    # When a window is provided, use the windowed tally; otherwise use the
+    # all-time tally for completeness.
+    histogram_to_use = windowed_reason_histogram if window_start is not None else reason_histogram
+    if histogram_to_use:
+        # Deterministic tie-break: highest count, then reason key (mirrors
+        # ci_resolution.merge_gate_runtime_block's per-project tie-break).
+        most_common_reason = sorted(
+            histogram_to_use.items(), key=lambda kv: (-kv[1], kv[0])
+        )[0][0]
+
+    return {
+        "verified_count": verified_count,
+        "fell_open_count": fell_open_count,
+        "verification_rate": verification_rate,
+        "most_common_reason": most_common_reason,
+        "degraded_project_count": degraded_project_count,
+        "project_count": project_count,
     }
 
 
@@ -1501,6 +2162,7 @@ def compute_migration_health(
     failed_tasks: List[Task],
     *,
     error_log_map: Dict[str, Any],
+    active_tasks: List[Task] | None = None,
 ) -> Dict[str, Any]:
     """Summarize migration-task throughput and migration-error incidence.
 
@@ -1527,11 +2189,43 @@ def compute_migration_health(
             for f in payload_files
         )
 
+    def _is_migration_producing(t: Task) -> bool:
+        if _task_type(t) == "migrate":
+            return True
+        ctx = t.context or {}
+        files = ctx.get("related_files") or []
+        if isinstance(files, list) and any(
+            isinstance(f, str)
+            and (
+                f.startswith("backend/alembic/versions/")
+                or f == "backend/app/models.py"
+                or f.endswith("/backend/app/models.py")
+            )
+            for f in files
+        ):
+            return True
+        payload_files = (t.first_payload or {}).get("related_files") or []
+        return isinstance(payload_files, list) and any(
+            isinstance(f, str)
+            and (
+                f.startswith("backend/alembic/versions/")
+                or f == "backend/app/models.py"
+                or f.endswith("/backend/app/models.py")
+            )
+            for f in payload_files
+        )
+
+    def _task_age_seconds(t: Task, *, field: str) -> int | None:
+        ts = getattr(t, field, None)
+        if ts is None:
+            return None
+        return max(0, int((_utcnow() - ts).total_seconds()))
+
     _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
         1
-        for t in failed_tasks
+        for t in _migrate_failed
         if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
         or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
     )
@@ -1540,6 +2234,72 @@ def compute_migration_health(
         for t in (completed_tasks + failed_tasks)
         if _task_type(t) != "migrate" and _touched_migration(t)
     )
+
+    active_migration_tasks = [
+        t for t in (active_tasks or []) if _is_migration_producing(t)
+    ]
+    migration_slot_holder = min(
+        (
+            t
+            for t in active_migration_tasks
+            if t.status == TaskStatus.IN_PROGRESS
+        ),
+        key=lambda t: (
+            t.started_at or t.created_at or _utcnow(),
+            str(t.id),
+        ),
+        default=None,
+    )
+    holder_hold_seconds = (
+        _task_age_seconds(migration_slot_holder, field="started_at")
+        if migration_slot_holder is not None
+        else None
+    )
+    if holder_hold_seconds is None and migration_slot_holder is not None:
+        holder_hold_seconds = _task_age_seconds(
+            migration_slot_holder, field="created_at"
+        )
+    serializing_waiters = [
+        t
+        for t in active_migration_tasks
+        if t.status == TaskStatus.QUEUED
+        and (t.latest_status_message or "").startswith(
+            "Waiting: serializing migration"
+        )
+    ]
+    longest_wait = min(
+        serializing_waiters,
+        key=lambda t: (
+            t.updated_at or t.created_at or t.started_at or _utcnow(),
+            str(t.id),
+        ),
+        default=None,
+    )
+    longest_wait_seconds = (
+        _task_age_seconds(longest_wait, field="updated_at")
+        if longest_wait is not None
+        else None
+    )
+    if longest_wait_seconds is None and longest_wait is not None:
+        longest_wait_seconds = _task_age_seconds(longest_wait, field="created_at")
+    deferred_count = len(serializing_waiters)
+    if migration_slot_holder is None and deferred_count == 0:
+        contention_status = "idle"
+        contention_severity = "info"
+    elif deferred_count == 0:
+        contention_status = "held"
+        contention_severity = "info"
+    else:
+        hold_threshold_seconds = int(
+            _MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD.total_seconds()
+        )
+        if holder_hold_seconds is not None and holder_hold_seconds >= hold_threshold_seconds:
+            contention_status = "elevated"
+            contention_severity = "critical"
+        else:
+            contention_status = "contention"
+            contention_severity = "warning"
+
     return {
         "current_schema_revision": EXPECTED_SCHEMA_REVISION,
         "migration_tasks_in_window": len(_migrate_completed) + len(_migrate_failed),
@@ -1547,6 +2307,31 @@ def compute_migration_health(
         "migration_tasks_failed": len(_migrate_failed),
         "migration_errors_in_window": _migration_errors,
         "auto_generated_migrations": _auto_generated_migrations,
+        "migration_slot_contention": {
+            "status": contention_status,
+            "severity": contention_severity,
+            "holder": {
+                "task_id": str(migration_slot_holder.id),
+                "title": migration_slot_holder.title,
+                "started_at": migration_slot_holder.started_at.isoformat()
+                if migration_slot_holder.started_at
+                else None,
+                "hold_seconds": holder_hold_seconds,
+            }
+            if migration_slot_holder is not None
+            else None,
+            "deferred_count": deferred_count,
+            "longest_wait": {
+                "task_id": str(longest_wait.id),
+                "title": longest_wait.title,
+                "waiting_since": longest_wait.updated_at.isoformat()
+                if longest_wait.updated_at
+                else None,
+                "wait_seconds": longest_wait_seconds,
+            }
+            if longest_wait is not None
+            else None,
+        },
     }
 
 
@@ -1652,6 +2437,7 @@ def compute_digest_cost_economics(
     window_start: "datetime",
     now: "datetime",
     daily_cost_ceiling_usd: float,
+    compute_job_daily_cost_usd: float = 0.0,
 ) -> Dict[str, Any]:
     """Compute the digest's entire cost/economics section.
 
@@ -1733,9 +2519,12 @@ def compute_digest_cost_economics(
         else None
     )
 
-    # Compute today's cost for cost ceiling warning
+    # Compute today's cost for cost ceiling warning. The VM figure comes from
+    # task VM-runtime; off-VM compute-job spend is passed in pre-aggregated by
+    # the caller (admin_digest) from the ComputeJob ledger so daily_cost_usd
+    # means total spend, not just VM runtime.
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_cost_usd = round(
+    daily_vm_cost_usd = round(
         sum(
             ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
             * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
@@ -1746,6 +2535,8 @@ def compute_digest_cost_economics(
         ),
         2,
     )
+    daily_compute_cost_usd = round(float(compute_job_daily_cost_usd or 0.0), 2)
+    daily_cost_usd = round(daily_vm_cost_usd + daily_compute_cost_usd, 2)
 
     # Compute overall product_ratio and type_distribution across all directions
     all_product_ratios = [
@@ -1814,9 +2605,13 @@ def compute_digest_cost_economics(
         for ttype in _type_cost
     }
 
-    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
+    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window.
+    # Sum the VERIFIED merge count (excludes unverified-degraded fall-open merges) so the headline pipeline
+    # rate stays consistent with the per-direction acceptance/conversion rates, which already use the verified
+    # count. Fall back to raw prs_merged when the verified key is absent (legacy/partial direction dicts).
     _pipeline_total_merged_d = sum(
-        d.get("prs_merged") or 0 for d in direction_progress_list
+        (d.get("verified_prs_merged", d.get("prs_merged")) or 0)
+        for d in direction_progress_list
     )
     _pipeline_total_rejected_d = sum(
         d.get("prs_rejected") or 0 for d in direction_progress_list
@@ -1827,54 +2622,32 @@ def compute_digest_cost_economics(
         if _pipeline_total_decided > 0
         else None
     )
-    _pipeline_total_created_d = sum(
-        d.get("tasks_created") or 0 for d in direction_progress_list
+    # Conversion rate denominator is PR-eligible tasks (excludes research/audit/
+    # memo/investigate types that never open a PR), matching the per-direction
+    # conversion_rate so the headline figure is not diluted by non-PR work.
+    _pipeline_total_eligible_d = sum(
+        d.get("pr_eligible_tasks_created") or 0 for d in direction_progress_list
     )
     pipeline_conversion_rate = (
-        round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
-        if _pipeline_total_created_d > 0
+        round(_pipeline_total_merged_d / _pipeline_total_eligible_d, 3)
+        if _pipeline_total_eligible_d > 0
         else None
     )
-    pipeline_autonomous_prs_merged = sum(
-        d.get("autonomous_prs_merged") or 0 for d in direction_progress_list
-    )
-    pipeline_assisted_prs_merged = sum(
-        d.get("assisted_prs_merged") or 0 for d in direction_progress_list
-    )
-    pipeline_operator_action_count = sum(
-        d.get("operator_action_count") or 0 for d in direction_progress_list
-    )
-    pipeline_generalized_successes = sum(
-        d.get("generalized_successes", d.get("prs_merged", 0)) or 0
-        for d in direction_progress_list
-    )
-    pipeline_generalized_terminal_outcomes = sum(
-        d.get("generalized_terminal_outcomes", 0) or 0 for d in direction_progress_list
-    )
-    pipeline_generalized_health_rate = (
-        round(
-            pipeline_generalized_successes / pipeline_generalized_terminal_outcomes, 3
-        )
-        if pipeline_generalized_terminal_outcomes > 0
-        else None
-    )
+    # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+    # pipeline_operator_action_count were window-level sums of the per-direction
+    # autonomous_prs_merged / assisted_prs_merged / operator_action_count fields.
+    # They were emitted to /api/admin/digest but had no named consumer — no UI
+    # component or backend decision read them, and they pure-duplicated the
+    # per-direction fields already surfaced in DirectionCard. Removed to satisfy
+    # the "every emitted metric has a named consumer" invariant.
+    # Retired: generalized success / health / outcome-kind rollups were computed here
+    # but never surfaced to /api/admin/digest or any UI consumer.
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = (
                 overall_type_distribution.get(ttype, 0) + cnt
             )
-
-    pipeline_outcome_kind_breakdown: Dict[str, Dict[str, int]] = {}
-    for d in direction_progress_list:
-        for kind, counts in (d.get("outcome_kind_breakdown") or {}).items():
-            bucket = pipeline_outcome_kind_breakdown.setdefault(
-                kind, {"success": 0, "neutral": 0, "failure": 0}
-            )
-            if not isinstance(counts, dict):
-                continue
-            for status in ("success", "neutral", "failure"):
-                bucket[status] += counts.get(status, 0) or 0
 
     pipeline_filter_funnel: Dict[str, int] = {}
     for d in direction_progress_list:
@@ -1889,6 +2662,8 @@ def compute_digest_cost_economics(
         "provisioning_overhead_usd": provisioning_overhead_usd,
         "provisioning_overhead_pct": provisioning_overhead_pct,
         "daily_cost_usd": daily_cost_usd,
+        "daily_vm_cost_usd": daily_vm_cost_usd,
+        "daily_compute_cost_usd": daily_compute_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "overall_product_ratio": overall_product_ratio,
         "median_cost_per_merged_pr": median_cost_per_merged_pr,
@@ -1896,12 +2671,9 @@ def compute_digest_cost_economics(
         "median_cpm_by_type": median_cpm_by_type,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
-        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
-        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
-        "pipeline_operator_action_count": pipeline_operator_action_count,
-        "pipeline_generalized_successes": pipeline_generalized_successes,
-        "pipeline_generalized_health_rate": pipeline_generalized_health_rate,
-        "pipeline_outcome_kind_breakdown": pipeline_outcome_kind_breakdown,
+        # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+        # pipeline_operator_action_count (consumer-less digest duplicates of the
+        # per-direction outcome fields — see retirement note above).
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
     }

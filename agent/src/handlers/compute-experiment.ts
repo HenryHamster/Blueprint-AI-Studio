@@ -71,7 +71,34 @@ function numOrNull(v: unknown): number | null {
   return null;
 }
 
+// Reserved top-level result keys. A reported metric whose name collides with one
+// of these is skipped so it can never overwrite a job-level field. Must stay in
+// sync with the keys written into `result` below.
+const RESERVED_RESULT_KEYS = new Set<string>([
+  'job_id', 'backend', 'machine_type', 'status', 'outcome', 'intentional_terminal',
+  'killed_by', 'final_cost_usd', 'accrued_cost_usd', 'spend_cap_usd', 'terminal_reason',
+  'poll_attempts', 'result_reference', 'experiment',
+]);
+
 type JobResponse = Record<string, unknown>;
+
+/**
+ * Read the command-reported result metrics off the polled terminal job (the
+ * backend stamps them into polling_metadata.result_metrics) and flatten each one
+ * as a top-level NUMERIC key on `result`. Metrics colliding with a reserved
+ * job-level key are skipped; non-numeric values are dropped.
+ */
+function forwardResultMetrics(result: Record<string, unknown>, job: JobResponse): void {
+  const meta = job.polling_metadata;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return;
+  const reported = (meta as Record<string, unknown>).result_metrics;
+  if (!reported || typeof reported !== 'object' || Array.isArray(reported)) return;
+  for (const [name, value] of Object.entries(reported as Record<string, unknown>)) {
+    if (RESERVED_RESULT_KEYS.has(name)) continue;
+    const numeric = numOrNull(value);
+    if (numeric !== null) result[name] = numeric;
+  }
+}
 
 function unwrapJobData(res: unknown): JobResponse | null {
   if (res && typeof res === 'object' && 'data' in res) {
@@ -324,7 +351,7 @@ export async function handleComputeExperiment(
   const classification = classifyOutcome(outcome, status);
   const finalCost = numOrNull(finalJob.final_cost_usd) ?? numOrNull(finalJob.accrued_cost_usd);
 
-  const result = {
+  const result: Record<string, unknown> = {
     job_id: jobId,
     backend: strVal(finalJob.backend) || null,
     machine_type: strVal(finalJob.machine_type) || null,
@@ -341,8 +368,14 @@ export async function handleComputeExperiment(
     experiment,
   };
 
+  // Flatten command-reported result metrics to the TOP LEVEL as numeric keys so
+  // the downstream gate can read them by name (obj.get(metricName)). A metric
+  // whose name collides with a reserved job-level key is SKIPPED — it must never
+  // overwrite the job-level field.
+  forwardResultMetrics(result, finalJob);
+
   const killedSuffix = classification.killedBy ? ` (killed by ${classification.killedBy})` : '';
-  sendLog(ws, `Compute job ${jobId} terminal: outcome=${result.outcome}${killedSuffix}, final_cost=$${finalCost ?? 'n/a'}\n`);
+  sendLog(ws, `Compute job ${jobId} terminal: outcome=${(outcome || status) || 'unknown'}${killedSuffix}, final_cost=$${finalCost ?? 'n/a'}\n`);
 
   await persistAndPostStatus(taskId, {
     task_id: taskId,

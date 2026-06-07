@@ -27,6 +27,10 @@ import {
   formatDecompositionOutcomes,
 } from './research-direction-context.js';
 import { renderDirection } from './direction-renderer.js';
+import {
+  writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
+} from './strategic-helpers.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 export {
   formatCochangeHints,
   formatDecompositionOutcomes,
@@ -1042,9 +1046,21 @@ export function buildPortfolioComposition(
   activeDirections: Array<Record<string, unknown>>,
   systems: Array<Record<string, unknown>>,
   activeByScope: Record<string, number> | undefined,
+  authoritativeActiveTotal?: number,
+  authoritativeSystemCounts?: Record<string, number>,
 ): string {
-  const total = activeDirections.length;
+  const shipped = activeDirections.length;
+  // Anchor the empty-state guard and percentage denominator on the trim-proof
+  // authoritative active total when present; fall back to the (possibly trimmed)
+  // shipped row count for old payloads/tests that omit it. Never render
+  // "portfolio is empty" while the authoritative count says directions are active.
+  const total = (typeof authoritativeActiveTotal === 'number' && authoritativeActiveTotal >= 0)
+    ? authoritativeActiveTotal
+    : shipped;
   if (total === 0) return 'No active directions — portfolio is empty.';
+  if (shipped === 0) {
+    return `Portfolio has ${total} active direction(s), but their per-direction detail was not shipped this cycle (trimmed/dropped under the byte budget) — category mix unavailable. Fetch with \`./fetch direction <id>\`.`;
+  }
 
   const catCounts: Record<string, number> = { product: 0, structural: 0, mixed: 0, uncategorized: 0 };
   const systemCounts: Record<string, number> = {};
@@ -1066,27 +1082,62 @@ export function buildPortfolioComposition(
   const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
   const productPct = pct(catCounts.product);
   const lines: string[] = [];
+  // When the shipped rows are fewer than the authoritative total, the category
+  // mix is computed from the shipped subset but percentages divide by the true
+  // total — flag that so the reader does not mistake a partial mix for the whole.
+  if (shipped < total) {
+    lines.push(`_Category mix below computed from ${shipped} of ${total} active directions shipped this cycle (${total - shipped} trimmed for budget — fetch with \`./fetch direction <id>\`); percentages use the authoritative total of ${total}._`);
+  }
   const catParts = (['product', 'structural', 'mixed', 'uncategorized'] as const)
     .filter(c => catCounts[c] > 0)
     .map(c => `${c}=${catCounts[c]} (${pct(catCounts[c])}%)`);
   const productFlag = productPct < 30 ? ' [LOW PRODUCT RATIO — <30%]' : '';
   lines.push(`Category mix: ${catParts.join(', ')}${productFlag}`);
 
-  const mappedSystems = new Set(Object.keys(systemCounts));
+  // Per-system signals (coverage gaps + concentration risk). Prefer the
+  // authoritative per-system active map when present — it is computed from the
+  // FULL direction set before trimming, so a system whose only direction was
+  // trimmed out of the shipped rows is never falsely reported uncovered, and a
+  // trimmed direction still counts toward concentration. Fall back to the
+  // shipped-row map for older payloads/tests that omit it.
+  const hasAuthSystemCounts = authoritativeSystemCounts != null
+    && typeof authoritativeSystemCounts === 'object';
+  const effectiveSystemCounts: Record<string, number> = hasAuthSystemCounts
+    ? authoritativeSystemCounts
+    : systemCounts;
+  // The shipped detail list is incomplete when fewer active rows shipped than
+  // the authoritative total — i.e. some active directions were trimmed.
+  const listIncomplete = shipped < total;
+
   const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
     id: s.id as string,
     name: typeof s.name === 'string' ? (s.name) : (s.id as string),
   }));
-  const uncovered = allSystems.filter(s => !mappedSystems.has(s.id));
   if (allSystems.length > 0) {
-    lines.push(`System coverage: ${mappedSystems.size}/${allSystems.length} vision systems have directions`
-      + (uncovered.length > 0 ? ` — gaps: ${uncovered.map(s => `${s.name} (${s.id})`).join(', ')}` : ''));
+    const mapped = allSystems.filter(s => (effectiveSystemCounts[s.id] || 0) > 0);
+    if (hasAuthSystemCounts || !listIncomplete) {
+      // Authoritative map present, OR the shipped rows are complete — uncovered
+      // claims are trustworthy.
+      const uncovered = allSystems.filter(s => (effectiveSystemCounts[s.id] || 0) === 0);
+      lines.push(`System coverage: ${mapped.length}/${allSystems.length} vision systems have directions`
+        + (uncovered.length > 0 ? ` — gaps: ${uncovered.map(s => `${s.name} (${s.id})`).join(', ')}` : ''));
+    } else {
+      // Map absent AND shipped rows incomplete — cannot prove a system is
+      // uncovered (its only direction may have been trimmed for budget).
+      // Suppress the false gap list; report only the verifiable lower bound.
+      lines.push(`System coverage: at least ${mapped.length}/${allSystems.length} vision systems have directions (coverage gaps not shown — per-direction detail trimmed for budget, so an unmapped system may still be covered; fetch with \`./fetch direction <id>\`)`);
+    }
   }
 
-  const concentrated = Object.entries(systemCounts).filter(([, n]) => n >= 3);
+  const concentrated = Object.entries(effectiveSystemCounts).filter(([, n]) => n >= 3);
   if (concentrated.length > 0) {
     const parts = concentrated.map(([sid, n]) => `${sid}=${n}`);
-    lines.push(`CONCENTRATION RISK: 3+ directions on same system: ${parts.join(', ')}`);
+    // When derived from the shipped subset only (no authoritative map, list
+    // trimmed), the count may under-report directions that were trimmed.
+    const partialNote = (!hasAuthSystemCounts && listIncomplete)
+      ? ' [from shipped subset only — may under-count trimmed directions]'
+      : '';
+    lines.push(`CONCENTRATION RISK: 3+ directions on same system: ${parts.join(', ')}${partialNote}`);
   }
 
   if (activeByScope) {
@@ -1215,6 +1266,13 @@ export async function handlePlan(
   // The plan prompt advertises `./design-doc get <key>` for architectural
   // grounding; provision the read-only helper so that contract is honest.
   writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|section|playbook) so the
+  // planner can resolve refs trimmed from its launch snapshot. project_id is set
+  // for all task types by the backend; if it is missing we skip BOTH the helper
+  // and its prompt advertisement so we never promise a helper we didn't write.
+  const planProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (planProjectId) writeFetchHelper(taskId, planProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const planFetchGuidance = planProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const disallowedTools = configureAgentPermissions('plan');
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -1267,7 +1325,8 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "scope": "medium",
       "risk": "low",
       "type": "create",
-      "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)"
+      "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)",
+      "acceptance_evidence": { "kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar" }
     },
     {
       "title": "feat: second subtask",
@@ -1314,13 +1373,14 @@ Rules:
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs.
+- acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds/changes tables or columns, that SAME subtask must also generate the Alembic migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject). Set the subtask's type="migrate" and include in its related_files the model file(s) (backend/app/models.py), the new Alembic file (backend/alembic/versions/...), and backend/app/main.py for EXPECTED_SCHEMA_REVISION. The migration agent will handle Alembic generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
 - IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
 - ALSO write /tmp/plan_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -1402,6 +1462,13 @@ export async function handleResearch(
   // The research prompt advertises `./design-doc get <key>` for architectural
   // grounding; provision the read-only helper so that contract is honest.
   writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|problem-model|gap) so the
+  // research agent can resolve refs trimmed from its launch snapshot. project_id
+  // is set for all task types by the backend; if missing we skip BOTH the helper
+  // and its prompt advertisement so we never promise a helper we didn't write.
+  const researchProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (researchProjectId) writeFetchHelper(taskId, researchProjectId, WORKSPACE, { verbs: RESEARCH_FETCH_VERBS });
+  const researchFetchGuidance = researchProjectId ? buildFetchGuidance(RESEARCH_FETCH_VERBS) : '';
   const researchMode = strVal(payload.research_mode as string, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');
@@ -1490,6 +1557,19 @@ ${hotspotsSection}
       crossDirSection = `\n\nOther active directions (recent activity — avoid duplicating):\n${snippets.join('\n')}`;
     }
   }
+
+  // Pull the most relevant existing knowledge documents so research builds on
+  // accumulated knowledge instead of re-deriving the same findings from scratch.
+  // Query with the explicit research focus when present, else the current
+  // direction's text. Fail-soft: an empty list yields no section and no failure.
+  const currentDirectionText = directions.length > 0
+    ? strVal((directions.find(d => d.id === currentDirectionId) ?? directions[0]).text)
+    : '';
+  const priorDocs = await fetchPriorKnowledge(userPrompt || currentDirectionText);
+  if (priorDocs.length > 0) {
+    sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the research prompt\n`);
+  }
+  const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
 
   // Pipeline-wide scope conversion rates — rendered from pipeline_health.scope_conversion_rates
   // so measurement directions can read the number straight from the prompt instead
@@ -1733,7 +1813,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
-${pipelineScopeRatesSection}${anomalySection}
+${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
 ${(() => {
   const lines: string[] = [];
@@ -1812,8 +1892,36 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
 **Implementation findings** — these are your primary output. Each one spawns an agent that writes code:
   feature, improvement, bug, refactor, perf, security_audit, qa, deps, docs, migrate, test
 
+**Compute experiments** — spawns a budgeted, auto-torn-down compute job (NOT a code PR):
+  compute_experiment (aliases: measurement, benchmark) — emit when a MEASURABLE or EMPIRICAL
+    question can only be answered by RUNNING CODE or a BENCHMARK, not by more reading: a
+    perf claim to confirm (throughput/latency), a before-vs-after comparison, an accuracy or
+    cost measurement. Do NOT use it for questions a code read settles, or for open-ended
+    exploration. The finding must carry a launch contract describing how to run it:
+    \`command\` (a single, self-contained shell command that runs the experiment end-to-end on
+    a fresh VM), \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
+    \`deadline_seconds\` (a positive wall-clock timeout). Optionally add \`success_criterion\`
+    — a numeric goal of {"metric": "<name read from the result>", "operator": ">=|<=|>|<|==|!=",
+    "threshold": <number>} — to make the result machine-checkable (the gate fails the experiment
+    if the reported metric misses the goal). Put the launch fields either flat on the finding or
+    nested under a \`compute_experiment\` object. Above a configured spend threshold the launch
+    holds for operator approval; below it, it runs autonomously.
+
 **Sub-research** — spawns another research cycle (use sparingly):
   research
+
+**Knowledge findings** — these spawn a knowledge agent that produces a durable, queryable
+knowledge document (NOT a code PR). Emit ONLY when genuinely warranted, never by default:
+  web_research — emit when the work hinges on FACTS or BEST-PRACTICES that live OUTSIDE this
+    repo (an external API contract, a library's correct usage, a security/standards reference,
+    a comparison of approaches you cannot settle from the codebase alone). The deliverable is
+    sourced knowledge the implementer needs before code can be written correctly.
+  design — emit when the work needs a FILE-GROUNDED design document before implementation can
+    safely begin: the change is cross-cutting or architecturally risky enough that an implementer
+    starting straight from a prompt would likely get the structure wrong. The deliverable is a
+    design doc grounded in the actual repo files, not external facts.
+  Prefer a plain implementation finding when the work can land safely without either. Use
+  web_research vs design by SOURCE OF TRUTH: outside the repo → web_research; inside the repo → design.
 
 **Metadata** — these update the system's knowledge but do not produce code changes:
   direction_note, direction_update, direction_proposal, design_doc_observation
@@ -1833,14 +1941,17 @@ implementation findings. Add metadata alongside them when relevant.
   "priority": "high|medium|low",
   "actionability_grade": "HIGH|MEDIUM|LOW",
   "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
+  "acceptance_evidence": null,
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
   "prerequisite": null,
   "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
+  "compute_experiment": {"command": "self-contained shell command to run the experiment", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
-  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}]
+  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}],
+  "acceptance_evidence": {"kind": "test", "descriptor": "named test exercising the new seam end-to-end", "selector": "testing/test_foo.py::test_bar"}
 }]
 \`\`\`
 
@@ -1850,7 +1961,11 @@ implementation findings. Add metadata alongside them when relevant.
 
 **prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
 
+**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). Omit entirely on non-experiment findings.
+
 **provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
+
+**acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact", "descriptor": "short human-readable proof", "selector": "optional test path/selector or artifact ref"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
 
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.
@@ -1863,9 +1978,11 @@ implementation findings. Add metadata alongside them when relevant.
 - pattern_inferred: structural inference from naming/architecture patterns, with no direct inspection. This is the default — use it (or omit the field) when uncertain.
 - deduced: derived from adjacent evidence (e.g. another finding, a log line) without directly inspecting the subject.
 
+**acceptance_evidence** (OPTIONAL, additive — default null): the FORWARD evidence that will prove this finding's claim true once implemented, carried onto the spawned task. This is the OPPOSITE direction from verification_basis: verification_basis is BACKWARD ('how well-evidenced is the claim I am making now'), acceptance_evidence is FORWARD ('what concrete observation will demonstrate the fix worked'). Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior to exercise; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Omit (or null) when you cannot name a concrete, non-trivial proof — never invent a placeholder/always-true declaration (those are rejected).
+
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
-Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research.
+Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research, web_research/design → knowledge agent (produces a knowledge document, not a PR).
 
 - Use scope=large for cross-component work — the pipeline has a plan agent for safe decomposition. But most product features are scope=small or scope=medium.
 - direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
@@ -1876,7 +1993,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);

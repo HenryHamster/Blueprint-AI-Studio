@@ -49,6 +49,24 @@ def _make_efficient_task(project_id, **overrides):
     return make_task(**defaults)
 
 
+def _make_merged_task(project_id, *, reason: str | None = None):
+    context = {"pr_merged": True}
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context=context,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+
 @pytest.mark.asyncio
 async def test_compute_current_axes_returns_all_keys(db_session):
     project = make_project()
@@ -1209,6 +1227,143 @@ async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
 
 
 @pytest.mark.asyncio
+async def test_compute_llm_cost_breakdown_credits_each_attempt_model(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.attempt_history[0]["provider"] == "anthropic"
+    assert task.attempt_history[0]["model"] == "claude-sonnet-4-6"
+
+    task.status = TaskStatus.COMPLETED
+    task.context = {"pr_merged": True}
+    task.provider = "openai"
+    task.model = "gpt-5.4"
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    by_model = {(e["provider"], e["model"]): e for e in breakdown["by_model"]}
+    anthropic_row = by_model[("anthropic", "claude-sonnet-4-6")]
+    openai_row = by_model[("openai", "gpt-5.4")]
+    assert anthropic_row["total_input_tokens"] == 1000
+    assert anthropic_row["total_output_tokens"] == 400
+    assert openai_row["total_input_tokens"] == 250
+    assert openai_row["total_output_tokens"] == 150
+
+    # One MERGED task spanning two model buckets credits the merge once per
+    # distinct bucket — never per attempt-row — and exactly once to the total
+    # (no double-credit across buckets).
+    assert anthropic_row["merged_count"] == 1
+    assert openai_row["merged_count"] == 1
+    assert anthropic_row["merge_rate"] == 1.0
+    assert openai_row["merge_rate"] == 1.0
+    assert anthropic_row["cost_per_merge"] == round(anthropic_row["total_cost_usd"] / 1, 6)
+    assert openai_row["cost_per_merge"] == round(openai_row["total_cost_usd"] / 1, 6)
+
+    totals = breakdown["totals"]
+    assert totals["task_count"] == 2  # two attempt-rows
+    assert totals["merged_count"] == 1  # one merged TASK, not double-credited
+    assert totals["merge_rate"] == round(1 / 2, 4)
+
+
+@pytest.mark.asyncio
+async def test_compute_llm_cost_breakdown_merge_counts_multi_attempt_task_once(
+    db_session,
+):
+    """A multi-attempt MERGED task in a single model bucket credits merged_count
+    once (not once per attempt), so merge_rate and cost_per_merge divide by the
+    merge count — not the attempt count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Bank a first attempt, then run a second attempt on the SAME model.
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task.status = TaskStatus.COMPLETED
+    task.context = {"pr_merged": True}
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    row = {(e["provider"], e["model"]): e for e in breakdown["by_model"]}[
+        ("anthropic", "claude-sonnet-4-6")
+    ]
+    # Two attempt-rows in one bucket, but a single merged task.
+    assert row["task_count"] == 2
+    assert row["merged_count"] == 1
+    assert row["merge_rate"] == round(1 / 2, 4)
+    # cost_per_merge divides total bucket cost by the merge COUNT (1), not the
+    # attempt count (2): the per-attempt accumulation would halve this figure.
+    assert row["cost_per_merge"] == round(row["total_cost_usd"] / 1, 6)
+
+    totals = breakdown["totals"]
+    assert totals["merged_count"] == 1
+    assert totals["merge_rate"] == round(1 / 2, 4)
+
+
+@pytest.mark.asyncio
 async def test_schema_version_v3_migrates_llm_axis(db_session):
     """Existing baseline at schema_version=3 gets llm_cost_per_merged_pr cleared
     and re-seeded, then bumped to schema_version=5 (via v4 intermediate).
@@ -1532,6 +1687,185 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     assert "fakeprovider:mystery-model" in result["unpriced_combos"]
     assert "unattributed:unknown" in result["unpriced_combos"]
 
+    # None of these tasks carry the landed signal, so every bucket reads as an
+    # explicit 0-of-N merged with no confident cost-per-merge (no divide-by-zero).
+    assert by_provider["anthropic"]["merged_count"] == 0
+    assert by_provider["anthropic"]["merge_rate"] == 0.0
+    assert by_provider["anthropic"]["cost_per_merge"] is None
+    assert by_model[("anthropic", "claude-sonnet-4-6")]["merged_count"] == 0
+    assert by_model[("anthropic", "claude-sonnet-4-6")]["cost_per_merge"] is None
+    assert totals["merged_count"] == 0
+    assert totals["merge_rate"] == 0.0
+
+
+def test_compute_llm_cost_breakdown_approximate_priced():
+    """Approximate-priced combos (proxy rate, not exact published pricing) are marked distinctly from unpriced."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # gpt-5.3-codex-spark: priced at 3e-6 / 12e-6 (closest GA equivalent) — NO exact published rate.
+    # 1000 in @ 3e-6, 500 out @ 12e-6 = 0.003 + 0.006 = 0.009
+    approximate_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="openai",
+        model="gpt-5.3-codex-spark",
+    )
+
+    # Exact-priced for comparison (gpt-5.4 has published rate).
+    exact_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+        },
+        provider="openai",
+        model="gpt-5.4",
+    )
+
+    result = compute_llm_cost_breakdown([approximate_task, exact_task])
+
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    # Approximate-priced combo is marked as both priced AND approximate.
+    approx_row = by_model[("openai", "gpt-5.3-codex-spark")]
+    assert approx_row["priced"] is True
+    assert approx_row["approximate_priced"] is True
+    # Exact-priced combo is priced but NOT approximate.
+    exact_row = by_model[("openai", "gpt-5.4")]
+    assert exact_row["priced"] is True
+    assert exact_row["approximate_priced"] is False
+
+    # Approximate combo appears in the caveated list, NOT in unpriced_combos.
+    assert "openai:gpt-5.3-codex-spark" in result["approximate_priced_combos"]
+    assert "openai:gpt-5.3-codex-spark" not in result["unpriced_combos"]
+    assert result["unpriced_combos"] == []
+
+
+def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():
+    """Priced bucket with merges yields cost-per-merge; unpriced bucket suppresses it."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Two anthropic sonnet tasks, ONE merged. cost = 0.0105 each, total 0.021.
+    merged = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    not_merged = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Unpriced but merged: cost is understated, so cost_per_merge must stay None.
+    unpriced_merged = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+        },
+        provider="fakeprovider",
+        model="mystery-model",
+    )
+
+    result = compute_llm_cost_breakdown([merged, not_merged, unpriced_merged])
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    by_provider = {e["provider"]: e for e in result["by_provider"]}
+
+    sonnet = by_model[("anthropic", "claude-sonnet-4-6")]
+    assert sonnet["merged_count"] == 1
+    assert sonnet["verified_merged_count"] == 1
+    assert sonnet["merge_rate"] == round(1 / 2, 4)
+    assert sonnet["verified_merge_rate"] == round(1 / 2, 4)
+    # priced bucket: cost_per_merge = total_cost / merged = 0.021 / 1
+    assert sonnet["cost_per_merge"] == round(sonnet["total_cost_usd"] / 1, 6)
+
+    fake = by_model[("fakeprovider", "mystery-model")]
+    assert fake["merged_count"] == 1
+    assert fake["merge_rate"] == 1.0
+    # unpriced -> understated cost -> no confident cost-per-merge
+    assert fake["cost_per_merge"] is None
+    assert fake["priced"] is False
+
+    # Provider with a single unpriced model is itself flagged unpriced.
+    assert by_provider["fakeprovider"]["priced"] is False
+    assert by_provider["fakeprovider"]["cost_per_merge"] is None
+    assert by_provider["anthropic"]["priced"] is True
+    assert by_provider["anthropic"]["cost_per_merge"] == round(
+        by_provider["anthropic"]["total_cost_usd"] / 1, 6
+    )
+
+    totals = result["totals"]
+    assert totals["merged_count"] == 2
+    assert totals["verified_merged_count"] == 2
+    assert totals["merge_rate"] == round(2 / 3, 4)
+    assert totals["verified_merge_rate"] == round(2 / 3, 4)
+
+
+def test_compute_llm_cost_breakdown_verified_excludes_degraded_merges():
+    """Degraded fall-open merges still count as landed, but not verified."""
+    import uuid
+
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    project_id = uuid.uuid4()
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+
+    verified = _make_merged_task(project_id)
+    degraded = _make_merged_task(project_id, reason=degraded_reason)
+
+    result = compute_llm_cost_breakdown([verified, degraded])
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    by_provider = {e["provider"]: e for e in result["by_provider"]}
+
+    model_row = by_model[("anthropic", "claude-sonnet-4-6")]
+    provider_row = by_provider["anthropic"]
+
+    assert model_row["merged_count"] == 2
+    assert model_row["verified_merged_count"] == 1
+    assert model_row["merge_rate"] == 1.0
+    assert model_row["verified_merge_rate"] == 0.5
+    assert model_row["cost_per_merge"] == round(model_row["total_cost_usd"] / 1, 6)
+
+    assert provider_row["merged_count"] == 2
+    assert provider_row["verified_merged_count"] == 1
+    assert provider_row["merge_rate"] == 1.0
+    assert provider_row["verified_merge_rate"] == 0.5
+    assert provider_row["cost_per_merge"] == round(
+        provider_row["total_cost_usd"] / 1, 6
+    )
+
+    totals = result["totals"]
+    assert totals["merged_count"] == 2
+    assert totals["verified_merged_count"] == 1
+    assert totals["merge_rate"] == 1.0
+    assert totals["verified_merge_rate"] == 0.5
+    assert totals["total_cost_usd"] == model_row["total_cost_usd"]
+
 
 def test_compute_llm_cost_breakdown_empty():
     """No tasks -> empty buckets, zeroed totals, coverage_fraction=None."""
@@ -1545,6 +1879,62 @@ def test_compute_llm_cost_breakdown_empty():
     assert totals["unpriced_task_count"] == 0
     assert totals["total_cost_usd"] == 0.0
     assert totals["unpriced_coverage_fraction"] is None
+    assert totals["merged_count"] == 0
+    assert totals["merge_rate"] is None
+    # No-fallback case: caveat stays at zero so the panel renders uncluttered.
+    assert totals["fallback_task_count"] == 0
+    assert totals["fallback_cost_usd"] == 0.0
+
+
+def test_compute_llm_cost_breakdown_fallback_caveat():
+    """Tasks stamped with routing_fallback / model_fallback are counted and
+    their spend summed; clean tasks never inflate the fallback caveat."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Intended-routing task (no marker): 1000 in @ 3e-6, 500 out @ 15e-6 = 0.0105
+    clean = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 1000, "total_output_tokens": 500},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Cross-provider fallback: resolved onto sonnet but intended anthropic→openai.
+    cross = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "routing_fallback": {
+                "intended_provider": "openai",
+                "effective_provider": "anthropic",
+                "reason": "cross_provider",
+            }
+        },
+        api_call_summary={"total_input_tokens": 1000, "total_output_tokens": 500},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Same-provider preview→GA downgrade marker also counts as a fallback.
+    downgrade = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"model_fallback": {"requested": "x-preview", "effective": "x-ga"}},
+        api_call_summary={"total_input_tokens": 2000, "total_output_tokens": 1000},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = compute_llm_cost_breakdown([clean, cross, downgrade])
+    totals = result["totals"]
+    assert totals["fallback_task_count"] == 2
+    # cross = 0.0105, downgrade = 2000*3e-6 + 1000*15e-6 = 0.021 -> 0.0315
+    assert totals["fallback_cost_usd"] == round(0.0105 + 0.021, 6)
+
+    clean_only = compute_llm_cost_breakdown([clean])
+    assert clean_only["totals"]["fallback_task_count"] == 0
+    assert clean_only["totals"]["fallback_cost_usd"] == 0.0
 
 
 def test_compute_llm_cost_breakdown_missing_provider_routes_to_unattributed():
@@ -1651,6 +2041,10 @@ async def test_llm_cost_breakdown_endpoint_returns_rollup(
     assert data["totals"]["task_count"] == 2
     assert data["totals"]["priced_task_count"] == 1
     assert data["totals"]["unpriced_task_count"] == 1
+    assert data["totals"]["merged_count"] == 0
+    assert data["totals"]["verified_merged_count"] == 0
+    assert data["totals"]["merge_rate"] == 0.0
+    assert data["totals"]["verified_merge_rate"] == 0.0
     assert "fakeprovider:mystery-model" in data["unpriced_combos"]
 
 
@@ -2538,3 +2932,159 @@ async def test_pool_hit_rate_estimate_endpoint_validates_target_size(
         f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=101"
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# maybe_alert_unpriced_models_coverage — unpriced-models operator alert
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_UNPRICED_KEY,
+    UNPRICED_ALERT_MIN_TASKS,
+    maybe_alert_unpriced_models_coverage,
+)
+
+
+def _priced_task(project_id):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 1000, "total_output_tokens": 500},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+
+def _unpriced_task(project_id, model="fake-model-x"):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 500, "total_output_tokens": 200},
+        provider="fakeprovider",
+        model=model,
+    )
+
+
+async def _unpriced_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("unpriced models"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_fires_when_coverage_degrades(db_session, mocker):
+    """Crossing the unpriced-share threshold fires one WARNING naming the combos."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 priced + 4 unpriced -> unpriced share = 4/6 = 0.67, well over threshold.
+    for _ in range(2):
+        db_session.add(_priced_task(project.id))
+    for _ in range(4):
+        db_session.add(_unpriced_task(project.id))
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is True
+
+    alerts = await _unpriced_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "fakeprovider:fake-model-x" in alerts[0].message
+    assert "67%" in alerts[0].message
+    bcast.assert_awaited()
+
+    await db_session.refresh(project)
+    assert project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_UNPRICED_KEY] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_no_fire_when_coverage_full(db_session, mocker):
+    """Full pricing coverage (no unpriced tasks) never alerts."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(5):
+        db_session.add(_priced_task(project.id))
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is None
+    assert await _unpriced_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_dedups_on_stable_degraded_state(db_session, mocker):
+    """A second tick at the same degraded state does not fire a second alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_priced_task(project.id))
+    for _ in range(4):
+        db_session.add(_unpriced_task(project.id))
+    await db_session.commit()
+
+    first = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    second = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert first is True
+    assert second is None  # deduped on the persisted marker
+    assert len(await _unpriced_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_ignores_tokenless_and_unattributed(db_session, mocker):
+    """Token-less and unattributed (no provider/model) tasks never trip the alert.
+
+    Many unpriced-LOOKING tasks here are excluded from the attributed
+    denominator, so the unpriced share stays below threshold and nothing fires.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One real unpriced task — below UNPRICED_ALERT_MIN_TASKS on its own.
+    db_session.add(_unpriced_task(project.id))
+    # Token-less tasks (no usage) — not priceable, must be ignored.
+    for _ in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                api_call_summary={"llm_call_count": 2},
+                provider="fakeprovider",
+                model="fake-model-x",
+            )
+        )
+    # Token-bearing but unattributed (no provider/model) — must be ignored.
+    for _ in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                api_call_summary={
+                    "total_input_tokens": 300,
+                    "total_output_tokens": 100,
+                },
+            )
+        )
+    await db_session.commit()
+
+    assert UNPRICED_ALERT_MIN_TASKS > 1  # guards the single-unpriced premise
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is None
+    assert await _unpriced_alerts(db_session, project.id) == []

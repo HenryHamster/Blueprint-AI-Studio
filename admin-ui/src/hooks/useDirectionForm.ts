@@ -1,21 +1,36 @@
-import { useState } from 'react';
+import { useState, useRef, type SetStateAction } from 'react';
 import type { Direction } from '../components/DirectionsPanel';
 
 export type DirectionCategory = 'product' | 'structural' | 'mixed' | null;
 
 export function useDirectionForm() {
   // Add form state
-  const [newText, setNewText] = useState('');
-  const [newPriority, setNewPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [newCategory, setNewCategory] = useState<DirectionCategory>(null);
-  const [newPathTags, setNewPathTags] = useState<string[]>([]);
+  const [newText, setNewTextState] = useState('');
+  const [newPriority, setNewPriorityState] = useState<'high' | 'medium' | 'low'>('medium');
+  const [newCategory, setNewCategoryState] = useState<DirectionCategory>(null);
+  const [newPathTags, setNewPathTagsState] = useState<string[]>([]);
   const [newPathInput, setNewPathInput] = useState('');
-  const [newCompletionCriteria, setNewCompletionCriteria] = useState('');
+  const [newCompletionCriteria, setNewCompletionCriteriaState] = useState('');
+  // Acceptance-evidence contract authored at create time, stored under
+  // Direction.context. Mirrors completion_criteria plumbing (trim-or-null on send).
+  const [newSuccessEvidence, setNewSuccessEvidenceState] = useState('');
+  const [newRetirementCondition, setNewRetirementConditionState] = useState('');
   // When true, create the direction directly in the 'staged' state (atomic
   // born-staged create) instead of 'active', so a next-version idea never
   // passes through a research-eligible active state. Gated in the UI to an
   // open release version, mirroring the edit-form 'staged' status option.
-  const [newStaged, setNewStaged] = useState(false);
+  const [newStaged, setNewStagedState] = useState(false);
+
+  // Client idempotency identity for the add path. Minted lazily on first submit
+  // and reused across double-clicks / failed retries / lost-response replays so
+  // the backend collapses them into one direction. Cleared by resetAddForm()
+  // (i.e. on a successful create or a fresh draft) so the next logical add mints
+  // a new key.
+  const addIdempotencyKeyRef = useRef<string | null>(null);
+  // A failed submit keeps the current key alive for an unchanged retry, but the
+  // first real draft edit after that failure must rotate the key so a newly
+  // edited add does not replay the prior logical request.
+  const rotateAddIdempotencyKeyOnDraftChangeRef = useRef(false);
 
   // Edit form state
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -26,6 +41,10 @@ export function useDirectionForm() {
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');
   const [editCompletionCriteria, setEditCompletionCriteria] = useState('');
+  // Acceptance-evidence contract for inline edit; seeded from the direction's
+  // context when entering edit mode (see startEdit).
+  const [editSuccessEvidence, setEditSuccessEvidence] = useState('');
+  const [editRetirementCondition, setEditRetirementCondition] = useState('');
 
   function startEdit(d: Direction) {
     setEditingId(d.id);
@@ -36,16 +55,72 @@ export function useDirectionForm() {
     setEditPathTags(d.paths ?? []);
     setEditPathInput('');
     setEditCompletionCriteria(d.completion_criteria ?? '');
+    setEditSuccessEvidence(d.context?.success_evidence ?? '');
+    setEditRetirementCondition(d.context?.retirement_condition ?? '');
+  }
+
+  function resetAddKeyForEditedDraft() {
+    if (!rotateAddIdempotencyKeyOnDraftChangeRef.current) return;
+    addIdempotencyKeyRef.current = null;
+    rotateAddIdempotencyKeyOnDraftChangeRef.current = false;
+  }
+
+  function setNewText(value: string) {
+    resetAddKeyForEditedDraft();
+    setNewTextState(value);
+  }
+
+  function setNewPriority(value: 'high' | 'medium' | 'low') {
+    resetAddKeyForEditedDraft();
+    setNewPriorityState(value);
+  }
+
+  function setNewCategory(value: DirectionCategory) {
+    resetAddKeyForEditedDraft();
+    setNewCategoryState(value);
+  }
+
+  function setNewPathTags(value: SetStateAction<string[]>) {
+    resetAddKeyForEditedDraft();
+    setNewPathTagsState(value);
+  }
+
+  function setNewCompletionCriteria(value: string) {
+    resetAddKeyForEditedDraft();
+    setNewCompletionCriteriaState(value);
+  }
+
+  function setNewSuccessEvidence(value: string) {
+    resetAddKeyForEditedDraft();
+    setNewSuccessEvidenceState(value);
+  }
+
+  function setNewRetirementCondition(value: string) {
+    resetAddKeyForEditedDraft();
+    setNewRetirementConditionState(value);
+  }
+
+  function setNewStaged(value: boolean) {
+    resetAddKeyForEditedDraft();
+    setNewStagedState(value);
+  }
+
+  function markAddAttemptFailed() {
+    rotateAddIdempotencyKeyOnDraftChangeRef.current = true;
   }
 
   function resetAddForm() {
-    setNewText('');
-    setNewPriority('medium');
-    setNewCategory(null);
-    setNewPathTags([]);
+    setNewTextState('');
+    setNewPriorityState('medium');
+    setNewCategoryState(null);
+    setNewPathTagsState([]);
     setNewPathInput('');
-    setNewCompletionCriteria('');
-    setNewStaged(false);
+    setNewCompletionCriteriaState('');
+    setNewSuccessEvidenceState('');
+    setNewRetirementConditionState('');
+    setNewStagedState(false);
+    addIdempotencyKeyRef.current = null;
+    rotateAddIdempotencyKeyOnDraftChangeRef.current = false;
   }
 
   return {
@@ -55,7 +130,11 @@ export function useDirectionForm() {
     newPathTags, setNewPathTags,
     newPathInput, setNewPathInput,
     newCompletionCriteria, setNewCompletionCriteria,
+    newSuccessEvidence, setNewSuccessEvidence,
+    newRetirementCondition, setNewRetirementCondition,
     newStaged, setNewStaged,
+    addIdempotencyKeyRef,
+    markAddAttemptFailed,
     editingId, setEditingId,
     editText, setEditText,
     editPriority, setEditPriority,
@@ -64,6 +143,8 @@ export function useDirectionForm() {
     editPathTags, setEditPathTags,
     editPathInput, setEditPathInput,
     editCompletionCriteria, setEditCompletionCriteria,
+    editSuccessEvidence, setEditSuccessEvidence,
+    editRetirementCondition, setEditRetirementCondition,
     startEdit,
     resetAddForm,
   };

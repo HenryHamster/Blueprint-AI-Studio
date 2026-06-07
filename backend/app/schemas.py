@@ -53,6 +53,36 @@ class BlockedNeed(BaseModel):
         return v
 
 
+class ReproduceVerdict(BaseModel):
+    """Durable reproduce-on-HEAD verdict for bug-report-/finding-derived work.
+
+    Carries a canonical defect-truth status for a task whose source is a bug
+    report or a research finding: did the cited defect actually reproduce
+    against automain HEAD, was it already resolved / non-reproducing, or could
+    it not be determined. Mirrors ``BlockedNeed``'s additive, extra-ignoring
+    shape so older agents that omit it (or send only ``no_op_reason``) behave
+    identically. Persisted into ``task.context["reproduce_verdict"]`` (a
+    non-underscore key so the review/fix respawn carry-forward preserves it for
+    free) and consumed by task-outcome / digest / strategic scoring.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    status: str = Field(..., max_length=20)
+    reason: str | None = Field(None, max_length=2000)
+    # Durable evidence metadata (citations checked, symbols probed, etc.). Kept
+    # as a free Dict so seeders and the agent can attach whatever provenance is
+    # available without a schema lock-step.
+    evidence: Dict[str, Any] | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        allowed = {"reproduced", "already_resolved", "indeterminate"}
+        if v not in allowed:
+            raise ValueError(f"status must be one of {allowed}")
+        return v
+
+
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
@@ -131,6 +161,12 @@ class AgentStatusPayload(BaseModel):
     # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
     # behave identically to today (free-text waiting_on/reason only).
     blocked_need: BlockedNeed | None = None
+    # Optional durable reproduce-on-HEAD verdict for bug-report-/finding-derived
+    # work. Set by the agent on a terminal status when it determined whether the
+    # cited defect reproduces against HEAD. Persisted into
+    # task.context["reproduce_verdict"]. Absent payloads behave identically to
+    # today (older agents only send no_op_reason).
+    reproduce_verdict: ReproduceVerdict | None = None
 
 
 class UploadUrlRequest(BaseModel):
@@ -191,6 +227,12 @@ class HeartbeatRequest(BaseModel):
     # recently-built image with an older agent runtime from the current one.
     # None on local dev or pre-fingerprint images.
     agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+    # Git commit the agent VM image was built from, baked into the image as
+    # /opt/agent/AGENT_SOURCE_SHA during Packer bake and read at agent startup.
+    # Maps a running VM back to its exact source commit (the runtime fingerprint
+    # only identifies a content hash, not a git SHA). Permissive 7-40 hex so both
+    # abbreviated and full SHAs validate; None on local dev or pre-marker images.
+    agent_source_sha: str | None = Field(None, pattern="^[0-9a-f]{7,40}$")
     # Cumulative per-task LLM telemetry. Optional/backwards-compatible — older
     # agents that don't yet emit these fields silently skip persistence; newer
     # agents send running totals on every heartbeat. Persisted into

@@ -13,7 +13,9 @@ import {
   buildWroteNewOutput,
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, MAX_DISABLED_TEST_MARKERS,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun, matchesEnvironmentFailureSignature,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
+  type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
@@ -73,15 +75,22 @@ interface VerifyTestsResult {
   // returned null) and on every detected=false / setup-failure path, so older
   // consumers that ignore it are byte-for-byte unaffected.
   coverage?: { passed: number; skipped: number; total: number };
-  // Cheap goal-level acceptance probe, run ONLY on the detected=false fall-open
-  // paths (no suite / thin / all-skipped). Gives the no-CI merge gate at least
-  // one honest execution signal — "does the changed code still compile/build?" —
-  // when the unit suite produced none. CONSERVATIVE: a probe that could not run
-  // (missing deps / unprovisioned setup) degrades to the existing fall-open and
-  // never blocks; only a clear compile/build FAILURE blocks the merge. The
-  // backend (ci_resolution.classify_merge_test_verdict) keys off
-  // ran/passed/could_not_run to decide block-vs-fall-open. Additive: absent on
-  // every detected=true verdict and the setup-failure FAILED path.
+  // Cheap goal-level acceptance probe. Attached on TWO paths:
+  //   - the detected=false fall-open paths (no suite / thin / all-skipped) and
+  //     the setup-failure path, where it may carry EITHER the operator's declared
+  //     build_cmd OR a generic ecosystem compile check (tsc/compileall/…); and
+  //   - the detected=true + PASSED path, where it carries the operator's DECLARED
+  //     build_cmd ONLY (no generic compile probes) — a green unit suite must not
+  //     mask a broken declared build (bundled frontends, tests that run against
+  //     source without the build step). Gives the no-CI merge gate at least one
+  //     honest "does the deliverable still build?" signal even when a passing
+  //     suite produced none for the declared build. CONSERVATIVE: a probe that
+  //     could not run (missing deps / unprovisioned setup) degrades to a fall-open
+  //     and never blocks; only a clear compile/build FAILURE blocks the merge. The
+  //     backend (ci_resolution.classify_merge_test_verdict) keys off
+  //     declared/ran/passed/could_not_run to decide block-vs-fall-open. Additive:
+  //     absent on a detected=true verdict with no declared build_cmd and on the
+  //     setup-failure FAILED path's no-probe case.
   probe?: {
     ran: boolean;
     ecosystem: string;
@@ -124,6 +133,16 @@ interface VerifyTestsResult {
     could_not_run: boolean;
     output: string;
     label: string;
+    // ADDITIVE honesty signal mirroring ``probe.wrote_no_artifact`` for the
+    // declared-build path: set ONLY for a PASSED, BUILD-INTENT documented command
+    // (the discovery layer's ``heavy`` flag) whose working tree we could
+    // confidently observe before AND after the run — true when the command exited
+    // 0 yet wrote NO new output (a likely no-op build/generate). Left UNSET for
+    // non-build commands (lint/test/typecheck correctly produce no artifact), when
+    // the tree was unobservable, and on every other outcome — so the backend
+    // degrades to ``documented_command_passed`` rather than emitting the no-op
+    // reason on uncertainty.
+    wrote_no_artifact?: boolean;
   };
   // Diff-aware VISIBILITY signal for the inverse anti-pattern of the documented-
   // command probe: a PR that makes a red suite green by DISABLING tests rather
@@ -139,6 +158,33 @@ interface VerifyTestsResult {
   disabledTests?: {
     count: number;
     markers: Array<{ file: string; marker: string; line: string }>;
+  };
+  // Declared acceptance-test probe. Attached ONLY when the implementation task
+  // declared, at plan time, a named acceptance test (``acceptance_evidence`` with
+  // ``kind="test"``) — the test that should exercise the seam end-to-end. The
+  // gate runs that SPECIFIC test (targeted) and reports whether it actually
+  // executed in the PR's run. A declared test that is ABSENT (not found) or
+  // SKIPPED (collected but every match skipped/deselected/xfail'd) did NOT prove
+  // the claim — the backend (ci_resolution.acceptance_test_is_clear_failure)
+  // flips this to a HIGH-precedence merge BLOCK, mirroring how
+  // compute_experiment fails closed when its declared metric is absent. A check
+  // that itself ``could_not_run`` (no targetable pytest suite / environment
+  // failure) degrades to a fall-open carrying the operator-visible
+  // ``acceptance_test_not_run`` reason rather than a hard block. ADDITIVE +
+  // CONSERVATIVE: omitted entirely when no acceptance test was declared (or the
+  // declared kind is not ``test``), so a PR with no declaration serializes
+  // byte-for-byte as today and an older backend that ignores the field is
+  // unaffected.
+  acceptanceTest?: {
+    declared: boolean;
+    descriptor: string;
+    selector?: string;
+    // The declared test was found/collected (true for ``ran``/``skipped``,
+    // false for ``absent``).
+    present: boolean;
+    // The declared test actually executed (true ONLY for ``ran``).
+    ran: boolean;
+    status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
   };
 }
 
@@ -232,10 +278,19 @@ async function snapshotWorkingTree(cwd: string): Promise<string | null> {
 async function runAcceptanceProbe(
   ws: WebSocket | null,
   buildConfig: BuildConfig | undefined,
+  opts: { declaredOnly?: boolean } = {},
 ): Promise<VerifyTestsResult['probe']> {
-  const probes = detectAcceptanceProbes(buildConfig).slice(0, MAX_ACCEPTANCE_PROBES);
+  // declaredOnly restricts the run to the operator's OWN declared build_cmd
+  // probe(s) — used on the passing-suite path where a green suite already
+  // exercised the source, so only the authoritative declared build is worth
+  // adding (never the generic tsc/compileall/go-build/cargo-check probes).
+  let candidates = detectAcceptanceProbes(buildConfig);
+  if (opts.declaredOnly) candidates = candidates.filter(p => p.declared);
+  const probes = candidates.slice(0, MAX_ACCEPTANCE_PROBES);
   if (probes.length === 0) {
-    sendLog(ws, 'Acceptance probe: no probeable ecosystem detected — no goal-level probe signal.\n');
+    if (!opts.declaredOnly) {
+      sendLog(ws, 'Acceptance probe: no probeable ecosystem detected — no goal-level probe signal.\n');
+    }
     return undefined;
   }
   let firstPass: AcceptanceProbe | null = null;
@@ -343,6 +398,43 @@ async function attachAcceptanceProbe(
   return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
 }
 
+// Run a DECLARED-build-only acceptance probe on the detected=true + PASSED path
+// and fold its verdict into the result via the existing ``probe`` field. Unlike
+// attachAcceptanceProbe (the fall-open path), this filters to the operator's OWN
+// declared ``build_cmd`` — generic ecosystem compile probes (tsc/compileall/go
+// build/cargo check) are NOT run, because a green suite already exercised the
+// source; we only add the authoritative "does the deliverable build" claim. The
+// backend reads probe.passed=false on a CLEAR declared-build failure and flips
+// the gate to a block. CONSERVATIVE + ADDITIVE: no declared build_cmd → no probe
+// → the pass is byte-for-byte unchanged; a could-not-run declared build (missing
+// deps / unprovisioned setup) falls open without blocking; only a clear declared-
+// build FAILURE blocks. NEVER throws — any error degrades to the unchanged pass.
+async function attachDeclaredBuildProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  base: VerifyTestsResult,
+): Promise<VerifyTestsResult> {
+  let probe: VerifyTestsResult['probe'];
+  try {
+    probe = await runAcceptanceProbe(ws, buildConfig, { declaredOnly: true });
+  } catch (e) {
+    sendLog(ws, `Declared build probe errored — skipping (suite passed): ${e instanceof Error ? e.message : String(e)}\n`);
+    return base;
+  }
+  if (!probe) return base;
+  let note: string;
+  if (probe.outcome === 'fail') {
+    note = `We ran your declared build command \`${probe.label}\` and it FAILED — the unit suite passed but the declared build did not succeed; blocking the merge.`;
+  } else if (probe.outcome === 'pass') {
+    note = probe.wrote_no_artifact === true
+      ? `We ran your declared build command \`${probe.label}\` and it exited cleanly but wrote no artifact — possible no-op build (unit suite passed).`
+      : `We ran your declared build command \`${probe.label}\` and it passed — your declared build succeeds (unit suite passed).`;
+  } else {
+    note = `We ran your declared build command \`${probe.label}\` but it could not run — missing deps / unprovisioned setup; not blocking (unit suite passed).`;
+  }
+  return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
+}
+
 // ── Diff-aware documented / PR-introduced command probe ──────────────────────
 // Cap on commands actually RUN (the discovery layer is already bounded to the
 // same constant). Each runs ONCE under a bounded timeout, no retries.
@@ -415,10 +507,23 @@ async function runDocumentedCommandsProbe(
   sendLog(ws, `Documented-command probe: running ${discovered.length} PR-introduced/documented command(s): ${discovered.map(d => d.label).join(', ')}\n`);
 
   let firstPass: DocumentedCommand | null = null;
+  // The no-op observation for the winning PASS command: undefined = not
+  // confidently observed (degrade to documented_command_passed); boolean =
+  // observed. Only a BUILD-INTENT (``heavy``) command can set it.
+  let firstPassWroteNoArtifact: boolean | undefined;
   let firstCouldNotRun: DocumentedCommand | null = null;
   for (const cmd of discovered) {
     const runner = runnerFromCommand(cmd.command, cmd.cwd);
     const timeoutMs = cmd.heavy ? DECLARED_BUILD_TIMEOUT : GENERIC_PROBE_TIMEOUT;
+    // For a BUILD-INTENT command that could still WIN the verdict (no earlier
+    // pass yet), snapshot the tree BEFORE it runs so a clean exit that wrote
+    // nothing is distinguishable from a real build — mirroring the declared-build
+    // no-op detection. Non-build commands (``heavy`` false: lint/test/typecheck/
+    // ``--help``) correctly produce no artifact and are NEVER snapshotted. A
+    // failed snapshot leaves the observation unavailable (flag stays unset).
+    const before = cmd.heavy && firstPass === null
+      ? await snapshotWorkingTree(runner.cwd)
+      : null;
     let outcome: 'pass' | 'fail' | 'could_not_run';
     let output = '';
     try {
@@ -440,13 +545,30 @@ async function runDocumentedCommandsProbe(
         label: `PR-introduced command failed: ${cmd.label}`,
       };
     }
-    if (outcome === 'pass' && firstPass === null) firstPass = cmd;
+    if (outcome === 'pass' && firstPass === null) {
+      firstPass = cmd;
+      // Only a BUILD-INTENT command with BOTH snapshots observed yields a
+      // confident no-op signal; anything else leaves the flag unset.
+      if (cmd.heavy && before !== null) {
+        const after = await snapshotWorkingTree(runner.cwd);
+        if (after !== null) {
+          const wroteSomething = buildWroteNewOutput(before, after);
+          firstPassWroteNoArtifact = !wroteSomething;
+          if (!wroteSomething) {
+            sendLog(ws, `Documented-command probe [${cmd.label}]: build command exited cleanly but wrote no new output — possible no-op build.\n`);
+          }
+        }
+      }
+    }
     if (outcome === 'could_not_run' && firstCouldNotRun === null) firstCouldNotRun = cmd;
   }
   if (firstPass !== null) {
     return {
       ran: true, outcome: 'pass', passed: true, could_not_run: false,
       output: '', label: `PR-introduced command passed: ${firstPass.label}`,
+      ...(firstPassWroteNoArtifact !== undefined
+        ? { wrote_no_artifact: firstPassWroteNoArtifact }
+        : {}),
     };
   }
   const cnr = firstCouldNotRun as DocumentedCommand;
@@ -478,7 +600,9 @@ async function attachDocumentedCommandsProbe(
   if (block.outcome === 'fail') {
     note = `Documented/PR-introduced command probe FAILED — ${block.label}; blocking the merge.`;
   } else if (block.outcome === 'pass') {
-    note = `Documented/PR-introduced command probe passed — ${block.label} (cheap goal-level signal).`;
+    note = block.wrote_no_artifact === true
+      ? `Documented/PR-introduced command probe ran but wrote no artifact — ${block.label}; possible no-op build (cheap goal-level signal; not confident verification).`
+      : `Documented/PR-introduced command probe passed — ${block.label} (cheap goal-level signal).`;
   } else {
     note = `Documented/PR-introduced command probe could not run — ${block.label}; falling open without a block.`;
   }
@@ -514,6 +638,107 @@ function attachDisabledTests(
   if (markers.length === 0) return base;
   sendLog(ws, `Newly-disabled-tests probe: PR newly disables ${markers.length} test(s) — surfacing for operator visibility (does NOT block).\n`);
   return { ...base, disabledTests: { count: markers.length, markers } };
+}
+
+// ── Declared acceptance-test probe ───────────────────────────────────────────
+// Read the optional plan-time acceptance-test declaration off the task context.
+// Returns a normalized {descriptor, selector?} ONLY for a well-formed
+// ``kind="test"`` declaration; null for an absent / malformed / non-test
+// declaration (mirroring the backend ``parse_acceptance_evidence`` shape, read
+// defensively). NEVER throws.
+function parseDeclaredAcceptanceTest(
+  task: Record<string, unknown>,
+): DeclaredAcceptanceTest | null {
+  const ctx = (task as { context?: unknown }).context;
+  if (!ctx || typeof ctx !== 'object') return null;
+  const ev = (ctx as Record<string, unknown>).acceptance_evidence;
+  if (!ev || typeof ev !== 'object') return null;
+  const e = ev as Record<string, unknown>;
+  if (e.kind !== 'test') return null;
+  const descriptor = typeof e.descriptor === 'string' ? e.descriptor.trim() : '';
+  if (!descriptor) return null;
+  const selector =
+    typeof e.selector === 'string' && e.selector.trim() ? e.selector.trim() : undefined;
+  return { descriptor, selector };
+}
+
+// Run the declared acceptance test (if any) and fold the verdict into the
+// result via the additive ``acceptanceTest`` block. Self-contained: it detects
+// the runner, runs ONLY the declared test (targeted), and classifies whether it
+// executed. A clear ABSENT/SKIPPED is carried on the block for the backend to
+// flip into a merge BLOCK; an environment failure or an un-targetable selector
+// degrades to ``could_not_run`` (fall-open). NEVER throws — any error degrades
+// to the unchanged result. Skipped entirely when no acceptance test was
+// declared, so a PR with no declaration is byte-for-byte unchanged.
+async function attachAcceptanceTestProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  task: Record<string, unknown>,
+  base: VerifyTestsResult,
+): Promise<VerifyTestsResult> {
+  let declared: DeclaredAcceptanceTest | null;
+  try {
+    declared = parseDeclaredAcceptanceTest(task);
+  } catch {
+    return base;
+  }
+  if (!declared) return base;
+  const label = declared.selector || declared.descriptor;
+
+  let runner: TestRunner | null = null;
+  try {
+    runner = buildAcceptanceTestRunner(declared, detectTestRunners(buildConfig));
+  } catch {
+    runner = null;
+  }
+  const blockBase = {
+    declared: true,
+    descriptor: declared.descriptor,
+    ...(declared.selector ? { selector: declared.selector } : {}),
+  };
+  if (!runner) {
+    sendLog(ws, `Declared acceptance test [${label}]: no targetable suite — could not run the check (fall-open).\n`);
+    const note = `Declared acceptance test \`${label}\` could not be targeted (no runnable suite to execute it) — cannot confirm it ran; falling open as degraded.`;
+    return {
+      ...base,
+      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run' },
+      output: [base.output, note].filter(Boolean).join('\n'),
+    };
+  }
+
+  let output = '';
+  let status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
+  try {
+    output = await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+    status = classifyAcceptanceTestRun(output);
+  } catch (err: unknown) {
+    const e = err as Error & { stdout?: string; stderr?: string };
+    output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
+    // An environment/setup failure (missing runtime, OOM, docker daemon, …) means
+    // we could NOT confidently observe whether the test ran — degrade to
+    // could_not_run rather than mis-reading a missing tool as an absent test.
+    status = matchesEnvironmentFailureSignature(output)
+      ? 'could_not_run'
+      : classifyAcceptanceTestRun(output);
+  }
+  const ran = status === 'ran';
+  const present = status !== 'absent';
+  sendLog(ws, `Declared acceptance test [${label}]: ${status}\n`);
+  let note: string;
+  if (status === 'ran') {
+    note = `Declared acceptance test \`${label}\` ran — confirmed present and executed.`;
+  } else if (status === 'skipped') {
+    note = `Declared acceptance test \`${label}\` was SKIPPED — the promised test did not actually execute; blocking the merge.`;
+  } else if (status === 'absent') {
+    note = `Declared acceptance test \`${label}\` is ABSENT — the promised test was not found in the PR's run; blocking the merge.`;
+  } else {
+    note = `Declared acceptance test \`${label}\` could not be run — cannot confirm it ran; falling open as degraded.`;
+  }
+  return {
+    ...base,
+    acceptanceTest: { ...blockBase, present, ran, status },
+    output: [base.output, note].filter(Boolean).join('\n'),
+  };
 }
 
 // ── Stale-command self-heal ──────────────────────────────────────────────────
@@ -817,6 +1042,14 @@ export async function handleVerifyTests(
         ...(loop.coverage ? { coverage: loop.coverage } : {}),
         output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
       };
+      // A green suite must not mask a broken DECLARED build. On the passing
+      // path, still exercise the operator's OWN declared build_cmd as a
+      // goal-level acceptance probe (declared-only — no generic compile probes);
+      // the backend blocks the merge only on a CLEAR declared-build failure.
+      if (passed) {
+        statusRef.value = 'Running declared build probe (suite passed)...';
+        result = await attachDeclaredBuildProbe(ws, buildConfig, result);
+      }
     }
   }
 
@@ -829,6 +1062,12 @@ export async function handleVerifyTests(
   const prDiff = await computePrDiff(ws, baseBranch);
   result = await attachDocumentedCommandsProbe(ws, result, prDiff);
   result = attachDisabledTests(ws, result, prDiff);
+  // Declared acceptance-test probe: when the implementation task promised a named
+  // test, confirm that SPECIFIC test actually ran in the PR. Runs on every
+  // completed path (the early setup-failure FAILED returns above skip it); a
+  // no-op when no acceptance test was declared.
+  statusRef.value = 'Confirming declared acceptance test ran...';
+  result = await attachAcceptanceTestProbe(ws, buildConfig, task, result);
 
   // Write the result file (parity with smoketest's /tmp result file — useful
   // for operator inspection); the authoritative copy is the artifact logs.

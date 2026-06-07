@@ -17,8 +17,12 @@ blocked-resume machinery carry the work to completion — no parallel waiting lo
 Matching is deliberately CONSERVATIVE: an explicit reference (task id, PR number)
 is matched directly; a capability need is matched only on an exact/explicit
 signal (payload type, exact title, or an exact related-file reference) and never
-on a fuzzy heuristic. When the signal is ambiguous (more than one candidate) or
-weak, it returns ``None`` so good independent work is never falsely serialized.
+on a fuzzy heuristic. When the signal is weak (no candidate qualifies) it returns
+``None`` so good independent work is never falsely serialized. When MORE THAN ONE
+candidate qualifies (genuine duplicate foundations), it deterministically returns
+the CANONICAL provider — earliest by ``created_at``, tie-broken by ``str(id)`` —
+matching the spawn-time resolver and the convergence path so every dependent
+attaches to the SAME foundation rather than an arbitrary duplicate.
 
 This is a pure matcher over a pre-fetched candidate list — it does no IO, which
 keeps it cheap to call inside the sweep loop and trivial to unit-test.
@@ -28,7 +32,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.finding_deduplication import prerequisite_matches_task
+from app.finding_deduplication import (
+    prerequisite_matches_task,
+    select_canonical_provider,
+)
+from app.landed_signal import has_merge_unblock_signal
 from app.models import Task
 
 # Candidate statuses an in-flight foundation can be in. Kept here (not imported
@@ -73,26 +81,30 @@ def _match_task(ref: str, candidates: List[Task]) -> Optional[Task]:
     (:func:`finding_deduplication.prerequisite_matches_task`) so a need that
     names its foundation by a non-UUID ``finding_hash`` — exactly how the
     producer records sibling/prerequisite needs — resolves here too, not only a
-    raw task id. Ambiguity (more than one candidate sharing the signal) returns
-    ``None`` so independent work is never falsely serialized.
+    raw task id. When more than one candidate shares the signal, the CANONICAL
+    provider (earliest by ``created_at``, id-tiebroken) is returned so the
+    resume-time matcher attaches the dependent to the SAME foundation the
+    spawn-time resolver would pick.
     """
     normalized = {"kind": "task", "ref": str(ref).strip()}
     matches = [c for c in candidates if prerequisite_matches_task(normalized, c)]
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_pr(ref: str, candidates: List[Task]) -> Optional[Task]:
-    """kind='pr': the single candidate whose open PR equals ``ref``.
+    """kind='pr': the canonical candidate whose open PR equals ``ref``.
 
-    Ambiguity (more than one candidate owning the number) returns ``None`` — we
-    never guess which in-flight task to serialize behind.
+    When more than one candidate owns the number, the CANONICAL provider
+    (earliest by ``created_at``, id-tiebroken) is returned so dependents
+    deterministically serialize behind the same foundation rather than an
+    arbitrary one.
     """
     try:
         pr_num = int(str(ref).strip().lstrip("#"))
     except (ValueError, AttributeError, TypeError):
         return None
     matches = [c for c in candidates if _candidate_pr_number(c) == pr_num]
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_capability(
@@ -111,8 +123,11 @@ def _match_capability(
       - its title exactly equals the ref (case-insensitive, trimmed), OR
       - the ref appears as an exact entry in its ``related_files``.
 
-    Returns the match only when EXACTLY ONE candidate qualifies; ambiguity or no
-    signal returns ``None`` so independent work is never falsely serialized.
+    When more than one candidate qualifies, the CANONICAL provider (earliest by
+    ``created_at``, id-tiebroken) is returned so every dependent of duplicate
+    capability providers deterministically attaches to the SAME foundation; no
+    qualifying signal returns ``None`` so independent work is never falsely
+    serialized.
     """
     ref_text = str(ref).strip()
     if not ref_text:
@@ -138,7 +153,7 @@ def _match_capability(
         ):
             matches.append(c)
             continue
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
@@ -162,27 +177,73 @@ def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
     return None
 
 
+def _foundation_shipped(
+    foundation: Task, failed_parent_ids: Optional[set] = None
+) -> bool:
+    """True iff a COMPLETED foundation's work actually SHIPPED.
+
+    Aligns the blocked-resume notion of "done" with the one the respawn-dedup
+    layer keys off (:func:`finding_deduplication.build_dedup_state`): a completed
+    task only satisfies a dependent's prerequisite when its work is genuinely
+    visible to that dependent. Two completed sub-states are NOT shipped and are
+    excluded here, exactly as the dedup layer would RE-SPAWN them:
+
+      * a COMPLETED task with NO merge-unblock signal (the PR closed/superseded
+        without merging — nothing landed), and
+      * a *ghost merge* — a PR that merged into a rollup staging branch whose
+        rollup parent later FAILED/CANCELLED (or COMPLETED without merging), so
+        the code never reached the integration branch. ``failed_parent_ids`` is
+        the stranded-parent set; a foundation whose ``parent_task_id`` is in it is
+        a ghost merge.
+
+    Gate on the merge-UNBLOCK / rollup-unblock signal (``pr_merged``-equivalent,
+    via :func:`has_merge_unblock_signal`), NOT the stricter integration-LANDING
+    signal: a foundation that merged onto the SHARED staging base carries the
+    rollup-unblock bit and IS genuinely visible to a same-base dependent, so it
+    must still satisfy it. Using ``has_landed_signal`` here would wrongly park
+    those same-base staging dependents.
+    """
+    if not has_merge_unblock_signal(foundation):
+        return False
+    if failed_parent_ids and foundation.parent_task_id in failed_parent_ids:
+        return False
+    return True
+
+
 def completed_foundation_for_need(
-    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+    task: Task,
+    need: Dict[str, Any],
+    completed_candidates: List[Task],
+    failed_parent_ids: Optional[set] = None,
 ) -> Optional[Task]:
-    """Return the already-completed task that satisfies ``need``, or ``None``.
+    """Return the already-completed, SHIPPED task that satisfies ``need``, or ``None``.
 
     Same exact-match signals as the live path (task id / PR number / explicit
-    capability marker) — never a fuzzy guess. Exposed (alongside the boolean
+    capability marker) — never a fuzzy guess — but the candidate must also have
+    actually shipped (see :func:`_foundation_shipped`): a COMPLETED-but-unmerged
+    task or a ghost merge does NOT satisfy the need, mirroring the respawn-dedup
+    layer that would rebuild such a foundation. Exposed (alongside the boolean
     :func:`need_satisfied_by_completed`) so a resume path can inspect the actual
     landed foundation — e.g. to decide whether a cross-base base re-cut is
     required before the dependent leaves BLOCKED.
     """
     if not isinstance(need, dict):
         return None
-    eligible = [c for c in completed_candidates if c.id != task.id]
+    eligible = [
+        c
+        for c in completed_candidates
+        if c.id != task.id and _foundation_shipped(c, failed_parent_ids)
+    ]
     return _match_need(need, eligible)
 
 
 def need_satisfied_by_completed(
-    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+    task: Task,
+    need: Dict[str, Any],
+    completed_candidates: List[Task],
+    failed_parent_ids: Optional[set] = None,
 ) -> bool:
-    """True if ``need`` is satisfied by already-completed/merged work.
+    """True if ``need`` is satisfied by already-completed/merged work that SHIPPED.
 
     The live ``resolve_blocked_need`` path only considers active candidates, but a
     parked blocker may have outlived the foundation it waited on — the sibling
@@ -191,10 +252,19 @@ def need_satisfied_by_completed(
     simply done, so the parked task should resume and proceed with no edge.
 
     Uses the SAME exact-match signals as the live path (task id / PR number /
-    explicit capability marker) — never a fuzzy guess. ``completed_candidates`` is
-    the pre-fetched set of same-project tasks in :data:`COMPLETED_CANDIDATE_STATUSES`.
+    explicit capability marker) — never a fuzzy guess — AND the SAME "shipped"
+    gate as the respawn-dedup layer (:func:`_foundation_shipped`): a
+    COMPLETED-but-unmerged task or a ghost merge does NOT satisfy the need.
+    ``completed_candidates`` is the pre-fetched set of same-project tasks in
+    :data:`COMPLETED_CANDIDATE_STATUSES`; ``failed_parent_ids`` is the
+    stranded-parent set used to exclude ghost merges.
     """
-    return completed_foundation_for_need(task, need, completed_candidates) is not None
+    return (
+        completed_foundation_for_need(
+            task, need, completed_candidates, failed_parent_ids
+        )
+        is not None
+    )
 
 
 def need_matched_dead_foundation(
@@ -211,24 +281,23 @@ def need_matched_dead_foundation(
     is untouched. ``dead_candidates`` is the pre-fetched set of same-project tasks
     in :data:`TERMINAL_CANDIDATE_STATUSES`.
 
-    A requeue-replaced cancellation (``_replaced_by_task_id``) or a clean
-    "scope already covered" exit (``failure_category == SCOPE_EMPTY``) is NOT a
-    genuine death — the work either continues under a replacement clone or was a
-    deliberate no-op — so such candidates are excluded and never trigger a
-    termination.
+    A non-death cancellation is NOT a genuine death and is excluded so it never
+    triggers a termination: a requeue-replaced clone (``_replaced_by_task_id``),
+    a clean "scope already covered" no-op (``failure_category == SCOPE_EMPTY``),
+    or a co-deferred shelving (``_co_deferred_shelved``) whose work re-surfaces in
+    a later cycle. The shared predicate
+    :func:`app.failure_classification.is_non_death_cancellation` is the single
+    source of this policy, so it cannot drift from the dispatch-time classifier.
     """
     if not isinstance(need, dict):
         return False
-    from app.failure_classification import SCOPE_EMPTY
+    from app.failure_classification import is_non_death_cancellation
 
     eligible = []
     for c in dead_candidates:
         if c.id == task.id:
             continue
-        ctx = c.context or {}
-        if ctx.get("_replaced_by_task_id"):
-            continue
-        if ctx.get("failure_category") == SCOPE_EMPTY:
+        if is_non_death_cancellation(c):
             continue
         eligible.append(c)
     return _match_need(need, eligible) is not None

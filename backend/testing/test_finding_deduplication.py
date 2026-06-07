@@ -23,7 +23,9 @@ from app.finding_deduplication import (
     finding_hash,
     is_duplicate,
     normalize_prerequisite,
+    prerequisite_matches_task,
     resolve_prerequisite_task,
+    select_canonical_provider,
 )
 from app.models import Task, TaskStatus
 
@@ -98,6 +100,72 @@ def test_build_dedup_state_excludes_completed_without_pr_merged():
     assert "abc123" not in hashes
     assert failed == {}
     assert prior == {}
+
+
+def test_build_dedup_state_suppresses_completed_no_op_reproduce_off_ramp():
+    # COMPLETED-without-pr_merged but carrying a no_op_reason = the agent took
+    # the reproduce-on-HEAD off-ramp and verified the finding does not
+    # reproduce. The finding hash MUST be suppressed so it is not re-dispatched
+    # next cycle, and the failed_hashes label records why there's no PR.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "noop1",
+            "no_op_reason": "defect already fixed by intervening merge; cited code refactored away",
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "noop1" in hashes
+    assert failed["noop1"] == "no-op (not reproducing)"
+
+
+def test_build_dedup_state_suppresses_completed_already_resolved_verdict():
+    # COMPLETED-without-pr_merged carrying the canonical reproduce verdict
+    # ``already_resolved`` (the durable signal, no legacy no_op_reason): the
+    # agent verified the defect does not reproduce on HEAD. The finding hash MUST
+    # be suppressed even though no_op_reason is absent.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "verdict_resolved",
+            "reproduce_verdict": {
+                "status": "already_resolved",
+                "reason": "cited symbol absent on HEAD; refactored away",
+            },
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "verdict_resolved" in hashes
+    assert failed["verdict_resolved"] == "no-op (not reproducing)"
+
+
+def test_build_dedup_state_indeterminate_verdict_stays_eligible():
+    # COMPLETED-without-pr_merged with an ``indeterminate`` verdict: the defect
+    # could NOT be ruled out, so the finding stays eligible for retry — only an
+    # affirmative already_resolved (or legacy no_op_reason) suppresses it.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "verdict_indet",
+            "reproduce_verdict": {"status": "indeterminate"},
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "verdict_indet" not in hashes
+    assert failed == {}
+
+
+def test_build_dedup_state_incomplete_no_pr_completion_stays_eligible():
+    # COMPLETED-without-pr_merged and WITHOUT a no_op_reason = a dropped /
+    # abandoned no-PR completion (work was left incomplete). It must remain
+    # eligible for retry, so its finding hash is NOT suppressed.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": "incomplete1"},
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "incomplete1" not in hashes
+    assert failed == {}
 
 
 def test_build_dedup_state_includes_completed_pr_merged():
@@ -1201,14 +1269,140 @@ def test_resolve_prerequisite_task_malformed_prereq_returns_none():
     assert resolve_prerequisite_task({"kind": "bogus", "ref": "x"}, [foundation]) is None
 
 
-def test_resolve_prerequisite_task_prefers_first_match_in_order():
-    # Caller controls candidate ordering (e.g. in-flight before sibling batch);
-    # the first explicit match wins.
-    first = _make_task(
-        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "shared-hash-0001"}
+def test_resolve_prerequisite_task_selects_canonical_earliest_created_at():
+    # Several candidates share the same explicit signal (duplicate foundations).
+    # The CANONICAL provider — earliest by created_at — must win regardless of
+    # the order the caller supplies the candidates in, so every dependent
+    # deterministically attaches to the same foundation.
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    earliest = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"finding_hash": "shared-hash-0001"},
+        created_at=base,
     )
-    second = _make_task(
-        status=TaskStatus.QUEUED, context={"finding_hash": "shared-hash-0001"}
+    later = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "shared-hash-0001"},
+        created_at=base + timedelta(hours=2),
     )
     prereq = {"kind": "task", "ref": "shared-hash-0001"}
-    assert resolve_prerequisite_task(prereq, [first, second]) is first
+    # `later` appears first in iteration order, but `earliest` is canonical.
+    assert resolve_prerequisite_task(prereq, [later, earliest]) is earliest
+    # Order-independent: the same canonical choice with the list reversed.
+    assert resolve_prerequisite_task(prereq, [earliest, later]) is earliest
+
+
+def test_resolve_prerequisite_task_canonical_capability_earliest_wins():
+    # Multiple active tasks advertise the SAME explicit capability marker.
+    base = datetime(2026, 2, 1, 9, 0, 0)
+    earliest = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"provides_capability": "auth-service"},
+        created_at=base,
+    )
+    later = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"capability": ["auth-service"]},
+        created_at=base + timedelta(minutes=30),
+    )
+    prereq = {"kind": "capability", "ref": "auth-service"}
+    assert resolve_prerequisite_task(prereq, [later, earliest]) is earliest
+
+
+def test_resolve_prerequisite_task_created_at_tie_breaks_on_str_id():
+    # Same created_at: the tie breaks deterministically on str(task.id), the
+    # exact rule compute_foundation_convergence_actions uses.
+    base = datetime(2026, 3, 1, 0, 0, 0)
+    a = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"finding_hash": "tie-hash-0001"},
+        created_at=base,
+    )
+    b = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "tie-hash-0001"},
+        created_at=base,
+    )
+    expected = min((a, b), key=lambda t: str(t.id))
+    prereq = {"kind": "task", "ref": "tie-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [a, b]) is expected
+    assert resolve_prerequisite_task(prereq, [b, a]) is expected
+
+
+def test_resolve_prerequisite_task_none_created_at_sorts_as_minimum():
+    # A missing created_at sorts as datetime.min — so it only wins if it is
+    # genuinely the earliest, matching the convergence path's rule. Here the
+    # None-dated task wins over a real-dated one (None == minimum).
+    no_date = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "nd-hash-0001"}
+    )
+    no_date.created_at = None
+    dated = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "nd-hash-0001"},
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    prereq = {"kind": "task", "ref": "nd-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [dated, no_date]) is no_date
+
+
+def test_resolve_prerequisite_task_single_match_unchanged():
+    # A lone match is returned as-is (no behavioral change for the common case).
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "solo-hash-0001"}
+    )
+    other = _make_task(status=TaskStatus.QUEUED)
+    prereq = {"kind": "task", "ref": "solo-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
+
+
+def test_select_canonical_provider_empty_returns_none():
+    assert select_canonical_provider([]) is None
+
+
+def test_select_canonical_provider_picks_earliest_then_id():
+    base = datetime(2026, 4, 1, 0, 0, 0)
+    later = _make_task(created_at=base + timedelta(hours=1))
+    earlier = _make_task(created_at=base)
+    assert select_canonical_provider([later, earlier]) is earlier
+    # created_at tie → str(id) tiebreak
+    a = _make_task(created_at=base)
+    b = _make_task(created_at=base)
+    assert select_canonical_provider([a, b]) is min((a, b), key=lambda t: str(t.id))
+
+
+# ---------------------------------------------------------------------------
+# prerequisite_matches_task (shared predicate — single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_prerequisite_matches_task_matches_by_id():
+    task = _make_task()
+    assert prerequisite_matches_task({"kind": "task", "ref": str(task.id)}, task) is True
+
+
+def test_prerequisite_matches_task_matches_by_finding_hash():
+    task = _make_task(context={"finding_hash": "abc123def4560000"})
+    assert prerequisite_matches_task({"kind": "task", "ref": "abc123def4560000"}, task) is True
+
+
+def test_prerequisite_matches_task_matches_capability_marker_case_insensitive():
+    task = _make_task(context={"provides_capability": "Auth-Service"})
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+
+
+def test_prerequisite_matches_task_matches_capability_list_marker():
+    task = _make_task(context={"capability": ["logging", "auth-service"]})
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+
+
+def test_prerequisite_matches_task_negatives():
+    task = _make_task(context={"finding_hash": "1111222233334444"})
+    # Wrong hash, missing marker, malformed need, None task, and the resume-only
+    # 'pr' kind all return False (pr is intentionally not a predicate signal).
+    assert prerequisite_matches_task({"kind": "task", "ref": "ffffffffffffffff"}, task) is False
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth"}, task) is False
+    assert prerequisite_matches_task({"kind": "bogus", "ref": "x"}, task) is False
+    assert prerequisite_matches_task(None, task) is False
+    assert prerequisite_matches_task({"kind": "task", "ref": "x"}, None) is False
+    assert prerequisite_matches_task({"kind": "pr", "ref": "42"}, task) is False

@@ -181,6 +181,11 @@ let vmImageTs: number | null = null;
 // vm-heartbeats and task heartbeats so stale-image diagnostics can identify
 // the exact agent runtime revision independently of image name or build timestamp.
 let agentRuntimeFingerprint: string | null = null;
+// Git commit the image was built from, baked into /opt/agent/AGENT_SOURCE_SHA by
+// packer (see infra/packer/agent.pkr.hcl). Read once at startup and included in
+// vm-heartbeats and task heartbeats so a running VM maps back to its exact build
+// commit. Stays null in local dev / on pre-marker images / on an 'unknown' bake.
+let agentSourceSha: string | null = null;
 
 /** Fetch the GCP boot-disk image path from the instance metadata service.
  *  Returns the short image name and extracted unix build timestamp, or
@@ -216,6 +221,22 @@ export function readAgentRuntimeFingerprint(): string | null {
   try {
     const raw = fs.readFileSync('/opt/agent/AGENT_RUNTIME_FINGERPRINT', 'utf-8').trim();
     const m = /^AGENT_RUNTIME_FINGERPRINT=([0-9a-f]{64})$/.exec(raw);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the baked source git SHA from the well-known marker written by the
+ *  packer provisioner (/opt/agent/AGENT_SOURCE_SHA). Returns the commit SHA, or
+ *  null when the file is absent (local dev / pre-marker image) or carries an
+ *  empty/'unknown' value (a build with no commit in the environment) — so the
+ *  agent never reports a bogus SHA over the wire. The permissive 7-40 hex match
+ *  also rejects the literal 'unknown' fallback. */
+export function readAgentSourceSha(): string | null {
+  try {
+    const raw = fs.readFileSync('/opt/agent/AGENT_SOURCE_SHA', 'utf-8').trim();
+    const m = /^AGENT_SOURCE_SHA=([0-9a-f]{7,40})$/.exec(raw);
     return m ? m[1] : null;
   } catch {
     return null;
@@ -1170,7 +1191,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
+          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint, ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}) }),
         });
         if (res.status === 401 || res.status === 403) {
           log(`pollForNextRole vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -1191,7 +1212,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
       const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
+        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint, ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}) }),
       });
       if (res.status === 401 || res.status === 403) {
         log(`pollForNextRole initial vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -1608,6 +1629,11 @@ export function _setAgentRuntimeFingerprintForTesting(value: string | null): voi
   agentRuntimeFingerprint = value;
 }
 
+/** Test-only: set the baked source git SHA used in heartbeats. */
+export function _setAgentSourceShaForTesting(value: string | null): void {
+  agentSourceSha = value;
+}
+
 export function snapshotToolTrace(options?: { refreshLastEntry?: boolean }): ToolTraceEntry[] {
   if (options?.refreshLastEntry && _toolTrace.length > 0) {
     _toolTrace[_toolTrace.length - 1] = {
@@ -1779,6 +1805,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
+        ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
@@ -1833,6 +1860,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
+        ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
@@ -2774,6 +2802,8 @@ async function completeStartup(
   if (startupStatusRef) startupStatusRef.value = 'Completing startup: reading runtime fingerprint';
   agentRuntimeFingerprint = readAgentRuntimeFingerprint();
   log(`Agent runtime fingerprint: ${agentRuntimeFingerprint ?? '<not available>'}`);
+  agentSourceSha = readAgentSourceSha();
+  log(`Agent source git SHA: ${agentSourceSha ?? '<not available>'}`);
   if (startupStatusRef) startupStatusRef.value = 'Completing startup: loading VM image identity';
   await loadVmImageIdentity();
   if (startupStatusRef) startupStatusRef.value = 'Completing startup: replaying stale results';

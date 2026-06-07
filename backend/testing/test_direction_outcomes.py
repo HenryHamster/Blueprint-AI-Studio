@@ -302,8 +302,7 @@ async def test_status_aggregation_mixed(db_session: AsyncSession):
     assert entry["tasks_completed"] == 2
     assert entry["tasks_failed"] == 1
     assert entry["tasks_cancelled"] == 1
-    # BLOCKED is counted in its own bucket — NOT folded into the failure tally.
-    assert entry["tasks_blocked"] == 1
+    # BLOCKED tasks are non-terminal and not folded into the failure tally.
 
 
 def test_blocked_status_does_not_count_as_failure():
@@ -399,6 +398,69 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_generalized_success_gates_on_reproduce_verdict(db_session: AsyncSession):
+    """A merged fix still counts as a shipped merge, but only a *reproduced*
+    defect scores as a generalized (proven-fix) success; an already_resolved
+    merge ships code without inflating generalized_successes."""
+    direction_id = "d-reproduce"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "reproduce_verdict": {"status": "reproduced"},
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+        title="reproduced-fix",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "reproduce_verdict": {"status": "already_resolved"},
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+        title="already-resolved-merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Both merged PRs still count as shipped code (merge-rate metrics unchanged).
+    assert entry["prs_merged"] == 2
+    assert entry["verified_prs_merged"] == 2
+    assert entry["conversion_rate"] == 1.0
+    # ...but only the reproduced defect is a proven-fix generalized success.
+    assert entry["generalized_successes"] == 1
+    code_merge = entry["outcome_kind_breakdown"]["code_merge"]
+    assert code_merge["success"] == 1
+    assert code_merge["neutral"] == 1
+
+
+@pytest.mark.asyncio
 async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
     """Staging/no-op success paths should not inflate prs_merged analytics."""
     direction_id = "d-prs-non-merge"
@@ -475,6 +537,283 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
     assert entry["conversion_rate"] is None
+
+
+def test_verified_merged_count_helper():
+    """verified_merged_count prefers verified_prs_merged, falls back to prs_merged."""
+    from app.direction_outcomes import verified_merged_count
+
+    # Legacy entry (no verified_prs_merged) → falls back to raw prs_merged.
+    assert verified_merged_count({"prs_merged": 4}) == 4
+    # New entry → uses verified count (degraded merges already excluded).
+    assert verified_merged_count({"prs_merged": 4, "verified_prs_merged": 2}) == 2
+    # Empty / missing → 0.
+    assert verified_merged_count({}) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merge(
+    db_session: AsyncSession,
+):
+    """Conversion counts verified + benign-unverified merges, NOT degraded ones."""
+    direction_id = "d-verif-conv"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Verified merge — no fall-open reason.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="verified",
+    )
+    # Benign-unverified merge (no runnable suite) — a legitimate positive signal.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        },
+        title="benign",
+    )
+    # Degraded-unverified merge (verify setup failed) — never actually verified.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 3
+    assert entry["verified_prs_merged"] == 2
+    # Verification-aware: 2 (verified + benign) / 3 created, NOT 3/3.
+    assert entry["conversion_rate"] == round(2 / 3, 3)
+
+
+@pytest.mark.asyncio
+async def test_verified_merged_excludes_declared_unsatisfied_acceptance(
+    db_session: AsyncSession,
+):
+    """A merged PR whose declared acceptance evidence is unsatisfied does not
+    count toward verified_prs_merged (or conversion_rate); satisfied / no-key
+    merges still count, mirroring the per-task outcome layer."""
+    direction_id = "d-accept-conv"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Merge with no acceptance verdict (legacy / no declaration) — still counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="no-acceptance",
+    )
+    # Merge with acceptance declared AND satisfied — counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": True},
+        },
+        title="acceptance-satisfied",
+    )
+    # Merge with acceptance declared but NOT satisfied — excluded.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="acceptance-unsatisfied",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 3
+    # Only the no-key + satisfied merges are verified; the unsatisfied one drops.
+    assert entry["verified_prs_merged"] == 2
+    assert entry["conversion_rate"] == round(2 / 3, 3)
+
+
+@pytest.mark.asyncio
+async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
+    db_session: AsyncSession,
+):
+    """The acceptance exclusion composes with the degraded-unverified one: a
+    merge that is both degraded and acceptance-unsatisfied drops once, and each
+    exclusion independently removes its row."""
+    direction_id = "d-accept-degraded"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
+    await db_session.flush()
+
+    # Clean verified merge — counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="clean",
+    )
+    # Degraded-unverified merge — excluded by the degraded gate.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded",
+    )
+    # Acceptance-unsatisfied merge — excluded by the acceptance gate.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="acceptance-unsatisfied",
+    )
+    # Both degraded AND acceptance-unsatisfied — still drops exactly once.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="both",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 4
+    # Only the clean merge survives both gates.
+    assert entry["verified_prs_merged"] == 1
+    assert entry["conversion_rate"] == round(1 / 4, 3)
+
+
+def test_churn_metrics_excludes_degraded_unverified_merges():
+    """_compute_churn_metrics counts degraded merges as non-merge finished work."""
+    from app.strategic_completion import _compute_churn_metrics
+
+    # Each cycle: 2 completed, 2 merged of which only 1 verified (1 degraded).
+    direction = {
+        "research_history": [
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+        ]
+    }
+    metrics = _compute_churn_metrics(direction)
+    # Verified-aware merged = 3 of 6 finished → 0.5 (raw prs_merged would be 1.0).
+    assert metrics["merged"] == 3
+    assert metrics["merge_rate"] == 0.5
+
+
+def test_lifetime_burn_excludes_degraded_unverified_merges():
+    """_compute_lifetime_burn_metrics uses verified counts (window + aggregate)."""
+    from app.strategic_completion import _compute_lifetime_burn_metrics
+
+    direction = {
+        "research_history": [
+            {"tasks_completed": 4, "prs_merged": 4, "verified_prs_merged": 2},
+        ],
+        "history_aggregate": {
+            "total_tasks_completed": 4,
+            "total_prs_merged": 4,
+            "total_verified_prs_merged": 2,
+        },
+    }
+    m = _compute_lifetime_burn_metrics(direction)
+    # lifetime_merged = 2 (window verified) + 2 (agg verified) = 4, of 8 finished.
+    assert m["lifetime_merged"] == 4
+    assert m["lifetime_merge_rate"] == 0.5
+
+
+def test_lifetime_burn_legacy_aggregate_falls_back_to_total_prs_merged():
+    """Aggregates predating total_verified_prs_merged use total_prs_merged."""
+    from app.strategic_completion import _compute_lifetime_burn_metrics
+
+    direction = {
+        "research_history": [],
+        "history_aggregate": {
+            "total_tasks_completed": 4,
+            "total_prs_merged": 4,
+        },
+    }
+    m = _compute_lifetime_burn_metrics(direction)
+    assert m["lifetime_merged"] == 4
 
 
 @pytest.mark.asyncio
@@ -685,148 +1024,8 @@ async def test_avg_time_to_merge_none_when_no_merged(db_session: AsyncSession):
     assert entry["avg_time_to_merge_hours"] is None
 
 
-@pytest.mark.asyncio
-async def test_implementation_and_review_timing_split(db_session: AsyncSession):
-    """avg_implementation_hours covers all completed; avg_review_hours uses review child's vm_stopped_at."""
-    direction_id = "d-split"
-    project = await _create_project(db_session, directions=[])
-    research_task = await _make_research_task(db_session, project.id)
-    research_task_id = str(research_task.id)
-
-    project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=2)
-    ]
-    await db_session.flush()
-
-    base = _utcnow()
-    # Merged create task: 2h implementation
-    merged = await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "pr_number": 42},
-        created_at=base,
-        vm_stopped_at=base + timedelta(hours=2),
-        title="impl",
-    )
-    # Completed-but-unmerged create task: 4h implementation, contributes only to impl avg
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={},
-        created_at=base,
-        vm_stopped_at=base + timedelta(hours=4),
-        title="impl-only",
-    )
-    # Review child for PR 42: vm_stopped 1h after merged.vm_stopped_at
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "review", "pr_number": 42}],
-        context={"pr_number": 42},
-        created_at=base + timedelta(hours=2),
-        vm_stopped_at=base + timedelta(hours=3),
-        title="review",
-    )
-    await db_session.flush()
-    # Ensure merged's updated_at doesn't interfere
-    merged.updated_at = base + timedelta(hours=10)
-    await db_session.flush()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=research_task_id,
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    entry = project.directions[0]["research_history"][0]
-    # Mean across all completed children: impl=2h, impl-only=4h, review=1h
-    assert entry["avg_implementation_hours"] == 2.33
-    assert entry["avg_review_hours"] == 1.0  # 3h - 2h via review child
-
-
-@pytest.mark.asyncio
-async def test_avg_review_hours_falls_back_to_updated_at(db_session: AsyncSession):
-    """When no review child exists, avg_review_hours uses merged task's updated_at."""
-    direction_id = "d-rev-fallback"
-    project = await _create_project(db_session, directions=[])
-    research_task = await _make_research_task(db_session, project.id)
-    research_task_id = str(research_task.id)
-
-    project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=1)
-    ]
-    await db_session.flush()
-
-    base = _utcnow()
-    merged = await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "pr_number": 99},
-        created_at=base,
-        vm_stopped_at=base + timedelta(hours=1),
-        title="merged-no-review",
-    )
-    await db_session.flush()
-    merged.updated_at = base + timedelta(hours=2, minutes=30)
-    await db_session.flush()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=research_task_id,
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    entry = project.directions[0]["research_history"][0]
-    assert entry["avg_implementation_hours"] == 1.0
-    assert entry["avg_review_hours"] == 1.5
-
-
-@pytest.mark.asyncio
-async def test_timing_fields_none_when_no_data(db_session: AsyncSession):
-    """Both new timing fields are None when no qualifying tasks exist."""
-    direction_id = "d-no-timing"
-    project = await _create_project(db_session, directions=[])
-    research_task = await _make_research_task(db_session, project.id)
-    research_task_id = str(research_task.id)
-
-    project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=1)
-    ]
-    await db_session.flush()
-
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.FAILED,
-        context={},
-        title="failed",
-    )
-    await db_session.flush()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=research_task_id,
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    entry = project.directions[0]["research_history"][0]
-    assert entry["avg_implementation_hours"] is None
-    assert entry["avg_review_hours"] is None
+# Retired: tests for avg_implementation_hours and avg_review_hours.
+# Fields were retired as they had no named consumers. Removed 2026-06-05.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3029,66 +3228,8 @@ async def test_preventive_context_counts(db_session: AsyncSession):
     assert entry["preventive_context_tasks_failed"] == 1
 
 
-@pytest.mark.asyncio
-async def test_remediation_task_counts(db_session: AsyncSession):
-    """remediation_tasks_{created,merged,failed} counted via diagnosis_task_id/auto_remediation."""
-    direction_id = "d-rem"
-    project = await _create_project(db_session, directions=[])
-    research_task = await _make_research_task(db_session, project.id)
-    research_task_id = str(research_task.id)
-
-    project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=5)
-    ]
-    await db_session.flush()
-
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={"diagnosis_task_id": "diag-1", "pr_merged": True},
-        title="rem-diag-merged",
-    )
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.FAILED,
-        context={"auto_remediation": True},
-        title="rem-auto-failed",
-    )
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={"auto_remediation": True},  # completed, not merged
-        title="rem-auto-no-pr",
-    )
-    # Non-remediation: shouldn't count
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
-        title="regular-merged",
-    )
-    await db_session.flush()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=research_task_id,
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    entry = project.directions[0]["research_history"][0]
-    assert entry["remediation_tasks_created"] == 3
-    assert entry["remediation_tasks_merged"] == 1
-    assert entry["remediation_tasks_failed"] == 1
+# Retired: test_remediation_task_counts. Tested the retired fields remediation_tasks_created,
+# remediation_tasks_merged, remediation_tasks_failed which were never consumed. Removed 2026-06-05.
 
 
 def test_synthesize_prompt_quality_patterns_emits_when_signal_meaningful():
@@ -4086,10 +4227,9 @@ async def test_generalized_health_code_only_unchanged(db_session: AsyncSession):
 async def test_product_vs_structural_classification_registry_driven(
     db_session: AsyncSession,
 ):
-    """product_ratio / structural_count classify child tasks via the task-type
-    registry (PRODUCT_TASK_TYPES), not the stale {create, feature, improvement}
-    set. create + fix + migrate count as product; refactor + research count as
-    structural; an unknown/future type defaults to structural."""
+    """product_ratio classifies child tasks via the task-type registry (PRODUCT_TASK_TYPES).
+    create + fix + migrate count as product; refactor + research count as structural;
+    an unknown/future type defaults to structural."""
     direction_id = "d-product-split"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
@@ -4126,6 +4266,213 @@ async def test_product_vs_structural_classification_registry_driven(
     )
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # 3 product / 6 total = 0.5, 3 structural.
+    # 3 product / 6 total = 0.5
     assert entry["product_ratio"] == 0.5
-    assert entry["structural_count"] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# verified_prs_merged
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verified_prs_merged_excludes_degraded(db_session: AsyncSession):
+    """verified_prs_merged counts only merges NOT falling open for a degraded reason."""
+    direction_id = "d-verified-prs"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # 1. Verified merge (no unverified_merge_reason).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="verified-merge",
+    )
+    # 2. Benign unverified merge (project has no test suite — not penalised).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        },
+        title="benign-unverified",
+    )
+    # 3. Degraded unverified merge (env/setup failure blocked verification).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded-unverified",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # All three PR merges count in the raw metric (back-compat).
+    assert entry["prs_merged"] == 3
+    # Only verified + benign count as verified merges (degraded excluded).
+    assert entry["verified_prs_merged"] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# no_op_task_details — affirmative no-op (already-resolved / non-reproducing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_populated(db_session: AsyncSession):
+    """A COMPLETED child with a no_op_reason populates no_op_task_details."""
+    direction_id = "d-noop"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"no_op_reason": "defect already resolved on HEAD"},
+        title="stale-finding",
+    )
+    # A plain COMPLETED child with no no_op_reason must NOT appear.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        title="plain-complete",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["no_op_task_details"] == [
+        {"title": "stale-finding", "no_op_reason": "defect already resolved on HEAD"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_excludes_merged_and_failed(
+    db_session: AsyncSession,
+):
+    """A merged-and-no-op'd child keeps its merge (no stale); failed is excluded."""
+    direction_id = "d-noop-excl"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # Merged completion that also carries a no_op_reason must NOT be tallied as
+    # a no-op (a verified merge keeps its merged tag).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "no_op_reason": "should be ignored"},
+        title="merged-finding",
+    )
+    # A FAILED child with a no_op_reason is not COMPLETED — excluded.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"no_op_reason": "irrelevant"},
+        title="failed-finding",
+        latest_status_message="boom",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["no_op_task_details"] == []
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_capped_and_truncated(db_session: AsyncSession):
+    """no_op_task_details caps at 5 entries and truncates reason to 120 chars."""
+    direction_id = "d-noop-cap"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=7)
+    ]
+    await db_session.flush()
+
+    long_reason = "Y" * 200
+    for i in range(7):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context={"no_op_reason": long_reason},
+            title=f"noop-{i}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert len(entry["no_op_task_details"]) == 5
+    assert all(len(d["no_op_reason"]) == 120 for d in entry["no_op_task_details"])

@@ -49,7 +49,9 @@ from app.digest_metrics import (
     _stash_projected_task_fields,
     _task_prompt_fingerprint,  # noqa: F401  re-exported for external importers
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
+    compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
     compute_direction_progress,
@@ -275,7 +277,7 @@ async def _compute_digest(
         await session.execute(text("SET LOCAL statement_timeout = '30s'"))
 
     # --- Query tasks from extended lookback window ---
-    # Load terminal tasks (COMPLETED/FAILED) for digest stats, plus any task
+    # Load terminal tasks (COMPLETED/FAILED/CANCELLED) for digest stats, plus any task
     # with requires_approval=True so we can surface pending-approval items in
     # needs_attention even while they are still IN_PROGRESS/QUEUED/etc.
     # QUEUED/PROVISIONING/IN_PROGRESS without approval flags are excluded here
@@ -284,7 +286,9 @@ async def _compute_digest(
     task_filters = [
         Task.created_at >= lookback_start,
         or_(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.requires_approval.is_(True),
         ),
     ]
@@ -335,6 +339,15 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Token telemetry for the per-effort/per-model LLM efficiency
+                    # rollup (compute_effort_model_efficiency). api_call_summary is
+                    # accessed directly (not via __dict__), so it MUST be loaded
+                    # here or the async access would trigger a lazy-load error; the
+                    # banked *_db columns back the property fallbacks.
+                    Task.api_call_summary,
+                    Task.llm_input_tokens_banked_db,
+                    Task.llm_output_tokens_banked_db,
+                    Task.llm_call_count_banked_db,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -381,6 +394,12 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Token telemetry for the per-effort/per-model LLM efficiency
+                    # rollup (compute_effort_model_efficiency).
+                    Task.api_call_summary,
+                    Task.llm_input_tokens_banked_db,
+                    Task.llm_output_tokens_banked_db,
+                    Task.llm_call_count_banked_db,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -406,6 +425,11 @@ async def _compute_digest(
         for t in all_tasks
         if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
     ]
+    cancelled_tasks = [
+        t
+        for t in all_tasks
+        if t.status == TaskStatus.CANCELLED and _derive_completed_at(t) >= window_start
+    ]
     # Approval tasks use created_at (they haven't completed yet)
     # _to_naive_utc strips tz from t.created_at (TIMESTAMPTZ since 0061) for
     # comparison with naive window_start. See time_utils._to_naive_utc.
@@ -413,7 +437,8 @@ async def _compute_digest(
         t
         for t in all_tasks
         if t.requires_approval
-        and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        and t.status
+        not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
         and _to_naive_utc(t.created_at) >= window_start
     ]
 
@@ -442,6 +467,9 @@ async def _compute_digest(
                     Task.status,
                     Task.title,
                     Task.started_at,
+                    Task.created_at,
+                    Task.updated_at,
+                    Task.latest_status_message,
                     Task.project_id,
                     Task.context,
                     Task.vm_provisioned_at,
@@ -469,6 +497,9 @@ async def _compute_digest(
                     Task.title,
                     Task.payloads,
                     Task.started_at,
+                    Task.created_at,
+                    Task.updated_at,
+                    Task.latest_status_message,
                     Task.project_id,
                     Task.context,
                     Task.vm_provisioned_at,
@@ -493,6 +524,11 @@ async def _compute_digest(
     dir_id_to_text: Dict[str, str] = {}
     scope_conversion_rates: Dict[str, Dict[str, int]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, int]] = {}
+    direction_portfolio: Dict[str, Any] = {
+        "active_count": 0,
+        "self_sufficient_count": 0,
+        "composition": [],
+    }
 
     if project_id:
         project = await session.get(Project, project_id)
@@ -503,6 +539,7 @@ async def _compute_digest(
                 prev_scope_conversion_rates,
                 dir_id_to_text,
                 _,
+                direction_portfolio,
             ) = await compute_direction_progress(
                 session,
                 project=project,
@@ -587,21 +624,29 @@ async def _compute_digest(
         )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
-        needs_attention.append(
-            {
-                "task_id": tid,
-                "title": t.title or "Pending approval",
-                "reason": "approval_required",
-                "error_snippet": None,
-                "pr_url": pr_artifact_map.get(tid),
-                "waiting_since": waiting_since.isoformat() if waiting_since else None,
-                "waiting_hours": waiting_hours,
-                "approval_reason": t.latest_status_message,
-                "touched_critical": (t.context or {}).get("touched_critical", []),
-                "direction_id": t_dir_id,
-                "direction_text": t_dir_text,
-            }
-        )
+        payload = t.first_payload
+        task_type = payload.get("type", "create")
+        entry = {
+            "task_id": tid,
+            "title": t.title or "Pending approval",
+            "reason": "approval_required",
+            "error_snippet": None,
+            "pr_url": pr_artifact_map.get(tid),
+            "waiting_since": waiting_since.isoformat() if waiting_since else None,
+            "waiting_hours": waiting_hours,
+            "approval_reason": t.latest_status_message,
+            "touched_critical": (t.context or {}).get("touched_critical", []),
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
+            "task_type": task_type,
+        }
+        # Held compute_experiment launches carry a proposed spend cap and
+        # deadline in their payload — surface them so the operator can approve,
+        # adjust the cap, or reject with full context.
+        if task_type == "compute_experiment":
+            entry["spend_cap_usd"] = payload.get("spend_cap_usd")
+            entry["deadline_seconds"] = payload.get("deadline_seconds")
+        needs_attention.append(entry)
     needs_attention.sort(
         key=lambda x: (
             0 if x["reason"] == "approval_required" else 1,
@@ -900,12 +945,23 @@ async def _compute_digest(
         outer_loop_convergence_trend=outer_loop_convergence_trend,
     )
 
+    # Today's settled off-VM compute-job spend so daily_cost_usd reflects total
+    # spend, not just VM runtime. Mirrors the today_start the pure function uses.
+    from app.compute_jobs import get_recent_terminal_compute_spend_usd
+
+    _cost_now = _utcnow()
+    _today_start = _cost_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    compute_job_daily_cost_usd = await get_recent_terminal_compute_spend_usd(
+        session, project_id=project_id, since=_today_start
+    )
+
     _cost_econ = compute_digest_cost_economics(
         all_tasks=all_tasks,
         direction_progress_list=direction_progress_list,
         window_start=window_start,
-        now=_utcnow(),
+        now=_cost_now,
         daily_cost_ceiling_usd=float(_runtime_config.get("daily_cost_ceiling_usd", 0)),
+        compute_job_daily_cost_usd=compute_job_daily_cost_usd,
     )
     total_estimated_cost_usd = _cost_econ["total_estimated_cost_usd"]
     total_spot_cost_usd = _cost_econ["total_spot_cost_usd"]
@@ -920,11 +976,21 @@ async def _compute_digest(
     _median_cpm_by_type = _cost_econ["median_cpm_by_type"]
     pipeline_acceptance_rate = _cost_econ["pipeline_acceptance_rate"]
     pipeline_conversion_rate = _cost_econ["pipeline_conversion_rate"]
-    pipeline_autonomous_prs_merged = _cost_econ["pipeline_autonomous_prs_merged"]
-    pipeline_assisted_prs_merged = _cost_econ["pipeline_assisted_prs_merged"]
-    pipeline_operator_action_count = _cost_econ["pipeline_operator_action_count"]
+    # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+    # pipeline_operator_action_count — consumer-less digest duplicates of the
+    # per-direction autonomous_prs_merged / assisted_prs_merged /
+    # operator_action_count fields (already surfaced in DirectionCard).
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
+
+    # Per-effort-tier / per-actual-model LLM efficiency rollup over the window's
+    # finished (terminal) tasks. Additive — answers whether effort-tier scaling
+    # earns its money in landed PRs. Reuses the shared LLM pricing so its totals
+    # reconcile with the per-model cost surface.
+    effort_model_efficiency = compute_effort_model_efficiency(
+        completed_tasks + failed_tasks + cancelled_tasks,
+        runtime_config=_runtime_config,
+    )
 
     # --- Scope mismatch diagnostics ---
     # Aggregate calibration data across terminal tasks in the window to surface
@@ -1062,10 +1128,15 @@ async def _compute_digest(
     # --- Latest strategic cycle + prediction calibration ---
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
-    fresh_reviewer_trend: Optional[Dict[str, Any]] = None
+    # Retired: fresh_reviewer_trend digest emission — the computation stays live
+    # (sr_reviewer_trends.compute_fresh_reviewer_trend persists it to
+    # project.design_doc, and pipeline_health.py emits it on its own surface),
+    # but the digest-payload copy had no named reader (no UI component renders
+    # digest.fresh_reviewer_trend). Removed to satisfy the consumer invariant.
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
+    sr_false_attestation_trends: Optional[Dict[str, Any]] = None
     memo_pathway_exits: int = 0
     recent_cycle_memo_stats: list[dict[str, Any]] = []
     memo_ever_cited: dict[str, Any] | None = None
@@ -1086,6 +1157,9 @@ async def _compute_digest(
             )
             if _sr_rrts:
                 sr_regression_risk_test_signal_trends = _sr_rrts
+            _sft = (_proj.design_doc or {}).get("sr_false_attestation_trends")
+            if _sft:
+                sr_false_attestation_trends = _sft
             cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
             completed_cycles = [
                 c
@@ -1133,21 +1207,9 @@ async def _compute_digest(
                 for c in _sc_history
                 if c.get("outcome") not in (None, "in_progress")
             ]
-            # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
-            _fr_trends = (_proj.design_doc or {}).get("fresh_reviewer_trend") or {}
-            if _fr_trends:
-                fresh_reviewer_trend = {
-                    "computed_at": _fr_trends.get("computed_at"),
-                    "bucket_mode": _fr_trends.get("bucket_mode"),
-                    "current_cycle_id": _fr_trends.get("current_cycle_id"),
-                    "previous_cycle_id": _fr_trends.get("previous_cycle_id"),
-                    "current_sample_size": _fr_trends.get("current_sample_size"),
-                    "previous_sample_size": _fr_trends.get("previous_sample_size"),
-                    "per_category_hit_rate": _fr_trends.get("per_category_hit_rate")
-                    or {},
-                    "added_value": _fr_trends.get("added_value") or {},
-                    "approval_rate_lift": _fr_trends.get("approval_rate_lift") or {},
-                }
+            # Retired: fresh_reviewer_trend extraction from design_doc — its digest
+            # payload key had no named reader (see retirement note above). The
+            # underlying design_doc["fresh_reviewer_trend"] persistence is untouched.
             # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
             _et = (_proj.design_doc or {}).get("edges_trend") or {}
             if _et:
@@ -1227,6 +1289,14 @@ async def _compute_digest(
         session, project_id
     )
 
+    # --- Fleet-wide no-CI merge-gate verification health (read-only) — surfaces
+    # whether merges across the fleet actually ran real tests vs. fell open to an
+    # UNVERIFIED merge, which fall-open reason dominates, and how many projects
+    # have a degraded gate. NEVER influences a merge decision. ---
+    merge_gate_fleet_health = await compute_merge_gate_fleet_health(
+        session, project_id, window_start=window_start
+    )
+
     _review_quality = compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
     _sr_disallowed_blind_spot_rate = _compute_sr_disallowed_blind_spot_rate(
@@ -1241,7 +1311,10 @@ async def _compute_digest(
     )
 
     migration_health = compute_migration_health(
-        completed_tasks, failed_tasks, error_log_map=error_log_map
+        completed_tasks,
+        failed_tasks,
+        error_log_map=error_log_map,
+        active_tasks=active_tasks_all,
     )
 
     return {
@@ -1256,16 +1329,17 @@ async def _compute_digest(
         ],
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
+        "sr_false_attestation_trends": sr_false_attestation_trends,
         "self_review_skip_rate": _self_review_skip_rate,
         "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
-        "fresh_reviewer_trend": fresh_reviewer_trend,
+        # Retired: fresh_reviewer_trend / edges_considered_metrics digest keys —
+        # both were emitted without a named reader (no UI component reads them;
+        # edges_trend below IS consumed by ReviewQualitySection and stays). The
+        # _compute_edges_considered_metrics computation remains live (used by
+        # pipeline_health.py and re-exported for external importers).
         "edges_trend": edges_trend,
-        "edges_considered_metrics": _review_quality["edges_considered_metrics"],
-        "parallel_review_effectiveness": _review_quality[
-            "parallel_review_effectiveness"
-        ],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),
@@ -1285,10 +1359,12 @@ async def _compute_digest(
         "failure_stage_distribution": failure_stage_distribution,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
+        "direction_portfolio": direction_portfolio,
         "overall_product_ratio": overall_product_ratio,
         "median_cost_per_merged_pr": median_cost_per_merged_pr,
         "cost_per_merge_by_type": cost_per_merge_by_type,
         "median_cost_per_merge_by_type": _median_cpm_by_type,
+        "effort_model_efficiency": effort_model_efficiency,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,
@@ -1309,6 +1385,8 @@ async def _compute_digest(
         "retry_success_rate_by_class": retry_success_rate_by_class,
         "retry_wasted_rate": retry_wasted_rate,
         "daily_cost_usd": daily_cost_usd,
+        "daily_vm_cost_usd": _cost_econ["daily_vm_cost_usd"],
+        "daily_compute_cost_usd": _cost_econ["daily_compute_cost_usd"],
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
@@ -1327,9 +1405,9 @@ async def _compute_digest(
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
-        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
-        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
-        "pipeline_operator_action_count": pipeline_operator_action_count,
+        # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+        # pipeline_operator_action_count — consumer-less duplicates of per-direction
+        # outcome fields (see retirement note at the extraction site above).
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,
@@ -1345,6 +1423,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
+        "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,
         "prediction_calibration_factor": prediction_calibration["factor"]
         if prediction_calibration

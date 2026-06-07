@@ -86,6 +86,14 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
+// PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the
+// genuine text and the writer-invocation assertions can inspect the call args.
+vi.mock('./strategic-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./strategic-helpers.js')>();
+  return { ...actual, writeFetchHelper: vi.fn() };
+});
+
 // fs is consumed by both `import fs from 'fs'` (default import) and
 // `import * as fs from 'fs'` (namespace import) across the codebase under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
@@ -130,6 +138,7 @@ import { setupWorkspace, runClaudeCode } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
+import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -164,6 +173,31 @@ describe('overlap warning text generation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).not.toContain('WARNING:');
+  });
+
+  it('injects reserved-revision guidance for a create task with a reservation', async () => {
+    const task = {
+      title: 'Add column',
+      description: '',
+      context: { related_files: ['backend/app/models.py'] },
+      project_context: {},
+      migration_reservation: {
+        provisional_revision: '0153',
+        provisional_down_revision: '0151',
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Add a column' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('Reserved migration revision');
+    expect(prompt).toContain('revision = "0153"');
+    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
+  });
+
+  it('omits reserved-revision guidance for a create task with no reservation', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Reserved migration revision');
   });
 
   it('generates no warning when file_overlap_warnings is an empty array', async () => {
@@ -263,6 +297,56 @@ describe('sibling task note generation', () => {
     const task = { title: 'Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).not.toContain('avoid making changes that overlap');
+  });
+});
+
+// ── Stale-premise / provenance notice injection ───────────────────────────────
+describe('provenance notice injection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('omits the stale-premise notice when _provenance_warnings is absent', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Stale-premise notice');
+  });
+
+  it('renders the stale-premise notice when _provenance_warnings is populated', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {
+        _provenance_warnings: {
+          cited_files_changed_since_generation: true,
+          broken_source_ref_count: 1,
+          broken_refs: ['app/foo.py:10'],
+          ungrounded_claim_count: 1,
+          ungrounded_refs: ['some claim'],
+        },
+      },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Stale-premise notice');
+    expect(prompt).toContain('Cited files changed since the finding was generated');
+    expect(prompt).toContain('1 broken/missing citation(s)');
+    expect(prompt).toContain('app/foo.py:10');
+    expect(prompt).toContain('1 ungrounded claim(s)');
+    expect(prompt).toContain('REPRODUCE-FIRST');
+  });
+
+  it('renders the notice for refactor tasks too', async () => {
+    const task = {
+      title: 'Refactor',
+      description: '',
+      context: {
+        _provenance_warnings: { cited_files_changed_since_generation: true },
+      },
+    };
+    await handleRefactor(TASK_ID, { prompt: 'Refactor it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).toContain('## Stale-premise notice');
   });
 });
 
@@ -395,6 +479,56 @@ describe('viewport infra skip guidance in prompt', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+  });
+});
+
+// ── Read-only ./fetch provisioning + guidance ─────────────────────────────────
+describe('mid-run ./fetch provisioning for create/refactor', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handleCreate advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { project_id: 'p-xyz' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    // Only the provisioned read-only verbs are advertised.
+    expect(prompt).toContain('./fetch direction <id>');
+    expect(prompt).toContain('./fetch section <key>');
+    expect(prompt).toContain('./fetch playbook <key>');
+    // problem-model/gap/message are NOT provisioned for code-change agents.
+    expect(prompt).not.toContain('./fetch problem-model');
+    expect(prompt).not.toContain('./fetch gap <id>');
+    expectCalledWith(writeFetchHelper,
+      TASK_ID, 'p-xyz', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleCreate omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
+  });
+
+  it('handleRefactor advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    const task = { title: 'Refactor task', description: '', project_metadata: { project_id: 'p-abc' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    expectCalledWith(writeFetchHelper,
+      TASK_ID, 'p-abc', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleRefactor omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
   });
 });
 
@@ -1030,6 +1164,54 @@ describe('issue context propagation', () => {
     const task = { title: 'My Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('Task: My Task');
+  });
+});
+
+const STANDARD_CODE_TASKS = [
+  ['create', handleCreate],
+  ['refactor', handleRefactor],
+  ['docs', handleDocs],
+  ['qa', handleQA],
+  ['deps', handleDeps],
+] as const;
+
+describe('acceptance evidence propagation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(STANDARD_CODE_TASKS)('includes the acceptance-evidence block for %s tasks', async (taskType, handler) => {
+    await handler(
+      TASK_ID,
+      {
+        prompt: 'Do something',
+        type: taskType,
+        acceptance_evidence: {
+          kind: 'named_test',
+          test_path: 'testing/test_widget.py',
+          test_id: 'test_widget_handles_empty',
+        },
+      },
+      { title: 'Task', description: '', context: {}, project_context: {} },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('testing/test_widget.py');
+    expect(prompt).toContain('test_widget_handles_empty');
+    expect(prompt).toContain('real merge-test verdict');
+  });
+
+  it.each(STANDARD_CODE_TASKS)('omits the acceptance-evidence block when undeclared for %s tasks', async (_taskType, handler) => {
+    await handler(
+      TASK_ID,
+      { prompt: 'Do something', type: _taskType },
+      { title: 'Task', description: '', context: {}, project_context: {} },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(capturedPrompt()).not.toContain('## Acceptance Evidence');
   });
 });
 

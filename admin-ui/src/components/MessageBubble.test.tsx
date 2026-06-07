@@ -143,6 +143,94 @@ describe('MessageBubble', () => {
     expect(screen.getByText('Blocker')).toBeTruthy();
   });
 
+  test('renders stale citation badge for BUG_REPORT when cited code is absent on HEAD', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.getByText('cited code missing on HEAD')).toBeTruthy();
+    expect(screen.getByText('backend/app/models.py:Task')).toBeTruthy();
+  });
+
+  test('renders stale citation badge details for BLOCKER when broken and ungrounded refs are present', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BLOCKER',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/reaper.py:cancel_need'],
+            ungrounded_refs: ['backend/app/orchestrator.py#spawn'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.getByText('cited code missing on HEAD')).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/reaper\.py:cancel_need/)).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/orchestrator\.py#spawn/)).toBeTruthy();
+  });
+
+  test('renders partial-grounding badge for BUG_REPORT when citation_state=present with broken/ungrounded refs', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: ['backend/app/models.py:Task'],
+            ungrounded_refs: ['backend/app/reaper.py#sweep'],
+          },
+        },
+      }),
+    })} />);
+    // Partially grounded uses a distinct, softer label — not the fully-stale wording.
+    expect(screen.getByText('some cited code missing on HEAD')).toBeTruthy();
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.getByText(/backend\/app\/models\.py:Task/)).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/reaper\.py#sweep/)).toBeTruthy();
+  });
+
+  test('renders indeterminate badge for BLOCKER when citation_state=indeterminate', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BLOCKER',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'indeterminate',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.getByText('citations could not be verified')).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/models\.py:Task/)).toBeTruthy();
+  });
+
+  test('renders no badge when citation_state=present and no broken/ungrounded refs', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: [],
+            ungrounded_refs: [],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.queryByText('some cited code missing on HEAD')).toBeNull();
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.queryByText('citations could not be verified')).toBeNull();
+  });
+
   test('data-testid message-bubble is set', () => {
     render(<MessageBubble {...makeProps()} />);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();

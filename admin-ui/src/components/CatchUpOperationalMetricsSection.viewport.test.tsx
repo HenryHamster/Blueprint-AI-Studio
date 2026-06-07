@@ -51,6 +51,23 @@ describe('CatchUpOperationalMetricsSection — viewport regression', () => {
               migration_tasks_failed: 1,
               migration_errors_in_window: 2,
               auto_generated_migrations: 1,
+              migration_slot_contention: {
+                status: 'elevated',
+                severity: 'critical',
+                holder: {
+                  task_id: 'holder-1',
+                  title: 'Author migration',
+                  started_at: '2026-06-06T10:00:00Z',
+                  hold_seconds: 9000,
+                },
+                deferred_count: 3,
+                longest_wait: {
+                  task_id: 'waiter-1',
+                  title: 'Queued migration waiter',
+                  waiting_since: '2026-06-06T11:00:00Z',
+                  wait_seconds: 5400,
+                },
+              },
             }}
             preventionEfficacy={{
               preventive_tasks_created: 10,

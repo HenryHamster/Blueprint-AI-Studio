@@ -55,6 +55,13 @@ class DigestCache:
         self._last_good: Dict[Hashable, Any] = {}
         # key -> Future being computed
         self._in_flight: Dict[Hashable, asyncio.Future[Any]] = {}
+        # key -> whether the currently-cached result was served from the
+        # stale fallback (a failed compute), vs. produced by a fresh compute.
+        # Set True on serve-stale-on-failure, cleared on a successful compute.
+        # Exposed via ``get_or_compute_meta`` so callers can mark a response
+        # as not-live even when its age alone wouldn't trip a staleness
+        # threshold (the "recent cache but compute currently failing" window).
+        self._served_stale: Dict[Hashable, bool] = {}
 
     def clear(self) -> None:
         """Drop all cached results (fresh + last-good). In-flight futures are
@@ -62,6 +69,7 @@ class DigestCache:
         caching."""
         self._results.clear()
         self._last_good.clear()
+        self._served_stale.clear()
 
     async def get_or_compute(
         self,
@@ -69,16 +77,42 @@ class DigestCache:
         compute_fn: Callable[[], Awaitable[Any]],
         ttl: float | None = None,
     ) -> Any:
+        """Result-only wrapper around :meth:`get_or_compute_meta`.
+
+        Preserved byte-compatible for the callers that don't need the
+        served-stale signal (admin_digest, admin_pool_accounts).
+        """
+        result, _served_stale = await self.get_or_compute_meta(
+            key, compute_fn, ttl=ttl
+        )
+        return result
+
+    async def get_or_compute_meta(
+        self,
+        key: Hashable,
+        compute_fn: Callable[[], Awaitable[Any]],
+        ttl: float | None = None,
+    ) -> Tuple[Any, bool]:
+        """Like :meth:`get_or_compute` but also returns whether the result was
+        served from the stale fallback.
+
+        Returns ``(result, served_stale)``. ``served_stale`` is True when the
+        returned payload came from the last-good fallback because the live
+        compute failed (and for reads served from the negative-cache window
+        that failure opened), so a caller can present the reading as
+        not-live even while its age is still under a freshness threshold.
+        """
         now = time.monotonic()
         self._sweep_expired(now)
 
         cached = self._results.get(key)
         if cached is not None and cached[1] > now:
-            return cached[0]
+            return cached[0], self._served_stale.get(key, False)
 
         in_flight = self._in_flight.get(key)
         if in_flight is not None:
-            return await in_flight
+            result = await in_flight
+            return result, self._served_stale.get(key, False)
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
@@ -107,9 +141,10 @@ class DigestCache:
                     stale,
                     time.monotonic() + self._stale_retry_ttl,
                 )
+                self._served_stale[key] = True
                 if not future.done():
                     future.set_result(stale)
-                return stale
+                return stale, True
             if not future.done():
                 future.set_exception(exc)
                 # Mark as retrieved so asyncio doesn't log
@@ -122,10 +157,11 @@ class DigestCache:
             effective_ttl = self._default_ttl if ttl is None else ttl
             self._results[key] = (result, time.monotonic() + effective_ttl)
             self._last_good[key] = result
+            self._served_stale[key] = False
             self._in_flight.pop(key, None)
             if not future.done():
                 future.set_result(result)
-            return result
+            return result, False
 
     def _sweep_expired(self, now: float) -> None:
         expired = [k for k, (_, exp) in self._results.items() if exp <= now]

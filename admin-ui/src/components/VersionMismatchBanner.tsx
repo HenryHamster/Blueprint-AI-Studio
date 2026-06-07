@@ -1,14 +1,24 @@
 import { useState, useEffect } from 'react';
 import { AlertCircle } from 'lucide-react';
 
+// A backend SHA is only comparable when it is a real commit identifier.
+// In production the deploy pipeline does not yet populate a real backend SHA,
+// so /api/version reports the sentinel 'unknown' (see backend/app/main.py).
+// Sentinel/empty values mean "no comparison data" — never a genuine mismatch.
+function isRealSha(s: unknown): s is string {
+  if (typeof s !== 'string') return false;
+  const v = s.trim().toLowerCase();
+  return v !== '' && v !== 'unknown';
+}
+
 export function VersionMismatchBanner() {
   const [mismatch, setMismatch] = useState(false);
   useEffect(() => {
     const expectedSha = import.meta.env.VITE_EXPECTED_BACKEND_SHA;
-    if (!expectedSha) return;
+    if (!expectedSha || expectedSha === 'unknown') return;
     fetch('/api/version')
       .then(r => r.json())
-      .then(data => { if (data.sha && data.sha !== expectedSha) setMismatch(true); })
+      .then(data => { if (isRealSha(data.sha) && data.sha !== expectedSha) setMismatch(true); })
       .catch(() => {});
   }, []);
 

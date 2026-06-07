@@ -59,7 +59,13 @@ async def test_health_overview_caches_repeated_calls_within_ttl(
 
     assert r1.status_code == 200
     assert r2.status_code == 200
-    assert r1.json() == r2.json() == expected
+    # Both polls return the same payload (dedup) and the underlying compute ran
+    # once. The endpoint additively stamps freshness provenance, so assert the
+    # core payload is a subset rather than exact-equal.
+    body1, body2 = r1.json(), r2.json()
+    assert body1 == body2
+    for key, value in expected.items():
+        assert body1[key] == value
     assert spy.call_count == 1
 
 
@@ -162,8 +168,8 @@ async def test_health_overview_recomputes_after_ttl(
     finally:
         app.dependency_overrides.pop(get_digest_cache, None)
 
-    assert r1.json() == {"overall_status": "first"}
-    assert r2.json() == {"overall_status": "second"}
+    assert r1.json()["overall_status"] == "first"
+    assert r2.json()["overall_status"] == "second"
     assert spy.call_count == 2
 
 
@@ -187,10 +193,93 @@ async def test_health_overview_cache_key_includes_query_params(
     finally:
         app.dependency_overrides.pop(get_digest_cache, None)
 
-    assert r1.json() == {"hours": 24}
-    assert r2.json() == {"hours": 48}
-    assert r3.json() == {"hours": 24}
+    assert r1.json()["hours"] == 24
+    assert r2.json()["hours"] == 48
+    assert r3.json()["hours"] == 24
     # 24h fetched once (r1, r3 share), 48h fetched once → 2 compute calls total.
+    assert spy.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_health_overview_on_demand_stamps_live_freshness(
+    client: AsyncClient, db_session, mocker
+):
+    """The on-demand compute path stamps a truthful, ~live freshness signal:
+    served_stale False and a small precompute_age_seconds derived from the
+    payload's generated_at — so the card renders it as a live verdict."""
+    from app.time_utils import _utcnow
+
+    fresh_cache = DigestCache(default_ttl=60.0)
+    app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
+
+    payload: Dict[str, Any] = {
+        "overall_status": "healthy",
+        "success_rate": {"current": 1.0, "trend": None, "window_hours": 24},
+        "actionable_issues": [],
+        "direction_portfolio": {},
+        "queue_depth": {"queued": 0, "active": 0, "evaluating": 0},
+        "generated_at": _utcnow().isoformat(),
+    }
+    spy = AsyncMock(return_value=payload)
+    mocker.patch.object(_admin_health, "_compute_health_overview", spy)
+
+    try:
+        resp = await client.get("/api/admin/health-overview")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["overall_status"] == "healthy"
+    assert body["served_stale"] is False
+    assert body["precomputed"] is False
+    assert body["precompute_age_seconds"] is not None
+    assert body["precompute_age_seconds"] < 60
+
+
+@pytest.mark.asyncio
+async def test_health_overview_serve_stale_marks_verdict_not_live(
+    client: AsyncClient, db_session, mocker
+):
+    """The bug this task fixes: when the live compute fails and the cache serves
+    the last good payload, the response must carry served_stale=True AND a large
+    age, so the (potentially hours-old) green verdict is never shown as live."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    short_cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    app.dependency_overrides[get_digest_cache] = lambda: short_cache
+
+    old_iso = (_utcnow() - timedelta(hours=2)).isoformat()
+    good: Dict[str, Any] = {
+        "overall_status": "healthy",
+        "success_rate": {"current": 1.0, "trend": None, "window_hours": 24},
+        "actionable_issues": [],
+        "direction_portfolio": {},
+        "queue_depth": {"queued": 0, "active": 0, "evaluating": 0},
+        "generated_at": old_iso,
+    }
+    spy = AsyncMock(side_effect=[good, RuntimeError("statement timeout")])
+    mocker.patch.object(_admin_health, "_compute_health_overview", spy)
+
+    try:
+        r1 = await client.get("/api/admin/health-overview")
+        await asyncio.sleep(0.1)  # expire the fresh entry → next poll recomputes
+        r2 = await client.get("/api/admin/health-overview")  # compute fails → stale
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert r1.status_code == 200
+    assert r1.json()["served_stale"] is False
+
+    assert r2.status_code == 200
+    b2 = r2.json()
+    # The old green verdict is still served (no 500) ...
+    assert b2["overall_status"] == "healthy"
+    # ... but it is explicitly marked not-live, by both signals the card reads.
+    assert b2["served_stale"] is True
+    assert b2["precompute_age_seconds"] > 120
     assert spy.call_count == 2
 
 

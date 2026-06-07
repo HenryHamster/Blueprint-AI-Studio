@@ -14,7 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, StrategicCycle, TaskStatus, _utcnow
-from app.sr_blind_spots import _REVIEWER_ORIGINS
+from app.sr_blind_spots import _REVIEWER_ORIGINS, reviewer_confirmed_categories
 from app.sr_catch_rate_trends import (
     _MIN_SR_SAMPLE,
     _SR_CODE_CHANGE_TYPES,
@@ -96,7 +96,7 @@ async def compute_fresh_reviewer_trend(
             findings = (
                 ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
             )
-            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+            reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
             check_results = (
                 ctx.get("_self_review_outcome", {}).get("check_results") or {}
             )
@@ -115,7 +115,7 @@ async def compute_fresh_reviewer_trend(
                 if not cat:
                     continue
                 cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
-                if cat in human_cats:
+                if cat in reviewer_confirmed_cats:
                     cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
                     if cat not in agent_failed:
                         cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
@@ -580,5 +580,4 @@ async def compute_edges_trend(
     )
 
     return result
-
 

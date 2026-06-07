@@ -20,7 +20,7 @@ from sqlmodel import select
 
 from app.models import Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
-from app.task_capabilities import PLAN_SUBTASK_TYPES
+from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from testing.factories import make_project, make_task
 
 
@@ -459,3 +459,698 @@ async def test_dependent_on_skipped_producer_fails_plan(
         f"No children should spawn when plan fails due to unsatisfiable dependency, "
         f"got {len(children)}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES))
+async def test_knowledge_prereq_subtype_spawns_as_itself(
+    db_session, mocker, _quiet_mocks, knowledge_type
+):
+    """A plan subtask of a knowledge-prerequisite type (web_research / design)
+    spawns AS ITSELF, carries the parent's direction context, and is NOT given
+    the implementation ``create`` prompt suffix.
+
+    These types produce a durable knowledge document, not a branch/PR, so they
+    must become spawnable plan children without being treated as PR-producing
+    implementation subtypes.
+    """
+    # Configure a create suffix so we can assert the knowledge child does NOT
+    # receive it (the suffix is for code/PR work only).
+    from app.shared_state import runtime_config
+
+    runtime_config["agent_prompt_suffixes"] = {"create": "IMPLEMENTATION SUFFIX"}
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": f"Knowledge {knowledge_type}",
+                    "prompt": "gather the prerequisite knowledge",
+                    "type": knowledge_type,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    # Thread direction context onto the parent plan, as the real pipeline does.
+    task.context = {
+        **(task.context or {}),
+        "direction_id": "dir-knowledge-1",
+        "research_task_id": "res-knowledge-1",
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, (
+        f"Expected 1 child for {knowledge_type}, got {len(children)}"
+    )
+    child = children[0]
+    # Spawned as the knowledge type, not downgraded to create.
+    assert child.first_payload.get("type") == knowledge_type, (
+        f"Knowledge child should keep type {knowledge_type!r}, "
+        f"got {child.first_payload.get('type')!r}"
+    )
+    # No implementation prompt suffix for a non-PR producer.
+    assert "prompt_suffix" not in child.first_payload, (
+        f"Knowledge child must not receive the create prompt_suffix, "
+        f"got {child.first_payload.get('prompt_suffix')!r}"
+    )
+    # Direction context threaded to the child like every other plan child.
+    assert (child.context or {}).get("direction_id") == "dir-knowledge-1"
+    assert (child.context or {}).get("research_task_id") == "res-knowledge-1"
+
+
+@pytest.mark.asyncio
+async def test_implementation_child_can_depend_on_knowledge_prereq(
+    db_session, mocker, _quiet_mocks
+):
+    """An implementation child may depend on a knowledge-prerequisite producer.
+
+    web_research produces the knowledge a downstream ``create`` needs. Because
+    the knowledge type is now a valid plan child (not skipped), the dependent
+    create spawns with depends_on pointing at the producer — and the plan does
+    NOT fail with an unsatisfiable-dependency error.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Research the vendor API",
+                    "prompt": "learn the vendor protocol",
+                    "type": "web_research",
+                },
+                {
+                    "title": "Implement the integration",
+                    "prompt": "build it on the research",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.FAILED, (
+        f"Plan must not fail when a create depends on a knowledge prereq, "
+        f"got status {task.status} / {task.latest_status_message!r}"
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2, f"Expected 2 children, got {len(children)}"
+    by_title = {c.title: c for c in children}
+    producer = by_title["Research the vendor API"]
+    dependent = by_title["Implement the integration"]
+
+    assert producer.first_payload.get("type") == "web_research"
+    assert dependent.depends_on == [str(producer.id)], (
+        f"Dependent create should depend on the knowledge producer, "
+        f"got {dependent.depends_on!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_exceeding_subtask_cap_fails_with_record(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan with more than 10 subtasks fails with a durable record of what was dropped.
+
+    Rather than silently truncating at 10 and losing the remaining subtasks,
+    the plan must FAIL and persist a subtask_cap_exceeded record containing:
+    - The total subtask count
+    - The dropped indices and titles
+    - Any unsatisfiable dependencies on dropped subtasks
+    """
+    # Create 12 subtasks to exceed the cap.
+    subtasks_list = [
+        {"title": f"Step {i}", "prompt": f"do step {i}", "scope": "small"}
+        for i in range(12)
+    ]
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL due to exceeding the subtask cap.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL when exceeding subtask cap, got status {task.status}"
+    )
+
+    # Error message should mention the cap and dropped count.
+    assert "exceed" in (task.latest_status_message or "").lower(), (
+        f"Expected 'exceed' in error message, got {task.latest_status_message!r}"
+    )
+    assert "12" in (task.latest_status_message or ""), (
+        f"Expected total count '12' in error message, got {task.latest_status_message!r}"
+    )
+    assert "2" in (task.latest_status_message or ""), (
+        f"Expected dropped count '2' in error message, got {task.latest_status_message!r}"
+    )
+
+    # Context must record dropped subtasks durably.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded on task.context, got {cap_record!r}"
+    assert cap_record.get("total_subtasks") == 12, (
+        f"Record must capture total subtask count, got {cap_record.get('total_subtasks')!r}"
+    )
+    assert cap_record.get("dropped_count") == 2, (
+        f"Record must capture dropped count, got {cap_record.get('dropped_count')!r}"
+    )
+    assert cap_record.get("dropped_indices") == [10, 11], (
+        f"Record must list dropped indices [10, 11], got {cap_record.get('dropped_indices')!r}"
+    )
+
+    # No children should have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when plan exceeds subtask cap, got {len(children)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kept_subtask_depending_on_dropped_subtask_fails_plan(
+    db_session, mocker, _quiet_mocks
+):
+    """A kept subtask with a broken dependency on a dropped subtask causes plan failure.
+
+    This catches the scenario where a subtask references a dropped subtask in its
+    depends_on_indices. The plan must FAIL rather than silently removing the dependency
+    edge (which would cause premature dispatch). The broken dependency must be recorded
+    in the context.
+    """
+    # Create 11 subtasks: steps 0-9 kept, step 10 dropped.
+    # Step 8 depends on step 10 (which will be dropped).
+    subtasks_list = [
+        {"title": "Step 0", "prompt": "step 0", "scope": "small"},
+        {"title": "Step 1", "prompt": "step 1", "scope": "small"},
+        {"title": "Step 2", "prompt": "step 2", "scope": "small"},
+        {"title": "Step 3", "prompt": "step 3", "scope": "small"},
+        {"title": "Step 4", "prompt": "step 4", "scope": "small"},
+        {"title": "Step 5", "prompt": "step 5", "scope": "small"},
+        {"title": "Step 6", "prompt": "step 6", "scope": "small"},
+        {"title": "Step 7", "prompt": "step 7", "scope": "small"},
+        {
+            "title": "Step 8",
+            "prompt": "step 8 depends on dropped",
+            "scope": "small",
+            "depends_on_indices": [10],  # Broken: index 10 will be dropped
+        },
+        {"title": "Step 9", "prompt": "step 9", "scope": "small"},
+        {"title": "Step 10 (dropped)", "prompt": "step 10", "scope": "small"},
+    ]
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL due to exceeding subtask cap + broken dependency.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL when cap exceeded with broken dependencies, "
+        f"got status {task.status}"
+    )
+
+    # Error message should mention unsatisfiable dependencies.
+    msg = task.latest_status_message or ""
+    assert "unsatisfiable" in msg.lower() or "exceed" in msg.lower(), (
+        f"Expected 'unsatisfiable' or 'exceed' in error message, got {msg!r}"
+    )
+
+    # Context must record both the cap exceeded and the broken dependencies.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded, got {cap_record!r}"
+
+    # The broken dependency must be documented.
+    broken_deps = cap_record.get("broken_dependencies", [])
+    assert len(broken_deps) >= 1, (
+        f"Must record at least one broken dependency, got {broken_deps!r}"
+    )
+
+    # Verify the broken dependency record details.
+    step_8_dep = next(
+        (d for d in broken_deps if d.get("subtask_title") == "Step 8"),
+        None,
+    )
+    assert step_8_dep, (
+        f"Step 8's broken dependency must be recorded, got {broken_deps!r}"
+    )
+    assert step_8_dep.get("broken_dep_index") == 10, (
+        f"Broken dependency should reference dropped index 10, "
+        f"got {step_8_dep.get('broken_dep_index')!r}"
+    )
+    assert step_8_dep.get("broken_dep_title") == "Step 10 (dropped)", (
+        f"Broken dependency should reference dropped title, "
+        f"got {step_8_dep.get('broken_dep_title')!r}"
+    )
+
+    # No children should have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when broken dependencies exist, got {len(children)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kept_subtask_depending_on_out_of_range_index_fails_gracefully(
+    db_session, mocker, _quiet_mocks
+):
+    """A kept subtask depending on an index beyond the array must not crash.
+
+    Regression: a plausible LLM miscount can produce a depends_on_indices entry
+    that points past the end of the subtasks list (e.g. [12] in a 12-subtask
+    plan). The cap path's broken-dependency title lookup must NOT IndexError on
+    such an entry — doing so would abort _handle_plan_completion before the
+    FAILED status and subtask_cap_exceeded record commit, leaving the plan stuck.
+    The dependency is still unsatisfiable, so it must be recorded (with a safe
+    fallback title) and the plan must FAIL cleanly.
+    """
+    # 12 subtasks: steps 0-9 kept, steps 10-11 dropped. Step 0 declares a
+    # dependency on index 12, which is beyond the end of the 12-element list.
+    subtasks_list = [
+        {
+            "title": "Step 0",
+            "prompt": "step 0 depends on out-of-range index",
+            "scope": "small",
+            "depends_on_indices": [12],  # Out of range: len(subtasks) == 12
+        },
+    ]
+    for i in range(1, 12):
+        subtasks_list.append(
+            {"title": f"Step {i}", "prompt": f"step {i}", "scope": "small"}
+        )
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    # Must not raise IndexError.
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL cleanly (not stuck) due to exceeding the cap.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL cleanly when cap exceeded with out-of-range dep, "
+        f"got status {task.status}"
+    )
+
+    # The cap record and the broken dependency must still be committed.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded, got {cap_record!r}"
+
+    broken_deps = cap_record.get("broken_dependencies", [])
+    step_0_dep = next(
+        (d for d in broken_deps if d.get("subtask_title") == "Step 0"),
+        None,
+    )
+    assert step_0_dep, (
+        f"Step 0's out-of-range dependency must be recorded, got {broken_deps!r}"
+    )
+    assert step_0_dep.get("broken_dep_index") == 12, (
+        f"Broken dependency should reference index 12, "
+        f"got {step_0_dep.get('broken_dep_index')!r}"
+    )
+    # Safe fallback title for the out-of-range index.
+    assert step_0_dep.get("broken_dep_title") == "#12", (
+        f"Out-of-range dependency should use safe fallback title '#12', "
+        f"got {step_0_dep.get('broken_dep_title')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
+    db_session, mocker, _quiet_mocks
+):
+    """Post-injection cycle removes only the offending injected edge.
+
+    Subtask A explicitly declares a forward dependency on subtask B, and A and B
+    share a file — so file-overlap injection adds B→A, forming a 2-cycle with
+    A→B. A second, UNRELATED same-file pair (C, D) gets its own conflict-
+    prevention edge D→C that has nothing to do with the cycle.
+
+    The old behaviour wholesale-discarded EVERY injected edge, so D→C was lost
+    and C/D could dispatch in parallel and conflict. The fix must drop ONLY the
+    cycle-closing injected edge (B→A) while preserving the unrelated D→C
+    serialization, and record what was dropped on task.context.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "A",
+                    "prompt": "edit shared foo",
+                    "scope": "small",
+                    "related_files": ["foo.py"],
+                    "depends_on_indices": [1],  # explicit forward reference to B
+                },
+                {
+                    "title": "B",
+                    "prompt": "edit shared foo too",
+                    "scope": "small",
+                    "related_files": ["foo.py"],  # shared with A → injects B→A
+                },
+                {
+                    "title": "C",
+                    "prompt": "edit shared bar",
+                    "scope": "small",
+                    "related_files": ["bar.py"],
+                },
+                {
+                    "title": "D",
+                    "prompt": "edit shared bar too",
+                    "scope": "small",
+                    "related_files": ["bar.py"],  # shared with C → injects D→C
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 4
+    by_title = {c.title: c for c in children}
+    a, b, c, d = (by_title["A"], by_title["B"], by_title["C"], by_title["D"])
+
+    # Explicit edge A→B survives; cycle-closing injected edge B→A is dropped.
+    assert a.depends_on == [str(b.id)], (
+        f"Explicit A→B must survive, got {a.depends_on!r}"
+    )
+    assert (b.depends_on or []) == [], (
+        f"Cycle-closing injected B→A must be dropped, got {b.depends_on!r}"
+    )
+
+    # Unrelated conflict-prevention edge D→C must be PRESERVED (not wholesale-dropped).
+    assert (c.depends_on or []) == [], (
+        f"C should have no deps, got {c.depends_on!r}"
+    )
+    assert d.depends_on == [str(c.id)], (
+        f"Unrelated injected D→C must survive the cycle break, got {d.depends_on!r}"
+    )
+
+    # Resolution is observable beyond a bare error log.
+    await db_session.refresh(task)
+    dropped = (task.context or {}).get("dropped_serialization_edges")
+    assert dropped, f"Dropped edges must be recorded on task.context, got {dropped!r}"
+    assert any(
+        e["successor"] == "B" and e["predecessor"] == "A" for e in dropped
+    ), f"Dropped record must name the B→A edge, got {dropped!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence propagation (plan decomposition → child payload + context)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evidence_propagated_to_child_payload(
+    db_session, mocker, _quiet_mocks
+):
+    """A subtask's declared acceptance_evidence lands on its child payload.
+
+    A plan declaring a well-formed named_test acceptance_evidence on a subtask
+    must propagate it verbatim onto the spawned child task's first_payload,
+    validated by the child payload schema's AcceptanceEvidence model.
+    """
+    evidence = {
+        "kind": "named_test",
+        "test_path": "testing/test_foo.py",
+        "test_id": "test_seam_behavior",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: implement seam",
+                    "prompt": "implement the seam",
+                    "scope": "small",
+                    "type": "create",
+                    "acceptance_evidence": evidence,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    child_evidence = children[0].first_payload.get("acceptance_evidence")
+    assert child_evidence is not None, "acceptance_evidence missing from child payload"
+    assert child_evidence["kind"] == "named_test"
+    assert child_evidence["test_path"] == "testing/test_foo.py"
+    assert child_evidence["test_id"] == "test_seam_behavior"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evidence_absent_not_synthesized(
+    db_session, mocker, _quiet_mocks
+):
+    """A subtask with no acceptance_evidence spawns a child without the key.
+
+    Absence must change nothing — the key stays out of the child payload; the
+    backend never synthesizes one.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: no evidence",
+                    "prompt": "do it",
+                    "scope": "small",
+                    "type": "create",
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    assert "acceptance_evidence" not in children[0].first_payload, (
+        "acceptance_evidence must not be synthesized when absent, got "
+        f"{children[0].first_payload.get('acceptance_evidence')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_acceptance_evidence_degrades_not_aborts_spawn(
+    db_session, mocker, _quiet_mocks
+):
+    """A malformed acceptance_evidence must NOT abort the whole decomposition.
+
+    An LLM-generated declaration is untrusted. A malformed one (here: a
+    named_test pointing at a non-test path) must degrade to 'no declaration' on
+    its own child — the key is simply omitted — while every other subtask spawns
+    normally. The pre-validation must never raise out of the spawn loop, which
+    would roll back EVERY child and lose the decomposition permanently.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: malformed evidence",
+                    "prompt": "implement A",
+                    "scope": "small",
+                    "type": "create",
+                    # Not a test file → AcceptanceEvidence validation fails.
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "app/handler.py",
+                    },
+                },
+                {
+                    "title": "feat: well-formed sibling",
+                    "prompt": "implement B",
+                    "scope": "small",
+                    "type": "create",
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_bar.py",
+                        "test_id": "test_sibling_behavior",
+                    },
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    # Both children survive — the malformed declaration did not abort the batch.
+    assert len(children) == 2, f"Expected 2 children, got {len(children)}"
+    by_title = {c.title: c for c in children}
+    malformed_child = by_title["feat: malformed evidence"]
+    sibling_child = by_title["feat: well-formed sibling"]
+    # Malformed declaration degraded to 'no declaration' (key omitted).
+    assert "acceptance_evidence" not in malformed_child.first_payload, (
+        "malformed acceptance_evidence must degrade to omitted, got "
+        f"{malformed_child.first_payload.get('acceptance_evidence')!r}"
+    )
+    # The well-formed sibling still carries its declaration verbatim.
+    sibling_evidence = sibling_child.first_payload.get("acceptance_evidence")
+    assert sibling_evidence is not None, "well-formed sibling lost its evidence"
+    assert sibling_evidence["test_path"] == "testing/test_bar.py"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence propagation (plan decomposition → child CONTEXT)
+# The lighter {kind, descriptor, selector} proof descriptor the agent renders.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_acceptance_evidence_propagates_to_child_context(
+    db_session, mocker, _quiet_mocks
+):
+    """A well-formed subtask acceptance_evidence round-trips onto child context."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Step A",
+                    "prompt": "do step A",
+                    "scope": "small",
+                    "acceptance_evidence": {
+                        "kind": "test",
+                        "descriptor": "seam test exercises new path end-to-end",
+                        "selector": "testing/test_foo.py::test_bar",
+                    },
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].context["acceptance_evidence"] == {
+        "kind": "test",
+        "descriptor": "seam test exercises new path end-to-end",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_absent_acceptance_evidence_is_noop(
+    db_session, mocker, _quiet_mocks
+):
+    """No declaration ⇒ child context carries no acceptance_evidence key at all."""
+    plan_logs = json.dumps(
+        {"subtasks": [{"title": "Step A", "prompt": "do step A", "scope": "small"}]}
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert "acceptance_evidence" not in (children[0].context or {})
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_malformed_acceptance_evidence_is_dropped(
+    db_session, mocker, _quiet_mocks
+):
+    """A malformed declaration (bad kind) is dropped — no key, no raise."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Step A",
+                    "prompt": "do step A",
+                    "scope": "small",
+                    "acceptance_evidence": {"kind": "screenshot", "descriptor": "nope"},
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert "acceptance_evidence" not in (children[0].context or {})

@@ -99,11 +99,10 @@ export interface Direction {
   remediation_monitor_started_at?: string;
   remediation_history?: RemediationHistoryEntry[];
   /**
-   * Productivity score: (merged − 0.5 × rejected) / cycles.
-   * Quality-weighted — can go negative when rejections outweigh merges.
-   * Backend key is `merge_rate` for historical reasons; treat as productivity score.
+   * Merged PRs per research cycle (unbounded, can exceed 1).
+   * Null when the direction has never been researched.
    */
-  merge_rate?: number | null;
+  merges_per_cycle?: number | null;
   history_aggregate?: {
     total_prs_merged?: number | null;
     total_prs_rejected?: number | null;

@@ -100,6 +100,52 @@ def test_write_completed_no_merge_is_neutral():
     assert is_successful_outcome(task) is False
 
 
+def test_write_merged_spawn_seed_without_terminal_verdict_is_success_legacy():
+    # The spawn-time seed is no longer the canonical truth signal. Without a
+    # terminal reproduce_verdict, merged scoring falls back to merge semantics.
+    ctx = {**_merged_context(), "target_defect_reproduction": "present"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_merged_indeterminate_spawn_seed_without_terminal_verdict_is_success():
+    # An indeterminate spawn seed alone must not hold back a later merged task;
+    # only the terminal reproduce_verdict can downgrade success.
+    ctx = {**_merged_context(), "target_defect_reproduction": "indeterminate"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_merged_absent_spawn_seed_without_terminal_verdict_is_success():
+    # A historical row that only carries the spawn-time seed keeps bare-merge
+    # success until a terminal reproduce verdict is actually recorded.
+    ctx = {**_merged_context(), "target_defect_reproduction": "absent"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_write_merged_no_verdict_key_is_success_legacy():
+    # No recorded verdict (feature create, legacy row) keeps bare-merge success.
+    task = _make_task("create", context=_merged_context())
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_write_unverified_degraded_neutral_regardless_of_verdict():
+    # An unverified-degraded merge stays neutral even when the defect reproduced;
+    # the degraded-environment gate is independent of the reproduction gate.
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    ctx = {
+        **_merged_context(),
+        REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+        "reproduce_verdict": {"status": "reproduced"},
+    }
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+
+
 def test_write_success_matches_is_merged_completion_exactly():
     from app.landed_signal import is_merged_completion
 
@@ -107,6 +153,40 @@ def test_write_success_matches_is_merged_completion_exactly():
     unmerged = _make_task("refactor", context={})
     assert is_successful_outcome(merged) == is_merged_completion(merged) is True
     assert is_successful_outcome(unmerged) == is_merged_completion(unmerged) is False
+
+
+def test_write_merged_satisfied_acceptance_is_success():
+    # A merged code task whose declared acceptance evidence was SATISFIED keeps
+    # its verified-success credit.
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    ctx = {
+        **_merged_context(),
+        CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "kind": "named_test"},
+    }
+    task = _make_task("create", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_write_merged_unsatisfied_acceptance_is_neutral():
+    # Declared acceptance evidence that was NOT satisfied (e.g. the named test is
+    # absent or ran unverified) holds the merge back from a verified success.
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    ctx = {
+        **_merged_context(),
+        CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "kind": "named_test"},
+    }
+    task = _make_task("create", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_no_acceptance_key_is_success_legacy():
+    # No recorded acceptance verdict (no declaration / legacy row) keeps the
+    # bare-merge success exactly as before.
+    task = _make_task("create", context=_merged_context())
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,6 +220,40 @@ def test_research_untitled_findings_is_neutral():
 def test_research_failed_is_failure():
     task = _make_task("research", status=TaskStatus.FAILED, plan_output=[])
     assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_RESEARCH_QUALITY)
+
+
+def test_research_surviving_findings_recorded_is_success():
+    # When the completion handler recorded surviving findings, the cycle is a
+    # success regardless of how many raw titled findings sit in plan_output.
+    task = _make_task(
+        "research",
+        plan_output=[{"title": "fix: do the thing"}],
+        context={"research_surviving_findings": 2},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
+    assert is_successful_outcome(task) is True
+
+
+def test_research_zero_survivors_is_neutral_despite_titled_findings():
+    # Core fix: every titled finding was rejected at ingestion (stale dup /
+    # citation absent on HEAD / low actionability). plan_output still holds the
+    # raw findings for admin visibility, but the cycle produced no work — neutral.
+    task = _make_task(
+        "research",
+        plan_output=[
+            {"title": "fix: stale", "actionability_grade": "HIGH"},
+            {"title": "fix: dup", "actionability_grade": "MEDIUM"},
+        ],
+        context={"research_surviving_findings": 0},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
+    assert is_successful_outcome(task) is False
+
+
+def test_research_missing_survivor_count_falls_back_to_titled_findings():
+    # Legacy tasks (dispatch predates the survivor signal) keep the old heuristic.
+    task = _make_task("research", plan_output=[{"title": "fix: legacy"}], context={})
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,6 +614,115 @@ def test_summary_verify_tests_undetected_verdict():
     assert summary["verdict"] == "undetected"
 
 
+def test_summary_verify_tests_declared_build_failed_on_passing_suite_is_fail():
+    # A green unit suite that ALSO broke the operator's declared build must not
+    # show a clean "pass" — the gate blocks, so the summary verdict is "fail".
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "ecosystem": "node",
+                "label": "npm run build (admin-ui)",
+                "output": "webpack: build error",
+            },
+        },
+    )
+    assert summary["verdict"] == "fail"
+
+
+def test_summary_verify_tests_declared_build_could_not_run_on_passing_suite_stays_pass():
+    # A declared build that could not run does NOT block — summary stays "pass".
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+
+
+def test_summary_verify_tests_generic_probe_fail_on_passing_suite_stays_pass():
+    # A GENERIC (non-declared) probe failure does not block a passing suite.
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "label": "tsc",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+
+
+def test_summary_verify_tests_absent_acceptance_test_on_passing_suite_is_fail():
+    # A green suite that promised a named test which is ABSENT must surface
+    # "fail" (the gate blocks at HIGH precedence) and carry the test as evidence.
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": False,
+                "ran": False,
+                "status": "absent",
+            },
+        },
+    )
+    assert summary["verdict"] == "fail"
+    labels = {e["label"]: e["value"] for e in summary["evidence"]}
+    assert "Declared acceptance test" in labels
+    assert "absent" in labels["Declared acceptance test"]
+
+
+def test_summary_verify_tests_ran_acceptance_test_stays_pass():
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+    labels = {e["label"]: e["value"] for e in summary["evidence"]}
+    assert "Declared acceptance test" in labels
+
+
 def test_summary_memo_artifact():
     task = _make_task(
         "memo",
@@ -763,6 +986,418 @@ def test_summary_panel_review_counts_lens_issues_without_top_level():
 
 def test_summary_panel_review_no_verdict_is_none():
     task = _make_task("panel_review", plan_output={})
+    assert build_task_evaluation_summary(task) is None
+
+
+# --- write/PR task evaluation summary (merge + reproduce verdict) ------------
+
+
+def test_summary_write_merged_reproduced_is_verified_fix():
+    context = _merged_context()
+    context["reproduce_verdict"] = {
+        "status": "reproduced",
+        "reason": "asserted NPE reproduced against HEAD before the fix",
+    }
+    task = _make_task("fix", context=context)
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "verified_fix"
+    assert {"label": "Merge", "value": "landed on integration"} in summary["evidence"]
+    assert {"label": "Reproduce verdict", "value": "reproduced"} in summary["evidence"]
+    assert summary["highlights"][0]["label"] == "Verdict reason"
+
+
+def test_summary_write_merged_already_resolved_is_shipped_unproven():
+    context = _merged_context()
+    context["reproduce_verdict"] = {"status": "already_resolved"}
+    task = _make_task("fix", context=context)
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "shipped_unproven"
+
+
+def test_summary_write_degraded_merge_with_reproduced_verdict_is_shipped_unverified():
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    context = _merged_context()
+    context["reproduce_verdict"] = {"status": "reproduced"}
+    context[REVIEW_LOOP_KEY] = {
+        UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"
+    }
+    task = _make_task("fix", context=context)
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "shipped_unverified"
+
+
+def test_summary_write_merged_no_verdict_is_merged():
+    task = _make_task("create", context=_merged_context())
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "merged"
+
+
+def test_summary_write_unmerged_already_resolved_noop_renders_verdict():
+    # A no-op completion (no merge) that recorded already_resolved still renders
+    # a summary surfacing the verdict so operators see WHY there is no PR.
+    task = _make_task(
+        "fix",
+        context={"reproduce_verdict": {"status": "already_resolved"}},
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "already_resolved"
+    assert {"label": "Reproduce verdict", "value": "already_resolved"} in summary[
+        "evidence"
+    ]
+
+
+def test_summary_write_in_flight_no_verdict_is_none():
+    # A write task that neither merged nor carries a verdict has nothing to
+    # summarize — preserves the prior no-summary contract for write types.
+    task = _make_task("create", context={})
+    assert build_task_evaluation_summary(task) is None
+
+
+# --- merge_verification_status / is_verified_merge --------------------------
+
+
+def _merged_with_reason(reason: str | None) -> Task:
+    """A merged code-merge completion carrying an optional fall-open reason."""
+    context = _merged_context()
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return _make_task(KIND_CODE_MERGE, context=context)
+
+
+def test_merge_verification_status_verified_when_no_reason():
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    task = _merged_with_reason(None)
+    assert merge_verification_status(task) == "verified"
+    assert is_verified_merge(task) is True
+
+
+def test_merge_verification_status_benign_reasons():
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    for reason in BENIGN_UNVERIFIED_REASONS:
+        task = _merged_with_reason(reason)
+        assert merge_verification_status(task) == "unverified_benign", reason
+        assert is_verified_merge(task) is False, reason
+
+
+def test_merge_verification_status_degraded_reasons():
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    for reason in DEGRADED_UNVERIFIED_REASONS:
+        task = _merged_with_reason(reason)
+        assert merge_verification_status(task) == "unverified_degraded", reason
+        assert is_verified_merge(task) is False, reason
+
+
+def test_merge_verification_status_unknown_reason_defaults_benign():
+    from app.landed_signal import merge_verification_status
+
+    task = _merged_with_reason("some_future_unclassified_reason")
+    assert merge_verification_status(task) == "unverified_benign"
+
+
+def test_merge_verification_status_non_merged_is_none():
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    # COMPLETED but never landed.
+    completed_unmerged = _make_task(KIND_CODE_MERGE, context={})
+    assert merge_verification_status(completed_unmerged) is None
+    assert is_verified_merge(completed_unmerged) is False
+
+    # Not COMPLETED even though the (stale) landed flag is present.
+    in_progress = _make_task(
+        KIND_CODE_MERGE, status=TaskStatus.IN_PROGRESS, context=_merged_context()
+    )
+    assert merge_verification_status(in_progress) is None
+    assert is_verified_merge(in_progress) is False
+
+
+def test_merge_verification_status_ignores_malformed_review_loop():
+    from app.landed_signal import merge_verification_status
+
+    context = _merged_context()
+    context["review_loop"] = "not-a-dict"
+    task = _make_task(KIND_CODE_MERGE, context=context)
+    assert merge_verification_status(task) == "verified"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _evaluate_write: degraded-unverified merge downgrade
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _write_merged_with_reason(reason: str | None) -> Task:
+    """A merged write-type task carrying an optional fall-open reason."""
+    context = _merged_context()
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return _make_task("create", context=context)
+
+
+def test_write_degraded_unverified_merge_is_neutral():
+    """A merged PR that fell open for a degraded reason must NOT score as success."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    for reason in DEGRADED_UNVERIFIED_REASONS:
+        task = _write_merged_with_reason(reason)
+        result = evaluate_task_outcome(task)
+        assert result == TaskOutcome("neutral", KIND_CODE_MERGE), (
+            f"reason={reason!r} should be neutral, got {result}"
+        )
+        assert is_successful_outcome(task) is False, reason
+
+
+def test_write_benign_unverified_merge_is_success():
+    """A benign fall-open (no suite, kill-switch) must still score as success."""
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+
+    for reason in BENIGN_UNVERIFIED_REASONS:
+        task = _write_merged_with_reason(reason)
+        result = evaluate_task_outcome(task)
+        assert result == TaskOutcome("success", KIND_CODE_MERGE), (
+            f"reason={reason!r} should be success, got {result}"
+        )
+        assert is_successful_outcome(task) is True, reason
+
+
+def test_write_verified_merge_is_success():
+    """A verified merge (no fall-open reason) must score as success."""
+    task = _write_merged_with_reason(None)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _evaluate_write: reproduce-on-HEAD verdict gating of proven-fix success
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _write_merged_with_verdict(status: str | None) -> Task:
+    """A merged write-type task carrying an optional reproduce-on-HEAD verdict."""
+    context = _merged_context()
+    if status is not None:
+        context["reproduce_verdict"] = {"status": status}
+    return _make_task("fix", context=context)
+
+
+def test_write_merged_reproduced_verdict_is_success():
+    """A merged fix whose defect reproduced on HEAD is a proven fix → success."""
+    task = _write_merged_with_verdict("reproduced")
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_terminal_reproduced_verdict_overrides_indeterminate_spawn_seed():
+    """The terminal canonical verdict outranks the spawn-time seed."""
+    context = _merged_context()
+    context["target_defect_reproduction"] = "indeterminate"
+    context["reproduce_verdict"] = {"status": "reproduced"}
+    task = _make_task("fix", context=context)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_merged_already_resolved_verdict_is_neutral():
+    """A merged PR whose defect was already resolved ships code but is NOT a
+    proven fix — neutral, so it does not inflate proven-fix success accounting."""
+    task = _write_merged_with_verdict("already_resolved")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_terminal_already_resolved_verdict_overrides_present_spawn_seed():
+    """A terminal already_resolved verdict keeps success neutral even if the
+    spawn-time seed said the defect was present on HEAD."""
+    context = _merged_context()
+    context["target_defect_reproduction"] = "present"
+    context["reproduce_verdict"] = {"status": "already_resolved"}
+    task = _make_task("fix", context=context)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_indeterminate_verdict_is_neutral():
+    """A merged fix whose reproduce verdict is indeterminate stays neutral."""
+    task = _write_merged_with_verdict("indeterminate")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_no_verdict_preserves_merge_success():
+    """A merged task with NO reproduce verdict (feature/refactor or historical)
+    keeps the prior merged-PR == success semantics exactly."""
+    task = _write_merged_with_verdict(None)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_merged_malformed_verdict_falls_back_to_merge_success():
+    """A malformed verdict shape degrades to merge-based scoring (success)."""
+    context = _merged_context()
+    context["reproduce_verdict"] = "not-a-dict"
+    task = _make_task("fix", context=context)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_reproduce_verdict_status_reader():
+    """The canonical reader returns the status, or None for missing/malformed."""
+    from app.landed_signal import reproduce_verdict_status
+
+    assert (
+        reproduce_verdict_status(_write_merged_with_verdict("reproduced"))
+        == "reproduced"
+    )
+    assert reproduce_verdict_status(_make_task("fix", context={})) is None
+    bad = _make_task("fix", context={"reproduce_verdict": {"status": "bogus"}})
+    assert reproduce_verdict_status(bad) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_first_attempt_succeeded: merge-verification awareness
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_first_attempt_succeeded_degraded_returns_false():
+    """A degraded-unverified merge_verification makes first_attempt False."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+    ) is False
+    assert _compute_first_attempt_succeeded(
+        1, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+    ) is False
+
+
+def test_first_attempt_succeeded_benign_unverified_is_unaffected():
+    """Benign-unverified merge does not suppress the flag."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="unverified_benign"
+    ) is True
+
+
+def test_first_attempt_succeeded_verified_is_unaffected():
+    """A verified merge keeps the normal first-attempt semantics."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="verified"
+    ) is True
+    assert _compute_first_attempt_succeeded(
+        2, TaskStatus.COMPLETED, merge_verification="verified"
+    ) is False
+
+
+def test_first_attempt_succeeded_none_verification_backward_compat():
+    """Passing None merge_verification preserves pre-change semantics."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED, merge_verification=None) is True
+    assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED, merge_verification=None) is True
+    assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED, merge_verification=None) is False
+    assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED, merge_verification=None) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence surfacing (build_task_evaluation_summary wrapper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _audit_plan_output() -> dict:
+    """A findings-shaped plan_output that yields a non-None base summary."""
+    return {"findings": [{"title": "leak", "severity": "high"}]}
+
+
+def test_summary_acceptance_evidence_absent_is_byte_for_byte_unchanged():
+    """No declaration ⇒ summary identical to today's (no extra evidence item)."""
+    base = build_task_evaluation_summary(
+        _make_task("security_audit", plan_output=_audit_plan_output())
+    )
+    with_ctx = build_task_evaluation_summary(
+        _make_task(
+            "security_audit", plan_output=_audit_plan_output(), context={"other": 1}
+        )
+    )
+    assert with_ctx == base
+    assert all(e["label"] != "Acceptance evidence" for e in with_ctx["evidence"])
+
+
+def test_summary_acceptance_evidence_declared_is_appended():
+    """A well-formed declaration appends alongside the builder's own evidence."""
+    task = _make_task(
+        "security_audit",
+        plan_output=_audit_plan_output(),
+        context={
+            "acceptance_evidence": {
+                "kind": "test",
+                "descriptor": "end-to-end seam test passes",
+                "selector": "testing/test_foo.py::test_bar",
+            }
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    # Builder's own evidence is preserved, with the contract appended last.
+    assert summary["evidence"][0]["label"] == "Findings"
+    assert summary["evidence"][-1] == {
+        "label": "Acceptance evidence",
+        "value": "end-to-end seam test passes",
+    }
+
+
+def test_summary_acceptance_evidence_malformed_is_dropped():
+    """A malformed declaration (bad kind) never surfaces and never raises."""
+    task = _make_task(
+        "security_audit",
+        plan_output=_audit_plan_output(),
+        context={"acceptance_evidence": {"kind": "screenshot", "descriptor": "nope"}},
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert all(e["label"] != "Acceptance evidence" for e in summary["evidence"])
+
+
+def test_summary_acceptance_evidence_synthesized_when_no_builder_summary():
+    """A write type with no findings still surfaces the promised proof.
+
+    A non-merged write task still gets a minimal ``declared`` summary when it
+    promised acceptance evidence, even though the write-summary builder itself
+    has no shipped/verdict signal to surface yet.
+    """
+    task = _make_task(
+        "create",
+        status=TaskStatus.COMPLETED,
+        context={
+            "acceptance_evidence": {
+                "kind": "behavior",
+                "descriptor": "the new endpoint scopes audit to the candidate",
+            }
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "declared"
+    assert summary["evidence"] == [
+        {
+            "label": "Acceptance evidence",
+            "value": "the new endpoint scopes audit to the candidate",
+        }
+    ]
+
+
+def test_summary_acceptance_evidence_absent_no_findings_stays_none():
+    """No declaration AND no findings ⇒ summary stays None (unchanged)."""
+    task = _make_task("create", status=TaskStatus.COMPLETED, context={})
     assert build_task_evaluation_summary(task) is None
 
 

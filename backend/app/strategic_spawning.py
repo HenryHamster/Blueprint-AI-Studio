@@ -17,7 +17,9 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_outcomes import verified_merged_count
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
+from app.knowledge_query import build_knowledge_index
 from app.models import (
     Task,
     Project,
@@ -28,6 +30,10 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.capability_demand import (
+    fetch_missing_demand_for_spawn,
+    missing_demand_prompt_hint,
+)
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.problem_model import compute_model_size_signal, parse_problem_model
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
@@ -992,10 +998,18 @@ def _direction_activity_score(stat: dict) -> int:
     Higher = more activity. Combines work shipped (merged), work pending (failed),
     and recency (cycles). High-priority directions get a small boost so a quiet
     high-priority direction doesn't get evicted by a chatty low-priority one.
+
+    "Work shipped" counts VERIFIED merges (``verified_prs_merged``, populated in
+    the direction_stats loop) so a direction whose merges never actually landed —
+    or landed degraded/unverified — does not win payload space over one that
+    truly shipped. Falls back to the raw ``prs_merged`` for back-compat with
+    stat dicts that predate the verified field.
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(stat.get("prs_merged") or 0)
+    merged = int(
+        stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0
+    )
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")
@@ -1532,13 +1546,20 @@ def _build_prune_candidates(
             continue
         dir_status[did] = str(d.get("status") or "active")
         history = d.get("research_history") or []
+        # Retiring a capability gap is a ground-truth "shipped" decision, so it
+        # must use the verification-aware merged count — a degraded/unverified
+        # merge (test/CI verdict blocked by an environment failure) is NOT proof
+        # the work landed. Mirror the rest of the system: verified_merged_count
+        # per entry (with its legacy prs_merged fallback) plus the verified
+        # aggregate key (falling back to total_prs_merged for pre-attribution
+        # folded history).
         merged = sum(
-            int(h.get("prs_merged", 0) or 0)
-            for h in history
-            if isinstance(h, dict)
+            verified_merged_count(h) for h in history if isinstance(h, dict)
         )
         agg = d.get("history_aggregate") or {}
-        merged += int(agg.get("total_prs_merged") or 0)
+        merged += int(
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+        )
         dir_shipped[did] = merged > 0
 
     gaps = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []
@@ -1768,13 +1789,27 @@ _CRITICAL_OPEN_MESSAGE_TYPES = (
 def _open_message_survival_key(msg: dict) -> tuple:
     """Sort key ranking an open message's survival priority HIGH→LOW.
 
-    Critical types (BUG_REPORT/BLOCKER) rank first; within a tier, oldest-open
-    items rank first (ascending created_at). The HEAD of the sorted list
-    survives when the feed must be bounded, so BUG_REPORT/BLOCKER and the
-    oldest-open items are the last to be dropped.
+    Critical types (BUG_REPORT/BLOCKER) rank first, with reproducing (non-stale)
+    ones ahead of stale (citation_state == "absent") ones; within each tier,
+    oldest-open items rank first (ascending created_at). The HEAD of the sorted
+    list survives when the feed must be bounded, so reproducing criticals are
+    last to be dropped, followed by stale criticals, then non-critical messages.
     """
     is_critical = msg.get("type") in _CRITICAL_OPEN_MESSAGE_TYPES
-    return (0 if is_critical else 1, msg.get("created_at") or "")
+    citation_state = msg.get("citation_state")
+    is_stale = citation_state == "absent"
+
+    # Tier 0: reproducing critical messages (highest priority)
+    # Tier 1: stale critical messages (lower than reproducing)
+    # Tier 2: non-critical messages
+    if is_critical and not is_stale:
+        tier = 0
+    elif is_critical and is_stale:
+        tier = 1
+    else:
+        tier = 2
+
+    return (tier, msg.get("created_at") or "")
 
 
 def _bound_open_messages(messages: list, keep: int) -> list:
@@ -1814,6 +1849,52 @@ def _summarize_open_messages(messages: list) -> list:
     critical inbox items survive budget pressure instead of vanishing.
     """
     return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
+
+
+def _open_message_citation_summary(context: Any) -> dict:
+    """Promote a message's stored citation-grounding signal to a compact summary.
+
+    BUG_REPORT/BLOCKER ingestion stores a reproduce-on-HEAD citation signal under
+    ``context['_provenance_warnings']`` (the same key research findings use). This
+    surfaces it at the top level of the packed open-message dict so the strategist
+    sees the report's grounding state instead of trusting it blindly.
+
+    The signal is surfaced in two cases:
+
+    * ``citation_state == "absent"`` — the report is fully stale (cited code gone
+      on HEAD); the strategist must discount it.
+    * any state that still carries ``broken_refs``/``ungrounded_refs`` — the
+      report is only PARTIALLY grounded (mixed/indeterminate). The broken and
+      ungrounded references stay VISIBLE so the strategist can inspect them
+      during triage instead of having that detail stripped, while the non-absent
+      state keeps the report actionable (not discounted as stale).
+
+    Returns an empty dict (no key added) when there is no recorded warning, or
+    when a non-absent state carries no broken/ungrounded refs (nothing to flag).
+    """
+    if not isinstance(context, dict):
+        return {}
+    warnings = context.get("_provenance_warnings")
+    if not isinstance(warnings, dict):
+        return {}
+    state = warnings.get("citation_state")
+    broken = warnings.get("broken_refs")
+    broken_list = broken if isinstance(broken, list) and broken else []
+    ungrounded = warnings.get("ungrounded_refs")
+    ungrounded_list = ungrounded if isinstance(ungrounded, list) and ungrounded else []
+    # Surface when fully absent (stale) OR when a non-absent state still carries
+    # broken/ungrounded refs (mixed/partially grounded). A non-absent state with
+    # no refs has nothing to flag, so it is omitted (keeps the feed clean).
+    if state != "absent" and not broken_list and not ungrounded_list:
+        return {}
+    summary: dict = {}
+    if isinstance(state, str) and state:
+        summary["citation_state"] = state
+    if broken_list:
+        summary["broken_refs"] = broken_list
+    if ungrounded_list:
+        summary["ungrounded_refs"] = ungrounded_list
+    return summary
 
 
 async def _fetch_open_messages(
@@ -1862,6 +1943,11 @@ async def _fetch_open_messages(
             "resolution": m.resolution,
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+            # Promote the reproduce-on-HEAD citation signal (stored on the
+            # message context at ingestion) to the top level so a stale or
+            # broken-citation bug report is VISIBLY discounted to the strategist
+            # rather than silently trusted. Absent when no warning was recorded.
+            **_open_message_citation_summary(m.context),
         }
         for m in result.scalars().all()
     ]
@@ -1885,6 +1971,14 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
+    # Trim-proof authoritative direction counts (true active/paused/total computed
+    # before any trimming) and the operator's real max-active ceiling. Critical
+    # tier with no summarize_fn: tiny scalars the packer ships verbatim, so the
+    # agent's direction-health/portfolio/list views can anchor their headline
+    # count, slots line, and gap flags on the true active set even when the
+    # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
+    "direction_counts": {"priority": "critical"},
+    "max_active_directions": {"priority": "critical"},
     "prompt_suffix": {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
@@ -1951,6 +2045,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
     # summaries to a navigation skeleton under genuine budget exhaustion.
     "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output). Medium priority with no summarize_fn: it is already capped
+    # (count) and char-bounded (per-entry summary) at build time, so the packer
+    # drops it whole under budget rather than trimming — mirroring
+    # staged_directions / operator_overrides. Full bodies fetched on demand.
+    "knowledge_index": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
@@ -2002,6 +2102,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low"},
+    # Aggregated missing-foundation demand (capability/foundation prerequisites
+    # declared by dependents that no task provides). Medium priority and bounded at
+    # build time by collect_missing_capability_demand, so the packer drops it whole
+    # under budget rather than trimming. Actionable: the strategist can open a
+    # foundation direction or record an explicit retirement.
+    "missing_capability_demand": {"priority": "medium"},
 }
 
 
@@ -2036,6 +2142,16 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model_health": {"priority": "high"},
     "proposed_changes": {"priority": "high"},
     "shipped_changes_manifest": {"priority": "medium"},
+    # Advisory prompt hint framing missing-foundation demand to act on. High
+    # priority so the directive survives budget pressure (it is small).
+    "prompt_suffix": {"priority": "high"},
+    # Aggregated missing-foundation demand — see _STRATEGIC_REVIEW_SCHEMA. Medium
+    # priority; bounded at build time so the packer drops it whole under budget.
+    "missing_capability_demand": {"priority": "medium"},
+    # Compact, body-omitted index of existing knowledge documents — see
+    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
+    # whole under budget; full bodies fetched on demand.
+    "knowledge_index": {"priority": "medium"},
 }
 
 
@@ -2766,8 +2882,12 @@ def _build_previous_decision_outcomes(
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         cycles_active = len(history) + (agg.get("total_cycles") or 0)
-        prs_merged = sum(h.get("prs_merged", 0) for h in history) + (
-            agg.get("total_prs_merged") or 0
+        # Verified merge total — the previous-decision-outcome prior (and the
+        # derived calibration_delta) must reflect work that actually landed, not
+        # degraded/unverified merges. Legacy fallback handled by
+        # verified_merged_count / the aggregate .get chain.
+        prs_merged = sum(verified_merged_count(h) for h in history) + (
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
         is_paused = d.get("status") == "paused"
         auto_paused = bool(d.get("auto_paused"))
@@ -3079,13 +3199,33 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         _agent_view_design_doc(project.design_doc), **verification_kwargs
     )
 
+    # Surface aggregated missing-foundation demand to the strategist so it can open
+    # a foundation direction or record an explicit retirement of stranded demand.
+    # Read-only, fail-open, additive: included only when demand is non-empty.
+    _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+    _missing_demand_present = bool(_missing_demand.get("demands"))
+    _missing_demand_hint = (
+        missing_demand_prompt_hint(_missing_demand) if _missing_demand_present else None
+    )
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output) so the strategist knows what knowledge already exists and
+    # can fetch full bodies on demand — included only when documents exist.
+    _knowledge_index = await build_knowledge_index(session, project.id)
+
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
             "design_doc": _design_doc_index(reconciled_design_doc),
+            **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
+            **(
+                {"missing_capability_demand": _missing_demand}
+                if _missing_demand_present
+                else {}
+            ),
+            **({"prompt_suffix": _missing_demand_hint} if _missing_demand_hint else {}),
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
                 **verification_kwargs,
@@ -3273,6 +3413,16 @@ async def _spawn_strategic_review(
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (
             agg.get("total_prs_merged") or 0
         )
+        # Verified lifetime merge total — degraded/unverified merges excluded
+        # (legacy fallback baked into verified_merged_count / the aggregate .get).
+        # The displayed prs_merged and operator_rejection_rate below stay RAW
+        # (operator-judgment metrics); only the activity-score selection input
+        # reads this verified field.
+        total_verified_merged = sum(
+            verified_merged_count(h) for h in history
+        ) + (
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -3330,6 +3480,7 @@ async def _spawn_strategic_review(
             "status": d.get("status"),
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
+            "verified_prs_merged": total_verified_merged,
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
@@ -3588,6 +3739,10 @@ async def _spawn_strategic_review(
                 session, project.id, drift_summary
             )
     except Exception:
+        # A failed best-effort snapshot flush leaves the AsyncSession in a
+        # pending-rollback state; clear it so the rest of the strategic spawn
+        # can continue on the same session.
+        await session.rollback()
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
     # LTS version/phase context — active whenever the integration branch and
@@ -3723,8 +3878,13 @@ async def _spawn_strategic_review(
                             "phase": v.phase,
                             "last_qualification": v.last_qualification,
                             "qualification_state": summarize_qualification_state(
-                                v.last_qualification
+                                v.last_qualification,
+                                v.serving_status,
+                                v.deploy_failure_reason,
                             ),
+                            "serving_status": v.serving_status,
+                            "served_sha": (v.served_sha or "")[:12] or None,
+                            "deploy_failure_reason": v.deploy_failure_reason,
                         }
                         for v in _closed
                     ]
@@ -3787,8 +3947,13 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] DeploymentState read failed; continuing"
                     )
+            # Real serving SHA only — NEVER a promoted_sha stand-in.  A version's
+            # served_sha is set solely once deploy_health confirms the promotion
+            # is actually serving (serving_status="serving_confirmed"); an
+            # unconfirmed or deploy_failed promotion reports null here, so the
+            # strategist never reads a merged-but-unshipped SHA as "deployed".
             if not _deployed_sha and _promoted_v is not None:
-                _deployed_sha = _promoted_v.promoted_sha
+                _deployed_sha = _promoted_v.served_sha
             _undeployed_dirs = (
                 (recent_interventions or {}).get("undeployed_directions") or []
             )
@@ -3814,6 +3979,15 @@ async def _spawn_strategic_review(
                     (_promoted_v.promoted_sha or "")[:12] or None
                     if _promoted_v
                     else None
+                ),
+                # Post-promotion serving outcome of the latest promotion: lets
+                # the strategist see whether "promoted" actually shipped vs is
+                # still unconfirmed or failed to deploy.
+                "promoted_serving_status": (
+                    _promoted_v.serving_status if _promoted_v else None
+                ),
+                "promoted_deploy_failure_reason": (
+                    _promoted_v.deploy_failure_reason if _promoted_v else None
                 ),
                 "open_version": (
                     _open_version.version_number if _open_version else None
@@ -4012,6 +4186,8 @@ async def _spawn_strategic_review(
         # resilient to back-merge refactors of release_version.
         _promoted_when = ""
         _verdict_txt = ""
+        _prior_serving_status: str | None = None
+        _prior_deploy_reason: str | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
@@ -4024,37 +4200,127 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
+                    _prior_serving_status = _v.serving_status
+                    _prior_deploy_reason = _v.deploy_failure_reason
                     break
         except Exception:
             logger.exception(
                 "[STRATEGIC] post-promote prior-version lookup failed; continuing"
             )
-        _post_promote_hint = (
-            f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
-            f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now live; "
-            f"v{_cur_n} opened from that promotion. v{_prior_n}'s mission is "
-            f"COMPLETE — do NOT plan, research, audit, or spawn work to promote, "
-            f"qualify, re-audit, or re-qualify v{_prior_n}; that is already done "
-            f"and merged to {_target} (cross-check `version_phase.recent_versions` "
-            f"and `deployment_state` — v{_prior_n} is recorded there with "
-            f"status='promoted'). The `goal` field on v{_cur_n} is a frozen "
-            f"version-open snapshot that still reads as v{_prior_n}'s promotion "
-            f"mission — treat it as STALE CARRY-OVER, not a live directive, and "
-            f"disregard its promote/qualify framing. A null "
-            f"`version_phase.last_qualification` on v{_cur_n} means this fresh "
-            f"version has not yet begun its OWN qualification (expected for a "
-            f"just-opened version) — it does NOT mean v{_prior_n}'s promotion is "
-            f"pending or failed. As your first action this cycle, set v{_cur_n}'s "
-            f"real mission: rewrite `intent.current_focus` to state what v{_cur_n} "
-            f"is for (not what v{_prior_n} achieved), retire directions v{_prior_n} "
-            f"already satisfied, and propose the directions the next milestone "
-            f"needs."
-        )
+        if _prior_serving_status == "deploy_failed":
+            # The prior promotion MERGED but never shipped — do NOT advance focus
+            # as if it succeeded.  This is the focus-advancement gate honoring the
+            # serving signal: the strategist must treat the milestone as NOT
+            # delivered and prioritize recovering the deploy.
+            _reason_txt = (
+                f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
+                f"{_target}{_promoted_when} but its deploy DID NOT confirm "
+                f"serving{_reason_txt}: the promotion did NOT ship and the code "
+                f"is NOT live (see `deployment_state.promoted_serving_status` = "
+                f"'deploy_failed' and `version_phase.recent_versions`). Do NOT "
+                f"treat v{_prior_n}'s mission as complete and do NOT advance "
+                f"`intent.current_focus` to the next milestone as if it shipped. "
+                f"Your TOP priority this cycle is recovering the failed deploy "
+                f"(roll forward a fix / investigate why the promoted SHA never "
+                f"served); only after it is serving should you move focus on."
+            )
+        elif _prior_serving_status == "unconfirmed":
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
+                f"(merged) to {_target}{_promoted_when}{_verdict_txt}, but its "
+                f"deploy is NOT yet confirmed serving (see "
+                f"`deployment_state.promoted_serving_status` = 'unconfirmed') — "
+                f"it is still inside the post-promotion confirmation window. Do "
+                f"NOT yet treat the milestone as fully shipped; the sweep will "
+                f"resolve it to serving_confirmed or deploy_failed shortly. You "
+                f"may begin setting v{_cur_n}'s mission, but do not declare "
+                f"v{_prior_n} live until serving is confirmed, and do NOT "
+                f"re-promote/re-qualify v{_prior_n}."
+            )
+        else:
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
+                f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now "
+                f"live; v{_cur_n} opened from that promotion. v{_prior_n}'s "
+                f"mission is COMPLETE — do NOT plan, research, audit, or spawn "
+                f"work to promote, qualify, re-audit, or re-qualify v{_prior_n}; "
+                f"that is already done and merged to {_target} (cross-check "
+                f"`version_phase.recent_versions` and `deployment_state` — "
+                f"v{_prior_n} is recorded there with status='promoted'). The "
+                f"`goal` field on v{_cur_n} is a frozen version-open snapshot "
+                f"that still reads as v{_prior_n}'s promotion mission — treat it "
+                f"as STALE CARRY-OVER, not a live directive, and disregard its "
+                f"promote/qualify framing. A null "
+                f"`version_phase.last_qualification` on v{_cur_n} means this "
+                f"fresh version has not yet begun its OWN qualification (expected "
+                f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
+                f"promotion is pending or failed. As your first action this "
+                f"cycle, set v{_cur_n}'s real mission: rewrite "
+                f"`intent.current_focus` to state what v{_cur_n} is for (not what "
+                f"v{_prior_n} achieved), retire directions v{_prior_n} already "
+                f"satisfied, and propose the directions the next milestone needs."
+            )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"
             if prompt_suffix
             else _post_promote_hint
         )
+    # Failed-deploy recovery directive — even if the next version has started
+    # qualification, keep the recovery priority visible while the latest promoted
+    # version remains in deploy_failed state. Computed at view time from that
+    # version's serving_status, so it self-clears as soon as the status flips to
+    # serving_confirmed — whether by a subsequent version promoting and confirming
+    # serving OR by the deploy-failure recovery sweep observing the SAME promoted
+    # SHA finally serve (a slow / boot-crashed deploy that later comes up healthy;
+    # see release_reconciliation._reconcile_if_deploy_failed_recovered). Fires
+    # independently of the post-promotion handoff (which self-clears once the fresh
+    # version starts qualifying) so failed deploys continue to drive strategic
+    # attention until actually recovered.
+    if (
+        _open_version is not None
+        and _integration_branch != _promotion_target
+    ):
+        _latest_promoted_version: Any | None = None
+        try:
+            from app.release_version import recent_closed_versions as _rcv
+
+            for _v in await _rcv(
+                session, project.id, limit=1
+            ):
+                if _v.status == "promoted":
+                    _latest_promoted_version = _v
+                    break
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] failed-deploy directive: latest promoted lookup failed; continuing"
+            )
+        if _latest_promoted_version is not None and _latest_promoted_version.serving_status == "deploy_failed":
+            _reason_txt = (
+                f" (reason={_latest_promoted_version.deploy_failure_reason})"
+                if _latest_promoted_version.deploy_failure_reason
+                else ""
+            )
+            _failed_deploy_directive = (
+                f"Active deployment crisis — v{_latest_promoted_version.version_number} "
+                f"MERGED to {_promotion_target} but DID NOT confirm serving{_reason_txt} "
+                f"(see `deployment_state.promoted_serving_status` = 'deploy_failed'). "
+                f"The promotion did NOT ship and code is NOT live. Your TOP priority "
+                f"this cycle is RECOVERING the failed deploy (roll forward a fix / "
+                f"investigate why the promoted SHA never served). Only after it is "
+                f"serving should you move focus on. This directive clears the moment "
+                f"THIS deploy is confirmed serving — recovering the SAME promoted SHA "
+                f"(a slow or boot-crashed deploy that later comes up healthy) resolves "
+                f"it automatically; you do NOT need to cut and promote a subsequent "
+                f"version for it to clear."
+            )
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_failed_deploy_directive}"
+                if prompt_suffix
+                else _failed_deploy_directive
+            )
     # Qualification sub-state directive — last_qualification.status is overloaded
     # ("pending" = audit-scoring OR promotion-PR-open-and-auto-merging), which
     # made the agent conflate "wait for the audit" with "the promotion is
@@ -4365,13 +4631,52 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _approaches_block
             )
+    # Authoritative, trim-proof direction counts computed from the FULL untrimmed
+    # ``project.directions`` (NOT the budget-droppable ``directions_summary``).
+    # These anchor the agent-side Direction-Health / Portfolio-Composition /
+    # Current-research-directions views so their headline count, slots line, and
+    # gap flags can never be starved out by the same byte-budget pressure that
+    # trims or drops the per-direction detail list. Shipped as a ``critical``
+    # payload key (see _STRATEGIC_REVIEW_SCHEMA) so the packer never reduces them.
+    _all_directions = project.directions or []
+    _active_directions_count = sum(
+        1 for d in _all_directions if d.get("status") == "active"
+    )
+    _max_active_directions = _runtime_config.get("max_active_directions", 10)
+    # Authoritative per-system ACTIVE-direction tally, computed from the FULL
+    # direction set before any trimming. Nested under ``direction_counts`` so it
+    # inherits the same ``critical`` trim-proof packing — this lets the agent's
+    # per-system coverage-gap and concentration-risk signals stay truthful even
+    # when ``directions_summary`` is trimmed for budget. Directions with no
+    # ``system_id`` simply do not contribute.
+    _direction_active_by_system: dict[str, int] = {}
+    for _d in _all_directions:
+        if _d.get("status") != "active":
+            continue
+        _sys_id = _d.get("system_id")
+        if not _sys_id:
+            continue
+        _direction_active_by_system[_sys_id] = (
+            _direction_active_by_system.get(_sys_id, 0) + 1
+        )
+    _direction_counts = {
+        "active": _active_directions_count,
+        "paused": sum(1 for d in _all_directions if d.get("status") == "paused"),
+        "total": sum(
+            1
+            for d in _all_directions
+            if d.get("status") in ("active", "paused", "proposed")
+        ),
+        "max_active": _max_active_directions,
+        "by_system": _direction_active_by_system,
+    }
     # Advisory: when too few directions are active the fleet's per-direction
     # fan-out leaves most VM capacity idle. Surface that cost so the agent can
     # weigh opening more lanes for worthwhile parallel work.
     _parallelism_hint = _build_parallelism_hint(
-        sum(1 for d in (project.directions or []) if d.get("status") == "active"),
+        _active_directions_count,
         _runtime_config.get("max_concurrent_vms", 0),
-        _runtime_config.get("max_active_directions", 10),
+        _max_active_directions,
     )
     if _parallelism_hint:
         prompt_suffix = (
@@ -4408,6 +4713,20 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _steering_directive
             )
+    # Surface aggregated missing-foundation demand to the strategist so it can open
+    # a foundation direction or record an explicit retirement of stranded demand.
+    # Read-only, fail-open, additive: included only when demand is non-empty, and
+    # the advisory hint is appended to the cycle prompt_suffix.
+    _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+    _missing_demand_present = bool(_missing_demand.get("demands"))
+    if _missing_demand_present:
+        _missing_demand_hint = missing_demand_prompt_hint(_missing_demand)
+        if _missing_demand_hint:
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_missing_demand_hint}"
+                if prompt_suffix
+                else _missing_demand_hint
+            )
     # Compute the grounded problem_model once so it backs BOTH the payload field
     # and the cycle-start reconciliation (capabilities carry their advisory
     # ``verification`` block here). Reusing the single computed view keeps the
@@ -4435,6 +4754,10 @@ async def _spawn_strategic_review(
         _sr_model_health,
         _utcnow().isoformat(),
     )
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output) so the strategist knows what knowledge already exists and
+    # can fetch full bodies on demand — included only when documents exist.
+    _knowledge_index = await build_knowledge_index(session, project.id)
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -4462,6 +4785,7 @@ async def _spawn_strategic_review(
             # Concrete prune candidates — present only when the model is
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
+            **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()
@@ -4471,6 +4795,11 @@ async def _spawn_strategic_review(
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "enable_self_improvement": project.enable_self_improvement,
+            # Trim-proof authoritative direction counts + operator ceiling. Both
+            # are ``critical`` so the agent's direction views always anchor on the
+            # true active set even when ``directions_summary`` is trimmed/dropped.
+            "direction_counts": _direction_counts,
+            "max_active_directions": _max_active_directions,
             "directions_summary": direction_stats,
             **(
                 {"staged_directions": _staged_directions}
@@ -4555,6 +4884,11 @@ async def _spawn_strategic_review(
             **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
+                else {}
+            ),
+            **(
+                {"missing_capability_demand": _missing_demand}
+                if _missing_demand_present
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

@@ -40,6 +40,7 @@ from app.models import (
     TaskHistory,
     Project,
     ProjectMember,
+    ProjectMessage,
     Artifact,
     ArtifactType,
     DeploymentState,
@@ -1247,6 +1248,13 @@ class CreateTaskPayload(BaseModel):
     # The agent handler branches hotfix/* off main and the orchestrator
     # back-merges main → automain after the hotfix lands.
     hotfix: bool = False
+    # Optional originating ProjectMessage (e.g. a BUG_REPORT) this task is being
+    # spawned from. Additive and backward compatible — omitted by existing
+    # callers. When provided for an ``investigate`` task, the message's citations
+    # are RE-VALIDATED against current HEAD and any "cited code is absent" signal
+    # is injected into the spawned task's context + prompt so the investigating
+    # agent discounts a stale report. Ignored for all other task types.
+    source_message_id: uuid.UUID | None = None
 
     @field_validator("base_branch", "branch")
     @classmethod
@@ -1427,6 +1435,78 @@ async def create_task_manually(
             trimmed_directions.append(entry)
         task_payload["directions"] = trimmed_directions
 
+    # Reproduce-on-HEAD citation gate for investigation tasks spawned from a
+    # bug-report message. The decision-critical moment: a full agent run is
+    # about to chase a defect. Re-validate the originating message's citations
+    # against CURRENT HEAD (which may have moved since ingestion). Persist any
+    # actionable provenance signal into the spawned task's context (mirroring
+    # how research_completion injects finding["_provenance_warnings"]), and
+    # only append the loud prompt note when the cited code is unambiguously
+    # absent so the investigating agent discounts a stale report without
+    # treating a partially grounded one as resolved. Best-effort: a missing
+    # message or no extractable refs degrades silently (no injection).
+    citation_task_context: dict | None = None
+    if payload.source_message_id is not None and payload.task_type == TaskType.investigate:
+        from app.source_ref_validation import (
+            resolve_branch_verification_context,
+            summarize_bug_report_citations,
+            should_persist_message_citation_warning,
+        )
+
+        src_msg = await session.get(ProjectMessage, payload.source_message_id)
+        if src_msg is not None and src_msg.project_id == project.id:
+            try:
+                _ctx = await resolve_branch_verification_context(session, project)
+                signal = await summarize_bug_report_citations(
+                    src_msg.content,
+                    structured_context=src_msg.context,
+                    **_ctx,
+                )
+            except Exception:  # noqa: BLE001 — grounding must never block task create
+                logger.debug(
+                    "[ADMIN] source-message citation re-validation failed",
+                    exc_info=True,
+                )
+                signal = None
+            if signal:
+                _citation_absent = signal.get("citation_state") == "absent"
+                # Seed a baseline reproduce-on-HEAD verdict from the citation-
+                # grounding signal (no new validation pass): cited code absent
+                # on HEAD definitionally does not reproduce there, so seed
+                # `already_resolved`; otherwise the defect-truth is not yet
+                # established, so seed `indeterminate`. Non-underscore key so the
+                # review/fix respawn carry-forward preserves it and the agent
+                # overwrites it with a determined verdict on terminal status.
+                # See schemas.ReproduceVerdict.
+                citation_task_context = {
+                    "reproduce_verdict": {
+                        "status": (
+                            "already_resolved" if _citation_absent else "indeterminate"
+                        ),
+                        "reason": (
+                            "seeded from bug-report citation grounding: cited code "
+                            "absent on HEAD"
+                            if _citation_absent
+                            else "seeded baseline: reproduce-on-HEAD not yet determined"
+                        ),
+                    }
+                }
+                # Persist the provenance signal whenever it carries actionable
+                # detail (absent verdict, or a non-absent verdict that still has
+                # broken/ungrounded refs). The shared helper centralizes that
+                # policy so present/indeterminate noise is dropped consistently.
+                # The investigating agent renders it into its prompt via
+                # `formatInvestigateCitationProvenance` (agent/src/prompt.ts) —
+                # the single prompt-assembly point, so BOTH the fully-absent
+                # discount note and the partially-grounded "verify these specific
+                # refs, defect still actionable" note reach the agent regardless
+                # of which spawn path created the task (operator or strategist).
+                # No prompt-string mutation here: doing it agent-side avoids
+                # double-rendering on the operator path and covers context-only
+                # spawn paths that never touch this code.
+                if should_persist_message_citation_warning(signal):
+                    citation_task_context["_provenance_warnings"] = signal
+
     try:
         task_payload = validate_task_payload(task_payload)
     except ValueError as exc:
@@ -1504,6 +1584,7 @@ async def create_task_manually(
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
         idempotency_key=scoped_idempotency_key,
+        **({"context": citation_task_context} if citation_task_context else {}),
     )
     session.add(new_task)
     try:
@@ -1975,6 +2056,13 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         if isinstance(_last_check, datetime)
         else _last_check,
     }
+    health_recovery_history = list(
+        getattr(_deploy_health_module, "_health_recovery_history", [])
+    )
+    (
+        health_recovery_streak_required,
+        health_recovery_flap_escalated,
+    ) = _deploy_health_module.get_recovery_threshold_state()
 
     return {
         "current_revision": state.current_revision,
@@ -2003,16 +2091,13 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "ramp_step_size": ramp_step_size,
         "zone_health": _get_zone_health_summary(),
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
-        "health_recovery_streak": sum(
-            1
-            for x in getattr(_deploy_health_module, "_health_recovery_history", [])
-            if x
+        "health_recovery_streak": sum(1 for x in health_recovery_history if x),
+        "health_recovery_streak_required": health_recovery_streak_required,
+        "health_recovery_flap_escalated": health_recovery_flap_escalated,
+        "health_recovery_history": health_recovery_history,
+        "health_recovery_history_size": getattr(
+            _deploy_health_module, "_HEALTH_HISTORY_SIZE", 5
         ),
-        "health_recovery_streak_required": 3,
-        "health_recovery_history": list(
-            getattr(_deploy_health_module, "_health_recovery_history", [])
-        ),
-        "health_recovery_history_size": 5,
         "health_failure_streak": getattr(
             _deploy_health_module, "_pause_failure_streak", 0
         ),

@@ -888,14 +888,17 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
+    sweep_stale_migration_reservations,
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
+    sweep_merge_gate_verification_degradation,
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
+    sweep_resolve_stale_open_bug_messages,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -2433,12 +2436,29 @@ async def reaper_service():
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
-                                # Defer the direction-outcome refresh until after the
-                                # per-row commit persists this landing (a fresh
-                                # session re-fetches the task — the reaper's per-row
-                                # commit can expire ``task``, so reading its context
-                                # here would risk a sync lazy-load / MissingGreenlet).
-                                _orphan_merge_refresh_needed = True
+                            try:
+                                from app.task_completion import (  # noqa: PLC0415
+                                    _finalize_migration_reservation_after_merge,
+                                )
+
+                                await _finalize_migration_reservation_after_merge(
+                                    task,
+                                    session,
+                                    terminal_merge=_terminal_rollup_merge,
+                                )
+                            except Exception as _mr_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[MIGRATION] Failed to finalize reservation for "
+                                    "reaped merged task %s: %r",
+                                    task.id,
+                                    _mr_exc,
+                                )
+                            # Defer the direction-outcome refresh until after the
+                            # per-row commit persists this landing (a fresh
+                            # session re-fetches the task — the reaper's per-row
+                            # commit can expire ``task``, so reading its context
+                            # here would risk a sync lazy-load / MissingGreenlet).
+                            _orphan_merge_refresh_needed = True
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -3694,6 +3714,15 @@ async def reaper_service():
                     just_reaped_ids=_orphaned_task_ids,
                     progress_cb=_mark_reaper_progress,
                 )
+                try:
+                    await sweep_stale_migration_reservations(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Migration-reservation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 6: QUEUED task age alerts — 3-tier INFO/WARNING/ERROR escalation.
                 _mark_reaper_progress()
@@ -3837,6 +3866,21 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Fleet merge-gate verification degradation alerting — surface
+                # systemic claim-verification erosion (PRs landing UNVERIFIED at
+                # scale) proactively instead of only on the dashboard. Alerting
+                # only — never influences a merge decision.
+                _mark_reaper_progress()
+                try:
+                    await sweep_merge_gate_verification_degradation(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Merge-gate degradation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 15: Linked bug-class message convergence / resurfacing —
                 # reconcile each 'linked' BUG_REPORT/BLOCKER with its owning
                 # outcome: resolve when landed, reopen when failed/cancelled/
@@ -3881,6 +3925,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Open-owned-message resolve sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18: Negatively resolve OPEN bug-class messages confirmed
+                # stale on HEAD — resolve an open system/agent BUG_REPORT/BLOCKER
+                # whose cited code is unambiguously ABSENT on the current
+                # integration HEAD (re-grounded fresh, conservative tri-state;
+                # indeterminate/present leaves it open). Runs AFTER Step 17 so a
+                # landed owner is positively resolved first. Fail-safe per message.
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_stale_open_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-bug-message resolve sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

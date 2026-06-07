@@ -104,6 +104,12 @@ _vm_images: dict[str, tuple[str | None, int | None]] = {}
 # Track per-VM agent runtime fingerprint (64-hex SHA-256) reported via heartbeat.
 _vm_runtime_fingerprints: dict[str, str] = {}
 
+# Track per-VM source git SHA (7-40 hex) baked into the image and reported via
+# heartbeat. Distinct from the runtime fingerprint (a content hash of the agent
+# source): this is the exact git commit the image was built from, so a baked
+# image and a running VM can be mapped back to a specific SHA.
+_vm_source_shas: dict[str, str] = {}
+
 # Track when each VM's provisioning slot was actually acquired (ISO timestamp string).
 # Written by _provision_gcp after both Redis and local semaphore guards are passed;
 # read by the orchestrator to populate _cold_start_stages["provision_slot_acquired_at"].
@@ -715,6 +721,7 @@ async def provision_pool_vm(
 
 _last_provision_error: _OrderedDict = _OrderedDict()
 _PROVISION_ERROR_MAX = 500
+_NO_POOL_VM_UPDATE = object()
 
 
 def get_provision_error(vm_instance_id: str) -> str:
@@ -785,6 +792,178 @@ def get_vm_runtime_fingerprint(vm_instance_id: str) -> str | None:
     return _vm_runtime_fingerprints.get(vm_instance_id)
 
 
+def record_vm_source_sha(vm_instance_id: str, source_sha: str) -> None:
+    """Record the source git SHA (baked into the image) reported by a VM via heartbeat."""
+    if not vm_instance_id:
+        return
+    _vm_source_shas[vm_instance_id] = source_sha
+    logger.debug(f"[COMPUTE] VM {vm_instance_id} agent_source_sha={source_sha[:12]}…")
+
+
+def get_vm_source_sha(vm_instance_id: str) -> str | None:
+    """Return the source git SHA reported by a VM, or None if not yet reported."""
+    return _vm_source_shas.get(vm_instance_id)
+
+
+async def persist_pool_vm_image_state(
+    session,
+    vm_instance_id: str,
+    *,
+    image_name: str | None | object = _NO_POOL_VM_UPDATE,
+    build_ts: int | None | object = _NO_POOL_VM_UPDATE,
+    runtime_fingerprint: str | None | object = _NO_POOL_VM_UPDATE,
+    source_sha: str | None | object = _NO_POOL_VM_UPDATE,
+    heartbeat_at: datetime | None = None,
+) -> bool:
+    """Persist heartbeat-derived image identity onto a PoolVm row when present.
+
+    The in-memory heartbeat caches are enough for short-lived alerting, but they
+    vanish on orchestrator restart. This helper mirrors the observed image/source
+    identity onto the durable ``PoolVm`` registry row for warm-pool members so
+    later release-artifact checks can reason about the fleet across restarts.
+
+    Returns ``True`` when a matching PoolVm row was updated, ``False`` when the
+    VM is not a warm-pool member (task-bound chain/backlog VMs have no PoolVm row).
+    """
+    if not vm_instance_id:
+        return False
+    from app.warm_pool import get_pool_vm
+    from app.time_utils import _utcnow
+
+    member = await get_pool_vm(session, vm_instance_id)
+    if member is None:
+        return False
+    if image_name is not _NO_POOL_VM_UPDATE:
+        member.agent_image_name = image_name
+    if build_ts is not _NO_POOL_VM_UPDATE:
+        member.agent_image_build_ts = build_ts
+    if runtime_fingerprint is not _NO_POOL_VM_UPDATE:
+        member.agent_runtime_fingerprint = runtime_fingerprint
+    if source_sha is not _NO_POOL_VM_UPDATE:
+        member.agent_source_sha = source_sha
+    member.last_heartbeat_at = heartbeat_at or _utcnow()
+    session.add(member)
+    return True
+
+
+def get_image_source_git_sha(image_name: str, project: str | None = None) -> str | None:
+    """Read the ``source-git-sha`` label off a GCP image, or None when absent.
+
+    Best-effort, read-only provenance reader: maps a baked agent VM image back to
+    the exact git commit it was built from (the label set by the Packer bake in
+    infra/packer/agent.pkr.hcl). Returns None on LOCAL_MODE, any GCP error, a
+    missing label, or the baked ``unknown`` fallback (a build with no commit in
+    the environment). No VM cooperation required — the label lives on the image.
+    """
+    if LOCAL_MODE or not image_name:
+        return None
+
+    from google.cloud import compute_v1
+
+    proj = project or GCP_PROJECT_ID
+    try:
+        client = compute_v1.ImagesClient()
+        image = client.get(project=proj, image=image_name)
+        sha = (image.labels or {}).get("source-git-sha")
+    except Exception as e:  # provenance read must never raise to callers
+        logger.debug(f"[COMPUTE] get_image_source_git_sha({image_name}) failed: {e}")
+        return None
+    if not sha or sha == "unknown":
+        return None
+    return sha
+
+
+def _image_creation_epoch(image) -> int | None:
+    """Parse a GCP image ``creation_timestamp`` (ISO-8601) to epoch seconds, or None."""
+    ts = getattr(image, "creation_timestamp", None)
+    if not ts:
+        return None
+    try:
+        from datetime import datetime as _dt
+
+        return int(_dt.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def get_current_agent_image(
+    family: str | None = None, project: str | None = None
+) -> dict | None:
+    """Resolve the image the agent VM image family currently points at.
+
+    Read-only, best-effort: maps the live ``blueprint-agent-v2`` family target
+    back to its name, its baked ``source-git-sha`` provenance label, and a build
+    timestamp (epoch seconds, parsed from the image ``creation_timestamp``). This
+    is the 'current valid image' the fleet should converge to — a VM booted from
+    an older image is pre-promotion and should be recycled once this newer image
+    exists.
+
+    Returns ``{"image_name", "source_git_sha", "build_ts"}`` or ``None`` in
+    LOCAL_MODE / on any GCP error / when the family has no target. The baked
+    ``unknown`` SHA fallback is normalised to ``None`` (mirrors
+    :func:`get_image_source_git_sha`).
+    """
+    if LOCAL_MODE:
+        return None
+
+    from google.cloud import compute_v1
+
+    fam_input = family or AGENT_IMAGE_FAMILY
+    fam_name = fam_input.split("/")[-1]
+    proj = project or GCP_PROJECT_ID
+    if fam_input.startswith("projects/"):
+        proj = fam_input.split("/")[1]
+    try:
+        client = compute_v1.ImagesClient()
+        image = client.get_from_family(project=proj, family=fam_name)
+    except Exception as e:  # provenance read must never raise to callers
+        logger.debug(f"[COMPUTE] get_current_agent_image({fam_name}) failed: {e}")
+        return None
+    source_sha = (image.labels or {}).get("source-git-sha")
+    if source_sha == "unknown":
+        source_sha = None
+    return {
+        "image_name": image.name,
+        "source_git_sha": source_sha or None,
+        "build_ts": _image_creation_epoch(image),
+    }
+
+
+def get_outdated_image_vms(current_build_ts: int | None = None) -> list[dict]:
+    """Return VMs whose reported image predates the current image-family target.
+
+    Distinct from :func:`get_stale_image_vms` (a fixed temporal age threshold):
+    this compares each VM's heartbeat-reported ``build_ts`` against the build
+    timestamp of the image the family CURRENTLY points at. A VM is flagged as
+    soon as a newer valid image lands — even if it is younger than the staleness
+    threshold — so warm-pool / maintenance flows recycle pre-promotion boots and
+    the fleet converges on the promoted image instead of lingering on old boots.
+
+    ``current_build_ts`` may be supplied to avoid a redundant family lookup;
+    otherwise it is resolved via :func:`get_current_agent_image`. Returns ``[]``
+    in LOCAL_MODE / when the current image (or its build_ts) cannot be resolved
+    — there is no newer valid image to converge to, so nothing is 'outdated'.
+    """
+    if current_build_ts is None:
+        current = get_current_agent_image()
+        current_build_ts = current.get("build_ts") if current else None
+    if current_build_ts is None:
+        return []
+    outdated: list[dict] = []
+    for vm_id, (image_name, build_ts) in list(_vm_images.items()):
+        if build_ts is not None and build_ts < current_build_ts:
+            outdated.append(
+                {
+                    "vm_id": vm_id,
+                    "image_name": image_name,
+                    "build_ts": build_ts,
+                    "current_build_ts": current_build_ts,
+                    "agent_runtime_fingerprint": _vm_runtime_fingerprints.get(vm_id),
+                }
+            )
+    return outdated
+
+
 def get_provision_slot_acquired_at(vm_instance_id: str) -> str | None:
     """Return the ISO timestamp when this VM's provisioning slot was acquired, or None."""
     return _vm_provision_slot_times.get(vm_instance_id)
@@ -794,6 +973,7 @@ def _clear_vm_heartbeat_state(vm_instance_id: str) -> None:
     """Drop heartbeat-derived metadata once a VM is no longer running."""
     _vm_images.pop(vm_instance_id, None)
     _vm_runtime_fingerprints.pop(vm_instance_id, None)
+    _vm_source_shas.pop(vm_instance_id, None)
     _vm_provision_slot_times.pop(vm_instance_id, None)
 
 

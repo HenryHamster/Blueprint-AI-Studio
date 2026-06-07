@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
@@ -33,6 +34,7 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    KnowledgeDocument,
     Project,
     Task,
     TaskStatus,
@@ -312,6 +314,58 @@ async def test_compute_completion_met_criterion_completes_and_records_goal(
     assert criterion["met"] is True
     assert criterion["metric"] == "final_cost_usd"
     assert criterion["value"] == pytest.approx(0.42)
+    # Durable criterion verdict is also recorded on task.context for consumers.
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["measurable"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_reported_metric_met_records_goal(
+    db_session, _quiet_compute_io
+):
+    """A command-reported experiment metric (accuracy) flattened to a top-level
+    key that MEETS its declared goal PASSES, completes the task, and records the
+    met verdict durably on both plan_output and task.context."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "accuracy", ">=", 0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.93), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is True
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(0.93)
+    assert task.context["compute_success_criterion"]["met"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_reported_metric_unmet_fails_gate(
+    db_session, _quiet_compute_io
+):
+    """A reported experiment metric that MISSES its declared goal FAILS the gate
+    and records the unmet criterion durably on task.context."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "accuracy", ">=", 0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.83), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not met" in task.context["evaluation_gate"]["reason"]
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.83)
 
 
 @pytest.mark.asyncio
@@ -333,26 +387,231 @@ async def test_compute_completion_unmet_criterion_fails_gate(
     assert task.status == TaskStatus.FAILED
     assert task.context["evaluation_gate"]["passed"] is False
     assert "not met" in task.context["evaluation_gate"]["reason"]
+    assert task.context["compute_success_criterion"]["met"] is False
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_unmeasurable_criterion_does_not_bury_success(
+async def test_compute_completion_absent_metric_fails_closed_and_records(
     db_session, _quiet_compute_io
 ):
-    """A criterion naming an experiment-domain metric the terminal result can
-    NEVER carry (accuracy/loss/…) must NOT permanently fail a successful run at
-    the lifecycle level. The gate passes on the terminal+costed outcome and the
-    durable criterion records that the goal was unmeasurable (not silently met)."""
+    """A declared experiment-domain metric the command did NOT report (absent from
+    the terminal artifact) FAILS the gate CLOSED — it must NOT silently complete
+    as 'unmeasurable'. The durable criterion records the metric was not
+    measurable (absent) and the gate reason is operator-readable."""
     task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
 
-    # Real terminal artifact shape: no 'accuracy' key, ever.
+    # Real terminal artifact shape: no 'accuracy' key reported.
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not evaluable" in task.context["evaluation_gate"]["reason"]
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is False
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["metric"] == "accuracy"
+    assert ctx_criterion["value"] is None
+
+
+# ── Durable knowledge: the verdict survives as a queryable KnowledgeDocument ──
+
+
+async def _knowledge_docs_for(db_session, task) -> list[KnowledgeDocument]:
+    return (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _make_compute_task_with_identity(
+    db_session, *, metric, op, threshold, direction_id="d-compute"
+) -> Task:
+    """A compute task carrying benchmark identity + a strategic direction."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "X speeds up Y",
+            "benchmark": "bench-suite-v2",
+            "tags": ["perf"],
+            "success_criterion": {
+                "metric": metric,
+                "operator": op,
+                "threshold": threshold,
+            },
+        }
+    ]
+    task.context = {"direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_success_persists_one_knowledge_document(
+    db_session, _quiet_compute_io
+):
+    """A completed experiment whose criterion is met persists exactly ONE
+    KnowledgeDocument carrying the verdict: source_kind, outcome, metric/value,
+    criterion-met flag, cost, source_task_id, and direction_id."""
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.93), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.source_kind == "compute_experiment"
+    assert doc.source_task_id == task.id
+    assert doc.direction_id == "d-compute"
+    # The verdict (outcome, metric/value, criterion-met, cost) is recorded.
+    verdict = doc.forward_quality_verdict
+    assert verdict["outcome"] == "SUCCESS"
+    assert verdict["criterion_met"] is True
+    assert verdict["criterion"]["metric"] == "accuracy"
+    assert verdict["criterion"]["value"] == pytest.approx(0.93)
+    assert verdict["cost_usd"] == pytest.approx(0.37)
+    # The metric and its value surface in human-readable summary text.
+    assert "accuracy" in doc.summary
+    # plan_output mirrors a compact copy WITHOUT clobbering compute_result.
+    assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+    assert task.plan_output["knowledge_document"]["source_kind"] == "compute_experiment"
+
+
+@pytest.mark.asyncio
+async def test_compute_unmet_criterion_persists_honest_negative(
+    db_session, _quiet_compute_io
+):
+    """An experiment that finishes but misses its declared criterion FAILS the
+    gate yet still records an honest negative result as knowledge ("we tried X
+    and it did NOT meet the bar"), rather than silently dropping it."""
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.42), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.source_kind == "compute_experiment"
+    assert doc.forward_quality_verdict["criterion_met"] is False
+    assert doc.forward_quality_verdict["criterion"]["value"] == pytest.approx(0.42)
+    assert "NOT met" in doc.summary
+
+
+@pytest.mark.asyncio
+async def test_compute_success_without_criterion_persists_document(
+    db_session, _quiet_compute_io
+):
+    """An experiment with NO declared criterion that completes still persists its
+    verdict (outcome + cost) as knowledge, with criterion_met recorded as null."""
+    task = await _make_compute_task(db_session)  # no success_criterion in payload
+
     await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
-    criterion = task.plan_output["compute_result"]["criterion"]
-    assert criterion["measurable"] is False
-    assert criterion["metric"] == "accuracy"
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    assert docs[0].forward_quality_verdict["criterion_met"] is None
+    assert docs[0].forward_quality_verdict["outcome"] == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_compute_no_measurement_persists_no_document(
+    db_session, _quiet_compute_io
+):
+    """A gate failure with no terminal measurement (no outcome / no cost) has no
+    verdict to record and persists NO knowledge document."""
+    task = await _make_compute_task(db_session)
+
+    payload = json.dumps({"job_id": "job-abc", "final_cost_usd": 0.1})
+    await _handle_compute_experiment_completion(task, payload, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert await _knowledge_docs_for(db_session, task) == []
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_is_discoverable_as_prior_knowledge(
+    db_session, _quiet_compute_io
+):
+    """The persisted verdict is retrievable through the SAME prior-knowledge path
+    (build_knowledge_index / list_knowledge_documents) that injects
+    web_research/design documents into future research/strategist prompts."""
+    from app.knowledge_query import build_knowledge_index, list_knowledge_documents
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.93), db_session
+    )
+    await db_session.refresh(task)
+
+    index = await build_knowledge_index(db_session, task.project_id)
+    assert any(e["source_kind"] == "compute_experiment" for e in index)
+
+    listing = await list_knowledge_documents(
+        db_session, task.project_id, source_kind="compute_experiment"
+    )
+    assert listing["total"] == 1
+    assert listing["documents"][0]["source_task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_delivered_to_queued_dependent(
+    db_session, _quiet_compute_io
+):
+    """A compute_experiment's verdict is delivered to a QUEUED dependent that
+    declared this experiment in depends_on, via the shared knowledge-prerequisite
+    pointer machinery."""
+    from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: act on the experiment result",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.93), db_session
+    )
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
+    assert prereqs and prereqs[0]["source_kind"] == "compute_experiment"
+    assert prereqs[0]["source_task_id"] == str(task.id)
 
 
 # ── Full lifecycle: substrate kill → task completion ────────────────────────

@@ -337,6 +337,10 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     expect(doneScript).toContain('ALREADY_DONE_REASON');
     // The no-op branch posts COMPLETED with a no_op_reason field and NO pr_url.
     expect(doneScript).toContain('status: "COMPLETED", no_op_reason: $r');
+    // It also emits the canonical reproduce-on-HEAD verdict (already_resolved),
+    // reusing the affirmative reason as the verdict reason, additively alongside
+    // no_op_reason so older backends are unaffected.
+    expect(doneScript).toContain('reproduce_verdict: {status: "already_resolved", reason: $r}');
     // The branch runs BEFORE the PR-file requirement (so it does not need ./pr open).
     const noopIdx = doneScript.indexOf('if [ -n "$ALREADY_DONE_REASON" ]; then');
     const prFileIdx = doneScript.indexOf('PR_FILE="/tmp/pr_url_noop-task-1"');
@@ -347,6 +351,28 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     expect(doneScript).toContain('touch /tmp/done_noop-task-1');
     // Operator-facing status text explains the missing PR.
     expect(doneScript).toContain('deliverable already present');
+  });
+
+  it('supports explicit --reproduced and --indeterminate verdict flags on the normal PR completion path', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-verdicts',
+      workBranch: 'blueprint/noop-task-verdicts',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('--reproduced');
+    expect(doneScript).toContain('--indeterminate');
+    expect(doneScript).toContain('REPRODUCED_REASON');
+    expect(doneScript).toContain('INDETERMINATE_REASON');
+    expect(doneScript).toContain('REPRODUCE_VERDICT_STATUS="reproduced"');
+    expect(doneScript).toContain('REPRODUCE_VERDICT_STATUS="indeterminate"');
+    expect(doneScript).toContain('{reproduce_verdict: {status: $reproduce_status, reason: $reproduce_reason}}');
+    expect(doneScript).toContain('mutually exclusive');
   });
 
   it('requires an affirmative reason of at least 30 chars for --already-done', async () => {
@@ -366,6 +392,22 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     // Minimum-length guard (≥30) so a vacuous "done" cannot land COMPLETED.
     expect(doneScript).toContain('--already-done reason must be at least 30 chars');
     expect(doneScript).toContain('lt 30');
+  });
+
+  it('requires reasons for the explicit reproduced and indeterminate verdict flags', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-2b',
+      workBranch: 'blueprint/noop-task-2b',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('--reproduced requires a reason argument');
+    expect(doneScript).toContain('--indeterminate requires a reason argument');
   });
 
   it('makes --already-done and --warn-out-of-scope mutually exclusive', async () => {

@@ -682,6 +682,104 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   // Repo root covers the auto-detected (no build_config) case.
   addPyprojectAuto(WORKSPACE, 'root');
 
+  // 2b) requirements.txt Python auto-provision. A project that declares its
+  //     dependencies via requirements.txt (and common variants: requirements-dev.txt,
+  //     requirements/base.txt) has no existing pre-provisioning path — the only
+  //     requirements.txt install in the codebase fires inside the per-runner test-suite
+  //     loop, which is never reached for the cheap goal-level probes or when the suite
+  //     is absent/thin. Without this, the documented-command probe runs unprovisioned,
+  //     hits an ImportError, and classifies as "could not run" — silently falling open.
+  //     First matching requirements file wins; a dir with a declared install_cmd is
+  //     skipped (operator's command wins); deduped by cwd like the other auto steps.
+  const REQ_FILES = ['requirements.txt', 'requirements-dev.txt', 'requirements/base.txt'];
+  const addRequirementsTxtAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    for (const reqFile of REQ_FILES) {
+      if (exists(`${absDir}/${reqFile}`)) {
+        add({ cmd: 'pip', args: ['install', '-r', reqFile], cwd: absDir, label: `pip install -r ${reqFile} (${label})` });
+        return;
+      }
+    }
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addRequirementsTxtAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addRequirementsTxtAuto(WORKSPACE, 'root');
+
+  // 2c) Poetry Python auto-provision. A project with a committed poetry.lock
+  //     must run `poetry install` before tests/probes to install dependencies
+  //     AND the project's own package (with console-script entrypoints). Without
+  //     this, the documented-command probe runs unprovisioned, hits missing-dependency
+  //     or command-not-found, and classifies as "could not run" — silently falling open.
+  //     Skipped when a declared install_cmd is present (operator's command wins);
+  //     deduped by cwd like the other auto steps.
+  const addPoetryAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/pyproject.toml`) || !exists(`${absDir}/poetry.lock`)) return;
+    add({ cmd: 'poetry', args: ['install'], cwd: absDir, label: `poetry install (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPoetryAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPoetryAuto(WORKSPACE, 'root');
+
+  // 2d) Pipenv Python auto-provision. A project with a Pipfile must run
+  //     `pipenv install --system` before tests/probes to install dependencies
+  //     into the ambient interpreter (not a virtualenv). Without this, the
+  //     documented-command probe runs unprovisioned, hits missing-dependency or
+  //     command-not-found, and classifies as "could not run" — silently falling
+  //     open. Skipped when a declared install_cmd is present (operator's command
+  //     wins); deduped by cwd like the other auto steps.
+  const addPipenvAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/Pipfile`)) return;
+    add({ cmd: 'pipenv', args: ['install', '--system'], cwd: absDir, label: `pipenv install --system (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPipenvAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPipenvAuto(WORKSPACE, 'root');
+
+  // 2e) Bare setup.py/setup.cfg Python auto-provision. A project with setup.py or
+  //     setup.cfg but NO pyproject.toml must run `pip install .` before tests/probes to
+  //     install dependencies AND the project's own package (with console-script entrypoints).
+  //     Without this, the documented-command probe runs unprovisioned, hits missing-dependency
+  //     or command-not-found, and classifies as "could not run" — silently falling open.
+  //     Skipped when a declared install_cmd or any OTHER provisioning step already fired
+  //     (operator's command wins, deduped by cwd).
+  const bareSetupPy = (absDir: string): boolean =>
+    !exists(`${absDir}/pyproject.toml`) &&
+    !exists(`${absDir}/requirements.txt`) &&
+    !exists(`${absDir}/requirements-dev.txt`) &&
+    !exists(`${absDir}/requirements/base.txt`) &&
+    !exists(`${absDir}/poetry.lock`) &&
+    !exists(`${absDir}/Pipfile`) &&
+    (exists(`${absDir}/setup.py`) || exists(`${absDir}/setup.cfg`));
+  const addBareSetupAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir) || !bareSetupPy(absDir)) return;
+    add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addBareSetupAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addBareSetupAuto(WORKSPACE, 'root');
+
   // 3) Extra-ecosystem auto-provision (Ruby/Gradle/Maven/Elixir/PHP). The suite
   //    detector LAUNCHES these runners (detectExtraFamilyRunner) but their test
   //    commands (`bundle exec rake test`, `./gradlew test`, `mvn test`,
@@ -695,7 +793,7 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   //    any cwd already provisioned above (deduped by `add`). First match wins per
   //    dir; mirrors detectExtraFamilyRunner's detection order. A provisioning
   //    FAILURE flows through the existing setup-failure path exactly like a failed
-  //    declared install or pip/poetry install — never a blocking test failure.
+  //    declared install, pipenv/poetry install, or pip install — never a blocking test failure.
   const addExtraFamilyAuto = (absDir: string, label: string): void => {
     if (declaredCwds.has(absDir)) return;
     // Ruby: Gemfile → `bundle install`.
@@ -1474,6 +1572,18 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
     /^--- PASS:/.test(line)                  // Go verbose per-test pass marker
   ));
   if (!hasRealFailureEvidence && !hasRealPassEvidence) {
+    // Mocha/Jasmine: "N passing, M pending" where N=0 and M>0 is all-skipped.
+    // Check this before standalone skip patterns since pending is the skip token.
+    // May be on the same line or separate lines.
+    {
+      const passingM = trimmedLines.find(line => /\b(\d+)\s+passing\b/i.test(line))?.match(/\b(\d+)\s+passing\b/i);
+      const pendingM = trimmedLines.find(line => /\b(\d+)\s+pending\b/i.test(line))?.match(/\b(\d+)\s+pending\b/i);
+      if (passingM && pendingM) {
+        const passing = Number(passingM[1]);
+        const pending = Number(pendingM[1]);
+        if (passing === 0 && pending > 0) return 'all_skipped';
+      }
+    }
     // Standalone skip tokens: the family reports any passing test as its OWN
     // "N passed" / "Passed: N" / "--- PASS:" token (already excluded above), so
     // a non-zero skip/deselect/ignore/filter count here is decisive.
@@ -1506,6 +1616,7 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
       [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
       // PHPUnit: "OK, but incomplete, skipped, or risky tests!" → "Tests: 5, .., Skipped: 5"
       [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // NOTE: Mocha/Jasmine is handled separately above via the special "0 passing, N pending" check.
     ];
     // Compare the total and skip counts on the SAME line across all aggregate
     // families; `cmp` selects all-skip (===) vs has-passes (>).
@@ -1605,10 +1716,28 @@ export function extractTestCoverage(
     return 0;
   };
 
+  // ── Mocha/Jasmine special handling (passing + pending + failing = total) ────
+  // Mocha reports "N passing, M pending, K failing" where passing/pending/failing
+  // are the COUNTS of each category, not a total. So we need explicit addition.
+  // Tokens may be on the same line or separate lines.
+  {
+    const passingM = trimmedLines.find(line => /\b(\d+)\s+passing\b/i.test(line))?.match(/\b(\d+)\s+passing\b/i);
+    const pendingM = trimmedLines.find(line => /\b(\d+)\s+pending\b/i.test(line))?.match(/\b(\d+)\s+pending\b/i);
+    const failingM = trimmedLines.find(line => /\b(\d+)\s+failing\b/i.test(line))?.match(/\b(\d+)\s+failing\b/i);
+    if (passingM && pendingM) {
+      const passed = Number(passingM[1]);
+      const skipped = Number(pendingM[1]);
+      const failed = failingM ? Number(failingM[1]) : 0;
+      const total = passed + skipped + failed;
+      if (total > 0) return { passed, skipped, total };
+    }
+  }
+
   // ── Aggregate families (single summary line carrying a TOTAL) ──────────────
   // Each entry is [totalRe, skipRe]; mirrors AGGREGATE_FAMILIES in
   // classifyTestExecution. A family fires only on lines carrying BOTH tokens,
   // and counts are summed across all such lines (one per class/project).
+  // NOTE: Mocha/Jasmine is handled separately above via mochaMatch, not here.
   const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
     [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],            // Ruby/RSpec
     [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],                  // Ruby/Minitest
@@ -1617,7 +1746,7 @@ export function extractTestCoverage(
     [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // .NET
     [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // PHPUnit
   ];
-  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+failures?\b/i];
+  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+(?:failures?|failing)\b/i];
   const errPatterns = [/\bErrors?:\s*(\d+)\b/i, /\b(\d+)\s+errors?\b/i];
   const aggregateResults: Array<{ passed: number; skipped: number; total: number }> = [];
   for (const [totalRe, skipRe] of AGGREGATE_FAMILIES) {
@@ -1772,6 +1901,60 @@ export function buildTargetedPytestRunners(runners: TestRunner[], selectors: str
   return runners
     .map(runner => withPytestSelectors(runner, selectors))
     .filter((runner): runner is TestRunner => runner !== null);
+}
+
+// ── Declared acceptance-test probe ───────────────────────────────────────────
+// When an implementation task declared, at plan time, a named acceptance test
+// (``acceptance_evidence`` with ``kind="test"``), the no-CI merge gate must
+// confirm that specific test actually EXISTS and RAN in the PR's suite — not
+// just that the suite as a whole passed. These two helpers are the pure,
+// unit-testable core of that probe; the execution + timeout discipline lives in
+// the verify-tests handler.
+
+/** A plan-time acceptance-test declaration as it travels on the task context. */
+export interface DeclaredAcceptanceTest {
+  descriptor: string;
+  selector?: string;
+}
+
+/** Build a TARGETED runner that runs ONLY the declared acceptance test, reusing
+ *  the same pytest-selector targeting the gate uses for CI-failure replay.
+ *
+ *  Conservative: it only knows how to target a pytest-style selector (a
+ *  ``…test_x.py::test_y`` node id, or a ``testing/…`` path) against an
+ *  already-detected pytest runner. When the declaration carries no usable
+ *  selector, or no detected runner accepts pytest selectors, it returns ``null``
+ *  — the caller then degrades to a "could not run the check" fall-open rather
+ *  than fabricating an arbitrary command. ``runners`` is passed in (not detected
+ *  here) so the function stays pure and the caller controls detection. */
+export function buildAcceptanceTestRunner(
+  declared: DeclaredAcceptanceTest,
+  runners: TestRunner[],
+): TestRunner | null {
+  const selector = (declared.selector || declared.descriptor || '').trim();
+  if (!selector) return null;
+  // Only a pytest-shaped selector can be targeted today. A bare prose
+  // descriptor (no ``.py`` node id / ``testing/`` path) is not runnable as a
+  // selector, so we decline rather than guess.
+  const looksPytest = /\.py(::|$)/.test(selector) || /(^|\/)testing\//.test(selector);
+  if (!looksPytest) return null;
+  const targeted = buildTargetedPytestRunners(runners, [selector]);
+  return targeted.length > 0 ? targeted[0] : null;
+}
+
+/** Classify whether the declared acceptance test's targeted run actually
+ *  executed the test. Thin map over :func:`classifyTestExecution`:
+ *    - ``ran``     — the test executed (passed or failed; execution is what we
+ *                    confirm here, the suite gate owns pass/fail);
+ *    - ``skipped`` — the selector matched but every collected test was
+ *                    skipped/deselected/xfail'd (it did NOT actually run);
+ *    - ``absent``  — the selector matched nothing (the promised test is missing
+ *                    / zero-collection / unknown node id). */
+export function classifyAcceptanceTestRun(output: string): 'ran' | 'skipped' | 'absent' {
+  const cls = classifyTestExecution(output);
+  if (cls === 'no_tests') return 'absent';
+  if (cls === 'all_skipped') return 'skipped';
+  return 'ran';
 }
 
 // isDockerRunner is used by callers in index.ts via re-export
@@ -2237,14 +2420,18 @@ export const MAX_DISABLED_TEST_MARKERS = 20;
 // Path heuristics for "this is a TEST file" — restrict the scan so unrelated
 // prose or a non-test ``# ignore``-style comment cannot false-positive. Mirrors
 // the common ecosystem conventions: ``*.test.*`` / ``*.spec.*`` (JS/TS), Go
-// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``, and
-// anything under a ``tests/`` / ``__tests__/`` / ``spec/`` directory.
+// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``,
+// Rust ``*_test.rs`` / ``*_spec.rs``, Java/Kotlin ``*Test.java`` / ``*Test.kt``,
+// and anything under a ``tests/`` / ``test/`` / ``__tests__/`` / ``spec/`` directory.
 const TEST_FILE_PATTERNS: RegExp[] = [
   /\.(test|spec)\.[a-z0-9]+$/i,
   /_test\.go$/i,
   /(^|\/)test_[^/]*\.py$/i,
   /_test\.py$/i,
   /_spec\.rb$/i,
+  /_test\.rs$/i,
+  /_spec\.rs$/i,
+  /Test\.(java|kt|kts)$/i,
   /(^|\/)(tests?|__tests__|spec)\//i,
 ];
 
@@ -2255,32 +2442,69 @@ export function isTestFilePath(relPath: string): boolean {
   return TEST_FILE_PATTERNS.some(re => re.test(p));
 }
 
+/** Detect the language(s) of a test file based on its path and extension. */
+function detectTestLanguages(relPath: string): string[] {
+  const p = (relPath || '').trim().toLowerCase();
+  const languages = new Set<string>();
+
+  // File extension-based detection
+  if (p.endsWith('.ts') || p.endsWith('.tsx') || p.endsWith('.js') || p.endsWith('.jsx')) {
+    languages.add('js-ts');
+  } else if (p.endsWith('.py')) {
+    languages.add('python');
+  } else if (p.endsWith('.go')) {
+    languages.add('go');
+  } else if (p.endsWith('.rs')) {
+    languages.add('rust');
+  } else if (p.endsWith('.rb')) {
+    languages.add('ruby');
+  } else if (p.endsWith('.java') || p.endsWith('.kt') || p.endsWith('.kts')) {
+    languages.add('jvm');
+  }
+
+  // Directory-based detection (for ambiguous test files under tests/ directories)
+  if (p.includes('/__tests__/') || p.includes('/tests/') || p.includes('/test/') || p.includes('/spec/')) {
+    // If directory alone can't determine the language, we need to preserve multi-language detection
+    if (languages.size === 0) {
+      // Ambiguous case: /tests/ dir but no clear extension. This shouldn't happen
+      // since test files should have extensions, but be conservative.
+      return ['js-ts', 'python', 'go', 'rust', 'ruby', 'jvm'];
+    }
+  }
+
+  return Array.from(languages);
+}
+
 // Each marker is anchored so it matches REAL usage (``it.skip(`` …), not a
 // substring inside an identifier or a longer marker name. ``kind`` is the
-// human-facing label surfaced in the verdict.
-const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp }> = [
+// human-facing label surfaced in the verdict. ``languages`` restricts the
+// marker to only test files of the specified language(s).
+const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp; languages: string[] }> = [
   // JS / TS (Jest / Vitest / Mocha / Jasmine).
-  { kind: 'it.skip', re: /\bit\.skip\b/ },
-  { kind: 'test.skip', re: /\btest\.skip\b/ },
-  { kind: 'describe.skip', re: /\bdescribe\.skip\b/ },
-  { kind: 'context.skip', re: /\bcontext\.skip\b/ },
-  { kind: 'xit', re: /\bxit\s*\(/ },
-  { kind: 'xdescribe', re: /\bxdescribe\s*\(/ },
-  { kind: 'xtest', re: /\bxtest\s*\(/ },
+  { kind: 'it.skip', re: /\bit\.skip\b/, languages: ['js-ts'] },
+  { kind: 'test.skip', re: /\btest\.skip\b/, languages: ['js-ts'] },
+  { kind: 'describe.skip', re: /\bdescribe\.skip\b/, languages: ['js-ts'] },
+  { kind: 'context.skip', re: /\bcontext\.skip\b/, languages: ['js-ts'] },
+  { kind: 'xit', re: /\bxit\s*\(/, languages: ['js-ts'] },
+  { kind: 'xdescribe', re: /\bxdescribe\s*\(/, languages: ['js-ts'] },
+  { kind: 'xtest', re: /\bxtest\s*\(/, languages: ['js-ts'] },
   // Python — pytest markers and unittest decorators.
-  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/ },
-  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/ },
-  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/ },
-  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/ },
+  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/, languages: ['python'] },
+  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/, languages: ['python'] },
+  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/, languages: ['python'] },
+  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/, languages: ['python'] },
   // Go — testing.T skip calls.
-  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/ },
+  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/, languages: ['go'] },
   // Rust — ignored test attribute.
-  { kind: '#[ignore]', re: /#\[\s*ignore\b/ },
+  { kind: '#[ignore]', re: /#\[\s*ignore\b/, languages: ['rust'] },
   // JUnit (Java/Kotlin).
-  { kind: '@Disabled', re: /@Disabled\b/ },
-  { kind: '@Ignore', re: /@Ignore\b/ },
+  { kind: '@Disabled', re: /@Disabled\b/, languages: ['jvm'] },
+  { kind: '@Ignore', re: /@Ignore\b/, languages: ['jvm'] },
   // RSpec (Ruby) — ``pending`` marks an example as not-yet-passing.
-  { kind: 'pending', re: /\bpending\b/ },
+  // Avoid false positives on string literals ("pending"), symbols (:pending),
+  // and identifiers containing "pending". Match only genuine RSpec calls:
+  // pending followed by space/paren/brace/do or end-of-line.
+  { kind: 'pending', re: /(?<!:)\bpending\b(?:\s|$|\(|\{|do\b)/, languages: ['ruby'] },
 ];
 
 // Whether a (trimmed) added line is a comment we should NOT scan for markers —
@@ -2311,8 +2535,9 @@ export interface DiscoverDisabledTestsInput {
  * Discover the test-skip / disable markers a PR NEWLY introduces. Scans ONLY the
  * added lines (``+`` lines) of changed TEST files, so pre-existing skips and
  * non-test files are ignored. Anchored, ecosystem-aware marker matching keeps
- * prose / comments from false-positiving. Pure — no filesystem access — so it is
- * directly unit-testable. Bounded to ``max`` markers.
+ * prose / comments from false-positiving. Language-scoped markers are only checked
+ * for languages matching the test file (e.g., RSpec 'pending' only in Ruby files).
+ * Pure — no filesystem access — so it is directly unit-testable. Bounded to ``max`` markers.
  */
 export function discoverNewlyDisabledTests(
   input: DiscoverDisabledTestsInput,
@@ -2327,11 +2552,18 @@ export function discoverNewlyDisabledTests(
     if (!Object.prototype.hasOwnProperty.call(input.addedLinesByFile, rel)) continue;
     const added = input.addedLinesByFile[rel];
     if (added.length === 0) continue;
+
+    // Detect the file's language(s) and filter markers accordingly.
+    const fileLanguages = detectTestLanguages(rel);
+
     for (const raw of added) {
       if (out.length >= max) break;
       const line = (raw || '').trim();
       if (!line || isCommentLine(line)) continue;
-      const hit = DISABLED_TEST_MARKERS.find(m => m.re.test(line));
+      // Only check markers whose language(s) match the file's detected language(s).
+      const hit = DISABLED_TEST_MARKERS.find(
+        m => m.languages.some(lang => fileLanguages.includes(lang)) && m.re.test(line),
+      );
       if (hit) out.push({ file: rel, marker: hit.kind, line });
     }
   }

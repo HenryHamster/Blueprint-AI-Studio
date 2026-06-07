@@ -71,8 +71,13 @@ export function DeploySection({
                 }`}>{deployState.status}</span>
               </div>
               <div>
-                <span className="text-[11px] text-neutral-500 block mb-1">SHA</span>
+                <span className="text-[11px] text-neutral-500 block mb-1">{deployState.rolled_back_from_sha ? 'Live SHA' : 'SHA'}</span>
                 <span className="text-sm text-neutral-300 font-mono">{deployState.current_sha?.slice(0, 8) || '\u2014'}</span>
+                {deployState.status === 'ROLLED_BACK' && deployState.rolled_back_from_sha && (
+                  <span className="text-[11px] text-red-400/80 font-mono block mt-0.5" title={deployState.rolled_back_from_sha}>
+                    rolled back from {deployState.rolled_back_from_sha.slice(0, 8)}
+                  </span>
+                )}
               </div>
               {(deployState.failure_rate ?? 0) > 0 && (
                 <div>
@@ -183,6 +188,16 @@ export function DeploySection({
                     {deployState.health_recovery_streak}/{deployState.health_recovery_streak_required ?? 3} healthy checks
                   </span>
                 </div>
+                {deployState.health_recovery_flap_escalated && (
+                  <p className="text-[11px] text-orange-400 bg-orange-950/20 rounded px-2 py-1 flex items-start gap-1.5">
+                    <Zap className="w-3 h-3 mt-0.5 shrink-0" />
+                    <span>
+                      Recovery bar raised to {deployState.health_recovery_streak_required ?? 3} because the
+                      pipeline has been flapping (repeated auto-pause/resume); the full recent probe history must
+                      pass before it auto-resumes.
+                    </span>
+                  </p>
+                )}
                 <div className="w-full bg-neutral-800 rounded-full h-2">
                   <div
                     className="bg-emerald-500 h-2 rounded-full transition-all duration-500"
@@ -208,7 +223,7 @@ export function DeploySection({
 
             {/* Action buttons */}
             <div className="flex gap-2 flex-wrap">
-              {deployState.status === 'PAUSED' || deployState.status === 'HALTED' ? (
+              {deployState.status === 'PAUSED' || deployState.status === 'HALTED' || deployState.status === 'ROLLED_BACK' ? (
                 <button onClick={onResumePipeline}
                   className="bg-emerald-950/30 hover:bg-emerald-900/40 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-emerald-900/50 flex items-center gap-1.5">
                   <Play className="w-3.5 h-3.5" /> Resume
@@ -219,7 +234,7 @@ export function DeploySection({
                   <Pause className="w-3.5 h-3.5" /> Pause
                 </button>
               )}
-              {deployState.status === 'MONITORING' && (
+              {(deployState.status === 'MONITORING' || deployState.status === 'ROLLED_BACK') && (
                 <button onClick={onMarkStable}
                   className="bg-neutral-800 hover:bg-neutral-700 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-1.5">
                   <CheckCircle className="w-3.5 h-3.5" /> Mark Stable
@@ -234,7 +249,7 @@ export function DeploySection({
               )}
               <button
                 onClick={() => { if (window.confirm('Rollback to last known good revision? This will pause the pipeline.')) onRollback(); }}
-                disabled={!deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha}
+                disabled={deployState.status === 'ROLLED_BACK' || !deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha}
                 className="bg-red-950/30 hover:bg-red-900/40 disabled:opacity-30 disabled:cursor-not-allowed text-red-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-red-900/50 flex items-center gap-1.5">
                 <RotateCw className="w-3.5 h-3.5" /> Rollback
               </button>

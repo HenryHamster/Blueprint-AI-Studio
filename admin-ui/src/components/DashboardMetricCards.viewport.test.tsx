@@ -29,7 +29,7 @@ const failureGroups: FailureGroup[] = [
 // Worst-case trends payload: high finding count, SR-alone + reviewer lift lines,
 // stale badge — the densest layout the card can produce.
 const trends = {
-  categories: { correctness: { current_human_count: 64 } },
+  categories: { correctness: { current_reviewer_finding_count: 64 } },
   previous_overall_hit_rate: 0.61,
   overall_trend_verdict: 'declining',
   overall_sr_alone_hit_rate: 0.55,

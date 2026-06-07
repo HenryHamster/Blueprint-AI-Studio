@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
+  clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
   patchAdminSettings,
@@ -20,6 +21,15 @@ import {
   type QualificationState,
 } from '../api';
 import { timeAgo } from '../utils/time';
+
+// Generate a client idempotency key for a version cut. Prefers the native UUID
+// generator and falls back to a timestamp+random token for older runtimes (and
+// JSDOM, where crypto.randomUUID may be absent). Mirrors MessagesPanel.
+function generateIdempotencyKey(): string {
+  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 const QUAL_VERDICT_COLOR: Record<string, string> = {
   pending: 'text-blue-400',
@@ -74,65 +84,163 @@ const FINDING_SEVERITY_STYLE: Record<string, string> = {
   low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
 };
 const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+
+// Operator-readable display state for an audit that carries no report yet,
+// derived once from the underlying audit task status. Mirrors the backend's
+// terminal-vs-non-terminal task-status notion so this never disagrees with the
+// qualification-state summary rendered above (which itself splits a bare
+// 'pending' into 'qualifying' / 'in flight'):
+//   - non-terminal (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) → still running
+//   - BLOCKED → waiting on a precondition, distinct from a crash
+//   - FAILED/CANCELLED (or unknown) → genuinely crashed, loud red affordance
+//   - COMPLETED with no report → finished-but-empty anomaly, not a crash
+type AuditNoReportKind = 'running' | 'blocked' | 'crashed' | 'completed_empty';
+
+const AUDIT_NO_REPORT_DISPLAY: Record<
+  AuditNoReportKind,
+  { label: string; className: string }
+> = {
+  running: {
+    label: 'audit running — no report yet',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+  blocked: {
+    label: 'audit blocked — waiting on a precondition',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+  crashed: {
+    label: 'audit crashed — no report',
+    className: 'bg-red-500/10 text-red-400 border-red-500/20',
+  },
+  completed_empty: {
+    label: 'audit completed without a report',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+};
+
+function classifyAuditNoReport(taskStatus: string | null | undefined): AuditNoReportKind {
+  switch ((taskStatus ?? '').toUpperCase()) {
+    case 'QUEUED':
+    case 'PROVISIONING':
+    case 'IN_PROGRESS':
+    case 'EVALUATING':
+      return 'running';
+    case 'BLOCKED':
+      return 'blocked';
+    case 'COMPLETED':
+      return 'completed_empty';
+    case 'FAILED':
+    case 'CANCELLED':
+    default:
+      return 'crashed';
+  }
+}
 const QUAL_STATE_STYLE: Record<string, string> = {
   qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
   promoted: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  // Promotion is merged but serving is not yet confirmed — provisional, amber.
+  promoted_unconfirmed: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // Promotion merged but the deploy never confirmed serving — loud red, NOT the
+  // clean green 'promoted' look.
+  promotion_deploy_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
 
-// Provenance + staleness header for the audit findings. Shows which commit the
-// audit ran against and how long ago, and flags when that commit differs from the
-// version's most-recently-evaluated candidate (currentCandidateSha) — i.e. the
-// integration branch advanced and some findings may already be fixed.
+// Distinct, operator-readable serving-confirmation badge for a promoted version.
+// Green = confirmed live; amber = still awaiting deploy confirmation; red = a
+// deploy that failed to stabilize (with the failure reason). Renders nothing
+// when there is no serving signal (e.g. a not-yet-promoted version).
+function ServingStatusBadge({
+  servingStatus,
+  servedSha,
+  servedAt,
+  deployFailureReason,
+}: {
+  servingStatus?: string | null;
+  servedSha?: string | null;
+  servedAt?: string | null;
+  deployFailureReason?: string | null;
+}) {
+  if (!servingStatus) return null;
+  if (servingStatus === 'serving_confirmed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="serving_confirmed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+        title="The promoted commit is confirmed serving in production."
+      >
+        ✓ serving confirmed
+        {servedSha && <span className="font-mono text-emerald-500/90">@{servedSha.slice(0, 7)}</span>}
+        {servedAt && <span className="text-emerald-600/90">{timeAgo(servedAt)}</span>}
+      </span>
+    );
+  }
+  if (servingStatus === 'deploy_failed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="deploy_failed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
+        title={deployFailureReason ?? 'The promoted deploy never confirmed serving in production.'}
+      >
+        ⚠ deploy failed — NOT serving
+        {deployFailureReason && (
+          <span className="font-normal text-red-300 truncate max-w-[200px]">{deployFailureReason}</span>
+        )}
+      </span>
+    );
+  }
+  if (servingStatus === 'unconfirmed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="unconfirmed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
+        title="Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window."
+      >
+        … awaiting deploy confirmation
+      </span>
+    );
+  }
+  return null;
+}
+
+// Provenance for scoped audit evidence. Shows which commit the audit ran
+// against and how long ago; the backend decides whether that evidence is
+// current or merely historical context for this candidate.
 function AuditProvenance({
   audit,
-  currentCandidateSha,
 }: {
   audit: LatestAudit;
-  currentCandidateSha?: string | null;
 }) {
-  const sha = audit.candidate_sha;
-  const isStale = !!(sha && currentCandidateSha && sha !== currentCandidateSha);
-  if (!sha && !audit.created_at) return null;
+  if (!audit.candidate_sha && !audit.created_at) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {sha && (
-        <span className="text-[10px] text-neutral-500 font-mono" title={sha}>
-          @{sha.slice(0, 7)}
+      {audit.candidate_sha && (
+        <span className="text-[10px] text-neutral-500 font-mono" title={audit.candidate_sha}>
+          @{audit.candidate_sha.slice(0, 7)}
         </span>
       )}
       {audit.created_at && (
         <span className="text-[10px] text-neutral-600">ran {timeAgo(audit.created_at)}</span>
       )}
-      {isStale && (
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-950/40 text-amber-400 border-amber-900/50"
-          title={`audit commit ${(sha ?? '').slice(0, 7)} differs from evaluated candidate ${(currentCandidateSha ?? '').slice(0, 7)}`}
-        >
-          findings from an older commit — branch advanced
-        </span>
-      )}
     </div>
   );
 }
 
-function AuditFindingsList({
-  audit,
-  currentCandidateSha,
-}: {
-  audit: LatestAudit;
-  currentCandidateSha?: string | null;
-}) {
+function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   if (!audit.report) {
+    const { label, className } = AUDIT_NO_REPORT_DISPLAY[classifyAuditNoReport(audit.task_status)];
     return (
       <div className="space-y-0.5">
-        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
-        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-          audit crashed — no report
+        <AuditProvenance audit={audit} />
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${className}`}>
+          {label}
         </span>
       </div>
     );
@@ -141,7 +249,7 @@ function AuditFindingsList({
   if (findings.length === 0) {
     return (
       <div className="space-y-0.5">
-        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <AuditProvenance audit={audit} />
         <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>
       </div>
     );
@@ -154,13 +262,25 @@ function AuditFindingsList({
   return (
     <div className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
-      <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+      <AuditProvenance audit={audit} />
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
           <span>{f.summary}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function HistoricalAuditContext({ audit }: { audit: LatestAudit }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+        no current audit for this candidate
+      </span>
+      <AuditProvenance audit={audit} />
     </div>
   );
 }
@@ -197,24 +317,61 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
 
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
-  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat, ground_truth_validated, validated_precision, resolved_outcome_sample } = readiness;
   const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
+  // Once promotion is live, this dry-run window is frozen pre-go-live history —
+  // it no longer receives verdicts, so it is NOT current readiness. Label it as a
+  // historical calibration window rather than presenting a stale 'ready' number.
+  const isHistoricalCalibration = readiness.is_current_readiness === false;
+  if (isHistoricalCalibration) {
+    return (
+      <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/30 text-neutral-400" title={reason}>
+          pre-go-live dry-run calibration (historical)
+        </span>
+        <p className="text-[10px] text-neutral-500 line-clamp-2">{reason}</p>
+        {verdicts_evaluated > 0 && (
+          <p className="text-[9px] text-neutral-600">
+            {verdicts_evaluated} pre-go-live dry-run{verdicts_evaluated !== 1 ? 's' : ''} · {consecutive_clean_passes} clean streak (frozen)
+          </p>
+        )}
+      </div>
+    );
+  }
+  // Determine the caveat text: use backend-provided caveat if available, otherwise default
+  const explanatoryCaveat = caveat ?? (ground_truth_validated ? 'validated against post-promotion outcomes' : 'self-approval only — no post-promotion outcome is recorded');
+  const hasValidatedPrecision = ground_truth_validated && validated_precision != null && (resolved_outcome_sample ?? 0) > 0;
+
   return (
     <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
       <div className="flex flex-wrap items-center gap-2">
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
-          {ready ? 'ready to promote' : 'not ready'}
+        <span
+          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
+          title={explanatoryCaveat}
+        >
+          {ready ? 'self-approval streak clears thresholds' : 'not ready'}
         </span>
         {verdicts_evaluated > 0 && (
           <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
         )}
         {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
+          <span className="text-[10px] text-neutral-500" title={explanatoryCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
+        )}
+        {hasValidatedPrecision && (
+          <span
+            className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+            title={`validated qualifier precision from ${resolved_outcome_sample} resolved promotion outcomes`}
+          >
+            {Math.round(validated_precision * 100)}% validated precision ({resolved_outcome_sample} resolved)
+          </span>
         )}
         {consecutive_clean_passes > 0 && (
           <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
         )}
       </div>
+      {ready && (
+        <p className="text-[9px] text-neutral-600 italic">{explanatoryCaveat}</p>
+      )}
       {!ready && reason && (
         <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
       )}
@@ -315,6 +472,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  // One idempotency key per confirmed cut: generated on confirm, reused across
+  // a lost-response retry, cleared on success so the next cut gets a fresh key.
+  const cutIdempotencyKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
@@ -337,6 +497,21 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const promotionEnabled = data.promotion_enabled ?? false;
   const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
+  // A promotion in flight (audit passed, promotion PR open and auto-merging)
+  // makes the qualify + phase-flip levers unsafe: re-qualifying clobbers the
+  // promotion-pending record and a phase flip clears the in-flight indication
+  // without cancelling anything. The backend refuses both with a 409; disable
+  // the controls here so the panel presents the same truth, consistent with how
+  // the cut lever already surfaces this state.
+  const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
+  // Admin-only lever: a promoted version latched to deploy_failed (current open
+  // version after promotion, or a recent promoted one) can be cleared once the
+  // deploy is verified or attested live. The backend endpoint is project-scoped
+  // and targets the latest promoted deploy_failed version.
+  const isAdmin = userRole === 'admin';
+  const hasDeployFailed = cv?.serving_status === 'deploy_failed'
+    || recent.some(v => v.serving_status === 'deploy_failed');
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
     if (!projectId) return;
@@ -454,14 +629,58 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     if (!window.confirm(msg)) return;
     setActionLoading('cut');
     setActionMsg(null);
+    if (!cutIdempotencyKeyRef.current) {
+      cutIdempotencyKeyRef.current = generateIdempotencyKey();
+    }
     try {
-      const result = await cutVersion(projectId, cutReason || undefined);
+      const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
       setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
       setCuttingVersion(false);
       setCutReason('');
+      cutIdempotencyKeyRef.current = null;
       onRefresh();
     } catch (error) {
       setActionMsg(error instanceof Error ? error.message : 'Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // Clear a stale post-promotion deploy_failed serving state. First attempts the
+  // verify path (no force) — the backend clears only if the promoted SHA is
+  // independently observed serving. If it refuses (live SHA unobservable), prompt
+  // for an attestation reason and retry the operator-attested force path.
+  const handleClearDeployFailed = async () => {
+    if (!projectId) return;
+    if (!window.confirm('Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.')) return;
+    setActionLoading('clear-deploy-failed');
+    setActionMsg(null);
+    try {
+      const result = await clearDeployFailed(projectId);
+      setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
+      onRefresh();
+    } catch (verifyError) {
+      const msg = verifyError instanceof Error ? verifyError.message : '';
+      // Only offer the attested override when the backend explicitly asked for it
+      // (the verify path could not confirm the deploy live).
+      if (!msg.includes('force=true')) {
+        setActionMsg(msg || 'Request failed');
+        setActionLoading(null);
+        return;
+      }
+      const reason = window.prompt('The deploy could not be independently verified live. To force-clear, enter an attestation reason (required):');
+      if (!reason || !reason.trim()) {
+        setActionMsg(msg);
+        setActionLoading(null);
+        return;
+      }
+      try {
+        const result = await clearDeployFailed(projectId, true, reason.trim());
+        setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
+        onRefresh();
+      } catch (forceError) {
+        setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
+      }
     } finally {
       setActionLoading(null);
     }
@@ -647,6 +866,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
+                  <ServingStatusBadge
+                    servingStatus={cv.serving_status ?? cv.qualification_state.serving_status}
+                    servedSha={cv.served_sha}
+                    servedAt={cv.served_at}
+                    deployFailureReason={cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                  />
                 </div>
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
               </div>
@@ -655,10 +880,23 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <QualSummary q={cv.last_qualification} />
+                  {cv.last_qualification.candidate_sha && (
+                    <span
+                      className="text-[10px] text-neutral-500 font-mono"
+                      title={cv.last_qualification.candidate_sha}
+                    >
+                      @{cv.last_qualification.candidate_sha.slice(0, 7)}
+                    </span>
+                  )}
                   {cv.last_qualification.finalized_at && (
                     <span className="text-[10px] text-neutral-600">as of {timeAgo(cv.last_qualification.finalized_at)}</span>
                   )}
                 </div>
+                {(cv.merged_since_verdict ?? 0) > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+                    {cv.merged_since_verdict} task{cv.merged_since_verdict === 1 ? '' : 's'} merged since this verdict — re-qualify for current state
+                  </span>
+                )}
                 {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
                   <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
                     {cv.last_qualification.sub_scores && (
@@ -700,12 +938,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 )}
               </div>
             )}
-            {cv.latest_audit && (
+            {auditEvidenceState === 'current' && cv.latest_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <AuditFindingsList
-                  audit={cv.latest_audit}
-                  currentCandidateSha={cv.last_qualification?.candidate_sha}
-                />
+                <AuditFindingsList audit={cv.latest_audit} />
+              </div>
+            )}
+            {auditEvidenceState === 'stale' && cv.stale_audit && (
+              <div className="pl-2 border-l border-neutral-700/50">
+                <HistoricalAuditContext audit={cv.stale_audit} />
               </div>
             )}
             {projectId && (
@@ -713,7 +953,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'build' ? (
                   <button
                     onClick={() => handleSetPhase('stabilize')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
@@ -721,7 +962,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 ) : (
                   <button
                     onClick={() => handleSetPhase('build')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
@@ -730,11 +972,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'stabilize' && (
                   <button
                     onClick={handleQualify}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
+                )}
+                {promotionInFlight && (
+                  <span data-testid="promotion-in-flight-note" className="text-[10px] text-emerald-300 italic">
+                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging — qualify & phase locked until it lands or is canceled
+                  </span>
                 )}
                 {cuttingVersion ? (
                   <div className="flex flex-col gap-1 w-full">
@@ -782,6 +1030,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     Cut/Abandon
                   </button>
                 )}
+                {isAdmin && hasDeployFailed && (
+                  <button
+                    data-testid="clear-deploy-failed"
+                    onClick={handleClearDeployFailed}
+                    disabled={actionLoading !== null}
+                    title="Clear a stale post-promotion deploy-failed serving state once the deploy is verified or attested live"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'clear-deploy-failed' ? '…' : 'Clear deploy-failed'}
+                  </button>
+                )}
                 {actionMsg && (
                   <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
                 )}
@@ -805,6 +1064,24 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
                   {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                   {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                  {v.post_promotion_outcome && (
+                    <span
+                      className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
+                        v.post_promotion_outcome === 'serving_confirmed'
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                          : v.post_promotion_outcome === 'deploy_failed'
+                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                      }`}
+                      title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
+                    >
+                      {v.post_promotion_outcome === 'serving_confirmed'
+                        ? '✓ serving'
+                        : v.post_promotion_outcome === 'deploy_failed'
+                          ? '⚠ deploy failed'
+                          : 'unconfirmed'}
+                    </span>
+                  )}
                   <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
                   {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
                 </div>
@@ -820,6 +1097,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
                   <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
                   <span className="text-neutral-500">{v.status}</span>
+                  <ServingStatusBadge
+                    servingStatus={v.serving_status ?? v.qualification_state?.serving_status}
+                    servedSha={v.served_sha}
+                    servedAt={v.served_at}
+                    deployFailureReason={v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                  />
                   <QualSummary q={v.last_qualification} />
                   {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
                     <span className="text-neutral-400">

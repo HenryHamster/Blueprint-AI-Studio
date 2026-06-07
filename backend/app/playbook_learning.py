@@ -68,7 +68,6 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _compute_cat_fp_stats,
     _compute_cat_severity_calibration,
     _compute_edges_stats,
-    _compute_execution_evidence_miss_rates,
     _compute_miss_latency_stats,
     _compute_reasoning_engagement,
     _format_sr_alert_title,
@@ -76,7 +75,6 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _partition_edges_by_origin,
     _percentile,
     _reviewer_caught_author_miss,
-    _score_reasoning_quality,
     _sr_skip_stats,
     _stats_for_tasks,
     _task_prompt_fingerprint,
@@ -210,7 +208,6 @@ from app.review_learning import (  # noqa: E402,F401
     compute_recurring_first_review_descriptions,
     compute_review_effectiveness,
     extract_review_feedback_to_playbook,
-    resolve_sr_miss_human_truth,
 )
 
 

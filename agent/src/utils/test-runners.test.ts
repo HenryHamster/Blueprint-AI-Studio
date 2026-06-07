@@ -18,6 +18,7 @@ import {
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
@@ -1641,7 +1642,31 @@ describe('classifyTestExecution — all-skipped (no real tests executed)', () =>
     )).toBe('all_skipped');
   });
 
+  it('Mocha all-pending (passing == 0, pending == total) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '0 passing\n5 pending\n0 failing',
+    )).toBe('all_skipped');
+  });
+
+  it('Mocha all-pending on one line (0 passing, 5 pending) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '0 passing (5ms), 5 pending',
+    )).toBe('all_skipped');
+  });
+
   // ── Conservative invariant: any real pass/fail keeps it a real 'ran' ──
+  it('Mocha mixed pass-with-pending ("5 passing, 1500 pending") → ran', () => {
+    expect(classifyTestExecution(
+      '5 passing (120ms)\n1500 pending\n0 failing',
+    )).toBe('ran');
+  });
+
+  it('Mocha with failure ("2 passing, 3 pending, 1 failing") → ran', () => {
+    expect(classifyTestExecution(
+      '2 passing (45ms)\n3 pending\n1 failing',
+    )).toBe('ran');
+  });
+
   it('pytest mixed pass-with-skips ("5 passed, 1500 skipped") → ran', () => {
     expect(classifyTestExecution(
       '===== 5 passed, 1500 skipped in 4.20s =====',
@@ -1766,6 +1791,30 @@ describe('extractTestCoverage — pass/skip/total parsing', () => {
   });
 
   describe('aggregate families (single summary line)', () => {
+    it('Mocha passing/pending/failing → passed + pending + failing = total', () => {
+      expect(extractTestCoverage('5 passing (120ms)\n3 pending\n0 failing')).toEqual({
+        passed: 5, skipped: 3, total: 8,
+      });
+    });
+
+    it('Mocha all-pending (0 passing, 5 pending, 0 failing)', () => {
+      expect(extractTestCoverage('0 passing\n5 pending\n0 failing')).toEqual({
+        passed: 0, skipped: 5, total: 5,
+      });
+    });
+
+    it('Mocha with failures (3 passing, 2 pending, 1 failing)', () => {
+      expect(extractTestCoverage('3 passing\n2 pending\n1 failing')).toEqual({
+        passed: 3, skipped: 2, total: 6,
+      });
+    });
+
+    it('Mocha on single line "5 passing (125ms), 3 pending"', () => {
+      expect(extractTestCoverage('5 passing (125ms), 3 pending, 0 failing')).toEqual({
+        passed: 5, skipped: 3, total: 8,
+      });
+    });
+
     it('RSpec examples/pending → derives passed from total', () => {
       expect(extractTestCoverage('5 examples, 0 failures, 3 pending')).toEqual({
         passed: 2, skipped: 3, total: 5,
@@ -1843,6 +1892,18 @@ describe('extractTestCoverage — pass/skip/total parsing', () => {
 
     it('Go non-verbose pass (no counts) → null', () => {
       expect(extractTestCoverage('ok  example.com/pkg 0.5s')).toBeNull();
+    });
+
+    it('Mocha only passing (no pending token) → null', () => {
+      expect(extractTestCoverage('5 passing')).toBeNull();
+    });
+
+    it('Mocha only pending (no passing token) → null', () => {
+      expect(extractTestCoverage('3 pending')).toBeNull();
+    });
+
+    it('Mocha zero total (0 passing, 0 pending) → null', () => {
+      expect(extractTestCoverage('0 passing\n0 pending')).toBeNull();
     });
 
     it('inconsistent aggregate (skipped > total) → null', () => {
@@ -2915,5 +2976,312 @@ describe('discoverNewlyDisabledTests', () => {
       addedLinesByFile: { 'src/app.ts': ['it.skip("x")'] },
     });
     expect(markers).toHaveLength(0);
+  });
+
+  it('detects RSpec pending as a skip marker but not as a string/symbol/identifier', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/app_spec.rb'],
+      addedLinesByFile: {
+        'spec/app_spec.rb': [
+          'pending',
+          'pending "not implemented"',
+          'pending { some_code }',
+          'pending do',
+          'status = :pending',
+          'message = "pending"',
+          'let(:pending_case) { helper }',
+          'pending_items = []',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(4);
+    expect(markers.map(m => m.line)).toEqual([
+      'pending',
+      'pending "not implemented"',
+      'pending { some_code }',
+      'pending do',
+    ]);
+  });
+
+  it('does not false-positive on benign Ruby code containing the word pending', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/test_spec.rb'],
+      addedLinesByFile: {
+        'spec/test_spec.rb': [
+          'expect(status).to eq("pending")',
+          'expect(status).to eq(:pending)',
+          "{ pending: false }",
+          "{ pending: true }",
+          "let(:pending_task) { Task.new }",
+          'result = thing.pending?',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('detects pending as skip in RSpec examples but avoids hash literals and symbols', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/helpers_spec.rb'],
+      addedLinesByFile: {
+        'spec/helpers_spec.rb': [
+          'it "does something" do',
+          '  pending',
+          'end',
+          'it "another" do',
+          '  pending("reason for skip")',
+          'end',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(2);
+    expect(markers.map(m => m.marker)).toEqual(['pending', 'pending']);
+  });
+
+  // ─── Language-scoped marker tests: RSpec 'pending' only in Ruby files ────────
+
+  it('RSpec pending marker is scoped to Ruby files — Python test_pending.py adding "pending = []" yields zero markers', () => {
+    // The RSpec 'pending' marker matches the word "pending" with word boundaries,
+    // but it should ONLY fire for Ruby/RSpec files, not Python files with
+    // legitimate variable names like "pending = []".
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_pending.py'],
+      addedLinesByFile: {
+        'test_pending.py': [
+          'pending = []',
+          'pending.append(task)',
+          'return pending',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('RSpec pending marker is scoped to Ruby files — JS test.js adding "pending = []" yields zero markers', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['pending.test.js'],
+      addedLinesByFile: {
+        'pending.test.js': [
+          'let pending = [];',
+          'const pending = [1, 2];',
+          'pending.push(item);',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('RSpec pending marker is scoped to Ruby files — Go test adds "pending" identifier without affecting marker detection', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['util_test.go'],
+      addedLinesByFile: {
+        'util_test.go': [
+          'pending := []Task{}',
+          'pending = append(pending, task)',
+          'self.pending()',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Language-scoped marker tests: Go t.Skip() only in Go files ──────────────
+
+  it('Go t.Skip() marker is scoped to Go files — JS test.js adding .Skip() call yields zero markers', () => {
+    // The Go marker matches `<identifier>.Skip(`, but it should ONLY fire for Go
+    // files, not JS/TS files that may have legitimate .Skip() method calls.
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['skip.test.js'],
+      addedLinesByFile: {
+        'skip.test.js': [
+          'queue.Skip()',
+          'runner.Skip(message)',
+          'this.Skip()',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('Go t.Skip() marker is scoped to Go files — Python test file adding .Skip() call yields zero markers', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_runner.py'],
+      addedLinesByFile: {
+        'test_runner.py': [
+          'obj.Skip()',
+          'self.Skip("reason")',
+          'queue.Skip()',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Language-scoped marker tests: @Disabled/@Ignore only in JVM files ──────
+
+  it('JUnit @Disabled marker is scoped to JVM files — JS/TS test file should not detect @Disabled', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['utils.test.ts'],
+      addedLinesByFile: {
+        'utils.test.ts': [
+          '@Disabled',
+          '@Ignore',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Language-scoped marker tests: Rust #[ignore] only in Rust files ────────
+
+  it('Rust #[ignore] marker is scoped to Rust files — JS test file should not detect #[ignore]', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['utils.test.js'],
+      addedLinesByFile: {
+        'utils.test.js': [
+          '#[ignore]',
+          '#[ignore = "slow"]',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Language-scoped marker tests: Python @pytest only in Python files ───────
+
+  it('Python @pytest.mark.skip marker is scoped to Python files — JS test file should not detect @pytest decorators', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['async.test.js'],
+      addedLinesByFile: {
+        'async.test.js': [
+          '@pytest.mark.skip',
+          '@pytest.mark.skipif(condition)',
+          '@unittest.skip("reason")',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Language-scoped marker tests: JS/TS markers only in JS/TS files ─────────
+
+  it('JS/TS it.skip marker is scoped to JS/TS files — Python test file should not detect it.skip', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_module.py'],
+      addedLinesByFile: {
+        'test_module.py': [
+          'it.skip',
+          'describe.skip',
+          'test.skip',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  // ─── Cross-language scenario: multilanguage detection ─────────────────────────
+
+  it('correctly detects markers in mixed-language changes — Python and JS', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_app.py', 'app.test.js'],
+      addedLinesByFile: {
+        'test_app.py': [
+          '@pytest.mark.skip("broken")',
+          'pending = []',  // not a Python marker
+        ],
+        'app.test.js': [
+          'it.skip("flaky", () => {})',
+          '@pytest.mark.skip',  // not a JS/TS marker
+        ],
+      },
+    });
+    expect(markers).toHaveLength(2);
+    expect(markers[0]).toEqual({
+      file: 'test_app.py',
+      marker: '@pytest.mark.skip',
+      line: '@pytest.mark.skip("broken")',
+    });
+    expect(markers[1]).toEqual({
+      file: 'app.test.js',
+      marker: 'it.skip',
+      line: 'it.skip("flaky", () => {})',
+    });
+  });
+
+  it('correctly detects markers in Go, Rust, and JVM files with language scoping', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['handler_test.go', 'lib_test.rs', 'AppTest.java'],
+      addedLinesByFile: {
+        'handler_test.go': ['t.Skip("not yet")'],
+        'lib_test.rs': ['#[ignore]'],
+        'AppTest.java': ['@Disabled', '@Ignore'],
+      },
+    });
+    expect(markers).toHaveLength(4);
+    expect(markers.map(m => m.marker).sort()).toEqual(
+      ['#[ignore]', '@Disabled', '@Ignore', 't.Skip()'].sort(),
+    );
+  });
+});
+
+describe('buildAcceptanceTestRunner — targeted declared acceptance test', () => {
+  const PYTEST_RUNNER: TestRunner = {
+    cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'],
+    cwd: '/tmp/workspace/backend', label: 'pytest (backend)',
+  };
+
+  it('targets a pytest node-id selector against a detected pytest runner', () => {
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'the seam test', selector: 'testing/test_seam.py::test_blocks' },
+      [PYTEST_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    // The selector is appended to the pytest argv (cwd ends in /backend, so the
+    // testing/ prefix is normalized for a backend-run pytest).
+    expect(runner?.args).toContain('testing/test_seam.py::test_blocks');
+    expect(runner?.cmd).toBe('python3');
+  });
+
+  it('falls back to descriptor when no selector is given but descriptor is a pytest path', () => {
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'testing/test_seam.py::test_x' },
+      [PYTEST_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    expect(runner?.args).toContain('testing/test_seam.py::test_x');
+  });
+
+  it('returns null for a non-pytest / prose descriptor (not targetable)', () => {
+    expect(
+      buildAcceptanceTestRunner({ descriptor: 'the dashboard renders the new column' }, [PYTEST_RUNNER]),
+    ).toBeNull();
+  });
+
+  it('returns null when no detected runner accepts pytest selectors', () => {
+    const goRunner: TestRunner = { cmd: 'go', args: ['test', './...'], cwd: '/tmp/workspace', label: 'go test' };
+    expect(
+      buildAcceptanceTestRunner({ descriptor: 'x', selector: 'testing/test_seam.py::test_x' }, [goRunner]),
+    ).toBeNull();
+  });
+
+  it('returns null for an empty selector/descriptor', () => {
+    expect(buildAcceptanceTestRunner({ descriptor: '   ' }, [PYTEST_RUNNER])).toBeNull();
+  });
+});
+
+describe('classifyAcceptanceTestRun — ran / skipped / absent', () => {
+  it('maps a real execution to ran', () => {
+    expect(classifyAcceptanceTestRun('collected 1 item\n1 passed in 0.10s')).toBe('ran');
+    // A failing-but-executed test still counts as ran (the suite gate owns pass/fail).
+    expect(classifyAcceptanceTestRun('FAILED testing/test_seam.py::test_x\n1 failed in 0.2s')).toBe('ran');
+  });
+
+  it('maps an all-skipped run to skipped', () => {
+    expect(classifyAcceptanceTestRun('collected 1 item\n1 skipped in 0.01s')).toBe('skipped');
+  });
+
+  it('maps a zero-collection / not-found run to absent', () => {
+    expect(classifyAcceptanceTestRun('no tests ran in 0.01s')).toBe('absent');
+    expect(classifyAcceptanceTestRun('collected 0 items')).toBe('absent');
   });
 });

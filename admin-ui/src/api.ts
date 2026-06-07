@@ -942,24 +942,53 @@ export interface LlmCostModelRow {
   share_of_total_cost: number | null;
   task_count: number;
   llm_call_count: number;
+  /** Count of tasks in this bucket that landed/merged on the integration branch. */
+  merged_count: number;
+  /** merged_count / task_count, or null when the bucket has no tasks. */
+  merge_rate: number | null;
+  /** Count of tasks in this bucket that landed and were verified (not fall-open degraded). */
+  verified_merged_count: number;
+  /** verified_merged_count / task_count, or null when the bucket has no tasks. */
+  verified_merge_rate: number | null;
   priced: boolean;
+  /** True when this (provider, model) is priced at a proxy rate (closest GA equivalent) rather than exact published pricing. */
+  approximate_priced: boolean;
+  /**
+   * cost_usd / verified_merged_count, present only when the bucket is fully
+   * priced AND has at least one verified merge. Null for unpriced (understated
+   * cost) or zero-verified-merge buckets so the panel never shows a
+   * misleading/divide-by-zero figure.
+   */
+  cost_per_merge: number | null;
 }
 
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
-  by_provider: Array<Omit<LlmCostModelRow, 'model' | 'priced'>>;
+  by_provider: Array<Omit<LlmCostModelRow, 'model'>>;
   by_model: LlmCostModelRow[];
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cost_usd: number;
     task_count: number;
+    merged_count: number;
+    merge_rate: number | null;
+    verified_merged_count: number;
+    verified_merge_rate: number | null;
     priced_task_count: number;
     unpriced_task_count: number;
     unpriced_coverage_fraction: number | null;
+    /** Tasks whose runtime selection fell back to a provider/model other than
+     * the intended routing — their spend is folded into the resolved model's
+     * bucket, so by-model attribution is not purely the configured routing. */
+    fallback_task_count: number;
+    /** Dollar spend attributable to the fallback tasks above. */
+    fallback_cost_usd: number;
   };
   unpriced_combos: string[];
+  /** (provider, model) combos priced at a proxy rate (no separately published API rate). */
+  approximate_priced_combos: string[];
 }
 
 export async function fetchLlmCostBreakdown(
@@ -1049,6 +1078,13 @@ export interface QualificationState {
   promotion_pr_url?: string | null;
   error?: string | null;
   blocker?: string | null;
+  // Post-promotion serving confirmation. A 'promoted' state is provisional:
+  // serving_status is 'unconfirmed' while the deploy is still within its
+  // confirmation window, 'serving_confirmed' once the promoted SHA is live, or
+  // 'deploy_failed' (state becomes 'promotion_deploy_failed') when the deploy
+  // never stabilized. deploy_failure_reason carries the failure detail.
+  serving_status?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface CurrentVersion {
@@ -1063,12 +1099,31 @@ export interface CurrentVersion {
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Tasks merged at/after the last qualification verdict's finalized_at — a
+   *  verdict-staleness signal. >0 means work landed since the verdict was
+   *  computed, so the displayed confidence no longer reflects the current tree.
+   *  null when there is no verdict or no parseable finalized_at. */
+  merged_since_verdict?: number | null;
   /** Non-terminal tasks still in flight against this version. A version cut does
    *  not stop them — they continue and land against the freshly-opened version. */
   in_flight_task_count?: number;
   qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
+  // Version-scoped audit evidence for the open candidate. `latest_audit` is
+  // current only when audit_evidence_state='current'; `stale_audit` carries
+  // historical provenance when the newest scoped audit belongs to an older
+  // candidate, and 'none' means this candidate has no scoped audit evidence yet.
+  audit_evidence_state?: 'current' | 'stale' | 'none';
+  stale_audit?: LatestAudit | null;
+  // Post-promotion serving confirmation (additive). serving_status is one of
+  // 'unconfirmed' | 'serving_confirmed' | 'deploy_failed'; served_sha/served_at
+  // record the confirmed-serving commit, and deploy_failure_reason the detail
+  // when the deploy never stabilized.
+  serving_status?: string | null;
+  served_sha?: string | null;
+  served_at?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface RecentVersion {
@@ -1081,6 +1136,12 @@ export interface RecentVersion {
   abandoned_at?: string | null;
   abandoned_by?: string | null;
   abandon_reason?: string | null;
+  // Post-promotion serving confirmation (additive) — see CurrentVersion.
+  qualification_state?: QualificationState | null;
+  serving_status?: string | null;
+  served_sha?: string | null;
+  served_at?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1102,6 +1163,25 @@ export interface PromotionReadiness {
   recurring_blockers: Record<string, number>;
   blocker_counts: Record<string, number>;
   thresholds: Record<string, number>;
+  // True when ground truth is validated (sufficient resolved-outcome sample exists);
+  // false otherwise. When true, `validated_precision`, `serving_confirmed_count`,
+  // `deploy_failed_count`, and `resolved_outcome_sample` are populated.
+  ground_truth_validated?: boolean;
+  caveat?: string;
+  // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
+  // *current* readiness only pre-go-live. Once promotion is effectively enabled
+  // the window is frozen pre-go-live history: regime='live', is_current_readiness=false.
+  regime?: 'pre_go_live_calibration' | 'live';
+  is_current_readiness?: boolean;
+  promotion_enabled?: boolean;
+  // Ground-truth-validated qualifier precision (when validated_precision is non-null).
+  validated_precision?: number | null;
+  // Number of promotion outcomes resolved (served or failed) used to derive validated_precision.
+  resolved_outcome_sample?: number;
+  // Number of promoted verdicts that were confirmed serving (contributing to validated_precision).
+  serving_confirmed_count?: number;
+  // Number of promoted verdicts whose deploy failed without stabilizing (contributing to validated_precision).
+  deploy_failed_count?: number;
 }
 
 export interface StagedDirection {
@@ -1209,14 +1289,57 @@ export interface CutVersionResponse {
 export async function cutVersion(
   projectId: string,
   reason?: string,
+  idempotencyKey?: string,
 ): Promise<CutVersionResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-cut`, {
     method: 'POST',
-    body: JSON.stringify({ reason: reason ?? '' }),
+    body: JSON.stringify({
+      reason: reason ?? '',
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+    }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const detail = data?.detail || data?.error?.message || `Failed to cut version: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+export interface ClearDeployFailedResponse {
+  version_number: number;
+  serving_status: string | null;
+  served_sha: string | null;
+  served_at: string | null;
+  deploy_failure_reason: string | null;
+  clear_mode: 'verified' | 'operator_attested';
+  operator_attested: boolean;
+  attestation_reason: string | null;
+}
+
+// Clear a stale post-promotion deploy_failed serving state. Without `force`, the
+// backend only clears when the promoted SHA is independently observed serving;
+// with `force` + a `reason` it records an operator-attested clear (used in the
+// interim where the live serving SHA is unobservable).
+export async function clearDeployFailed(
+  projectId: string,
+  force?: boolean,
+  reason?: string,
+): Promise<ClearDeployFailedResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/clear-deploy-failed`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(force ? { force: true } : {}),
+        ...(reason ? { reason } : {}),
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail =
+      data?.detail || data?.error?.message || `Failed to clear deploy-failed: ${res.status}`;
     throw new Error(detail);
   }
   return data;
@@ -1266,6 +1389,10 @@ export interface QualificationVerdictRecord {
   started_at: string | null;
   finalized_at: string | null;
   created_at: string;
+  // How this verdict's promotion actually played out in production:
+  // 'serving_confirmed' | 'deploy_failed' | 'unconfirmed' (null until recorded).
+  post_promotion_outcome?: string | null;
+  post_promotion_outcome_at?: string | null;
 }
 
 export interface QualificationVerdictsInfraContext {
@@ -1881,6 +2008,10 @@ export interface StrategicRefreshMarker {
   reason?: string;
   origin?: string;
   count?: number;
+  /** Coalesced operator-steering requests only (excludes automated qualification/promotion
+   *  refreshes). The UI badge uses this for the '+N steers coalesced' label so the count
+   *  reflects genuine human steers, not system-triggered refreshes. */
+  operator_count?: number;
   excerpt?: string;
   /** Timestamp when a prior marker was consumed by the strategic loop (receipt field). */
   last_fired_at?: string;

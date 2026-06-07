@@ -55,7 +55,6 @@ from app.sr_analytics_common import (  # noqa: F401
     _collect_prompt_versions,
     _compute_cat_fp_stats,
     _compute_cat_severity_calibration,
-    _compute_execution_evidence_miss_rates,
     _compute_miss_latency_stats,
     _compute_reasoning_engagement,
     _finalize_examples,
@@ -63,7 +62,6 @@ from app.sr_analytics_common import (  # noqa: F401
     _is_sensitive_desc,
     _is_trend_significant,
     _percentile,
-    _score_reasoning_quality,
     _sr_skip_stats,
     _task_prompt_fingerprint,
 )

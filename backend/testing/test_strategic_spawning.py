@@ -34,6 +34,7 @@ from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
     _spawn_strategic_review,
+    _direction_activity_score,
     _build_operator_steering_directive,
     _build_shipped_changes_manifest,
     _build_recent_interventions,
@@ -41,11 +42,13 @@ from app.strategic_spawning import (
     _AGENT_VIEW_FLOOR_BYTES,
     _FLOOR_MIN_GAPS,
     _STRATEGIC_REVIEW_SCHEMA,
+    _DESIGN_DOC_UPDATE_SCHEMA,
     _design_doc_index,
     _summarize_design_doc_index,
     _DESIGN_DOC_INDEX_SUMMARY_CHARS,
 )
-from app.payload_schemas import pack_under_budget
+from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -516,6 +519,143 @@ async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
     payload = result.scalars().all()[0].payloads[0]
 
     assert "operator_overrides" not in payload
+
+
+# ── knowledge_index in strategic payloads ───────────────────────────────────
+
+
+async def _seed_knowledge_doc(session, project, *, title="KDoc", direction_id=None):
+    """Persist one KnowledgeDocument for the project (FK source_task_id needs a task)."""
+    from app.models import KnowledgeDocument
+
+    task = Task(
+        project_id=project.id,
+        title="src",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "web_research", "topic": "t", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        title=title,
+        summary="A prior knowledge summary.",
+        body="# Body\n\n" + ("x" * 50),
+        topic="auth",
+        direction_id=direction_id,
+        source_kind="web_research",
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+def test_knowledge_index_registered_in_both_schemas():
+    """The packer must know about knowledge_index so it never warns / drops it
+    as an unregistered key."""
+    assert "knowledge_index" in _STRATEGIC_REVIEW_SCHEMA
+    assert "knowledge_index" in _DESIGN_DOC_UPDATE_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session):
+    """strategic_review carries the compact, body-omitted knowledge index when
+    the project has knowledge documents."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_knowledge_doc(db_session, project, title="Prior research")
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+
+    assert "knowledge_index" in payload
+    entry = payload["knowledge_index"][0]
+    assert entry["title"] == "Prior research"
+    assert "body" not in entry
+    assert set(entry.keys()) == {
+        "id",
+        "title",
+        "summary",
+        "topic",
+        "direction_id",
+        "source_kind",
+        "created_at",
+    }
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_knowledge_index_when_none(db_session):
+    """strategic_review omits knowledge_index entirely when no documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "knowledge_index" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_includes_knowledge_index_when_docs_exist(
+    db_session,
+):
+    """design_doc_update carries the knowledge index when documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_knowledge_doc(db_session, project, title="Design knowledge")
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "design_doc_update"
+    )
+    assert "knowledge_index" in payload
+    assert payload["knowledge_index"][0]["title"] == "Design knowledge"
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_omits_knowledge_index_when_none(db_session):
+    """design_doc_update omits knowledge_index entirely when no documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "design_doc_update"
+    )
+    assert "knowledge_index" not in payload
 
 
 # ── operator_rejection_rate in _spawn_strategic_review ────────────────────────
@@ -4318,6 +4458,144 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
         f"Trimmed list must include directions_summary; meta={meta}"
     )
 
+    # Trim-proof anchor: even though directions_summary was trimmed to <=12, the
+    # authoritative direction_counts + max ceiling must carry the TRUE active
+    # count (50) so the agent views never under-report or render false-empty.
+    assert "direction_counts" in payload, (
+        "Authoritative direction_counts must survive budget pressure"
+    )
+    assert payload["direction_counts"]["active"] == 50, (
+        f"direction_counts.active must be the true pre-trim count, got "
+        f"{payload['direction_counts']['active']}"
+    )
+    assert payload["direction_counts"]["total"] == 50
+    assert "max_active_directions" in payload, (
+        "max_active ceiling must reach the agent (no hardcoded fallback)"
+    )
+    assert payload["direction_counts"]["max_active"] == payload["max_active_directions"]
+    # Neither anchor key was trimmed or dropped — they are critical-tier.
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    assert "direction_counts" not in trimmed_keys | dropped_keys
+    assert "max_active_directions" not in trimmed_keys | dropped_keys
+
+
+@pytest.mark.asyncio
+async def test_direction_counts_by_system_survives_directions_summary_trim(db_session):
+    """The authoritative per-system ACTIVE map (direction_counts.by_system) is
+    computed from the FULL direction set before packing, so it stays correct and
+    complete even when directions_summary is trimmed under byte-budget pressure.
+    This is what keeps the agent's per-system coverage-gap and concentration
+    signals truthful when the per-direction detail list is trimmed."""
+    import json as _json
+    from app.payload_schemas import _MAX_PAYLOAD_BYTES
+
+    # 50 active directions spread across 3 systems (plus a few with no system_id
+    # which must NOT contribute to the map), all bulky enough to force a trim.
+    systems = ["sys-a", "sys-b", "sys-c"]
+    directions = []
+    for i in range(50):
+        d = {
+            "id": f"d-sys{i:02d}",
+            "status": "active",
+            "text": f"Direction {i} " + ("filler text " * 30),
+            "priority": "medium",
+            "research_history": [
+                {
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                    "tasks_created": 1,
+                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "failed_task_details": [],
+                    "timestamp": "2026-04-01T00:00:00Z",
+                }
+                for _ in range(8)
+            ],
+            "research_context": "context narrative " * 200,
+        }
+        # Last 5 directions intentionally carry no system_id.
+        if i < 45:
+            d["system_id"] = systems[i % 3]
+        directions.append(d)
+
+    # Expected per-system active tally from the FULL set: 45 directions round
+    # -robin across 3 systems → 15 each; the 5 system-less ones contribute 0.
+    expected_by_system = {"sys-a": 15, "sys-b": 15, "sys-c": 15}
+
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "per-system trim-proofing test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # Payload must fit under the hard cap and the detail list must have trimmed.
+    serialized_size = len(_json.dumps(payload, default=str).encode())
+    assert serialized_size < _MAX_PAYLOAD_BYTES
+    assert len(payload["directions_summary"]) <= 12, (
+        "directions_summary must be trimmed for this test to be meaningful"
+    )
+    meta = payload["_packer_meta"]
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    assert "directions_summary" in trimmed_keys
+
+    # The per-system map is nested under the critical direction_counts field and
+    # reflects the FULL active set (15/15/15), NOT the ≤12 trimmed shipped rows.
+    by_system = payload["direction_counts"]["by_system"]
+    assert by_system == expected_by_system, (
+        f"by_system must be the true pre-trim per-system tally, got {by_system}"
+    )
+    assert sum(by_system.values()) == 45, (
+        "system-less directions must not contribute to the per-system map"
+    )
+    # Inherits direction_counts' critical tier — never trimmed or dropped.
+    assert "direction_counts" not in trimmed_keys | dropped_keys
+
+
+@pytest.mark.asyncio
+async def test_direction_counts_survive_problem_model_floor_pressure(db_session):
+    """Authoritative direction_counts survive even when a huge floor-reserved
+    problem_model drops directions_summary entirely.
+
+    The problem_model has a packer floor reservation; under a tiny byte budget it
+    consumes the budget and directions_summary is dropped wholesale. The critical
+    direction_counts + max_active_directions anchor must still ship verbatim."""
+    schema = _STRATEGIC_REVIEW_SCHEMA
+    raw = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "P",
+        "base_branch": "main",
+        "enable_self_improvement": False,
+        "vision": {"purpose": "x"},
+        "problem_model": {"gaps": [{"id": f"g{i}", "d": "y" * 200} for i in range(40)]},
+        "direction_counts": {"active": 7, "paused": 2, "total": 9, "max_active": 15},
+        "max_active_directions": 15,
+        "directions_summary": [
+            {"id": f"d{i}", "status": "active", "text": "z" * 200} for i in range(20)
+        ],
+    }
+    # Tiny budget: forces directions_summary to drop, problem_model to degrade.
+    packed = pack_under_budget(raw, schema, budget=2000)
+    assert packed["direction_counts"]["active"] == 7, (
+        "direction_counts must ship verbatim under maximum budget pressure"
+    )
+    assert packed["max_active_directions"] == 15
+    meta = packed["_packer_meta"]
+    affected = {e["key"] for e in meta["trimmed"]} | {e["key"] for e in meta["dropped"]}
+    assert "direction_counts" not in affected
+    assert "max_active_directions" not in affected
+    # The detail list is legitimately droppable; only the counts are trim-proof.
+    assert "directions_summary" not in packed or len(packed["directions_summary"]) < 20
+
 
 @pytest.mark.asyncio
 async def test_drift_signals_survives_budget_pressure(db_session):
@@ -5546,6 +5824,293 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
     suffix = payload.get("prompt_suffix", "")
     assert "Version handoff" not in suffix, (
         f"v1 has no prior promotion; handoff hint must not fire. Got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_renders_after_next_version_qualification_started(
+    db_session, mocker, _lts_split_active
+):
+    """Failed-deploy directive must keep rendering even after the next version
+    has begun qualification — until a subsequent version is promoted and confirmed
+    serving. This ensures the recovery priority remains visible to the strategist
+    even when the next version is building/qualifying."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # v1: promoted but deployment failed
+    prior_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="Cloud Run deployment timed out",
+    )
+    db_session.add(prior_version)
+    # v2: open and already started qualification (condition that used to clear handoff)
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "not_promoted", "confidence": 0.75},
+        qualification_attempts=1,  # Has started qualifying
+    )
+    db_session.add(current_version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    # The post-promotion handoff must have self-cleared (fresh version has qualified)
+    assert "Version handoff" not in suffix, (
+        f"Post-promotion handoff should self-clear after first qualification; got: {suffix}"
+    )
+    # But the failed-deploy directive must be present
+    assert "deployment crisis" in suffix.lower() or "failed deploy" in suffix.lower(), (
+        f"Failed-deploy directive must render even after next version has qualified; got: {suffix}"
+    )
+    assert "v1" in suffix, f"Directive must reference the failed v1; got: {suffix}"
+    assert "deploy_failed" in suffix or "DID NOT confirm serving" in suffix, (
+        f"Directive must reference deployment failure; got: {suffix}"
+    )
+    assert "Cloud Run deployment timed out" in suffix, (
+        f"Directive must include failure reason; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_clears_when_newer_version_serving_confirmed(
+    db_session, mocker, _lts_split_active
+):
+    """Failed-deploy directive must clear once a subsequent version is promoted
+    AND confirmed serving. This prevents the recovery priority from lingering
+    after it has actually been resolved by a newer promotion."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # v1: promoted but deployment failed
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=5),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="Cloud Run crashed on startup",
+    )
+    db_session.add(failed_version)
+    # v2: promoted and serving confirmed (recovery successful)
+    recovery_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(days=1),
+        last_qualification={"status": "promoted", "confidence": 0.95},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    db_session.add(recovery_version)
+    # v3: open and ready for next iteration
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+    )
+    db_session.add(current_version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    # The failed-deploy directive must NOT be present because v2 is the latest
+    # promoted version and it is serving_confirmed (not deploy_failed)
+    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
+        f"Failed-deploy directive must clear when recovery is confirmed serving; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
+    db_session, mocker, _lts_split_active
+):
+    """The crisis directive text must correctly state that confirming THIS deploy
+    serving (a recovery of the SAME promoted SHA) clears it — not only a
+    subsequent promotion. The old wording wrongly implied a same-SHA recovery
+    could never clear it."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="boot crash, recovered late",
+    )
+    db_session.add(failed_version)
+    # An open v2 — the directive only fires while a version is open.
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "deployment crisis" in suffix.lower(), f"directive missing; got: {suffix}"
+    # The corrected wording: same-SHA recovery clears it; no subsequent version
+    # is required.
+    assert "SAME promoted SHA" in suffix, (
+        f"directive must state same-SHA recovery clears it; got: {suffix}"
+    )
+    assert "do NOT need to cut and promote a subsequent" in suffix, (
+        f"directive must not imply only a subsequent version clears it; got: {suffix}"
+    )
+    # The misleading old phrasing must be gone.
+    assert "remains active until a subsequent version is promoted AND confirmed serving" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_clears_on_same_sha_recovery(
+    db_session, mocker, _lts_split_active
+):
+    """A same-SHA recovery (the single promoted version's serving_status flips
+    deploy_failed -> serving_confirmed, no subsequent version) clears the crisis
+    directive — the directive is computed at view time from serving_status."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    recovered_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=6),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        # Recovery flipped the SAME promoted SHA back to serving_confirmed.
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    db_session.add(recovered_version)
+    # An open v2 so the directive WOULD fire if v1 were still deploy_failed —
+    # making the "directive cleared" assertion meaningful rather than vacuous.
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
+        f"Crisis directive must clear on a same-SHA recovery; got: {suffix}"
     )
 
 
@@ -7559,6 +8124,35 @@ class TestBuildPruneCandidates:
         assert len(out["resolved_gaps"]) == 1
         assert out["resolved_gaps"][0]["reason"] == "direction_shipped"
 
+    def test_verified_merge_ships_gap_but_degraded_does_not(self):
+        """Gap retirement is a ground-truth decision: only a verified merge
+        retires the gap; a direction whose only merges are unverified_degraded
+        (verified_prs_merged == 0) must NOT mark the gap direction_shipped."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g-deg", "name": "degraded only", "status": "active",
+                 "active_moves": ["d-deg"]},
+                {"id": "g-ver", "name": "verified", "status": "active",
+                 "active_moves": ["d-ver"]},
+            ],
+        }
+        directions = [
+            # Raw prs_merged>0 but the verification-aware count is 0 → not shipped.
+            {"id": "d-deg", "status": "active",
+             "research_history": [{"prs_merged": 3, "verified_prs_merged": 0}]},
+            # A genuine verified merge → still ships the gap.
+            {"id": "d-ver", "status": "active",
+             "research_history": [{"prs_merged": 1, "verified_prs_merged": 1}]},
+        ]
+        out = _build_prune_candidates(
+            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+        )
+        resolved = {rg["gap_id"]: rg["reason"] for rg in out["resolved_gaps"]}
+        assert resolved == {"g-ver": "direction_shipped"}
+        assert "g-deg" not in resolved
+
     def test_surfaces_claimed_but_absent_capabilities(self):
         from app.strategic_spawning import _build_prune_candidates
 
@@ -7875,6 +8469,136 @@ def test_summarize_open_messages_preserves_critical_and_oldest():
     # Per-message excerpt is capped.
     bug = next(m for m in trimmed if m["id"] == "bug")
     assert len(bug["content"]) == _OPEN_MESSAGE_EXCERPT_MAX_CHARS
+
+
+def test_reproducing_bug_survives_over_older_stale_one():
+    """A reproducing bug report ranks higher than an older stale one.
+
+    When the inbox must be trimmed under budget pressure, reproducing bug
+    reports (citation_state != "absent") should rank higher in survival priority
+    than stale ones (citation_state == "absent"). This ensures fresh, actionable
+    bugs are preserved while stale ones (likely already fixed/refactored away)
+    are deprioritized.
+    """
+    from app.strategic_spawning import _open_message_survival_key, _bound_open_messages
+
+    messages = []
+    # Old STALE bug report (citation_state == "absent")
+    messages.append(
+        {
+            "id": "old_stale",
+            "type": "BUG_REPORT",
+            "content": "This bug is stale (cited code is absent)",
+            "created_at": "2026-05-01T00:00:00",
+            "citation_state": "absent",
+        }
+    )
+    # Newer REPRODUCING bug report (no citation_state = not stale)
+    messages.append(
+        {
+            "id": "new_reproducing",
+            "type": "BUG_REPORT",
+            "content": "This bug is fresh and reproducing",
+            "created_at": "2026-06-01T00:00:00",
+        }
+    )
+
+    # Verify the reproducing bug ranks higher (lower tuple value) than the stale one.
+    stale_key = _open_message_survival_key(messages[0])
+    reproducing_key = _open_message_survival_key(messages[1])
+
+    # Reproducing should have tier=0, stale should have tier=1.
+    assert reproducing_key[0] == 0  # tier 0: reproducing critical
+    assert stale_key[0] == 1  # tier 1: stale critical
+    # So reproducing_key < stale_key, meaning reproducing survives first.
+    assert reproducing_key < stale_key
+
+    # When both fit in the budget, both survive.
+    trimmed = _bound_open_messages(messages, keep=2)
+    ids = {m["id"] for m in trimmed}
+    assert "old_stale" in ids
+    assert "new_reproducing" in ids
+
+    # When we must trim to 1 item, the reproducing bug survives.
+    trimmed_strict = _bound_open_messages(messages, keep=1)
+    assert len(trimmed_strict) == 1
+    assert trimmed_strict[0]["id"] == "new_reproducing"
+
+
+def test_open_message_citation_summary_promotes_absent_state_with_refs():
+    """A fully absent citation signal is promoted with its broken/ungrounded refs."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "absent",
+            "broken_refs": ["backend/app/x.py"],
+            "ungrounded_refs": ["backend/app/y.py:foo"],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    assert summary["citation_state"] == "absent"
+    assert summary["broken_refs"] == ["backend/app/x.py"]
+    assert summary["ungrounded_refs"] == ["backend/app/y.py:foo"]
+
+
+def test_open_message_citation_summary_promotes_mixed_present_state_with_refs():
+    """A partially grounded (present) report keeps its ref detail instead of being stripped."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "present",
+            "broken_refs": ["backend/app/x.py"],
+            "ungrounded_refs": [],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    # Non-absent state is preserved (NOT collapsed/stripped) so the strategist
+    # can see it is mixed rather than fully stale.
+    assert summary["citation_state"] == "present"
+    assert summary["broken_refs"] == ["backend/app/x.py"]
+    assert "ungrounded_refs" not in summary
+
+
+def test_open_message_citation_summary_promotes_indeterminate_state_with_refs():
+    """An indeterminate report carrying ungrounded refs surfaces those refs."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "indeterminate",
+            "broken_refs": [],
+            "ungrounded_refs": ["backend/app/z.py:bar"],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    assert summary["citation_state"] == "indeterminate"
+    assert summary["ungrounded_refs"] == ["backend/app/z.py:bar"]
+    assert "broken_refs" not in summary
+
+
+def test_open_message_citation_summary_omits_non_absent_state_without_refs():
+    """A non-absent state with no broken/ungrounded refs has nothing to flag."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "present",
+            "broken_refs": [],
+            "ungrounded_refs": [],
+        }
+    }
+    assert _open_message_citation_summary(context) == {}
+
+
+def test_open_message_citation_summary_empty_without_warning():
+    """No recorded warning yields an empty summary (no keys added)."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    assert _open_message_citation_summary({}) == {}
+    assert _open_message_citation_summary(None) == {}
+    assert _open_message_citation_summary({"_provenance_warnings": "nope"}) == {}
 
 
 class TestParallelismHint:
@@ -9671,3 +10395,157 @@ async def test_design_doc_update_ships_design_doc_index_not_full_prose(
     assert set(by_key) == {"systems/auth", "capabilities/login"}
     assert by_key["capabilities/login"]["status"] == "working"
     assert unique not in json.dumps(dd)
+
+
+# ── Missing-foundation demand in strategic payloads ──────────────────────────
+
+
+def _blocked_dependent(project_id, need, *, direction_id="d-strat-dep"):
+    """A BLOCKED dependent waiting on a single capability/foundation need."""
+    from app.time_utils import _utcnow as _ut
+
+    return Task(
+        project_id=project_id,
+        title="create: needs a missing foundation",
+        payloads=[{"type": "create", "prompt": "build feature", "base_branch": "main"}],
+        status=TaskStatus.BLOCKED,
+        blocked_at=_ut() - timedelta(hours=4),
+        context={
+            "direction_id": direction_id,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": need.get("ref"),
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+                "needs": [need],
+            },
+        },
+        created_by="ORCHESTRATOR",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_missing_capability_demand(db_session):
+    """The strategic_review payload surfaces aggregated missing-foundation demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth subsystem"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "strategic_review"
+    ][0].payloads[0]
+
+    assert payload["missing_capability_demand"] == expected
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_sr_demand")
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_demand_when_none(db_session):
+    """The strategic_review payload omits the demand field when no demand exists."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "strategic_review"
+    ][0].payloads[0]
+
+    assert "missing_capability_demand" not in payload
+    validate_internal_payload(dict(payload), "test_sr_no_demand")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_includes_missing_capability_demand(db_session):
+    """The design_doc_update payload surfaces aggregated missing-foundation demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    need = {"kind": "capability", "ref": "search-index", "label": "Search index"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "design_doc_update"
+    ][0].payloads[0]
+
+    assert payload["missing_capability_demand"] == expected
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_ddu_demand")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_omits_demand_when_none(db_session):
+    """The design_doc_update payload omits the demand field when no demand exists."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "design_doc_update"
+    ][0].payloads[0]
+
+    assert "missing_capability_demand" not in payload
+    validate_internal_payload(dict(payload), "test_ddu_no_demand")
+
+
+# ---------------------------------------------------------------------------
+# _direction_activity_score: verified-merge selection input
+# ---------------------------------------------------------------------------
+
+
+def test_direction_activity_score_prefers_verified_merges():
+    """A degraded merge (verified_prs_merged=0) must not boost the activity score."""
+    degraded = {"verified_prs_merged": 0, "prs_merged": 5}
+    verified = {"verified_prs_merged": 5, "prs_merged": 5}
+    # The degraded direction shipped nothing verified → no merge boost (score 0),
+    # while the verified direction earns the 3x-per-merge boost.
+    assert _direction_activity_score(degraded) == 0
+    assert _direction_activity_score(verified) == 15
+    assert _direction_activity_score(verified) > _direction_activity_score(degraded)
+
+
+def test_direction_activity_score_legacy_falls_back_to_prs_merged():
+    """Stat dict predating verified_prs_merged uses raw prs_merged (back-compat)."""
+    legacy = {"prs_merged": 4}
+    # 4 merges * 3 = 12, no other signals.
+    assert _direction_activity_score(legacy) == 12

@@ -10,6 +10,7 @@ from app.providers.base import (
     FileMaterial,
     LLMProvider,
     SecretMaterial,
+    UsageSnapshot,
     ValidationResult,
     parse_json_secret,
     tier_model_from_runtime_config,
@@ -360,6 +361,22 @@ class OpenAIProvider(LLMProvider):
             args=tuple(args),
             unsupported=tuple(unsupported),
         )
+
+    async def probe_usage(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> UsageSnapshot:
+        """No clean usage-headroom source for OpenAI/Codex → always unknown.
+
+        Neither the API-key billing surface nor the ChatGPT-plan (Codex OAuth)
+        access token exposes a reliable, documented per-window utilization
+        endpoint. Rather than scrape a flaky surface, we resolve to unknown so
+        selection behaves exactly as today for OpenAI accounts. Revisit if a
+        first-class usage endpoint appears.
+        """
+        return UsageSnapshot.unknown()
 
     async def list_available_models(
         self,

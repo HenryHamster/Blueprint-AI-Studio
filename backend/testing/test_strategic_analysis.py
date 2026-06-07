@@ -11,7 +11,11 @@ from app.strategic_analysis import (
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
-from app.direction_metrics import _compute_difficulty_index
+from app.direction_metrics import (
+    _compute_difficulty_index,
+    _compute_lifetime_generalized_outcome_state,
+    _compute_productivity_score,
+)
 
 
 def _make_project(directions=None, vision=None):
@@ -1038,6 +1042,114 @@ def test_difficulty_index_mixed_uses_history_and_aggregate():
 def test_difficulty_index_capped_at_thirty():
     d = {"research_history": [{"tasks_created": 1000, "prs_merged": 1}]}
     assert _compute_difficulty_index(d) == 30.0
+
+
+# ---------------------------------------------------------------------------
+# Verified-merge scoring: a degraded/unverified merge (prs_merged=1 but
+# verified_prs_merged=0) must NOT inflate selection/scoring inputs. Legacy
+# entries (only prs_merged) must still count via the fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_difficulty_index_excludes_degraded_unverified_merge():
+    """A degraded merge counts as zero verified merges → direction stays 'hard'."""
+    d = {
+        "research_history": [
+            {"tasks_created": 10, "prs_merged": 1, "verified_prs_merged": 0}
+        ]
+    }
+    # 0 verified merges → defaults to 1.0 (unknown / easy-until-proven), NOT
+    # 10/1 = 10.0 which the raw count would have produced.
+    assert _compute_difficulty_index(d) == 1.0
+
+
+def test_difficulty_index_legacy_entry_still_counts():
+    """Entry with only prs_merged (no verified field) falls back to raw count."""
+    d = {"research_history": [{"tasks_created": 10, "prs_merged": 2}]}
+    assert _compute_difficulty_index(d) == 5.0
+
+
+def test_productivity_score_excludes_degraded_unverified_merge():
+    """A degraded merge does not credit productivity (verified merges only)."""
+    degraded = {
+        "research_history": [
+            {"tasks_created": 1, "prs_merged": 1, "verified_prs_merged": 0}
+        ]
+    }
+    verified = {
+        "research_history": [
+            {"tasks_created": 1, "prs_merged": 1, "verified_prs_merged": 1}
+        ]
+    }
+    # Degraded merge scores 0 (no verified merge, no rejection); a real verified
+    # merge scores positive. They must NOT be equal.
+    assert _compute_productivity_score(degraded) == 0.0
+    assert _compute_productivity_score(verified) > 0.0
+
+
+def test_productivity_score_legacy_entry_still_counts():
+    """Legacy entry (only prs_merged) credits productivity via fallback."""
+    legacy = {"research_history": [{"tasks_created": 1, "prs_merged": 1}]}
+    assert _compute_productivity_score(legacy) > 0.0
+
+
+def test_outcome_evaluation_window_merged_excludes_degraded_but_acceptance_raw():
+    """outcome['merged'] counts verified merges; acceptance_rate stays raw."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 1,
+                    "prs_rejected": 1,
+                    "tasks_created": 4,
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    # Verified merged = 1 (one of the two merges was degraded/unverified).
+    assert d["merged"] == 1
+    # acceptance_rate is an operator-judgment metric: counts RAW merges
+    # (2 merged / (2 merged + 1 rejected)).
+    assert d["acceptance_rate"] == round(2 / 3, 3)
+    # operator_rejection_rate also stays raw (1 rejected / 3 total raw PRs).
+    assert d["operator_rejection_rate"] == round(1 / 3, 2)
+
+
+def test_prediction_calibration_factor_uses_verified_merges():
+    """Calibration compares prediction against the VERIFIED actual merge total."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                # 4 raw merges but only 2 verified → actual should be 2.
+                {"prs_merged": 4, "verified_prs_merged": 2},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    cycle_history = [
+        {
+            "outcome": "completed",
+            "created_predictions": {"dir-1": {"similar_past_merges": 2}},
+        }
+    ]
+    # actual_verified (2) / predicted (2) = 1.0 ratio. With raw merges it would
+    # have been 4/2 = 2.0 → clipped to 1.5. Prove we get the verified-derived 1.0
+    # (blended toward 1.0 for the single sample, which keeps it exactly 1.0).
+    factor = _real_compute_prediction_calibration_factor(
+        project, cycle_history, min_samples=1
+    )
+    assert factor == 1.0
 
 
 def test_cost_estimate_per_direction_and_overall():
@@ -2981,6 +3093,7 @@ def test_overall_generalized_success_rate_for_mixed_portfolio():
                 {
                     "timestamp": "2026-01-01T00:00:00",
                     "prs_merged": 2,
+                    "tasks_completed": 2,  # the 2 merges are completed terminal outcomes
                     "tasks_failed": 1,
                     "generalized_successes": 2,  # same as prs_merged for code-only
                 },
@@ -3009,6 +3122,46 @@ def test_overall_generalized_success_rate_for_mixed_portfolio():
     assert "generalized_successes" in overall
     assert overall["generalized_successes"] == 5
     assert overall["generalized_success_rate"] == round(5 / (5 + 1), 2)
+
+
+def test_generalized_health_rate_matches_dashboard_with_neutral_outcomes():
+    """Strategic generalized_health_rate equals the canonical dashboard value.
+
+    Regression guard for the divergent-denominator bug: the strategic path used
+    to divide by (successes + failed), omitting neutral terminal outcomes, so it
+    reported an optimistically higher 'health' than the operator dashboard for
+    the same direction. With the reconciliation, both paths divide successes by
+    ALL terminal outcomes (success + neutral + failure), so the two agree.
+    """
+    direction = {
+        "id": "dir-mixed",
+        "status": "active",
+        "research_history": [
+            {
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": 2,
+                "generalized_successes": 3,  # 2 code merges + 1 non-code success
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+                    "research": {"success": 1, "neutral": 2, "failure": 1},
+                },
+            },
+        ],
+    }
+    project = _make_project(directions=[direction])
+    result = _build_outcome_evaluation(project, [])
+    d = result["directions"][0]
+
+    # Denominator is ALL 6 terminal outcomes (3 success + 2 neutral + 1 failure),
+    # not the old 3 (successes) + 1 (failed) = 4 that dropped the neutrals.
+    assert d["generalized_terminal_outcomes"] == 6
+    assert d["generalized_health_rate"] == round(3 / 6, 3)
+
+    # The strategic value equals the canonical dashboard helper for the same data.
+    dashboard = _compute_lifetime_generalized_outcome_state(direction)
+    assert d["generalized_health_rate"] == dashboard["generalized_health_rate"]
+    # And it is strictly lower than the old neutral-dropping denominator would give.
+    assert d["generalized_health_rate"] < round(3 / (3 + 1), 3)
 
 
 def test_generalized_success_rate_absent_for_code_only_portfolio():

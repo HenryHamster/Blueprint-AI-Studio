@@ -24,6 +24,8 @@ function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.Cu
     qualification_state: null,
     last_qualification: null,
     latest_audit: null,
+    audit_evidence_state: 'none',
+    stale_audit: null,
     ...overrides,
   };
 }
@@ -34,6 +36,30 @@ function makeVersionLifecycleResponse(overrides: Partial<VersionLifecycleRespons
     recent_versions: [],
     promotion_enabled: false,
     promotion_readiness: null,
+    ...overrides,
+  };
+}
+
+function makeQualification(overrides: Partial<api.VersionQualification> = {}): api.VersionQualification {
+  return {
+    status: 'not_promoted',
+    confidence: 0.89,
+    threshold: 0.9,
+    sub_scores: null,
+    ci_resolution: null,
+    blocker: null,
+    finalized_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
+  return {
+    audit_task_id: 'task-1',
+    task_status: 'completed',
+    candidate_sha: 'abcdef1234567890',
+    created_at: '2026-01-01T00:00:00Z',
+    report: { findings: [{ severity: 'medium', summary: 'unverified finding' }] },
     ...overrides,
   };
 }
@@ -427,7 +453,7 @@ describe('VersionLifecyclePanel', () => {
       });
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined);
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined, expect.any(String));
       });
 
       expect(mockRefresh).toHaveBeenCalled();
@@ -459,7 +485,7 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build');
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build', expect.any(String));
       });
     });
 
@@ -510,6 +536,44 @@ describe('VersionLifecyclePanel', () => {
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
       });
+    });
+
+    it('reuses the same idempotency key when a failed cut is retried', async () => {
+      const cutVersionMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('network blip'))
+        .mockResolvedValueOnce({
+          abandoned_version: { version_number: 1, status: 'abandoned' },
+          new_version: { version_number: 2, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+        });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
+
+      // Retry after the failure (the cut UI stays open on error).
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
+
+      // Both calls carried the SAME generated key (a lost-response retry must
+      // not advance the version a second time on the backend).
+      const firstKey = cutVersionMock.mock.calls[0][2];
+      const secondKey = cutVersionMock.mock.calls[1][2];
+      expect(typeof firstKey).toBe('string');
+      expect(firstKey).toBeTruthy();
+      expect(secondKey).toBe(firstKey);
     });
   });
 
@@ -743,36 +807,13 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
-  describe('audit findings provenance + staleness', () => {
-    function makeQualification(overrides: Partial<api.VersionQualification> = {}): api.VersionQualification {
-      return {
-        status: 'not_promoted',
-        confidence: 0.89,
-        threshold: 0.9,
-        sub_scores: null,
-        ci_resolution: null,
-        blocker: null,
-        finalized_at: '2026-01-01T00:00:00Z',
-        ...overrides,
-      };
-    }
-
-    function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
-      return {
-        audit_task_id: 'task-1',
-        task_status: 'completed',
-        candidate_sha: 'abcdef1234567890',
-        created_at: '2026-01-01T00:00:00Z',
-        report: { findings: [{ severity: 'medium', summary: 'unverified finding' }] },
-        ...overrides,
-      };
-    }
-
-    it('renders the audit candidate SHA and run-age provenance', () => {
+  describe('audit evidence rendering', () => {
+    it('renders the current audit findings with provenance for the active candidate', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
               latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
             }),
           })}
@@ -781,17 +822,21 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
+      expect(screen.getByText('Audit Findings')).toBeInTheDocument();
+      expect(screen.getByText('unverified finding')).toBeInTheDocument();
       expect(screen.getByText('@abcdef1')).toBeInTheDocument();
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
     });
 
-    it('shows a stale badge when the audit commit differs from the evaluated candidate', () => {
+    it('renders stale audit provenance as historical context only and says there is no current audit', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'fed9876543210000' }),
-              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+              audit_evidence_state: 'stale',
+              latest_audit: null,
+              stale_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
             }),
           })}
           loading={false}
@@ -799,16 +844,23 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.getByText(/findings from an older commit/)).toBeInTheDocument();
+      expect(screen.getByText('Historical Audit Context')).toBeInTheDocument();
+      expect(screen.getByText(/no current audit for this candidate/i)).toBeInTheDocument();
+      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
+      expect(screen.getByText(/^ran /)).toBeInTheDocument();
+      expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
+      expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
     });
 
-    it('does not show a stale badge when the audit commit matches the evaluated candidate', () => {
+    it('does not display inherited findings when the current candidate has no audit evidence', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
-              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+              audit_evidence_state: 'none',
+              latest_audit: null,
+              stale_audit: null,
             }),
           })}
           loading={false}
@@ -816,7 +868,117 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.queryByText(/findings from an older commit/)).not.toBeInTheDocument();
+      expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
+      expect(screen.queryByText(/no current audit for this candidate/i)).not.toBeInTheDocument();
+      expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
+    });
+
+    it('preserves the crashed-audit affordance for a terminally-failed candidate audit', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'FAILED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it('shows a cancelled no-report audit as crashed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'CANCELLED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it.each(['IN_PROGRESS', 'QUEUED', 'PROVISIONING', 'EVALUATING'])(
+      'shows an in-flight no-report audit (%s) as running, not crashed',
+      (status) => {
+        render(
+          <VersionLifecyclePanel
+            data={makeVersionLifecycleResponse({
+              current_version: makeCurrentVersion({
+                audit_evidence_state: 'current',
+                latest_audit: makeLatestAudit({ report: null, task_status: status }),
+              }),
+            })}
+            loading={false}
+            projectId="proj-1"
+            onRefresh={mockRefresh}
+          />
+        );
+        expect(screen.getByText(/audit running — no report yet/)).toBeInTheDocument();
+        expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
+      }
+    );
+
+    it('shows a blocked no-report audit as blocked, distinct from crashed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'BLOCKED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit blocked — waiting on a precondition/)).toBeInTheDocument();
+      expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
+    });
+
+    it('shows a completed-but-empty no-report audit as a distinct anomaly, not a crash', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'COMPLETED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit completed without a report/)).toBeInTheDocument();
+      expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
+    });
+
+    it('preserves the no-findings affordance only for the current candidate audit', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: { findings: [] } }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit: no findings/)).toBeInTheDocument();
     });
 
     it('renders an "as of" freshness label beside the qualification summary', () => {
@@ -833,6 +995,544 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByText(/^as of /)).toBeInTheDocument();
+    });
+  });
+
+  describe('qualification verdict staleness', () => {
+    it('flags the verdict as stale and shows the verdict candidate SHA when tasks merged after it', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 3,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(
+        screen.getByText(/3 tasks merged since this verdict — re-qualify for current state/)
+      ).toBeInTheDocument();
+      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
+    });
+
+    it('singularizes the staleness flag for a single merge', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 1,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(
+        screen.getByText(/1 task merged since this verdict — re-qualify for current state/)
+      ).toBeInTheDocument();
+    });
+
+    it('renders no staleness flag when zero tasks merged after the verdict', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('renders no staleness flag when merged_since_verdict is null/absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: null,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('renders no verdict SHA or staleness flag gracefully when there is no candidate_sha', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: null }),
+              merged_since_verdict: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/^@/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe('promotion-in-flight locks qualify + phase controls', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    const promotionInFlightState: api.QualificationState = {
+      state: 'promotion_in_flight',
+      summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
+      promotion_pr_number: 4242,
+      promotion_pr_url: 'https://example/pr/4242',
+    };
+
+    it('disables Run Qualify and the phase flip while a promotion is in flight', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: promotionInFlightState,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeDisabled();
+      // In stabilize phase, the phase-flip button targets build.
+      expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
+      // The note makes the locked state legible.
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent('#4242');
+    });
+
+    it('leaves qualify + phase controls actionable when no promotion is in flight', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: { state: 'qualifying', summary: 'Audit in flight.' },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeEnabled();
+      expect(screen.getByRole('button', { name: /build/ })).toBeEnabled();
+      expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('promotion readiness regime labeling', () => {
+    function makeReadiness(overrides: Partial<api.PromotionReadiness> = {}): api.PromotionReadiness {
+      return {
+        ready: true,
+        reason: 'qualifier self-approval streak clears thresholds',
+        verdicts_evaluated: 6,
+        would_promote_count: 6,
+        would_promote_rate: 1,
+        consecutive_clean_passes: 6,
+        confidence: { mean: 0.95, stdev: 0.01, min: 0.94, max: 0.97, stable: true },
+        recurring_blockers: {},
+        blocker_counts: {},
+        thresholds: {},
+        regime: 'pre_go_live_calibration',
+        is_current_readiness: true,
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('presents a current readiness streak pre-go-live', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ promotion_readiness: makeReadiness() })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/self-approval streak clears thresholds/)).toBeInTheDocument();
+      expect(screen.queryByText(/pre-go-live dry-run calibration \(historical\)/)).not.toBeInTheDocument();
+    });
+
+    it('relabels as historical calibration once promotion is live (not current readiness)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ready: false,
+              is_current_readiness: false,
+              regime: 'live',
+              promotion_enabled: true,
+              reason: 'promotion is live for this project — this is a pre-go-live dry-run calibration window, not current readiness',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Stale dry-run streak is NOT presented as a live "ready" signal.
+      expect(screen.queryByText(/self-approval streak clears thresholds/)).not.toBeInTheDocument();
+      expect(screen.getByText(/pre-go-live dry-run calibration \(historical\)/)).toBeInTheDocument();
+      expect(screen.getByText(/frozen/)).toBeInTheDocument();
+    });
+
+    it('shows validated precision badge when ground_truth_validated is true with sufficient sample', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: true,
+              validated_precision: 0.92,
+              resolved_outcome_sample: 12,
+              serving_confirmed_count: 11,
+              deploy_failed_count: 1,
+              caveat: 'validated against post-promotion outcomes',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+      // Should show validated precision badge with sample count
+      expect(screen.getByText(/92% validated precision \(12 resolved\)/)).toBeInTheDocument();
+      // Caveat should reflect the validated state
+      expect(screen.getByText(/validated against post-promotion outcomes/)).toBeInTheDocument();
+    });
+
+    it('shows self-approval-only framing when ground_truth_validated is false', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: false,
+              validated_precision: null,
+              resolved_outcome_sample: 0,
+              caveat: 'self-approval only — no post-promotion outcome is recorded',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should NOT show validated precision badge
+      expect(screen.queryByText(/validated precision/)).not.toBeInTheDocument();
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+      // Caveat should reflect self-approval-only
+      expect(screen.getByText(/self-approval only/)).toBeInTheDocument();
+    });
+
+    it('does not show validated precision badge when sample is zero even if ground_truth_validated is true', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: true,
+              validated_precision: null,
+              resolved_outcome_sample: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should NOT show validated precision badge (no sample yet)
+      expect(screen.queryByText(/validated precision/)).not.toBeInTheDocument();
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+    });
+  });
+
+  describe('post-promotion serving confirmation', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders a green serving-confirmed badge with served SHA and time', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Candidate was promoted AND its deploy is CONFIRMED serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              served_at: '2026-01-02T00:00:00Z',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(badge).toHaveTextContent(/serving confirmed/);
+      expect(badge).toHaveTextContent('@abcdef1');
+    });
+
+    it('renders an amber awaiting-confirmation badge while unconfirmed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Candidate was promoted (merged) but serving is NOT yet confirmed.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+    });
+
+    it('renders a loud red failure badge with the reason — not a clean green promoted', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'Candidate merged but its deploy NEVER confirmed serving.',
+                serving_status: 'deploy_failed',
+                deploy_failure_reason: 'boot crash loop',
+              },
+              serving_status: 'deploy_failed',
+              deploy_failure_reason: 'boot crash loop',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent(/deploy failed/);
+      expect(badge).toHaveTextContent('boot crash loop');
+      expect(badge.className).toContain('text-red-400');
+      // The deploy-failed state badge must NOT be styled like the green 'promoted'.
+      const stateBadge = screen.getByText('promotion deploy failed');
+      expect(stateBadge.className).toContain('text-red-400');
+      expect(stateBadge.className).not.toContain('emerald');
+    });
+
+    it('shows the serving failure in the History rows for a recent version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 4,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'deploy_failed',
+                deploy_failure_reason: 'never stabilized',
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent('never stabilized');
+    });
+
+    it('reflects post_promotion_outcome in the verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v1',
+            release_version_id: 'rv1',
+            candidate_sha: 'deadbeef1234',
+            confidence: 0.95,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'deploy_failed',
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const history = await screen.findByTestId('verdict-history');
+      expect(within(history).getByText(/deploy failed/)).toBeInTheDocument();
+    });
+  });
+
+  describe('clear deploy-failed lever', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('shows the clear control only for admins when serving_status is deploy_failed', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }),
+      });
+      const { rerender } = render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} userRole="admin" />
+      );
+      expect(screen.getByTestId('clear-deploy-failed')).toBeInTheDocument();
+
+      // Non-admin: hidden.
+      rerender(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} userRole="user" />
+      );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('hides the clear control when no version is deploy_failed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'serving_confirmed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('calls clearDeployFailed on the verify path and reports the outcome', async () => {
+      const clearMock = vi.fn().mockResolvedValue({
+        version_number: 1,
+        serving_status: 'serving_confirmed',
+        served_sha: 'live999',
+        served_at: '2026-01-01T00:30:00Z',
+        deploy_failure_reason: null,
+        clear_mode: 'verified',
+        operator_attested: false,
+        attestation_reason: null,
+      });
+      vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('clear-deploy-failed'));
+
+      await waitFor(() => {
+        expect(clearMock).toHaveBeenCalledWith('proj-1');
+      });
+      await waitFor(() => {
+        expect(screen.getByText(/Deploy-failed cleared \(verified\)/)).toBeInTheDocument();
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('prompts for an attestation reason and force-clears when verify is refused', async () => {
+      const clearMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('deploy could not be independently verified live — re-submit with force=true and a reason'))
+        .mockResolvedValueOnce({
+          version_number: 1,
+          serving_status: 'serving_confirmed',
+          served_sha: 'promoted123',
+          served_at: '2026-01-01T02:00:00Z',
+          deploy_failure_reason: null,
+          clear_mode: 'operator_attested',
+          operator_attested: true,
+          attestation_reason: 'verified live by hand',
+        });
+      vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
+      const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('verified live by hand');
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('clear-deploy-failed'));
+
+      await waitFor(() => {
+        expect(promptSpy).toHaveBeenCalled();
+      });
+      await waitFor(() => {
+        expect(clearMock).toHaveBeenLastCalledWith('proj-1', true, 'verified live by hand');
+      });
+      await waitFor(() => {
+        expect(screen.getByText(/operator-attested/)).toBeInTheDocument();
+      });
+      promptSpy.mockRestore();
     });
   });
 });

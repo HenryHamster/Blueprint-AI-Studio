@@ -127,8 +127,21 @@ async def _attempt_alembic_autoreconcile(
     from app.github import get_file_text_at_ref, commit_file_changes
 
     try:
+        parent_project = (
+            await session.get(Project, parent.project_id) if parent.project_id else None
+        )
         plan = await _plan_rollup_migration_reconciliation(
-            gh_token, owner, repo, rollup_pr_number, target_branch
+            gh_token,
+            owner,
+            repo,
+            rollup_pr_number,
+            target_branch,
+            promotion_target=(
+                _get_project_promotion_target(parent_project)
+                if parent_project is not None
+                else None
+            ),
+            project_id=str(parent.project_id),
         )
     except Exception as e:
         logger.warning(
@@ -217,6 +230,96 @@ async def _attempt_alembic_autoreconcile(
         f"{staging_branch}, bumped EXPECTED_SCHEMA_REVISION; deferring re-validation"
     )
     return True
+
+
+async def attempt_pr_migration_finalization(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    *,
+    pr_number: int,
+    pr_branch: str,
+    target_branch: str,
+    promotion_target: str | None = None,
+    project_id: str | None = None,
+) -> dict | None:
+    """Rewrite a PR's provisional migration chain onto the live target head.
+
+    Returns a compact finalization record when a mechanical rewrite commit was
+    pushed to ``pr_branch`` and ``None`` when the PR either needs no rewrite or
+    cannot be reconciled safely. Fail-safe: any GitHub fetch/push failure yields
+    ``None`` so callers keep the merge held rather than guessing.
+
+    Lives here (not in ``rollup_migration_validation``) because it PUSHES: the
+    planner module is held read-only by ``test_backmerge_migration_planner_is_
+    read_only`` so the dual-head back-merge planner can never write a branch. The
+    only legitimate inline migration pushes are the rollup staging-branch
+    reconcile (``_attempt_alembic_autoreconcile`` above) and this PR-branch
+    finalize — both intentionally co-located in this module.
+    """
+    from app.github import get_file_text_at_ref, commit_file_changes
+    from app.migration_chain import rewrite_expected_schema_revision
+
+    plan = await _plan_rollup_migration_reconciliation(
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        target_branch,
+        promotion_target=promotion_target,
+        project_id=project_id,
+    )
+    if not plan:
+        return None
+
+    main_text = await get_file_text_at_ref(
+        "backend/app/main.py",
+        token=gh_token,
+        owner=owner,
+        repo=repo,
+        ref=pr_branch,
+        project_id=project_id,
+    )
+    if not main_text:
+        return None
+    new_main_text, replaced = rewrite_expected_schema_revision(
+        main_text, plan["expected_schema_revision"]
+    )
+    if replaced == 0:
+        return None
+
+    upserts = dict(plan["upserts"])
+    if new_main_text != main_text:
+        upserts["backend/app/main.py"] = new_main_text
+    if not upserts and not plan["deletes"]:
+        return None
+
+    commit_kind = (
+        "rechain"
+        if plan["old_revision"] == plan["new_revision"]
+        else f"renumber {plan['old_revision']}->{plan['new_revision']}"
+    )
+    await commit_file_changes(
+        gh_token,
+        owner,
+        repo,
+        pr_branch,
+        upserts=upserts,
+        deletes=list(plan["deletes"]),
+        message=(
+            "fix(alembic): auto-finalize provisional migration chain "
+            f"({commit_kind}, down_revision->{plan['new_down_revision']})"
+        ),
+        project_id=project_id,
+    )
+    return {
+        "pr_number": pr_number,
+        "branch": pr_branch,
+        "old_revision": plan["old_revision"],
+        "finalized_revision": plan["new_revision"],
+        "finalized_down_revision": plan["new_down_revision"],
+        "expected_schema_revision": plan["expected_schema_revision"],
+    }
 
 
 async def _classify_merged_rollup_landing(

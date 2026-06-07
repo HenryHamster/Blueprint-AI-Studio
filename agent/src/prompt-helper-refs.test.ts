@@ -10,7 +10,11 @@ import {
   writeDesignDocHelper,
 } from './prompt.js';
 import * as promptModule from './prompt.js';
-import { writeStrategicHelpers } from './handlers/strategic-helpers.js';
+import {
+  writeStrategicHelpers,
+  writeFetchHelper,
+  DESIGN_DOC_FETCH_VERBS,
+} from './handlers/strategic-helpers.js';
 import { provisionAmbientHelpers } from './providers/runners.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -136,6 +140,7 @@ describe('per-handler prompt/helper provisioning parity', () => {
     writeMessagesHelper: (ws) => { writeMessagesHelper('t-helpertest', ws); },
     writeDesignDocHelper: (ws) => { writeDesignDocHelper('t-helpertest', ws); },
     writeStrategicHelpers: (ws) => { writeStrategicHelpers('t-helpertest', 'p-helpertest', ws); },
+    writeFetchHelper: (ws) => { writeFetchHelper('t-helpertest', 'p-helpertest', ws, { verbs: DESIGN_DOC_FETCH_VERBS }); },
   };
 
   // Every model-prompt-emitting handler whose prompt advertises helpers. The
@@ -150,6 +155,19 @@ describe('per-handler prompt/helper provisioning parity', () => {
     { type: 'plan', sources: ['handlers/research-plan.ts'] },
     { type: 'strategic_review', sources: ['handlers/strategic.ts'] },
     { type: 'design_doc_update', sources: ['handlers/design-doc.ts'] },
+    { type: 'create', sources: ['handlers/standard.ts'] },
+    { type: 'refactor', sources: ['handlers/standard.ts'] },
+    { type: 'review', sources: ['handlers/review-fix.ts'] },
+    { type: 'fix', sources: ['handlers/review-fix.ts'] },
+    { type: 'migrate', sources: ['handlers/specialized.ts'] },
+    { type: 'debug', sources: ['handlers/specialized.ts'] },
+    { type: 'perf', sources: ['handlers/specialized.ts'] },
+    { type: 'investigate', sources: ['handlers/specialized.ts'] },
+    { type: 'smoketest', sources: ['handlers/specialized.ts'] },
+    { type: 'security_audit', sources: ['handlers/audits.ts'] },
+    { type: 'self_audit', sources: ['handlers/audits.ts'] },
+    { type: 'release_audit', sources: ['handlers/audits.ts'] },
+    { type: 'panel_review', sources: ['handlers/panel-review.ts'] },
   ];
 
   let ws: string;
@@ -225,6 +243,77 @@ describe('per-handler prompt/helper provisioning parity', () => {
           `ambiently via provisionAmbientHelpers (./note, ./playbook, ./messages) or by ` +
           `calling its write*Helper in the handler — or stop advertising it in the prompt.`
       ).toEqual([]);
+    });
+  }
+});
+
+// The per-handler helper-provisioning test above guarantees a handler provisions
+// every helper its prompt advertises. This complementary parity guard makes the
+// SHARED LAUNCH-CONTEXT block a structural guarantee the same way: every
+// model-prompt-emitting code/analysis handler must call buildContextPrefix so it
+// surfaces sibling/queued task awareness, the served direction, and quality
+// signals to the agent. Without this, equipping is a per-handler choice — which
+// is exactly how investigate launched with none while its near-twin debug
+// launched fully equipped.
+describe('per-handler launch-context parity', () => {
+  // Extract a top-level `export async function <name>(...) { ... }` body by
+  // brace-balancing from the signature's opening brace. String/comment-aware
+  // enough for this source (no `{`/`}` inside string literals in these bodies).
+  const extractFnBody = (src: string, name: string): string | null => {
+    const sig = new RegExp(`export\\s+async\\s+function\\s+${name}\\s*\\(`).exec(src);
+    if (!sig) return null;
+    // Skip past the parameter list (which itself contains braces, e.g.
+    // `statusRef: { value: string }`) by paren-balancing to the signature's
+    // closing `)`, THEN take the next `{` as the function body's open brace.
+    const parenStart = src.indexOf('(', sig.index);
+    let pd = 0;
+    let parenEnd = -1;
+    for (let i = parenStart; i < src.length; i++) {
+      if (src[i] === '(') pd++;
+      else if (src[i] === ')') { pd--; if (pd === 0) { parenEnd = i; break; } }
+    }
+    if (parenEnd < 0) return null;
+    const braceStart = src.indexOf('{', parenEnd);
+    if (braceStart < 0) return null;
+    let depth = 0;
+    for (let i = braceStart; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') {
+        depth--;
+        if (depth === 0) return src.slice(braceStart, i + 1);
+      }
+    }
+    return null;
+  };
+
+  // Enumerate EVERY exported `handle*` function in specialized.ts dynamically, so
+  // a newly-added specialized handler that omits the launch-context block fails
+  // this test without anyone having to remember to register it here.
+  const specializedSrc = readFileSync(path.join(SRC_DIR, 'handlers/specialized.ts'), 'utf-8');
+  const handlerNames = [
+    ...specializedSrc.matchAll(/export\s+async\s+function\s+(handle[A-Za-z0-9_]+)\s*\(/g),
+  ].map((m) => m[1]);
+
+  it('specialized.ts exposes the expected model-prompt-emitting handlers', () => {
+    // Guard against a regex/refactor that silently turns the sweep into a no-op.
+    expect(handlerNames).toEqual(
+      expect.arrayContaining([
+        'handleMigrate', 'handleSmoketest', 'handleDebug', 'handlePerf', 'handleInvestigate',
+      ]),
+    );
+  });
+
+  for (const name of handlerNames) {
+    it(`${name} includes the shared launch-context block (buildContextPrefix)`, () => {
+      const body = extractFnBody(specializedSrc, name);
+      expect(body, `could not extract body of ${name}`).not.toBeNull();
+      expect(
+        (body ?? '').includes('buildContextPrefix('),
+        `${name} builds a model prompt without the shared launch-context block. ` +
+          `Call buildContextPrefix(task) and render it in the prompt (it degrades ` +
+          `to '' when context is absent), so this handler launches as well-equipped ` +
+          `as its peers (create/fix/refactor/debug).`,
+      ).toBe(true);
     });
   }
 });

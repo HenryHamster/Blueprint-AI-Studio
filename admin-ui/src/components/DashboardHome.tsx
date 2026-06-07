@@ -17,6 +17,7 @@ import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSe
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { LlmCostBreakdownPanel } from './LlmCostBreakdownPanel';
+import { EffortEfficiencyPanel } from './EffortEfficiencyPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
@@ -49,6 +50,8 @@ import { ResearchYieldFunnel } from './ResearchYieldFunnel';
 import { OpenResidualCasesSection } from './OpenResidualCasesSection';
 import { RejectionPatternSummary } from './RejectionPatternSummary';
 import { RecentMergesTimeline } from './RecentMergesTimeline';
+import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
+import { DependencyHealthCard } from './DependencyHealthCard';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -461,7 +464,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     const hasAttribution = dirs.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
     const totalAutonomousPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
     const totalAssistedPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
-    const selfSufficientCount = dirs.filter(d => {
+    const selfSufficientCount = digest?.direction_portfolio?.self_sufficient_count ?? dirs.filter(d => {
       const history = d.research_history ?? [];
       const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
       const lifetimeAutonomous = histHasAttrib
@@ -471,7 +474,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
     }).length;
     return { directions: dirs, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount };
-  }, [digest?.direction_progress]);
+  }, [digest?.direction_progress, digest?.direction_portfolio]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   const classSparkMap = useMemo(() => {
@@ -696,6 +699,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           <DirectionPortfolioSection
             directions={directions}
             loading={loading}
+            directionPortfolio={digest?.direction_portfolio}
             productPct={productPct}
             totalDirPRs={totalDirPRs}
             hasAttribution={hasAttribution}
@@ -751,6 +755,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Section 2g: LLM Cost by Model */}
           <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
 
+          {/* Section 2h: Effort-tier & actual-model efficiency (cost vs landed) */}
+          {!loading && <EffortEfficiencyPanel data={digest?.effort_model_efficiency} />}
+
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
@@ -759,6 +766,20 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         {/* Section 4: Recent Merge Timeline */}
         <div className="lg:col-span-1">
           <RecentMergesTimeline mergeEvents={mergeEvents} loading={loading} />
+
+          {/* Fleet-wide no-CI merge-gate verification health (read-only) */}
+          {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
+            <div className="mt-4">
+              <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+            </div>
+          )}
+
+          {/* Dependency/foundation-resolution health (read-only) */}
+          {digest?.dependency_health_signals && (
+            <div className="mt-4">
+              <DependencyHealthCard data={digest.dependency_health_signals} />
+            </div>
+          )}
 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">

@@ -41,6 +41,7 @@ import logging
 import re
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -469,6 +470,107 @@ async def _fail_gate(
     )
 
 
+# Context key under which a knowledge prerequisite's durable pointer is stamped
+# onto each dependent task that declared the producing task in its ``depends_on``.
+# The implementation handler reads this at launch and resolves each pointer to
+# full content via the agent by-id endpoint (fail-soft). Shared contract name with
+# the agent runtime (``agent/src/handlers/prior-knowledge.ts``).
+KNOWLEDGE_PREREQUISITES_KEY = "knowledge_prerequisites"
+
+# Bound the dependent scan exactly as the orchestrator's _mark_unblocked_dependents
+# does: ``depends_on`` is a JSON column filtered in Python, so the cap is on the raw
+# QUEUED-dependent pool, ordered deterministically (oldest first).
+_DEPENDENT_SCAN_CAP = 100
+
+
+async def _deliver_knowledge_to_dependents(
+    task: Task,
+    doc: KnowledgeDocument,
+    normalized: dict[str, Any],
+    session: AsyncSession,
+) -> None:
+    """Stamp a durable knowledge pointer onto every QUEUED dependent that declared
+    this producing task as a prerequisite.
+
+    When a plan commissions a ``web_research`` / ``design`` prerequisite and makes
+    an implementation task depend on it, the implementation task must receive the
+    produced knowledge when it later launches. We establish that linkage HERE — at
+    prerequisite completion — so it SURVIVES the dependent being released later: a
+    compact pointer (``doc_id`` / ``source_task_id`` / ``source_kind`` / ``title`` /
+    ``summary``) is appended to each dependent's
+    ``context["knowledge_prerequisites"]`` (deduped by ``doc_id``). The
+    implementation handler resolves the pointer to full content at launch via the
+    agent by-id endpoint, fail-soft.
+
+    Mirrors the orchestrator's ``_mark_unblocked_dependents`` Python-filter over the
+    ``depends_on`` JSON column. Purely additive: it never changes whether/how the
+    document is persisted, a project with no dependents is a no-op, and any error
+    is swallowed so delivery can never break the producing task's completion.
+    """
+    task_id_str = str(task.id)
+    try:
+        dependents = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.project_id == task.project_id,
+                        Task.depends_on.isnot(None),
+                    )
+                    .order_by(Task.created_at)
+                    .limit(_DEPENDENT_SCAN_CAP)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception:  # noqa: BLE001 — best-effort; delivery must never break completion
+        logger.warning(
+            "[%s] dependent scan failed for task %s; knowledge not delivered",
+            _kind_tag(doc.source_kind),
+            task.id,
+            exc_info=True,
+        )
+        return
+
+    pointer = {
+        "doc_id": str(doc.id),
+        "source_task_id": task_id_str,
+        "source_kind": doc.source_kind,
+        "title": normalized["title"],
+        "summary": normalized["summary"],
+    }
+    touched = 0
+    for dep in dependents:
+        if task_id_str not in (dep.depends_on or []):
+            continue
+        ctx = dict(dep.context or {})
+        existing = ctx.get(KNOWLEDGE_PREREQUISITES_KEY)
+        prereqs = list(existing) if isinstance(existing, list) else []
+        # Dedupe by doc id so a re-entrant completion never stamps twice.
+        if any(
+            isinstance(p, dict) and p.get("doc_id") == pointer["doc_id"]
+            for p in prereqs
+        ):
+            continue
+        prereqs.append(pointer)
+        ctx[KNOWLEDGE_PREREQUISITES_KEY] = prereqs
+        dep.context = ctx
+        flag_modified(dep, "context")
+        session.add(dep)
+        touched += 1
+
+    if touched:
+        await session.commit()
+        logger.info(
+            "[%s] Delivered knowledge document %s to %d dependent task(s)",
+            _kind_tag(doc.source_kind),
+            doc.id,
+            touched,
+        )
+
+
 async def _persist_document(
     task: Task,
     document: dict[str, Any],
@@ -537,6 +639,12 @@ async def _persist_document(
     session.add(task)
     await session.commit()
     await session.refresh(doc)
+
+    # Close the knowledge-prerequisite loop: link this freshly-persisted document
+    # to any QUEUED dependent that commissioned it, so the dependent launches with
+    # the produced knowledge. Established at completion so it survives the dependent
+    # dispatching later. Best-effort — never blocks the producing task's completion.
+    await _deliver_knowledge_to_dependents(task, doc, normalized, session)
 
     await broadcast_to_project(
         str(task.project_id),
@@ -754,6 +862,178 @@ async def _handle_knowledge_document_completion(
         kind=kind,
     )
     await _persist_document(task, document, verdict_record, session, kind)
+
+
+async def persist_compute_experiment_knowledge(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+) -> KnowledgeDocument | None:
+    """Persist a ``compute_experiment`` verdict as a durable KnowledgeDocument.
+
+    A ``compute_experiment`` runs a budgeted compute job and completes with a
+    measured verdict — a terminal ``outcome``, the measured metric value, whether
+    a declared success criterion was met, and the ``cost``. ``web_research`` and
+    ``design`` results become first-class :class:`KnowledgeDocument` rows that are
+    indexed, delivered to dependents, and injected as prior knowledge into future
+    research/design/strategist prompts; this seam gives a compute_experiment's
+    answer the SAME durable home, so a later cycle asking the same measurable
+    question can discover that the experiment already ran and what it found.
+
+    Unlike the web_research/design lane this synthesizes the document from the
+    measured verdict rather than from agent-emitted prose, so it bypasses the
+    citation/topic forward-quality gates — the metric gate already ran in
+    ``task_completion._handle_compute_experiment_completion`` and is what admits
+    (or fails) the experiment. It is invoked for BOTH the met-criterion success
+    path AND the unmet-criterion fail path, so the system durably learns "we
+    tried X and it did NOT meet the bar" rather than silently dropping a negative
+    result.
+
+    This is a strictly ADDITIVE, best-effort post-completion step: it persists
+    one row, mirrors a compact ``plan_output["knowledge_document"]``, and reuses
+    :func:`_deliver_knowledge_to_dependents`. It NEVER mutates ``task.status``,
+    ``latest_status_message``, or ``plan_output["compute_result"]`` — the compute
+    handler owns those — and any failure is the caller's to swallow so durable
+    knowledge can never break task completion.
+    """
+    payload = task.first_payload or {}
+    experiment = str(payload.get("experiment") or "").strip()
+    benchmark = str(payload.get("benchmark") or "").strip()
+    identity = experiment or benchmark or "compute experiment"
+
+    crit_met = criterion.get("met") if isinstance(criterion, dict) else None
+
+    if crit_met is True:
+        verdict_phrase = "criterion met"
+    elif crit_met is False:
+        verdict_phrase = "criterion NOT met"
+    else:
+        verdict_phrase = outcome
+    title = f"Compute experiment: {identity} — {verdict_phrase}"[:500]
+
+    summary_parts = [f"Outcome: {outcome}."]
+    if isinstance(criterion, dict):
+        metric = criterion.get("metric")
+        op = criterion.get("operator")
+        threshold = criterion.get("threshold")
+        value = criterion.get("value")
+        if crit_met is True:
+            summary_parts.append(
+                f"Success criterion MET: {metric}={value} "
+                f"(required {op} {threshold})."
+            )
+        elif criterion.get("measurable"):
+            summary_parts.append(
+                f"Success criterion NOT met: {metric}={value} "
+                f"(required {op} {threshold})."
+            )
+        else:
+            summary_parts.append(
+                f"Success criterion NOT evaluable: {metric} "
+                f"(required {op} {threshold}) was not reported."
+            )
+    if cost is not None:
+        summary_parts.append(f"Cost: ${cost}.")
+    summary = " ".join(summary_parts)
+
+    body_lines = [
+        f"# Compute experiment verdict: {identity}",
+        "",
+        f"- **Outcome:** {outcome}",
+    ]
+    if benchmark:
+        body_lines.append(f"- **Benchmark:** {benchmark}")
+    if isinstance(criterion, dict):
+        body_lines.append(
+            f"- **Success criterion:** `{criterion.get('metric')} "
+            f"{criterion.get('operator')} {criterion.get('threshold')}`"
+        )
+        body_lines.append(f"- **Measured value:** {criterion.get('value')}")
+        body_lines.append(f"- **Criterion met:** {crit_met}")
+        body_lines.append(f"- **Measurable:** {criterion.get('measurable')}")
+    if cost is not None:
+        body_lines.append(f"- **Cost (USD):** {cost}")
+    if result_reference:
+        body_lines.append(f"- **Result reference:** {result_reference}")
+    body = "\n".join(body_lines)
+
+    raw_tags = payload.get("tags")
+    base_tags = [str(t) for t in raw_tags[:28]] if isinstance(raw_tags, list) else []
+    tags = list(dict.fromkeys([*base_tags, "compute_experiment", outcome]))[:30]
+
+    topic = (
+        payload.get("topic") or experiment or benchmark or payload.get("metric")
+    )
+    topic = str(topic)[:200] if topic else None
+
+    citations = (
+        [result_reference]
+        if result_reference and _is_usable_citation(result_reference)
+        else []
+    )
+
+    direction_id = (task.context or {}).get("direction_id")
+    direction_id = str(direction_id) if direction_id else None
+
+    verdict_record = {
+        "strategy": "metric",
+        "outcome": outcome,
+        "cost_usd": cost,
+        "criterion": criterion,
+        "criterion_met": crit_met,
+    }
+
+    doc = KnowledgeDocument(
+        project_id=task.project_id,
+        source_task_id=task.id,
+        direction_id=direction_id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title=title,
+        summary=summary,
+        body=body,
+        topic=topic,
+        tags=tags,
+        source_citations=citations,
+        forward_quality_verdict=verdict_record,
+    )
+    session.add(doc)
+
+    # Mirror a compact copy into plan_output for admin visibility WITHOUT
+    # touching the compute_result the compute handler already wrote there.
+    plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+    plan_output = dict(plan_output)
+    plan_output["knowledge_document"] = {
+        "id": str(doc.id),
+        "title": title,
+        "summary": summary,
+        "topic": topic,
+        "tags": tags,
+        "direction_id": direction_id,
+        "citation_count": len(citations),
+        "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
+    }
+    task.plan_output = plan_output
+    flag_modified(task, "plan_output")
+    session.add(task)
+    await session.commit()
+    await session.refresh(doc)
+
+    # Close the knowledge-prerequisite loop for any QUEUED dependent that waited
+    # on this experiment's result. Best-effort — never blocks completion.
+    await _deliver_knowledge_to_dependents(
+        task, doc, {"title": title, "summary": summary}, session
+    )
+
+    logger.info(
+        "[COMPUTE] Persisted compute-experiment knowledge document %s for task %s",
+        doc.id,
+        task.id,
+    )
+    return doc
 
 
 async def _handle_web_research_completion(

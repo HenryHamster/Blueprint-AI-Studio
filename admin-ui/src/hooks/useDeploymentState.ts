@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { User } from 'firebase/auth';
 import type { DeployState, OrchestratorHealth, ProviderApisHealth } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
@@ -94,7 +94,17 @@ export function useDeploymentState(
     }
   };
 
+  // In-flight guard: rollback is not free to repeat — a genuine double-submit
+  // (double-click) would double-count toward the consecutive-rollback HALT
+  // threshold. The ref blocks the second concurrent call before it issues a
+  // request; the state mirror drives button-disable in the UI.
+  const rollbackInFlight = useRef(false);
+  const [isRollingBack, setIsRollingBack] = useState(false);
+
   const handleRollback = async () => {
+    if (rollbackInFlight.current) return;
+    rollbackInFlight.current = true;
+    setIsRollingBack(true);
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/rollback`, {
         method: 'POST', headers: await authHeaders(),
@@ -105,10 +115,26 @@ export function useDeploymentState(
         return;
       }
       const data = await res.json();
+      // The backend returns a truthful HTTP 200 with status='rollback_failed'
+      // when the Cloud Run traffic shift never happened (it deliberately avoids a
+      // 5xx, which would quarantine the serving instance). Treat that body as a
+      // retryable failure — NOT a completed rollback — so the operator knows
+      // traffic still serves the bad revision and can retry. Still refresh deploy
+      // state so the UI reflects the untouched (STABLE) status.
+      if (data.status === 'rollback_failed') {
+        const servingSha = data.serving_sha?.slice(0, 8) ?? 'current revision';
+        const detail = data.gcloud_error ? ` (${data.gcloud_error})` : '';
+        addToast(`Rollback failed — traffic still serves ${servingSha}; retry${detail}`, 'error');
+        fetchDeployState();
+        return;
+      }
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
     } catch {
       addToast('Rollback failed', 'error');
+    } finally {
+      rollbackInFlight.current = false;
+      setIsRollingBack(false);
     }
   };
 
@@ -231,7 +257,7 @@ export function useDeploymentState(
   return {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
-    handleRollback, handleMarkStable, handleRepairState,
+    handleRollback, isRollingBack, handleMarkStable, handleRepairState,
     zoneHealth,
     orchestratorHealth,
     detailedHealth,

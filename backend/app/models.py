@@ -166,15 +166,18 @@ class ArtifactType(str, Enum):
 class SourceKind(str, Enum):
     """Which task type produced a :class:`KnowledgeDocument`.
 
-    A knowledge document is written by either a codebase-internal ``design``
-    task or a web-grounded ``web_research`` task; ``UNKNOWN`` is the durable
-    fallback so pre-existing rows (and any future producer that does not stamp
-    a kind) backfill cleanly. Stored as the enum *value* in a plain String
-    column, mirroring ``ArtifactType`` / ``TaskStatus``.
+    A knowledge document is written by a codebase-internal ``design`` task, a
+    web-grounded ``web_research`` task, or a ``compute_experiment`` task whose
+    measured verdict (outcome / metric / criterion-met / cost) is persisted so
+    future research and strategist cycles can discover what was already measured.
+    ``UNKNOWN`` is the durable fallback so pre-existing rows (and any future
+    producer that does not stamp a kind) backfill cleanly. Stored as the enum
+    *value* in a plain String column, mirroring ``ArtifactType`` / ``TaskStatus``.
     """
 
     DESIGN = "design"
     WEB_RESEARCH = "web_research"
+    COMPUTE_EXPERIMENT = "compute_experiment"
     UNKNOWN = "unknown"
 
 
@@ -204,6 +207,28 @@ class PoolVmState(str, Enum):
     IDLE = "IDLE"
     LEASED = "LEASED"
     RETIRING = "RETIRING"
+
+
+class MigrationReservationStatus(str, Enum):
+    """Lifecycle of a provisional Alembic revision reservation.
+
+    ACTIVE    — the reservation holds a provisional revision id for an
+                in-flight migration-producing task; it participates in
+                next-number allocation so concurrent tasks get distinct ids.
+    FINALIZED — the migration merged; ``finalized_revision`` records the id the
+                migration actually shipped under (which may differ from the
+                provisional id if a merge-time renumber moved it).
+    EXPIRED   — the reserving task was reaped/abandoned without shipping; the
+                reservation no longer participates in allocation and its
+                provisional id is free to be re-handed-out.
+
+    Stored as the enum *value* in a plain String column, mirroring
+    ``ComputeJobStatus`` / ``TaskStatus``.
+    """
+
+    ACTIVE = "ACTIVE"
+    FINALIZED = "FINALIZED"
+    EXPIRED = "EXPIRED"
 
 
 # --- Auto-pause diagnosis workflow constants ---
@@ -1521,6 +1546,8 @@ def bank_task_current_attempt(
         "vm_stopped_at": effective_stop.isoformat() if effective_stop else None,
         "vm_spot": bool(task.vm_spot),
         "vm_machine_type": task.vm_machine_type,
+        "provider": task.provider,
+        "model": task.model,
         "vm_runtime_cost_usd": round(vm_cost, 6),
         "llm_input_tokens": input_tokens,
         "llm_output_tokens": output_tokens,
@@ -1705,6 +1732,24 @@ class PoolVm(SQLModel, table=True):
     # retired rather than leased after a rebake.
     agent_image_fingerprint: str | None = Field(
         default=None, sa_column=Column(String, nullable=True)
+    )
+    # Durable image identity observed from task / VM heartbeats so the fleet can
+    # still be reasoned about after an orchestrator restart (the in-memory
+    # heartbeat caches are intentionally lossy).
+    agent_image_name: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+    agent_image_build_ts: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    agent_runtime_fingerprint: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    agent_source_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    last_heartbeat_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
 
     state: PoolVmState = Field(
@@ -2576,7 +2621,7 @@ class MaxPlanAccount(SQLModel, table=True):
                 if (now - at_dt).total_seconds() < cooldown:
                     return True
             return False
-        except Exception:
+        except Exception:  # noqa: BLE001 — documented: False on any parse failure
             return False
 
 
@@ -2824,9 +2869,7 @@ class KnowledgeDocument(SQLModel, table=True):
     authoring_branch: str | None = Field(
         default=None, sa_column=Column(String, nullable=True)
     )
-    head_sha: str | None = Field(
-        default=None, sa_column=Column(String, nullable=True)
-    )
+    head_sha: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -3264,6 +3307,73 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
 
+    # ----- Post-promotion serving confirmation -----
+    # Whether the promoted version's code is actually serving in production.
+    # ``status`` flips to "promoted" the instant the candidate merges; these
+    # columns track whether the deploy then stabilized.  All nullable so the
+    # migration is purely additive and pre-existing rows backfill naturally.
+    #
+    # **IMPORTANT: This field is a legacy projection for single-artifact releases.**
+    # It mirrors the ``backend_revision`` artifact's serving_status via
+    # ``project_backend_revision_artifact()`` during multi-artifact windows.
+    # When multiple required artifacts are registered (e.g. backend_revision + other
+    # services), this scalar reflects ONLY the backend artifact's state, not the
+    # whole-release aggregate. For the authoritative whole-release status, use
+    # ``aggregate_required_artifact_status()`` to compute from the full
+    # ReleaseDeployArtifact rows. This scalar is whole-release-accurate only
+    # while backend_revision is the sole required artifact.
+    #
+    #   serving_status values: NULL (not-yet-promoted / NA) | "unconfirmed"
+    #     | "serving_confirmed" | "deploy_failed".
+    serving_status: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # The production serving SHA captured when serving was confirmed.
+    # **IMPORTANT: This is a legacy projection field.**
+    # It mirrors ``ReleaseDeployArtifact.served_identifier`` for the backend_revision
+    # artifact via ``project_backend_revision_artifact()``. During multi-artifact
+    # windows, this scalar reflects ONLY the backend artifact's serving SHA.
+    # The authoritative per-artifact serving identity is stored in
+    # ReleaseDeployArtifact.served_identifier. This field is whole-release-accurate
+    # only while backend_revision is the sole required artifact.
+    served_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # When serving was confirmed.
+    served_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Bounded confirmation-window deadline, stamped at promotion.
+    deploy_confirm_deadline: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Durable deduplication anchor for the deploy-failed operator alert.
+    # Mirrors the *_alerted_at dedup convention on this model: stamped when the
+    # alert fires so the next sweep skips re-posting for the same failure.
+    deploy_confirm_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Short code for why confirmation failed:
+    # no_new_revision | rolled_back | halted | sha_mismatch.
+    deploy_failure_reason: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
+        back_populates="version"
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3284,6 +3394,80 @@ class ReleaseVersion(SQLModel, table=True):
             "project_id",
             "version_number",
             name="uq_releaseversion_project_version",
+        ),
+    )
+
+
+class ReleaseDeployArtifact(SQLModel, table=True):
+    """Per-artifact serving confirmation record for a promoted release version."""
+
+    __tablename__ = "releasedeployartifact"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    artifact_kind: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Values: "unconfirmed" | "serving_confirmed" | "deploy_failed".
+    serving_status: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # Generic observed identity for the served artifact (SHA, fingerprint, etc).
+    served_identifier: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    confirmation_deadline: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    reason_code: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    served_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    created_at: datetime | None = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=True, server_default=func.now()),
+    )
+    updated_at: datetime | None = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=True,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    version: ReleaseVersion | None = Relationship(back_populates="deploy_artifacts")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "artifact_kind",
+            name="uq_releasedeployartifact_version_kind",
         ),
     )
 
@@ -3389,6 +3573,88 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
+    # ----- Post-promotion serving outcome -----
+    # Immutable record of how this verdict's promotion actually played out in
+    # production.  Nullable: only set for verdicts that promoted and then had
+    # their deploy confirmed/failed.
+    #   post_promotion_outcome values: "serving_confirmed" | "deploy_failed"
+    #     | "unconfirmed".
+    post_promotion_outcome: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # When the post-promotion outcome was recorded.
+    post_promotion_outcome_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # --- Per-attempt evidence mirrored from ``last_qualification`` ----------
+    # These NULLABLE columns durably retain the richer evidence the qualifier
+    # assembles into the ``last_qualification`` base_record but which was
+    # previously dropped when the verdict row was written, so blocked/held
+    # attempts no longer lose it on the next re-qualification overwrite.  All
+    # are nullable — existing verdict rows carry no such evidence.
+
+    # Migration-safety verdicts (e.g. 'pass'/'block') and their detail strings.
+    migration_safety: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+    migration_safety_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    migration_apply_safety: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+    migration_apply_safety_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Audit findings and the findings excluded from scoring (JSONB lists).
+    audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    excluded_audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Structured erosion / smoketest / audit-reconciliation detail (JSONB).
+    test_erosion_detail: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    smoketest_detail: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    audit_reconciliation: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Promotion-attempt context (only set on the promotion_failed / promoted
+    # paths): the merge PR URL, whether the merge hit a conflict, and the
+    # error/detail string describing why the merge failed.
+    promotion_pr_url: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+    promotion_conflict: bool | None = Field(
+        default=None,
+        sa_column=Column(Boolean, nullable=True),
+    )
+    promotion_error_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3399,5 +3665,89 @@ class QualificationVerdict(SQLModel, table=True):
             "ix_qualificationverdict_project_created",
             "project_id",
             "created_at",
+        ),
+    )
+
+
+class MigrationReservation(SQLModel, table=True):
+    """A provisional Alembic revision id reserved for a migration-producing task.
+
+    Migration authoring serializes the whole pipeline when the orchestrator
+    holds a single "one migration-producing task at a time" slot for a task's
+    entire agent run. A reservation breaks that convoy: the moment a task needs
+    a revision id it is handed a provisional ``revision`` / ``down_revision`` off
+    the merged chain head, and concurrent tasks each get the NEXT distinct
+    monotonic id (the allocator considers both the merged head and every still
+    ``ACTIVE`` reservation). The reservation persists enough lifecycle state for
+    a later merge-time finalize (``FINALIZED`` + ``finalized_revision``) or an
+    expiry sweep (``EXPIRED``) to reconcile the provisional id against what the
+    migration actually shipped under.
+
+    The agent-facing contract is intentionally additive (the ORM row is
+    returned as-is) so a later claim-response rollout can expose the reservation
+    without breaking existing consumers.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id")
+    # Detach-on-delete (SET NULL), NOT cascade: a reservation is durable
+    # allocation history that must outlive its originating task so a merge-time
+    # finalize/expiry can still reconcile the provisional id. Mirrors
+    # ComputeJob.task_id.
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # The provisional revision id handed to the task, and the chain head it was
+    # anchored onto. Both are the NNNN-style Alembic ids parsed by
+    # ``migration_chain``; kept as strings to preserve zero-padding/width.
+    provisional_revision: str = Field(
+        sa_column=Column(String(64), nullable=False, index=True)
+    )
+    provisional_down_revision: str = Field(
+        sa_column=Column(String(64), nullable=False)
+    )
+
+    status: MigrationReservationStatus = Field(
+        default=MigrationReservationStatus.ACTIVE,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=MigrationReservationStatus.ACTIVE.value,
+        ),
+    )
+    # The revision id the migration actually shipped under, set at merge-time
+    # finalize. Usually equals ``provisional_revision``; differs only when a
+    # merge-time renumber moved the migration.
+    finalized_revision: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Hot path: scan a project's ACTIVE reservations during allocation.
+        Index(
+            "ix_migrationreservation_project_status",
+            "project_id",
+            "status",
         ),
     )

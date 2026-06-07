@@ -10,9 +10,9 @@
 - Agent: TypeScript, Node.js
 
 ## Testing
-- Backend: `bash scripts/test-backend.sh` (builds Docker image, runs import check + full suite)
-  - Specific file: `bash scripts/test-backend.sh testing/test_agent.py`
-  - Standalone only (no DB): `bash scripts/test-backend.sh --standalone`
+- Backend, targeted — **the default for task work**: `bash scripts/test-backend.sh testing/test_<module>.py [more files]` — run the test files covering what you changed.
+- Backend, standalone smoke (no DB): `bash scripts/test-backend.sh --standalone --no-postgres` — invariant/security/pipeline files; this is what `./check test` runs.
+- Backend, FULL suite: `bash scripts/test-backend.sh` with no test-file arguments — **never run this on an agent VM.** It builds the Docker image and runs the entire DB-backed suite: 45–60+ min on a 2-vCPU/8 GB VM (OOM-prone), and redundant — CI runs the same suite sharded on every automain/main-targeting PR and on every plan rollup PR. The bare invocation exists for developer machines, not task VMs.
 - Frontend: `cd admin-ui && npm run build && npx eslint .`
 - Agent: `cd agent && npx tsc --noEmit`
 
@@ -25,7 +25,7 @@
 
 ## Common Patterns
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
-- Always run tests before finishing: backend uses Docker (`bash scripts/test-backend.sh`), frontend: `cd admin-ui && npm run build`
+- Verify before finishing with TARGETED tests: run the backend test files covering your change (`bash scripts/test-backend.sh testing/test_<module>.py`), plus `cd admin-ui && npm run build` if you touched frontend. Do NOT run the full backend suite on an agent VM — CI owns the full matrix on your PR.
 - New admin endpoints need `@require_project_access` or `@require_role` decorators
 
 ## Generating Code for One Language From Another

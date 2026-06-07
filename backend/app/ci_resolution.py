@@ -463,13 +463,24 @@ def classify_merge_test_verdict(
     Absent / below-threshold / malformed coverage keeps the empty detail exactly
     (older agents that emit no ``coverage`` are unaffected).
 
-    Acceptance probe (``detected=false`` only): when no unit suite ran, the agent
-    may still attach a cheap goal-level ``probe`` ("does the changed code still
-    compile/build/boot"). A CLEAR probe failure — it ran, did not pass, and was
-    NOT a could-not-run degrade — maps to ``"fail"`` so the existing block-and-fix
-    path fires carrying the probe output. Every other probe state (pass /
-    could-not-run / absent / old-shape verdict) keeps today's ``"undetected"``
-    fall-open, so missing-deps / unprovisioned setup never hard-blocks a merge.
+    Declared build probe (HIGH precedence, runs regardless of suite detection):
+    when the project declares a ``build_cmd``, the agent runs it as a goal-level
+    acceptance ``probe`` (carrying ``declared=true``) on BOTH the detected=false
+    fall-open paths AND the detected=true + passed path. A CLEAR declared-build
+    failure — it ran, did not pass, and was NOT a could-not-run degrade — maps to
+    ``"fail"`` EVEN WHEN a unit suite was detected and passed, because a green
+    suite must not mask a broken declared build (bundled frontends, tests that
+    exercise source without the build step). See
+    :func:`declared_build_is_clear_failure`.
+
+    Generic acceptance probe (``detected=false`` only): when no unit suite ran, the
+    agent may attach a cheap GENERIC goal-level ``probe`` ("does the changed code
+    still compile/build/boot"). A CLEAR generic-probe failure — it ran, did not
+    pass, and was NOT a could-not-run degrade — maps to ``"fail"`` on the
+    detected=false path so the existing block-and-fix path fires carrying the probe
+    output. Every other probe state (pass / could-not-run / absent / old-shape
+    verdict) keeps today's ``"undetected"`` fall-open, so missing-deps /
+    unprovisioned setup never hard-blocks a merge.
 
     Documented-command probe (HIGH precedence, runs regardless of suite
     detection): the agent may attach a ``documentedCommands`` block describing the
@@ -558,26 +569,32 @@ def classify_merge_test_verdict(
             f"tests skipped), so the suite was made green by skipping rather "
             f"than by passing{suffix}.",
         )
+    # HIGH precedence: a DECLARED acceptance test (the named test the plan
+    # promised would exercise the seam) that was ABSENT or SKIPPED in the PR's run
+    # did NOT prove the claim — block the merge REGARDLESS of whether the unit
+    # suite was detected and passed, exactly the way compute_experiment fails
+    # closed when its declared success metric is absent from the result. A green
+    # suite must not let a promised-but-missing/never-run test merge as proven. A
+    # check that itself could_not_run (no targetable suite / environment failure)
+    # does NOT block here — it falls open with the ``acceptance_test_not_run``
+    # degraded reason via :func:`classify_unverified_fall_open_reason`.
+    if acceptance_test_is_clear_failure(acceptance_test_block(verdict)):
+        return ("fail", _acceptance_test_failure_detail(acceptance_test_block(verdict)))
+    # HIGH precedence: the operator's OWN declared build command CLEARLY failed.
+    # A green unit suite must NOT mask a broken declared build (bundled frontends,
+    # tests that exercise source without the build step), so a declared-build
+    # clear failure blocks the merge REGARDLESS of whether a suite was detected and
+    # passed. Generic (non-declared) probes keep the detected=false-only semantics
+    # below. Checked here so a passing suite cannot fall through to "pass".
+    if declared_build_is_clear_failure(verdict.get("probe")):
+        return ("fail", _declared_build_failure_detail(verdict["probe"]))
     if verdict.get("detected") is False:
         if probe_is_clear_failure(verdict.get("probe")):
+            # A declared-build clear failure was already handled at HIGH
+            # precedence above (it blocks regardless of suite detection); only a
+            # GENERIC compile/build probe failure reaches here.
             probe = verdict["probe"]
             output = str(probe.get("output") or "").strip()
-            if probe.get("declared"):
-                # The operator's OWN declared build command failed — surface that
-                # explicitly so the spawned fix task knows the authoritative build
-                # (not a generic compile probe) is what broke.
-                label = str(probe.get("label") or "").strip()
-                prefix = (
-                    f"Declared build command `{label}` failed: "
-                    if label
-                    else "Declared build command failed: "
-                )
-                return (
-                    "fail",
-                    (prefix + output)
-                    if output
-                    else (prefix + "the declared build did not succeed."),
-                )
             return (
                 "fail",
                 output
@@ -627,6 +644,44 @@ def probe_is_clear_failure(probe: Any) -> bool:
     if probe.get("could_not_run"):
         return False
     return probe.get("passed") is False
+
+
+def declared_build_is_clear_failure(probe: Any) -> bool:
+    """Whether an acceptance ``probe`` is the operator's OWN declared build that
+    CLEARLY failed — a blocking failure that fires REGARDLESS of suite detection.
+
+    Narrower than :func:`probe_is_clear_failure`: it additionally requires the
+    probe to be the project's declared ``build_cmd`` (``declared is True``). A
+    declared build that clearly failed blocks the merge even when a unit suite was
+    detected and passed, because a green suite must not mask a broken declared
+    build. A GENERIC (non-declared) compile probe is unaffected here — it keeps
+    its existing detected=false-only handling. Defensive about a missing / non-dict
+    / generic / old-shape probe (returns False).
+    """
+    if not isinstance(probe, dict):
+        return False
+    if probe.get("declared") is not True:
+        return False
+    return probe_is_clear_failure(probe)
+
+
+def _declared_build_failure_detail(probe: dict[str, Any]) -> str:
+    """Build the operator-facing ``detail`` for a CLEAR declared-build failure.
+
+    Shared by the HIGH-precedence declared-build block (which fires regardless of
+    suite detection) so the wording stays identical to the historical
+    detected=false declared-build path. Surfaces the declared command label and
+    its captured output so the spawned fix task knows the AUTHORITATIVE build (not
+    a generic compile probe) is what broke.
+    """
+    output = str(probe.get("output") or "").strip()
+    label = str(probe.get("label") or "").strip()
+    prefix = (
+        f"Declared build command `{label}` failed: "
+        if label
+        else "Declared build command failed: "
+    )
+    return (prefix + output) if output else (prefix + "the declared build did not succeed.")
 
 
 def _documented_command_is_clear_failure(documented: Any) -> bool:
@@ -692,6 +747,79 @@ def disabled_tests_block(verdict: Any) -> dict[str, Any] | None:
                 }
             )
     return {"count": count, "markers": markers}
+
+
+def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
+    """Defensively normalize the optional ``acceptanceTest`` block an agent
+    attaches when the implementation task declared (at plan time) a named
+    acceptance test (``acceptance_evidence`` with ``kind="test"``).
+
+    Returns ``{"declared", "descriptor", "selector"?, "present", "ran",
+    "status"}`` when a well-formed ``declared=true`` block with a recognized
+    ``status`` is present, else ``None``. ``status`` is one of ``ran`` /
+    ``skipped`` / ``absent`` / ``could_not_run``. Pure read-side accessor,
+    mirroring :func:`disabled_tests_block`: defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``None``), so an agent that omits it
+    degrades silently and the gate is unchanged.
+    """
+    if not isinstance(verdict, dict):
+        return None
+    raw = verdict.get("acceptanceTest")
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("declared") is not True:
+        return None
+    status = str(raw.get("status") or "").strip().lower()
+    if status not in {"ran", "skipped", "absent", "could_not_run"}:
+        return None
+    descriptor = str(raw.get("descriptor") or "").strip()
+    block: dict[str, Any] = {
+        "declared": True,
+        "descriptor": descriptor,
+        "present": bool(raw.get("present")),
+        "ran": bool(raw.get("ran")),
+        "status": status,
+    }
+    selector = raw.get("selector")
+    if isinstance(selector, str) and selector.strip():
+        block["selector"] = selector.strip()
+    return block
+
+
+def acceptance_test_is_clear_failure(block: Any) -> bool:
+    """Whether a declared acceptance-test block is a CLEAR, blocking failure — a
+    promised test that was ABSENT or SKIPPED (it did not actually run).
+
+    True only when the block is the declared acceptance test, it did NOT run, and
+    its status is the definitive ``absent`` or ``skipped``. A ``could_not_run``
+    status is NOT a clear failure: the check itself could not be performed (no
+    targetable suite / environment failure), so it degrades to a fall-open
+    (``acceptance_test_not_run``) rather than hard-blocking. Defensive about a
+    missing / non-dict / old-shape block (returns False), so an older agent that
+    emits no ``acceptanceTest`` keeps today's gate behavior exactly.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("declared") is not True:
+        return False
+    if block.get("ran") is True:
+        return False
+    return block.get("status") in {"absent", "skipped"}
+
+
+def _acceptance_test_failure_detail(block: dict[str, Any]) -> str:
+    """Build the operator-facing ``detail`` for a CLEAR declared-acceptance-test
+    failure so the spawned fix task knows which promised test must run."""
+    name = str(block.get("selector") or block.get("descriptor") or "").strip()
+    status = str(block.get("status") or "").strip()
+    label = f"`{name}` " if name else ""
+    if status == "absent":
+        reason = "is absent — the promised test was not found in the PR's run"
+    elif status == "skipped":
+        reason = "was skipped — the promised test did not actually execute"
+    else:  # defensive; only absent/skipped reach here
+        reason = "did not run"
+    return f"Declared acceptance test {label}{reason}.".replace("  ", " ")
 
 
 def _suite_is_non_verifying(verdict: dict[str, Any]) -> bool:
@@ -784,6 +912,60 @@ _ALL_SKIPPED_NO_TESTS_REASONS = frozenset(
 )
 
 
+# --- Single source of truth: benign-vs-degraded UNVERIFIED-merge reasons -----
+#
+# The no-CI merge gate records WHY a PR merged without real test verification in
+# ``review_loop["unverified_merge_reason"]`` (the reason KEYS are minted by
+# :func:`classify_unverified_fall_open_reason` here and at the orchestrator's
+# two other fall-open decision sites). Two downstream layers must agree on
+# whether a given reason is *benign* (the project legitimately has no runnable
+# suite, or only positive execution signals were obtained — do NOT penalize) or
+# *degraded* (verification was expected but an environment/setup failure
+# prevented it — escalate loudly):
+#   - :mod:`app.alert_dispatch` maps these onto ``AlertSeverity`` (WARNING vs
+#     ERROR), and
+#   - success-scoring analytics distinguish a *verified* merge from one the gate
+#     merged UNVERIFIED.
+# Keep that partition HERE, in one dependency-light leaf (this module imports
+# only ``app.github``), so the two layers cannot drift. ``alert_dispatch``
+# DERIVES ``_UNVERIFIED_REASON_SEVERITY`` from these sets rather than re-listing
+# the keys. Their union is the canonical emitted reason set (pinned by
+# ``test_invariants._UNVERIFIED_REASON_KEYS``); they are disjoint by contract.
+DEGRADED_UNVERIFIED_REASONS = frozenset(
+    {
+        "verify_setup_failed",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+        "documented_command_no_artifact",
+        "acceptance_test_not_run",
+    }
+)
+BENIGN_UNVERIFIED_REASONS = frozenset(
+    {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "probe_passed",
+        "documented_command_passed",
+    }
+)
+
+
+def is_degraded_unverified_reason(reason: str | None) -> bool:
+    """Whether a no-CI UNVERIFIED-merge reason key marks a *degraded* fall-open.
+
+    Degraded reasons mean verification was expected but an environment/setup
+    failure prevented it (escalate). Benign reasons mean no verification was
+    expected, or only positive execution signals were obtained. Unknown / None
+    keys are treated as NOT degraded, mirroring ``alert_dispatch``'s WARNING
+    default — a key with no explicit classification never silently escalates.
+    """
+    return reason in DEGRADED_UNVERIFIED_REASONS
+
+
 def classify_unverified_fall_open_reason(
     verdict: dict[str, Any] | None,
 ) -> tuple[str, str]:
@@ -820,9 +1002,13 @@ def classify_unverified_fall_open_reason(
     ``documentedCommands`` block is present (a command the PR INTRODUCES or
     DOCUMENTS), surface DISTINCT operator-visible reason keys —
     ``documented_command_could_not_run`` when missing deps / unprovisioned setup
-    degraded it (the claim went unverified), or ``documented_command_passed``
-    when the documented command was the positive execution evidence (no unit
-    suite ran but the documented command executed and passed). This signal takes
+    degraded it (the claim went unverified), ``documented_command_no_artifact``
+    when a BUILD-INTENT documented command exited 0 yet (per the agent's
+    ``wrote_no_artifact`` observation) wrote no output to the fresh PR-head clone
+    (a likely no-op build — mirroring the declared-build ``probe_no_artifact``
+    refinement), or ``documented_command_passed`` when the documented command was
+    the positive execution evidence (no unit suite ran but the documented command
+    executed and passed). This signal takes
     precedence over the acceptance-probe / all-skipped phrasing because a command
     the PR itself introduced is the most specific claim we can speak to. A CLEAR
     documented-command failure never reaches here — it blocks via
@@ -834,6 +1020,22 @@ def classify_unverified_fall_open_reason(
     ``documentedCommands`` keeps the generic reason).
     """
     if isinstance(verdict, dict):
+        # A DECLARED acceptance test that the gate could not confirm RAN takes
+        # precedence over every other fall-open phrasing: it is the most specific
+        # promise the plan made. A clear absent/skipped never reaches here (it
+        # blocks via :func:`classify_merge_test_verdict`); this surfaces the
+        # could_not_run degrade (no targetable suite / environment failure) so the
+        # operator sees the promised test went unconfirmed and the merge is
+        # excluded from verified-merge accounting.
+        acceptance = acceptance_test_block(verdict)
+        if acceptance is not None and not acceptance.get("ran"):
+            name = str(acceptance.get("selector") or acceptance.get("descriptor") or "").strip()
+            phrase = (
+                f"a declared acceptance test could not be confirmed to run ({name})"
+                if name
+                else "a declared acceptance test could not be confirmed to run"
+            )
+            return (phrase, "acceptance_test_not_run")
         documented = verdict.get("documentedCommands")
         if isinstance(documented, dict) and documented.get("ran"):
             label = str(documented.get("label") or "").strip()
@@ -846,6 +1048,25 @@ def classify_unverified_fall_open_reason(
                 )
                 return (phrase, "documented_command_could_not_run")
             if documented.get("passed") is True:
+                # Honest refinement mirroring the declared-build ``probe_no_artifact``
+                # path: a BUILD-INTENT documented/PR-introduced command that exited 0
+                # but — per the agent's ``wrote_no_artifact`` observation — wrote
+                # NOTHING to the fresh PR-head clone is a likely no-op build/generate.
+                # A result-producing command that produced no result does not honestly
+                # verify the claim, so surface a DISTINCT reason instead of the
+                # confident ``documented_command_passed``. The agent sets the flag ONLY
+                # for a build-intent command whose tree it confidently observed; an
+                # absent / false flag (lint/test command, older agent, unobservable
+                # tree) keeps today's ``documented_command_passed`` byte-for-byte.
+                if documented.get("wrote_no_artifact") is True:
+                    phrase = (
+                        f"a PR-introduced/documented build ran but emitted no artifact "
+                        f"({label}) — possible no-op build"
+                        if label
+                        else "a PR-introduced/documented build ran but emitted no "
+                        "artifact (possible no-op build)"
+                    )
+                    return (phrase, "documented_command_no_artifact")
                 phrase = (
                     f"a PR-introduced/documented command was executed and passed ({label})"
                     if label

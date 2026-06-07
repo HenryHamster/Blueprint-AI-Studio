@@ -60,6 +60,9 @@ import {
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
+  formatProvenanceWarnings,
+  formatInvestigateCitationProvenance,
+  formatAcceptanceEvidence,
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
@@ -2242,6 +2245,28 @@ describe('getTaskTypeHints', () => {
     expect(result).toBeUndefined();
   });
 
+  it('fix hint requires reproduce-on-HEAD first with a non-reproducible no-op off-ramp', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    expect(hint).toContain('REPRODUCE FIRST');
+    expect(hint).toContain('reproduces on current HEAD');
+    expect(hint).toContain('./done --already-done');
+  });
+
+  it('fix hint references the structured reproduce verdict and names all three outcomes', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    expect(hint).toContain('already_resolved');
+    expect(hint).toContain('reproduce-on-HEAD verdict');
+    expect(hint).toContain('indeterminate');
+    expect(hint).toContain('./done --reproduced');
+    expect(hint).toContain('./done --indeterminate');
+  });
+
+  it('investigate hint asks for the canonical reproduce verdict, not free-text only', () => {
+    const hint = TASK_TYPE_HINTS['investigate'];
+    expect(hint).toContain('reproduce-on-HEAD verdict');
+    expect(hint).toContain('indeterminate');
+  });
+
   it('returns static hint when buildConfig has empty directories array', () => {
     const result = getTaskTypeHints({ directories: [] })['create'];
     expect(result).toBe(TASK_TYPE_HINTS['create']);
@@ -2938,6 +2963,244 @@ describe('buildRetryContext', () => {
     expect(result).toContain('## Previous Attempt (attempt #4 failed)');
     expect(result).not.toContain('Retry budget:');
     expect(result).not.toContain('Final attempt');
+  });
+});
+
+// ── formatProvenanceWarnings ──────────────────────────────────────────────────
+describe('formatProvenanceWarnings', () => {
+  it('returns empty string when context is undefined', () => {
+    expect(formatProvenanceWarnings(undefined)).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is absent', () => {
+    expect(formatProvenanceWarnings({ scope: 'medium' })).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is an empty object', () => {
+    expect(formatProvenanceWarnings({ _provenance_warnings: {} })).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is not a dict (defensive)', () => {
+    expect(formatProvenanceWarnings({ _provenance_warnings: 'oops' })).toBe('');
+    expect(formatProvenanceWarnings({ _provenance_warnings: ['a'] })).toBe('');
+    expect(formatProvenanceWarnings({ _provenance_warnings: null })).toBe('');
+  });
+
+  it('renders the cited-files-changed signal', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { cited_files_changed_since_generation: true },
+    });
+    expect(result).toContain('## Stale-premise notice');
+    expect(result).toContain('Cited files changed since the finding was generated');
+    expect(result).toContain('REPRODUCE-FIRST');
+  });
+
+  it('does not render the cited-files signal when the flag is false', () => {
+    expect(
+      formatProvenanceWarnings({
+        _provenance_warnings: { cited_files_changed_since_generation: false },
+      }),
+    ).toBe('');
+  });
+
+  it('renders the broken-citation count and the offending refs', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        broken_source_ref_count: 2,
+        broken_refs: ['app/foo.py:42', 'app/bar.ts'],
+      },
+    });
+    expect(result).toContain('2 broken/missing citation(s)');
+    expect(result).toContain('app/foo.py:42');
+    expect(result).toContain('app/bar.ts');
+  });
+
+  it('renders the broken-citation signal from refs alone when count is missing', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { broken_refs: ['app/only.py'] },
+    });
+    expect(result).toContain('1 broken/missing citation(s)');
+    expect(result).toContain('app/only.py');
+  });
+
+  it('renders the ungrounded-claim count and the offending refs', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        ungrounded_claim_count: 3,
+        ungrounded_refs: ['claim about retries', 'claim about caching'],
+      },
+    });
+    expect(result).toContain('3 ungrounded claim(s)');
+    expect(result).toContain('claim about retries');
+    expect(result).toContain('claim about caching');
+  });
+
+  it('renders all three signals combined and the no-op/pivot instruction', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        cited_files_changed_since_generation: true,
+        broken_source_ref_count: 1,
+        broken_refs: ['x.py'],
+        ungrounded_claim_count: 1,
+        ungrounded_refs: ['some claim'],
+      },
+    });
+    expect(result).toContain('Cited files changed since the finding was generated');
+    expect(result).toContain('1 broken/missing citation(s)');
+    expect(result).toContain('1 ungrounded claim(s)');
+    expect(result).toContain('./done --already-done');
+    expect(result).toContain('do NOT fabricate');
+  });
+
+  it('does not throw on malformed nested fields and renders nothing useful', () => {
+    expect(() =>
+      formatProvenanceWarnings({
+        _provenance_warnings: {
+          broken_source_ref_count: 'two',
+          broken_refs: 'notalist',
+          ungrounded_refs: [123, null, 'real ref'],
+        },
+      }),
+    ).not.toThrow();
+    // ungrounded_refs has one stringifiable real ref, so the signal fires for it.
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { ungrounded_refs: [123, null, 'real ref'] },
+    });
+    expect(result).toContain('real ref');
+  });
+});
+
+// ── formatInvestigateCitationProvenance ───────────────────────────────────────
+describe('formatInvestigateCitationProvenance', () => {
+  it('returns empty string when context is undefined', () => {
+    expect(formatInvestigateCitationProvenance(undefined)).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is absent', () => {
+    expect(formatInvestigateCitationProvenance({ scope: 'medium' })).toBe('');
+  });
+
+  it('returns empty string for a non-dict _provenance_warnings (defensive)', () => {
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: 'oops' })).toBe('');
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: ['a'] })).toBe('');
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: null })).toBe('');
+  });
+
+  it('returns empty string for a non-absent verdict with no stale refs', () => {
+    expect(
+      formatInvestigateCitationProvenance({
+        _provenance_warnings: { citation_state: 'present', broken_refs: [], ungrounded_refs: [] },
+      }),
+    ).toBe('');
+  });
+
+  it('renders the ABSENT discount note and the stale refs', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: {
+        citation_state: 'absent',
+        broken_refs: ['app/gone.py'],
+        ungrounded_refs: ['app/x.py:vanished'],
+      },
+    });
+    expect(result).toContain('## Citation-provenance notice');
+    expect(result).toContain('ABSENT on the current');
+    expect(result).toContain('discount its actionability');
+    expect(result).toContain('app/gone.py');
+    expect(result).toContain('app/x.py:vanished');
+    // Absent framing must not claim the defect is still actionable.
+    expect(result).not.toContain('NOT presumed resolved');
+  });
+
+  it('renders the ABSENT note even when no specific stale refs are present', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: { citation_state: 'absent', broken_refs: [], ungrounded_refs: [] },
+    });
+    expect(result).toContain('ABSENT on the current');
+    expect(result).toContain('discount its actionability');
+  });
+
+  it('renders the PARTIAL note for a grounded report with stale refs', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: {
+        citation_state: 'present',
+        broken_refs: ['app/moved.py'],
+        ungrounded_refs: ['app/y.py:renamed'],
+      },
+    });
+    expect(result).toContain('## Citation-provenance notice');
+    expect(result).toContain('PARTIALLY grounded');
+    expect(result).toContain('NOT presumed resolved');
+    expect(result).toContain('remains actionable');
+    expect(result).toContain('app/moved.py');
+    expect(result).toContain('app/y.py:renamed');
+    // Partial framing must not use the stronger absent discount.
+    expect(result).not.toContain('discount its actionability');
+  });
+
+  it('does not throw on malformed nested fields', () => {
+    expect(() =>
+      formatInvestigateCitationProvenance({
+        _provenance_warnings: {
+          citation_state: 'present',
+          broken_refs: 'notalist',
+          ungrounded_refs: [123, null, 'real ref'],
+        },
+      }),
+    ).not.toThrow();
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: { citation_state: 'present', ungrounded_refs: [123, null, 'real ref'] },
+    });
+    expect(result).toContain('real ref');
+  });
+});
+
+// ── formatAcceptanceEvidence ──────────────────────────────────────────────────
+describe('formatAcceptanceEvidence', () => {
+  it('returns empty string when acceptance_evidence is absent or malformed', () => {
+    expect(formatAcceptanceEvidence(undefined)).toBe('');
+    expect(formatAcceptanceEvidence({})).toBe('');
+    expect(formatAcceptanceEvidence({ acceptance_evidence: null })).toBe('');
+    expect(formatAcceptanceEvidence({ acceptance_evidence: 'oops' })).toBe('');
+    expect(formatAcceptanceEvidence({
+      acceptance_evidence: { kind: 'named_test', test_path: 'backend/app/handler.py' },
+    })).toBe('');
+  });
+
+  it('renders named_test obligations with path, test_id, and gate conditions', () => {
+    const result = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'testing/test_widget.py',
+        test_id: 'test_widget_handles_empty',
+      },
+    });
+
+    expect(result).toContain('## Acceptance Evidence');
+    expect(result).toContain('testing/test_widget.py');
+    expect(result).toContain('test_widget_handles_empty');
+    expect(result).toContain('real merge-test verdict');
+    expect(result).toContain('production code');
+    expect(result).toContain('test-only diff fails the gate');
+  });
+
+  it('renders observable_behavior and downstream_artifact obligations', () => {
+    const observable = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: 'the dashboard shows the live serving SHA banner',
+      },
+    });
+    expect(observable).toContain('the dashboard shows the live serving SHA banner');
+    expect(observable).toContain('real, non-empty diff');
+
+    const artifact = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'downstream_artifact',
+        artifact_id: 'release-deploy-artifact-registry',
+      },
+    });
+    expect(artifact).toContain('release-deploy-artifact-registry');
+    expect(artifact).toContain('real, non-empty diff');
   });
 });
 

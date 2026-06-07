@@ -1186,6 +1186,49 @@ async def test_abandon_without_reason_still_cuts(db_session):
 
 
 @pytest.mark.asyncio
+async def test_abandon_idempotent_replay_same_key_does_not_open_further_version(
+    db_session,
+):
+    """A repeated cut carrying the same idempotency key replays the original
+    cut's result (does NOT abandon the freshly-opened next version) so the
+    version number is not advanced a second time."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=7)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="pivot",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-1",
+    )
+    await db_session.commit()
+    assert abandoned.version_number == 7
+    assert new_version.version_number == 8
+    # The key is stamped into the abandoned row's provenance (no schema change).
+    assert abandoned.last_qualification["idempotency_key"] == "cut-key-1"
+
+    # Repeat with the SAME key: returns the original pair, no second cut.
+    replay_abandoned, replay_new = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="pivot",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-1",
+    )
+    await db_session.commit()
+    assert replay_abandoned.version_number == 7
+    assert replay_new.version_number == 8
+
+    # v8 is still open and was NOT abandoned; no v9 was opened.
+    current = await rv.current_open_version(db_session, project.id)
+    assert current.version_number == 8
+    assert current.status == "open"
+    all_rows = await rv.recent_closed_versions(db_session, project.id, limit=10)
+    assert [v.version_number for v in all_rows] == [7]
+
+
+@pytest.mark.asyncio
 async def test_abandon_activates_staged_directions(db_session):
     """An abandon counts as the awaited version resolving: staged directions
     gated on the abandoned version are activated, not orphaned."""
@@ -1260,3 +1303,161 @@ async def test_late_qualifier_finalize_inert_after_abandon(db_session):
     assert version.status == "abandoned"
     # No duplicate next version was opened.
     assert await rv.current_open_version(db_session, project.id) is None
+
+
+# ===========================================================================
+# Idempotency tests — version cuts with idempotency_key
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_abandon_with_idempotency_key_stores_key(db_session):
+    """A cut with an idempotency_key stores it in last_qualification for later
+    detection of duplicates."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=1)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="test cut",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-123",
+    )
+    await db_session.commit()
+    await db_session.refresh(abandoned)
+
+    # The key is stored in last_qualification.
+    assert abandoned.last_qualification.get("idempotency_key") == "cut-key-123"
+    assert new_version.version_number == 2
+
+
+@pytest.mark.asyncio
+async def test_abandon_idempotency_duplicate_returns_original_pair(db_session):
+    """A repeat cut with the same idempotency_key returns the original
+    abandoned/next pair instead of cutting a second version."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=3)
+
+    # First cut with a key.
+    abandoned1, new1 = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="original cut",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-abc",
+    )
+    await db_session.commit()
+
+    # Simulate the open version v4 being used (what would happen in production).
+    # Now retry the SAME cut with the same key.
+    abandoned2, new2 = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="retry cut (should be ignored)",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-abc",
+    )
+    await db_session.commit()
+
+    # The second call returns the ORIGINAL abandoned/next pair.
+    assert abandoned2.version_number == 3
+    assert abandoned2.status == "abandoned"
+    assert new2.version_number == 4
+    # Only one cut was performed; no v5 was created.
+    all_versions = await rv.recent_closed_versions(db_session, project.id, limit=10)
+    assert [v.version_number for v in all_versions] == [3]
+
+
+@pytest.mark.asyncio
+async def test_abandon_different_idempotency_keys_produce_different_cuts(db_session):
+    """Two cuts with different idempotency_keys each produce their own cut
+    (no deduplication across different keys)."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=1)
+
+    # First cut.
+    abandoned1, new1 = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="first cut",
+        operator_id="op@example.com",
+        idempotency_key="key-1",
+    )
+    await db_session.commit()
+
+    # v2 is now open (created by the first cut)
+    assert new1.version_number == 2
+
+    # Second cut with a DIFFERENT key (on the now-open v2).
+    abandoned2, new2 = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="second cut",
+        operator_id="op@example.com",
+        idempotency_key="key-2",
+    )
+    await db_session.commit()
+
+    # Both cuts succeed independently.
+    assert abandoned1.version_number == 1
+    assert new1.version_number == 2
+    assert abandoned2.version_number == 2
+    assert new2.version_number == 3
+    # Both keys are stored in their respective abandoned versions.
+    await db_session.refresh(abandoned1)
+    await db_session.refresh(abandoned2)
+    assert abandoned1.last_qualification.get("idempotency_key") == "key-1"
+    assert abandoned2.last_qualification.get("idempotency_key") == "key-2"
+
+
+@pytest.mark.asyncio
+async def test_abandon_no_idempotency_key_still_works(db_session):
+    """Cuts without an idempotency_key (None) work as before: no deduplication,
+    no key storage."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=5)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="cut without key",
+        operator_id="op@example.com",
+        idempotency_key=None,
+    )
+    await db_session.commit()
+    await db_session.refresh(abandoned)
+
+    # No key stored.
+    assert "idempotency_key" not in (abandoned.last_qualification or {})
+    assert new_version.version_number == 6
+
+
+@pytest.mark.asyncio
+async def test_abandon_concurrent_race_guard_independent_of_idempotency(db_session):
+    """The concurrent-race guard (re-lock + re-check) still prevents two
+    concurrent operators from opening duplicate vN+1, even when using different
+    idempotency keys (the race happens before the key check)."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=1)
+
+    # Simulate two concurrent cut attempts with different keys hitting the
+    # same open version. In production, the second one would re-lock and find
+    # the version already closed (status != 'open'), returning (None, None).
+    # Here we just verify the race guard works by manually closing the row.
+    open_v = await rv.current_open_version(db_session, project.id)
+    assert open_v is not None
+    open_v.status = "promoted"  # Simulate it being closed by concurrent op.
+    db_session.add(open_v)
+    await db_session.commit()
+
+    # Now the second cut attempt should find no open version.
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="late cut attempt",
+        operator_id="op@example.com",
+        idempotency_key="different-key",
+    )
+
+    assert abandoned is None and new_version is None

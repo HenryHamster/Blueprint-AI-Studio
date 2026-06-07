@@ -73,7 +73,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import RATE_LIMIT, classify_failure
 from app.models import (
     ArtifactType,
@@ -108,6 +108,7 @@ from app.release_promotion import (
     promote,
 )
 from app.release_reconciliation import (
+    _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_pending_timed_out,  # noqa: F401 — re-exported for back-compat
@@ -119,11 +120,13 @@ from app.release_qualifier_audit import (
     _enrich_infra_error,
     _handle_infra_failure,
     _latest_artifact_logs,
+    _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_smoketest_task,
     _spawn_release_audit_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
+    resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -186,6 +189,7 @@ from app.release_qualifier_sweep import (
     _parse_started_at,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
+from app.migration_apply_gate import run_migration_apply_gate
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
 )
@@ -424,6 +428,33 @@ async def _qualification_in_flight(
             return True
     # status == "pending" but every child already terminated → not in flight.
     return False
+
+
+def _promotion_in_flight_result(
+    version: release_version.ReleaseVersion,
+) -> dict[str, Any] | None:
+    """Return a ``promotion_in_flight`` status dict, or None when not in flight.
+
+    A version whose audit PASSED and now has an open promotion PR auto-merging
+    (``last_qualification.status == "pending"`` + a ``promotion_pending``
+    sub-key) is mid-promotion. Re-qualifying in this state would spawn a fresh
+    audit/smoketest pair and clobber the promotion-pending record other parts of
+    the system rely on as provenance that the promotion is still legitimately
+    merging — so ``run_qualification`` refuses (no-op) just like the version-cut
+    lever does (``abandon_current_version`` raises ``VersionCutBlockedByPromotion``
+    on the same predicate). Reuses ``summarize_qualification_state`` so all the
+    operator levers agree by construction.
+    """
+    qual_state = release_version.summarize_qualification_state(
+        version.last_qualification
+    )
+    if qual_state and qual_state.get("state") == "promotion_in_flight":
+        return {
+            "status": "promotion_in_flight",
+            "promotion_pr_number": qual_state.get("promotion_pr_number"),
+            "promotion_pr_url": qual_state.get("promotion_pr_url"),
+        }
+    return None
 
 
 async def _increment_qualification_attempts(
@@ -993,6 +1024,21 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
+    # Cheap pre-lock promotion-in-flight check (no I/O — pure DB read).  A
+    # version whose audit passed and now has an open promotion PR auto-merging
+    # must not be re-qualified: doing so spawns a fresh heavy audit/smoketest
+    # pair and clobbers the promotion-pending record.  Consistent with the
+    # version-cut lever, which refuses in the same state.  Best-effort fast path
+    # — the authoritative re-check happens under the row lock below.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
+            "in flight — skipping (promotion_in_flight, pre-lock)",
+            version.version_number,
+        )
+        return _promo
+
     project = await session.get(Project, project_id)
     if project is None:
         logger.warning(
@@ -1138,6 +1184,24 @@ async def run_qualification(
             version.version_number,
         )
         return {"status": "already_pending"}
+
+    # Guard 2b (under the lock): a promotion is in flight — the audit PASSED and
+    # a promotion PR is open and auto-merging (last_qualification.status ==
+    # "pending" + a promotion_pending sub-key, children already terminal).  This
+    # is NOT "in flight" by the child-task definition above, and "pending" is not
+    # a conclusive verdict, so neither Guard 2 nor Guard 3 catches it.  Spawning
+    # a fresh audit/smoketest pair here and overwriting the promotion-pending
+    # record would discard the provenance the rest of the system relies on to
+    # know the promotion is still legitimately merging — so refuse (no-op),
+    # consistent with the version-cut lever.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
+            "in flight — skipping (promotion_in_flight)",
+            version.version_number,
+        )
+        return _promo
 
     # Guard 3 (under the lock): a conclusive qualification verdict
     # (promoted/not_promoted/dry_run) for this candidate commit has been reached
@@ -1310,6 +1374,10 @@ _BLOCKER_LABELS: dict[str, str] = {
         "an Alembic revision-identity collision between the candidate and the "
         "deployed promotion target"
     ),
+    "migration_apply_drift": (
+        "the candidate's migration chain does not apply cleanly against "
+        "production's recorded schema state (deploy-fatal drift)"
+    ),
 }
 
 async def _resolve_migration_identity_at_finalize(
@@ -1387,6 +1455,80 @@ async def _resolve_migration_identity_at_finalize(
             exc,
         )
         return ("defer", f"migration-identity gate error: {exc}")
+
+
+async def _resolve_migration_apply_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> tuple[str, str | None]:
+    """Run the scratch-DB migration-apply gate at finalize time.
+
+    Distinct from :func:`_resolve_migration_identity_at_finalize` (which
+    compares migration FILENAMES for revision-id collisions): this dimension
+    reproduces the deployed upgrade against an isolated scratch DB seeded to
+    production's REAL recorded state (the live ``alembic_version`` stamp plus the
+    tables actually present) and asserts the resulting schema satisfies every
+    required object.  It catches the live-DB-stamped-ahead-of-real-schema class
+    (the v5 computejob renumber-skip) that the filename check structurally
+    cannot see.
+
+    Resolves the project's GitHub credentials and promotion-target branch, gets
+    the production engine via :func:`resolve_async_engine`, then delegates to
+    :func:`run_migration_apply_gate` — which owns ALL scratch-DB orchestration
+    (provision, seed, apply, drift-check).  This helper only adapts the qualifier
+    context to that engine's keyword contract; it does NOT reimplement it.
+
+    Returns the ``("ok"|"block"|"defer", detail)`` verdict:
+      * ``"ok"``    — the candidate applies cleanly; qualification proceeds.
+      * ``"block"`` — the resulting schema is missing a required object; the
+        caller turns this into the ``migration_apply_drift`` hard blocker
+        (confidence forced to 0).
+      * ``"defer"`` — production's state could not be read, the candidate's
+        migrations could not be fetched, or the scratch DB could not be
+        provisioned; the caller HOLDS the release rather than waving it through.
+
+    Mirrors the identity gate's inert edges: a MISSING ``candidate_sha``, a
+    vanished project, or unresolved GitHub credentials return ``("ok", None)``
+    so the gate stays inert for cases CI already blocks (the missing-SHA guard;
+    the finalize CI re-resolution degrading to ``ci_unresolved``).
+    """
+    if not candidate_sha:
+        return ("ok", None)
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return ("ok", None)
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return ("ok", None)
+        token, owner, repo = resolved
+        prod_engine = resolve_async_engine(session)
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            gh_token=token,
+            owner=owner,
+            repo=repo,
+            candidate_ref=candidate_sha,
+            project_id=str(version.project_id),
+        )
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-apply gate for v%d "
+            "candidate %s: %s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            verdict,
+            detail or "applies cleanly",
+        )
+        return verdict, detail
+    except Exception as exc:  # noqa: BLE001 — any failure HOLDS (never waves through)
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize migration-apply gate failed for "
+            "v%d (holding this attempt): %s",
+            version.version_number,
+            exc,
+        )
+        return ("defer", f"migration-apply gate error: {exc}")
 
 
 async def _finalize_qualification(
@@ -1689,6 +1831,29 @@ async def _finalize_qualification(
         )
     migration_collision = migration_verdict == "block"
 
+    # --- Deterministic scratch-DB migration-APPLY safety gate ---------------
+    # Complementary to the filename-identity check above: replay the candidate's
+    # migration chain the deploy way against production's REAL recorded schema
+    # state (live alembic_version stamp + present tables) on an isolated scratch
+    # DB, and HARD-block when the resulting schema is missing a required object
+    # (the v5 computejob renumber-skip class the filename check cannot see).  A
+    # 'defer' verdict (prod state unreadable, candidate fetch failed, scratch DB
+    # unprovisionable) HOLDS the release via _handle_infra_failure exactly like
+    # the identity gate's defer path — never waved through.
+    # Thread the exact SHA snapped into last_qualification through this gate;
+    # do not re-derive it from any live checkout state.
+    apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
+        session, version, candidate_sha
+    )
+    if apply_verdict == "defer":
+        return await _handle_infra_failure(
+            session,
+            version,
+            qual,
+            "migration_apply_check_unavailable",
+        )
+    migration_apply_blocked = apply_verdict == "block"
+
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
         ci_green=ci_green,
@@ -1699,6 +1864,7 @@ async def _finalize_qualification(
         smoketest_enabled=smoketest_enabled,
         ci_state=ci_resolution.get("state", _CI_RED),
         migration_collision=migration_collision,
+        migration_apply_blocked=migration_apply_blocked,
     )
 
     finalized_at = _utcnow().isoformat()
@@ -1723,6 +1889,8 @@ async def _finalize_qualification(
         "audit_reconciliation": audit_reconciliation,
         "migration_safety": migration_verdict,
         "migration_safety_detail": migration_detail,
+        "migration_apply_safety": apply_verdict,
+        "migration_apply_safety_detail": apply_detail,
     }
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
@@ -1784,6 +1952,14 @@ async def _finalize_qualification(
                 and migration_detail
             ):
                 blocker_label = f"{blocker_label} — {migration_detail}"
+            # The migration-apply blocker carries the specific missing object so
+            # the operator sees WHICH required table/column the candidate's chain
+            # would fail to create, not just the generic blocker label.
+            if (
+                composite["blocker"] == "migration_apply_drift"
+                and apply_detail
+            ):
+                blocker_label = f"{blocker_label} — {apply_detail}"
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "

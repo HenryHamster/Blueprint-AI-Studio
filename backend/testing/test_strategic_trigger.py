@@ -665,6 +665,68 @@ async def test_cancel_does_not_leave_receipt(db_session):
 
 
 @pytest.mark.asyncio
+async def test_operator_count_initial_value_for_fresh_markers(db_session):
+    """Fresh operator markers start with operator_count=1; fresh qualification
+    markers start with operator_count=0 so the UI coalesce badge is truthful."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_message", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert project.vision["_strategic_refresh"]["operator_count"] == 1
+
+    # Clear and re-arm with qualification origin
+    project.vision.pop("_strategic_refresh", None)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    await st.request_strategic_refresh(db_session, project.id, "post_qualification:promoted")
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert project.vision["_strategic_refresh"]["operator_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_count_tracks_only_operator_coalesces(db_session):
+    """Automated (qualification) coalesces must NOT increment operator_count;
+    only genuine operator requests count toward the operator-steer tally."""
+    project = await _make_project(db_session)
+    # First request: operator (operator_count = 1)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_message", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    # Three automated coalesces — operator_count must stay at 1
+    for _ in range(3):
+        await st.request_strategic_refresh(db_session, project.id, "post_qualification:promoted")
+        await db_session.commit()
+    await db_session.refresh(project)
+
+    marker = project.vision["_strategic_refresh"]
+    assert marker["count"] == 4         # total coalesces tracked as before
+    assert marker["operator_count"] == 1  # only the original operator request
+
+
+@pytest.mark.asyncio
+async def test_operator_count_increments_on_each_operator_coalesce(db_session):
+    """Each additional operator request increments operator_count so the UI can
+    show '+N steers coalesced' accurately for back-to-back human steers."""
+    project = await _make_project(db_session)
+    for _ in range(4):
+        await st.request_strategic_refresh(
+            db_session, project.id, "operator_message", origin=st.ORIGIN_OPERATOR
+        )
+        await db_session.commit()
+    await db_session.refresh(project)
+
+    marker = project.vision["_strategic_refresh"]
+    assert marker["count"] == 4
+    assert marker["operator_count"] == 4
+
+
+@pytest.mark.asyncio
 async def test_cancel_is_idempotent_noop_when_nothing_armed(db_session):
     """Cancelling with no marker pending is a harmless no-op returning False,
     so a duplicate/late client retry cannot error."""

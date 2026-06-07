@@ -12,11 +12,15 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
-  writePlaybookHelper, formatPlaybook, type PlaybookEntry,
+  writePlaybookHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
+import {
+  writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
+} from './strategic-helpers.js';
 import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
 } from '../json-extract.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 
 // Reads the design progress markdown the agent writes for retry context.
 // Mirrors readWebResearchProgress but for the design kind. Returns the content
@@ -131,6 +135,16 @@ export async function handleDesign(
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
   writePlaybookHelper(taskId);
+  // The design prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|section|playbook) so the
+  // design agent can resolve refs trimmed from its launch snapshot. project_id is
+  // set for all task types by the backend; if it is missing we skip BOTH the
+  // helper AND its prompt advertisement so we never promise a helper we didn't write.
+  const designProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (designProjectId) writeFetchHelper(taskId, designProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const designFetchGuidance = designProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
 
   const disallowedTools = configureAgentPermissions('design');
 
@@ -146,12 +160,22 @@ export async function handleDesign(
   const documentPath = `/tmp/design_document_${taskId}.json`;
   const progressPath = `/tmp/design_progress_${taskId}.md`;
 
+  // Pull the most relevant existing knowledge documents (topic preferred, else
+  // the prompt) so the design builds on prior knowledge instead of re-deriving
+  // from scratch and silently duplicating or contradicting an existing design.
+  // Fail-soft: an empty list yields no section and no failure.
+  const priorDocs = await fetchPriorKnowledge(topic || prompt);
+  if (priorDocs.length > 0) {
+    sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the design prompt\n`);
+  }
+  const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
+
   const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Design question:
 ${prompt}
 
-# HOW TO DESIGN
+${priorKnowledgeSection}# HOW TO DESIGN
 1. Explore the codebase THOROUGHLY — read the real modules, types, and call sites relevant to the question. Use subagents for parallel exploration.
 2. Ground every design decision in what the code ACTUALLY does today. Reference concrete files and symbols; do not invent structure that isn't there.
 3. Propose a concrete, reviewable design: the components involved, how they interact, the data/contract shapes, the trade-offs, and the migration/rollout path where relevant.
@@ -180,9 +204,11 @@ ALSO write ${progressPath} — a concise markdown summary (under ~3000 chars) of
 ## Codebase
 ${fileTreeSection}
 
+Read full design-doc section prose on demand with \`./design-doc get <key>\` (list keys with \`./design-doc list\`).
+
 ${PLAYBOOK_GUIDANCE}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running design analysis...';
   const fingerprint = computePromptFingerprint('design');

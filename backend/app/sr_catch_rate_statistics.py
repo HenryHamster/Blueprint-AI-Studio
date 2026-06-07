@@ -20,5 +20,4 @@ from app.sr_analytics_common import (  # noqa: F401 — re-exported facade surfa
     _compute_reasoning_engagement,
     _is_trend_significant,
     _percentile,
-    _score_reasoning_quality,
 )

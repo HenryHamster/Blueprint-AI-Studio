@@ -90,6 +90,14 @@ vi.mock('./code-change.js', () => ({
   runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
+// PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the
+// genuine text and the writer-invocation assertions can inspect the call args.
+vi.mock('./strategic-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./strategic-helpers.js')>();
+  return { ...actual, writeFetchHelper: vi.fn() };
+});
+
 vi.mock('fs', () => {
   const stub = {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -126,6 +134,7 @@ import { runCodeChangeTask } from './code-change.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import { computePromptFingerprint, buildScopedLintOneliner } from '../prompt.js';
+import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 
 const BLUEPRINT_CONFIG = {
   directories: [
@@ -317,6 +326,52 @@ describe('handleFix — operator steering (strategic_intent)', () => {
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('## Operator Steering');
     expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+});
+
+// ── handleFix: stale-premise / provenance notice ───────────────────────────
+describe('handleFix — provenance / stale-premise notice', () => {
+  const hist = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+
+  it('renders the stale-premise notice when _provenance_warnings is present', async () => {
+    await handleFix(
+      'task-provenance-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 9, prompt: 'address review' },
+      {
+        context: {
+          scope: 'small',
+          review_loop: { iteration: 2, review_history: hist },
+          _provenance_warnings: {
+            cited_files_changed_since_generation: true,
+            broken_source_ref_count: 2,
+            broken_refs: ['app/foo.py:5', 'app/bar.ts'],
+          },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Stale-premise notice');
+    expect(prompt).toContain('Cited files changed since the finding was generated');
+    expect(prompt).toContain('2 broken/missing citation(s)');
+    expect(prompt).toContain('app/foo.py:5');
+    expect(prompt).toContain('REPRODUCE-FIRST');
+    // Additive — existing review context still present.
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('omits the stale-premise notice when _provenance_warnings is absent', async () => {
+    await handleFix(
+      'task-no-provenance-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 10, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: hist } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('## Stale-premise notice');
   });
 });
 
@@ -972,6 +1027,109 @@ describe('handleReview — verdict file parsing', () => {
   });
 });
 
+// ── handleReview: project vision and strategic intent (direction goal) ────────
+describe('handleReview — project vision and strategic intent (direction goal)', () => {
+  const basePayload = {
+    pr_number: 50,
+    branch: 'feature/strategic',
+    base_branch: 'main',
+    original_prompt: 'Review the changes',
+  };
+
+  it('surfaces project vision in the review prompt when vision is present', async () => {
+    await handleReview(
+      'task-review-vision',
+      basePayload,
+      {
+        context: { scope: 'medium' },
+        vision: {
+          purpose: 'Ship the right user outcome.',
+          success_criteria: ['The fix is validated by the review feedback.'],
+          priorities: ['Keep the change minimal.'],
+          context: 'Reviewers should understand why this work matters.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Project Vision');
+    expect(prompt).toContain('**Purpose:** Ship the right user outcome.');
+    expect(prompt).toContain('**Success criteria:**');
+    expect(prompt).toContain('- The fix is validated by the review feedback.');
+    expect(prompt).toContain('**Priorities:**');
+    expect(prompt).toContain('- Keep the change minimal.');
+    expect(prompt).toContain('**Context:** Reviewers should understand why this work matters.');
+  });
+
+  it('surfaces strategic intent in the review prompt when strategic_intent is present', async () => {
+    await handleReview(
+      'task-review-steering',
+      basePayload,
+      {
+        context: { scope: 'medium' },
+        strategic_intent: {
+          purpose: 'Build an autonomous coding studio.',
+          current_focus: 'Thread operator steering into tactical prompts.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
+    expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
+  });
+
+  it('surfaces both vision and strategic intent in the review prompt when both are present', async () => {
+    await handleReview(
+      'task-review-both',
+      basePayload,
+      {
+        context: { scope: 'medium' },
+        vision: {
+          purpose: 'Ship the right user outcome.',
+          success_criteria: ['The fix is validated.'],
+          priorities: ['Keep it minimal.'],
+          context: 'Why this matters.',
+        },
+        strategic_intent: {
+          purpose: 'Build an autonomous studio.',
+          current_focus: 'Strategic steering.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    // Both sections must be present
+    expect(prompt).toContain('## Project Vision');
+    expect(prompt).toContain('Ship the right user outcome.');
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('Build an autonomous studio.');
+    // Vision must come before Operator Steering
+    const visionIdx = prompt.indexOf('## Project Vision');
+    const steeringIdx = prompt.indexOf('## Operator Steering');
+    expect(visionIdx).toBeLessThan(steeringIdx);
+  });
+
+  it('omits strategic framing sections when neither vision nor strategic_intent is present', async () => {
+    await handleReview(
+      'task-review-no-framing',
+      basePayload,
+      { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Project Vision');
+    expect(prompt).not.toContain('## Operator Steering');
+    // But the review still works with base content
+    expect(prompt).toContain('Review the changes');
+  });
+});
+
 // ── handleReview: deleted-head-branch protection ─────────────────────────────
 describe('handleReview — deleted head branch short-circuit', () => {
   const basePayload = {
@@ -1379,6 +1537,33 @@ describe('handleFix — code-change helper guidance is in prompt', () => {
     expect(prompt).toContain('./pr');
     expect(prompt).toContain('./done');
     expect(prompt).toContain('./fail');
+  });
+});
+
+describe('handleFix — acceptance evidence is in prompt', () => {
+  it('prepends the acceptance-evidence block when declared', async () => {
+    await handleFix(
+      'task-fix-acceptance',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'address review feedback',
+        acceptance_evidence: {
+          kind: 'named_test',
+          test_path: 'testing/test_widget.py',
+          test_id: 'test_widget_handles_empty',
+        },
+      },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('testing/test_widget.py');
+    expect(prompt).toContain('test_widget_handles_empty');
+    expect(prompt).toContain('real merge-test verdict');
   });
 });
 
@@ -2809,5 +2994,62 @@ describe('handleFix — parallel-fix fan-out gating', () => {
       expect.stringContaining('"fix_was_parallelized":true'),
       'utf-8',
     );
+  });
+});
+
+// ── Read-only ./fetch provisioning + guidance ─────────────────────────────────
+describe('mid-run ./fetch provisioning for review/fix', () => {
+  const reviewPayload = { pr_number: 5, branch: 'feat/y', base_branch: 'main', original_prompt: '' };
+  const fixPayload = { branch: 'feat/y', base_branch: 'main', pr_number: 5, prompt: 'address review' };
+  const fixContext = { context: { scope: 'small', review_loop: { iteration: 1, review_history: [] } } };
+
+  it('handleReview advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    await handleReview(
+      'task-review-fetch', reviewPayload,
+      { context: { scope: 'medium' }, project_metadata: { project_id: 'p-rev' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    expect(prompt).toContain('./fetch direction <id>');
+    expect(prompt).toContain('./fetch section <key>');
+    expect(prompt).toContain('./fetch playbook <key>');
+    expect(prompt).not.toContain('./fetch problem-model');
+    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+      'task-review-fetch', 'p-rev', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleReview omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    await handleReview(
+      'task-review-nofetch', reviewPayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
+  });
+
+  it('handleFix advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    await handleFix(
+      'task-fix-fetch', fixPayload,
+      { ...fixContext, project_metadata: { project_id: 'p-fix' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+      'task-fix-fetch', 'p-fix', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleFix omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    await handleFix(
+      'task-fix-nofetch', fixPayload, fixContext,
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
   });
 });

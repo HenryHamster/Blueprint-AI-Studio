@@ -391,6 +391,149 @@ async def classify_existing_paths(
     return present, missing
 
 
+async def _git_output(
+    args: List[str], repo_root: str = _REPO_ROOT, timeout: int = 5
+) -> Optional[str]:
+    """Run ``git <args>`` in *repo_root* and return stdout, or None on any failure.
+
+    Conservative by construction: a missing checkout, non-zero exit, timeout, or
+    any exception all collapse to None so callers degrade rather than guess.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        if proc.returncode != 0:
+            return None
+        return stdout.decode(errors="replace")
+    except Exception:
+        logger.debug("[SOURCE_REF_VALIDATION] git %s failed", args, exc_info=True)
+        return None
+
+
+async def resolve_head_commit(
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Optional[str]:
+    """Resolve the current HEAD commit SHA of the integration/verification branch.
+
+    Uses the GitHub API (the branch tip) when ``token/owner/repo/branch`` are all
+    provided — the backend has no local checkout in prod — and falls back to the
+    local checkout's ``git rev-parse HEAD`` otherwise (the agent VM has one).
+    Returns None when indeterminate (no creds + no checkout, or any API/git
+    error) so a finding is never stamped with a bogus provenance SHA. Mirrors the
+    conservative degradation of :func:`validate_source_refs`.
+    """
+    if all([token, owner, repo, branch]):
+        try:
+            from app.github_refs import get_branch_sha
+
+            return await get_branch_sha(
+                str(token), str(owner), str(repo), str(branch)
+            )
+        except Exception:
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] head-commit GitHub resolution failed",
+                exc_info=True,
+            )
+    out = await _git_output(["rev-parse", "HEAD"], cwd)
+    return out.strip() if out and out.strip() else None
+
+
+def finding_cited_paths(finding: Dict[str, Any]) -> List[str]:
+    """Extract the file paths a finding cites via its file-type ``sources``.
+
+    PR and message sources are skipped; line/range suffixes are stripped. Only
+    refs that look like file paths are returned, ready to test against a diff.
+    """
+    paths: List[str] = []
+    if not isinstance(finding, dict):
+        return paths
+    for src in finding.get("sources") or []:
+        if not isinstance(src, dict):
+            continue
+        if (src.get("type") or "").lower() in ("pr", "message"):
+            continue
+        ref = src.get("ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        path, _, _ = _parse_ref(ref)
+        if path and _looks_like_file_path(path):
+            paths.append(path)
+    return paths
+
+
+async def cited_paths_changed_since(
+    sha: Optional[str],
+    paths: list,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Optional[bool]:
+    """Return whether any of *paths* changed between *sha* and current HEAD.
+
+    Tri-state, mirroring :func:`validate_source_refs`:
+      * True  — the diff was computed and at least one cited path appears in it.
+      * False — the diff was computed and none of the cited paths changed.
+      * None  — indeterminate (unknown SHA, no cited paths, no creds + no
+                checkout, or an API/git error). Callers MUST NOT treat None as
+                "changed": only an affirmative True flags a finding stale.
+    """
+    if not sha:
+        return None
+    norm = {
+        _parse_ref(p)[0] for p in paths if isinstance(p, str) and p
+    }
+    norm.discard("")
+    if not norm:
+        return None
+    if all([token, owner, repo, branch]):
+        try:
+            from app.github_refs import get_files_changed_between_refs
+
+            changed = await get_files_changed_between_refs(
+                str(token),
+                str(owner),
+                str(repo),
+                sha,
+                str(branch),
+                project_id=project_id,
+            )
+        except Exception:
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] changed-files GitHub compare failed",
+                exc_info=True,
+            )
+            changed = None
+    else:
+        out = await _git_output(["diff", "--name-only", f"{sha}..HEAD"], cwd)
+        changed = out.splitlines() if out is not None else None
+    if changed is None:
+        return None
+    changed_set = {c for c in changed if c}
+    return any(c in changed_set for c in norm)
+
+
 # Recognizes the `path/to/file.ext:symbol` convention used in finding claims
 # (e.g. "backend/app/x.py:my_func stores Y"). The symbol must start with a
 # letter or underscore, which excludes line-number refs like file.py:42.
@@ -1276,3 +1419,309 @@ async def validate_source_refs(
         validated.append(source)
 
     return validated
+
+
+# ── Free-text bug-report citation grounding ───────────────────────────────────
+# Agent/operator-submitted BUG_REPORT (and BLOCKER) findings arrive as free
+# prose, not the structured ``sources``/``claims`` a research finding carries.
+# The helpers below reuse the SAME validation machinery research findings flow
+# through (file existence via :func:`validate_source_refs`/:func:`summarize_broken_refs`,
+# symbol grounding via :func:`detect_absent_symbols`) so a bug report whose cited
+# code was already refactored away or fixed is flagged — and discounted — exactly
+# like a stale research citation, instead of being trusted blindly.
+
+CITATION_STATE_ABSENT = "absent"
+CITATION_STATE_PRESENT = "present"
+CITATION_STATE_INDETERMINATE = "indeterminate"
+
+
+def classify_reproduction(
+    *,
+    present_file_count: int,
+    broken_file_count: int,
+    total_symbol_refs: int,
+    ungrounded_symbol_count: int,
+    has_backend: bool,
+) -> str:
+    """Single conservative reproduce-on-HEAD verdict shared by every gate.
+
+    The one place the "does this finding/bug-report still reproduce on the
+    integration HEAD?" question is decided, so finding ingestion, deferred-finding
+    recovery, and the bug-report citation summary all agree by construction.
+
+    Inputs are pre-computed counts from the EXISTING grounding helpers:
+      * ``present_file_count``  — file citations that resolve at HEAD (a file ref
+        not marked ``valid: False`` by :func:`validate_source_refs`; an
+        indeterminate file is counted here so an unknowable file never drives a
+        rejection).
+      * ``broken_file_count``   — file citations unambiguously absent at HEAD
+        (``broken_source_ref_count`` from :func:`summarize_broken_refs`).
+      * ``total_symbol_refs``   — distinct ``path:symbol`` references parsed from
+        the claims/excerpts (:func:`_parse_path_symbol_refs`).
+      * ``ungrounded_symbol_count`` — of those, the count unambiguously absent
+        (:func:`detect_absent_symbols`).
+      * ``has_backend``         — whether any existence/symbol check could run at
+        all (:func:`_has_validation_backend`).
+
+    Returns:
+      * :data:`CITATION_STATE_ABSENT` ONLY when at least one citation was actually
+        checkable, ZERO file citations survive, and EVERY parseable ``path:symbol``
+        reference is ungrounded — i.e. nothing the input cites still exists.
+      * :data:`CITATION_STATE_INDETERMINATE` when no backend was available or
+        nothing was checkable (no citations, or every check degraded). A
+        checkout-less prod backend therefore NEVER rejects.
+      * :data:`CITATION_STATE_PRESENT` otherwise — any surviving file or grounded
+        symbol (including a partially-grounded input) passes through.
+
+    Mirrors the conservative tri-state semantics of :func:`validate_source_refs`:
+    an indeterminate or partially-grounded input is never reported ``absent``.
+    """
+    if not has_backend:
+        return CITATION_STATE_INDETERMINATE
+    # A surviving (present-or-unknowable) file citation means cited code remains.
+    if present_file_count > 0:
+        return CITATION_STATE_PRESENT
+    # A grounded symbol (any parseable ref not proven absent) likewise survives.
+    # Indeterminate symbols count as grounded here, so an inconclusive symbol
+    # check never tips a verdict to ``absent``.
+    if (total_symbol_refs - ungrounded_symbol_count) > 0:
+        return CITATION_STATE_PRESENT
+    # Nothing survives. Reject ONLY when at least one citation came back
+    # unambiguously absent; if nothing could actually be checked, stay
+    # indeterminate so a git/API outage never spuriously rejects.
+    if broken_file_count > 0 or ungrounded_symbol_count > 0:
+        return CITATION_STATE_ABSENT
+    return CITATION_STATE_INDETERMINATE
+
+
+def _extract_bug_report_file_refs(
+    content: Any, structured_context: Optional[Dict[str, Any]] = None
+) -> List[str]:
+    """Extract repo-relative file paths cited in a bug report's free text.
+
+    References are pulled two ways, mirroring the design-doc grounding path:
+    - From the prose via :data:`_DESIGN_DOC_PATH_RE`, which matches repo-relative
+      ``backend|agent|admin-ui/.../<name>.<ext>`` tokens embedded anywhere in the
+      text (the same regex :func:`_extract_design_doc_paths` uses on notes).
+    - From an optional ``structured_context`` mapping's ``file_path`` field (e.g.
+      an agent annotation's ``file_path``), so a structured pointer is grounded
+      even when the prose does not repeat it.
+
+    Line/range suffixes (``:42``, ``#L10-L20``) are stripped via
+    :func:`_parse_ref`, non-file-looking tokens are dropped, and the result is
+    deduplicated and order-preserving.
+    """
+    paths: List[str] = []
+    seen: set = set()
+
+    def _add(raw: Any) -> None:
+        if not isinstance(raw, str) or not raw:
+            return
+        path, _, _ = _parse_ref(raw.strip())
+        if path and _looks_like_file_path(path) and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    if isinstance(structured_context, dict):
+        _add(structured_context.get("file_path"))
+    if isinstance(content, str) and content:
+        for match in _DESIGN_DOC_PATH_RE.finditer(content):
+            _add(match.group(1))
+    return paths
+
+
+def _has_validation_backend(
+    token: str | None,
+    owner: str | None,
+    repo: str | None,
+    branch: str | None,
+    cwd: str,
+) -> bool:
+    """Whether existence/symbol checks have any usable backend to consult.
+
+    True when full GitHub credentials are present, or a local git checkout
+    exists at *cwd*. When neither is available every check degrades to
+    indeterminate, so the caller must NOT report a clean result as ``present``.
+    """
+    if all([token, owner, repo, branch]):
+        return True
+    return bool(cwd and os.path.isdir(os.path.join(cwd, ".git")))
+
+
+async def summarize_bug_report_citations(
+    content: Any,
+    *,
+    structured_context: Optional[Dict[str, Any]] = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Dict[str, Any]:
+    """Ground a free-text bug report's citations against the integration branch.
+
+    Extracts file references and ``path:symbol`` references from *content* (and an
+    optional *structured_context* mapping, e.g. an annotation's ``file_path``) —
+    see :func:`_extract_bug_report_file_refs` and :func:`_parse_path_symbol_refs`
+    for exactly how references are pulled from the prose — then validates each
+    against the project's real integration branch reusing the existing machinery:
+    file existence via :func:`validate_source_refs` + :func:`summarize_broken_refs`,
+    symbol presence via :func:`detect_absent_symbols`.
+
+    Returns a structured signal mirroring :func:`summarize_broken_refs`::
+
+        {"citation_state": "absent"|"present"|"indeterminate",
+         "broken_refs": [path, ...],
+         "ungrounded_refs": ["path:symbol", ...]}
+
+    Degradation is conservative and consistent with :func:`validate_source_refs`:
+    a reference is only ``absent`` when it is UNAMBIGUOUSLY missing on the branch.
+    When NO references can be extracted, or no validation backend is available
+    (no credentials and no local checkout), the state is ``indeterminate`` and is
+    NEVER reported as ``absent``/broken. Best-effort: any internal error degrades
+    to an empty (indeterminate) result rather than raising.
+    """
+    file_paths = _extract_bug_report_file_refs(content, structured_context)
+    symbol_pairs = _parse_path_symbol_refs(content)
+
+    broken_refs: List[str] = []
+    if file_paths:
+        sources = [{"type": "file", "ref": p} for p in file_paths]
+        try:
+            validated = await validate_source_refs(
+                sources,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+                cwd=cwd,
+            )
+            broken = summarize_broken_refs(validated)
+            if broken:
+                broken_refs = list(broken.get("broken_refs") or [])
+        except Exception:  # noqa: BLE001 — grounding must never raise to the caller
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] bug-report file-citation check failed",
+                exc_info=True,
+            )
+            broken_refs = []
+
+    ungrounded_refs: List[str] = []
+    if symbol_pairs:
+        try:
+            ungrounded_refs = await detect_absent_symbols(
+                None,
+                [content],
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+        except Exception:  # noqa: BLE001 — grounding must never raise to the caller
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] bug-report symbol-grounding check failed",
+                exc_info=True,
+            )
+            ungrounded_refs = []
+
+    # Delegate the absent/present/indeterminate verdict to the single shared
+    # reproduce-on-HEAD classifier so bug-report grounding agrees with finding
+    # ingestion by construction: ``absent`` only when NOTHING the report cites
+    # still exists; any surviving independent file (or grounded symbol) keeps the
+    # verdict non-absent (a partially-grounded report counts as ``present``).
+    #
+    # CRITICAL: ``_DESIGN_DOC_PATH_RE`` also surfaces the host path of a
+    # ``path:symbol`` token as a standalone file ref, so a file that appears
+    # ONLY as the host of an explicitly-cited (now-absent) symbol must NOT be
+    # counted as an independent surviving file — otherwise the symbol-locus-absent
+    # case (present host file + absent symbol) would wrongly flip to ``present``.
+    symbol_host_paths = {path for path, _symbol in symbol_pairs}
+    present_file_count = sum(
+        1
+        for path in file_paths
+        if path not in broken_refs and path not in symbol_host_paths
+    )
+    # A definitively-broken file ref or ungrounded symbol can only have been
+    # produced by a backend that actually ran, so treat their presence as proof
+    # a backend was consulted even when the credentials/local-checkout heuristic
+    # cannot see one (e.g. a checkout-less prod path whose existence check still
+    # resolved to a hard 404). ``classify_reproduction`` trusts ``has_backend``
+    # absolutely — without this, a confirmed-absent citation would be suppressed
+    # to ``indeterminate`` and never flagged. Empty broken/ungrounded sets leave
+    # ``has_backend`` driven solely by the heuristic, so an unknowable (None)
+    # check still degrades to ``indeterminate``, never ``absent``.
+    has_backend = (
+        _has_validation_backend(token, owner, repo, branch, cwd)
+        or bool(broken_refs)
+        or bool(ungrounded_refs)
+    )
+    state = classify_reproduction(
+        present_file_count=present_file_count,
+        broken_file_count=len(broken_refs),
+        total_symbol_refs=len(symbol_pairs),
+        ungrounded_symbol_count=len(ungrounded_refs),
+        has_backend=has_backend,
+    )
+
+    return {
+        "citation_state": state,
+        "broken_refs": broken_refs,
+        "ungrounded_refs": ungrounded_refs,
+    }
+
+
+def should_persist_message_citation_warning(signal: Any) -> bool:
+    """Whether a citation signal should be stored on message/task context.
+
+    We only persist signals that carry operator/strategist-facing provenance:
+    a fully stale ``absent`` verdict, or a mixed non-absent verdict that still
+    has broken/ungrounded refs worth surfacing. Clean ``present`` and empty
+    ``indeterminate`` results are omitted to avoid storing noise.
+    """
+    if not isinstance(signal, dict):
+        return False
+    if signal.get("citation_state") == CITATION_STATE_ABSENT:
+        return True
+    broken_refs = signal.get("broken_refs")
+    if isinstance(broken_refs, list) and broken_refs:
+        return True
+    ungrounded_refs = signal.get("ungrounded_refs")
+    return isinstance(ungrounded_refs, list) and bool(ungrounded_refs)
+
+
+async def compute_message_citation_warning(
+    session: Any,
+    project: Any,
+    content: Any,
+    *,
+    structured_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort citation warning for a BUG_REPORT/BLOCKER message, or None.
+
+    Resolves the project's integration-branch verification context (via
+    :func:`resolve_branch_verification_context`) and runs
+    :func:`summarize_bug_report_citations`. Returns the structured signal when
+    it carries actionable provenance for downstream consumers: a fully stale
+    ``absent`` verdict, or a mixed non-absent verdict with broken/ungrounded
+    refs that should remain visible. Clean ``present``/``indeterminate`` inputs
+    still return None so message creation does not accumulate noise. Never
+    raises: any failure degrades to None, so message creation is never blocked
+    by grounding.
+    """
+    try:
+        ctx = await resolve_branch_verification_context(session, project)
+        signal = await summarize_bug_report_citations(
+            content, structured_context=structured_context, **ctx
+        )
+    except Exception:  # noqa: BLE001 — best-effort, must never fail message creation
+        logger.debug(
+            "[SOURCE_REF_VALIDATION] message citation warning computation failed",
+            exc_info=True,
+        )
+        return None
+    if should_persist_message_citation_warning(signal):
+        return signal
+    return None

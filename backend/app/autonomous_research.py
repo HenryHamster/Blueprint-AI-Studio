@@ -21,6 +21,7 @@ from app.models import (
     AlertSeverity,
 )
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.knowledge_query import build_knowledge_index
 from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
@@ -34,7 +35,10 @@ from app.shared_state import (
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.task_capabilities import STRATEGIC_TASK_TYPES
-from app.task_locking import with_vision_locked
+from app.task_locking import (
+    acquire_direction_research_spawn_lock,
+    with_vision_locked,
+)
 from app.time_utils import _utcnow
 from app.direction_mode import (
     append_prompt_suffix,
@@ -50,6 +54,10 @@ from app.source_ref_validation import (
     classify_existing_paths,
     detect_absent_symbols,
     resolve_branch_verification_context,
+)
+from app.capability_demand import (
+    fetch_missing_demand_for_spawn,
+    missing_demand_prompt_hint,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +105,11 @@ def research_direction_claim_key(
     """
     base = f"research-direction:{project_id}:{direction_id or _CLAIM_UNDIRECTED}"
     return f"{base}:pipelined" if pipelined else base
+
+
+def research_idempotency_key(project_id, direction_id) -> str:
+    """Compatibility wrapper for the canonical primary research claim key."""
+    return research_direction_claim_key(project_id, direction_id)
 
 
 def _research_spawn_lock_key(project_id) -> int:
@@ -1334,7 +1347,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         TaskStatus.IN_PROGRESS,
                     ]
                 ),
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1360,7 +1373,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         TaskStatus.EVALUATING,
                     ]
                 ),
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1405,7 +1418,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 Task.project_id == project.id,
                 Task.created_by == "ORCHESTRATOR",
                 Task.created_at >= one_hour_ago,
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1856,6 +1869,27 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         if project.build_config:
             research_payload["build_config"] = project.build_config
+        # Surface aggregated missing-foundation demand so the research agent can
+        # propose/create the absent foundation capability or recommend retiring the
+        # stranded demand. Advisory + additive: read-only, fail-open, injected only
+        # when demand is non-empty, and it does NOT bypass the spawn dedup/cooldown/
+        # circuit-breaker guards that already ran above.
+        _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+        if _missing_demand.get("demands"):
+            research_payload["missing_capability_demand"] = _missing_demand
+            _demand_hint = missing_demand_prompt_hint(_missing_demand)
+            if _demand_hint:
+                append_prompt_suffix(research_payload, _demand_hint)
+        # Compact, body-omitted index of existing knowledge documents
+        # (web_research / design output), scoped to this project and — when the
+        # cycle is directed — the current direction first. Lets the research
+        # agent ground findings in knowledge that already exists and fetch full
+        # bodies on demand. Included only when documents exist.
+        _knowledge_index = await build_knowledge_index(
+            session, project.id, direction_id=current_dir_id
+        )
+        if _knowledge_index:
+            research_payload["knowledge_index"] = _knowledge_index
         research_payload = validate_internal_payload(
             research_payload, "autonomous_research:research"
         )
@@ -1931,6 +1965,111 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"[AUTONOMOUS] Injecting {len(dir_deferred)} deferred finding(s) from previous "
                 f"research cycle(s) into new research task for direction {current_dir_id or 'undirected'}"
             )
+
+        await acquire_direction_research_spawn_lock(
+            session, project.id, current_dir_id
+        )
+        if current_dir_id is not None:
+            locked_direction_research = [
+                task
+                for task in (
+                    (
+                        await session.execute(
+                            select(Task).where(
+                                Task.project_id == project.id,
+                                Task.status.in_(
+                                    [
+                                        TaskStatus.QUEUED,
+                                        TaskStatus.PROVISIONING,
+                                        TaskStatus.IN_PROGRESS,
+                                        TaskStatus.EVALUATING,
+                                        TaskStatus.BLOCKED,
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if task.first_payload.get("type") == "research"
+                and task.first_payload.get("current_direction_id") == current_dir_id
+            ]
+            is_pipelined_spawn = current_dir_id in pipelined_direction_ids
+            if is_pipelined_spawn:
+                if len(locked_direction_research) != 1:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — expected one stuck parent, found %s active task(s)",
+                        project.id,
+                        current_dir_id,
+                        len(locked_direction_research),
+                    )
+                    continue
+                locked_parent = locked_direction_research[0]
+                if locked_parent.status != TaskStatus.EVALUATING:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — active holder is %s, not stale EVALUATING",
+                        project.id,
+                        current_dir_id,
+                        locked_parent.status,
+                    )
+                    continue
+                locked_updated = locked_parent.updated_at
+                if locked_updated is not None and locked_updated.tzinfo is not None:
+                    locked_updated = locked_updated.replace(tzinfo=None)
+                if locked_updated is None or (
+                    (now - locked_updated).total_seconds() / 60
+                ) < evaluating_timeout_minutes:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — parent is no longer stale enough",
+                        project.id,
+                        current_dir_id,
+                    )
+                    continue
+                locked_parent_has_active_children = (
+                    (
+                        await session.execute(
+                            select(Task.id).where(
+                                Task.parent_task_id == locked_parent.id,
+                                Task.status.in_(
+                                    [
+                                        TaskStatus.QUEUED,
+                                        TaskStatus.PROVISIONING,
+                                        TaskStatus.IN_PROGRESS,
+                                        TaskStatus.EVALUATING,
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                    is not None
+                )
+                locked_parent_has_open_pr = bool(
+                    ((locked_parent.context or {}).get("review_loop") or {}).get(
+                        "pr_number"
+                    )
+                )
+                if locked_parent_has_active_children or locked_parent_has_open_pr:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — parent resumed progress",
+                        project.id,
+                        current_dir_id,
+                    )
+                    continue
+            elif locked_direction_research:
+                logger.info(
+                    "[AUTONOMOUS] Skipping research for project %s direction %s "
+                    "under lock — a concurrent task already holds the direction",
+                    project.id,
+                    current_dir_id,
+                )
+                continue
 
         new_task = Task(
             project_id=project.id,
@@ -2279,7 +2418,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (
+from app.autonomous_research_residual import (  # noqa: E402
     _spawn_residual_fingerprint_remediation,
 )
 

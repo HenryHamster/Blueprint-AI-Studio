@@ -992,6 +992,23 @@ def _compute_scope_overflow_warning(
     }
 
 
+# Marker convention for the ``requires_approval`` hold reason. When a task is
+# held out of dispatch (``requires_approval=True``) because of a deliberate
+# SPEND/BUDGET decision — as opposed to a review-pipeline ESCALATION — the set
+# site stamps ``task.context["approval_hold_reason"] = SPEND_BUDGET_APPROVAL_HOLD_REASON``.
+# The recovery sweep keys off this marker to give spend/budget holds a separate,
+# longer, operator-configurable window that resolves to a CLEAN NON-FAILURE
+# CANCELLED terminal instead of the review-escalation 2h→FAILED disposition (a
+# cost decision an operator simply has not reached is not a pipeline failure).
+#
+# ABSENCE of the marker MUST preserve today's review-escalation behavior exactly
+# — do NOT stamp it at any review-escalation set site. Currently set in
+# research_completion.py for the large-scope-budget-mismatch path below; the
+# future compute_experiment spend-threshold hold MUST reuse this same constant
+# so both paths share one recovery-sweep branch.
+SPEND_BUDGET_APPROVAL_HOLD_REASON = "spend_budget"
+
+
 def check_scope_budget_mismatch(
     scope: str,
     related_files: list[str] | None,
@@ -1006,6 +1023,10 @@ def check_scope_budget_mismatch(
     - scope_calibrated_from is set when the scope is upgraded.
     - scope_budget_warning is a human-readable string when a mismatch is detected.
     - requires_approval is True only for large-scope findings with too many files.
+      When the caller sets ``requires_approval`` from this gate it MUST also stamp
+      ``approval_hold_reason=SPEND_BUDGET_APPROVAL_HOLD_REASON`` on the task
+      context so the recovery sweep treats the hold as a deliberate spend/budget
+      decision (clean non-failure timeout) rather than a review escalation.
     """
     n = len(related_files) if related_files else 0
     _large_limit = (SCOPE_FILE_BUDGETS.get("large") or {}).get("total_files_max") or 20

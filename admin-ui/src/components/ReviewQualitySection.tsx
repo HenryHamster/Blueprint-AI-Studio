@@ -351,7 +351,10 @@ export function ReviewQualitySection({
           );
         })()}
         {digest?.self_review_prediction_accuracy?.prediction_hit_rate != null && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+          <div
+            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+            title="SR Prediction Hit Rate: share of issues flagged by SR that the reviewer LLM also flagged. This is inter-agent agreement against the reviewer LLM, not human validation."
+          >
             <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
             <p className={`text-xl font-bold font-mono ${digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.7 ? 'text-emerald-400' : digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.4 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.self_review_prediction_accuracy.prediction_hit_rate * 100)}%

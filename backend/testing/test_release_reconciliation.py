@@ -172,9 +172,7 @@ async def test_reconcile_pending_auto_merge_skips_on_single_branch(db_session, m
     is_ancestor = mocker.patch(
         "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
     )
-    get_pr = mocker.patch(
-        "app.github.get_pull_request", new=AsyncMock(return_value={})
-    )
+    get_pr = mocker.patch("app.github.get_pull_request", new=AsyncMock(return_value={}))
 
     _project, version = await _make_project_and_version(
         db_session, integration_branch="trunk", promotion_target="trunk"
@@ -332,26 +330,20 @@ async def test_reconcile_migration_carrying_candidate_reconciles_to_promoted(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Target branch currently has the candidate's migration (it already merged) —
     # no duplicates, so the post-merge check sees a clean chain.
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # Full-chain health check reads each migration's source: a clean single-head
     # chain (0099 -> 0100), so the candidate's own merge is not falsely blocked.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0099"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0099"})),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -361,32 +353,36 @@ async def test_reconcile_migration_carrying_candidate_reconciles_to_promoted(
 
     # Test both reconcile paths (promotion_failed and pending_auto_merge).
     for build_version in [
-        lambda v, sha: v.__setattr__(
-            "last_qualification",
-            {
-                "status": "promotion_failed",
-                "candidate_sha": sha,
-                "pr_url": "https://github.com/acme/widget/pull/42",
-                "error": "merge_blocked",
-                "confidence": 0.95,
-            },
-        )
-        or v,
-        lambda v, sha: v.__setattr__(
-            "last_qualification",
-            {
-                "status": "pending",
-                "candidate_sha": sha,
-                "confidence": 0.95,
-                "promotion_pending": {
-                    "pr_number": 42,
+        lambda v, sha: (
+            v.__setattr__(
+                "last_qualification",
+                {
+                    "status": "promotion_failed",
+                    "candidate_sha": sha,
                     "pr_url": "https://github.com/acme/widget/pull/42",
-                    "auto_merge_enabled": True,
-                    "enabled_at": _utcnow().isoformat(),
+                    "error": "merge_blocked",
+                    "confidence": 0.95,
                 },
-            },
-        )
-        or v,
+            )
+            or v
+        ),
+        lambda v, sha: (
+            v.__setattr__(
+                "last_qualification",
+                {
+                    "status": "pending",
+                    "candidate_sha": sha,
+                    "confidence": 0.95,
+                    "promotion_pending": {
+                        "pr_number": 42,
+                        "pr_url": "https://github.com/acme/widget/pull/42",
+                        "auto_merge_enabled": True,
+                        "enabled_at": _utcnow().isoformat(),
+                    },
+                },
+            )
+            or v
+        ),
     ]:
         _project, version = await _make_project_and_version(
             db_session, integration_branch="trunk", promotion_target="release"
@@ -432,9 +428,7 @@ async def test_reconcile_genuine_third_party_collision_blocks(db_session, mocker
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Target branch has a duplicate revision id (0100 appears twice) — a genuine
@@ -453,9 +447,7 @@ async def test_reconcile_genuine_third_party_collision_blocks(db_session, mocker
     # mock it anyway so an ordering change cannot turn this into a spurious defer.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0099"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0099"})),
     )
     branch_sha_mock = mocker.patch(
         "app.github.get_branch_sha",
@@ -562,9 +554,7 @@ async def test_reconcile_distinct_id_dual_head_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Distinct revision ids, every prefix unique — but 0100 and 0101 BOTH anchor
@@ -610,8 +600,7 @@ async def test_reconcile_distinct_id_dual_head_blocks(db_session, mocker):
         assert reconciled is True, f"Expected reconciled=True for status={status!r}"
         await db_session.refresh(version)
         assert version.status == "open", (
-            f"Expected status=open (not promoted) for dual head, "
-            f"got {version.status!r}"
+            f"Expected status=open (not promoted) for dual head, got {version.status!r}"
         )
         assert version.last_qualification["status"] == "promotion_failed"
         assert version.last_qualification["error"] == "migration_guard_blocked"
@@ -630,23 +619,17 @@ async def test_reconcile_dangling_down_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # 0100 anchors to 0098, which is not present on the branch — a broken chain.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0098"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0098"})),
     )
     branch_sha_mock = mocker.patch(
         "app.github.get_branch_sha",
@@ -700,9 +683,7 @@ async def test_reconcile_duplicate_in_file_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Distinct filename prefixes (0099/0100/0101) — the filename-prefix dup pass
@@ -777,9 +758,7 @@ async def test_reconcile_unparseable_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
@@ -853,16 +832,12 @@ async def test_reconcile_filename_prefix_mismatch_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0101_add_gadget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0101_add_gadget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0101_add_gadget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0101_add_gadget.py"]),
     )
     # 0101_add_gadget declares in-file revision '0100' (not '0101'): a unique,
     # parseable id and a single-head chain {0099: None, 0100: 0099} — only the
@@ -926,16 +901,12 @@ async def test_reconcile_post_merge_defers_on_source_fetch_failure(db_session, m
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # The per-file source fetch raises — migration safety is unknown, so defer.
     mocker.patch(
@@ -1137,3 +1108,1202 @@ async def test_reconcile_promotion_pending_timeout_never_touches_main(db_session
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "promotion_pending_timeout"
     assert "promotion_pending" not in version.last_qualification
+
+
+# ===========================================================================
+# Post-promotion serving confirmation.
+#
+# A promotion is PROVISIONAL (serving_status="unconfirmed") until deploy_health
+# confirms the promoted SHA is actually serving.  These tests cover the pure
+# classifier and the dedicated-session confirmation sweep across all three
+# scenarios: serving-confirmed, no-new-revision deploy-failure, and a
+# rollback/halt after promotion.
+# ===========================================================================
+
+from datetime import datetime  # noqa: E402
+
+from app.models import (  # noqa: E402
+    Alert,
+    AlertSeverity,
+    DeploymentState,
+    DeploymentStatus,
+    QualificationVerdict,
+    ReleaseDeployArtifact,
+)
+from app import release_artifacts as artifact_registry  # noqa: E402
+from app.release_artifacts import (  # noqa: E402
+    BACKEND_REVISION_ARTIFACT_KIND,
+    ReleaseArtifactProvider,
+    get_or_create_release_deploy_artifact,
+)
+from app.release_reconciliation import (  # noqa: E402
+    _classify_serving_outcome,
+    _confirm_serving_or_fail,
+)
+from app.strategic_trigger import (  # noqa: E402
+    ORIGIN_QUALIFICATION,
+    strategic_refresh_origin,
+    strategic_refresh_pending,
+)
+from sqlalchemy import select as _select  # noqa: E402
+
+_SHA_A = "a" * 40
+_SHA_B = "b" * 40
+
+
+def _ds(status, deployed_at, current_sha="", halted_at=None):
+    """Build a transient DeploymentState for the pure classifier tests."""
+    return DeploymentState(
+        id=1,
+        status=status,
+        current_sha=current_sha,
+        deployed_at=deployed_at,
+        halted_at=halted_at,
+    )
+
+
+def test_classify_serving_confirmed_new_stable_revision():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha=_SHA_A)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out is not None
+    assert out[0] == "serving_confirmed"
+    assert out[1] == _SHA_A
+    assert out[2] == promoted_at.replace(minute=5)
+
+
+def test_classify_sha_mismatch_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha=_SHA_B)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "sha_mismatch", None)
+
+
+def test_classify_unobservable_serving_sha_does_not_confirm_within_window():
+    """A new STABLE revision booted after promotion but its live serving SHA is
+    unobservable (Cloud Run lookup degraded to no value).  Within the window the
+    gate must NOT confirm — and crucially must never echo the promoted SHA as a
+    served_sha stand-in.  No decision yet → keep waiting."""
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    # STABLE, booted after the promotion, but current_sha is unobservable ("").
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha="")
+    assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
+
+
+def test_classify_unobservable_serving_sha_fails_after_deadline():
+    """If the serving SHA stays unobservable until the deadline elapses, the gate
+    lands a DISTINCT deploy_failed reason (serving_sha_unobservable) rather than
+    silently confirming with the promoted SHA."""
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    after = datetime(2026, 6, 5, 13, 1, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha="")
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, after)
+    assert out == ("deploy_failed", "serving_sha_unobservable", None)
+
+
+def test_classify_no_new_revision_only_after_deadline():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    # Old revision that predates the promotion never advanced; STABLE but stale.
+    ds = _ds(
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A
+    )
+    # Within the window → no decision yet.
+    assert (
+        _classify_serving_outcome(
+            ds, promoted_at, _SHA_A, deadline, datetime(2026, 6, 5, 12, 40, 0)
+        )
+        is None
+    )
+    # Past the deadline → deploy_failed.
+    out = _classify_serving_outcome(
+        ds, promoted_at, _SHA_A, deadline, datetime(2026, 6, 5, 13, 1, 0)
+    )
+    assert out == ("deploy_failed", "no_new_revision", None)
+
+
+def test_classify_rollback_after_promotion_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 20, 0)  # within window — rollback fails immediately
+    ds = _ds(DeploymentStatus.ROLLED_BACK, promoted_at.replace(minute=10))
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "rolled_back", None)
+
+
+def test_classify_halt_after_promotion_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 20, 0)
+    ds = _ds(
+        DeploymentStatus.HALTED,
+        promoted_at.replace(minute=2),
+        halted_at=promoted_at.replace(minute=10),
+    )
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "halted", None)
+
+
+def test_classify_monitoring_new_revision_waits_within_window():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 15, 0)
+    # New revision booted but still MONITORING (not yet STABLE) → wait.
+    ds = _ds(
+        DeploymentStatus.MONITORING, promoted_at.replace(minute=5), current_sha=_SHA_A
+    )
+    assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
+
+
+async def _make_promoted_unconfirmed_version(
+    db_session,
+    *,
+    promoted_at: datetime,
+    deadline: datetime,
+    promoted_sha: str = _SHA_A,
+    with_verdict: bool = True,
+):
+    """Create a self-repo project + a v1 recorded promoted/unconfirmed."""
+    project = Project(
+        name="Serving-Test",
+        user_id="serving-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = promoted_sha
+    version.serving_status = "unconfirmed"
+    version.deploy_confirm_deadline = deadline
+    version.last_qualification = {"status": "promoted", "promoted_sha": promoted_sha}
+    db_session.add(version)
+    # Commit the version BEFORE inserting the verdict so the verdict's FK to
+    # releaseversion is satisfied (mirrors the real flow: the verdict row is
+    # written by the promotion AFTER the version exists).
+    await db_session.commit()
+    await db_session.refresh(version)
+    if with_verdict:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=promoted_sha,
+                terminal_status="promoted",
+                would_promote=True,
+                promotion_enabled=True,
+            )
+        )
+    await db_session.commit()
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+            serving_status="unconfirmed",
+            confirmation_deadline=deadline,
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+async def _set_deploy_state(db_session, **kwargs):
+    existing = await db_session.get(DeploymentState, 1)
+    if existing is not None:
+        for k, v in kwargs.items():
+            setattr(existing, k, v)
+        db_session.add(existing)
+    else:
+        db_session.add(DeploymentState(id=1, **kwargs))
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_confirm_serving_confirmed_scenario(db_session):
+    """(a) A new healthy revision boots after promotion within the window →
+    serving_confirmed, served_sha stamped, verdict outcome recorded."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+    )
+    assert state["state"] == "promoted"
+    assert state["serving_status"] == "serving_confirmed"
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+    assert verdict.post_promotion_outcome_at is not None
+
+
+@pytest.mark.asyncio
+async def test_backend_artifact_row_confirms_and_projects_to_scalars(db_session):
+    """Backend-only registry parity: the artifact row confirms exactly as the
+    legacy scalar path did, and the scalars mirror that backend artifact row."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is True
+
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.refresh(version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_A
+    assert artifact.reason_code is None
+    assert version.serving_status == artifact.serving_status
+    assert version.served_sha == artifact.served_identifier
+    assert version.served_sha == _SHA_A
+
+
+@pytest.mark.asyncio
+async def test_backend_artifact_backfill_preserves_legacy_resolved_scalars(db_session):
+    """Lazy backend-row creation must inherit the stored scalar outcome instead
+    of defaulting a historical promotion back to unconfirmed."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.delete(artifact)
+    version.serving_status = "serving_confirmed"
+    version.served_sha = _SHA_A
+    version.served_at = promoted_at + timedelta(minutes=8)
+    version.deploy_failure_reason = None
+    db_session.add(version)
+    await db_session.commit()
+
+    artifact, created = await get_or_create_release_deploy_artifact(
+        db_session,
+        version,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        confirmation_deadline=deadline,
+    )
+    await db_session.commit()
+
+    assert created is True
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_A
+    assert artifact.served_at == version.served_at
+    assert artifact.reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
+    db_session, mocker
+):
+    """A second required provider keeps the overall outcome unresolved until it
+    confirms, while the legacy scalars continue mirroring backend_revision."""
+    synthetic_state = {"mode": "wait"}
+
+    async def _check_synthetic(_session, _version, artifact, now):
+        mode = synthetic_state["mode"]
+        if mode == "wait":
+            return None
+        if mode == "confirm":
+            return ("serving_confirmed", "vm-image-fingerprint", now)
+        raise AssertionError(f"unexpected synthetic mode: {mode}")
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is False
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {artifact.artifact_kind: artifact for artifact in artifacts}
+    await db_session.refresh(version)
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].served_identifier == _SHA_A
+    assert by_kind["synthetic_required"].serving_status == "unconfirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome is None
+
+    synthetic_state["mode"] = "confirm"
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=30),
+    )
+    assert resolved is True
+
+    await db_session.refresh(version)
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+
+
+@pytest.mark.asyncio
+async def test_required_artifact_deadline_failure_records_reason_code(
+    db_session, mocker
+):
+    """A required non-backend artifact can fail the overall outcome at its
+    deadline while the backend SHA stays projected but the scalar status flips
+    to deploy_failed for legacy readers."""
+    synthetic_state = {"mode": "wait"}
+
+    async def _check_synthetic(_session, _version, artifact, now):
+        if synthetic_state["mode"] == "confirm":
+            return ("serving_confirmed", "vm-image-fingerprint", now)
+        if (
+            artifact.confirmation_deadline is not None
+            and now >= artifact.confirmation_deadline
+        ):
+            return ("deploy_failed", "synthetic_deadline_elapsed", None)
+        return None
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(minutes=10)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=1),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=5),
+    )
+    assert resolved is False
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is True
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {artifact.artifact_kind: artifact for artifact in artifacts}
+    await db_session.refresh(version)
+    assert by_kind["synthetic_required"].serving_status == "deploy_failed"
+    assert by_kind["synthetic_required"].reason_code == "synthetic_deadline_elapsed"
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha == _SHA_A
+    assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome == "deploy_failed"
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_sha_within_window_stays_unconfirmed(db_session):
+    """A new STABLE revision booted after promotion but its serving SHA is
+    unobservable: within the window the sweep must NOT confirm and must NEVER
+    stamp served_sha with the promoted (merged) SHA stand-in."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # STABLE, booted after promotion, but no observable serving SHA.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="",
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+    # Critically: served_sha was NOT fabricated from the promoted SHA.
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_sha_after_deadline_deploy_failed(db_session):
+    """If the serving SHA never becomes observable before the deadline, the sweep
+    lands a distinct serving_sha_unobservable deploy_failed state — it never
+    upgrades to serving_confirmed by echoing the merged SHA."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # New STABLE revision booted after promotion, but serving SHA unobservable.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="",
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "serving_sha_unobservable"
+    # No fabricated served_sha.
+    assert version.served_sha is None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+    )
+    assert state["state"] == "promotion_deploy_failed"
+    assert state["serving_status"] == "deploy_failed"
+
+
+@pytest.mark.asyncio
+async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
+    """(b) The live revision never advances within the window → deploy_failed,
+    a loud ERROR alert fires, a distinct state is reported, and the never-shipped
+    promotion is NOT summarized as cleanly shipped."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # Stale revision predating the promotion; STABLE but never advanced.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_confirm_alerted_at is not None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+    )
+    # Distinct PROMOTION_DEPLOY_FAILED-class state — NOT a clean "promoted".
+    assert state["state"] == "promotion_deploy_failed"
+    assert state["serving_status"] == "deploy_failed"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].severity == AlertSeverity.ERROR
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "deploy_failed"
+
+
+@pytest.mark.asyncio
+async def test_confirm_rollback_after_promotion_deploy_failed_scenario(db_session):
+    """(c) A rollback after promotion → deploy_failed (reason rolled_back) with
+    the loud alert, even while still inside the confirmation window."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.ROLLED_BACK,
+        current_sha="c" * 40,
+        deployed_at=promoted_at + timedelta(minutes=10),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "rolled_back"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("deploy FAILED" in a.title for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_confirm_deploy_failed_arms_strategic_refresh(db_session):
+    """A deploy_failed resolution wakes the strategist: it arms exactly one
+    coalescing strategic-refresh marker (qualification origin, deploy-failed
+    reason) so recovery is not gated behind the strategic-spawn cooldown."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,  # stale revision, never advanced
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    # Automated trigger (respects the failure breaker), not operator origin.
+    assert strategic_refresh_origin(project.vision) == ORIGIN_QUALIFICATION
+    marker = project.vision["_strategic_refresh"]
+    assert str(marker.get("reason", "")).startswith("promotion_deploy_failed:")
+    # Single-slot / coalescing: exactly one refresh was armed, not stacked.
+    assert int(marker.get("count") or 1) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirm_serving_confirmed_does_not_arm_refresh(db_session):
+    """A clean serving_confirmed resolution must NOT wake the strategist —
+    only failed deploys arm the refresh via this path."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_confirm_within_window_unconfirmed_does_not_arm_refresh(db_session):
+    """A still-in-window MONITORING no-op leaves the version unconfirmed and
+    arms no refresh — the strategist is only woken on a terminal failure."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.MONITORING,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_confirm_within_window_no_decision_keeps_unconfirmed(db_session):
+    """A new revision still MONITORING within the window leaves the version
+    unconfirmed (no premature confirm, no premature failure)."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.MONITORING,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+
+
+# ===========================================================================
+# Post-promotion deploy-failure RECOVERY.
+#
+# A serving_status="deploy_failed" latch is NOT terminal-by-construction.  A
+# deploy that boot-crashed and recovered, or was merely slow past the bounded
+# confirmation window (the real v5 case promoted 14:58 UTC, served 19:51 UTC),
+# can later actually serve its promoted SHA.  Within a bounded recovery window
+# the sweep flips it back to a truthful serving_confirmed state and clears every
+# derived failure surface; beyond the window a genuinely dead deploy stays failed.
+# ===========================================================================
+
+from app.release_reconciliation import (  # noqa: E402
+    _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT,
+    _reconcile_if_deploy_failed_recovered,
+)
+from app.release_stall_alerts import (  # noqa: E402
+    _deploy_failed_alert_title,
+)
+
+
+async def _make_promoted_deploy_failed_version(
+    db_session,
+    *,
+    promoted_at: datetime,
+    deadline: datetime,
+    alerted_at: datetime,
+    promoted_sha: str = _SHA_A,
+    deploy_failure_reason: str = "no_new_revision",
+    with_open_alert: bool = True,
+):
+    """Create a self-repo project + a v1 latched to promoted/deploy_failed.
+
+    Mirrors the post-``_confirm_serving_or_fail`` deploy-failed state: the verdict
+    row carries ``post_promotion_outcome="deploy_failed"`` and (optionally) a loud
+    open ERROR alert with the deterministic deploy-failed title is present.
+    """
+    project = Project(
+        name="Recover-Test",
+        user_id="recover-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = promoted_sha
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = deploy_failure_reason
+    version.deploy_confirm_deadline = deadline
+    version.deploy_confirm_alerted_at = alerted_at
+    version.last_qualification = {"status": "promoted", "promoted_sha": promoted_sha}
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=promoted_sha,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=True,
+            post_promotion_outcome="deploy_failed",
+            post_promotion_outcome_at=alerted_at,
+        )
+    )
+    if with_open_alert:
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.ERROR,
+                title=_deploy_failed_alert_title(version.version_number),
+                message="deploy failed",
+            )
+        )
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
+    """(a) A version latched deploy_failed whose promoted SHA later begins serving
+    within the recovery window flips back to serving_confirmed: served_sha/at are
+    stamped, deploy_failure_reason cleared, the verdict outcome flips to
+    serving_confirmed, the open operator alert is dismissed, and the strategist is
+    woken so the crisis directive recomputes."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)  # long since elapsed
+    alerted_at = promoted_at + timedelta(hours=1)  # within the 24h recovery window
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # A new STABLE revision finally came up healthy serving the promoted SHA.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    # The view-time summary now reports the TRUE serving_confirmed state.
+    state = rv.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+    )
+    assert state["state"] == "promoted"
+    assert state["serving_status"] == "serving_confirmed"
+
+    # The verdict's post-promotion outcome flipped — the readiness precision
+    # sample self-corrects off this row.
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    # The loud deploy-failed operator alert was resolved (dismissed).
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is not None
+
+    # The strategist was woken so the "recover the failed deploy" crisis directive
+    # recomputes against the now-true serving_confirmed state.
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    marker = project.vision["_strategic_refresh"]
+    assert str(marker.get("reason", "")) == "promotion_deploy_recovered"
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_when_sha_never_serves(db_session):
+    """(b) A genuinely failed deploy (promoted SHA never serves — the live revision
+    predates the promotion and never advanced) stays deploy_failed and keeps its
+    alert and verdict outcome; no recovery, no refresh."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # Stale revision predating the promotion; STABLE but never advanced.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha is None
+
+    # The open deploy-failed alert is untouched.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_when_non_backend_required_artifact_still_failed(
+    db_session, mocker
+):
+    """Backend serving alone cannot recover an aggregate deploy_failed latch
+    while a required non-backend artifact still reports deploy_failed."""
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="synthetic_deadline_elapsed",
+    )
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="synthetic_required",
+            serving_status="deploy_failed",
+            reason_code="synthetic_deadline_elapsed",
+            confirmation_deadline=deadline,
+        )
+    )
+    await db_session.commit()
+
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_beyond_recovery_window(db_session):
+    """(b) A deploy whose promoted SHA only begins serving AFTER the recovery
+    window has elapsed stays deploy_failed forever — the recovery check is bounded
+    so a genuinely dead deploy is no longer re-examined."""
+    now = _utcnow()
+    # Failure was recorded well beyond the recovery window.
+    alerted_at = now - timedelta(
+        seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT + 3600
+    )
+    promoted_at = alerted_at - timedelta(hours=1)
+    deadline = alerted_at
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # Even though the promoted SHA is NOW genuinely serving, the window elapsed.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha is None

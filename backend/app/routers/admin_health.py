@@ -101,12 +101,19 @@ async def get_health_overview(
             ),
         )
 
+    # L3: on-demand compute, wrapped in the TTL/in-flight-dedup cache. This is
+    # the path that serves the last good result on compute failure. Both the
+    # fresh-compute and serve-stale branches must carry a TRUTHFUL freshness
+    # signal: a fresh compute is ~0s old (live); a served-stale payload keeps
+    # its original generated_at (minutes/hours old) AND the cache reports
+    # served_stale=True, so the card never shows an old "Healthy" verdict as a
+    # live, authoritative reading.
     cache_key = (
         "health-overview",
         str(project_id) if project_id else None,
         lookback_hours,
     )
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_health_overview(
             project_id=project_id,
@@ -114,6 +121,24 @@ async def get_health_overview(
             session=session,
         ),
     )
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 @router.get("/diagnostics/null-branch-config")
@@ -680,6 +705,13 @@ async def _compute_health_overview(
         "actionable_issues": actionable_issues,
         "direction_portfolio": direction_portfolio,
         "queue_depth": queue_depth,
+        # Truthful freshness stamp carried inside the payload so age is
+        # computable on EVERY serve path — including the on-demand compute and
+        # the serve-stale-on-failure fallback, neither of which goes through the
+        # precompute/shared-cache provenance annotation above. A served-stale
+        # payload keeps its original (old) generated_at, so the endpoint can
+        # derive a large precompute_age_seconds and the card dims it.
+        "generated_at": now.isoformat(),
     }
 
 

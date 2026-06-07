@@ -15,9 +15,10 @@ import json
 import logging
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.compute_backends import (
@@ -348,6 +349,42 @@ async def list_compute_jobs(
     return list(result.scalars().all())
 
 
+async def get_recent_terminal_compute_spend_usd(
+    session,
+    *,
+    project_id: uuid.UUID | None,
+    since: datetime,
+    until: datetime | None = None,
+) -> float:
+    """Sum ``final_cost_usd`` over terminal compute jobs in a time window.
+
+    The single source of truth for "how much off-VM compute did we spend
+    recently". Counts only jobs that have reached a terminal status
+    (``_COMPUTE_JOB_TERMINAL_STATUSES``) and carry a recorded
+    ``final_cost_usd``, whose ``completed_at`` falls in ``[since, until)``
+    (``until`` is exclusive; omit it for an open-ended upper bound). In-flight
+    jobs — non-terminal status, no ``completed_at``, or ``final_cost_usd``
+    still ``None`` — are ignored so the figure reflects settled spend only.
+    Scoped to ``project_id`` when provided; ``None`` aggregates across projects.
+    """
+    conditions = [
+        ComputeJob.status.in_(_COMPUTE_JOB_TERMINAL_STATUSES),
+        ComputeJob.completed_at.is_not(None),
+        ComputeJob.completed_at >= since,
+        ComputeJob.final_cost_usd.is_not(None),
+    ]
+    if project_id is not None:
+        conditions.append(ComputeJob.project_id == project_id)
+    if until is not None:
+        conditions.append(ComputeJob.completed_at < until)
+    result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.final_cost_usd), 0.0)).where(
+            *conditions
+        )
+    )
+    return float(result.scalar_one() or 0.0)
+
+
 async def active_compute_job_vm_ids(session) -> set[str]:
     """External ids of non-terminal compute jobs.
 
@@ -433,6 +470,12 @@ async def _process_single_compute_job(session, job: ComputeJob) -> None:
         finished = status.finished_at or now
         cost = await backend.poll_cost(job, as_of=finished)
         job.accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
+        # Persist any command-reported result metrics under a dedicated
+        # polling_metadata key. polling_metadata already serializes to the agent
+        # via serialize_compute_job_response, so the metrics reach the handler
+        # without a migration. Absent metrics (None) leave the key unwritten.
+        if status.metrics:
+            _set_meta(job, result_metrics=dict(status.metrics))
         outcome = (
             ComputeJobOutcome.SUCCESS
             if status.status == ComputeJobStatus.SUCCEEDED

@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from app.models import Task
 from app.shared_state import DEFAULT_TASK_SCOPE
-from app.sr_blind_spots import _REVIEWER_ORIGINS
+from app.sr_blind_spots import _REVIEWER_ORIGINS, reviewer_confirmed_categories
 
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
@@ -111,6 +111,9 @@ _PR_REF_RE = re.compile(r"\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b")
 _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 _EDGE_CATS = {"correctness", "error-handling"}
 
+# Retired: execution-evidence miss-rate aggregation over tests/lint/typecheck
+# outcomes had no real consumer beyond compatibility shims, so the helpers were deleted.
+
 
 def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
     from app.review_learning import _categorize_review_issues as _impl
@@ -186,37 +189,6 @@ def _sr_skip_stats(
     return round(skipped / total, 3), dist
 
 
-def _compute_execution_evidence_miss_rates(
-    tasks: list,
-) -> dict[str, dict[str, Any]]:
-    """Aggregate miss-rates for execution-evidence SR categories."""
-    totals: dict[str, dict[str, int]] = {}
-    for t in tasks:
-        ctx = t.context or {}
-        check_results = (ctx.get("_self_review_outcome") or {}).get(
-            "check_results"
-        ) or {}
-        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
-            result = check_results.get(cat)
-            if result is None:
-                continue
-            if cat not in totals:
-                totals[cat] = {"sample_count": 0, "miss_count": 0}
-            totals[cat]["sample_count"] += 1
-            if not result.get("passed", True):
-                totals[cat]["miss_count"] += 1
-    out: dict[str, dict[str, Any]] = {}
-    for cat, stats in totals.items():
-        if stats["sample_count"] == 0:
-            continue
-        out[cat] = {
-            "miss_rate": round(stats["miss_count"] / stats["sample_count"], 3),
-            "miss_count": stats["miss_count"],
-            "sample_count": stats["sample_count"],
-        }
-    return out
-
-
 def _compute_cat_fp_stats(
     tasks: list,
 ) -> tuple[
@@ -246,17 +218,13 @@ def _compute_cat_fp_stats(
         }
         if not sr_failed:
             continue
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         reviewer_cats = {
             finding.get("category")
             for finding in (sro.get("reviewer_findings") or [])
             if isinstance(finding, dict) and finding.get("category")
         }
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
-        rev_hist_cats: set[str] = set()
-        if rev_hist:
-            rev_hist_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
-        confirmed = reviewer_cats | human_cats | rev_hist_cats
+        confirmed = reviewer_confirmed_cats | reviewer_cats
         task_scope = ctx.get("scope", DEFAULT_TASK_SCOPE)
         for category in sr_failed:
             bucket = cat_fp.setdefault(category, {"fp": 0, "tp": 0})
@@ -295,8 +263,13 @@ def _compute_cat_severity_calibration(
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         if not rev_hist:
             continue
+        confirmed = reviewer_confirmed_categories(ctx)
+        if not confirmed:
+            continue
         rev_cats = _categorize_review_issues(rev_hist)
         for category, rev_issues in rev_cats.items():
+            if category not in confirmed:
+                continue
             cr = check_results.get(category)
             if not isinstance(cr, dict):
                 continue
@@ -341,38 +314,17 @@ def _task_prompt_fingerprint(task: Task) -> str:
     return "unknown"
 
 
-def _score_reasoning_quality(reasoning: str) -> float:
-    """Score reasoning quality on a 0.0-1.0 scale based on specificity signals."""
-    if not reasoning or not isinstance(reasoning, str):
-        return 0.0
-
-    text = reasoning.strip()
-    if not text:
-        return 0.0
-
-    score = 0.0
-    if re.search(r"\b(?:[\w\-./]*[\w\-/]+\.[\w]+)\b", text):
-        score += 0.33
-    if re.search(r"(?:test_\w+|_test\.py|\:\:\w+|\w+::)", text):
-        score += 0.33
-    if len(text.split()) >= 6:
-        score += 0.34
-    return min(1.0, score)
-
-
 def _compute_reasoning_engagement(
     tasks: list,
     cats: set[str],
 ) -> dict[str, dict[str, Any]]:
-    """Compute PASS reasoning engagement and quality rates for each category."""
+    """Compute PASS reasoning engagement rate for each category."""
     from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
 
     stats: dict[str, dict[str, Any]] = {
         cat: {
             "with_reasoning": 0,
-            "with_quality": 0,
             "total_passes": 0,
-            "quality_scores": [],
         }
         for cat in cats
     }
@@ -390,27 +342,15 @@ def _compute_reasoning_engagement(
             reasoning = entry.get("reasoning") or ""
             if isinstance(reasoning, str) and len(reasoning.strip()) > 10:
                 stats[cat]["with_reasoning"] += 1
-            quality_score = _score_reasoning_quality(reasoning)
-            stats[cat]["quality_scores"].append(quality_score)
-            if quality_score > 0.5:
-                stats[cat]["with_quality"] += 1
 
     result: dict[str, dict[str, Any]] = {}
     for cat, values in stats.items():
         total = values["total_passes"]
-        quality_scores = values.get("quality_scores", [])
-        avg_quality = (
-            round(sum(quality_scores) / len(quality_scores), 3)
-            if quality_scores
-            else None
-        )
         result[cat] = {
             "engagement_rate": round(values["with_reasoning"] / total, 3)
             if total > 0
             else None,
-            "reasoning_quality_rate": avg_quality,
             "with_reasoning": values["with_reasoning"],
-            "with_quality": values["with_quality"],
             "total_passes": total,
         }
     return result

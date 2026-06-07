@@ -460,6 +460,111 @@ async def test_direction_stats_conversion_rate():
 
 
 @pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merges():
+    """Direction- and pipeline-level conversion exclude degraded-unverified merges.
+
+    Cycle has 3 merged PRs from 4 tasks created, but only 2 verified (verified +
+    benign-unverified); 1 was degraded-unverified. Conversion must be 2/4=0.5,
+    not 3/4=0.75 — agreeing with the per-task verification layer.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Improve test coverage",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                        "tasks_created": 4,
+                    },
+                ],
+            }
+        ]
+    )
+
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    assert stats[0]["conversion_rate"] == 0.5
+    # Pipeline-level conversion is verification-aware too: 2 verified / 4 created.
+    assert result["pipeline_conversion_rate"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_excludes_pr_ineligible_task_types():
+    """conversion_rate denominator drops research/audit/memo tasks (which never open a PR).
+
+    research_history records 6 tasks_created but type_breakdown shows 4 of them are
+    PR-ineligible (research/audit), leaving 2 PR-eligible. With 1 PR merged the
+    direction conversion_rate AND the headline pipeline_conversion_rate must be
+    1/2 = 0.5, not 1/6 = 0.167.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Mixed task-type direction",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 6,
+                        "type_breakdown": {
+                            "research": {"created": 3},
+                            "audit": {"created": 1},
+                            "create": {"created": 2},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    # 1 merged / (6 created - 4 PR-ineligible) = 1/2
+    assert stats[0]["conversion_rate"] == 0.5
+    # Headline pipeline rate uses the same PR-eligible denominator.
+    assert result["pipeline_conversion_rate"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_direction_with_zero_cycles_excluded():
     """Active direction with no completed research cycles in window is excluded from stats."""
     now = _utcnow()
@@ -2080,6 +2185,41 @@ async def test_self_review_prediction_accuracy_partial_overlap():
     assert acc["prediction_hit_rate"] == 0.5
     assert acc["miss_rate"] == 0.5
     # false_alarm_rate: self-review flagged 1 cat (test-coverage), human rejected it too → 0 false alarms
+    assert acc["false_alarm_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_includes_later_iteration_only():
+    """A task first APPROVED then rejected on a later iteration (only
+    ``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) is in the prediction-accuracy
+    sample — matching the scorer's any-iteration ground truth."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"test-coverage": {"passed": False}}
+                },
+                # First review approved; rejected only on a later iteration.
+                "_all_iterations_rejection_categories": {"test-coverage": 1},
+            },
+            created_at=now - timedelta(hours=i),
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    # All six later-iteration-only tasks are counted in the sample.
+    assert acc["sample_size"] == 6
+    # SR flagged test-coverage and the reviewer confirmed it (later) → hit, not
+    # a false alarm.
+    assert acc["prediction_hit_rate"] == 1.0
     assert acc["false_alarm_rate"] == 0.0
 
 

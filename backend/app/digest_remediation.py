@@ -26,7 +26,11 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
-from app.landed_signal import is_merged_completion, landed_signal_predicate
+from app.landed_signal import (
+    is_merged_completion,
+    is_verified_merge,
+    landed_signal_predicate,
+)
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -215,10 +219,24 @@ async def compute_remediation_and_patterns(
         if not _fp_:
             continue
         _entry = _fp_task_states.setdefault(
-            str(_fp_), {"inflight": False, "merged": False, "proactive": False}
+            str(_fp_),
+            {
+                "inflight": False,
+                "landed": False,
+                "verified": False,
+                "proactive": False,
+            },
         )
-        if _t.status == TaskStatus.COMPLETED and _ctx.get("pr_url"):
-            _entry["merged"] = True
+        # Use the canonical landed/verified predicates the rest of the
+        # remediation funnel relies on — NOT a loose "completed + pr_url"
+        # proxy. ``landed`` means the PR actually landed on integration
+        # (``is_merged_completion``); ``verified`` additionally requires the
+        # system's verification standard (``is_verified_merge``: a merged
+        # completion with no fall-open / degraded unverified-merge reason).
+        if is_merged_completion(_t):
+            _entry["landed"] = True
+        if is_verified_merge(_t):
+            _entry["verified"] = True
         if _t.status in _inflight_statuses:
             _entry["inflight"] = True
         if _ctx.get("proactive") or _ctx.get("proactive_investigation"):
@@ -259,7 +277,7 @@ async def compute_remediation_and_patterns(
                         "last_seen": _info.get("last_seen"),
                         "severity": _info.get("severity"),
                         "details": _info.get("latest_details") or "",
-                        "affected_direction_count": len(_dirs_last_24h),
+                        "affected_direction_count": len(_info.get("affected_directions", [])),
                         "suggested_action": (
                             "Investigate the upward trend before it trips the surge "
                             "threshold — check recent deploys, infra health, and "
@@ -275,9 +293,13 @@ async def compute_remediation_and_patterns(
             )
             _state = _fp_task_states.get(_fp_key, {})
             _recent = _fp_count_48h.get(_fp_key, 0)
-            if _state.get("merged") and _recent == 0:
+            # Status ladder grounded in real signals: ``fix_verified`` needs the
+            # stronger verification standard AND no recurrence in the last 48h;
+            # ``fix_shipped`` needs only a real landed remediation; otherwise
+            # in-flight work reads as ``investigating``, else ``unaddressed``.
+            if _state.get("verified") and _recent == 0:
                 _status = "fix_verified"
-            elif _state.get("merged"):
+            elif _state.get("landed"):
                 _status = "fix_shipped"
             elif _state.get("inflight"):
                 _status = "investigating"
@@ -394,7 +416,13 @@ async def compute_remediation_funnel(
         )
     )
     remediations_spawned = len(_rem_tasks)
-    remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
+    # "merged" must mean the PR actually landed on the integration branch, not
+    # merely that the task reached a terminal COMPLETED status (a remediation can
+    # close completed without merging). Use the canonical landed-signal predicate
+    # — the same one the CI auto-remediation tally below uses — so "merged" means
+    # merged everywhere in the funnel, and the success rate (merged / spawned)
+    # the admin UI derives reflects real merges.
+    remediations_merged = sum(1 for t in _rem_tasks if is_merged_completion(t))
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
     _held_projects_q = select(Project).options(
@@ -490,7 +518,10 @@ async def compute_remediation_funnel(
 
     merged_remediations_by_trigger_class: Dict[str, int] = {}
     for r in _rem_tasks:
-        if r.status != TaskStatus.COMPLETED:
+        # "merged" here means the same thing as the headline remediations_merged
+        # count and the CI auto-remediation tally: the PR actually landed, not
+        # merely that the task reached COMPLETED.
+        if not is_merged_completion(r):
             continue
         trigger_cls = (r.context or {}).get("trigger_failure_class")
         if not trigger_cls:
@@ -522,9 +553,12 @@ async def compute_remediation_funnel(
         bucket = remediation_success_by_confidence.setdefault(
             conf, {"merged": 0, "failed": 0}
         )
-        if r.status == TaskStatus.COMPLETED:
+        # Consistent with the rest of the funnel: only a landed PR counts as
+        # "merged". A completed-but-not-landed remediation is neither a merge nor
+        # a hard failure, so it inflates neither arm of the success ratio.
+        if is_merged_completion(r):
             bucket["merged"] += 1
-        else:
+        elif r.status == TaskStatus.FAILED:
             bucket["failed"] += 1
 
     _completed_inv = [

@@ -6,6 +6,8 @@ export interface SrMissExample {
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
+  current_reviewer_finding_count?: number | null;
+  previous_reviewer_finding_count?: number | null;
   current_human_count?: number | null;
   previous_human_count?: number | null;
   miss_rate?: number | null;
@@ -24,7 +26,6 @@ export interface SrCategoryTrend {
   examples?: SrMissExample[];
   below_floor?: boolean | null;
   reasoning_engagement_rate?: number | null;
-  reasoning_quality_rate?: number | null;
   reasoning_engagement_with?: number | null;
   reasoning_engagement_total?: number | null;
   precision_recall_quadrant?: 'healthy' | 'conservative_shift' | 'noisy_shift' | 'both_declining' | 'mixed' | 'flat' | null;

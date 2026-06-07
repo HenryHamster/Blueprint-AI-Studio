@@ -18,15 +18,18 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity
+from app.models import Alert, AlertSeverity, ReleaseDeployArtifact
+from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
+    _confirm_serving_or_fail,
+    _reconcile_if_deploy_failed_recovered,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
@@ -62,6 +65,17 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # three consecutive crashes strongly suggest a persistent bug in the finalize
 # path rather than a transient error, and the loop must self-recover.
 _MAX_SWEEP_CRASH_STREAK = 3
+
+# How long a ``serving_status="deploy_failed"`` version remains eligible for
+# serving RECOVERY.  A deploy_failed latch is not terminal-by-construction: a
+# deploy that boot-crashed and recovered, or was merely slow past the ~60-min
+# confirmation window (the real v5 case promoted 14:58 UTC and only began serving
+# at 19:51 UTC — ~5h late), can later actually serve its promoted SHA.  Within
+# this window the post-promotion sweep re-checks deploy_failed versions and
+# recovers any whose promoted SHA is now independently observed serving; beyond
+# it a genuinely dead deploy stays loudly failed forever.  24h is generous enough
+# to cover the v5 ~5h-late case with wide margin.
+_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
 
 
 def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
@@ -454,6 +468,129 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
+    # Post-promotion serving confirmation.  A promoted version is PROVISIONAL
+    # (serving_status == "unconfirmed") until deploy_health confirms the
+    # promoted SHA is actually serving in production.  For each such version,
+    # derive the outcome from the DeploymentState singleton (the existing
+    # deploy-health serving signal — no new always-on monitor) in its own
+    # dedicated session, and either confirm it serving or land a distinct loud
+    # deploy-failed state.  Unlike the loops above this scans PROMOTED versions
+    # (the rest target ``open`` ones), so it runs its own narrow query.
+    required_artifact_kinds = required_release_artifact_kinds()
+    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
+    if required_artifact_kinds:
+        required_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+            )
+        )
+        pending_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+                or_(
+                    ReleaseDeployArtifact.serving_status.is_(None),
+                    ReleaseDeployArtifact.serving_status == "unconfirmed",
+                ),
+            )
+        )
+        required_artifact_count = (
+            select(func.count(ReleaseDeployArtifact.id))
+            .where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+            )
+            .scalar_subquery()
+        )
+        unresolved_filter = or_(
+            unresolved_filter,
+            pending_artifact_exists,
+            and_(
+                required_artifact_exists,
+                required_artifact_count < len(required_artifact_kinds),
+            ),
+        )
+    unconfirmed_ids = list(
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion.id).where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    unresolved_filter,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for version_id in unconfirmed_ids:
+        try:
+            resolved = await _confirm_serving_or_fail(
+                version_id,
+                session_factory=session_factory,
+                now=now,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: serving-confirmation check failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if resolved:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep resolved post-promotion serving "
+                "status for version %s",
+                version_id,
+            )
+
+    # Post-promotion deploy-failure RECOVERY.  A serving_status="deploy_failed"
+    # latch is not terminal-by-construction: a deploy that boot-crashed and then
+    # recovered (or was merely slow past the confirmation window — the real v5
+    # case served ~5h late) can later actually serve its promoted SHA.  Within a
+    # bounded recovery window, re-check promoted+deploy_failed versions and flip
+    # any whose promoted SHA is now INDEPENDENTLY observed serving back to a
+    # truthful serving_confirmed state (clearing the version status, the operator
+    # alert, the strategist crisis directive, and the verdict precision sample).
+    # Beyond the window a genuinely dead deploy stays loudly failed forever.  Like
+    # the unconfirmed loop this scans PROMOTED versions, so it runs its own narrow
+    # query; each version recovers in its own dedicated session.
+    deploy_failed_ids = list(
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion.id).where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    release_version.ReleaseVersion.serving_status == "deploy_failed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for version_id in deploy_failed_ids:
+        try:
+            recovered = await _reconcile_if_deploy_failed_recovered(
+                version_id,
+                session_factory=session_factory,
+                now=now,
+                recovery_window_seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: deploy-failed recovery check failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if recovered:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep recovered deploy-failed version %s "
+                "(promoted SHA confirmed serving after a prior latch)",
+                version_id,
+            )
+
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
     # failures) or stalled in build (sitting too long without advancing).  The
@@ -475,8 +612,7 @@ async def sweep_stuck_qualifications(
                 )
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
                 alerted = (
-                    await _check_version_stabilize_stall(alert_session, v)
-                    or alerted
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
                 )
                 alerted = (
                     await _check_version_promotion_readiness(alert_session, v)

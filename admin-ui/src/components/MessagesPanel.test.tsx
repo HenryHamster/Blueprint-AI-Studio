@@ -14,6 +14,7 @@ import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome
 // preserve here, and the only export this suite reads is `auth.currentUser`.
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
+  getIdToken: vi.fn(async () => 'test-token'),
 }));
 
 // Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
@@ -2392,6 +2393,42 @@ describe('MessagesPanel Investigate action', () => {
     expect(confirmBtn).toBeTruthy();
     expect(cancelBtn).toBeTruthy();
   });
+
+  test('investigation task POST includes source_message_id', async () => {
+    const blocker = makeMsg({
+      id: 'msg-origin',
+      message_type: 'BLOCKER',
+      content: 'Critical issue with stale refs',
+      status: 'open',
+    });
+    const el = await renderWithMessages([blocker]);
+    const investigateBtn = el.querySelector('button[title="Investigate"]') as HTMLButtonElement;
+    expect(investigateBtn).toBeTruthy();
+
+    await act(async () => { investigateBtn.click(); });
+    const confirmBtn = [...el.querySelectorAll('button')].find(b => b.title === 'Confirm investigation') as HTMLButtonElement | undefined;
+    expect(confirmBtn).toBeTruthy();
+
+    await act(async () => { confirmBtn?.click(); });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/tasks'),
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.any(String),
+      }),
+    );
+
+    const body = JSON.parse(((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(body).toMatchObject({
+      github_repo: 'owner/repo',
+      title: 'Critical issue with stale refs',
+      prompt: expect.stringContaining('Original message: msg-origin'),
+      source_message_id: 'msg-origin',
+      task_type: 'investigate',
+    });
+  });
 });
 
 describe('MessagesPanel showOnlyNew filter', () => {
@@ -3621,6 +3658,164 @@ describe('MessagesPanel send arming receipt', () => {
   });
 });
 
+// ── Feedback → direction conversion idempotency ───────────────────────────────
+// The operator can convert a FEEDBACK message into a steering direction. A
+// retried (or batch-replayed) conversion of the SAME message must reuse one
+// client idempotency identity so the backend collapses it to a single
+// direction, and a backend duplicate replay (`status: "duplicate"`) is a clean
+// success — not an error. (The POST /directions backend dedup is covered in
+// test_directions.py; these tests lock the client key reuse + replay handling.)
+
+describe('MessagesPanel handleCreateDirection idempotency', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  // Installs an apiFetch mock that serves a single FEEDBACK message on the list
+  // GET and records every POST /directions body. `failFirstPost` makes the first
+  // create POST fail (500) so the retry path can be exercised; `duplicate` makes
+  // the create response carry `status: "duplicate"`.
+  function _setupDirectionMock(opts: { failFirstPost?: boolean; failFirstPatch?: boolean; duplicate?: boolean } = {}): {
+    postBodies: Record<string, unknown>[];
+    patchBodies: Record<string, unknown>[];
+  } {
+    const postBodies: Record<string, unknown>[] = [];
+    const patchBodies: Record<string, unknown>[] = [];
+    let postCount = 0;
+    let patchCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/directions') && method === 'POST') {
+        postBodies.push(JSON.parse(String((init as RequestInit).body)));
+        postCount += 1;
+        if (opts.failFirstPost && postCount === 1) return new Response('boom', { status: 500 });
+        return new Response(
+          JSON.stringify({ direction: { id: 'd-xyz' }, ...(opts.duplicate ? { status: 'duplicate' } : {}) }),
+          { status: 200 },
+        );
+      }
+      if (urlStr.includes('/api/admin/messages/fb-1') && method === 'PATCH') {
+        patchBodies.push(JSON.parse(String((init as RequestInit).body)));
+        patchCount += 1;
+        if (opts.failFirstPatch && patchCount === 1) return new Response('boom', { status: 500 });
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [makeMsg({ id: 'fb-1', message_type: 'FEEDBACK', from_type: 'operator' })] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    return { postBodies, patchBodies };
+  }
+
+  async function renderPanel(addToast: (message: string, type: 'success' | 'error' | 'info') => void = () => {}) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  function createDirectionButton(el: HTMLElement): HTMLButtonElement {
+    const btn = el.querySelector('button[title="Create Direction"]') as HTMLButtonElement | null;
+    if (!btn) throw new Error('test setup: expected a Create Direction button on the feedback message');
+    return btn;
+  }
+
+  test('sends an idempotency_key with the direction create POST', async () => {
+    const { postBodies } = _setupDirectionMock();
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+    await act(async () => { btn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(1);
+    expect(typeof postBodies[0].idempotency_key).toBe('string');
+    expect((postBodies[0].idempotency_key as string).length).toBeGreaterThan(0);
+  });
+
+  test('reuses one idempotency_key per message id when a failed conversion is retried', async () => {
+    const { postBodies } = _setupDirectionMock({ failFirstPost: true });
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+
+    await act(async () => { btn.click(); }); // first attempt fails — key retained
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    await act(async () => { btn.click(); }); // retry — same message id, same key
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(2);
+    expect(postBodies[0].idempotency_key).toBeTruthy();
+    expect(postBodies[0].idempotency_key).toBe(postBodies[1].idempotency_key);
+  });
+
+  test('keeps one idempotency_key until the resolution PATCH succeeds', async () => {
+    const addToast = vi.fn();
+    const { postBodies, patchBodies } = _setupDirectionMock({ failFirstPatch: true, duplicate: true });
+    const el = await renderPanel(addToast);
+    const btn = createDirectionButton(el);
+
+    await act(async () => { btn.click(); }); // create succeeds, resolution PATCH fails
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    await act(async () => { btn.click(); }); // retry replays the same create idempotency key
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(2);
+    expect(postBodies[0].idempotency_key).toBeTruthy();
+    expect(postBodies[0].idempotency_key).toBe(postBodies[1].idempotency_key);
+    expect(patchBodies).toEqual([
+      { resolution: 'Direction created: d-xyz' },
+      { resolution: 'Direction created: d-xyz' },
+    ]);
+    expect(addToast).toHaveBeenCalledWith('Failed to create direction', 'error');
+    expect(addToast).toHaveBeenCalledWith('Direction created', 'success');
+  });
+
+  test('treats a status:"duplicate" create response as a clean success', async () => {
+    const { postBodies } = _setupDirectionMock({ duplicate: true });
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+    await act(async () => { btn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // One create, and the message was resolved (PATCH) — the duplicate replay
+    // routed through the success path rather than throwing.
+    expect(postBodies.length).toBe(1);
+    const patched = vi.mocked(apiFetch).mock.calls.some((c) => {
+      const init = c[1] as RequestInit | undefined;
+      return String(c[0]).includes('/api/admin/messages/fb-1') && init?.method === 'PATCH';
+    });
+    expect(patched).toBe(true);
+  });
+});
+
 
 describe('MessagesPanel strategic-refresh pending badge', () => {
   let root: Root | null = null;
@@ -3766,26 +3961,44 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).toContain('…');
   });
 
-  test('displays coalesce count when count > 1', async () => {
+  test('displays coalesce count when operator_count > 1 (operator-origin steers only)', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
         excerpt: 'Update the problem model for the new version',
-        origin: 'qualification',
+        origin: 'operator',
         count: 3,
+        operator_count: 3,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
     expect(el.textContent).toContain('+2 steers coalesced');
   });
 
-  test('does not display coalesce info when count = 1', async () => {
+  test('does not display coalesce count for qualification-origin markers (automated refreshes excluded)', async () => {
+    // A qualification marker with count > 1 should NOT show coalesce since the label
+    // uses operator_count, which is 0 for automated refreshes.
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'qualification',
+        count: 3,
+        operator_count: 0,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).not.toContain('coalesced');
+  });
+
+  test('does not display coalesce info when operator_count = 1', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
         excerpt: 'Update the problem model for the new version',
         origin: 'operator',
         count: 1,
+        operator_count: 1,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
@@ -3799,11 +4012,57 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
         excerpt: 'Investigate the performance regression in the query handler',
         origin: 'operator',
         count: 5,
+        operator_count: 5,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
     expect(el.textContent).toContain('Investigate the performance regression in the query handler');
     expect(el.textContent).toContain('+4 steers coalesced');
     expect(el.textContent).toContain('armed 2m ago');
+  });
+
+  test('does not show receipt when last_fired_at is older than 2 hours', async () => {
+    // A stale receipt (> 2h old) must be suppressed — it grows without bound otherwise
+    // and resurfaces confusingly after an operator cancels a fresh steer.
+    const staleAt = new Date(Date.now() - 3 * 3600_000).toISOString(); // 3 hours ago
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: staleAt,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).not.toContain('Steer picked up');
+  });
+
+  test('shows receipt when last_fired_at is within 2 hours', async () => {
+    // A recent receipt (< 2h old) must show — the steer just fired and context is fresh.
+    const recentAt = new Date(Date.now() - 30 * 60_000).toISOString(); // 30 minutes ago
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: recentAt,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
+  });
+
+  test('shows receipt for a naive-UTC (no trailing Z) timestamp within 2 hours', async () => {
+    // The backend serialises naive UTC ISO strings *without* a trailing 'Z'.
+    // The age gate must parse these through parseTimestamp (UTC), not raw
+    // new Date() (which would treat them as local time and shift the age by
+    // the operator's UTC offset).
+    const recentNaive = new Date(Date.now() - 30 * 60_000).toISOString().replace('Z', ''); // 30 min ago, naive UTC
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: recentNaive,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
+  });
+
+  test('hides receipt for a naive-UTC (no trailing Z) timestamp older than 2 hours', async () => {
+    // Complementary stale case: a 3h-old naive-UTC timestamp must be suppressed.
+    // Proves the gate is parsed as UTC, not local — a stale receipt stays hidden.
+    const staleNaive = new Date(Date.now() - 3 * 3600_000).toISOString().replace('Z', ''); // 3h ago, naive UTC
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: staleNaive,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).not.toContain('Steer picked up');
   });
 });

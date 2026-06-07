@@ -1,6 +1,6 @@
 """Unit tests for digest metric helpers (app.digest_metrics / sr_review_quality_metrics)."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -11,12 +11,15 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
     compute_churn_direction,
     compute_digest_cost_economics,
+    compute_effort_model_efficiency,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_migration_health,
     compute_narrative_summary,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
@@ -226,6 +229,83 @@ def test_compute_narrative_summary_direction_taxonomy_hint():
 
 def test_compute_narrative_summary_empty_window_fallback():
     assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
+
+
+def test_compute_migration_health_counts_migration_errors_only_for_migrate_tasks():
+    migrate_completed = make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "migrate"}])
+    migrate_failed = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "migrate"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+    non_migrate_completed = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+    non_migrate_failed = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+
+    result = compute_migration_health(
+        [migrate_completed, non_migrate_completed],
+        [migrate_failed, non_migrate_failed],
+        error_log_map={},
+    )
+
+    assert result["migration_tasks_in_window"] == 2
+    assert result["migration_tasks_succeeded"] == 1
+    assert result["migration_tasks_failed"] == 1
+    assert result["migration_errors_in_window"] == 1
+
+
+def test_compute_migration_health_reports_migration_slot_contention():
+    now = _utcnow()
+    holder = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        title="Author migration",
+        payloads=[{"type": "migrate"}],
+        started_at=now - timedelta(hours=3, minutes=15),
+    )
+    oldest_waiter = make_task(
+        status=TaskStatus.QUEUED,
+        title="Queued migration waiter",
+        payloads=[
+            {
+                "type": "create",
+                "related_files": ["backend/app/models.py"],
+            }
+        ],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(hours=1, minutes=45),
+        updated_at=now - timedelta(hours=1, minutes=30),
+    )
+    newer_waiter = make_task(
+        status=TaskStatus.QUEUED,
+        title="Younger migration waiter",
+        payloads=[{"type": "migrate"}],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(minutes=50),
+        updated_at=now - timedelta(minutes=20),
+    )
+
+    result = compute_migration_health(
+        [],
+        [],
+        error_log_map={},
+        active_tasks=[holder, oldest_waiter, newer_waiter],
+    )
+
+    contention = result["migration_slot_contention"]
+    assert contention["status"] == "elevated"
+    assert contention["severity"] == "critical"
+    assert contention["deferred_count"] == 2
+    assert contention["holder"]["task_id"] == str(holder.id)
+    assert contention["holder"]["hold_seconds"] >= 3 * 3600
+    assert contention["longest_wait"]["task_id"] == str(oldest_waiter.id)
+    assert contention["longest_wait"]["wait_seconds"] >= 90 * 60
 
 
 def test_compute_narrative_summary_convergence_verdict_appears():
@@ -907,6 +987,9 @@ def test_compute_digest_cost_economics_empty():
     assert result["provisioning_overhead_usd"] == 0.0
     assert result["provisioning_overhead_pct"] is None
     assert result["daily_cost_usd"] == 0.0
+    # Default compute-job spend is 0.0, so total == VM == 0.0 and split keys exist.
+    assert result["daily_vm_cost_usd"] == 0.0
+    assert result["daily_compute_cost_usd"] == 0.0
     assert result["daily_cost_ceiling_usd"] == 12.5
     assert result["overall_product_ratio"] is None
     assert result["median_cost_per_merged_pr"] is None
@@ -914,14 +997,45 @@ def test_compute_digest_cost_economics_empty():
     assert result["median_cpm_by_type"] is None
     assert result["pipeline_acceptance_rate"] is None
     assert result["pipeline_conversion_rate"] is None
-    assert result["pipeline_autonomous_prs_merged"] == 0
-    assert result["pipeline_assisted_prs_merged"] == 0
-    assert result["pipeline_operator_action_count"] == 0
-    assert result["pipeline_generalized_successes"] == 0
-    assert result["pipeline_generalized_health_rate"] is None
-    assert result["pipeline_outcome_kind_breakdown"] == {}
+    # Retired: pipeline_autonomous/assisted_prs_merged + pipeline_operator_action_count
+    # (consumer-less digest duplicates of per-direction outcome fields).
+    assert "pipeline_autonomous_prs_merged" not in result
+    assert "pipeline_assisted_prs_merged" not in result
+    assert "pipeline_operator_action_count" not in result
     assert result["overall_type_distribution"] == {}
     assert result["pipeline_filter_funnel"] == {}
+    assert "pipeline_generalized_successes" not in result
+    assert "pipeline_generalized_health_rate" not in result
+    assert "pipeline_outcome_kind_breakdown" not in result
+
+
+def test_compute_digest_cost_economics_includes_compute_job_spend():
+    """compute_job_daily_cost_usd folds into daily_cost_usd as total spend."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # A task that stopped earlier today (within today_start..now).
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    od_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        vm_spot=False,
+        vm_provisioned_at=max(window_start, today_start) + timedelta(seconds=0),
+        vm_stopped_at=max(window_start, today_start) + timedelta(seconds=3600),
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[od_task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+        compute_job_daily_cost_usd=2.5,
+    )
+    expected_vm = round(ON_DEMAND_RATE * 3600, 2)
+    assert result["daily_vm_cost_usd"] == expected_vm
+    assert result["daily_compute_cost_usd"] == 2.5
+    assert result["daily_cost_usd"] == round(expected_vm + 2.5, 2)
 
 
 def test_compute_digest_cost_economics_spot_on_demand_split():
@@ -1076,6 +1190,39 @@ def test_compute_digest_cost_economics_excludes_non_merge_unblocks():
     assert by_type["create"]["merged_count"] == 1
 
 
+def test_pipeline_conversion_rate_uses_pr_eligible_denominator():
+    """Headline pipeline_conversion_rate divides merges by PR-eligible tasks only.
+
+    direction_progress_list entries carry both tasks_created (all task rows) and
+    pr_eligible_tasks_created (excludes research/audit/memo/investigate). The
+    pipeline conversion rate must use the eligible count so non-PR work does not
+    dilute the rate: 3 merged / 5 eligible = 0.6, not 3 / 12 created.
+    """
+    now = _utcnow()
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=[
+            {
+                "estimated_cost_usd": 0.0,
+                "prs_merged": 2,
+                "tasks_created": 7,
+                "pr_eligible_tasks_created": 3,
+            },
+            {
+                "estimated_cost_usd": 0.0,
+                "prs_merged": 1,
+                "tasks_created": 5,
+                "pr_eligible_tasks_created": 2,
+            },
+        ],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # 3 merged / 5 PR-eligible tasks = 0.6 (NOT 3 / 12 created = 0.25)
+    assert result["pipeline_conversion_rate"] == 0.6
+
+
 def test_first_review_approval_breakdowns_exclude_non_merge_unblocks():
     """Review-eligible merge analytics require an integration-landing signal."""
     now = _utcnow()
@@ -1109,6 +1256,7 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "prs_merged": 3,
             "prs_rejected": 1,
             "tasks_created": 10,
+            "pr_eligible_tasks_created": 8,
             "autonomous_prs_merged": 2,
             "assisted_prs_merged": 1,
             "operator_action_count": 4,
@@ -1126,6 +1274,7 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "prs_merged": 1,
             "prs_rejected": 1,
             "tasks_created": 5,
+            "pr_eligible_tasks_created": 4,
             "autonomous_prs_merged": 1,
             "assisted_prs_merged": 0,
             "operator_action_count": 1,
@@ -1145,20 +1294,96 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
         now=now,
         daily_cost_ceiling_usd=0.0,
     )
-    # merged=4, rejected=2 → 4/6 = 0.667; created=15 → 4/15 = 0.267.
+    # merged=4, rejected=2 → 4/6 = 0.667; PR-eligible=8+4=12 → 4/12 = 0.333.
     assert result["pipeline_acceptance_rate"] == 0.667
-    assert result["pipeline_conversion_rate"] == 0.267
-    assert result["pipeline_autonomous_prs_merged"] == 3
-    assert result["pipeline_assisted_prs_merged"] == 1
-    assert result["pipeline_operator_action_count"] == 5
-    assert result["pipeline_generalized_successes"] == 6
-    assert result["pipeline_generalized_health_rate"] == 0.75
-    assert result["pipeline_outcome_kind_breakdown"] == {
-        "code_merge": {"success": 4, "neutral": 0, "failure": 2},
-        "research_quality": {"success": 2, "neutral": 0, "failure": 0},
-    }
+    assert result["pipeline_conversion_rate"] == 0.333
+    # Retired: pipeline_autonomous/assisted_prs_merged + pipeline_operator_action_count
+    # (consumer-less digest duplicates of per-direction outcome fields).
+    assert "pipeline_autonomous_prs_merged" not in result
+    assert "pipeline_assisted_prs_merged" not in result
+    assert "pipeline_operator_action_count" not in result
     assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
     assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
+    assert "pipeline_generalized_successes" not in result
+    assert "pipeline_generalized_health_rate" not in result
+    assert "pipeline_outcome_kind_breakdown" not in result
+
+
+def test_compute_digest_cost_economics_pipeline_uses_verified_merged():
+    """Pipeline acceptance/conversion rates sum the verified merge count, so a
+    direction whose only merges are unverified-degraded does not inflate the
+    headline rate, while a direction with genuine verified merges contributes
+    normally — matching the verified per-direction rates the pipeline aggregates."""
+    now = _utcnow()
+    dirs = [
+        {
+            # Genuine direction: every merge is verified.
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "verified_prs_merged": 3,
+            "prs_rejected": 1,
+            "tasks_created": 10,
+            "pr_eligible_tasks_created": 10,
+        },
+        {
+            # Degraded direction: 2 merges, none verified (no-CI fall-open).
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 2,
+            "verified_prs_merged": 0,
+            "prs_rejected": 1,
+            "tasks_created": 5,
+            "pr_eligible_tasks_created": 5,
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # Verified merged = 3 + 0 = 3 (NOT raw 3 + 2 = 5).
+    # acceptance = 3 / (3 + 2 rejected) = 0.6; conversion = 3 / 15 created = 0.2.
+    assert result["pipeline_acceptance_rate"] == 0.6
+    assert result["pipeline_conversion_rate"] == 0.2
+    # The degraded merges lower BOTH rates versus the raw-count rollup, which
+    # would have produced acceptance 5/7 ≈ 0.714 and conversion 5/15 ≈ 0.333.
+    assert result["pipeline_acceptance_rate"] < round(5 / 7, 3)
+    assert result["pipeline_conversion_rate"] < round(5 / 15, 3)
+
+
+def test_compute_digest_cost_economics_pipeline_verified_fallback():
+    """A direction dict lacking verified_prs_merged falls back to raw prs_merged
+    so legacy/partial entries degrade to prior behavior rather than to zero."""
+    now = _utcnow()
+    dirs = [
+        {
+            # Legacy dict: no verified_prs_merged key → falls back to prs_merged.
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 4,
+            "prs_rejected": 1,
+            "tasks_created": 8,
+            "pr_eligible_tasks_created": 8,
+        },
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "verified_prs_merged": 1,
+            "prs_rejected": 0,
+            "tasks_created": 4,
+            "pr_eligible_tasks_created": 4,
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # merged = 4 (fallback) + 1 (verified) = 5; rejected = 1; created = 12.
+    assert result["pipeline_acceptance_rate"] == round(5 / 6, 3)
+    assert result["pipeline_conversion_rate"] == round(5 / 12, 3)
 
 
 def test_compute_scope_mismatch_summary_no_calibrated_tasks():
@@ -1377,6 +1602,70 @@ def test_compute_sr_prediction_accuracy_reviewer_origin_excluded():
     assert result["miss_rate"] == 1.0
 
 
+def test_compute_review_quality_metrics_includes_later_iteration_only_confirmations():
+    """A task whose reviewer-confirmed categories appear only on a LATER
+    iteration (``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) must be sampled by
+    compute_review_quality_metrics and its later-confirmed category scored as a
+    hit — not dropped from the sample, not counted as a false alarm."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": False}}
+                },
+                # Confirmed on a later iteration only; first review approved.
+                "_all_iterations_rejection_categories": {"correctness": 1},
+            },
+        )
+        for _ in range(5)
+    ]
+    result = compute_review_quality_metrics(tasks)
+    pred = result["self_review_prediction_accuracy"]
+    assert pred is not None
+    # All five later-iteration-only tasks are in the sample.
+    assert pred["sample_size"] == 5
+    # SR flagged correctness AND reviewer confirmed it (later) => a hit, not a
+    # false alarm.
+    assert pred["prediction_hit_rate"] == 1.0
+    assert pred["false_alarm_rate"] == 0.0
+
+
+def test_compute_review_quality_metrics_fresh_reviewer_uses_any_iteration_truth():
+    """Fresh-reviewer effectiveness must sample and confirm against the same
+    later-iteration-aware reviewer truth as prediction accuracy."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "_all_iterations_rejection_categories": {"correctness": 1},
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": True}},
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "confirmed later",
+                        }
+                    ],
+                },
+            },
+        )
+        for _ in range(3)
+    ]
+
+    result = compute_review_quality_metrics(tasks)
+    fre = result["fresh_reviewer_effectiveness"]
+
+    assert fre["fresh_reviewer_sample_size"] == 3
+    assert fre["prediction_sample_size"] == 3
+    assert fre["per_category_hit_rate"]["correctness"] == 1.0
+    assert fre["reviewer_finding_added_value"]["correctness"] == 3
+
+
 def test_compute_review_quality_metrics_empty_returns_nones():
     """Empty input → every metric is None / empty-ish per sample-size guards."""
     result = compute_review_quality_metrics([])
@@ -1433,53 +1722,6 @@ def test_compute_review_quality_metrics_review_accuracy_shape():
     assert acc["overrides"] == 0
     assert acc["precision"] == 1.0
     assert acc["recall"] == 1.0
-
-
-def test_parallel_review_effectiveness_buckets_correctly():
-    """Tasks with review_was_parallelized=True/False bucket into parallel/serial."""
-
-    def _make_review(parallelized: bool, verdict: str = "APPROVE"):
-        return make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review"}],
-            context={
-                "blueprint_review_verdict": verdict,
-                "review_was_parallelized": parallelized,
-            },
-        )
-
-    parallel_tasks = [_make_review(True) for _ in range(3)]
-    serial_tasks = [_make_review(False) for _ in range(3)]
-    result = compute_review_quality_metrics(parallel_tasks + serial_tasks)
-    pre = result["parallel_review_effectiveness"]
-    assert pre is not None
-    assert pre["sample_sizes"]["parallel"] == 3
-    assert pre["sample_sizes"]["serial"] == 3
-    assert pre["parallel"]["count"] == 3
-    assert pre["serial"]["count"] == 3
-    assert pre["parallel"]["approval_rate"] == 1.0
-    assert pre["serial"]["approval_rate"] == 1.0
-
-
-def test_parallel_review_effectiveness_none_when_insufficient_sample():
-    """Returns None when either bucket has fewer than 3 tasks."""
-
-    def _make_review(parallelized: bool):
-        return make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review"}],
-            context={
-                "blueprint_review_verdict": "APPROVE",
-                "review_was_parallelized": parallelized,
-            },
-        )
-
-    # Only 2 parallel tasks — below threshold
-    tasks = [_make_review(True) for _ in range(2)] + [
-        _make_review(False) for _ in range(5)
-    ]
-    result = compute_review_quality_metrics(tasks)
-    assert result["parallel_review_effectiveness"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2109,6 +2351,476 @@ async def test_dependency_health_signals_query_surfaces_recut_escalated(db_sessi
     assert "plain-queued" not in titles
 
 
+def test_unresumable_cancellation_summary_counts_and_buckets():
+    """The pure summarizer counts terminal give-up cancellations and breaks them
+    down by give-up class and by originating direction; tasks with no marker are
+    skipped."""
+    from app.digest_metrics import compute_unresumable_cancellation_summary
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+        GIVE_UP_NEVER_SATISFIABLE,
+    )
+
+    def _cancelled(give_up_class, direction_id, at):
+        return make_task(
+            status=TaskStatus.CANCELLED,
+            context={
+                UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                    "give_up_class": give_up_class,
+                    "need": {"kind": "capability", "ref": "x"},
+                    "direction_id": direction_id,
+                    "at": at,
+                }
+            },
+        )
+
+    died_a = _cancelled(GIVE_UP_FOUNDATION_DIED, "d-aaa", "2026-06-04T10:00:00")
+    died_b = _cancelled(GIVE_UP_FOUNDATION_DIED, "d-bbb", "2026-06-04T11:00:00")
+    never_a = _cancelled(GIVE_UP_NEVER_SATISFIABLE, "d-aaa", "2026-06-04T12:00:00")
+    # No marker → excluded.
+    plain = make_task(status=TaskStatus.CANCELLED, context={})
+
+    result = compute_unresumable_cancellation_summary(
+        [died_a, died_b, never_a, plain]
+    )
+
+    assert result["total"] == 3
+    assert result["by_class"] == {
+        GIVE_UP_FOUNDATION_DIED: 2,
+        GIVE_UP_NEVER_SATISFIABLE: 1,
+    }
+    assert result["by_direction"] == {"d-aaa": 2, "d-bbb": 1}
+    # Newest-first.
+    assert result["tasks"][0]["task_id"] == str(never_a.id)
+
+
+def test_unresumable_cancellation_summary_filters_by_window():
+    """A marker whose ``at`` precedes ``window_start`` is excluded from the count."""
+    from app.digest_metrics import compute_unresumable_cancellation_summary
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+    )
+
+    recent = make_task(
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": None,
+                "direction_id": "d-aaa",
+                "at": "2026-06-04T10:00:00",
+            }
+        },
+    )
+    stale = make_task(
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": None,
+                "direction_id": "d-aaa",
+                "at": "2026-05-01T10:00:00",
+            }
+        },
+    )
+
+    result = compute_unresumable_cancellation_summary(
+        [recent, stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+
+    assert result["total"] == 1
+    assert result["tasks"][0]["task_id"] == str(recent.id)
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_unresumable_cancellations(
+    db_session,
+):
+    """The DB-backed dependency-health query surfaces the unresumable-cancellation
+    aggregate: CANCELLED tasks carrying the marker within the recent window are
+    counted; an unmarked CANCELLED task is excluded."""
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+    )
+
+    project = make_project(name="Unresumable cancel query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    marked = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        title="gave-up-dependent",
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": {"kind": "task", "ref": "foo"},
+                "direction_id": "d-aaa",
+                "at": _utcnow().isoformat(),
+            }
+        },
+    )
+    unmarked = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        title="plain-cancelled",
+        context={},
+    )
+    db_session.add_all([marked, unmarked])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["unresumable_cancellations"]
+    assert agg["total"] == 1
+    assert agg["by_class"] == {GIVE_UP_FOUNDATION_DIED: 1}
+    assert agg["by_direction"] == {"d-aaa": 1}
+    assert agg["tasks"][0]["title"] == "gave-up-dependent"
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_finding_structural_give_up(
+    db_session,
+):
+    """The dependency-health rollup counts research findings that were finally dropped."""
+    project = make_project(name="Finding give-up query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dropped = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="research cycle with give-up",
+        context={
+            "finding_structural_give_up": {
+                "at": "2026-06-04T12:00:00",
+                "total": 2,
+                "by_reason": {"prereq_deferred_same_cycle": 2},
+                "by_direction": {"d-aaa": 2},
+                "sample": [
+                    {
+                        "title": "Use shared helper",
+                        "reason": "prereq_deferred_same_cycle",
+                        "direction_id": "d-aaa",
+                    }
+                ],
+            }
+        },
+    )
+    plain = make_task(project_id=project.id, status=TaskStatus.COMPLETED, title="plain")
+    db_session.add_all([dropped, plain])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["finding_structural_give_up"]
+    assert agg["total"] == 2
+    assert agg["by_reason"] == {"prereq_deferred_same_cycle": 2}
+    assert agg["by_direction"] == {"d-aaa": 2}
+    assert agg["findings"][0]["title"] == "Use shared helper"
+
+
+def test_live_blocked_summary_counts_and_buckets_by_age():
+    """The live-blocked summarizer counts EVERY currently-BLOCKED task (not just
+    parked/escalated ones) and buckets them by how long they have been blocked."""
+    from app.digest_metrics import compute_live_blocked_summary
+
+    now = _utcnow()
+
+    def _blocked(age_hours, direction_id=None):
+        return make_task(
+            status=TaskStatus.BLOCKED,
+            title=f"blocked-{age_hours}h",
+            blocked_at=now - timedelta(hours=age_hours),
+            context={"direction_id": direction_id} if direction_id else {},
+        )
+
+    fresh = _blocked(0.5, "d-aaa")  # <1h
+    mid = _blocked(3, "d-aaa")  # 1-6h
+    older = _blocked(12)  # 6-24h
+    ancient = _blocked(48)  # >24h
+    # No blocked_at → unknown bucket, still counted.
+    no_ts = make_task(status=TaskStatus.BLOCKED, title="no-ts", blocked_at=None)
+
+    result = compute_live_blocked_summary([fresh, mid, older, ancient, no_ts])
+
+    assert result["total"] == 5
+    assert result["by_age"] == {
+        "<1h": 1,
+        "1-6h": 1,
+        "6-24h": 1,
+        ">24h": 1,
+        "unknown": 1,
+    }
+    # Newest-blocked first: the 0.5h task leads (excluding the no-ts null sort).
+    titles = [t["title"] for t in result["tasks"]]
+    assert "blocked-0.5h" in titles
+    assert result["tasks"][0]["title"] == "blocked-0.5h"
+
+
+def test_blocked_resume_summary_counts_and_breaks_down_by_resolved_by():
+    """The pure resume summarizer counts resume markers and breaks them down by
+    ``resolved_by`` (edge vs completed) and by originating direction; tasks with no
+    marker are skipped."""
+    from app.digest_metrics import compute_blocked_resume_summary
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    def _resumed(resolved_by, direction_id, at):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                RESUME_MARKER_CONTEXT_KEY: {
+                    "resolved_by": resolved_by,
+                    "foundation": ["f-1"],
+                    "direction_id": direction_id,
+                    "at": at,
+                }
+            },
+        )
+
+    edge_a = _resumed("edge", "d-aaa", "2026-06-04T10:00:00")
+    edge_b = _resumed("edge", "d-bbb", "2026-06-04T11:00:00")
+    completed_a = _resumed("completed", "d-aaa", "2026-06-04T12:00:00")
+    # No marker → excluded.
+    plain = make_task(status=TaskStatus.QUEUED, context={})
+
+    result = compute_blocked_resume_summary([edge_a, edge_b, completed_a, plain])
+
+    assert result["total"] == 3
+    assert result["by_resolved_by"] == {"edge": 2, "completed": 1}
+    assert result["by_direction"] == {"d-aaa": 2, "d-bbb": 1}
+    # Newest-first.
+    assert result["tasks"][0]["task_id"] == str(completed_a.id)
+
+
+def test_blocked_resume_summary_filters_by_window_and_empty_case():
+    """A marker whose ``at`` precedes ``window_start`` is excluded; an all-stale set
+    yields an empty (zeroed) summary."""
+    from app.digest_metrics import compute_blocked_resume_summary
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    def _resumed(at):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                RESUME_MARKER_CONTEXT_KEY: {
+                    "resolved_by": "edge",
+                    "foundation": ["f-1"],
+                    "direction_id": "d-aaa",
+                    "at": at,
+                }
+            },
+        )
+
+    recent = _resumed("2026-06-04T10:00:00")
+    stale = _resumed("2026-05-01T10:00:00")
+
+    result = compute_blocked_resume_summary(
+        [recent, stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+    assert result["total"] == 1
+    assert result["tasks"][0]["task_id"] == str(recent.id)
+
+    # Empty case: every marker stale → zeroed summary.
+    empty = compute_blocked_resume_summary(
+        [stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+    assert empty["total"] == 0
+    assert empty["by_resolved_by"] == {}
+    assert empty["tasks"] == []
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_live_blocked(db_session):
+    """The DB-backed query surfaces the live BLOCKED population — including a
+    not-yet-escalated dependent the parked-blocker signal deliberately omits."""
+    project = make_project(name="Live blocked query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    waiting = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        title="healthy-waiting-dependent",
+        blocked_at=_utcnow() - timedelta(hours=2),
+        context={"direction_id": "d-aaa"},  # no _blocked_escalated
+    )
+    queued = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="not-blocked",
+    )
+    db_session.add_all([waiting, queued])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    live = result["live_blocked"]
+    assert live["total"] == 1
+    assert live["tasks"][0]["title"] == "healthy-waiting-dependent"
+    assert live["by_age"] == {"1-6h": 1}
+    # The not-yet-escalated waiter is NOT in the parked-only signal.
+    assert result["parked_blockers"]["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_blocked_resumes(db_session):
+    """The DB-backed query is STATUS-AGNOSTIC for resume markers: a resumed task
+    that has advanced past QUEUED (e.g. to DONE) still carries the marker and is
+    counted within the window; an unmarked task is excluded."""
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    project = make_project(name="Blocked resume query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Status-agnostic proof: marker present on a DONE (non-QUEUED) task.
+    resumed_done = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="resumed-then-done",
+        context={
+            RESUME_MARKER_CONTEXT_KEY: {
+                "resolved_by": "completed",
+                "foundation": [{"kind": "task", "ref": "foo"}],
+                "direction_id": "d-aaa",
+                "at": _utcnow().isoformat(),
+            }
+        },
+    )
+    unmarked = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="plain-done",
+        context={},
+    )
+    db_session.add_all([resumed_done, unmarked])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["resumes"]
+    assert agg["total"] == 1
+    assert agg["by_resolved_by"] == {"completed": 1}
+    assert agg["by_direction"] == {"d-aaa": 1}
+    assert agg["tasks"][0]["title"] == "resumed-then-done"
+
+
+def _blocked_dependent(project_id, need, *, direction_id=None, blocked_at=None):
+    """A BLOCKED dependent waiting on a single machine-resolvable foundation need —
+    mirrors the producer's expected ``blocker.needs`` shape (see
+    test_capability_demand._blocked)."""
+    ctx = {
+        "blocker": {
+            "source": "agent",
+            "waiting_on": need.get("ref"),
+            "reason": "BLOCKER: waiting on foundation",
+            "need": need,
+            "needs": [need],
+        },
+    }
+    if direction_id is not None:
+        ctx["direction_id"] = direction_id
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.BLOCKED,
+        blocked_at=blocked_at or (_utcnow() - timedelta(hours=4)),
+        context=ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_capability_demand_summary_aggregates_blocked_and_cancelled(
+    db_session,
+):
+    """The summary folds live-blocked (still_blocked) and recently give-up-CANCELLED
+    (already_cancelled) dependents of the same capability into one demand, exposing
+    the split, the per-direction count, and a largest-first sample."""
+    from app.digest_metrics import compute_missing_capability_demand_summary
+    from app.reaper_sweeps import (
+        GIVE_UP_NEVER_SATISFIABLE,
+        MISSING_FOUNDATION_MARKER_KEY,
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    )
+
+    project = make_project(name="Missing demand summary", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    cap_need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth"}
+
+    # Two live BLOCKED dependents of the same capability under different directions.
+    live_a = _blocked_dependent(
+        project.id, cap_need, direction_id="d-live", blocked_at=now - timedelta(hours=10)
+    )
+    live_b = _blocked_dependent(
+        project.id, cap_need, direction_id="d-live2", blocked_at=now - timedelta(hours=3)
+    )
+    # A give-up-CANCELLED dependent retired as missing-foundation within the window.
+    cancelled = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_NEVER_SATISFIABLE,
+                "need": cap_need,
+                "direction_id": "d-dead",
+                "at": (now - timedelta(hours=2)).isoformat(),
+                MISSING_FOUNDATION_MARKER_KEY: True,
+            }
+        },
+    )
+    db_session.add_all([live_a, live_b, cancelled])
+    await db_session.commit()
+
+    summary = await compute_missing_capability_demand_summary(
+        db_session, project_id=project.id, now=now
+    )
+
+    assert summary["total"] == 1
+    assert summary["still_blocked"] == 2
+    assert summary["already_cancelled"] == 1
+    # by_direction counts how many demands each originating direction carries.
+    assert summary["by_direction"] == {"d-live": 1, "d-live2": 1, "d-dead": 1}
+    entry = summary["demands"][0]
+    assert entry["kind"] == "capability"
+    assert entry["dependent_count"] == 3
+    assert entry["oldest_blocked_at"] == (now - timedelta(hours=10)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_includes_missing_capability_demand(db_session):
+    """The dependency-health rollup nests the missing-capability-demand summary so the
+    digest router emits it with no router edit — a real named consumer."""
+    project = make_project(name="Missing demand rollup", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cap_need = {"kind": "capability", "ref": "billing-core", "label": "Billing"}
+    blocked = _blocked_dependent(project.id, cap_need, direction_id="d-aaa")
+    db_session.add(blocked)
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    assert "missing_capability_demand" in result
+    agg = result["missing_capability_demand"]
+    assert agg["total"] == 1
+    assert agg["still_blocked"] == 1
+    assert agg["already_cancelled"] == 0
+    assert agg["by_direction"] == {"d-aaa": 1}
+
+
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():
     """Two active write-tasks under DIFFERENT parents whose related-file sets
     strongly overlap are surfaced; a disjoint task is not."""
@@ -2441,6 +3153,110 @@ def test_compute_foundation_convergence_actions_same_parent_excluded():
     assert len(actions) == 0, "Same-parent siblings should be excluded"
 
 
+def test_compute_foundation_convergence_actions_same_parent_included_when_opted_out():
+    """exclude_same_parent=False (the spawn-time call) DOES converge same-parent
+    genuine duplicates: a research batch's children all share one parent, so the
+    coarse parent check would otherwise mask every within-batch duplicate."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    parent_id = uuid4()
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_id,
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_id,  # Same parent — included only when opted out.
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+
+    assert compute_foundation_convergence_actions([t1, t2]) == []
+    actions = compute_foundation_convergence_actions(
+        [t1, t2], exclude_same_parent=False
+    )
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+
+
+def test_apply_foundation_convergence_action_wires_edge_and_stamps_marker():
+    """The shared apply helper wires the depends_on edge and stamps the
+    _foundation_converged marker, returning the mutated dependent."""
+    from app.digest_metrics import (
+        apply_foundation_convergence_action,
+        compute_foundation_convergence_actions,
+    )
+
+    now = _utcnow()
+    canonical = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.QUEUED,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "apply001"},
+    )
+    dependent = make_task(
+        created_at=now,
+        status=TaskStatus.QUEUED,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "apply001"},
+    )
+    by_id = {str(canonical.id): canonical, str(dependent.id): dependent}
+    candidates = [canonical, dependent]
+    [action] = compute_foundation_convergence_actions(candidates)
+
+    result = apply_foundation_convergence_action(action, by_id, candidates)
+
+    assert result is dependent
+    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    marker = dependent.context.get("_foundation_converged", {})
+    assert marker.get("foundation_id") == str(canonical.id)
+    assert "apply001" in marker.get("reason", "")
+
+
+def test_apply_foundation_convergence_action_refuses_self_and_existing_edge():
+    """The apply helper is idempotent and refuses a self-edge: an already-present
+    edge returns None and does not duplicate, and a self-referential action is
+    rejected."""
+    from app.digest_metrics import apply_foundation_convergence_action
+
+    now = _utcnow()
+    canonical = make_task(created_at=now - timedelta(hours=1), payloads=[{"type": "fix"}])
+    dependent = make_task(
+        created_at=now,
+        payloads=[{"type": "fix"}],
+        depends_on=[str(canonical.id)],
+    )
+    by_id = {str(canonical.id): canonical, str(dependent.id): dependent}
+    candidates = [canonical, dependent]
+
+    # Already-present edge → no-op.
+    existing_action = {
+        "dependent_id": str(dependent.id),
+        "foundation_id": str(canonical.id),
+        "reason": "x",
+        "shared_files": [],
+    }
+    assert apply_foundation_convergence_action(existing_action, by_id, candidates) is None
+    assert dependent.depends_on == [str(canonical.id)]
+
+    # Self-edge → refused.
+    self_action = {
+        "dependent_id": str(dependent.id),
+        "foundation_id": str(dependent.id),
+        "reason": "x",
+        "shared_files": [],
+    }
+    assert apply_foundation_convergence_action(self_action, by_id, candidates) is None
+
+
 def test_compute_foundation_convergence_actions_earlier_task_is_canonical():
     """Earlier-created task becomes canonical foundation; later depends on earlier."""
     from app.digest_metrics import compute_foundation_convergence_actions
@@ -2579,3 +3395,517 @@ def test_compute_foundation_convergence_actions_multiple_pairs():
     pair_ids = {(a["foundation_id"], a["dependent_id"]) for a in actions}
     assert (str(t1a.id), str(t1b.id)) in pair_ids
     assert (str(t2a.id), str(t2b.id)) in pair_ids
+
+
+# ---------------------------------------------------------------------------
+# compute_effort_model_efficiency — per-effort-tier / per-actual-model rollup
+# ---------------------------------------------------------------------------
+
+
+def _eff_task(
+    *,
+    effort=None,
+    task_type="create",
+    provider="anthropic",
+    model="claude-opus-4-8",
+    input_tokens=0,
+    output_tokens=0,
+    call_count=1,
+    landed=False,
+    status=TaskStatus.COMPLETED,
+    context=None,
+    attempt_history=None,
+):
+    """Build a terminal task for the effort/model efficiency rollup tests.
+
+    Tokens go through ``api_call_summary`` (the current-attempt source
+    ``get_task_total_llm_totals`` reads); ``landed`` stamps the canonical
+    ``pr_merged`` landed signal that ``is_merged_completion`` reads.
+    ``attempt_history`` (a list of banked-attempt dicts with provider/model/
+    llm_input_tokens/llm_output_tokens/llm_call_count) feeds the per-attempt
+    cost split that ``_task_llm_attempts`` reads.
+    """
+    payload = {"type": task_type}
+    if effort is not None:
+        payload["effort"] = effort
+    ctx = dict(context or {})
+    if landed:
+        ctx["pr_merged"] = True
+    kwargs = {}
+    if attempt_history is not None:
+        # attempt_history is a context-backed property; the persisted column is
+        # attempt_history_db (what the SQLModel constructor accepts directly).
+        kwargs["attempt_history_db"] = attempt_history
+    return make_task(
+        status=status,
+        provider=provider,
+        model=model,
+        payloads=[payload],
+        context=ctx,
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": call_count,
+        },
+        **kwargs,
+    )
+
+
+def test_effort_model_efficiency_aggregates_by_effort_and_model():
+    """Per-effort and per-model rows carry honest run/landed/cost numbers, and
+    cost is priced with the shared LLM_TOKEN_PRICING table."""
+    tasks = [
+        # high/opus, landed: 1000*15e-6 + 2000*75e-6 = 0.165
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=2000, landed=True),
+        # high/opus, NOT landed: 1000*15e-6 + 1000*75e-6 = 0.09
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=1000, landed=False),
+        # medium/sonnet, landed: 2000*3e-6 + 1000*15e-6 = 0.021
+        _eff_task(effort="medium", model="claude-sonnet-4-6",
+                  input_tokens=2000, output_tokens=1000, landed=True),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    by_effort = {r["effort"]: r for r in result["by_effort"]}
+    # Effort rows are ordered low->max: medium precedes high.
+    assert [r["effort"] for r in result["by_effort"]] == ["medium", "high"]
+
+    high = by_effort["high"]
+    assert high["run_count"] == 2
+    assert high["landed_count"] == 1
+    assert high["landed_rate"] == 0.5
+    assert high["total_cost_usd"] == pytest.approx(0.255)
+    # cost_per_merge = priced cost / landed PRs.
+    assert high["cost_per_merge"] == pytest.approx(0.255)
+    assert high["input_tokens"] == 2000
+    assert high["output_tokens"] == 3000
+
+    medium = by_effort["medium"]
+    assert medium["run_count"] == 1
+    assert medium["landed_rate"] == 1.0
+    assert medium["cost_per_merge"] == pytest.approx(0.021)
+
+    by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    opus = by_model[("anthropic", "claude-opus-4-8")]
+    assert opus["run_count"] == 2 and opus["priced"] is True
+    assert opus["total_cost_usd"] == pytest.approx(0.255)
+    # by_model is sorted by cost desc — opus (0.255) before sonnet (0.021).
+    assert result["by_model"][0]["model"] == "claude-opus-4-8"
+
+    totals = result["totals"]
+    assert totals["run_count"] == 3
+    assert totals["landed_count"] == 2
+    assert totals["total_cost_usd"] == pytest.approx(0.276)
+    assert totals["unpriced_coverage_fraction"] == 1.0
+
+
+def test_effort_model_efficiency_cancelled_runs_add_spend_not_landings():
+    """Cancelled terminal runs can burn tokens, so they must add spend/run count
+    without inflating landed/merge counts."""
+    tasks = [
+        _eff_task(
+            effort="high",
+            model="claude-opus-4-8",
+            input_tokens=1000,
+            output_tokens=1000,
+            landed=True,
+            status=TaskStatus.COMPLETED,
+        ),
+        _eff_task(
+            effort="high",
+            model="claude-opus-4-8",
+            input_tokens=500,
+            output_tokens=500,
+            landed=False,
+            status=TaskStatus.CANCELLED,
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    assert high["run_count"] == 2
+    assert high["landed_count"] == 1
+    assert high["landed_rate"] == 0.5
+    # 1000*15e-6 + 1000*75e-6 + 500*15e-6 + 500*75e-6
+    assert high["total_cost_usd"] == pytest.approx(0.135)
+    assert high["cost_per_merge"] == pytest.approx(0.135)
+
+    totals = result["totals"]
+    assert totals["run_count"] == 2
+    assert totals["landed_count"] == 1
+    assert totals["total_cost_usd"] == pytest.approx(0.135)
+
+
+def test_effort_model_efficiency_reconciles_with_llm_cost_breakdown():
+    """Total priced LLM cost AND the per-actual-model breakdown equal
+    compute_llm_cost_breakdown over the same tasks — the two cost surfaces must
+    not diverge, including for a task that retried on a different model."""
+    from app.efficiency_snapshot import compute_llm_cost_breakdown
+
+    tasks = [
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1500, output_tokens=2500, landed=True),
+        _eff_task(effort="low", model="claude-haiku-4-5-20251001",
+                  input_tokens=4000, output_tokens=1000, landed=False),
+        # Multi-attempt task: an opus attempt was BANKED, then it retried and
+        # finished on sonnet. Each attempt must be priced at its OWN model rate,
+        # so both cost surfaces must agree on the per-model split, not just total.
+        _eff_task(
+            effort="high",
+            model="claude-sonnet-4-6",  # final/current attempt ran on sonnet
+            input_tokens=600,
+            output_tokens=300,
+            landed=True,
+            attempt_history=[
+                {
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-8",
+                    "llm_input_tokens": 800,
+                    "llm_output_tokens": 1200,
+                    "llm_call_count": 2,
+                }
+            ],
+        ),
+    ]
+
+    eff = compute_effort_model_efficiency(tasks)
+    breakdown = compute_llm_cost_breakdown(tasks)
+
+    assert eff["totals"]["total_cost_usd"] == pytest.approx(
+        breakdown["totals"]["total_cost_usd"]
+    )
+    # Per-actual-model cost must reconcile too — the multi-attempt task's opus
+    # tokens land in the opus bucket, its sonnet tokens in the sonnet bucket.
+    eff_by_model = {
+        (r["provider"], r["model"]): r["total_cost_usd"] for r in eff["by_model"]
+    }
+    bd_by_model = {
+        (r["provider"], r["model"]): r["total_cost_usd"]
+        for r in breakdown["by_model"]
+    }
+    assert eff_by_model == pytest.approx(bd_by_model)
+
+
+def test_effort_model_efficiency_splits_retried_task_across_attempt_models():
+    """A task that retried on a different model attributes each attempt's tokens
+    and cost to that attempt's own model, while run/landed counts stay per-task
+    (credited once per distinct model bucket, never once per attempt)."""
+    tasks = [
+        _eff_task(
+            effort="high",
+            model="claude-sonnet-4-6",  # final attempt ran on sonnet
+            input_tokens=2000,  # sonnet: 2000*3e-6 + 1000*15e-6 = 0.021
+            output_tokens=1000,
+            landed=True,
+            attempt_history=[
+                {
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-8",  # earlier attempt ran on opus
+                    "llm_input_tokens": 1000,  # opus: 1000*15e-6 + 2000*75e-6 = 0.165
+                    "llm_output_tokens": 2000,
+                    "llm_call_count": 3,
+                }
+            ],
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    opus = by_model[("anthropic", "claude-opus-4-8")]
+    sonnet = by_model[("anthropic", "claude-sonnet-4-6")]
+    # Each attempt priced at its OWN model's rate.
+    assert opus["total_cost_usd"] == pytest.approx(0.165)
+    assert opus["input_tokens"] == 1000 and opus["output_tokens"] == 2000
+    assert sonnet["total_cost_usd"] == pytest.approx(0.021)
+    assert sonnet["input_tokens"] == 2000 and sonnet["output_tokens"] == 1000
+    # Run count credited ONCE per distinct model bucket, not once per attempt.
+    assert opus["run_count"] == 1 and sonnet["run_count"] == 1
+    assert opus["landed_count"] == 1 and sonnet["landed_count"] == 1
+
+    # Effort bucket: one task, both attempts' cost summed; run/landed counted once.
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    assert high["run_count"] == 1
+    assert high["landed_count"] == 1
+    assert high["total_cost_usd"] == pytest.approx(0.165 + 0.021)
+    # resolved_models exposes both models the high tier actually ran on.
+    resolved = {r["model"] for r in high["resolved_models"]}
+    assert resolved == {"claude-opus-4-8", "claude-sonnet-4-6"}
+
+    totals = result["totals"]
+    assert totals["run_count"] == 1  # one task, not two attempts
+    assert totals["landed_count"] == 1
+    assert totals["total_cost_usd"] == pytest.approx(0.165 + 0.021)
+
+
+def test_effort_model_efficiency_cost_per_merge_uses_verified_merge():
+    """Degraded (no-CI fall-open) merges count in landed_count but are excluded
+    from the verified payoff figures, and cost_per_merge divides by the verified
+    count so degraded merges do not make spend look cheaper."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    tasks = [
+        # Verified merge: no fall-open reason. opus: 0.165
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=2000, landed=True),
+        # Degraded fall-open merge: landed but NOT verified. opus: 0.09
+        _eff_task(
+            effort="high",
+            model="claude-opus-4-8",
+            input_tokens=1000,
+            output_tokens=1000,
+            landed=True,
+            context={"review_loop": {"unverified_merge_reason": degraded_reason}},
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    # Raw landed counts BOTH merges; verified counts only the real one.
+    assert high["landed_count"] == 2
+    assert high["landed_rate"] == 1.0
+    assert high["verified_landed_count"] == 1
+    assert high["verified_landed_rate"] == 0.5
+    # cost_per_merge divides total cost (0.165 + 0.09 = 0.255) by VERIFIED count (1).
+    assert high["total_cost_usd"] == pytest.approx(0.255)
+    assert high["cost_per_merge"] == pytest.approx(0.255)
+
+    by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    opus = by_model[("anthropic", "claude-opus-4-8")]
+    assert opus["landed_count"] == 2
+    assert opus["verified_landed_count"] == 1
+    assert opus["cost_per_merge"] == pytest.approx(0.255)
+
+    totals = result["totals"]
+    assert totals["landed_count"] == 2
+    assert totals["verified_landed_count"] == 1
+    assert totals["verified_landed_rate"] == 0.5
+    assert totals["cost_per_merge"] == pytest.approx(0.255)
+
+
+def test_effort_model_efficiency_unpriced_combo_not_folded_into_priced():
+    """An unpriced (provider, model) combo contributes 0 cost, is counted as a
+    run/token bearer, and is surfaced in unpriced_combos — never folded in."""
+    tasks = [
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=1000, landed=True),
+        # Unknown model with real tokens — priceable but unpriced.
+        _eff_task(effort="low", provider="anthropic", model="claude-mystery-9",
+                  input_tokens=5000, output_tokens=5000, landed=False),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    assert "anthropic:claude-mystery-9" in result["unpriced_combos"]
+    low = {r["effort"]: r for r in result["by_effort"]}["low"]
+    assert low["total_cost_usd"] == 0.0
+    assert low["unpriced_run_count"] == 1
+    assert low["priced_run_count"] == 0
+    assert low["unpriced_coverage_fraction"] == 0.0
+    # The unpriced run still counts toward run/token volume.
+    assert low["run_count"] == 1
+    assert low["input_tokens"] == 5000
+    # Totals: only the opus task's cost is folded in (the mystery model adds 0).
+    assert result["totals"]["total_cost_usd"] == pytest.approx(0.09)
+    assert result["totals"]["unpriced_coverage_fraction"] == 0.5
+
+
+def test_effort_model_efficiency_surfaces_fallback_divergence():
+    """A requested->effective model downgrade is surfaced both in the fallbacks
+    block and as a divergent resolved_model under the requested effort tier."""
+    tasks = [
+        _eff_task(
+            effort="high",
+            model="claude-sonnet-4-6",  # actually ran on sonnet, not opus
+            input_tokens=1000,
+            output_tokens=1000,
+            landed=True,
+            context={
+                "model_fallback": {
+                    "requested": "claude-opus-4-8",
+                    "effective": "claude-sonnet-4-6",
+                    "provider": "anthropic",
+                    "reason": "no_account_with_opus_access",
+                }
+            },
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    assert result["fallbacks"]["total"] == 1
+    combo = result["fallbacks"]["combos"][0]
+    assert combo["requested"] == "claude-opus-4-8"
+    assert combo["effective"] == "claude-sonnet-4-6"
+    assert combo["count"] == 1
+
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    resolved = high["resolved_models"]
+    assert len(resolved) == 1
+    # High effort was requested but the run resolved onto sonnet — visible divergence.
+    assert resolved[0]["model"] == "claude-sonnet-4-6"
+    assert resolved[0]["run_count"] == 1
+
+
+def test_effort_model_efficiency_missing_effort_resolves_to_default_tier():
+    """A task with no explicit payload effort and no routing config resolves to
+    the dispatcher's DEFAULT_EFFORT_LEVEL ('medium'), not 'unspecified' — its
+    effective routing effort is what selected the model and drove cost."""
+    from app.max_plan_pool import DEFAULT_EFFORT_LEVEL
+
+    tasks = [
+        _eff_task(effort=None, model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=True),
+    ]
+    # Empty runtime_config -> no payload/context/type/category effort -> default.
+    result = compute_effort_model_efficiency(tasks, runtime_config={})
+    efforts = {r["effort"] for r in result["by_effort"]}
+    assert efforts == {DEFAULT_EFFORT_LEVEL}
+
+
+def test_effort_model_efficiency_buckets_by_resolved_routing_effort():
+    """Tasks with NO explicit payload effort (review/strategic_review/ops types)
+    land in their CATEGORY routing tier — the effort that actually selected the
+    model — instead of collapsing into 'unspecified'."""
+    runtime_config = {
+        "task_type_categories": {
+            "review": ["review", "strategic_review"],
+            "strategic": ["strategic"],
+            "ops": ["deps"],
+        },
+        "category_routing": {
+            "review": {"effort": "high"},
+            "strategic": {"effort": "max"},
+            "ops": {"effort": "low"},
+            "_default": {"effort": "medium"},
+        },
+    }
+    tasks = [
+        _eff_task(effort=None, task_type="review", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="strategic_review",
+                  model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="strategic", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="deps", model="claude-haiku-4-5",
+                  input_tokens=100, output_tokens=100, landed=False),
+    ]
+    result = compute_effort_model_efficiency(tasks, runtime_config=runtime_config)
+    by_effort = {r["effort"]: r for r in result["by_effort"]}
+    assert "unspecified" not in by_effort
+    # review + strategic_review both resolve to the 'review' category -> high.
+    assert by_effort["high"]["run_count"] == 2
+    assert by_effort["max"]["run_count"] == 1
+    assert by_effort["low"]["run_count"] == 1
+
+
+def test_effort_model_efficiency_explicit_payload_effort_wins():
+    """Explicit payload effort is the most-specific layer and overrides the
+    category routing config — so previously-bucketed tasks are unaffected."""
+    runtime_config = {
+        "task_type_categories": {"review": ["review"]},
+        "category_routing": {"review": {"effort": "high"}},
+    }
+    tasks = [
+        # type=review would resolve to 'high' by category, but explicit 'low'
+        # in the payload wins.
+        _eff_task(effort="low", task_type="review", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+    ]
+    result = compute_effort_model_efficiency(tasks, runtime_config=runtime_config)
+    efforts = {r["effort"] for r in result["by_effort"]}
+    assert efforts == {"low"}
+
+
+def test_effort_model_efficiency_empty_input():
+    """Empty input yields empty rows and zeroed totals, not an error."""
+    result = compute_effort_model_efficiency([])
+    assert result["by_effort"] == []
+    assert result["by_model"] == []
+    assert result["unpriced_combos"] == []
+    assert result["fallbacks"]["total"] == 0
+    assert result["totals"]["run_count"] == 0
+    assert result["totals"]["landed_rate"] is None
+    assert result["totals"]["cost_per_merge"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_first_attempt_breakdowns: verified_overall
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _fa_task(*, succeeded: bool, reason: str | None = None) -> object:
+    """Create a minimal in-memory task-like object for first-attempt breakdown tests."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if reason is not None:
+        ctx[LANDED_SIGNAL_KEY] = True
+        ctx[LANDED_ON_INTEGRATION_KEY] = True
+        ctx["review_loop"] = {"unverified_merge_reason": reason}
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_verified_overall_excludes_degraded():
+    """verified_overall must not count degraded-unverified merges as successes."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    # One verified success, one degraded-unverified "success" (should be excluded).
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=None),        # verified success
+        _fa_task(succeeded=True, reason=degraded_reason),  # degraded — exclude
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    # overall counts both True flags → 2/2 = 1.0
+    assert result["overall"] == 1.0
+    # verified_overall counts only the verified success → 1/2 = 0.5
+    assert result["verified_overall"] == 0.5
+
+
+def test_first_attempt_breakdowns_verified_overall_benign_counts():
+    """Benign fall-opens must still count in verified_overall."""
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+
+    benign_reason = next(iter(BENIGN_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=None),         # verified
+        _fa_task(succeeded=True, reason=benign_reason),  # benign — should count
+        _fa_task(succeeded=False, reason=None),         # plain failure
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    # overall: 2 successes / 3 measured = 0.67
+    assert result["overall"] == round(2 / 3, 2)
+    # verified_overall: both successes count (benign is fine) → 2/3 = 0.67
+    assert result["verified_overall"] == round(2 / 3, 2)
+
+
+def test_first_attempt_breakdowns_verified_overall_all_degraded():
+    """verified_overall is 0.0 when all successes are degraded-unverified."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=degraded_reason),
+        _fa_task(succeeded=True, reason=degraded_reason),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["overall"] == 1.0
+    assert result["verified_overall"] == 0.0
+
+
+def test_first_attempt_breakdowns_verified_overall_no_measured_is_none():
+    """verified_overall returns None when no task has the metric recorded."""
+    tasks = [make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}], context={})]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["verified_overall"] is None

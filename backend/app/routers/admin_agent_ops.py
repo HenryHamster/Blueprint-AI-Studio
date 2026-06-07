@@ -41,6 +41,7 @@ from app.playbook_storage import (
 )
 from app.routers.agent import verify_agent_token
 from app.source_ref_validation import (
+    compute_message_citation_warning as _compute_message_citation_warning,
     ground_design_doc_value,
     resolve_branch_verification_context as _resolve_branch_verification_context,
 )
@@ -54,6 +55,8 @@ from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
+    spawn_budget_status,
+    spawn_title_is_redundant,
 )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
@@ -64,7 +67,10 @@ from app.strategic_constants import (
     STRATEGIC_RESOLUTION_MAX,
     STRATEGIC_SYSTEM_ID_MAX,
 )
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import (
+    STRATEGIC_TASK_TYPES,
+    STRATEGIST_SPAWNABLE_TASK_TYPES,
+)
 from app.task_locking import (
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
@@ -550,9 +556,30 @@ async def agent_annotate(
             **({"severity": payload.severity} if payload.severity else {}),
         }
 
+    # Reproduce-on-HEAD citation grounding: an ``issue`` annotation maps to a
+    # BUG_REPORT. Validate the file/symbol citations in its free-text content
+    # (and any structured ``file_path``) against the project's real integration
+    # branch and stash an ``_provenance_warnings`` signal when a citation is
+    # unambiguously absent, so a stale issue is discounted rather than trusted.
+    # Best-effort and conservative — indeterminate never flags, never fails.
+    msg_type = _ANNOTATION_TYPE_MAP[payload.annotation_type]
+    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        project = await session.get(Project, task.project_id)
+        if project is not None:
+            structured = (
+                {"file_path": payload.file_path.strip()}
+                if payload.file_path and payload.file_path.strip()
+                else None
+            )
+            warning = await _compute_message_citation_warning(
+                session, project, content, structured_context=structured
+            )
+            if warning:
+                ctx = {**ctx, "_provenance_warnings": warning}
+
     msg = ProjectMessage(
         project_id=task.project_id,
-        message_type=_ANNOTATION_TYPE_MAP[payload.annotation_type],
+        message_type=msg_type,
         from_type="agent",
         from_task_id=task.id,
         content=content,
@@ -1403,13 +1430,27 @@ async def strategic_operation(
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
             msg_type = MessageType.NOTE
+        msg_ctx = data.get("context") or {}
+        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
+        # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
+        # fixed/refactored away would re-enter the strategist inbox fully
+        # trusted. Run the SAME conservative grounding the user/annotation paths
+        # use and stash an ``_provenance_warnings`` signal when a citation is
+        # unambiguously absent. Best-effort — indeterminate never flags, never
+        # fails message creation. (project is already locked above.)
+        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            warning = await _compute_message_citation_warning(
+                session, project, content
+            )
+            if warning:
+                msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
             content=content,
-            context=data.get("context") or {},
+            context=msg_ctx,
         )
         session.add(new_msg)
         await session.commit()
@@ -1481,16 +1522,19 @@ async def strategic_operation(
         )
 
     elif payload.op == "spawn_task":
-        # Allow strategic review to directly spawn a research or plan task for
-        # targeted investigation, jumping the normal autonomous research queue.
-        # Restricted to investigation types — implementation must go through
-        # normal direction → research → plan → create flow.
-        ALLOWED_SPAWN_TYPES = {"research", "plan"}
+        # Allow strategic review to directly spawn a research, plan, web_research,
+        # or design task for targeted investigation, jumping the normal autonomous
+        # research queue. The allowed set is DERIVED FROM THE TASK-TYPE REGISTRY
+        # (STRATEGIST_SPAWNABLE_TASK_TYPES) rather than a hardcoded literal, so a
+        # newly registered investigation/knowledge type becomes spawnable by
+        # declaring strategist_spawnable=True alone. Restricted to investigation /
+        # knowledge / plan types — implementation must go through the normal
+        # direction → research → plan → create flow.
         spawn_type = data.get("type")
-        if spawn_type not in ALLOWED_SPAWN_TYPES:
+        if spawn_type not in STRATEGIST_SPAWNABLE_TASK_TYPES:
             raise HTTPException(
                 status_code=400,
-                detail=f"spawn_task type must be one of {sorted(ALLOWED_SPAWN_TYPES)}; got '{spawn_type}'",
+                detail=f"spawn_task type must be one of {sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'",
             )
         raw_prompt = str(data.get("prompt", "")).strip()
         if not raw_prompt:
@@ -1551,17 +1595,24 @@ async def strategic_operation(
         # single review run never legitimately re-spawns the identical task),
         # so this only collapses accidental retries — it does not constrain the
         # strategic agent's judgement across distinct reviews.
+        #
+        # The broadened guard also collapses semantically-redundant spawns: a
+        # near-duplicate knowledge request for the SAME review and type that
+        # differs only in wording (word overlap >= threshold) is treated as the
+        # same logical investigation, so a single review cannot spend its budget
+        # on rewordings of one question. Exact-title matches keep the original
+        # idempotency semantics; the title-similarity check is additive.
         dedup_since = _utcnow() - timedelta(minutes=30)
         dupe_stmt = (
             select(Task)
             .where(
                 Task.project_id == project.id,
                 Task.created_by == "STRATEGIC_AGENT",
-                Task.title == title,
                 Task.created_at >= dedup_since,
             )
             .order_by(Task.created_at.asc())
         )
+        same_scope_candidates: list[Task] = []
         for candidate in (await session.execute(dupe_stmt)).scalars().all():
             cctx = candidate.context or {}
             if (
@@ -1569,14 +1620,33 @@ async def strategic_operation(
                 and cctx.get("parent_strategic_task_id") == str(task.id)
                 and (candidate.first_payload or {}).get("type") == spawn_type
             ):
+                same_scope_candidates.append(candidate)
+
+        dedup_overlap_threshold = _runtime_config.get(
+            "strategist_spawn_dedup_overlap_threshold", 4
+        )
+        for candidate in same_scope_candidates:
+            exact = candidate.title == title
+            semantic = (
+                not exact
+                and spawn_title_is_redundant(
+                    title,
+                    [candidate.title or ""],
+                    threshold=dedup_overlap_threshold,
+                )
+                is not None
+            )
+            if exact or semantic:
                 logger.info(
                     "[STRATEGIC API] spawn_task idempotency: returning existing "
-                    "%s for duplicate spawn from strategic review %s "
-                    "(type=%s, title=%r)",
+                    "%s for %s spawn from strategic review %s "
+                    "(type=%s, title=%r, existing=%r)",
                     candidate.id,
+                    "duplicate" if exact else "semantic-duplicate",
                     task.id,
                     spawn_type,
                     title,
+                    candidate.title,
                 )
                 return _resp(
                     {
@@ -1588,6 +1658,84 @@ async def strategic_operation(
                         "deduplicated": True,
                     }
                 )
+
+        # Budget enforcement. The strategist's autonomous spawn path is otherwise
+        # unbounded: one review can queue any number of elevated-priority,
+        # real-cost tasks. Count this review's prior strategic_direct spawns and
+        # the project-wide spawns in the rolling window, then ask the pure policy
+        # helper whether one more fits. When exhausted, stamp an observable flag
+        # on the review, log, and refuse with 429 — never a silent swallow.
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
+        window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
+
+        per_review_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.created_by == "STRATEGIC_AGENT",
+                    Task.context["spawned_by"].as_string() == "strategic_direct",
+                    Task.context["parent_strategic_task_id"].as_string()
+                    == str(task.id),
+                )
+            )
+        ).scalar() or 0
+        window_since = _utcnow() - timedelta(minutes=window_minutes)
+        window_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.created_by == "STRATEGIC_AGENT",
+                    Task.context["spawned_by"].as_string() == "strategic_direct",
+                    Task.created_at >= window_since,
+                )
+            )
+        ).scalar() or 0
+
+        ok, scope, reason = spawn_budget_status(
+            per_review_count,
+            window_count,
+            per_review_cap=per_review_cap,
+            window_cap=window_cap,
+        )
+        if not ok:
+            ctx = task.context or {}
+            task.context = {
+                **ctx,
+                "_strategic_spawn_budget_exhausted": {
+                    "scope": scope,
+                    "reason": reason,
+                    "at": _utcnow().isoformat(),
+                },
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            logger.warning(
+                "[STRATEGIC API] spawn_task refused for strategic review %s: %s "
+                "(per_review=%s/%s, window=%s/%s)",
+                task.id,
+                reason,
+                per_review_count,
+                per_review_cap,
+                window_count,
+                window_cap,
+            )
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "op": "spawn_task",
+                        "scope": scope,
+                        "reason": reason,
+                    }
+                ),
+                status_code=429,
+            )
 
         new_task_ctx: dict = {
             "spawned_by": "strategic_direct",

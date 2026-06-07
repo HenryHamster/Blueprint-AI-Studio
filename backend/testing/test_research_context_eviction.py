@@ -8,10 +8,12 @@ import re
 from app.research_context import (
     _build_research_context,
     _parse_research_context,
+    _parse_established_entry,
     _parse_eviction_counts,
     _format_eviction_body,
     build_recent_findings_evidence,
     extract_diagnosis_from_context,
+    filter_direction_evidence,
 )
 from app.finding_deduplication import (
     extract_archived_diagnoses,
@@ -411,6 +413,52 @@ class TestPriorOutcomeTagging:
         assert "Clean up Z [small] (merged)" in result
         assert "(proposed)" not in result
 
+    def test_merged_but_unverified_not_tagged_merged(self):
+        # prs_merged>0 but verified_prs_merged=0: terminal/settled, but the
+        # merge did not reproduce on HEAD, so it must NOT read as shipped.
+        prior = self._prior_with_proposed(["Unverified W"])
+        history = [
+            {
+                "finding_titles": ["Unverified W"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 0,
+                "failed_task_details": [],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Unverified W [small] (proposed)" in result
+        assert "(merged)" not in result
+
+    def test_verified_merge_still_tagged_merged(self):
+        prior = self._prior_with_proposed(["Verified V"])
+        history = [
+            {
+                "finding_titles": ["Verified V"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 1,
+                "failed_task_details": [],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Verified V [small] (merged)" in result
+        assert "(proposed)" not in result
+
     def test_no_history_is_noop(self):
         prior = self._prior_with_proposed(["Thing A"])
         result = _build_research_context(
@@ -422,6 +470,114 @@ class TestPriorOutcomeTagging:
             prior_history=None,
         )
         assert "Thing A [small] (proposed)" in result
+
+    def test_no_op_titles_retagged_stale(self):
+        # A finding whose only child no-op'd as already-resolved retags (stale).
+        prior = self._prior_with_proposed(["Already Gone Defect"])
+        history = [
+            {
+                "finding_titles": ["Already Gone Defect"],
+                "tasks_created": 1,
+                "prs_merged": 0,
+                "failed_task_details": [],
+                "no_op_task_details": [
+                    {
+                        "title": "Already Gone Defect",
+                        "no_op_reason": "defect not reproducible on HEAD",
+                    }
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Already Gone Defect [small] (stale)" in result
+        assert "(proposed)" not in result
+
+    def test_failed_precedence_over_stale(self):
+        # A finding present in BOTH failed and no-op details keeps the failed tag.
+        prior = self._prior_with_proposed(["Contested Finding"])
+        history = [
+            {
+                "finding_titles": ["Contested Finding"],
+                "tasks_created": 1,
+                "prs_merged": 0,
+                "failed_task_details": [
+                    {"title": "Contested Finding", "category": "CODE_ERROR"},
+                ],
+                "no_op_task_details": [
+                    {"title": "Contested Finding", "no_op_reason": "gone"},
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "(failed: CODE_ERROR)" in result
+        assert "(stale)" not in result
+
+    def test_merged_precedence_over_stale(self):
+        # A verified-merged finding keeps (merged) even if also in no-op details.
+        prior = self._prior_with_proposed(["Shipped Then Gone"])
+        history = [
+            {
+                "finding_titles": ["Shipped Then Gone"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 1,
+                "failed_task_details": [],
+                "no_op_task_details": [
+                    {"title": "Shipped Then Gone", "no_op_reason": "gone"},
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Shipped Then Gone [small] (merged)" in result
+        assert "(stale)" not in result
+
+
+class TestStaleTagParsing:
+    """_parse_established_entry and filter_direction_evidence handle (stale)."""
+
+    def test_parse_established_entry_parses_stale(self):
+        rec = _parse_established_entry(
+            "Already Gone Defect [small] (stale). Short desc"
+        )
+        assert rec["title"] == "Already Gone Defect"
+        assert rec["status"] == "stale"
+
+    def test_filter_direction_evidence_excludes_stale(self):
+        ctx = (
+            "## Established Findings\n"
+            "- Fresh Finding [small] (proposed). desc\n"
+            "- Stale Finding [small] (stale). desc\n"
+            "\n## Failed Approaches\n\n## Open Questions\n"
+        )
+        raw_evidence = [
+            {"title": "Fresh Finding", "claims": ["c1"], "source_refs": ["r1"]},
+            {"title": "Stale Finding", "claims": ["c2"], "source_refs": ["r2"]},
+        ]
+        result = filter_direction_evidence(ctx, raw_evidence)
+        titles = {e["title"] for e in result}
+        assert "Fresh Finding" in titles
+        assert "Stale Finding" not in titles
 
 
 class TestClaimsAndSources:

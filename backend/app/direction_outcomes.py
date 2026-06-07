@@ -27,9 +27,12 @@ from app.failure_classification import (
     classify_failure as _classify_failure,
     classify_failure_taxonomy as _classify_taxonomy,
 )
-from app.landed_signal import is_merged_completion
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
-from app.review_pipeline import _is_test_file
 from app.task_capabilities import PRODUCT_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -122,6 +125,28 @@ def is_autonomous_merge(task: Task) -> bool:
     if ctx.get("review_dismissed") or ctx.get("user_overrode_review"):
         return False
     return True
+
+
+def verified_merged_count(entry: dict) -> int:
+    """Verification-aware merged-PR count for a research_history entry.
+
+    Returns the merges whose verification was NOT degraded — i.e. verified
+    merges PLUS benign-unverified merges (no runnable suite, or the no-CI gate
+    deliberately off), but EXCLUDING merges whose test/CI verification was
+    blocked by an environment/setup failure (``unverified_degraded``). This is
+    exactly the ``verified_prs_merged`` field computed in
+    ``_update_direction_research_outcomes``.
+
+    Direction- and pipeline-level rates (conversion, merge, churn, lifetime
+    burn) call this so a degraded-unverified merge does not count as a clean
+    success — matching the per-task outcome layer, which already scores such a
+    merge as neutral. Legacy entries written before ``verified_prs_merged`` was
+    recorded fall back to the raw ``prs_merged`` count, so historical data
+    degrades to prior behavior rather than dropping to zero.
+    """
+    if "verified_prs_merged" in entry:
+        return int(entry.get("verified_prs_merged") or 0)
+    return int(entry.get("prs_merged") or 0)
 
 
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
@@ -370,11 +395,10 @@ async def _update_direction_research_outcomes(
     )
     # BLOCKED tasks are counted separately from FAILED — they are parked on an
     # absent precondition, not failures, and the auto-unblock sweep is expected
-    # to return them to QUEUED. Surfacing the count keeps them out of the
-    # failure tally while still being visible to operators/analytics.
-    entry["tasks_blocked"] = sum(
-        1 for ct in child_tasks_rows if ct.status == TaskStatus.BLOCKED
-    )
+    # to return them to QUEUED.
+    # Retired: tasks_blocked. Was claimed to be visible to operators/analytics
+    # but has no named consumer (grep: no backend module, analytics, or admin-ui
+    # component reads it). Retired 2026-06-05.
     entry["prs_merged"] = sum(
         1
         for ct in child_tasks_rows
@@ -411,6 +435,27 @@ async def _update_direction_research_outcomes(
     entry["assisted_prs_merged"] = sum(
         1 for ct in _merged_rows if not is_autonomous_merge(ct)
     )
+    # verified_prs_merged: merged completions whose PR was actually verified by
+    # a real test suite (not a fall-open for a degraded environment/setup reason)
+    # AND whose declared acceptance evidence, if any, was satisfied. Additive
+    # alongside prs_merged for back-compat; consumers that need "proven fix"
+    # counts should prefer this field over the raw prs_merged.
+    #
+    # The acceptance exclusion mirrors the per-task outcome layer
+    # (``task_outcomes._evaluate_write``): a code task that DECLARED acceptance
+    # evidence carries a durable verdict under ``code_acceptance_verdict``; when
+    # that evidence was declared but NOT satisfied, the merge does not prove the
+    # claimed behavior and must not inflate verified progress. Rows with no
+    # recorded verdict (no declaration, legacy rows) are never excluded — the
+    # predicate is additive and backward-compatible.
+    entry["verified_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if merge_verification_status(ct) != "unverified_degraded"
+        and not acceptance_blocks_success(
+            (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        )
+    )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(
         1
@@ -433,24 +478,9 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    # Remediation tasks: spawned from a diagnosis or auto-remediation. Tracked
-    # separately so research agents can see the remediation burden — a
-    # direction merging emergency fixes is not the same as one merging features.
-    _remediation_rows = [
-        ct
-        for ct in child_tasks_rows
-        if (ct.context or {}).get("diagnosis_task_id")
-        or (ct.context or {}).get("auto_remediation") is True
-    ]
-    entry["remediation_tasks_created"] = len(_remediation_rows)
-    entry["remediation_tasks_merged"] = sum(
-        1
-        for ct in _remediation_rows
-        if is_merged_completion(ct)
-    )
-    entry["remediation_tasks_failed"] = sum(
-        1 for ct in _remediation_rows if _counts_as_failure(ct)
-    )
+    # Retired: remediation_tasks_created, remediation_tasks_merged, remediation_tasks_failed.
+    # Were intended to track remediation burden but have no named consumer (grep: no backend
+    # module, analytics, or admin-ui component reads them). Retired 2026-06-05.
     # Collect changed files from merged PRs for co-change index update
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])
@@ -459,8 +489,14 @@ async def _update_direction_research_outcomes(
         and (ct.context or {}).get("_pr_changed_files")
     ]
     _tasks_created = entry.get("tasks_created", 0)
+    # Conversion is verification-aware: degraded-unverified merges (verification
+    # was expected but blocked by an environment/setup failure) are excluded so
+    # the rate agrees with the per-task outcome layer, which scores them neutral.
+    # Benign-unverified and verified merges still count (verified_merged_count).
     entry["conversion_rate"] = (
-        round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
+        round(verified_merged_count(entry) / _tasks_created, 3)
+        if _tasks_created > 0
+        else None
     )
     # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
     # Uses evaluate_task_outcome to count successes across ALL task types (code
@@ -532,57 +568,10 @@ async def _update_direction_research_outcomes(
         if merge_durations
         else None
     )
-    # avg_implementation_hours: time the agent spent producing a PR
-    # (vm_stopped_at - created_at) across ALL completed children, not
-    # just merged ones. Pairs with avg_review_hours below to split
-    # avg_time_to_merge_hours into implementation vs review-pipeline time.
-    impl_durations = [
-        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds()
-        / 3600
-        for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED
-        and ct.vm_stopped_at is not None
-        and ct.created_at is not None
-    ]
-    entry["avg_implementation_hours"] = (
-        round(sum(impl_durations) / len(impl_durations), 2) if impl_durations else None
-    )
-    # avg_review_hours: time from implementation finish to PR merge.
-    # PR merge timestamp isn't stored; approximate via the matching
-    # review child's vm_stopped_at (latest if multiple iterations),
-    # falling back to the merged task's updated_at.
-    review_end_by_pr: dict = {}
-    for ct in child_tasks_rows:
-        if (ct.first_payload or {}).get("type") != "review":
-            continue
-        if ct.vm_stopped_at is None:
-            continue
-        pr_num = (ct.context or {}).get("pr_number")
-        if pr_num is None:
-            continue
-        prev = review_end_by_pr.get(pr_num)
-        if prev is None or ct.vm_stopped_at > prev:
-            review_end_by_pr[pr_num] = ct.vm_stopped_at
-    review_durations = []
-    for ct in child_tasks_rows:
-        if not (
-            is_merged_completion(ct)
-            and ct.vm_stopped_at is not None
-        ):
-            continue
-        pr_num = (ct.context or {}).get("pr_number")
-        end_ts = review_end_by_pr.get(pr_num) if pr_num is not None else None
-        if end_ts is None:
-            end_ts = ct.updated_at
-        end_ts_n = _to_naive_utc(end_ts)
-        vm_stop_n = _to_naive_utc(ct.vm_stopped_at)
-        if end_ts_n is not None and vm_stop_n is not None and end_ts_n >= vm_stop_n:
-            review_durations.append((end_ts_n - vm_stop_n).total_seconds() / 3600)
-    entry["avg_review_hours"] = (
-        round(sum(review_durations) / len(review_durations), 2)
-        if review_durations
-        else None
-    )
+    # Retired: avg_implementation_hours, avg_review_hours. These split avg_time_to_merge_hours
+    # into implementation vs review-pipeline time for research-agent consumption, but have
+    # no named consumer (grep: no backend module, analytics, or admin-ui component reads them).
+    # Retired 2026-06-05.
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
     review_iters = [
@@ -630,6 +619,30 @@ async def _update_direction_research_outcomes(
     entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
     entry["tasks_failed_infra"] = infra_failures
     entry["taxonomy_summary"] = taxonomy_summary
+
+    # Capture affirmative-no-op task details (mirror of failed_task_details) so
+    # the research layer can tell "we already tried this and the defect was gone"
+    # from "this is new and unattempted". A child that COMPLETED with a verified
+    # ``no_op_reason`` (the agent ran ``./done --already-done`` because the cited
+    # defect was absent / already resolved on HEAD) is scored neutral — neither a
+    # merged success nor a failure. We record title + the (truncated) reason so
+    # the prior-outcomes retagger can mark the originating finding '(stale)'.
+    # Merged completions are excluded so a finding that also shipped a verified
+    # fix keeps its merged tag, not a stale one.
+    no_op_details = []
+    for ct in child_tasks_rows:
+        if ct.status != TaskStatus.COMPLETED:
+            continue
+        no_op_reason = (ct.context or {}).get("no_op_reason")
+        if not no_op_reason or is_merged_completion(ct):
+            continue
+        no_op_details.append(
+            {
+                "title": ct.title or "",
+                "no_op_reason": str(no_op_reason)[:120],
+            }
+        )
+    entry["no_op_task_details"] = no_op_details[:5]  # cap at 5 to avoid bloat
 
     # Stage dropout: per-cycle breakdown of why tasks didn't reach main
     sd_code_error = 0
@@ -701,7 +714,8 @@ async def _update_direction_research_outcomes(
     entry["product_ratio"] = (
         round(product_count / total_typed, 2) if total_typed > 0 else 0.0
     )
-    entry["structural_count"] = structural_count
+    # Retired: structural_count. Raw count stored but never read; product_ratio (derived
+    # from this) IS consumed by digest_direction_progress.py. Retired 2026-06-05.
 
     # Track per-scope merge rates so research agents can calibrate scope assignments.
     # calibrated_in: tasks calibrated INTO this scope from a larger one (counted at the
@@ -826,6 +840,11 @@ async def _update_direction_research_outcomes(
         # Exclude test files: related_files typically declares production files
         # only, so including test files in the numerator systematically inflates
         # the ratio for tasks that ship proper test coverage.
+        # Deferred import: review_pipeline -> spawn_calibration -> direction_metrics
+        # imports verified_merged_count back out of this module, so importing
+        # review_pipeline at module load creates a circular import.
+        from app.review_pipeline import _is_test_file
+
         prod_changed = [f for f in changed if not _is_test_file(f)]
         if related and prod_changed:
             ratio = len(prod_changed) / len(related)
@@ -1119,6 +1138,18 @@ async def _update_direction_research_outcomes(
                     else:
                         new_established.append(item)
                 parsed["established"] = new_established
+            elif (ct.context or {}).get("no_op_reason"):
+                # Affirmative no-op (./done --already-done): the cited defect was
+                # absent / already resolved on HEAD. Retag the matching proposed
+                # finding to (stale) so this cycle's context already reflects that
+                # the area was clean and the research agent won't re-chase it.
+                new_established = []
+                for item in parsed["established"]:
+                    if title.lower() in item.lower() and "(proposed)" in item:
+                        new_established.append(item.replace("(proposed)", "(stale)"))
+                    else:
+                        new_established.append(item)
+                parsed["established"] = new_established
 
         # Reassemble the document (preserve eviction summary if present)
         parts: list = []
@@ -1170,6 +1201,11 @@ async def _update_direction_research_outcomes(
     await with_directions_locked(session, project_id, _apply_direction_outcomes)
 
     if merged_files_lists:
+        # Flush the directions mutation before reacquiring the same Project row
+        # for the design_doc/cochange write. Without this, the second
+        # populate_existing refresh can reload a pre-mutation directions blob and
+        # clobber the newly-added research_history metrics in the same session.
+        await session.flush()
         session.expire(project, ["design_doc"])
         await with_design_doc_locked(
             session,

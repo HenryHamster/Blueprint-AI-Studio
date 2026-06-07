@@ -208,7 +208,10 @@ const MIN_SR_CATCH_FINDINGS = 5;
 export function deriveReviewerFindingCount(trends: SrTrendWithFixIterations | null | undefined): number {
   const categories = trends?.categories;
   if (!categories) return 0;
-  return Object.values(categories).reduce((sum, cat) => sum + (cat.current_human_count ?? 0), 0);
+  return Object.values(categories).reduce(
+    (sum, cat) => sum + (cat.current_reviewer_finding_count ?? cat.current_finding_count ?? cat.current_human_count ?? 0),
+    0,
+  );
 }
 
 export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality }: {

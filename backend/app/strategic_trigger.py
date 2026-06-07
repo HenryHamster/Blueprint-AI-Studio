@@ -183,6 +183,11 @@ async def request_strategic_refresh(
             # staleness is visible, refresh the reason, bump an observability count.
             existing["reason"] = reason
             existing["count"] = int(existing.get("count") or 1) + 1
+            # operator_count tracks only genuine operator-steering coalesces so
+            # the UI badge can show a truthful "+N steers coalesced" that excludes
+            # automated qualification/promotion refreshes.
+            if origin == ORIGIN_OPERATOR:
+                existing["operator_count"] = int(existing.get("operator_count") or 0) + 1
             # Operator intent is sticky and never downgraded by a later
             # automated refresh; a later operator refresh upgrades an automated
             # slot. A fresh request re-arms the one-time deferral notice.
@@ -201,6 +206,7 @@ async def request_strategic_refresh(
                 "requested_at": _utcnow().isoformat(),
                 "reason": reason,
                 "count": 1,
+                "operator_count": 1 if origin == ORIGIN_OPERATOR else 0,
                 "origin": origin,
             }
             if _excerpt is not None:

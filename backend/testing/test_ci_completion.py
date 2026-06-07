@@ -14,8 +14,12 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from app.ci_completion import _normalize_merge_error
+from app.migration_reservations import allocate_migration_reservation
 from app.models import Alert, Project, Task, TaskStatus
 
 
@@ -32,6 +36,20 @@ def _default_no_migration_pr(mocker):
     itself re-patch ``app.github.get_pr_files`` to override this default.
     """
     mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _patch_dedicated_sessions_to_test_engine(mocker, db_session):
+    """Dedicated AsyncSessionLocal scopes in ci_completion must use the shared
+    test engine, not the production lazy engine."""
+    dedicated_session_local = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.database.AsyncSessionLocal", dedicated_session_local)
 
 
 # ---------------------------------------------------------------------------
@@ -3375,6 +3393,81 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
     assert task.status == TaskStatus.EVALUATING, "Held merge leaves task EVALUATING"
     assert "dual-head" in (task.latest_status_message or "").lower()
     assert "0002" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_merge_hold_auto_finalizes_reserved_migration_and_requeues_ci(
+    db_session, mocker
+):
+    """When the blocked PR owns an ACTIVE reservation, the CI merge path
+    rewrites the branch, records the finalization payload, and waits for fresh
+    CI instead of attempting the stale merge."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(return_value=(False, "dual-head: duplicate migration revision")),
+    )
+    finalization_mock = mocker.patch(
+        "app.rollup_management.attempt_pr_migration_finalization",
+        new=AsyncMock(
+            return_value={
+                "pr_number": 42,
+                "branch": "blueprint/test-branch",
+                "old_revision": "0153",
+                "finalized_revision": "0152",
+                "finalized_down_revision": "0151",
+                "expected_schema_revision": "0152",
+            }
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="dual-head auto-finalize", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "head_sha": "deadbeef",
+            "polls_since_pr_fetch": 2,
+            "mergeable_state": "clean",
+            "last_merge_msg": "old merge result",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    await allocate_migration_reservation(db_session, task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    merge_mock.assert_not_called()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is False
+    assert review_loop.get("head_sha") == ""
+    assert review_loop.get("polls_since_pr_fetch") == 999
+    assert "mergeable_state" not in review_loop
+    assert "last_merge_msg" not in review_loop
+    finalization = (task.context or {}).get("_migration_finalization")
+    assert finalization is not None
+    assert finalization["old_revision"] == "0153"
+    assert finalization["finalized_revision"] == "0152"
+    finalization_mock.assert_awaited_once()
+    assert finalization_mock.await_args.kwargs["promotion_target"] == "main"
+    assert "auto-finalized provisional alembic migration" in (
+        task.latest_status_message or ""
+    ).lower()
 
 
 @pytest.mark.asyncio
