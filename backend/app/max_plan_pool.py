@@ -1330,6 +1330,109 @@ def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
     return False
 
 
+def _account_model_recovery_at(
+    acct: dict,
+    model: str | None,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return the earliest cooldown recovery for ``acct``/``model``, or None.
+
+    Used by the park-and-retarget gate to answer "no alternate account is
+    usable NOW, but will one recover within the bounded warm-park window?".
+    Only active disabled-model cooldowns count; permanently disabled /
+    auth-broken / model-missing / cap-exhausted accounts yield None because this
+    helper cannot predict a bounded recovery for them.
+    """
+    if not _account_runtime_ready(acct):
+        return None
+    if not acct.get("enabled", True):
+        return None
+    dm = acct.get("disabled_models") or {}
+    if not dm:
+        return None
+
+    now = now or _utcnow()
+    infos: list[dict] = []
+    if model is None:
+        infos = [info for info in dm.values() if isinstance(info, dict)]
+    else:
+        normalized = _normalize_rl_model(model)
+        info = dm.get(normalized) if normalized else None
+        if info is None and normalized != model:
+            info = dm.get(model)
+        if isinstance(info, dict):
+            infos = [info]
+
+    earliest: datetime | None = None
+    for info in infos:
+        at_dt = info.get("at")
+        if at_dt is None:
+            continue
+        recovery_at = at_dt + timedelta(seconds=_cooldown_seconds_for_info(info))
+        if recovery_at <= now:
+            continue
+        if earliest is None or recovery_at < earliest:
+            earliest = recovery_at
+    return earliest
+
+
+async def alternate_account_recovery_deadline(
+    failed_account_id: str | None,
+    model: str | None,
+    *,
+    blacklist: list[str] | None = None,
+    park_budget_seconds: int = 600,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return when an alternate same-pool account becomes usable, or None.
+
+    The failed account itself is always excluded, alongside ``blacklist``.
+    Returns ``now`` when an alternate account is already healthy/probing, or the
+    earliest cooldown recovery time within ``park_budget_seconds`` when no
+    alternate is usable yet. Returns None when the pool is unknown/empty or no
+    alternate can recover inside the bounded park window.
+    """
+    failed_id = str(failed_account_id).strip() if failed_account_id else ""
+    if not failed_id:
+        return None
+    now = now or _utcnow()
+    park_budget_seconds = max(0, int(park_budget_seconds))
+    excluded = {failed_id}
+    for raw in blacklist or []:
+        if raw is None:
+            continue
+        sid = str(raw).strip()
+        if sid:
+            excluded.add(sid)
+
+    async with _max_plan_pool_lock:
+        failed_acct = _account_by_id.get(failed_id)
+        if failed_acct is None:
+            return None
+        user_id = str(failed_acct.get("user_id") or "").strip()
+        if not user_id:
+            return None
+        user_pool = _max_plan_pools.get(user_id, [])
+        if not user_pool:
+            return None
+
+        budget_deadline = now + timedelta(seconds=park_budget_seconds)
+        earliest_recovery: datetime | None = None
+        for acct in user_pool:
+            acct_id = str(acct.get("id") or "").strip()
+            if not acct_id or acct_id in excluded:
+                continue
+            if _account_available_for_model(acct, model):
+                return now
+            recovery_at = _account_model_recovery_at(acct, model, now=now)
+            if recovery_at is None or recovery_at > budget_deadline:
+                continue
+            if earliest_recovery is None or recovery_at < earliest_recovery:
+                earliest_recovery = recovery_at
+        return earliest_recovery
+
+
 def pool_wide_rate_limit_cooldown(
     at_time: datetime | None = None,
     *,

@@ -48,6 +48,7 @@ from app.max_plan_pool import (
     _usage_headroom_rank,
     _usage_headroom_settings,
     _usage_snapshot_summary,
+    alternate_account_recovery_deadline,
     cascade_disabled_models,
     describe_pool_blockage,
     disable_account_for_auth,
@@ -400,6 +401,77 @@ class TestSummarizePoolState:
             assert summary["healthy"] == 0
             assert summary["rate_limited"] == 0
             assert summary["earliest_recovery"] is None
+        finally:
+            self._reset_pools()
+
+
+class TestAlternateAccountRecoveryDeadline:
+    def _reset_pools(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_now_when_alternate_account_is_already_eligible(self):
+        self._reset_pools()
+        try:
+            failed = _acct(
+                id="failed",
+                user_id="u-park",
+                disabled_models={
+                    OPUS: {"at": datetime.utcnow() - timedelta(minutes=5), "hits": 1}
+                },
+            )
+            alternate = _acct(id="alternate", user_id="u-park")
+            _account_by_id.update({"failed": failed, "alternate": alternate})
+            _max_plan_pools["u-park"] = [failed, alternate]
+
+            now = datetime.utcnow()
+            deadline = await alternate_account_recovery_deadline(
+                "failed",
+                OPUS,
+                blacklist=["failed"],
+                park_budget_seconds=600,
+                now=now,
+            )
+            assert deadline == now
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_returns_recovery_within_budget_and_none_outside_budget(self):
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            failed = _acct(id="failed", user_id="u-park")
+            recovering = _acct(
+                id="recovering",
+                user_id="u-park",
+                disabled_models={
+                    OPUS: {"at": now - timedelta(minutes=20), "hits": 1}
+                },
+            )
+            _account_by_id.update({"failed": failed, "recovering": recovering})
+            _max_plan_pools["u-park"] = [failed, recovering]
+
+            deadline = await alternate_account_recovery_deadline(
+                "failed",
+                OPUS,
+                blacklist=["failed"],
+                park_budget_seconds=900,
+                now=now,
+            )
+            assert deadline == recovering["disabled_models"][OPUS]["at"] + timedelta(
+                seconds=_cooldown_seconds_for_info(recovering["disabled_models"][OPUS])
+            )
+
+            deadline = await alternate_account_recovery_deadline(
+                "failed",
+                OPUS,
+                blacklist=["failed"],
+                park_budget_seconds=120,
+                now=now,
+            )
+            assert deadline is None
         finally:
             self._reset_pools()
 

@@ -384,6 +384,57 @@ async def _run_reaper_once():
         pass
 
 
+@pytest.mark.asyncio
+async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mocker):
+    """An expired queued park must tear the held VM down and restore the cold
+    requeue shape so a warm VM cannot leak indefinitely."""
+    from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+
+    project = await _make_project(reaper_db)
+    old_vm_id = "agent-vm-park-expired"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=old_vm_id,
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        context={
+            "parked_for_retarget": True,
+            "park_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "warm_target_vm_id": old_vm_id,
+            "warm_handoff_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "warm_target_pr": "4242",
+            "blacklisted_accounts": ["acct-failed"],
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+
+    now = datetime.utcnow()
+    await run_infra_recovery_and_hold_maintenance(reaper_db, now)
+
+    await reaper_db.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != old_vm_id
+    assert task.retry_after_until is None
+    assert task.latest_status_message == "Park-and-retarget budget expired — cold requeueing"
+    assert "parked_for_retarget" not in ctx
+    assert "park_deadline" not in ctx
+    assert "warm_target_vm_id" not in ctx
+    assert "warm_handoff_deadline" not in ctx
+    assert "warm_target_pr" not in ctx
+    assert ctx.get("blacklisted_accounts") == ["acct-failed"]
+    delete_vm.assert_awaited_once_with(
+        old_vm_id, reason="park_retarget_budget_expired"
+    )
+
+
 # ── _copy_analysis_artifacts_to_previous (pure helper) ────────────────────
 
 

@@ -55,6 +55,7 @@ from app.broadcast import broadcast_to_project
 from app.routers.agent import verify_agent_token
 from app.sr_blind_spots import filter_disallowed_blind_spots
 from app.max_plan_pool import (
+    alternate_account_recovery_deadline,
     _max_plan_pool_lock,
     apply_task_llm_runtime_context,
     release_max_plan_account,
@@ -105,6 +106,8 @@ _AGENT_STATUS_TERMINAL_STATUSES = (
     TaskStatus.CANCELLED,
     TaskStatus.BLOCKED,
 )
+_PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS = 600
+_PARK_AND_RETARGET_MAX_BUDGET_SECONDS = 1800
 
 
 def record_task_result(
@@ -158,6 +161,29 @@ def record_task_result(
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
+
+
+def _park_and_retarget_budget_seconds() -> int:
+    raw = _runtime_config.get(
+        "park_and_retarget_budget_seconds",
+        _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS,
+    )
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS
+    return max(30, min(_PARK_AND_RETARGET_MAX_BUDGET_SECONDS, parsed))
+
+
+def _task_pr_number(task: Task) -> int | None:
+    payload = task.first_payload if task.payloads else {}
+    value = payload.get("pr_number") if isinstance(payload, dict) else None
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
@@ -1575,6 +1601,7 @@ async def update_agent_status(
 
                 from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+                    EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
                     NO_PROGRESS_TIMEOUT,
                     persist_failure_category,
                 )
@@ -1632,6 +1659,11 @@ async def update_agent_status(
 
                     # Track API failure retries to prevent infinite loops
                     ctx = dict(task.context or {})
+                    external_api_subtype = (
+                        ctx.get("external_api_subtype")
+                        if failure_class == "EXTERNAL_API"
+                        else None
+                    )
                     # Blacklist the account that just hit rate limit so retry picks a different one
                     acct_id_for_blacklist = get_task_llm_account_id(task)
                     if acct_id_for_blacklist and failure_class == "RATE_LIMIT":
@@ -1641,7 +1673,6 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
-                        external_api_subtype = ctx.get("external_api_subtype")
                         if (
                             external_api_subtype
                             == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
@@ -1808,17 +1839,105 @@ async def update_agent_status(
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
-                        bank_task_current_attempt(task, stopped_at=_utcnow())
+                        now = _utcnow()
+                        bank_task_current_attempt(task, stopped_at=now)
                         ctx = with_task_attempt_banking(task, ctx)
                         task.context = ctx
                         task.status = TaskStatus.QUEUED
                         # The earlier FAILED assignment fired the SQLAlchemy set event
                         # which added task.id to _terminated_task_ids, revoking the JWT.
                         # Since we're requeuing, drop the cache entry so the next
-                        # provisioned VM can successfully claim.
+                        # claim path can successfully authenticate.
                         from app.routers.agent import _terminated_task_ids
 
                         _terminated_task_ids.pop(str(task.id), None)
+
+                        park_budget_seconds = _park_and_retarget_budget_seconds()
+                        park_deadline = now + timedelta(seconds=park_budget_seconds)
+                        quota_cooldown_failure = (
+                            failure_class == "EXTERNAL_API"
+                            and external_api_subtype
+                            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+                        )
+                        warm_reclaim_ready = bool(
+                            _runtime_config.get("park_and_retarget_enabled", False)
+                            and _runtime_config.get("warm_continuity_enabled", False)
+                            and _runtime_config.get("warm_retarget_enabled", False)
+                            and old_vm_id_rl
+                        )
+                        park_blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                        if (
+                            acct_id_for_blacklist
+                            and (
+                                failure_class == "RATE_LIMIT"
+                                or quota_cooldown_failure
+                            )
+                            and acct_id_for_blacklist not in park_blacklisted
+                        ):
+                            park_blacklisted.append(acct_id_for_blacklist)
+
+                        alternate_recovery_at = None
+                        if warm_reclaim_ready and (
+                            failure_class == "RATE_LIMIT" or quota_cooldown_failure
+                        ):
+                            alternate_recovery_at = (
+                                await alternate_account_recovery_deadline(
+                                    acct_id,
+                                    model,
+                                    blacklist=park_blacklisted,
+                                    park_budget_seconds=park_budget_seconds,
+                                    now=now,
+                                )
+                            )
+
+                        if alternate_recovery_at is not None:
+                            retry_after_deadline = min(
+                                alternate_recovery_at, park_deadline
+                            )
+                            task.vm_instance_id = old_vm_id_rl
+                            task.last_heartbeat = None
+                            task.started_at = None
+                            task.retry_after_until = retry_after_deadline
+                            park_msg = (
+                                "Rate Limited — parked on warm VM for alternate-account retarget"
+                                if failure_class == "RATE_LIMIT"
+                                else "External API quota cooldown — parked on warm VM for alternate-account retarget"
+                            )
+                            task.latest_status_message = park_msg
+                            ctx["blacklisted_accounts"] = park_blacklisted
+                            ctx["parked_for_retarget"] = True
+                            ctx["park_deadline"] = park_deadline.isoformat()
+                            ctx["warm_target_vm_id"] = old_vm_id_rl
+                            ctx["warm_handoff_deadline"] = park_deadline.isoformat()
+                            pr_number = _task_pr_number(task)
+                            if pr_number is not None:
+                                ctx["warm_target_pr"] = pr_number
+                            else:
+                                ctx.pop("warm_target_pr", None)
+                            ctx.pop("_slot_released", None)
+                            ctx.pop("provision_failures", None)
+                            task.context = ctx
+                            session.add(task)
+                            await session.commit()
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                            )
+                            logger.info(
+                                "[AGENT STATUS][PARK-RETARGET] Task %s %s — parked on vm=%s until %s",
+                                task.id,
+                                failure_class,
+                                old_vm_id_rl,
+                                park_deadline.isoformat(),
+                            )
+                            return {
+                                "status": "accepted",
+                                "action": "park",
+                                "retry_after_until": retry_after_deadline.isoformat(),
+                                "park_deadline": park_deadline.isoformat(),
+                            }
+
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
@@ -1830,7 +1949,7 @@ async def update_agent_status(
                         # to prevent rapid cycling through exhausted accounts.
                         if failure_class == "RATE_LIMIT":
                             model = _extract_task_model(task)
-                            blacklisted = ctx.get("blacklisted_accounts") or []
+                            blacklisted = park_blacklisted
                             # Check this user's accounts to see if any are available.
                             # Find which user pool the failed account belongs to.
                             any_available = False
@@ -1896,11 +2015,18 @@ async def update_agent_status(
                         # execution_mode) for observability — debugging which provider failed
                         # and per-provider metrics need this. The blacklisted_accounts list
                         # already prevents the next attempt from re-picking the failed account.
+                        if failure_class == "RATE_LIMIT" or quota_cooldown_failure:
+                            ctx["blacklisted_accounts"] = park_blacklisted
+                        # else: preserve existing blacklisted_accounts — the list
+                        # already guards against re-picking a previously rate-limited
+                        # account on a subsequent non-rate-limit requeue.
                         ctx.pop("_slot_released", None)
-                        # The task just ran on a VM successfully enough to POST a result —
-                        # provisioning path worked. Don't carry a stale provision budget
-                        # into the retry, or one more provision hiccup will fail it outright.
                         ctx.pop("provision_failures", None)
+                        ctx.pop("parked_for_retarget", None)
+                        ctx.pop("park_deadline", None)
+                        ctx.pop("warm_target_vm_id", None)
+                        ctx.pop("warm_handoff_deadline", None)
+                        ctx.pop("warm_target_pr", None)
                         task.context = ctx
                         session.add(task)
                         await session.commit()

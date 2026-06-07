@@ -13148,6 +13148,134 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+async def test_next_role_respects_retry_after_for_warm_pinned_task(
+    client: AsyncClient, db_session
+):
+    """Warm-claim must not bypass retry_after_until on a parked/pinned task."""
+    project = Project(name="Next-Role Retry-After", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 5555}],
+        vm_instance_id="agent-vm-retry-after",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 5555}],
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() + timedelta(minutes=5),
+        context={
+            "warm_target_vm_id": "agent-vm-retry-after",
+            "warm_target_pr": "5555",
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-retry-after")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-retry-after",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 5555,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED
+    assert pinned_task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_next_role_defers_parked_task_when_retarget_has_no_account(
+    client: AsyncClient, db_session, mocker
+):
+    """A parked task must stay queued when retarget can't resolve an account."""
+    from types import SimpleNamespace
+    from app.shared_state import runtime_config as _runtime_config
+
+    project = Project(name="Next-Role Parked Retarget", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 6666}],
+        vm_instance_id="agent-vm-parked-retarget",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 6666}],
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        context={
+            "warm_target_vm_id": "agent-vm-parked-retarget",
+            "warm_target_pr": "6666",
+            "parked_for_retarget": True,
+            "park_deadline": (datetime.utcnow() + timedelta(minutes=5)).isoformat(),
+            "blacklisted_accounts": ["acct-failed"],
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    mocker.patch(
+        "app.max_plan_pool.select_llm_runtime_for_task",
+        return_value=SimpleNamespace(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-sonnet-4-6",
+            quality_tier=None,
+            account=None,
+            settings=None,
+            execution_mode=None,
+        ),
+    )
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "warm_retarget_enabled": True,
+            "warm_continuity_enabled": True,
+        },
+        clear=False,
+    )
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-parked-retarget")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-parked-retarget",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 6666,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED
+    assert pinned_task.vm_instance_id is None
+    ctx = pinned_task.context or {}
+    assert ctx.get("parked_for_retarget") is True
+    assert ctx.get("blacklisted_accounts") == ["acct-failed"]
+
+
+@pytest.mark.asyncio
 async def test_next_role_returns_204_when_warm_continuity_suppressed(
     client: AsyncClient, db_session, mocker
 ):
@@ -16768,6 +16896,277 @@ async def test_generic_failure_with_rate_limited_account_requeues_free(
     assert task.attempt_count == 0, (
         f"attempt_count must stay 0 on free RATE_LIMIT requeue, got {task.attempt_count}"
     )
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_parks_and_retains_vm_when_alternate_account_eligible(
+    client: AsyncClient, db_session, mocker
+):
+    """Flagged park-and-retarget keeps the warm VM when another same-pool
+    account is already eligible, preserving the free RATE_LIMIT requeue
+    semantics while blacklisting the failed account."""
+    from app.time_utils import _utcnow
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000park"
+    alternate_account_id = "aaaaaaaa-0001-4000-a000-00000000alt1"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-park",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {
+            "claude-sonnet-4-6": {"at": _utcnow() - timedelta(minutes=5), "hits": 1}
+        },
+    }
+    alternate = {
+        "id": alternate_account_id,
+        "user_id": "u-park",
+        "name": "alternate-account",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-alt",
+        "disabled_models": {},
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed, alternate_account_id: alternate})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-park": [failed, alternate]})
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Park And Retarget", user_id="u-park")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test park path"}],
+        vm_instance_id="agent-vm-park-me",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-park-me")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "claude_code_failed",
+            "logs": "Process exited with code 1",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "accepted"
+    assert body["action"] == "park"
+    assert body["retry_after_until"]
+    assert body["park_deadline"]
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id == "agent-vm-park-me"
+    assert task.attempt_count == 0
+    assert task.latest_status_message == (
+        "Rate Limited — parked on warm VM for alternate-account retarget"
+    )
+    assert ctx.get("parked_for_retarget") is True
+    assert ctx.get("warm_target_vm_id") == "agent-vm-park-me"
+    assert ctx.get("warm_handoff_deadline") == ctx.get("park_deadline")
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    assert task.retry_after_until is not None
+    delete_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_falls_back_to_cold_requeue_when_park_unavailable(
+    client: AsyncClient, db_session, mocker
+):
+    """When the park feature is dark or no alternate account is eligible,
+    the RATE_LIMIT path keeps the legacy cold requeue behaviour."""
+    from app.time_utils import _utcnow
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000cold"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-cold",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {
+            "claude-sonnet-4-6": {"at": _utcnow() - timedelta(minutes=5), "hits": 1}
+        },
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-cold": [failed]})
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Cold Requeue Fallback", user_id="u-cold")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test cold fallback"}],
+        vm_instance_id="agent-vm-cold-fallback",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-fallback")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "claude_code_failed",
+            "logs": "Process exited with code 1",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "accepted"}
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != "agent-vm-cold-fallback"
+    assert task.attempt_count == 0
+    assert ctx.get("parked_for_retarget") is None
+    assert ctx.get("warm_target_vm_id") is None
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    delete_vm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_external_api_provider_quota_cold_requeue_keeps_blacklist(
+    client: AsyncClient, db_session, mocker
+):
+    """EXTERNAL_API provider-quota fallback must keep the failed-account blacklist."""
+    from app.failure_classification import FailureClassification
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000quota"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-quota",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {},
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-quota": [failed]})
+    mocker.patch(
+        "app.failure_classification.classify_failure_with_confidence",
+        return_value=FailureClassification("EXTERNAL_API", 1.0),
+    )
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Quota Fallback", user_id="u-quota")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test quota fallback"}],
+        vm_instance_id="agent-vm-quota-fallback",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+            "external_api_subtype": "provider_quota",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-quota-fallback")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "external_api",
+            "logs": "quota exceeded: provider cooldown",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "accepted"}
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != "agent-vm-quota-fallback"
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    delete_vm.assert_awaited_once()
 
 
 @pytest.mark.asyncio
