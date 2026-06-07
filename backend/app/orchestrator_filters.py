@@ -12,6 +12,7 @@ slot-capping:
 
 import logging
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Callable, Coroutine, Any
 
@@ -335,6 +336,75 @@ def rollup_overlap_defers(
     return should_defer, stale_overlap
 
 
+# A file referenced by this many concurrent tasks (candidates + in-flight) in
+# the same dispatch cycle is considered a "hotspot" god-file. Cross-parent
+# tasks whose ONLY overlap is hotspot files are not held — additive edits to
+# such files (e.g. schemas.py, models.py) rebase cleanly between independent
+# feature branches and the occasional real conflict surfaces at rollup merge.
+HOTSPOT_FILE_THRESHOLD = 3
+
+
+def file_conflict_defers(
+    candidate_files: set,
+    blocker_files: set,
+    *,
+    scope: str,
+    cand_parent: "uuid.UUID | None",
+    blocker_parents: set,
+    hotspot_files: "frozenset | set" = frozenset(),
+) -> bool:
+    """Decide whether a file conflict should defer a candidate task.
+
+    Shared single source of truth for both the cold dispatch path
+    (filter_file_conflicts) and the warm backlog reuse path.
+
+    Cross-parent looseness with hotspot exemption:
+    - If the candidate and ALL overlapping blockers are under DIFFERENT
+      non-null parents, evaluate against only the NON-hotspot portion of the
+      overlap.  A hotspot-only overlap never defers, even at large scope.
+    - When parent information is missing or parents are the same, falls back
+      to the strict rule (any overlap defers large scope; 2+ files AND >= 50%
+      defers standard scope).
+
+    Args:
+        candidate_files: production files the candidate task will edit.
+        blocker_files: union of production files held by overlapping blockers.
+        scope: the candidate task's scope ("large" or anything else).
+        cand_parent: the candidate's parent_task_id (None if orphan).
+        blocker_parents: set of parent_task_id values for overlapping blockers
+            (None entries mean the blocker has no parent — stays conservative).
+        hotspot_files: files currently "hot" (referenced by many concurrent
+            tasks). Cross-parent overlaps limited to hotspot files skip deferral.
+
+    Returns:
+        True if the candidate should be deferred; False if it can proceed.
+    """
+    overlap = candidate_files & blocker_files
+    if not overlap:
+        return False
+    is_large = scope == "large"
+    confidently_cross_parent = (
+        cand_parent is not None
+        and bool(blocker_parents)
+        and all(p is not None and p != cand_parent for p in blocker_parents)
+    )
+    if confidently_cross_parent:
+        # Standard scope: the cross-parent exemption already existed and is preserved
+        # (different rollups target different branches; the threshold isn't meaningful
+        # for independent features). No change to this path.
+        if not is_large:
+            return False
+        # Large scope: previously always deferred regardless of parent relationship.
+        # Now only defer when the overlap includes at least one NON-hotspot file.
+        # A hotspot-only overlap (e.g. schemas.py shared by many independent tasks)
+        # is treated as safe: additive edits to god-files rebase cleanly.
+        non_hotspot_overlap = overlap - hotspot_files
+        return bool(non_hotspot_overlap)
+    return is_large or (
+        len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5
+    )
+
+
 def _coerce_uuid(raw) -> "uuid.UUID | None":
     """Parse *raw* into a UUID, returning None on any malformed value.
 
@@ -474,6 +544,22 @@ async def filter_file_conflicts(
     if not in_progress_files_by_project and not senior_holders_by_project:
         return eligible_ids
 
+    # Compute per-project hotspot files: files referenced by HOTSPOT_FILE_THRESHOLD
+    # or more concurrent tasks (candidates + in-flight). Cross-parent tasks whose
+    # only overlap is hotspot files are not held — see file_conflict_defers().
+    hotspot_files_by_project: dict[uuid.UUID, frozenset] = {}
+    file_counts_by_project: dict[uuid.UUID, Counter] = {}
+    for t in list(candidate_tasks) + list(active_tasks):
+        if _is_read_only_task(t):
+            continue
+        files = _prod_files((t.context or {}).get("related_files", []))
+        for f in files:
+            file_counts_by_project.setdefault(t.project_id, Counter())[f] += 1
+    for pid, counts in file_counts_by_project.items():
+        hotspot_files_by_project[pid] = frozenset(
+            f for f, n in counts.items() if n >= HOTSPOT_FILE_THRESHOLD
+        )
+
     non_conflicting = []
     for eid in eligible_ids:
         candidate = next((t for t in candidate_tasks if t.id == eid), None)
@@ -522,104 +608,81 @@ async def filter_file_conflicts(
         if not overlap:
             non_conflicting.append(eid)
             continue
-        # Large scope tasks defer on any overlap; standard scope uses the 2-file
-        # / 50% threshold (refactors are expected to touch decomposition targets —
-        # overlap is intentional). NB: plan (and every other read-only type) is
-        # exempted above, so the old ``or task_type == "plan"`` clause is gone.
+        # Compute overlapping blockers for attribution and cross-parent evaluation.
+        # Read-only tasks are excluded from in_progress_files_by_project above so
+        # they can never be in overlapping_blockers — but filter here too so
+        # blocker attribution ("blocked by: <title>") can never name a read-only
+        # task even if the two scans ever diverge.
+        overlapping_blockers = [
+            t
+            for t in active_tasks
+            if t.status == TaskStatus.IN_PROGRESS
+            and t.project_id == candidate.project_id
+            and not _is_read_only_task(t)
+            and _prod_files((t.context or {}).get("related_files", [])) & overlap
+        ]
+        # Senior reservation holders that overlap also count as blockers so
+        # the cross-parent looseness evaluates the candidate's parent relationship
+        # against them too (a senior in a different rollup gets the SAME
+        # cross-parent treatment as an in-flight blocker).
+        overlapping_blockers += [
+            h for h in senior_blockers if _file_conflict_reserved_files(h) & overlap
+        ]
         scope = (candidate.context or {}).get("scope", DEFAULT_TASK_SCOPE)
-        is_large = scope == "large"
-        # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
-        should_defer = is_large or (
-            len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5
-        )
-        if should_defer:
-            # Read-only tasks are excluded from in_progress_files_by_project
-            # above, so they can never contribute to ``overlap`` — but filter
-            # them here too so blocker attribution ("blocked by: <title>") can
-            # never name a read-only task even if the two scans ever diverge.
-            overlapping_blockers = [
-                t
-                for t in active_tasks
-                if t.status == TaskStatus.IN_PROGRESS
-                and t.project_id == candidate.project_id
-                and not _is_read_only_task(t)
-                and _prod_files((t.context or {}).get("related_files", [])) & overlap
-            ]
-            # Senior reservation holders that overlap also count as blockers so
-            # the cross-parent looseness below evaluates the candidate's parent
-            # relationship against them too (a senior in a different rollup gets
-            # the SAME cross-parent treatment as an in-flight blocker — we never
-            # defer a pairing the normal conflict logic would consider safe).
-            overlapping_blockers += [
-                h for h in senior_blockers if _file_conflict_reserved_files(h) & overlap
-            ]
-            # Cross-parent looseness: two WRITE tasks under DIFFERENT parents are
-            # different features whose PRs target different rollup branches — they
-            # share no immediate merge target, so overlapping a hot file
-            # (orchestrator.py / models.py / task_lifecycle.py) is rarely a real
-            # conflict; the eventual rollup/automain merge + the back-merge
-            # resolver catch the rare one. Only HOLD when an overlapping in-flight
-            # task is a SAME-PARENT sibling (the plan's coordinated decomposition
-            # merges to the same rollup branch). ALWAYS hold large-scope tasks
-            # (wide rewrites genuinely conflict across the board), and stay
-            # conservative on missing data — a null parent on either side keeps
-            # the hold.
-            cand_parent = candidate.parent_task_id
-            if (
-                not is_large
-                and cand_parent is not None
-                and overlapping_blockers
-                and all(
-                    t.parent_task_id is not None and t.parent_task_id != cand_parent
-                    for t in overlapping_blockers
-                )
-            ):
-                non_conflicting.append(eid)
-                logger.info(
-                    "[DISPATCH] Not deferring task %s — file overlap is cross-parent "
-                    "(different rollups, %d file(s): %s); real conflicts, if any, "
-                    "resolve at merge",
-                    eid,
-                    len(overlap),
-                    ", ".join(sorted(overlap))[:80],
-                )
-                continue
-            overlapping_files = ", ".join(sorted(overlap))[:120]
-            blocking_task = overlapping_blockers[0] if overlapping_blockers else None
-            blocking_title = (
-                f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
-            )
-            defer_msg = f"Waiting: file conflict on {overlapping_files}{blocking_title}"
-            if candidate.latest_status_message != defer_msg:
-                candidate.latest_status_message = defer_msg
-                session.add(candidate)
-                try:
-                    await broadcast_fn(
-                        str(candidate.project_id),
-                        "task_updated",
-                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
-                    )
-                except Exception:
-                    logger.debug(
-                        f"Failed to broadcast deferral for {eid}", exc_info=True
-                    )
-            logger.info(
-                f"[DISPATCH] Deferring task {eid} — file conflict "
-                f"({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}"
-            )
-            # Track persistence — if this candidate keeps deferring on the same
-            # overlapping files across dispatch cycles, raise one operator alert.
-            await _record_defer_and_maybe_escalate(
-                candidate,
-                session,
-                blocker_kind=f"file conflict on {overlapping_files}",
-                detail=defer_msg,
-                block_code="file_conflict",
-                broadcast_fn=broadcast_fn,
-                reserved_files=sorted(overlap),
-            )
-        else:
+        blocker_parents = {t.parent_task_id for t in overlapping_blockers}
+        hotspot_files = hotspot_files_by_project.get(candidate.project_id, frozenset())
+        if not file_conflict_defers(
+            candidate_files,
+            project_files,
+            scope=scope,
+            cand_parent=candidate.parent_task_id,
+            blocker_parents=blocker_parents,
+            hotspot_files=hotspot_files,
+        ):
             non_conflicting.append(eid)
+            logger.info(
+                "[DISPATCH] Not deferring task %s — file overlap is cross-parent "
+                "(different rollups, %d file(s): %s); real conflicts, if any, "
+                "resolve at merge",
+                eid,
+                len(overlap),
+                ", ".join(sorted(overlap))[:80],
+            )
+            continue
+        overlapping_files = ", ".join(sorted(overlap))[:120]
+        blocking_task = overlapping_blockers[0] if overlapping_blockers else None
+        blocking_title = (
+            f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
+        )
+        defer_msg = f"Waiting: file conflict on {overlapping_files}{blocking_title}"
+        if candidate.latest_status_message != defer_msg:
+            candidate.latest_status_message = defer_msg
+            session.add(candidate)
+            try:
+                await broadcast_fn(
+                    str(candidate.project_id),
+                    "task_updated",
+                    {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
+                )
+            except Exception:
+                logger.debug(
+                    f"Failed to broadcast deferral for {eid}", exc_info=True
+                )
+        logger.info(
+            f"[DISPATCH] Deferring task {eid} — file conflict "
+            f"({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}"
+        )
+        # Track persistence — if this candidate keeps deferring on the same
+        # overlapping files across dispatch cycles, raise one operator alert.
+        await _record_defer_and_maybe_escalate(
+            candidate,
+            session,
+            blocker_kind=f"file conflict on {overlapping_files}",
+            detail=defer_msg,
+            block_code="file_conflict",
+            broadcast_fn=broadcast_fn,
+            reserved_files=sorted(overlap),
+        )
     return non_conflicting
 
 

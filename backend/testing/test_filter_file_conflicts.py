@@ -284,8 +284,8 @@ class TestFilterFileConflicts:
 
     @pytest.mark.asyncio
     async def test_large_scope_cross_parent_still_deferred(self):
-        """Large-scope tasks (wide rewrites) conflict broadly even across rollups —
-        the cross-parent looseness must NOT exempt them."""
+        """Large-scope cross-parent tasks still defer on a NON-hotspot file overlap
+        (only 2 tasks reference it → count < HOTSPOT_FILE_THRESHOLD)."""
         pid = uuid.uuid4()
         c = _queued(pid, ["a.py", "b.py"], scope="large", parent=uuid.uuid4())
         ip = _in_progress(pid, ["a.py"], parent=uuid.uuid4())
@@ -295,6 +295,62 @@ class TestFilterFileConflicts:
         result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
         assert result == []
         assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_large_scope_cross_parent_hotspot_only_not_deferred(self):
+        """Large-scope cross-parent tasks sharing ONLY hotspot files are NOT deferred.
+
+        'schemas.py' is referenced by 3 tasks in this dispatch cycle
+        (candidate + 2 in-progress), making it a hotspot (>= HOTSPOT_FILE_THRESHOLD).
+        All three tasks are under different parents, so the overlap is confidently
+        cross-parent and the hotspot-only exemption applies even at large scope.
+        """
+        pid = uuid.uuid4()
+        parent_a, parent_b, parent_c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        # Three independent tasks all touching schemas.py → it becomes a hotspot.
+        c = _queued(pid, ["schemas.py"], scope="large", parent=parent_a)
+        ip1 = _in_progress(pid, ["schemas.py"], parent=parent_b)
+        ip2 = _in_progress(pid, ["schemas.py"], parent=parent_c)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip1, ip2], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+        broadcast_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_large_scope_same_parent_hotspot_still_deferred(self):
+        """Same-parent siblings still defer on a hotspot file — the hotspot exemption
+        only applies when tasks are confidently cross-parent."""
+        pid = uuid.uuid4()
+        parent = uuid.uuid4()
+        # Make schemas.py a hotspot with 3 tasks (same parent).
+        c = _queued(pid, ["schemas.py"], scope="large", parent=parent)
+        ip1 = _in_progress(pid, ["schemas.py"], parent=parent)
+        ip2 = _in_progress(pid, ["schemas.py"], parent=uuid.uuid4())
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        # ip1 shares the same parent as c → NOT confidently cross-parent → defer.
+        result = await filter_file_conflicts([c.id], [c], [ip1, ip2], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_null_parent_hotspot_stays_conservative(self):
+        """A null parent on either side → can't confirm independence → defer even
+        on a hotspot-only overlap (conservative fallback)."""
+        pid = uuid.uuid4()
+        # Candidate has a parent, one blocker does not → not confidently cross-parent.
+        c = _queued(pid, ["schemas.py"], scope="large", parent=uuid.uuid4())
+        ip1 = _in_progress(pid, ["schemas.py"], parent=None)  # null parent
+        ip2 = _in_progress(pid, ["schemas.py"], parent=uuid.uuid4())
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip1, ip2], session, broadcast_fn)
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_null_parent_overlap_stays_conservative_and_defers(self):

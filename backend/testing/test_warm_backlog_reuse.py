@@ -351,9 +351,11 @@ async def test_eligibility_skips_dependency_and_file_conflict(db_session):
         status=TaskStatus.IN_PROGRESS,
         context={"related_files": ["src/app.py"]},
     )
-    # Candidate that conflicts on src/app.py -> ineligible.
+    # Candidate that conflicts on src/app.py (large scope: any overlap defers) -> ineligible.
     await _make_backlog_task(
-        db_session, project.id, context={"related_files": ["src/app.py"]}
+        db_session,
+        project.id,
+        context={"scope": "large", "related_files": ["src/app.py"]},
     )
     # Candidate with an unmet dependency -> ineligible.
     await _make_backlog_task(
@@ -399,7 +401,8 @@ async def test_eligibility_read_only_conflict_semantics_match_dispatch(db_sessio
         db_session,
         project.id,
         payloads=[{"type": "fix"}],
-        context={"related_files": ["src/app.py"]},
+        # large scope: any overlap defers (matches cold dispatch behavior)
+        context={"scope": "large", "related_files": ["src/app.py"]},
     )
     # The review contributes nothing to the in-progress claim set, so the
     # overlapping write candidate is eligible.
@@ -411,8 +414,8 @@ async def test_eligibility_read_only_conflict_semantics_match_dispatch(db_sessio
     review_ip.payloads = [{"type": "fix"}]
     db_session.add(review_ip)
     await db_session.commit()
-    # Re-fetch eligibility: the only candidate now conflicts with an in-flight
-    # write on src/app.py, so it is ineligible.
+    # Re-fetch eligibility: the only candidate (large scope) now conflicts with
+    # an in-flight write on src/app.py, so it is ineligible.
     eligible = await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
     assert write_candidate.id not in eligible
 
@@ -427,6 +430,96 @@ async def test_eligibility_read_only_conflict_semantics_match_dispatch(db_sessio
     eligible = await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
     assert review_candidate.id in eligible
     assert write_candidate.id not in eligible
+
+
+@pytest.mark.asyncio
+async def test_warm_cross_parent_large_scope_hotspot_not_skipped(db_session):
+    """A large-scope candidate sharing ONLY a hotspot file with cross-parent
+    in-progress tasks is eligible for warm reuse (hotspot exemption parity
+    with filter_file_conflicts cold path)."""
+    project = await _make_project(db_session, name="Hotspot Cross-Parent")
+    vm_id = "agent-vm-hotspot-cp"
+
+    # Create real parent tasks (required by FK constraint on parent_task_id).
+    parent_a = await _make_backlog_task(
+        db_session, project.id, status=TaskStatus.EVALUATING
+    )
+    parent_b = await _make_backlog_task(
+        db_session, project.id, status=TaskStatus.EVALUATING
+    )
+    parent_c = await _make_backlog_task(
+        db_session, project.id, status=TaskStatus.EVALUATING
+    )
+
+    # Two IN_PROGRESS tasks under different parents touching schemas.py.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/schemas.py"]},
+        parent_task_id=parent_b.id,
+    )
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/schemas.py"]},
+        parent_task_id=parent_c.id,
+    )
+    # Candidate under a different parent — schemas.py overlap is hotspot-only.
+    candidate = await _make_backlog_task(
+        db_session,
+        project.id,
+        payloads=[{"type": "create", "prompt": "fix schemas", "base_branch": "automain"}],
+        context={"scope": "large", "related_files": ["backend/app/schemas.py"]},
+        parent_task_id=parent_a.id,
+    )
+    # schemas.py now appears in 3 tasks → hotspot → cross-parent candidate eligible.
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == candidate.id
+
+
+@pytest.mark.asyncio
+async def test_warm_same_parent_hotspot_still_skipped(db_session):
+    """Same-parent tasks still defer on a hotspot file — the exemption only
+    applies when tasks are confidently cross-parent."""
+    project = await _make_project(db_session, name="Hotspot Same-Parent")
+    vm_id = "agent-vm-hotspot-sp"
+
+    # Create real parent tasks (required by FK constraint on parent_task_id).
+    shared_parent = await _make_backlog_task(
+        db_session, project.id, status=TaskStatus.EVALUATING
+    )
+    other_parent = await _make_backlog_task(
+        db_session, project.id, status=TaskStatus.EVALUATING
+    )
+
+    # One IN_PROGRESS task with the SAME parent as the candidate.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/schemas.py"]},
+        parent_task_id=shared_parent.id,
+    )
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/schemas.py"]},
+        parent_task_id=other_parent.id,
+    )
+    # Candidate shares parent with ip1 → NOT confidently cross-parent → skipped.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        payloads=[{"type": "create", "prompt": "fix schemas", "base_branch": "automain"}],
+        context={"scope": "large", "related_files": ["backend/app/schemas.py"]},
+        parent_task_id=shared_parent.id,
+    )
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
 
 
 @pytest.mark.asyncio
@@ -538,7 +631,8 @@ async def test_dep_ready_task_still_respects_other_exclusions(db_session):
         depends_on=["00000000-0000-0000-0000-000000000123"],
         context={"_deps_satisfied": True, "warm_target_vm_id": "agent-vm-other"},
     )
-    # Dep-ready but file-conflicting with an IN_PROGRESS task -> still excluded.
+    # Dep-ready but file-conflicting with an IN_PROGRESS task -> still excluded
+    # (large scope: any single-file overlap defers).
     await _make_backlog_task(
         db_session,
         project.id,
@@ -549,7 +643,7 @@ async def test_dep_ready_task_still_respects_other_exclusions(db_session):
         db_session,
         project.id,
         depends_on=["00000000-0000-0000-0000-000000000123"],
-        context={"_deps_satisfied": True, "related_files": ["src/app.py"]},
+        context={"_deps_satisfied": True, "scope": "large", "related_files": ["src/app.py"]},
     )
     assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
 
@@ -1370,9 +1464,11 @@ async def test_scan_skip_reasons_increment_each_stage_once(db_session):
             status=TaskStatus.IN_PROGRESS,
             context={"related_files": ["src/app.py"]},
         )
-        # File-conflict candidate.
+        # File-conflict candidate (large scope: any single-file overlap defers).
         await _make_backlog_task(
-            db_session, project.id, context={"related_files": ["src/app.py"]}
+            db_session,
+            project.id,
+            context={"scope": "large", "related_files": ["src/app.py"]},
         )
         # Depends_on candidate.
         await _make_backlog_task(
