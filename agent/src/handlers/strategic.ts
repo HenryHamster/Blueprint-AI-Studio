@@ -680,7 +680,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # the SAME create-direction call — it is born staged (inert, gated to the open
 # version) in one atomic op, so it never passes through a research-eligible
 # active state. Requires an open version (skips 409 if none). Do NOT create-then-stage.
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit", "success_evidence": "updated observable outcome (optional)", "retirement_condition": "updated measurable retirement condition (optional)"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 # Stage a direction for the NEXT version: it goes inert (no work spawned) and
 # auto-activates when the current version promotes and the next one opens. Use

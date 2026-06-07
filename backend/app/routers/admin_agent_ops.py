@@ -910,6 +910,23 @@ async def strategic_operation(
             mode = _normalize_recommended_mode(data["recommended_mode"])
             if mode:
                 new_dir["recommended_mode"] = mode
+        raw_conflicts_with = data.get("conflicts_with")
+        if raw_conflicts_with:
+            if not isinstance(raw_conflicts_with, list) or not all(
+                isinstance(c, str) for c in raw_conflicts_with
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="conflicts_with must be a list of direction ID strings",
+                )
+            existing_ids = {d.get("id") for d in directions}
+            invalid = [cid for cid in raw_conflicts_with if cid not in existing_ids]
+            if invalid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown direction IDs in conflicts_with: {invalid}",
+                )
+            new_dir["conflicts_with"] = raw_conflicts_with
         directions.append(new_dir)
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
@@ -1041,6 +1058,28 @@ async def strategic_operation(
                         d["gap_id"] = str(gid)
                     else:
                         d.pop("gap_id", None)
+                if "conflicts_with" in changes:
+                    cw = changes["conflicts_with"]
+                    if cw is None or (isinstance(cw, list) and len(cw) == 0):
+                        d.pop("conflicts_with", None)
+                    elif isinstance(cw, list) and all(isinstance(c, str) for c in cw):
+                        other_ids = {
+                            other.get("id")
+                            for other in directions
+                            if other.get("id") != dir_id
+                        }
+                        invalid = [cid for cid in cw if cid not in other_ids]
+                        if invalid:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Unknown direction IDs in conflicts_with: {invalid}",
+                            )
+                        d["conflicts_with"] = cw
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="conflicts_with must be a list of direction ID strings",
+                        )
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:
