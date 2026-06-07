@@ -767,6 +767,25 @@ def _collect_retirement_metrics(
     return result
 
 
+def _snapshot_has_substantive_context(snapshot: dict) -> bool:
+    """Return True when the snapshot carries enough context to synthesize a meaningful memo.
+
+    retirement_metrics is checked for non-zero activity (final_prs_merged or
+    final_cycles_active) because _build_retirement_metrics always returns a dict.
+    """
+    metrics = snapshot.get("retirement_metrics") or {}
+    metrics_substantive = bool(
+        metrics.get("final_prs_merged") or metrics.get("final_cycles_active")
+    )
+    return bool(
+        snapshot.get("direction_text")
+        or snapshot.get("success_evidence")
+        or snapshot.get("retirement_condition")
+        or metrics_substantive
+        or snapshot.get("recent_history_summary")
+    )
+
+
 async def _spawn_retirement_memos(
     session: AsyncSession,
     project: Project,
@@ -821,6 +840,7 @@ async def _spawn_retirement_memos(
         rationale = rationales.get(did) or ""
         topic = direction_text[:120] or f"Direction {did}"
         snapshot = _build_retirement_snapshot(direction or {}, rationale)
+        snapshot["source_task_id"] = str(task.id)
         success_evidence = snapshot.get("success_evidence") or ""
         retirement_condition = snapshot.get("retirement_condition") or ""
         memo_payload = validate_internal_payload(
@@ -873,6 +893,14 @@ async def _spawn_retirement_memos(
             if metrics:
                 metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
                 parts.append(f"Final metrics: {metrics_str}")
+            history = snapshot.get("recent_history_summary") or []
+            if history:
+                history_lines = [
+                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                    for i, h in enumerate(history)
+                ]
+                parts.append("Recent history:\n" + "\n".join(history_lines))
             tags = ["direction-retirement"]
             if success_evidence:
                 tags.append("success-evidence")
@@ -881,6 +909,41 @@ async def _spawn_retirement_memos(
             citations = [f"direction:{did}", f"task:{task.id}"]
             synth_memo = {
                 "summary": rationale[:200],
+                "reasoning": "\n\n".join(parts),
+                "citations": citations,
+                "tags": tags,
+            }
+            _apply_synthesized_memo(memo_task, synth_memo, session)
+            synthesized = True
+        elif _snapshot_has_substantive_context(snapshot):
+            parts = []
+            if direction_text:
+                parts.append(f"Direction: {direction_text}")
+            if success_evidence:
+                parts.append(f"Success evidence: {success_evidence}")
+            if retirement_condition:
+                parts.append(f"Retirement condition: {retirement_condition}")
+            metrics = snapshot.get("retirement_metrics") or {}
+            if metrics:
+                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                parts.append(f"Final metrics: {metrics_str}")
+            history = snapshot.get("recent_history_summary") or []
+            if history:
+                history_lines = [
+                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                    for i, h in enumerate(history)
+                ]
+                parts.append("Recent history:\n" + "\n".join(history_lines))
+            tags = ["direction-retirement"]
+            if success_evidence:
+                tags.append("success-evidence")
+            if retirement_condition:
+                tags.append("retirement-condition")
+            citations = [f"direction:{did}", f"task:{task.id}"]
+            summary = direction_text[:200] or f"Direction {did} retired"
+            synth_memo = {
+                "summary": summary,
                 "reasoning": "\n\n".join(parts),
                 "citations": citations,
                 "tags": tags,

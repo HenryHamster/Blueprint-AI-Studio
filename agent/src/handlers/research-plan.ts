@@ -932,10 +932,58 @@ export function buildMemoCitationsSection(memoCitations: unknown): string {
     const m = memoCitations[i];
     if (!m || typeof m !== 'object') continue;
     const rec = m as Record<string, unknown>;
+    const compactText = (value: string) => value.replace(/\s+/g, ' ').trim();
     const taskId = typeof rec.task_id === 'string' && rec.task_id ? rec.task_id : '?';
     const excerpt = typeof rec.summary_excerpt === 'string' ? rec.summary_excerpt.trim() : '';
     const handle = `M${i}`;
-    lines.push(`- ${handle} (task_id: ${taskId}): ${excerpt || '(no summary)'}`);
+    const metaParts: string[] = [`task_id: ${taskId}`];
+    if (typeof rec.reasoning_kind === 'string' && rec.reasoning_kind) {
+      metaParts.push(`kind: ${rec.reasoning_kind}`);
+    }
+    if (typeof rec.direction_id === 'string' && rec.direction_id) {
+      metaParts.push(`direction: ${rec.direction_id}`);
+    }
+    const tags = Array.isArray(rec.tags) && rec.tags.length > 0
+      ? (rec.tags as unknown[]).filter((t) => typeof t === 'string').join(', ')
+      : '';
+    if (tags) metaParts.push(`tags: ${tags}`);
+    lines.push(`- ${handle} (${metaParts.join('; ')}): ${excerpt || '(no summary)'}`);
+    const citationRefs = typeof rec.citation_refs === 'string' ? rec.citation_refs.trim() : '';
+    if (citationRefs) {
+      lines.push(`  citation_refs: ${citationRefs}`);
+    }
+    if (typeof rec.success_evidence === 'string' && rec.success_evidence) {
+      lines.push(`  success_evidence: ${rec.success_evidence}`);
+    }
+    if (typeof rec.retirement_condition === 'string' && rec.retirement_condition) {
+      lines.push(`  retirement_condition: ${rec.retirement_condition}`);
+    }
+    const finalMetricsText = typeof rec.final_metrics_excerpt === 'string'
+      ? rec.final_metrics_excerpt.trim()
+      : (rec.final_metrics && typeof rec.final_metrics === 'object'
+        ? Object.entries(rec.final_metrics as Record<string, unknown>)
+          .map(([key, value]) => `${key}=${String(value)}`)
+          .join(', ')
+        : '');
+    if (finalMetricsText) {
+      lines.push(`  final_metrics: ${finalMetricsText}`);
+    }
+    const rationaleExcerpt = typeof rec.rationale_excerpt === 'string' && rec.rationale_excerpt
+      ? compactText(rec.rationale_excerpt)
+      : typeof rec.rationale === 'string'
+        ? compactText(rec.rationale).slice(0, 200)
+        : '';
+    if (rationaleExcerpt) {
+      lines.push(`  rationale: ${rationaleExcerpt}`);
+    }
+    const reasoningExcerpt = typeof rec.reasoning_excerpt === 'string' && rec.reasoning_excerpt
+      ? compactText(rec.reasoning_excerpt)
+      : typeof rec.reasoning === 'string'
+        ? compactText(rec.reasoning).slice(0, 200)
+        : '';
+    if (reasoningExcerpt) {
+      lines.push(`  reasoning: ${reasoningExcerpt}`);
+    }
   }
   return lines.join('\n');
 }

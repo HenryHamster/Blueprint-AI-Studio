@@ -1773,42 +1773,51 @@ _MEMO_CITATIONS_KEEP = 5
 _MEMO_EXCERPT_MAX_CHARS = 400
 
 
+_MEMO_HEAVY_FIELDS = ("citations", "final_metrics")
+_MEMO_VERBOSE_FIELDS = ("rationale", "reasoning")
+
+
+def _strip_heavy_fields(m: dict) -> dict:
+    """Return a copy of the memo entry without the heaviest optional fields."""
+    return {k: v for k, v in m.items() if k not in _MEMO_HEAVY_FIELDS}
+
+
+def _strip_verbose_fields(m: dict) -> dict:
+    """Return a copy without heavy AND verbose optional fields."""
+    drop = set(_MEMO_HEAVY_FIELDS) | set(_MEMO_VERBOSE_FIELDS)
+    return {k: v for k, v in m.items() if k not in drop}
+
+
+def _cap_excerpt(m: dict) -> dict:
+    result = dict(m)
+    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[:_MEMO_EXCERPT_MAX_CHARS]
+    return result
+
+
 def _summarize_memo_citations(memos: list) -> list:
     """Trim memo citations for inclusion in strategic-agent payloads.
 
-    Keeps the most recent N memos (by task_id) and caps excerpt length
-    so the digest survives under budget pressure rather than vanishing
-    entirely. The strategic reviewer can cite memos by task_id; shorter
-    excerpts still preserve citability.
+    Field-level trimming order (applied before entry-count capping):
+      1. Drop ``citations`` and ``final_metrics`` (largest optional fields).
+      2. Drop ``rationale`` and ``reasoning`` (verbose text fields; compact
+         ``*_excerpt`` variants are preserved).
+      3. Cap ``summary_excerpt`` to ``_MEMO_EXCERPT_MAX_CHARS``.
+    Then cap entry count to ``_MEMO_CITATIONS_KEEP`` (newest-first).
+
+    This ensures over-budget payloads degrade to a compact citable digest
+    rather than dropping the whole feed. ``task_id`` is always preserved.
     """
     if not isinstance(memos, list):
         return memos
-    if len(memos) <= _MEMO_CITATIONS_KEEP:
-        # No trimming needed for list size, but still cap excerpts
-        return [
-            {
-                **m,
-                "summary_excerpt": (m.get("summary_excerpt") or "")[
-                    :_MEMO_EXCERPT_MAX_CHARS
-                ]
-                if isinstance(m, dict)
-                else m,
-            }
-            for m in memos
-        ]
-    # Cap to most recent memos and trim excerpts
-    trimmed = memos[:_MEMO_CITATIONS_KEEP]
-    return [
-        {
-            **m,
-            "summary_excerpt": (m.get("summary_excerpt") or "")[
-                :_MEMO_EXCERPT_MAX_CHARS
-            ]
-            if isinstance(m, dict)
-            else m,
-        }
-        for m in trimmed
-    ]
+    result = []
+    for m in memos:
+        if not isinstance(m, dict):
+            result.append(m)
+            continue
+        entry = _strip_verbose_fields(m)
+        entry = _cap_excerpt(entry)
+        result.append(entry)
+    return result[:_MEMO_CITATIONS_KEEP]
 
 
 # ── Open-message inbox (the strategist's authoritative feed) ──────────────────

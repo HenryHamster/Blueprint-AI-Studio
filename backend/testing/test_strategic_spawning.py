@@ -11083,3 +11083,123 @@ def test_direction_health_reflects_declaration_coverage():
     assert _compute_productivity_score(legacy_twin) > _compute_productivity_score(
         undeclared_dir
     )
+
+
+# ── _summarize_memo_citations tests ──────────────────────────────────────────
+
+def test_summarize_memo_citations_legacy_shape_unchanged():
+    """Legacy {task_id, summary_excerpt} entries pass through unchanged."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [
+        {"task_id": "t1", "summary_excerpt": "First finding."},
+        {"task_id": "t2", "summary_excerpt": "Second finding."},
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 2
+    assert result[0]["task_id"] == "t1"
+    assert result[0]["summary_excerpt"] == "First finding."
+    assert result[1]["task_id"] == "t2"
+    assert result[1]["summary_excerpt"] == "Second finding."
+
+
+def test_summarize_memo_citations_strips_heavy_fields():
+    """Heavy fields are stripped, compact retirement excerpts survive."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [
+        {
+            "task_id": "t-ret",
+            "summary_excerpt": "Retirement memo.",
+            "reasoning_kind": "direction_retirement",
+            "direction_id": "dir-xyz",
+            "tags": ["retirement"],
+            "citations": ["task-cit-1", "task-cit-2"],
+            "final_metrics": {"merged_prs": 10},
+            "success_evidence": "All tests passed.",
+            "retirement_condition": "KPIs met.",
+            "rationale": "Long rationale text.",
+            "reasoning": "Full multi-paragraph reasoning that is verbose and should be dropped.",
+            "citation_refs": "task-cit-1, task-cit-2",
+            "final_metrics_excerpt": "final_prs_merged=10, final_cycles_active=4",
+            "rationale_excerpt": "Long rationale text.",
+            "reasoning_excerpt": "Direction: retired because KPIs were met.",
+        }
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["task_id"] == "t-ret"
+    assert entry["reasoning_kind"] == "direction_retirement"
+    assert entry["direction_id"] == "dir-xyz"
+    assert entry["tags"] == ["retirement"]
+    assert entry["success_evidence"] == "All tests passed."
+    assert entry["retirement_condition"] == "KPIs met."
+    assert entry["citation_refs"] == "task-cit-1, task-cit-2"
+    assert entry["final_metrics_excerpt"] == "final_prs_merged=10, final_cycles_active=4"
+    assert entry["rationale_excerpt"] == "Long rationale text."
+    assert entry["reasoning_excerpt"] == "Direction: retired because KPIs were met."
+    # Heavy/verbose fields stripped
+    assert "citations" not in entry, "_summarize_memo_citations must strip citations"
+    assert "final_metrics" not in entry, "_summarize_memo_citations must strip final_metrics"
+    assert "rationale" not in entry, "_summarize_memo_citations must strip rationale"
+    assert "reasoning" not in entry, "_summarize_memo_citations must strip full reasoning"
+
+
+def test_summarize_memo_citations_strips_full_reasoning_keeps_excerpt():
+    """Full reasoning is stripped in the budget-degraded path; reasoning_excerpt survives."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    long_reasoning = "Paragraph one. " * 100  # simulate a verbose reasoning blob
+    memos = [
+        {
+            "task_id": "t-full",
+            "summary_excerpt": "A retirement memo with full reasoning.",
+            "reasoning": long_reasoning,
+            "reasoning_excerpt": "Compact excerpt that fits in budget.",
+            "reasoning_kind": "direction_retirement",
+        }
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 1
+    entry = result[0]
+    assert "reasoning" not in entry, "full reasoning must be stripped to honour budget bounds"
+    assert entry["reasoning_excerpt"] == "Compact excerpt that fits in budget."
+    assert entry["task_id"] == "t-full"
+
+
+def test_summarize_memo_citations_caps_entry_count():
+    """Entry count is capped to _MEMO_CITATIONS_KEEP (newest-first)."""
+    from app.strategic_spawning import _summarize_memo_citations, _MEMO_CITATIONS_KEEP
+
+    memos = [{"task_id": f"t{i}", "summary_excerpt": f"memo {i}"} for i in range(20)]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == _MEMO_CITATIONS_KEEP
+    assert result[0]["task_id"] == "t0"
+
+
+def test_summarize_memo_citations_caps_excerpt_length():
+    """summary_excerpt is capped to _MEMO_EXCERPT_MAX_CHARS."""
+    from app.strategic_spawning import _summarize_memo_citations, _MEMO_EXCERPT_MAX_CHARS
+
+    long_text = "x" * (_MEMO_EXCERPT_MAX_CHARS + 100)
+    memos = [{"task_id": "t1", "summary_excerpt": long_text}]
+    result = _summarize_memo_citations(memos)
+    assert len(result[0]["summary_excerpt"]) == _MEMO_EXCERPT_MAX_CHARS
+
+
+def test_summarize_memo_citations_non_list_passthrough():
+    """Non-list input is returned as-is (guard for legacy callers)."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    assert _summarize_memo_citations(None) is None  # type: ignore[arg-type]
+    assert _summarize_memo_citations("invalid") == "invalid"  # type: ignore[arg-type]
+
+
+def test_summarize_memo_citations_non_dict_entries_preserved():
+    """Non-dict entries in the list are preserved unchanged."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [{"task_id": "t1", "summary_excerpt": "ok"}, "not-a-dict"]
+    result = _summarize_memo_citations(memos)
+    assert result[1] == "not-a-dict"

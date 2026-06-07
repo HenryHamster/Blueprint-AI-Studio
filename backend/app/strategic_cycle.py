@@ -280,7 +280,10 @@ async def query_recent_memo_citations(
     Returns ``[{"task_id": str, "summary_excerpt": str}]`` newest-first, capped
     at ``cap`` (oldest dropped). ``summary_excerpt`` is the first ~200 chars of
     ``plan_output['memo']['summary']`` — empty string when the memo has no
-    parseable summary.
+    parseable summary. Retirement memo rows also carry compact durable excerpts
+    from the spawned payload/context so the agent can still see the underlying
+    evidence after summary trimming: ``citation_refs``, ``final_metrics_excerpt``,
+    ``rationale_excerpt``, and ``reasoning_excerpt``.
     """
     from app.models import Task, TaskStatus  # noqa: PLC0415
 
@@ -309,7 +312,93 @@ async def query_recent_memo_citations(
         plan = t.plan_output if isinstance(t.plan_output, dict) else {}
         memo = plan.get("memo") if isinstance(plan.get("memo"), dict) else {}
         summary = str((memo or {}).get("summary") or "")
-        citations.append({"task_id": str(t.id), "summary_excerpt": summary[:200]})
+        payload0 = (t.payloads or [{}])[0] if isinstance(t.payloads, list) else {}
+        source_finding = (
+            payload0.get("source_finding")
+            if isinstance(payload0, dict) and isinstance(payload0.get("source_finding"), dict)
+            else {}
+        )
+        context = t.context if isinstance(t.context, dict) else {}
+
+        def _compact_metrics(value: Any) -> str:
+            if isinstance(value, dict) and value:
+                return ", ".join(f"{k}={v}" for k, v in value.items())
+            return ""
+
+        def _compact_text(value: Any) -> str:
+            if isinstance(value, str):
+                text = value.strip()
+                return text[:200] if text else ""
+            return ""
+
+        entry: dict[str, Any] = {
+            "task_id": str(t.id),
+            "summary_excerpt": summary[:200],
+        }
+        # Enriched fields — additive, all optional. Consumers that read only
+        # task_id/summary_excerpt are unaffected.
+        reasoning_kind = payload0.get("reasoning_kind") if isinstance(payload0, dict) else None
+        if reasoning_kind:
+            entry["reasoning_kind"] = str(reasoning_kind)
+        direction_id = payload0.get("direction_id") if isinstance(payload0, dict) else None
+        if direction_id:
+            entry["direction_id"] = str(direction_id)
+        if isinstance(memo, dict):
+            for field in ("tags", "citations", "reasoning"):
+                val = memo.get(field)
+                if val is not None:
+                    entry[field] = val
+            citations_val = memo.get("citations")
+            if isinstance(citations_val, list) and citations_val:
+                refs = ", ".join(
+                    c.strip() for c in citations_val if isinstance(c, str) and c.strip()
+                )
+                if refs:
+                    entry["citation_refs"] = refs
+            success_evidence = _compact_text(
+                source_finding.get("success_evidence")
+                or memo.get("success_evidence")
+                or context.get("success_evidence")
+            )
+            if success_evidence:
+                entry["success_evidence"] = success_evidence
+            retirement_condition = _compact_text(
+                source_finding.get("retirement_condition")
+                or memo.get("retirement_condition")
+                or context.get("retirement_condition")
+            )
+            if retirement_condition:
+                entry["retirement_condition"] = retirement_condition
+            final_metrics_value = (
+                source_finding.get("retirement_metrics")
+                or memo.get("final_metrics")
+                or context.get("final_metrics")
+            )
+            if final_metrics_value is not None:
+                entry["final_metrics"] = final_metrics_value
+            rationale_value = (
+                source_finding.get("rationale")
+                or memo.get("rationale")
+                or context.get("retirement_rationale")
+            )
+            if rationale_value is not None:
+                entry["rationale"] = rationale_value
+            rationale_excerpt = _compact_text(rationale_value)
+            if rationale_excerpt:
+                entry["rationale_excerpt"] = rationale_excerpt
+            reasoning_excerpt = _compact_text(memo.get("reasoning"))
+            if reasoning_excerpt:
+                entry["reasoning_excerpt"] = reasoning_excerpt
+            final_metrics_excerpt = _compact_metrics(final_metrics_value)
+            if final_metrics_excerpt:
+                entry["final_metrics_excerpt"] = final_metrics_excerpt
+        else:
+            rationale_excerpt = _compact_text(
+                source_finding.get("rationale") if isinstance(source_finding, dict) else None
+            )
+            if rationale_excerpt:
+                entry["rationale_excerpt"] = rationale_excerpt
+        citations.append(entry)
     return citations
 
 

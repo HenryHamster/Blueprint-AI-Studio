@@ -1889,6 +1889,94 @@ describe('buildMemoCitationsSection', () => {
     expect(result).toMatch(/authentic|genuinely informs/i);
     expect(result).toMatch(/performative.*not|valuable citations.*strengthen/i);
   });
+
+  it('renders reasoning_kind and direction_id when present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-ret-1',
+        summary_excerpt: 'Direction retired.',
+        reasoning_kind: 'direction_retirement',
+        direction_id: 'dir-abc123',
+      },
+    ]);
+    expect(result).toContain('task_id: memo-ret-1');
+    expect(result).toContain('kind: direction_retirement');
+    expect(result).toContain('direction: dir-abc123');
+  });
+
+  it('omits reasoning_kind and direction_id meta parts when absent (legacy shape)', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-legacy', summary_excerpt: 'Legacy memo.' },
+    ]);
+    expect(result).toContain('M0 (task_id: memo-legacy): Legacy memo.');
+    expect(result).not.toContain('kind:');
+    expect(result).not.toContain('direction:');
+  });
+
+  it('renders tags when present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-tags',
+        summary_excerpt: 'Tagged memo.',
+        tags: ['retirement', 'acceptance'],
+      },
+    ]);
+    expect(result).toContain('tags: retirement, acceptance');
+  });
+
+  it('renders success_evidence and retirement_condition as indented lines', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-ev',
+        summary_excerpt: 'Evidence memo.',
+        success_evidence: 'All tests passed.',
+        retirement_condition: 'KPIs met for 2 cycles.',
+      },
+    ]);
+    expect(result).toContain('success_evidence: All tests passed.');
+    expect(result).toContain('retirement_condition: KPIs met for 2 cycles.');
+  });
+
+  it('handles enriched entry with all new fields present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-full',
+        summary_excerpt: 'Full enriched memo.',
+        reasoning_kind: 'direction_retirement',
+        direction_id: 'dir-xyz',
+        tags: ['retirement'],
+        citation_refs: 'direction:dir-xyz, task:memo-src',
+        success_evidence: 'Evidence here.',
+        retirement_condition: 'Condition here.',
+        final_metrics_excerpt: 'final_prs_merged=12, final_cycles_active=4',
+        rationale_excerpt: 'Retired after acceptance criteria were met.',
+        reasoning_excerpt: 'Direction: full scope shipped.\n\nRetirement rationale: done.',
+      },
+    ]);
+    expect(result).toContain('M0');
+    expect(result).toContain('task_id: memo-full');
+    expect(result).toContain('kind: direction_retirement');
+    expect(result).toContain('direction: dir-xyz');
+    expect(result).toContain('tags: retirement');
+    expect(result).toContain('citation_refs: direction:dir-xyz, task:memo-src');
+    expect(result).toContain('success_evidence: Evidence here.');
+    expect(result).toContain('retirement_condition: Condition here.');
+    expect(result).toContain('final_metrics: final_prs_merged=12, final_cycles_active=4');
+    expect(result).toContain('rationale: Retired after acceptance criteria were met.');
+    expect(result).toContain('reasoning: Direction: full scope shipped.');
+    expect(result).toContain('Full enriched memo.');
+  });
+
+  it('skips malformed entries (non-object) gracefully', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-valid', summary_excerpt: 'Valid.' },
+      'not-an-object',
+      null,
+      { task_id: 'memo-also-valid', summary_excerpt: 'Also valid.' },
+    ]);
+    expect(result).toContain('M0 (task_id: memo-valid): Valid.');
+    expect(result).toContain('M3 (task_id: memo-also-valid): Also valid.');
+  });
 });
 
 describe('resolveMemoHandles', () => {

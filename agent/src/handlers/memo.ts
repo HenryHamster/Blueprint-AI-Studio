@@ -61,9 +61,13 @@ function _synthesizeDispatcherMemo(
   reasoningKind: string,
   sf: Record<string, unknown>,
   sourceTaskId: string,
+  directionId: string,
   sv: (v: unknown) => string,
 ): Record<string, unknown> | null {
-  const cite = sourceTaskId ? [`task:${sourceTaskId}`] : [];
+  const cite = [
+    directionId ? `direction:${directionId}` : null,
+    sourceTaskId ? `task:${sourceTaskId}` : null,
+  ].filter((x): x is string => x !== null);
   if (reasoningKind === 'regression_false_positive') {
     const verdictReason = sv(sf.verdict_reason);
     if (!verdictReason) return null;
@@ -107,6 +111,22 @@ function _synthesizeDispatcherMemo(
       const metrics = [qs && `quality_score=${qs}`, pm && `prs_merged=${pm}`, ca && `cycles_active=${ca}`].filter(Boolean).join(', ');
       parts.push(`Outcome metrics: ${metrics}`);
     }
+    const rhs = sf.recent_history_summary;
+    if (Array.isArray(rhs) && rhs.length > 0) {
+      const histLines = (rhs as unknown[]).map((h) => {
+        if (h == null || typeof h !== 'object') return null;
+        const hr = h as Record<string, unknown>;
+        const hParts = [];
+        if (typeof hr.cycles === 'number') hParts.push(`cycles=${hr.cycles}`);
+        if (typeof hr.prs_merged === 'number') hParts.push(`prs_merged=${hr.prs_merged}`);
+        if (typeof hr.tasks_completed === 'number') hParts.push(`tasks_completed=${hr.tasks_completed}`);
+        if (typeof hr.tasks_failed === 'number') hParts.push(`tasks_failed=${hr.tasks_failed}`);
+        return hParts.length > 0 ? hParts.join(', ') : null;
+      }).filter((x): x is string => x !== null);
+      if (histLines.length > 0) {
+        parts.push(`Recent history: ${histLines.join(' | ')}`);
+      }
+    }
     const summary = (rationale || directionText || 'Direction retired.').slice(0, 200);
     return { summary, reasoning: parts.join('\n\n'), citations: cite, tags: ['direction-retirement'] };
   }
@@ -127,7 +147,7 @@ export async function handleMemo(
 
   // Short-circuit for dispatcher memos: synthesize from source_finding directly.
   if (sourceFinding && typeof sourceFinding === 'object') {
-    const directMemo = _synthesizeDispatcherMemo(reasoningKind, sourceFinding as Record<string, unknown>, sourceTaskId, strVal);
+    const directMemo = _synthesizeDispatcherMemo(reasoningKind, sourceFinding as Record<string, unknown>, sourceTaskId, directionId, strVal);
     if (directMemo !== null) {
       await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: sanitize(JSON.stringify(directMemo)) });
       return;

@@ -3090,6 +3090,169 @@ async def test_memo_citations_persisted_in_cycle_metadata(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_memo_citations_include_structured_retirement_context(db_session, mocker):
+    """Enriched retirement memo context is surfaced in memo_citations.
+
+    A spawned direction_retirement memo task carries reasoning_kind/direction_id
+    in its first payload and structured evidence fields in source_finding/context.
+    query_recent_memo_citations must return these enriched fields from the
+    production-shaped spawn path so the strategic agent can make retirement-
+    relevance decisions without opening task detail.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="Retirement-Ctx",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    direction_id = "dir-abc123"
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Direction X retired",
+            "status": "retired",
+            "priority": "medium",
+            "notes": [],
+            "context": {
+                "success_evidence": "All 5 acceptance tests passed; zero regressions.",
+                "retirement_condition": "All KPIs above threshold for 2 consecutive cycles.",
+            },
+            "research_history": [
+                {"cycles": 2, "prs_merged": 4, "tasks_completed": 6, "tasks_failed": 1},
+                {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
+            ],
+        }
+    ]
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    rationale = "The direction delivered its full scope."
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        parent_task,
+        retired_ids=[direction_id],
+        rationales={direction_id: rationale},
+    )
+    assert spawned == 1
+    await db_session.commit()
+
+    # query_recent_memo_citations must surface enriched fields directly from the
+    # production-shaped spawn path.
+    cites = await strategic_cycle.query_recent_memo_citations(
+        db_session, project.id, cap=25
+    )
+    assert len(cites) == 1, "Expected one enriched memo citation"
+    entry = cites[0]
+
+    assert entry["summary_excerpt"].startswith("The direction delivered its full scope.")
+    assert entry.get("reasoning_kind") == "direction_retirement", (
+        "reasoning_kind from payload must be included in citation"
+    )
+    assert entry.get("direction_id") == direction_id, (
+        "direction_id from payload must be included in citation"
+    )
+    assert entry.get("success_evidence") == "All 5 acceptance tests passed; zero regressions.", (
+        "success_evidence from memo must be included"
+    )
+    assert entry.get("retirement_condition") == "All KPIs above threshold for 2 consecutive cycles.", (
+        "retirement_condition from memo must be included"
+    )
+    assert entry.get("citation_refs") == f"direction:{direction_id}, task:{parent_task.id}", (
+        "citation references must be preserved in compact form"
+    )
+    assert "final_prs_merged=6" in entry.get("final_metrics_excerpt", ""), (
+        "final metrics must be preserved in compact form"
+    )
+    assert "final_cycles_active=2" in entry.get("final_metrics_excerpt", ""), (
+        "final metrics must be preserved in compact form"
+    )
+    assert entry.get("rationale_excerpt") == rationale, (
+        "retirement rationale must be preserved in compact form"
+    )
+    assert entry.get("reasoning_excerpt", "").startswith("Direction: Direction X retired"), (
+        "memo reasoning must be preserved in compact form"
+    )
+    assert entry.get("tags") == [
+        "direction-retirement",
+        "success-evidence",
+        "retirement-condition",
+    ], (
+        "tags from memo must be included"
+    )
+    # Verify that full cycle flow also persists these enriched fields via
+    # _handle_strategic_completion.
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"_strategic_vision_set": True, "strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "memo_citations" in meta
+    cites_persisted = meta["memo_citations"]
+    assert len(cites_persisted) == 1
+    persisted = cites_persisted[0]
+    assert persisted["task_id"] != ""
+    assert persisted.get("reasoning_kind") == "direction_retirement", (
+        "reasoning_kind must survive the summarizer and persist in cycle_metadata"
+    )
+    assert persisted.get("direction_id") == direction_id, (
+        "direction_id must survive the summarizer and persist in cycle_metadata"
+    )
+    assert persisted.get("success_evidence") == "All 5 acceptance tests passed; zero regressions.", (
+        "success_evidence must survive summarizer trimming"
+    )
+    assert persisted.get("citation_refs") == f"direction:{direction_id}, task:{parent_task.id}", (
+        "citation_refs must survive summarizer trimming"
+    )
+    assert "final_prs_merged=6" in persisted.get("final_metrics_excerpt", ""), (
+        "final_metrics_excerpt must survive summarizer trimming"
+    )
+    assert "final_cycles_active=2" in persisted.get("final_metrics_excerpt", ""), (
+        "final_metrics_excerpt must survive summarizer trimming"
+    )
+    assert persisted.get("rationale_excerpt") == rationale, (
+        "rationale_excerpt must survive summarizer trimming"
+    )
+    assert persisted.get("reasoning_excerpt", "").startswith("Direction: Direction X retired"), (
+        "reasoning_excerpt must survive summarizer trimming"
+    )
+
+
+@pytest.mark.asyncio
 async def test_retirement_critiques_persisted_via_fallback_path(db_session, mocker):
     """Fallback (log-parse) path: retired_direction_critiques from JSON output ends up in cycle metadata."""
     import json
@@ -10480,3 +10643,211 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
     assert "CI passes on main for 7 days" in reasoning
     assert "All acceptance criteria verified" in reasoning
     assert rationale in reasoning
+
+    # Verify source_task_id is present in source_finding
+    source_finding = payload.get("source_finding")
+    assert source_finding.get("source_task_id") == str(parent_task.id)
+
+
+@pytest.mark.asyncio
+async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
+    """A no-rationale retirement with snapshot context produces a COMPLETED memo at spawn.
+
+    Verifies: memo is COMPLETED (not QUEUED), has a MEMO artifact, reasoning includes
+    recent history and metrics, citations include direction:<id> and task:<id>.
+    No QUEUED VM-bearing task is left behind.
+    """
+    from app.models import TaskStatus, Artifact, ArtifactType
+    from app.models import Task as TaskModel
+    from sqlmodel import select
+
+    direction_id = str(uuid.uuid4())
+    project = Project(
+        name="NoRationaleSnapshotTest",
+        user_id="u-no-rationale-snap",
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Ship the observability pipeline",
+                "status": "retired",
+                "priority": "medium",
+                "notes": [],
+                "context": {
+                    "success_evidence": "Dashboards live in production",
+                    "retirement_condition": "Metrics streaming confirmed",
+                },
+                "research_history": [
+                    {"cycles": 2, "prs_merged": 3, "tasks_completed": 5, "tasks_failed": 1},
+                    {"cycles": 1, "prs_merged": 1, "tasks_completed": 2, "tasks_failed": 0},
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        parent_task,
+        retired_ids=[direction_id],
+        rationales={},  # no rationale
+    )
+    assert spawned == 1
+
+    await db_session.commit()
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(TaskModel).where(
+                    TaskModel.project_id == project.id,
+                    TaskModel.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1, f"expected 1 retirement memo, got {len(retirement_memos)}"
+    memo = retirement_memos[0]
+
+    # No QUEUED VM-bearing memo — must be synthesized at spawn time
+    assert memo.status == TaskStatus.COMPLETED, (
+        f"expected COMPLETED (synthesized at spawn), got {memo.status}"
+    )
+
+    # Must have a MEMO artifact
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+
+    # plan_output must carry the memo
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    memo_data = memo.plan_output["memo"]
+    reasoning = memo_data.get("reasoning", "")
+
+    # Reasoning must include recent history
+    assert "Cycle 1" in reasoning, "reasoning must render recent_history_summary"
+    assert "PRs merged" in reasoning
+
+    # Reasoning must include metrics/evidence
+    assert "Dashboards live in production" in reasoning
+    assert "Metrics streaming confirmed" in reasoning
+
+    # Citations must reference both direction and source task
+    citations = memo_data.get("citations", [])
+    assert f"direction:{direction_id}" in citations
+    assert f"task:{parent_task.id}" in citations
+
+    # source_finding must carry source_task_id
+    source_finding = memo.payloads[0].get("source_finding")
+    assert source_finding is not None
+    assert source_finding.get("source_task_id") == str(parent_task.id)
+
+
+@pytest.mark.asyncio
+async def test_spawn_retirement_memo_empty_snapshot_stays_queued(db_session):
+    """A direction with no text, context, history, or rationale leaves the memo QUEUED.
+
+    When the snapshot is entirely empty, there is no substantive context to synthesize
+    from, so the memo task must remain QUEUED for an agent VM to handle.
+    """
+    from app.models import TaskStatus, Artifact
+    from app.models import Task as TaskModel
+    from sqlmodel import select
+
+    direction_id = str(uuid.uuid4())
+    project = Project(
+        name="EmptySnapshotTest",
+        user_id="u-empty-snap",
+        directions=[
+            {
+                "id": direction_id,
+                # No text, no context, no research_history
+                "status": "retired",
+                "priority": "medium",
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        parent_task,
+        retired_ids=[direction_id],
+        rationales={},  # no rationale, no snapshot context
+    )
+    assert spawned == 1
+
+    await db_session.commit()
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(TaskModel).where(
+                    TaskModel.project_id == project.id,
+                    TaskModel.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1
+    memo = retirement_memos[0]
+
+    # Genuinely empty snapshot — no substantive context → must stay QUEUED
+    assert memo.status == TaskStatus.QUEUED, (
+        f"expected QUEUED (no substantive context), got {memo.status}"
+    )
+
+    # No artifact should be created at spawn time
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 0, "empty-snapshot memo must not have a pre-baked artifact"

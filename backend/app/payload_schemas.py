@@ -442,8 +442,13 @@ class StrategicReviewPayload(_SystemPopulated):
     version_phase: dict[str, Any] | None = None
     # Citable memo summaries (terminal reasoning artifacts spawned from dropped
     # research findings) for this cycle window. Optional + default-None so
-    # existing consumers and tests are unaffected. Each entry:
-    # {task_id, summary_excerpt}. The reviewer prompt can cite memos by task_id.
+    # existing consumers and tests are unaffected. Each entry contains at
+    # minimum {task_id, summary_excerpt}; enriched entries also carry optional
+    # fields: reasoning_kind, direction_id, tags, citations, success_evidence,
+    # retirement_condition, final_metrics, rationale. The reviewer prompt can
+    # cite memos by task_id. Summarizer trims heavy fields (citations,
+    # final_metrics, rationale) before capping entry count to keep the feed
+    # small but citable under budget pressure.
     memo_citations: list[dict[str, Any]] | None = None
     # Per-axis efficiency snapshot with drift vs baseline. Keys: axes (dict of
     # axis_name → {current, baseline, drift_pct, history_tail}),
