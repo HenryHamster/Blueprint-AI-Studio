@@ -2758,3 +2758,117 @@ def test_gpu_image_family_is_driver_preinstalled():
     assert "deeplearning-platform-release" in compute.GPU_IMAGE_FAMILY
     # Pinned the same way AGENT_IMAGE_FAMILY is (fully-qualified family path).
     assert compute.GPU_IMAGE_FAMILY.startswith("projects/")
+
+
+class TestGpuImageFamilyValidation:
+    """GPU image family is validated at startup and gates GPU provisioning."""
+
+    def test_ensure_gpu_image_family_valid_raises_when_invalid(self, monkeypatch):
+        """_ensure_gpu_image_family_valid raises RuntimeError when GPU image is invalid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", 1.0)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        # Set last check to far in the future so recheck interval has NOT elapsed.
+        import time
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
+
+        with pytest.raises(RuntimeError, match="GPU"):
+            compute._ensure_gpu_image_family_valid()
+
+    def test_ensure_gpu_image_family_valid_passes_when_valid(self, monkeypatch):
+        """_ensure_gpu_image_family_valid is a no-op when GPU image is valid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        # Should not raise.
+        compute._ensure_gpu_image_family_valid()
+
+    def test_ensure_gpu_image_family_valid_rechecks_after_interval(self, monkeypatch):
+        """Re-validates after _IMAGE_FAMILY_RECHECK_INTERVAL elapses."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", 0.0)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        validate_calls = []
+
+        def fake_validate():
+            validate_calls.append(True)
+            # Simulate successful validation by letting state be set normally.
+
+        monkeypatch.setattr(compute, "_validate_gpu_image_family", fake_validate)
+
+        # Should not raise — recheck interval elapsed, revalidation succeeds.
+        compute._ensure_gpu_image_family_valid()
+        assert len(validate_calls) == 1
+        assert compute._gpu_image_family_valid is True
+
+    def test_ensure_gpu_image_family_valid_noop_in_local_mode(self, monkeypatch):
+        """_ensure_gpu_image_family_valid is a no-op in LOCAL_MODE even when invalid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "LOCAL_MODE", True)
+        # Should not raise in LOCAL_MODE regardless of GPU image state.
+        compute._ensure_gpu_image_family_valid()
+
+    async def test_provision_ephemeral_vm_gpu_calls_gpu_gate(self, monkeypatch):
+        """provision_ephemeral_vm calls _ensure_gpu_image_family_valid when accelerator is set."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        gpu_gate_calls = []
+
+        def fake_gpu_gate():
+            gpu_gate_calls.append(True)
+
+        monkeypatch.setattr(compute, "_ensure_gpu_image_family_valid", fake_gpu_gate)
+
+        async def fake_provision_gcp(**kwargs):
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_provision_gcp)
+
+        await compute.provision_ephemeral_vm(
+            "compute-job-vm-test",
+            startup_script="#!/bin/bash\ntrue",
+            accelerator="T4",
+        )
+        assert len(gpu_gate_calls) == 1
+
+    async def test_provision_ephemeral_vm_cpu_skips_gpu_gate(self, monkeypatch):
+        """provision_ephemeral_vm does NOT call _ensure_gpu_image_family_valid when accelerator is None."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        gpu_gate_calls = []
+
+        def fake_gpu_gate():
+            gpu_gate_calls.append(True)
+
+        monkeypatch.setattr(compute, "_ensure_gpu_image_family_valid", fake_gpu_gate)
+
+        async def fake_provision_gcp(**kwargs):
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_provision_gcp)
+
+        await compute.provision_ephemeral_vm(
+            "compute-job-vm-cpu-test",
+            startup_script="#!/bin/bash\ntrue",
+            accelerator=None,
+        )
+        assert len(gpu_gate_calls) == 0
+
+    def test_gpu_validation_failure_does_not_block_cpu_provisioning(self, monkeypatch):
+        """A failed GPU image validation leaves CPU provisioning (_ensure_image_family_valid) unaffected."""
+        # CPU image is valid; GPU image is not.
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        import time
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
+
+        # CPU gate passes.
+        compute._ensure_image_family_valid()
+
+        # GPU gate raises.
+        with pytest.raises(RuntimeError, match="GPU"):
+            compute._ensure_gpu_image_family_valid()

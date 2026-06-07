@@ -487,9 +487,41 @@ def _validate_image_family() -> None:
         ) from e
 
 
+def _validate_gpu_image_family() -> None:
+    """Verify the GPU boot image family exists in GCP. Prevents all-zone cascading failure.
+
+    Independent of _validate_image_family — a missing GPU image must not disable
+    CPU provisioning.
+    """
+    from google.cloud import compute_v1
+
+    try:
+        client = compute_v1.ImagesClient()
+        family_name = GPU_IMAGE_FAMILY.split("/")[-1]
+        project = "deeplearning-platform-release"
+        if GPU_IMAGE_FAMILY.startswith("projects/"):
+            parts = GPU_IMAGE_FAMILY.split("/")
+            project = parts[1]
+        image = client.get_from_family(project=project, family=family_name)
+        logger.info(
+            f"[STARTUP] GPU image family '{family_name}' validated in project '{project}'"
+            f" — resolved to '{image.name}'"
+        )
+    except Exception as e:
+        logger.exception("[STARTUP] GPU image family validation failed")
+        raise RuntimeError(
+            f"GPU_IMAGE_FAMILY '{GPU_IMAGE_FAMILY}' not found: {e}"
+        ) from e
+
+
 _image_family_valid: bool | None = None  # None = not yet checked, True/False = result
 _image_family_last_check: float = 0.0
 _IMAGE_FAMILY_RECHECK_INTERVAL: float = 300.0  # Retry validation every 5 min if failed
+
+# GPU image family validation state — independent of _image_family_valid so a
+# bad GPU image cannot disable CPU provisioning.
+_gpu_image_family_valid: bool | None = None
+_gpu_image_family_last_check: float = 0.0
 
 if not LOCAL_MODE and os.getenv(
     "K_REVISION"
@@ -504,6 +536,16 @@ if not LOCAL_MODE and os.getenv(
         _image_family_last_check = time.time()
         logger.exception(
             f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s"
+        )
+    try:
+        _validate_gpu_image_family()
+        _gpu_image_family_valid = True
+        _gpu_image_family_last_check = time.time()
+    except Exception:
+        _gpu_image_family_valid = False
+        _gpu_image_family_last_check = time.time()
+        logger.exception(
+            f"[STARTUP] GPU image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s"
         )
 
 # Manifest builder + payload URI validator are imported at the top of this
@@ -662,6 +704,38 @@ def _ensure_image_family_valid() -> None:
             raise RuntimeError(
                 f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
                 f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
+            )
+
+
+def _ensure_gpu_image_family_valid() -> None:
+    """Block GPU provisioning when the GPU boot image family is invalid.
+
+    Mirrors _ensure_image_family_valid but uses isolated state so a missing GPU
+    image does NOT disable CPU provisioning. Raises RuntimeError while invalid.
+    No-op in LOCAL_MODE.
+    """
+    global _gpu_image_family_valid, _gpu_image_family_last_check
+    if _gpu_image_family_valid is False and not LOCAL_MODE:
+        now = time.time()
+        if now - _gpu_image_family_last_check >= _IMAGE_FAMILY_RECHECK_INTERVAL:
+            try:
+                _validate_gpu_image_family()
+                _gpu_image_family_valid = True
+                _gpu_image_family_last_check = now
+                logger.info(
+                    "[COMPUTE] GPU image family re-validation succeeded — GPU provisioning re-enabled"
+                )
+            except Exception as revalidate_err:
+                _gpu_image_family_last_check = now
+                logger.exception("[COMPUTE] GPU image family re-validation still failing")
+                raise RuntimeError(
+                    f"GPU provisioning disabled: image family '{GPU_IMAGE_FAMILY}' "
+                    f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
+                ) from revalidate_err
+        else:
+            raise RuntimeError(
+                f"GPU provisioning disabled: image family '{GPU_IMAGE_FAMILY}' "
+                f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _gpu_image_family_last_check):.0f}s."
             )
 
 
@@ -2227,6 +2301,8 @@ async def provision_ephemeral_vm(
     and TERMINATE host-maintenance — instead of a plain CPU VM.
     """
     _ensure_image_family_valid()
+    if accelerator is not None:
+        _ensure_gpu_image_family_valid()
     if LOCAL_MODE:
         raise RuntimeError(
             "provision_ephemeral_vm is unavailable in LOCAL_MODE; use the local backend"
