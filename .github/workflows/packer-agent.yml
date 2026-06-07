@@ -8,6 +8,15 @@ on:
       - 'infra/packer/**'
   workflow_dispatch: {}
 
+# Collapse rapid agent/** + infra/packer/** pushes to a single bake. Several
+# commits can land on main in quick succession; without this each one starts
+# its own ~7.5-min multi-zone Packer build. cancel-in-progress: false lets an
+# already-running bake finish (don't waste a near-complete image build) while
+# GitHub keeps at most one pending run per group, coalescing the rest.
+concurrency:
+  group: packer-agent-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
