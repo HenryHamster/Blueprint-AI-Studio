@@ -4725,3 +4725,141 @@ async def test_declaration_coverage_none_when_no_merged_write_tasks(
     assert entry["acceptance_declared_merged"] == 0
     assert entry["acceptance_declaration_coverage"] is None
     assert entry["acceptance_merged_write_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unproven_merge_surfaced_to_research_feedback(
+    db_session: AsyncSession,
+):
+    """A merged WRITE task whose declared acceptance evidence was UNSATISFIED is
+    captured in ``unproven_merge_details`` (title + truncated verdict reason) so
+    the next research cycle learns the fix shipped but its claim did not hold.
+
+    Such a delivered-but-unproven merge is neither a failure nor a no-op, so it
+    must NOT appear in ``failed_task_details`` or ``no_op_task_details``. A
+    satisfied merge and an undeclared (legacy) merge are excluded from the new
+    list, and the list is capped at 5 like its siblings.
+    """
+    direction_id = "d-unproven-feedback"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=9)
+    ]
+    await db_session.flush()
+
+    # The delivered-but-unproven merge: declared acceptance evidence, NOT
+    # satisfied. Carries a verdict reason that should be surfaced verbatim
+    # (truncated to 120 chars).
+    long_reason = "named_test did not pass under the real merge verdict; " + (
+        "x" * 200
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": False,
+                "reason": long_reason,
+            },
+        },
+        title="unproven-merge",
+    )
+    # A satisfied merge — proven, must NOT be in unproven list.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": True},
+        },
+        title="proven-merge",
+    )
+    # An undeclared (legacy) merge — no verdict key, must NOT be in unproven list.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="undeclared-merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    details = entry["unproven_merge_details"]
+    assert len(details) == 1
+    only = details[0]
+    assert only["title"] == "unproven-merge"
+    # Reason is captured and truncated to 120 chars.
+    assert only["reason"] == long_reason[:120]
+    assert len(only["reason"]) == 120
+
+    # It is neither a failure nor a no-op.
+    unproven_titles = {d["title"] for d in details}
+    failed_titles = {d["title"] for d in entry.get("failed_task_details", [])}
+    no_op_titles = {d["title"] for d in entry.get("no_op_task_details", [])}
+    assert unproven_titles.isdisjoint(failed_titles)
+    assert unproven_titles.isdisjoint(no_op_titles)
+    assert "unproven-merge" not in failed_titles
+    assert "unproven-merge" not in no_op_titles
+
+
+@pytest.mark.asyncio
+async def test_unproven_merge_details_capped_at_five(
+    db_session: AsyncSession,
+):
+    """The unproven_merge_details list is capped at 5 entries like its siblings."""
+    direction_id = "d-unproven-cap"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=7)
+    ]
+    await db_session.flush()
+
+    for i in range(7):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                "code_acceptance_verdict": {
+                    "satisfied": False,
+                    "reason": f"evidence {i} unsatisfied",
+                },
+            },
+            title=f"unproven-{i}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert len(entry["unproven_merge_details"]) == 5

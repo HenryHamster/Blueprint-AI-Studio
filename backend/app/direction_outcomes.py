@@ -458,6 +458,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "no_op_task_details": {
         "consumer": "research_context.py (stale-finding retagging)"
     },
+    "unproven_merge_details": {
+        "consumer": "research_context.py (unproven-merge retagging)"
+    },
     "stage_dropout": {
         "consumer": "digest_direction_progress.py, pipeline_health.py, claim_task_helpers.py"
     },
@@ -931,6 +934,32 @@ async def _update_direction_research_outcomes(
             }
         )
     entry["no_op_task_details"] = no_op_details[:5]  # cap at 5 to avoid bloat
+
+    # Capture delivered-but-unproven merge details (mirror of the two lists
+    # above). When a merged WRITE task DECLARED acceptance evidence at plan time
+    # but that evidence was UNSATISFIED at merge, the acceptance gate records a
+    # ``code_acceptance_verdict`` with satisfied=False and the per-task scorer
+    # downgrades the merge to NEUTRAL (see acceptance_gate.acceptance_blocks_success
+    # and task_outcomes._evaluate_write). Such a merge is neither a failure
+    # (excluded from failed_task_details) nor a no-op (excluded from
+    # no_op_task_details), so without this list the next research cycle would see
+    # the originating finding as shipped and stop chasing it — even though its own
+    # declared evidence did not hold. We record title + the (truncated) verdict
+    # ``reason`` so the prior-outcomes retagger can mark the finding '(unproven)'
+    # and research re-targets it instead of treating it as resolved.
+    unproven_merge_details = []
+    for ct in _merged_write_rows:
+        verdict = (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not acceptance_blocks_success(verdict):
+            continue
+        reason = str((verdict or {}).get("reason") or "")[:120]
+        unproven_merge_details.append(
+            {
+                "title": ct.title or "",
+                "reason": reason,
+            }
+        )
+    entry["unproven_merge_details"] = unproven_merge_details[:5]  # cap at 5
 
     # Stage dropout: per-cycle breakdown of why tasks didn't reach main
     sd_code_error = 0
@@ -1415,12 +1444,24 @@ async def _update_direction_research_outcomes(
                 if moved:
                     parsed["established"] = new_established
             elif is_merged_completion(ct):
-                # Promote (proposed) finding to (confirmed)
+                # Promote (proposed) finding. A merge whose DECLARED acceptance
+                # evidence was UNSATISFIED (acceptance_blocks_success) shipped a
+                # fix whose own claim did not hold — tag it '(unproven)' rather
+                # than '(confirmed)' so this cycle's context already reflects that
+                # research should re-target it, not treat it as resolved. Verified
+                # / undeclared / legacy merges still promote to '(confirmed)'.
+                promoted_tag = (
+                    "unproven"
+                    if acceptance_blocks_success(
+                        (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+                    )
+                    else "confirmed"
+                )
                 new_established = []
                 for item in parsed["established"]:
                     if title.lower() in item.lower() and "(proposed)" in item:
                         new_established.append(
-                            item.replace("(proposed)", "(confirmed)")
+                            item.replace("(proposed)", f"({promoted_tag})")
                         )
                     else:
                         new_established.append(item)

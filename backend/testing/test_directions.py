@@ -2304,6 +2304,71 @@ class TestComputeDirectionQualityScore:
             d_recent_good
         ) > _compute_direction_quality_score(d_recent_bad)
 
+    def test_quality_score_treats_unverified_merge_as_wasted(self):
+        """Unverified merge (verified_prs_merged=0) counts as wasted cycle.
+
+        A cycle with tasks_created > 0 but zero verified merges (though raw
+        prs_merged > 0) is scored as a wasted cycle. The quality score should
+        be equal to a cycle that merged nothing, and strictly lower than the
+        same cycle with verified merges.
+        """
+        # Cycle with unverified merge: tasks_created > 0, prs_merged > 0, verified_prs_merged = 0
+        unverified_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 0,  # unverified/degraded merge
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Same cycle but with zero raw merges (truly wasted)
+        no_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 0,
+                    "verified_prs_merged": 0,
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Same cycle but with verified merge
+        verified_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,  # verified merge
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Unverified merge should be equal to no merge
+        assert _compute_direction_quality_score(unverified_merge) == pytest.approx(
+            _compute_direction_quality_score(no_merge)
+        )
+        # Verified merge should score higher than unverified
+        assert _compute_direction_quality_score(
+            verified_merge
+        ) > _compute_direction_quality_score(unverified_merge)
+
     def test_direction_sort_respects_quality_tiebreak(self):
         """Two directions with equal productivity: higher-quality sorts first."""
         from app.failure_classification import (

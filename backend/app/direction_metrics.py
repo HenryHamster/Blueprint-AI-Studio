@@ -551,10 +551,9 @@ def _compute_direction_quality_score(d: dict) -> float:
         )
 
         tasks_created = entry.get("tasks_created", 0) or 0
-        prs_merged = entry.get("prs_merged", 0) or 0
         if tasks_created > 0:
             active_w += w
-            if prs_merged == 0:
+            if verified_merged_count(entry) == 0:
                 wasted_w += w
 
     if (actionable_w + structural_w) > 0:

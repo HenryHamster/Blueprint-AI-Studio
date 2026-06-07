@@ -552,6 +552,115 @@ class TestPriorOutcomeTagging:
         assert "Shipped Then Gone [small] (merged)" in result
         assert "(stale)" not in result
 
+    def test_unproven_titles_retagged_unproven(self):
+        # A finding whose only child shipped a merge with UNSATISFIED declared
+        # acceptance evidence retags (unproven), distinct from merged/failed/stale.
+        prior = self._prior_with_proposed(["Shipped But Not Proven"])
+        history = [
+            {
+                "finding_titles": ["Shipped But Not Proven"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 0,
+                "failed_task_details": [],
+                "unproven_merge_details": [
+                    {
+                        "title": "Shipped But Not Proven",
+                        "reason": "named_test did not pass under merge verdict",
+                    }
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Shipped But Not Proven [small] (unproven)" in result
+        assert "(proposed)" not in result
+        assert "(merged)" not in result
+
+    def test_failed_precedence_over_unproven(self):
+        # A finding present in BOTH failed and unproven details keeps the failed tag.
+        prior = self._prior_with_proposed(["Contested Unproven"])
+        history = [
+            {
+                "finding_titles": ["Contested Unproven"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "failed_task_details": [
+                    {"title": "Contested Unproven", "category": "CODE_ERROR"},
+                ],
+                "unproven_merge_details": [
+                    {"title": "Contested Unproven", "reason": "evidence unsatisfied"},
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "(failed: CODE_ERROR)" in result
+        assert "(unproven)" not in result
+
+    def test_unproven_precedence_over_merged(self):
+        # A finding with a per-finding unproven merge keeps (unproven) even when a
+        # sibling's verified merge would otherwise make the cycle read as shipped.
+        prior = self._prior_with_proposed(["Unproven Here"])
+        history = [
+            {
+                "finding_titles": ["Unproven Here"],
+                "tasks_created": 2,
+                "prs_merged": 2,
+                "verified_prs_merged": 1,
+                "failed_task_details": [],
+                "unproven_merge_details": [
+                    {"title": "Unproven Here", "reason": "evidence unsatisfied"},
+                ],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Unproven Here [small] (unproven)" in result
+        assert "(merged)" not in result
+
+    def test_missing_unproven_key_is_noop(self):
+        # Legacy history entries without the key must read as an empty list.
+        prior = self._prior_with_proposed(["Legacy Finding"])
+        history = [
+            {
+                "finding_titles": ["Legacy Finding"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 1,
+                "failed_task_details": [],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        # No unproven key present → falls through to the normal merged tag.
+        assert "Legacy Finding [small] (merged)" in result
+        assert "(unproven)" not in result
+
 
 class TestStaleTagParsing:
     """_parse_established_entry and filter_direction_evidence handle (stale)."""
@@ -578,6 +687,31 @@ class TestStaleTagParsing:
         titles = {e["title"] for e in result}
         assert "Fresh Finding" in titles
         assert "Stale Finding" not in titles
+
+    def test_parse_established_entry_parses_unproven(self):
+        rec = _parse_established_entry(
+            "Shipped But Not Proven [small] (unproven). Short desc"
+        )
+        assert rec["title"] == "Shipped But Not Proven"
+        assert rec["status"] == "unproven"
+
+    def test_filter_direction_evidence_keeps_unproven(self):
+        # (unproven) findings are NOT excluded — research should revisit them,
+        # unlike (failed)/(stale) which are dropped.
+        ctx = (
+            "## Established Findings\n"
+            "- Fresh Finding [small] (proposed). desc\n"
+            "- Unproven Finding [small] (unproven). desc\n"
+            "\n## Failed Approaches\n\n## Open Questions\n"
+        )
+        raw_evidence = [
+            {"title": "Fresh Finding", "claims": ["c1"], "source_refs": ["r1"]},
+            {"title": "Unproven Finding", "claims": ["c2"], "source_refs": ["r2"]},
+        ]
+        result = filter_direction_evidence(ctx, raw_evidence)
+        titles = {e["title"] for e in result}
+        assert "Fresh Finding" in titles
+        assert "Unproven Finding" in titles
 
 
 class TestClaimsAndSources:
