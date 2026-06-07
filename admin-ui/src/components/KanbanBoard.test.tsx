@@ -41,6 +41,7 @@ vi.mock('./TaskCard', () => ({
 const testColumns: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED'] },
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'PROVISIONING'] },
+  { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
 ];
@@ -101,8 +102,23 @@ describe('KanbanBoard', () => {
     render(<KanbanBoard {...makeProps()} />);
     expect(screen.getAllByText('Queued').length).toBeGreaterThan(0);
     expect(screen.getAllByText('In Progress').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Blocked').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Completed').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Failed').length).toBeGreaterThan(0);
+  });
+
+  it('renders BLOCKED tasks in the Blocked column', () => {
+    const task = makeTask({ id: 'b1', title: 'Blocked Task', status: 'BLOCKED' });
+    render(<KanbanBoard {...makeProps({ tasks: [task] })} />);
+    expect(screen.getAllByText('Blocked Task').length).toBeGreaterThan(0);
+  });
+
+  it('does not offer a column-archive button for the non-terminal Blocked column', () => {
+    // BLOCKED is a waiting state, not terminal — it must not be bulk-archivable
+    // the way COMPLETED/CANCELLED/FAILED are.
+    const task = makeTask({ id: 'b1', title: 'Blocked Task', status: 'BLOCKED' });
+    render(<KanbanBoard {...makeProps({ tasks: [task] })} />);
+    expect(screen.queryByTitle('Archive all Blocked tasks')).not.toBeInTheDocument();
   });
 
   it('renders tasks with their titles', () => {

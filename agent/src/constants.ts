@@ -36,7 +36,7 @@ export const CLAUDE_RESULT_GRACE_MS = 30_000;
 // for this long while still alive (no data chunks received), force-kill via the
 // same SIGTERM→SIGKILL escalation as resultGraceTimer. Resets on every chunk.
 // Chosen to be well above any legitimate single tool call but well under the
-// 20-60 min wall-clock budget so a hung tool call is caught quickly.
+// 1.5-6 h wall-clock backstop so a hung tool call is caught quickly.
 // flags.timedOut stays false so the post-Claude commit/push phase still runs.
 // 2026-05-05: bumped 5 → 12 min. The backend Docker test runner is silent for
 // 5-8 min during sidecar build + alembic + pytest (see TEST_RUNNER_DOCKER_TIMEOUT
@@ -53,7 +53,7 @@ export const CLAUDE_STREAM_STALL_MS = 12 * 60_000;
 // actively generating/thinking, so a slow-but-working opus turn keeps this fresh
 // and never trips; only a genuinely hung call (a real 429/529 the SDK retries
 // silently, emitting ZERO model deltas) goes stale and fires. Such a hang
-// otherwise rides to the 45-min wall-clock timeout and is misclassified
+// otherwise rides to the wall-clock backstop and is misclassified
 // AGENT_TIMEOUT (incident 2026-05-29). On trigger, the agent reports the hang
 // (rate_limited only when a confirmed rate-limit message is present, else the
 // transient no_progress_timeout) so the orchestrator holds/reroutes instead of
@@ -324,7 +324,7 @@ export function isWorkflowToolName(name: string | undefined): boolean {
 }
 
 // Claude Code runner
-export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
+export const CLAUDE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 export const MAX_OUTPUT_BYTES = 10_000_000;
 
 // Stream-json drain: bound event-loop blocking inside drainJsonChunks. Yield
@@ -348,14 +348,24 @@ export const WITHIN_CHUNK_YIELD_MS = 50;
 export const HEARTBEAT_API_TIMEOUT = 10_000;
 export const HEARTBEAT_API_MAX_RETRIES = 2;
 
-// Effort-scaled subprocess timeout. Low-effort tasks that hang waste less VM
-// time; max-effort deep analysis gets more room. Unknown/unset effort falls
-// back to CLAUDE_TIMEOUT_MS.
+// Effort-scaled subprocess wall-clock ceiling. This is a RUNAWAY BACKSTOP, not
+// the stuck-detector: a genuinely hung run is caught far earlier by the stall
+// guards (CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS,
+// TOOL_USE_STALL_TIMEOUT_MS — all fire on *silence*, in ≤45 min). The wall
+// clock is the only guard that kills an actively-progressing run, and tool
+// time counts against it: a create task's `./check test` gate (Docker image
+// build + standalone pytest on a 2-vCPU VM) alone can eat 20+ min. At the old
+// 20–60 min caps that regularly executed finished work (task 705668f7,
+// 2026-06-07: killed mid-gate at minute 35 with the diff complete, ~30 min of
+// work lost and redone from scratch). Sized so the ceiling comfortably exceeds
+// worst-case legitimate gate time and only a pathological busy-loop — output
+// flowing, never converging — can reach it. Unknown/unset effort falls back
+// to CLAUDE_TIMEOUT_MS.
 export const CLAUDE_TIMEOUT_MS_BY_EFFORT: Record<string, number | undefined> = {
-  low: 20 * 60 * 1000,
-  medium: 35 * 60 * 1000,
-  high: 45 * 60 * 1000,
-  max: 60 * 60 * 1000,
+  low: 90 * 60 * 1000,
+  medium: 3 * 60 * 60 * 1000,
+  high: 4 * 60 * 60 * 1000,
+  max: 6 * 60 * 60 * 1000,
 };
 
 export function claudeTimeoutForEffort(effort?: string): number {

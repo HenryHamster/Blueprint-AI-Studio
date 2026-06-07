@@ -368,7 +368,7 @@ runtime_config: Dict = {
     # be surfaced as stale rather than waiting silently forever.
     "staged_direction_stale_fallback_days": 21,
     "max_parallel_research_per_project": 6,
-    "max_retained_images": 10,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
+    "max_retained_images": 5,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
     # Proposed compute_experiment spend cap (USD) above which an autonomously

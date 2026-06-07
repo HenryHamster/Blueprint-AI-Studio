@@ -66,6 +66,37 @@ describe('useSearchFilters', () => {
     expect(result.current.failureClassFilter).toEqual(['CODE_ERROR']);
   });
 
+  it('expands a legacy all-statuses selection (pre-BLOCKED) to the full current list', () => {
+    // A user who had "everything" selected before BLOCKED existed persisted the 7
+    // legacy statuses. Without migration that now reads as a deliberate 7-of-8
+    // subset that hides BLOCKED (and triggers a server-side &status= filter). The
+    // sanitizer must restore it to the full current set so "everything" stays so.
+    const legacy = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
+    localStorage.setItem(k('status'), JSON.stringify(legacy));
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.statusFilter).toEqual(STATUS_VALUES);
+    expect(result.current.statusFilter).toContain('BLOCKED');
+  });
+
+  it('preserves a deliberate partial status selection that omits BLOCKED', () => {
+    // A strict subset of the legacy set is a real user choice, not a "show
+    // everything" snapshot — leave it untouched even though it predates BLOCKED.
+    const partial = ['QUEUED', 'IN_PROGRESS', 'EVALUATING'];
+    localStorage.setItem(k('status'), JSON.stringify(partial));
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.statusFilter).toEqual(partial);
+    expect(result.current.statusFilter).not.toContain('BLOCKED');
+  });
+
+  it('leaves a selection that already includes BLOCKED untouched', () => {
+    // Once BLOCKED is part of the stored selection, the expansion must be a no-op
+    // so it does not fight a user who deliberately deselected other statuses.
+    const withBlocked = ['BLOCKED', 'FAILED'];
+    localStorage.setItem(k('status'), JSON.stringify(withBlocked));
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.statusFilter).toEqual(withBlocked);
+  });
+
   it('falls back to default when a stored array value is not an array', () => {
     localStorage.setItem(k('status'), JSON.stringify('FAILED'));
     const { result } = renderHook(() => useSearchFilters());

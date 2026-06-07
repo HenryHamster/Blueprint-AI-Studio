@@ -1195,6 +1195,145 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
 
 
 @pytest.mark.asyncio
+async def test_evaluating_parent_dead_vm_lease_is_reclaimed(
+    client: AsyncClient, db_session, mocker
+):
+    """A leased member whose task moved to EVALUATING (parent waiting on
+    children) with a dead VM and an expired lease is reclaimed via
+    ``pool_lease_orphaned``. EVALUATING parents run no further VM-side work
+    (children get their own VMs), yet before this they were invisible to every
+    cleanup layer: completion release fires only on terminal statuses,
+    _ensure_vm_deleted skips governed members, the generic orphan sweep exempts
+    LIVE_POOL_STATES, and drain only takes IDLE. The powered-off VM sat
+    TERMINATED holding its SSD disk until the parent completed — five such
+    zombies exhausted the region SSD quota and halted provisioning 2026-06-07."""
+    from app.warm_pool import register_pool_vm, get_pool_vm, try_pool_dispatch
+    from app.warm_pool_maintainer import sweep_idle_pool_vms
+    from app.shared_state import runtime_config as rc
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool EVALUATING Zombie", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct, provider, model = "acct-evalz-1", "anthropic", "claude-opus-4-8"
+        pool_vm_id = f"agent-vm-evalz-{uuid.uuid4().hex}"
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=pool_vm_id,
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "x", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+        assert leased is not None
+
+        # Parent finished its VM-side work and is now waiting on children;
+        # the VM powered off and the dispatch->claim handoff window passed.
+        task.status = TaskStatus.EVALUATING
+        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        db_session.add_all([task, leased])
+        await db_session.commit()
+
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=False)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        retired = await sweep_idle_pool_vms(
+            db_session, datetime.utcnow(), runtime_config=rc
+        )
+        assert retired == 1
+        delete_mock.assert_awaited_once()
+        assert await get_pool_vm(db_session, pool_vm_id) is None
+
+
+@pytest.mark.asyncio
+async def test_evaluating_parent_live_vm_lease_is_spared(
+    client: AsyncClient, db_session, mocker
+):
+    """Counterpart guard: an EVALUATING-leased member whose VM is still
+    heartbeating is NOT reclaimed — liveness guard (b) protects a VM that is
+    alive (e.g. warm-continuity reuse), regardless of the leased task's
+    status."""
+    from app.warm_pool import register_pool_vm, get_pool_vm, try_pool_dispatch
+    from app.warm_pool_maintainer import sweep_idle_pool_vms
+    from app.shared_state import runtime_config as rc
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool EVALUATING Live", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct, provider, model = "acct-evalz-2", "anthropic", "claude-opus-4-8"
+        pool_vm_id = f"agent-vm-evalz-{uuid.uuid4().hex}"
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=pool_vm_id,
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "x", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+        assert leased is not None
+
+        task.status = TaskStatus.EVALUATING
+        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        db_session.add_all([task, leased])
+        await db_session.commit()
+
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        retired = await sweep_idle_pool_vms(
+            db_session, datetime.utcnow(), runtime_config=rc
+        )
+        assert retired == 0
+        delete_mock.assert_not_awaited()
+        assert await get_pool_vm(db_session, pool_vm_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_warm_pool_cost_guard_drains_and_blocks_lease(
     client: AsyncClient, db_session, mocker
 ):

@@ -2926,6 +2926,101 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_retry_with_preexisting_children_stays_evaluating_not_completed(
+    db_session, mocker
+):
+    """Retry false-complete guard: a research that already spawned children on a
+    prior attempt must NOT auto-complete when the current pass yields zero NEW
+    children (all findings deduped against those existing children).
+
+    Failure mode this guards against: on a retry, the research re-derives the same
+    findings, which hash-dedup against the children it already spawned, so the
+    current pass's ``child_tasks`` is empty. The zero-children COMPLETED branch
+    would orphan the live children — rollup machinery (_check_and_trigger_rollup)
+    early-returns unless the parent is EVALUATING, so the research/<id> -> automain
+    rollup PR would never open and all descendant work would strand on the
+    research branch. The task must instead end EVALUATING so rollup owns the
+    existing children.
+    """
+    direction = _active_direction("d-retrydup1", "Retry-dedup direction")
+    project = Project(
+        name="Retry Preexisting Children Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    dup_title = "Refactor authentication middleware"
+    dup_desc = "Middleware needs cleanup"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Child the research already spawned on attempt 1 — a live (EVALUATING)
+    # implementation task parented to this research, carrying the finding hash so
+    # the re-derived finding on the retry hash-dedups against it. This is the
+    # pre-existing child the rollup machinery still owns.
+    existing_child = Task(
+        project_id=project.id,
+        parent_task_id=task.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "refactor it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction["id"]},
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing_child)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Refactor auth middleware",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        "Research that already owns children must stay EVALUATING (so rollup opens "
+        "its PR) even when the retry pass produces zero new children — it must NOT "
+        "false-complete to COMPLETED"
+    )
+    # The "auto-completed (no actionable tasks)" / "created 0 tasks" messaging must
+    # not be emitted: it would falsely claim the research produced nothing.
+    assert "auto-completed" not in (task.latest_status_message or "")
+    assert "0 tasks" not in (task.latest_status_message or "")
+
+    # No NEW children were spawned this pass; the single pre-existing child remains.
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1, (
+        "No new child should be spawned (finding deduped), and the pre-existing "
+        "child must remain owned by the still-EVALUATING research"
+    )
+    assert children[0].id == existing_child.id
+
+
+@pytest.mark.asyncio
 async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
     """A COMPLETED task without pr_merged=True (ghost completion) must NOT block re-proposal."""
     direction = _active_direction("d-ghost01", "Ghost completion direction")
@@ -6612,6 +6707,69 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     tasks = result.scalars().all()
     assert len(tasks) == 1, "Expected one strategic task to be spawned after decay"
     assert tasks[0].payloads[0].get("type") in ("design_doc_update", "strategic_review")
+
+
+def test_project_has_purpose_resolves_problem_model_then_vision():
+    """problem_model.intent.purpose is canonical; vision.purpose is the legacy fallback."""
+    from app.problem_model import project_has_purpose
+
+    project = Project(name="Purpose Resolution", user_id="test-user-123")
+
+    project.problem_model = {"intent": {"purpose": "build a bot"}}
+    project.vision = {}
+    assert project_has_purpose(project) is True
+
+    project.problem_model = {}
+    project.vision = {"purpose": "legacy purpose"}
+    assert project_has_purpose(project) is True
+
+    project.problem_model = {"intent": {"purpose": "   "}}
+    project.vision = {"purpose": ""}
+    assert project_has_purpose(project) is False
+
+    project.problem_model = None
+    project.vision = None
+    assert project_has_purpose(project) is False
+
+
+@pytest.mark.asyncio
+async def test_problem_model_purpose_suppresses_force_strategic(db_session):
+    """A purpose living only in problem_model.intent (vision empty — the
+    post-deprecation shape every onboarded project has) must NOT trip the
+    no-purpose arm of force_strategic. Before the fix, the trigger read only
+    vision.purpose, so such projects force-spawned a strategic cycle on every
+    tick, rate-limited only by the spawn cooldown (stsbot2 2026-06-07:
+    6 cycles in ~3h against a frequency of 6 spawns/cycle)."""
+    project = Project(
+        name="Problem Model Purpose Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pmpurp1")],
+        vision={},  # deprecated field, empty — purpose lives in problem_model
+        problem_model={"intent": {"purpose": "build a combat bot"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    strategic = [
+        t
+        for t in tasks
+        if (t.payloads or [{}])[0].get("type")
+        in ("strategic_review", "design_doc_update")
+    ]
+    assert strategic == [], (
+        "problem_model purpose must satisfy the no-purpose force-strategic arm"
+    )
+    # The active direction still gets normal research — the spawn itself works.
+    research = [
+        t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1
 
 
 @pytest.mark.asyncio

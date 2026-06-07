@@ -75,6 +75,16 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('if admin_ui_runtime_touched;  then SIZE_SECTIONS="$SIZE_SECTIONS,frontend"; fi');
     // Routed through the `run` helper so a breach lands in FAILED.
     expect(script).toContain('run "size guardrail ($SIZE_SECTIONS)" bash -c');
+    // npm install is guarded by a package-lock hash, not the bare existence of
+    // node_modules — a warm VM whose lockfile changed must actually reinstall.
+    expect(script).toContain('npm_ci_if_lock_changed() {');
+    expect(script).toContain('( cd admin-ui && npm_ci_if_lock_changed )');
+    expect(script).toContain('( cd agent && npm_ci_if_lock_changed )');
+    // The stale `[ -d node_modules ] || npm ci` skip-if-present guard is gone
+    // from both call sites. (Match the invoked command forms — the phrase also
+    // appears verbatim in the helper's explanatory NOTE comment, by design.)
+    expect(script).not.toContain('( cd admin-ui && [ -d node_modules ] || npm ci )');
+    expect(script).not.toContain('( cd agent && [ -d node_modules ] || npm ci )');
   });
 
   it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
@@ -411,6 +421,140 @@ esac
     expect(r.log).toContain('harness-ran');
     expect(r.log).not.toContain('pytest-ran');
     expect(r.status).toBe(0);
+  });
+});
+
+// ── npm_ci_if_lock_changed — lockfile-hash install guard ─────────────────────
+// Closes the warm-VM stale-deps hole: a reused VM carries node_modules from a
+// prior task, so `[ -d node_modules ] || npm ci` skipped the reinstall even
+// when package-lock.json changed on this branch. The new helper hashes the
+// lockfile and reinstalls on absence/mismatch. These tests execute the REAL
+// generated helper under an `npm` shim (no network, no real install).
+describe('writeCheckHelper — npm_ci_if_lock_changed runtime', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  const generateSelfRepoScript = async (): Promise<string> => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'lockhash-1',
+      workBranch: 'blueprint/lockhash-1',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    return script;
+  };
+
+  // Extract just the `npm_ci_if_lock_changed` function definition (header is
+  // shared across all stack paths) and run it in a sandbox under an npm shim
+  // that records each invocation. Returns whether `npm ci` ran and the
+  // sentinel's contents afterward.
+  const runHelper = async (
+    script: string,
+    setup: { lock: string; sentinel?: string },
+  ): Promise<{ npmRan: boolean; status: number; sentinel: string | null }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const posix = (p: string): string =>
+      p.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
+
+    // Pull the helper's body out of the generated header so we test the REAL
+    // emitted bash, not a hand-copy.
+    const fnMatch = script.match(/npm_ci_if_lock_changed\(\) \{[\s\S]*?\n\}/);
+    if (fnMatch === null) throw new Error('npm_ci_if_lock_changed must be defined in the generated header');
+    const fnDef = fnMatch[0];
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'lockhash-'));
+    try {
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.mkdirSync(realPath.join(dir, 'node_modules'), { recursive: true });
+      const logfile = realPath.join(dir, 'npm.log');
+      realFs.writeFileSync(logfile, '');
+      // npm shim: record the invocation; `npm ci` always succeeds here.
+      realFs.writeFileSync(
+        realPath.join(bin, 'npm'),
+        '#!/bin/sh\necho "npm $*" >> "$LOGFILE"\nexit 0\n',
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(realPath.join(dir, 'package-lock.json'), setup.lock);
+      const sentinelPath = realPath.join(dir, 'node_modules', '.pkg-lock-hash');
+      if (setup.sentinel !== undefined) realFs.writeFileSync(sentinelPath, setup.sentinel);
+
+      // Driver: source the function def, cd into the sandbox, call it.
+      const driver = `set -uo pipefail\n${fnDef}\ncd "$SANDBOX" || exit 9\nnpm_ci_if_lock_changed\n`;
+      let status = 0;
+      try {
+        realCp.execFileSync('bash', ['-c', driver], {
+          env: {
+            PATH: `${posix(bin)}:${process.env.PATH ?? ''}`,
+            LOGFILE: posix(logfile),
+            SANDBOX: posix(dir),
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        status = (err as { status?: number }).status ?? -1;
+      }
+      const log = realFs.readFileSync(logfile, 'utf8');
+      const sentinel = realFs.existsSync(sentinelPath)
+        ? realFs.readFileSync(sentinelPath, 'utf8')
+        : null;
+      return { npmRan: log.includes('npm ci'), status, sentinel };
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  // Compute the sha256 of a lockfile body the same way the helper does, so the
+  // "matching" scenario can pre-seed the sentinel with the real hash.
+  const sha256Field1 = async (body: string): Promise<string> => {
+    const realCrypto = await vi.importActual<typeof import('node:crypto')>('node:crypto');
+    return realCrypto.createHash('sha256').update(body).digest('hex');
+  };
+
+  it('scenario A: sentinel hash matches the lockfile -> skips npm ci', async () => {
+    const script = await generateSelfRepoScript();
+    const lock = '{"name":"x","lockfileVersion":3}\n';
+    const hash = await sha256Field1(lock);
+    const r = await runHelper(script, { lock, sentinel: `${hash}\n` });
+    expect(r.status).toBe(0);
+    expect(r.npmRan).toBe(false); // matching identity -> no reinstall
+    expect(r.sentinel?.trim()).toBe(hash); // sentinel left intact
+  });
+
+  it('scenario B: lockfile changed (hash mismatch) -> runs npm ci and rewrites the sentinel', async () => {
+    const script = await generateSelfRepoScript();
+    const newLock = '{"name":"x","lockfileVersion":3,"changed":true}\n';
+    const newHash = await sha256Field1(newLock);
+    // Sentinel carries a STALE hash from a prior install (warm-VM scenario).
+    const r = await runHelper(script, { lock: newLock, sentinel: 'deadbeefstalehash\n' });
+    expect(r.status).toBe(0);
+    expect(r.npmRan).toBe(true); // mismatch -> reinstall
+    expect(r.sentinel?.trim()).toBe(newHash); // sentinel rewritten to new identity
+  });
+
+  it('fail-safe: no sentinel at all -> runs npm ci and writes the sentinel', async () => {
+    const script = await generateSelfRepoScript();
+    const lock = '{"name":"x","lockfileVersion":3}\n';
+    const hash = await sha256Field1(lock);
+    const r = await runHelper(script, { lock }); // no sentinel pre-seeded
+    expect(r.status).toBe(0);
+    expect(r.npmRan).toBe(true);
+    expect(r.sentinel?.trim()).toBe(hash);
   });
 });
 

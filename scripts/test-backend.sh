@@ -177,6 +177,110 @@ ensure_image() {
   return 1
 }
 
+# --- Prebuilt deps image fast path -----------------------------------------
+# The backend test image is two-stage: a `deps` stage (the apt shellcheck + pip
+# layers — everything that only changes when requirements.txt / Dockerfile
+# changes) and an `app` stage (= COPY . .). On a fresh agent VM a full
+# `docker build` of the deps stage (base pull + pip install of ~37 packages)
+# costs 1–19 min and runs ~2×/task — the dominant pre-PR gate cost. Skipping
+# that build and bind-mounting the source over /app (mirroring CI exactly) saves
+# ~15–18 min per invocation.
+#
+# We resolve the deps image in three tiers, fastest first:
+#   1. LOCAL baked image: infra/packer/agent.pkr.hcl bakes
+#      `blueprint-backend-test-deps:<reqhash>` into the VM image's docker store
+#      at bake time, so on a booted agent VM this is a zero-network
+#      `docker image inspect` hit — no pull, no build. This is the primary
+#      fast path on agent VMs and is the reason this file exists.
+#   2. GHCR pull: `ghcr.io/henryhamster/backend-test-deps:<reqhash>` (what CI
+#      publishes). The package is PRIVATE, so an anonymous pull only succeeds
+#      when GHCR_TOKEN is supplied; otherwise this tier is skipped fast. Useful
+#      on dev machines / CI-adjacent hosts that have a token but no baked image.
+#   3. Local `docker build --target deps` (the original behavior) — always
+#      correct, just slow.
+#
+# reqhash = sha256(requirements.txt + Dockerfile)[:16] — IDENTICAL across the
+# local baked tag (agent.pkr.hcl), the GHCR tag (ci.yml: `backend-deps`), and
+# the computation below — so a requirements.txt/Dockerfile change cleanly misses
+# all prebuilt tiers and falls through to a local build until the next CI push /
+# packer bake catches up. No image can ever be silently stale.
+#
+# No public exposure: tier 1 needs no registry at all (the image lives only in
+# the VM's local docker store), and tier 2 stays a PRIVATE GHCR package gated on
+# GHCR_TOKEN. Nothing here makes any package public.
+#
+# Safety: this is strictly a speedup. If every tier misses (e.g. a same-PR
+# requirements.txt change whose deps tag isn't baked/pushed yet) we WARN loudly
+# and fall back to the exact `docker build` behavior below — so this path is
+# never worse than today. The pull is wrapped in `timeout` so a
+# slow-but-not-failing pull can't eat the test-runner budget before we decide to
+# fall back. Set BLUEPRINT_NO_DEPS_IMAGE=1 to force the old local-build path.
+DEPS_IMAGE=""          # non-empty ⇒ fast path: bind-mount source onto this image
+IMAGE_PATH_TAKEN=""    # "baked-deps-image" | "pulled-deps-image" | "local-build" (logged for fleet observability)
+GHCR_DEPS_REPO="ghcr.io/henryhamster/backend-test-deps"  # owner lowercased, mirrors CI
+LOCAL_DEPS_REPO="blueprint-backend-test-deps"            # baked into the agent VM image by agent.pkr.hcl
+DEPS_PULL_TIMEOUT="${BLUEPRINT_DEPS_PULL_TIMEOUT:-180}"   # seconds; cap a slow pull
+
+# Try to pull the prebuilt deps image. On success sets DEPS_IMAGE and returns 0;
+# on any failure leaves DEPS_IMAGE empty and returns 1 so the caller falls back
+# to a local build. Never exits the script (callers handle the fallback).
+resolve_deps_image() {
+  if [ -n "${BLUEPRINT_NO_DEPS_IMAGE:-}" ]; then
+    echo "=== BLUEPRINT_NO_DEPS_IMAGE set — using local docker build ===" >&2
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "WARN: sha256sum unavailable — cannot key the deps image, using local docker build" >&2
+    return 1
+  fi
+  # reqhash = sha256(requirements.txt + Dockerfile)[:16] — must match CI's
+  # `cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16`.
+  # We run from the backend dir, so the files are alongside us.
+  local reqhash
+  reqhash="$(cat requirements.txt Dockerfile | sha256sum | cut -c1-16)"
+  if [ -z "$reqhash" ]; then
+    echo "WARN: could not compute deps hash — using local docker build" >&2
+    return 1
+  fi
+  # Tier 1 — LOCAL baked image (agent.pkr.hcl bakes this into the VM image's
+  # docker store at bake time). This is the primary fast path on agent VMs: a
+  # zero-network `docker image inspect`, no pull, no build. Deterministic (an
+  # explicit reqhash-tagged image, not docker-build-cache magic) and
+  # reqhash-gated — a requirements.txt/Dockerfile change misses this tag and
+  # falls through to the next tier. Set BLUEPRINT_NO_LOCAL_DEPS_IMAGE=1 to skip
+  # (e.g. to force-exercise the GHCR/build path on a baked VM).
+  local local_img="$LOCAL_DEPS_REPO:$reqhash"
+  if [ -z "${BLUEPRINT_NO_LOCAL_DEPS_IMAGE:-}" ] \
+     && docker image inspect "$local_img" >/dev/null 2>&1; then
+    echo "=== Using locally baked deps image $local_img (no pull, no build) ===" >&2
+    DEPS_IMAGE="$local_img"
+    return 0
+  fi
+
+  local img="$GHCR_DEPS_REPO:$reqhash"
+
+  # Tier 2 — GHCR pull. The package is PRIVATE, so a login is required: skip the
+  # pull entirely when no GHCR_TOKEN is present (an anonymous pull of a private
+  # package just fails after a network round-trip). A failed login is non-fatal —
+  # we fall through to a local build.
+  if [ -z "${GHCR_TOKEN:-}" ]; then
+    echo "WARN: no GHCR_TOKEN and no baked deps image — falling back to local docker build" >&2
+    return 1
+  fi
+  echo "${GHCR_TOKEN}" | docker login ghcr.io \
+    -u "${GHCR_USER:-blueprint-ci}" --password-stdin >/dev/null 2>&1 \
+    || echo "WARN: ghcr login failed — pull will likely fail, then we fall back" >&2
+
+  echo "=== Pulling prebuilt deps image $img (timeout ${DEPS_PULL_TIMEOUT}s) ===" >&2
+  if timeout "$DEPS_PULL_TIMEOUT" docker pull "$img" >/dev/null 2>&1; then
+    DEPS_IMAGE="$img"
+    return 0
+  fi
+  echo "WARN: deps image $img unavailable (pull failed, missing tag, or timeout)" >&2
+  echo "WARN: falling back to local docker build — slower but identical result" >&2
+  return 1
+}
+
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ]; then
   PG_NETWORK="blueprint-test-net-$$"
@@ -241,7 +345,16 @@ _run() {
     # the host path in `-v /d/path:/admin-ui/src` to a Windows-style
     # path before passing it to docker.exe (the colon + leading slash
     # look like a Windows drive ref to MSYS).
-    MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+    if [ -n "$DEPS_IMAGE" ]; then
+      # Fast path: the deps image has no source baked in (it's the `deps`
+      # stage), so bind-mount the backend source over /app — exactly as the
+      # CI shards do. $PWD is the backend dir here (we cd'd at the top), so
+      # /app/CLAUDE.md (cp'd above), the agent/admin-ui mounts in $ENV_ARGS,
+      # alembic, and `app.*` all resolve identically to the built image.
+      MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/app" $ENV_ARGS "$DEPS_IMAGE" "$@"
+    else
+      MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+    fi
   else
     # Replace leading "python3" with $PYTHON if set (venv interpreter)
     if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then
@@ -253,9 +366,26 @@ _run() {
 }
 
 if [ "$USE_DOCKER" = "1" ]; then
-  echo "=== Building backend image ==="
-  ensure_image python:3.11-slim
-  docker build -t blueprint-backend-test . -q
+  # Fast path: resolve a prebuilt deps image (local baked → GHCR pull) and
+  # bind-mount the source (set in _run). Falls back loudly to the local build on
+  # any failure — never worse than today. The chosen path is logged so fleet
+  # fallback-rate is observable.
+  if resolve_deps_image; then
+    # Distinguish the baked (tier 1) vs pulled (tier 2) path for observability:
+    # the locally baked image carries the LOCAL_DEPS_REPO prefix (no registry
+    # host), the GHCR one carries the ghcr.io/... repo.
+    case "$DEPS_IMAGE" in
+      "$LOCAL_DEPS_REPO":*) IMAGE_PATH_TAKEN="baked-deps-image" ;;
+      *)                    IMAGE_PATH_TAKEN="pulled-deps-image" ;;
+    esac
+    echo "=== Using prebuilt deps image (skipping local build): $DEPS_IMAGE ==="
+  else
+    IMAGE_PATH_TAKEN="local-build"
+    echo "=== Building backend image ==="
+    ensure_image python:3.11-slim
+    docker build -t blueprint-backend-test . -q
+  fi
+  echo "=== test-backend image path: ${IMAGE_PATH_TAKEN} ==="
 fi
 
 # --- Postgres needs migrations applied before tests ---

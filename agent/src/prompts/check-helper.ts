@@ -93,10 +93,41 @@ run() {
     FAILED+=("$label")
   fi
 }
+
+# Idempotent npm install guarded by package-lock IDENTITY, not the mere
+# existence of node_modules. A warm/reused VM carries a populated
+# node_modules from a prior task; a bare \`[ -d node_modules ] || npm ci\`
+# then skips the install even when package-lock.json changed on this branch,
+# leaving STALE deps that mask or fake build/lint/test results. We hash
+# package-lock.json and stash the hash in a sentinel inside node_modules,
+# reinstalling only when it's absent or mismatched.
+#
+# NOTE: the sentinel guards lockfile IDENTITY (did the resolved dep set
+# change?), NOT node_modules tree-integrity (is every package actually on
+# disk and intact?). A matching hash means "this node_modules was last
+# installed from THIS lockfile", not "node_modules is provably complete".
+# That's the right tradeoff here: the warm-VM failure we're closing is a
+# CHANGED lockfile being ignored, and \`git clean\` at role handoff already
+# resets a corrupted tree. Call from within the target directory.
+npm_ci_if_lock_changed() {
+  local want sentinel=node_modules/.pkg-lock-hash
+  want=$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)
+  # Fail-safe: if we can't compute a hash (missing/unreadable lockfile or no
+  # sha256sum), install unconditionally rather than trust a stale tree.
+  if [ -n "$want" ] && [ -f "$sentinel" ] && [ "$(cat "$sentinel" 2>/dev/null)" = "$want" ]; then
+    return 0
+  fi
+  npm ci || return 1
+  # Write the sentinel ONLY after a zero-exit \`npm ci\`, so a killed/partial
+  # install never leaves a false-positive hash that suppresses a real retry.
+  # Recompute \`want\` post-install in case the lockfile was (re)written.
+  want=$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)
+  [ -n "$want" ] && printf '%s\\n' "$want" > "$sentinel"
+}
 `;
   const blueprintStackBlocks = `
 if admin_ui_runtime_touched; then
-  ( cd admin-ui && [ -d node_modules ] || npm ci ) >/tmp/check_npm_ci.log 2>&1 || {
+  ( cd admin-ui && npm_ci_if_lock_changed ) >/tmp/check_npm_ci.log 2>&1 || {
     echo "[check] admin-ui npm ci FAILED — see /tmp/check_npm_ci.log"
     tail -30 /tmp/check_npm_ci.log
     FAILED+=("admin-ui npm ci")
@@ -279,7 +310,7 @@ if admin_ui_runtime_touched; then
 fi
 
 if touches agent/; then
-  ( cd agent && [ -d node_modules ] || npm ci ) >/tmp/check_agent_npm_ci.log 2>&1 || {
+  ( cd agent && npm_ci_if_lock_changed ) >/tmp/check_agent_npm_ci.log 2>&1 || {
     echo "[check] agent npm ci FAILED — see /tmp/check_agent_npm_ci.log"
     tail -30 /tmp/check_agent_npm_ci.log
     FAILED+=("agent npm ci")

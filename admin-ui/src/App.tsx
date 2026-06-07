@@ -54,6 +54,7 @@ import { PlaybookPanel } from './components/PlaybookPanel';
 import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { parseTimestamp } from './utils/time';
+import { matchesStatusFilter } from './utils/statusFilter';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -445,7 +446,7 @@ export default function App() {
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
       const typeMatch = matchesTaskTypeFilter(taskType, s.taskTypeFilter, filterTaskTypeIds);
-      const statusMatch = s.statusFilter.includes(t.status);
+      const statusMatch = matchesStatusFilter(t.status, s.statusFilter);
       const query = s.searchQuery.toLowerCase();
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
       const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;

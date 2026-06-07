@@ -20,6 +20,20 @@ const STATUS_VALUES = STATUS_OPTIONS.map(o => o.value);
 
 const DEFAULT_STATUS_FILTER: string[] = [...STATUS_VALUES];
 
+// The full status set as it existed *before* BLOCKED was added (backend #7436).
+// A persisted 'filter:status' array equal to this set was a "show everything"
+// selection at the time it was saved — the user never chose to exclude BLOCKED,
+// because BLOCKED did not exist yet. Without migration it would now read as a
+// deliberate 7-of-8 subset: it would keep BLOCKED tasks hidden in every view AND
+// (because the count is below STATUS_OPTIONS.length) start sending a server-side
+// &status= param per status that omits BLOCKED entirely. We detect that exact
+// legacy-complete selection and expand it to the current full list so "everything"
+// stays "everything". Deliberate partial selections (any strict subset of the
+// legacy set, or one that already includes BLOCKED) are left untouched.
+const LEGACY_STATUS_VALUES: readonly string[] = [
+  'QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED',
+];
+
 // Keep only values present in `valid`, preserving a legitimately-empty selection.
 // Falls back to `fallback` when the stored value is not an array at all.
 function sanitizeStringArray(parsed: unknown, valid: readonly string[], fallback: string[]): string[] {
@@ -32,6 +46,17 @@ function sameSet(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const setB = new Set(b);
   return a.every(v => setB.has(v));
+}
+
+// Sanitize a persisted status selection, then apply the legacy-complete → full
+// expansion described on LEGACY_STATUS_VALUES. The expansion is a no-op once the
+// stored value already includes the new status (so it doesn't fight a user who
+// later deselects BLOCKED) and a no-op for any selection that isn't exactly the
+// legacy "everything" set.
+function sanitizeStatusFilter(parsed: unknown): string[] {
+  const sanitized = sanitizeStringArray(parsed, STATUS_VALUES, DEFAULT_STATUS_FILTER);
+  if (sameSet(sanitized, LEGACY_STATUS_VALUES)) return [...STATUS_VALUES];
+  return sanitized;
 }
 
 export function useSearchFilters(taskTypeValues: readonly string[] = FILTER_TASK_TYPE_IDS) {
@@ -48,8 +73,7 @@ export function useSearchFilters(taskTypeValues: readonly string[] = FILTER_TASK
     parsed => sanitizeStringArray(parsed, validTaskTypes, defaultTaskTypeFilter),
   );
   const [statusFilter, setStatusFilter] = usePersistedState<string[]>(
-    'filter:status', DEFAULT_STATUS_FILTER,
-    parsed => sanitizeStringArray(parsed, STATUS_VALUES, DEFAULT_STATUS_FILTER),
+    'filter:status', DEFAULT_STATUS_FILTER, sanitizeStatusFilter,
   );
   const [dateRange, setDateRange] = usePersistedState<DateRange>(
     'filter:dateRange', 'all',

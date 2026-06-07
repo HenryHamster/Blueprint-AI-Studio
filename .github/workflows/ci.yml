@@ -8,8 +8,13 @@ name: CI
 # promotion for negligible value. PR CI is the gate; keep it single.
 on:
   pull_request:
+    # NOTE: 'edited' deliberately omitted. The autonomous pipeline PATCHes PR
+    # bodies on every fix iteration (pr-helper.ts) to refresh the self-review
+    # section; with 'edited' each body update fired a full ~21-min 8-shard run
+    # on an unchanged tree. CI is SHA-keyed (resolve_ci_status), so 'synchronize'
+    # (a real new commit) is the only event that needs to gate — body edits don't.
     branches: [main, automain]
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 # Cancel superseded runs when a new commit lands on the same PR. Autonomous
