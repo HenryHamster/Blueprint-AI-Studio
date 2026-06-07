@@ -1124,6 +1124,10 @@ export interface CurrentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Post-promotion deploy-confirmation window deadline (ISO string). The sweep
+  // resolves serving_status to confirmed/failed when this elapses; the panel
+  // computes remaining/overdue at render time.
+  deploy_confirm_deadline?: string | null;
 }
 
 export interface RecentVersion {
@@ -1142,6 +1146,10 @@ export interface RecentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Post-promotion deploy-confirmation window deadline (ISO string) — see
+  // CurrentVersion. Present on the recently-promoted history row whose
+  // serving_status is still 'unconfirmed'.
+  deploy_confirm_deadline?: string | null;
 }
 
 export interface PromotionReadinessConfidence {

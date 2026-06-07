@@ -20,7 +20,7 @@ import {
   type PromotionReadiness,
   type QualificationState,
 } from '../api';
-import { timeAgo } from '../utils/time';
+import { timeAgo, deployWindowStatus } from '../utils/time';
 
 // Generate a client idempotency key for a version cut. Prefers the native UUID
 // generator and falls back to a timestamp+random token for older runtimes (and
@@ -159,11 +159,13 @@ function ServingStatusBadge({
   servedSha,
   servedAt,
   deployFailureReason,
+  deployConfirmDeadline,
 }: {
   servingStatus?: string | null;
   servedSha?: string | null;
   servedAt?: string | null;
   deployFailureReason?: string | null;
+  deployConfirmDeadline?: string | null;
 }) {
   if (!servingStatus) return null;
   if (servingStatus === 'serving_confirmed') {
@@ -196,14 +198,37 @@ function ServingStatusBadge({
     );
   }
   if (servingStatus === 'unconfirmed') {
+    // Compute the confirmation-window state at render time so the panel is
+    // honest at view time, not at fetch time. When `now` is past the deadline
+    // while serving is still unconfirmed, the resolving sweep is late/stuck and
+    // the deploy should be investigated — render a distinct overdue cue.
+    let windowText: string | null = null;
+    let overdue = false;
+    if (deployConfirmDeadline) {
+      const status = deployWindowStatus(deployConfirmDeadline);
+      overdue = status.overdue;
+      windowText = status.text;
+    }
     return (
       <span
         data-testid="serving-status-badge"
         data-serving-status="unconfirmed"
-        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
-        title="Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window."
+        data-deploy-window-overdue={deployConfirmDeadline ? String(overdue) : undefined}
+        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+          overdue
+            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+        }`}
+        title={
+          overdue
+            ? 'Promoted (merged) but serving is still not confirmed and the deploy confirmation window has elapsed — the resolving sweep is late or stuck; investigate the deploy.'
+            : 'Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window.'
+        }
       >
-        … awaiting deploy confirmation
+        {overdue ? '⚠ awaiting deploy confirmation — OVERDUE' : '… awaiting deploy confirmation'}
+        {windowText && (
+          <span className={`font-normal ${overdue ? 'text-red-300' : 'text-amber-500/90'}`}>{windowText}</span>
+        )}
       </span>
     );
   }
@@ -871,6 +896,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     servedSha={cv.served_sha}
                     servedAt={cv.served_at}
                     deployFailureReason={cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
                 </div>
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
@@ -1102,6 +1128,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     servedSha={v.served_sha}
                     servedAt={v.served_at}
                     deployFailureReason={v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                    deployConfirmDeadline={v.deploy_confirm_deadline}
                   />
                   <QualSummary q={v.last_qualification} />
                   {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (

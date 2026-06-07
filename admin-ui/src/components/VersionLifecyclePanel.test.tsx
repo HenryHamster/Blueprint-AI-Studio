@@ -1308,7 +1308,9 @@ describe('VersionLifecyclePanel', () => {
       expect(badge).toHaveTextContent('@abcdef1');
     });
 
-    it('renders an amber awaiting-confirmation badge while unconfirmed', () => {
+    it('renders an amber awaiting-confirmation badge with the remaining window while unconfirmed', () => {
+      // Deadline 10 minutes in the future — still inside the confirmation window.
+      const deadline = new Date(Date.now() + 10 * 60 * 1000).toISOString();
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
@@ -1319,6 +1321,7 @@ describe('VersionLifecyclePanel', () => {
                 serving_status: 'unconfirmed',
               },
               serving_status: 'unconfirmed',
+              deploy_confirm_deadline: deadline,
             }),
           })}
           loading={false}
@@ -1328,7 +1331,69 @@ describe('VersionLifecyclePanel', () => {
       );
       const badge = screen.getByTestId('serving-status-badge');
       expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'false');
       expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+      expect(badge).toHaveTextContent(/left in window/);
+      expect(badge.className).toContain('text-amber-400');
+    });
+
+    it('renders a red OVERDUE cue when the confirmation window has elapsed while still unconfirmed', () => {
+      // Deadline 15 minutes in the past — the resolving sweep is late/stuck.
+      const deadline = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Candidate was promoted (merged) but serving is NOT yet confirmed.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+              deploy_confirm_deadline: deadline,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'true');
+      expect(badge).toHaveTextContent(/OVERDUE/);
+      expect(badge).toHaveTextContent(/window elapsed/);
+      expect(badge.className).toContain('text-red-400');
+    });
+
+    it('shows the unconfirmed confirmation window in History rows for a recently-promoted version', () => {
+      const deadline = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 5,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'unconfirmed',
+                deploy_confirm_deadline: deadline,
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'false');
+      expect(badge).toHaveTextContent(/left in window/);
     });
 
     it('renders a loud red failure badge with the reason — not a clean green promoted', () => {

@@ -7813,6 +7813,49 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["audit_missing_reason"] is None
 
     @pytest.mark.asyncio
+    async def test_recent_version_echoes_deploy_confirm_deadline_for_unconfirmed(
+        self, client: AsyncClient, db_session
+    ):
+        """A recently-promoted (closed) version that is still 'unconfirmed'
+        echoes deploy_confirm_deadline in its recent_versions history row — the
+        field where the unconfirmed serving state actually appears."""
+        from datetime import datetime, timezone
+
+        project = await _make_project(db_session)
+        deadline = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            promoted_sha="promotedsha123",
+            serving_status="unconfirmed",
+            deploy_confirm_deadline=deadline,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with patch(
+            "app.release_qualifier.compute_promotion_readiness",
+            new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        history = resp.json()["recent_versions"]
+        row = next(r for r in history if r["version_number"] == 1)
+        assert row["serving_status"] == "unconfirmed"
+        # The deadline is echoed in the history row (the field is the only place
+        # the unconfirmed serving state actually appears). Compare against the
+        # persisted value's isoformat — the column stores naive UTC.
+        await db_session.refresh(version)
+        assert row["deploy_confirm_deadline"] == version.deploy_confirm_deadline.isoformat()
+        assert row["deploy_confirm_deadline"] is not None
+
+    @pytest.mark.asyncio
     async def test_merged_since_verdict_counts_merges_after_finalized_at(
         self, client: AsyncClient, db_session
     ):

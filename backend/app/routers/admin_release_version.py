@@ -295,6 +295,9 @@ async def get_version_lifecycle(
                 "served_sha": v.served_sha,
                 "served_at": v.served_at.isoformat() if v.served_at else None,
                 "deploy_failure_reason": v.deploy_failure_reason,
+                "deploy_confirm_deadline": v.deploy_confirm_deadline.isoformat()
+                if v.deploy_confirm_deadline
+                else None,
                 "qualification_state": _release_version.summarize_qualification_state(
                     v.last_qualification, v.serving_status, v.deploy_failure_reason
                 ),
