@@ -196,6 +196,7 @@ markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",
     "integration: End-to-end tests requiring agent subprocess (run via --integration)",
+    "agent_image_gate: Opt out of the default agent-image serving-gate stub fixture and drive the gate directly",
 ]
 
 [tool.coverage.run]

@@ -805,6 +805,45 @@ def get_vm_source_sha(vm_instance_id: str) -> str | None:
     return _vm_source_shas.get(vm_instance_id)
 
 
+async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
+    """True iff the running agent fleet is observed serving ``promoted_sha``.
+
+    Default fleet-serving definition for the agent VM image release artifact: at
+    least one currently-active (LIVE: PROVISIONING / IDLE / LEASED) warm-pool VM
+    reports ``agent_source_sha == promoted_sha`` — i.e. the freshly baked image
+    is live and running on the fleet.  DB-backed so the read survives an
+    orchestrator restart (the durable ``PoolVm.agent_source_sha`` is populated by
+    heartbeats via :func:`persist_pool_vm_image_state`); the in-memory heartbeat
+    map is consulted as a warm fallback before a row is persisted (and for
+    task-bound VMs that have no PoolVm registry row).
+
+    A read-only observation: returns ``False`` (not-yet-serving) rather than
+    raising on any error so it can never abort the serving-confirmation sweep.
+    """
+    if not promoted_sha:
+        return False
+    try:
+        from sqlalchemy import select
+
+        from app.models import PoolVm
+        from app.warm_pool import LIVE_POOL_STATES
+
+        match = (
+            await session.execute(
+                select(PoolVm.id).where(
+                    PoolVm.agent_source_sha == promoted_sha,
+                    PoolVm.state.in_(LIVE_POOL_STATES),
+                )
+            )
+        ).first()
+        if match is not None:
+            return True
+    except Exception as e:  # noqa: BLE001 — observation must never raise
+        logger.debug(f"[COMPUTE] fleet_serving_source_sha DB read failed: {e}")
+    # In-memory heartbeat fallback (warm before a PoolVm row is persisted).
+    return any(sha == promoted_sha for sha in _vm_source_shas.values())
+
+
 async def persist_pool_vm_image_state(
     session,
     vm_instance_id: str,

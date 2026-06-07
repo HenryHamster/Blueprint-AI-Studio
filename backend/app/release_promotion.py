@@ -39,6 +39,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.models import Project, QualificationVerdict
 from app.release_artifacts import (
+    AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
     get_or_create_release_deploy_artifact,
 )
@@ -1600,6 +1601,18 @@ async def _record_promotion_success(
             session,
             version,
             BACKEND_REVISION_ARTIFACT_KIND,
+            confirmation_deadline=version.deploy_confirm_deadline,
+        )
+        # Open the agent VM image serving window alongside the backend revision.
+        # The agent_image artifact is REQUIRED, so the aggregate serving status
+        # stays unconfirmed until BOTH the backend revision boots and the agent
+        # fleet is observed serving the promoted SHA (when the diff touched the
+        # bake paths) — a non-bake promotion's agent_image artifact confirms
+        # immediately so the aggregate tracks the backend revision alone.
+        await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            AGENT_IMAGE_ARTIFACT_KIND,
             confirmation_deadline=version.deploy_confirm_deadline,
         )
     session.add(version)

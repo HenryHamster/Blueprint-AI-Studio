@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import DeploymentState, ReleaseDeployArtifact, ReleaseVersion
 
 BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
+AGENT_IMAGE_ARTIFACT_KIND = "agent_image"
 
 ServingDecision = tuple[str, str | None, datetime | None]
 ServingCheck = Callable[
@@ -186,12 +187,24 @@ def summarize_release_artifacts(
                 reason_code=version.deploy_failure_reason,
             )
         else:
+            # No artifact row exists for this provider. A required non-backend
+            # provider whose row was never created must NOT strand the aggregate
+            # as "unconfirmed": current self-repo promotions create every
+            # required row synchronously in _record_promotion_success, so an
+            # absent row means the version predates the provider (legacy /
+            # backward-compat) or is a project the provider does not apply to
+            # (e.g. a non-self-repo version, which gets no agent_image row).
+            # Stranding those to "unconfirmed" would flip every such promoted
+            # version to a permanent false-negative serving state in the
+            # lifecycle/history and crisis-detection reads. Treat a missing row
+            # as vacuous (None) so the aggregate is computed only over the rows
+            # that actually exist plus the backend_revision legacy scalar
+            # fallback above; live promotions stay gated because their row
+            # exists and reports its real serving_status.
             evidence = ReleaseArtifactEvidence(
                 artifact_kind=provider.artifact_kind,
                 required=provider.required,
-                serving_status="unconfirmed"
-                if provider.required and version.status == "promoted"
-                else None,
+                serving_status=None,
                 served_identifier=None,
                 served_at=None,
                 reason_code=None,
@@ -380,3 +393,121 @@ register_release_artifact_provider(
     _check_backend_revision_serving,
     required=True,
 )
+
+
+def _previously_deployed_sha(
+    ds: DeploymentState | None,
+    promoted_sha: str,
+) -> str | None:
+    """Best-effort: the self-repo SHA serving *before* this promotion.
+
+    The agent-image bake diff is ``previously-deployed SHA ... promoted_sha``.
+    When the post-promotion backend revision has already advanced
+    ``current_sha`` to the promoted SHA, the pre-promotion serving commit is the
+    recorded ``prior_deploy_sha``; otherwise ``current_sha`` still holds it.
+    Returns ``None`` when neither is observable (diff base indeterminate).
+    """
+    if ds is None:
+        return None
+    current = ds.current_sha or None
+    if current and current == promoted_sha:
+        return ds.prior_deploy_sha or None
+    return current
+
+
+async def _check_agent_image_serving(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    artifact: ReleaseDeployArtifact,
+    now: datetime,
+) -> ServingDecision | None:
+    """Serving check for the agent VM image artifact (self-repo only).
+
+    A self-repo promotion whose diff touches the agent VM image bake paths
+    (``agent/`` or ``infra/packer/``) is only fully served once a freshly baked
+    agent image is rolled out and the running fleet is observed serving the
+    promoted source SHA.  This gate makes that second dimension a REQUIRED
+    serving-verified artifact:
+
+      * Non-bake promotion (diff did NOT touch the bake paths) — resolve to
+        ``serving_confirmed`` IMMEDIATELY (served identifier = promoted_sha) so
+        the version is never stranded waiting on a bake that will never run.
+      * Bake promotion (diff touched the bake paths) — ``serving_confirmed``
+        only once the fleet INDEPENDENTLY reports ``agent_source_sha`` matching
+        ``version.promoted_sha``; until then return ``None`` (not-yet) so the
+        version stays unconfirmed within the existing confirmation window.
+      * Indeterminate (non-self-repo, no GitHub creds, the rebake lookup errored,
+        the diff base is unobservable, or no fleet VM has reported a source SHA
+        yet) — treat as NOT-YET-CONFIRMED (return ``None``), never
+        ``deploy_failed``.  The version then resolves within the existing
+        confirmation/recovery windows exactly as the backend_revision artifact
+        does.
+
+    Lazy imports avoid a load-time cycle (``release_promotion`` imports this
+    module), mirroring ``_check_backend_revision_serving``.
+    """
+    from app import compute, github_refs
+    from app.models import Project
+    from app.release_promotion import _resolve_github_with_session
+
+    promoted_sha = version.promoted_sha
+    if not promoted_sha:
+        return None
+
+    project = await session.get(Project, version.project_id)
+    if project is None or not getattr(project, "is_self_repo", False):
+        # The agent VM image gate is scoped to the self-repo — only the self
+        # deploy runs the agent fleet this dimension reasons about.  A
+        # non-self-repo never gets an agent_image artifact at promotion time, so
+        # this is reached only if the generic refresh lazily created one.  There
+        # is no agent fleet to gate on, so the dimension is VACUOUSLY served:
+        # confirm immediately rather than strand the artifact unconfirmed (the
+        # same "never strand a bake that will never run" principle as the
+        # no-bake-path branch below).
+        return ("serving_confirmed", promoted_sha, now)
+
+    ds = await session.get(DeploymentState, 1)
+    base_sha = _previously_deployed_sha(ds, promoted_sha)
+    if not base_sha:
+        # Diff base unobservable → indeterminate → not-yet-confirmed.
+        return None
+
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return None
+    token, owner, repo = resolved
+
+    rebake = await github_refs.agent_image_rebake_expected(
+        token,
+        owner,
+        repo,
+        base_sha,
+        promoted_sha,
+        project_id=str(version.project_id),
+    )
+    if rebake is None:
+        # API/ref error → indeterminate → not-yet-confirmed.
+        return None
+    if rebake is False:
+        # No bake-path change → no agent rebake required → confirm immediately so
+        # the aggregate tracks the backend revision alone.
+        return ("serving_confirmed", promoted_sha, now)
+
+    # Bake expected: confirm only once the fleet is independently observed
+    # serving the promoted SHA (the freshly baked image is live and running).
+    if await compute.fleet_serving_source_sha(session, promoted_sha):
+        return ("serving_confirmed", promoted_sha, now)
+    return None
+
+
+# Self-repo agent VM image serving gate.  Registered REQUIRED so a bake-path
+# promotion stays NOT fully serving until the fleet serves the promoted SHA.
+# Guarded against double-registration: a sibling task may also register an
+# agent_image provider and the registry is keyed by artifact_kind — register
+# exactly once here so neither call site clobbers the other's semantics.
+if AGENT_IMAGE_ARTIFACT_KIND not in _ARTIFACT_PROVIDERS:
+    register_release_artifact_provider(
+        AGENT_IMAGE_ARTIFACT_KIND,
+        _check_agent_image_serving,
+        required=True,
+    )
