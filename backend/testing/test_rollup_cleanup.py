@@ -3184,3 +3184,82 @@ async def test_large_main_rollup_keeps_ci_waiting(cleanup_db, mocker):
     assert review_loop.get("ci_waiting") is True
     assert review_loop.get("ci_wait_started")
     assert review_loop.get("base_branch") == "main"
+
+
+@pytest.mark.asyncio
+async def test_resume_review_preserves_inflight_ci_fix_state(cleanup_db, mocker):
+    """PR #8746 (change C): RESUMING a large rollup whose EXISTING review_loop
+    already records in-flight CI/fix progress (ci_fix_spawned set / ci_passed
+    False) must PRESERVE that loop — not rebuild it and re-arm ci_waiting=True
+    with a fresh ci_wait_started.
+
+    Pre-fix the spawn-review path overwrote review_loop unconditionally,
+    discarding ci_fix_spawned and resetting ci_wait_started to now → the 1h
+    CI-wait backstop later FAILed the parent and cascade-cancelled the fix
+    (research 5b250ecd). The original ci_wait_started and ci_fix_spawned must
+    survive the resume.
+    """
+    _mock_high_risk_gate_deps(
+        mocker,
+        get_pull_request_responses=[
+            {"merged": False, "state": "open"},  # resume validation
+            {
+                "additions": 200,
+                "deletions": 0,
+                "merged": False,
+                "state": "open",
+            },  # diff size — large → review path
+        ],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="review-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    original_ci_wait_started = "2026-06-07T12:00:00"
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/risky-stg",
+            "parent_base": "main",
+            "rollup_pr_number": 9999,
+            "rollup_pr_url": "https://github.com/owner/repo/pull/9999",
+            # Existing in-flight state from a prior pass: a CI-failure fix was
+            # spawned, CI has not passed, the wait started earlier.
+            "review_loop": {
+                "pr_number": 9999,
+                "base_branch": "main",
+                "ci_waiting": True,
+                "ci_wait_started": original_ci_wait_started,
+                "ci_passed": False,
+                "ci_fix_spawned": "fix-task-abc",
+            },
+        },
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "review"
+    await cleanup_db.refresh(parent)
+    review_loop = (parent.context or {}).get("review_loop") or {}
+    # The existing in-flight state was preserved, NOT rebuilt/re-armed.
+    assert review_loop.get("ci_fix_spawned") == "fix-task-abc"
+    assert review_loop.get("ci_passed") is False
+    assert review_loop.get("ci_wait_started") == original_ci_wait_started
+    assert (parent.context or {}).get("_is_rollup_review") is True

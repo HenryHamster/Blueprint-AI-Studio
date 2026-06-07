@@ -723,6 +723,274 @@ async def test_spawn_verify_tests_creates_task_and_bypasses_cap(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_review_spawn_defers_when_blocked_fix_active(db_session, mocker):
+    """PR #8742 regression: a same-PR fix sitting BLOCKED (e.g. file_conflict
+    park) must make a review spawn DEFER, not spawn a re-review of the unchanged
+    head. BLOCKED holds the DB active-idempotency slot (alembic 0138), so the
+    cross-type liveness loop must treat it as live and hit the defer branch.
+
+    Pre-fix BLOCKED was absent from _PIPELINE_ACTIVE_STATUSES, so the BLOCKED
+    fix was invisible → the review spawned → REQUEST_CHANGES on an unchanged head
+    → repeat (11 wasted opus re-reviews in prod). MUST FAIL pre-fix.
+
+    The BLOCKED fix is also deliberately stale (no heartbeat, old started_at):
+    a BLOCKED task is a precondition park, not a dying VM, so it must NOT be
+    stale-superseded — it must reach the defer branch.
+    """
+    from datetime import datetime
+
+    from app.review_pipeline import SPAWN_REASON_DEFERRED, PIPELINE_TASK_STALE_MINUTES
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A fix on the SAME PR/chain, parked BLOCKED with a stale (no) heartbeat.
+    blocked_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        last_heartbeat=None,
+        started_at=datetime.utcnow()
+        - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 8742,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(blocked_fix)
+    await db_session.commit()
+    await db_session.refresh(blocked_fix)
+
+    # The originating task tries to (re)spawn a review for the same PR.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 8742,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=8742,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # Cross-type defer: no review spawned, deferral marker set.
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
+
+    # The BLOCKED fix must NOT have been stale-superseded (still BLOCKED).
+    await db_session.refresh(blocked_fix)
+    assert blocked_fix.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_review_spawn_defers_when_in_progress_fix_active(db_session, mocker):
+    """Cross-type regression lock: an IN_PROGRESS same-PR fix must also defer a
+    review spawn (the in-flight fix must finish first). This pins that adding
+    BLOCKED to the active set did not loosen the long-standing IN_PROGRESS defer.
+    """
+    from datetime import datetime
+
+    from app.review_pipeline import SPAWN_REASON_DEFERRED
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    inprogress_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow(),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 8742,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(inprogress_fix)
+    await db_session.commit()
+    await db_session.refresh(inprogress_fix)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 8742,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=8742,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
+    await db_session.refresh(inprogress_fix)
+    assert inprogress_fix.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_review_spawns_when_all_prior_fixes_terminal(db_session, mocker):
+    """Complement: when every prior same-PR fix is TERMINAL (COMPLETED / FAILED /
+    CANCELLED), none are live, so the cross-type defer does NOT fire and a fresh
+    review spawns. Confirms widening the active set to include BLOCKED did not
+    make terminal fixes spuriously block a review.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # One terminal fix in each terminal status. CANCELLED is excluded from the
+    # per-PR cap query (COMPLETED/FAILED only), so iteration count stays low and
+    # the cap (16) is not tripped by these.
+    for st in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=st,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 8742,
+                        "branch": "feat/x",
+                        "base_branch": "main",
+                        "original_task_id": str(original_task.id),
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "iteration": 1,
+                        "original_task_id": str(original_task.id),
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 8742,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            # iteration>1 so the first-review cross-cutting safeguard gate
+            # (iteration==1) is skipped — it needs github mocks we don't set up.
+            "review_loop": {"iteration": 3, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=8742,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # No live cross-type task → a fresh review is created.
+    assert created is True
+    assert result is not None
+    assert result.first_payload.get("type") == "review"
+    assert result.first_payload.get("pr_number") == 8742
+    assert result.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_session, mocker):
     """Regression: when a same-key spawn collides on the ux_task_active_idempotency_key
     partial unique index but the colliding task has raced OUT of the active-status

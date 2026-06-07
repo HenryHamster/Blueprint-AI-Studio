@@ -3208,3 +3208,89 @@ async def test_chain_active_no_vmcontact_row_allows_kill(eval_db):
         vm_instance_id="vm-chain-no-contact-row",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is False
+
+
+# ── BLOCKED review/fix child keeps rollup waiting (PR #8746) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_rollup_blocked_fix_child_keeps_parent_evaluating_no_completion_pass(
+    eval_db, mocker
+):
+    """PR #8746 regression: a BLOCKED review/fix child must keep the rollup's
+    ``pipeline_active`` gate True so the completion / review-loop-rebuild pass
+    does NOT run while a fix is parked on a precondition.
+
+    BLOCKED review/fix children are invisible to the subtask tally
+    (``active_count`` excludes review/fix types), so ONLY the ``pipeline_active``
+    loop can hold the parent. A BLOCKED child also never heartbeats, so it must
+    bypass the staleness skip. Pre-fix the loop skipped BLOCKED entirely →
+    ``pipeline_active=False`` → the function fell through to the
+    ``_verify_pr_merged`` completion pass and rebuilt review_loop from scratch,
+    re-arming ci_waiting and discarding ci_fix_spawned (research 5b250ecd).
+
+    Sharp pre-fix signal: ``_verify_pr_merged`` is reached (and the parent
+    progresses) only when the gate falls through. Post-fix the early return at
+    the ``pipeline_active`` gate means it is NEVER called and the parent stays
+    EVALUATING.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Spy: post-fix this must NOT be called (early return before the verify pass).
+    verify_spy = mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = Project(name="Blocked Fix Child Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # One terminal, merged ROLLUP_TYPES child (keeps `children` non-empty so the
+    # "all children review/fix → COMPLETED" short-circuit does NOT fire, and
+    # active_count stays 0 so only pipeline_active can hold the parent).
+    done_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "done"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    # The BLOCKED fix child — no heartbeat (parked on a precondition). Its
+    # type is excluded from ROLLUP_TYPES, so only the pipeline_active loop sees
+    # it; pre-fix it was skipped (status not in the active tuple).
+    blocked_fix = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "fix", "prompt": "fix", "pr_number": 8746}],
+        status=TaskStatus.BLOCKED,
+        last_heartbeat=None,
+        context={"sentinel": "untouched"},
+    )
+    eval_db.add(done_child)
+    eval_db.add(blocked_fix)
+    await eval_db.commit()
+    await eval_db.refresh(blocked_fix)
+
+    # Trigger on the terminal child's completion event.
+    await _check_and_trigger_rollup(done_child, eval_db)
+
+    # pipeline_active True (the BLOCKED fix) → early return; the completion pass
+    # never runs, so the parent stays EVALUATING and verify was never reached.
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    verify_spy.assert_not_called()
+
+    # The BLOCKED fix child was only READ — never mutated.
+    await eval_db.refresh(blocked_fix)
+    assert blocked_fix.status == TaskStatus.BLOCKED
+    assert (blocked_fix.context or {}).get("sentinel") == "untouched"
