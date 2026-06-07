@@ -226,7 +226,7 @@ describe('MetricsDashboard', () => {
     expect(screen.getByText('$24.50 across 3 tasks')).toBeInTheDocument();
   });
 
-  it('renders the warm-start origin breakdown and pool share beside the vm_reuse_rate axis', async () => {
+  it('renders the warm-start per-origin breakdown alongside the vm_reuse_rate card', async () => {
     render(
       <MetricsDashboard
         metricsHistory={[]}
@@ -249,6 +249,12 @@ describe('MetricsDashboard', () => {
     expect(screen.getByTestId('warm-start-origin-breakdown')).toBeInTheDocument();
     const share = screen.getByTestId('warm-start-pool-share');
     expect(share).toHaveTextContent('56%'); // round(0.5625 * 100)
+
+    // The aggregate vm_reuse_rate is explicitly captioned as contaminated so the
+    // operator is steered to the per-origin split rather than the headline rate.
+    const caveat = screen.getByTestId('vm-reuse-aggregate-caveat');
+    expect(caveat).toHaveTextContent(/conflates/i);
+    expect(caveat).toHaveTextContent(/pool share/i);
   });
 
   it('omits the origin breakdown when the axes response lacks it', async () => {

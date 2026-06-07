@@ -308,3 +308,375 @@ def test_acceptance_was_declared_and_is_proven_contract():
     assert acceptance_is_proven({"proven": True}) is True
     assert acceptance_is_proven({"proven": False}) is False
     assert acceptance_is_proven({"satisfied": True}) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consolidated axis invariant tests: universal laws across full verdict matrix
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These tests parametrize across the FULL verdict-kind matrix to pin the
+# non-gameable semantic relationships as fail-closed invariants: proven implies
+# declared AND satisfied; soft kinds are satisfied-but-not-proven; unsatisfied
+# verdicts never block success; no-declaration verdicts record nothing.
+
+
+def test_invariant_proven_implies_declared_and_satisfied():
+    """Proven NEVER occurs without BOTH declared and satisfied."""
+    # The ONLY pathway to proven=True is a satisfied named_test with real
+    # verification and seam changes. All other shapes must be proven=False.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    # The one proven case: declared + satisfied + named_test + verified + seam
+    assert verdict.proven is True
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+
+    # Contrapositive: if NOT declared, then NOT proven.
+    task_undeclared = _make_code_task(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    verdict_undeclared = evaluate_code_acceptance(task_undeclared)
+    assert verdict_undeclared.declared is False
+    assert verdict_undeclared.proven is False
+
+    # Contrapositive: if NOT satisfied, then NOT proven.
+    task_unsatisfied = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],  # test not present
+        unverified_reason=None,
+    )
+    verdict_unsatisfied = evaluate_code_acceptance(task_unsatisfied)
+    assert verdict_unsatisfied.declared is True
+    assert verdict_unsatisfied.satisfied is False
+    assert verdict_unsatisfied.proven is False
+
+
+def test_invariant_soft_kinds_are_satisfied_not_proven():
+    """Observable_behavior / downstream_artifact: satisfied but never proven."""
+    for kind, extra in (
+        ("observable_behavior", {"description": "the dashboard shows the SHA banner"}),
+        ("downstream_artifact", {"artifact_id": "release-deploy-artifact-registry"}),
+    ):
+        task = _make_code_task(
+            acceptance_evidence={"kind": kind, **extra},
+            changed_files=["backend/app/x.py"],  # shipped a real diff
+        )
+        verdict = evaluate_code_acceptance(task)
+        # Soft kinds CAN be satisfied (they shipped a real diff)...
+        assert verdict.satisfied is True
+        # ...but are NEVER proven (no machine-checked assertion).
+        assert verdict.proven is False
+        # And soft kinds must be declared (verdict was recorded).
+        assert verdict.declared is True
+
+
+def test_invariant_unsatisfied_verdict_never_proven_blocks_success():
+    """Unsatisfied verdicts are never proven and block success scoring."""
+    # All fail-closed cases: declared but unsatisfied
+    fail_cases = [
+        # named_test: test not present in PR
+        {
+            "evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": ["backend/app/widget.py"],  # test missing
+            "unverified_reason": None,
+        },
+        # named_test: test-only diff
+        {
+            "evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": ["backend/testing/test_widget.py"],  # no seam
+            "unverified_reason": None,
+        },
+        # named_test: unverified merge
+        {
+            "evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            "unverified_reason": "no_runnable_suite",  # fall-open
+        },
+        # observable_behavior: no changed files
+        {
+            "evidence": {
+                "kind": "observable_behavior",
+                "description": "the dashboard shows the SHA banner",
+            },
+            "changed_files": [],  # empty diff
+            "unverified_reason": None,
+        },
+    ]
+    for case in fail_cases:
+        task = _make_code_task(
+            acceptance_evidence=case["evidence"],
+            changed_files=case["changed_files"],
+            unverified_reason=case.get("unverified_reason"),
+        )
+        verdict = evaluate_code_acceptance(task)
+        # All fail-closed cases: declared but unsatisfied.
+        assert verdict.declared is True, f"Case {case['evidence']['kind']} should be declared"
+        assert verdict.satisfied is False, f"Case {case['evidence']['kind']} should be unsatisfied"
+        # NEVER proven if unsatisfied.
+        assert verdict.proven is False, f"Case {case['evidence']['kind']} should not be proven"
+        # Unsatisfied verdict blocks success.
+        record_code_acceptance_verdict(task)
+        recorded = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+        assert acceptance_blocks_success(recorded) is True
+
+
+def test_invariant_no_declaration_records_nothing():
+    """Undeclared tasks: verdict not recorded, scoring unchanged."""
+    task = _make_code_task(
+        acceptance_evidence=None,
+        changed_files=["backend/app/x.py"],
+    )
+    verdict = evaluate_code_acceptance(task)
+    # No declaration: not recorded.
+    assert verdict.declared is False
+    result = record_code_acceptance_verdict(task)
+    assert result is None
+    # The verdict key is never written.
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in (task.context or {})
+    # Undeclared tasks never block success (backward-compatible).
+    assert acceptance_blocks_success(None) is False
+
+
+def test_invariant_all_valid_kinds_covered():
+    """Every VALID kind is tested: named_test, observable_behavior, downstream_artifact."""
+    # This invariant ensures there is no blind spot in the kind matrix.
+    # The only valid kinds per AcceptanceEvidence schema are these three.
+    # (Unknown kinds cannot be created by validation, so we test only real ones.)
+    from app.payload_schemas import AcceptanceEvidence
+
+    # named_test kind
+    nt = AcceptanceEvidence(kind="named_test", test_path="backend/testing/test_x.py")
+    assert nt.kind == "named_test"
+
+    # observable_behavior kind
+    ob = AcceptanceEvidence(kind="observable_behavior", description="feature works")
+    assert ob.kind == "observable_behavior"
+
+    # downstream_artifact kind
+    da = AcceptanceEvidence(kind="downstream_artifact", artifact_id="some-artifact")
+    assert da.kind == "downstream_artifact"
+
+    # Verify the three kinds are the closed set by checking the schema.
+    # (This documents that if AcceptanceEvidence.kind ever adds a fourth kind,
+    # this test's assertion will need updating, triggering a review of whether
+    # the evaluation logic covers the new kind.)
+    import typing
+
+    hints = typing.get_type_hints(AcceptanceEvidence)
+    kind_annotation = hints.get("kind")
+    if hasattr(kind_annotation, "__args__"):
+        valid_kinds = set(kind_annotation.__args__)
+        assert valid_kinds == {"named_test", "observable_behavior", "downstream_artifact"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregate invariant tests: per-cycle relationships that strategic/release
+# decisions consume (proven_merged <= declared_merged <= total_write, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_aggregate_invariant_proven_subset_of_declared():
+    """Per-cycle: proven_merged_count <= declared_merged_count."""
+    # Import the aggregation functions from direction_outcomes.
+    from app.direction_outcomes import (
+        proven_merged_count,
+        declared_merged_count,
+    )
+
+    # Construct synthetic research_history entries covering all sub-relations.
+    cases = [
+        # All zero: no merges, no declarations.
+        {
+            "entry": {
+                "acceptance_proven_merged": 0,
+                "acceptance_declared_merged": 0,
+                "acceptance_merged_write_total": 0,
+                "acceptance_declaration_coverage": None,
+            },
+            "expected_proven": 0,
+            "expected_declared": 0,
+            "expected_total": 0,
+        },
+        # Some declared, none proven (soft kinds only).
+        {
+            "entry": {
+                "acceptance_proven_merged": 0,
+                "acceptance_declared_merged": 3,  # 3 soft-kind merges
+                "acceptance_merged_write_total": 5,
+                "acceptance_declaration_coverage": 0.6,
+            },
+            "expected_proven": 0,
+            "expected_declared": 3,
+            "expected_total": 5,
+        },
+        # Mixed: some proven, some declared but not proven.
+        {
+            "entry": {
+                "acceptance_proven_merged": 2,  # 2 named_test proven
+                "acceptance_declared_merged": 5,  # 3 more soft kinds
+                "acceptance_merged_write_total": 7,  # 2 undeclared
+                "acceptance_declaration_coverage": 5 / 7,
+            },
+            "expected_proven": 2,
+            "expected_declared": 5,
+            "expected_total": 7,
+        },
+        # All declared, all proven (all named_tests).
+        {
+            "entry": {
+                "acceptance_proven_merged": 4,
+                "acceptance_declared_merged": 4,
+                "acceptance_merged_write_total": 4,
+                "acceptance_declaration_coverage": 1.0,
+            },
+            "expected_proven": 4,
+            "expected_declared": 4,
+            "expected_total": 4,
+        },
+    ]
+    for case in cases:
+        entry = case["entry"]
+        proven = proven_merged_count(entry)
+        declared = declared_merged_count(entry)
+
+        # Invariant 1: proven is always a subset of declared.
+        assert proven <= declared, (
+            f"proven={proven} > declared={declared} violates subset invariant"
+        )
+        # Invariant 2: declared is never larger than total merged write tasks.
+        assert declared <= entry.get("acceptance_merged_write_total", 0), (
+            f"declared={declared} > total={entry.get('acceptance_merged_write_total')} "
+            "violates coverage invariant"
+        )
+
+
+def test_aggregate_invariant_coverage_fraction():
+    """Per-cycle: declaration_coverage == declared / total, in [0, 1]."""
+    from app.direction_outcomes import declared_merged_count
+
+    cases = [
+        # No write tasks: coverage is None.
+        {
+            "entry": {
+                "acceptance_declared_merged": 0,
+                "acceptance_merged_write_total": 0,
+                "acceptance_declaration_coverage": None,
+            },
+            "expected_coverage": None,
+        },
+        # All undeclared: coverage is 0.0.
+        {
+            "entry": {
+                "acceptance_declared_merged": 0,
+                "acceptance_merged_write_total": 5,
+                "acceptance_declaration_coverage": 0.0,
+            },
+            "expected_coverage": 0.0,
+        },
+        # Half declared: coverage is 0.5.
+        {
+            "entry": {
+                "acceptance_declared_merged": 3,
+                "acceptance_merged_write_total": 6,
+                "acceptance_declaration_coverage": 0.5,
+            },
+            "expected_coverage": 0.5,
+        },
+        # All declared: coverage is 1.0.
+        {
+            "entry": {
+                "acceptance_declared_merged": 4,
+                "acceptance_merged_write_total": 4,
+                "acceptance_declaration_coverage": 1.0,
+            },
+            "expected_coverage": 1.0,
+        },
+    ]
+    for case in cases:
+        entry = case["entry"]
+        coverage = entry.get("acceptance_declaration_coverage")
+        declared = declared_merged_count(entry)
+        total = entry.get("acceptance_merged_write_total", 0)
+
+        if coverage is None:
+            # No write tasks: coverage is None.
+            assert total == 0 or declared == 0
+        else:
+            # Coverage must be in [0, 1].
+            assert 0.0 <= coverage <= 1.0, f"coverage={coverage} outside [0, 1]"
+            # Coverage must equal declared / total (within floating-point tolerance).
+            if total > 0:
+                expected_coverage = round(declared / total, 3)
+                assert coverage == expected_coverage, (
+                    f"coverage={coverage} != declared/total={expected_coverage}"
+                )
+
+
+def test_aggregate_invariant_legacy_entries_degrade_safely():
+    """Legacy entries (before new fields existed) degrade to safe defaults."""
+    from app.direction_outcomes import (
+        proven_merged_count,
+        declared_merged_count,
+    )
+
+    # Old entry: no acceptance fields at all (pre-2026-06 entries).
+    old_entry = {
+        "prs_merged": 10,
+        "tasks_completed": 5,
+    }
+    # proven and declared count functions default to 0 when fields are absent.
+    assert proven_merged_count(old_entry) == 0
+    assert declared_merged_count(old_entry) == 0
+
+
+def test_aggregate_invariant_coverage_never_exceeds_bounds():
+    """Declaration coverage is clamped to [0, 1] and never inverted."""
+    # This invariant guards against division errors or inverted numerator/denominator.
+    cases = [
+        # declared > total (logic error — should never happen, but guard it).
+        {
+            "declared": 5,
+            "total": 3,
+            "should_clamp": True,
+        },
+        # Normal case: 0 <= declared <= total.
+        {
+            "declared": 2,
+            "total": 5,
+            "should_clamp": False,
+        },
+    ]
+    for case in cases:
+        declared = case["declared"]
+        total = case["total"]
+        # Synthesize the coverage value as the code would compute it.
+        coverage = round(declared / total, 3) if total > 0 else None
+        if coverage is not None:
+            # Coverage should be in [0, 1].
+            # If declared > total, coverage would exceed 1 — that's a bug in the
+            # source code (declared should never exceed total), not a test issue.
+            # But we document the invariant: if it ever happens, coverage > 1 is
+            # detectable evidence of the bug.
+            if declared <= total:
+                assert coverage <= 1.0

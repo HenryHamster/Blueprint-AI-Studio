@@ -418,6 +418,9 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             )}
             {axisDef.key === 'vm_reuse_rate' && data.warm_start_origin_breakdown && (
               <div className="mt-2 pt-2 border-t border-neutral-700/50 text-[10px]">
+                <div data-testid="vm-reuse-aggregate-caveat" className="text-amber-400/80 mb-1">
+                  Aggregate conflates warm-pool, backlog-reuse, and chain-continuity starts — read the per-origin split (esp. pool share) below, not the headline rate.
+                </div>
                 <WarmStartOriginRow breakdown={data.warm_start_origin_breakdown} />
               </div>
             )}

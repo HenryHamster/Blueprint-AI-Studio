@@ -149,7 +149,7 @@ export function ConversionRateCard({ rate, loading }: {
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
-      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / tasks created</p>
+      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / PR-eligible tasks created</p>
     </div>
   );
 }
