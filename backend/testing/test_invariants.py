@@ -8078,12 +8078,16 @@ class TestAgentTestRunnerSourceParity:
         specified", a sub-invocation's "no tests ran") is misread as "no tests
         ran" and the gate falls open, merging UNVERIFIED.
 
-        The agent vitest suite (which directly exercises the behavior) is run
-        NOWHERE automatically — not by ./check, not by CI — so this CI-enforced
-        source-scan pins "a family the gate can launch" and "its failure
-        signature is recognized" as ONE invariant. Each per-ecosystem failure
-        signature below must be present in the classifier region; a future edit
-        that silently drops one re-opens the fall-open and fails here.
+        The agent vitest suite (which directly exercises the behavior) IS run
+        automatically by the generated ./check (the agent stack block calls
+        `npx vitest run`; see check-helper.ts), but ./check only runs on the
+        agent VM at PR time and is NOT a required CI gate on this repo's PRs —
+        so the runner-family classifier signatures it would catch are not
+        enforced by CI. This CI-enforced source-scan therefore pins "a family
+        the gate can launch" and "its failure signature is recognized" as ONE
+        invariant. Each per-ecosystem failure signature below must be present in
+        the classifier region; a future edit that silently drops one re-opens
+        the fall-open and fails here.
         """
         source = self._read_agent_source()
         region = _extract_classifier_region(source)  # raises (loud) on parse miss
