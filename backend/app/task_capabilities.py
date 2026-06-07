@@ -539,6 +539,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="ops",
         user_launchable=False,
+        plan_knowledge_prereq_eligible=True,
         # No LLM provider runs — the handler is a programmatic launch+poll loop,
         # so it never selects a model/account.
         provider_configurable=False,

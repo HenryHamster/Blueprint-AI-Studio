@@ -19,6 +19,7 @@ vi.mock('../api', () => ({
   API_BASE_URL: 'http://localhost:8000',
   fetchComputeJobs: vi.fn(async () => []),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
+  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 

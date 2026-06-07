@@ -205,6 +205,38 @@ export async function fetchTask(taskId: string): Promise<import('./components/Ta
   return res.json();
 }
 
+export interface ArtifactDownloadUrlResponse {
+  url: string;
+}
+
+export async function resolveArtifactDownloadUrl(
+  projectId: string,
+  storageUri: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    storage_uri: storageUri,
+  });
+  const res = await apiFetch(
+    `/api/admin/artifacts/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve artifact download URL: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve artifact download URL: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ArtifactDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Artifact download resolver returned an empty URL');
+  }
+  return data.url;
+}
+
 export async function fetchTaskSerialConsole(taskId: string): Promise<import('./types/task').SerialConsoleResponse> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/serial-console`);
   if (!res.ok) throw new Error(`Failed to fetch serial console: ${res.status}`);
@@ -2020,6 +2052,15 @@ export interface KnowledgeForwardQualityVerdict {
   [key: string]: unknown;
 }
 
+export interface KnowledgeCitationRecord {
+  ref?: string | null;
+  url?: string | null;
+  title?: string | null;
+  excerpt?: string | null;
+}
+
+export type KnowledgeCitation = string | KnowledgeCitationRecord;
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -2028,7 +2069,7 @@ export interface KnowledgeDocument {
   /** Strategic direction key (e.g. `d-1a2b3c4d`) that motivated the producing task, or null. */
   direction_id: string | null;
   tags: string[];
-  source_citations: unknown[];
+  source_citations: KnowledgeCitation[];
   source_task_id: string | null;
   authoring_branch?: string | null;
   head_sha?: string | null;

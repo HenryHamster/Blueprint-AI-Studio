@@ -386,17 +386,22 @@ def test_plan_subtask_types_derived_from_registry():
 def test_plan_knowledge_subtask_types_derived_from_registry():
     """PLAN_KNOWLEDGE_SUBTASK_TYPES is the single source of truth for the
     plan-decomposition KNOWLEDGE-prerequisite child allowlist. It must be
-    registry-derived from ``plan_knowledge_prereq_eligible``, equal exactly
-    {web_research, design}, be DISJOINT from PLAN_SUBTASK_TYPES (knowledge
-    prereqs are NOT PR-producing implementation subtypes), and neither type may
-    appear in WRITE_TASK_TYPES or PRODUCT_TASK_TYPES."""
+    registry-derived from ``plan_knowledge_prereq_eligible``, include the
+    durable non-PR prerequisite producers {web_research, design,
+    compute_experiment}, be DISJOINT from PLAN_SUBTASK_TYPES (knowledge
+    prereqs are NOT PR-producing implementation subtypes), and none of the
+    types may appear in WRITE_TASK_TYPES or PRODUCT_TASK_TYPES."""
     expected = {
         cap.id.value
         for cap in TASK_CAPABILITIES
         if cap.plan_knowledge_prereq_eligible
     }
     assert frozenset(expected) == PLAN_KNOWLEDGE_SUBTASK_TYPES
-    assert PLAN_KNOWLEDGE_SUBTASK_TYPES == {"web_research", "design"}
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES == {
+        "compute_experiment",
+        "design",
+        "web_research",
+    }
     assert PLAN_KNOWLEDGE_SUBTASK_TYPES.issubset(ALL_TASK_TYPES)
     # Disjoint from the PR-producing implementation allowlist — knowledge
     # prereqs must NOT be classified as PR-producing subtypes.

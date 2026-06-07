@@ -9,6 +9,8 @@ variables.
 """
 
 import os
+import re
+import uuid
 import datetime
 import logging
 import asyncio
@@ -19,6 +21,131 @@ logger = logging.getLogger(__name__)
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
+
+# Merged helpers from both sides:
+# A gs:// URI is gs://<bucket>/<object>. Buckets allow lowercase letters,
+# digits, dots, dashes and underscores; object names are far more permissive
+# but we keep them to a safe printable subset (no control chars / spaces /
+# backslashes) so a hand-supplied reference can't smuggle traversal or
+# protocol-confusion tricks past the validator.
+_GS_URI_RE = re.compile(r"^gs://([a-z0-9][a-z0-9._-]{1,221}[a-z0-9])/([A-Za-z0-9._/-]+)$")
+
+# Object paths the agent writes for per-task artifacts/payloads all live under
+# ``tasks/<task_uuid>/...``; pulling the UUID back out lets the resolver bind a
+# storage reference to the owning task (and therefore project) before signing.
+_TASK_OBJECT_RE = re.compile(
+    r"^tasks/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/"
+)
+
+# Compute-job durable artifacts live under ``compute-jobs/<job_uuid>/...``.
+_COMPUTE_JOB_OBJECT_RE = re.compile(
+    r"^compute-jobs/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/"
+)
+
+
+class StorageUriError(ValueError):
+    """A storage reference is malformed, uses a non-gs scheme, or points
+    outside the configured artifact bucket. Callers should treat this as a
+    client error (reject the reference) rather than a storage outage."""
+
+
+def parse_artifact_uri(storage_uri: str) -> tuple[str, str]:
+    """Parse and validate a ``gs://<bucket>/<object>`` artifact reference.
+
+    Returns ``(bucket, object_name)``. Raises :class:`StorageUriError` when the
+    reference is empty, not a string, not a well-formed ``gs://`` URI, or points
+    at a bucket other than the configured :data:`ARTIFACT_BUCKET_NAME`. This is
+    the single choke point for bucket-allowlisting — fail closed here and no
+    out-of-bucket object can ever be signed.
+    """
+    if not isinstance(storage_uri, str) or not storage_uri:
+        raise StorageUriError("storage reference is empty")
+    match = _GS_URI_RE.match(storage_uri)
+    if not match:
+        raise StorageUriError(
+            f"not a well-formed gs://<bucket>/<object> reference: {storage_uri!r}"
+        )
+    bucket, object_name = match.group(1), match.group(2)
+    if bucket != ARTIFACT_BUCKET_NAME:
+        raise StorageUriError(
+            f"object is outside the artifact bucket (got bucket {bucket!r})"
+        )
+    # Defence in depth: ``..`` segments can't appear given the character class,
+    # but reject explicitly so the intent is unmistakable.
+    if ".." in object_name.split("/"):
+        raise StorageUriError("object path contains a parent-directory segment")
+    return bucket, object_name
+
+
+def task_id_for_artifact_uri(storage_uri: str) -> uuid.UUID | None:
+    """Return the owning task UUID encoded in a ``tasks/<uuid>/...`` artifact
+    reference, or ``None`` if the object does not live under a task prefix.
+
+    Used by the download resolver to bind a reference to a project before
+    signing; a ``None`` result means the reference can't be authorized by task
+    ownership and must be rejected by the caller.
+    """
+    try:
+        _bucket, object_name = parse_artifact_uri(storage_uri)
+    except StorageUriError:
+        return None
+    match = _TASK_OBJECT_RE.match(object_name)
+    if not match:
+        return None
+    try:
+        return uuid.UUID(match.group(1))
+    except ValueError:
+        return None
+
+
+def compute_job_id_for_artifact_uri(storage_uri: str) -> uuid.UUID | None:
+    """Return the owning compute-job UUID encoded in a ``compute-jobs/<uuid>/``
+    artifact reference, or ``None`` if the object does not live under that prefix."""
+    try:
+        _bucket, object_name = parse_artifact_uri(storage_uri)
+    except StorageUriError:
+        return None
+    match = _COMPUTE_JOB_OBJECT_RE.match(object_name)
+    if not match:
+        return None
+    try:
+        return uuid.UUID(match.group(1))
+    except ValueError:
+        return None
+
+
+async def generate_download_signed_url(
+    storage_uri: str, expiration_minutes: int = 60
+) -> str:
+    """Validate ``storage_uri`` and mint a V4 signed GET URL for it.
+
+    Bucket/scheme validation (:func:`parse_artifact_uri`) runs first and raises
+    :class:`StorageUriError` for malformed, non-gs, or out-of-bucket references —
+    no signing is attempted in that case, so a bad reference never leaks a URL.
+    A failure of the underlying GCS client (credentials, network, missing
+    object signing key) is re-raised as the original exception for the caller to
+    map to a storage-unavailable response.
+    """
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+
+    def _generate() -> str:
+        blob = (
+            storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=expiration_minutes),
+            method="GET",
+        )
+
+    try:
+        return await asyncio.to_thread(_generate)
+    except Exception:
+        logger.exception("Failed to generate download signed URL for %s", object_name)
+        raise
+
 
 # Object-name root under the shared artifact bucket where each compute job's
 # durable outputs live. Each job uploads one durable bundle under
@@ -225,7 +352,6 @@ async def count_compute_job_artifacts(job_id) -> int:
             exc_info=True,
         )
         return 0
-
 
 async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """

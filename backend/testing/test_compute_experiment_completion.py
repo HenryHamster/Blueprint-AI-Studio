@@ -24,6 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+)
 from app.compute_backends import (
     ComputeCostResult,
     ComputeLaunchResult,
@@ -612,6 +616,92 @@ async def test_compute_knowledge_delivered_to_queued_dependent(
     prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
     assert prereqs and prereqs[0]["source_kind"] == "compute_experiment"
     assert prereqs[0]["source_task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_measured_negative_completes_and_delivers_while_broken_fails(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode treats the criterion as advisory, not as the gate.
+
+    A measured negative result still completes and delivers durable knowledge to
+    its queued dependent, while a broken run with no measured verdict still
+    fails and delivers nothing.
+    """
+    from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+
+    negative = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    negative.context = {
+        **(negative.context or {}),
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+        ),
+    }
+    negative_dependent = Task(
+        project_id=negative.project_id,
+        title="act on negative measurement",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(negative.id)],
+    )
+    db_session.add(negative)
+    db_session.add(negative_dependent)
+    await db_session.commit()
+    await db_session.refresh(negative)
+    await db_session.refresh(negative_dependent)
+
+    await _handle_compute_experiment_completion(
+        negative, _result_artifact(accuracy=0.42), db_session
+    )
+
+    await db_session.refresh(negative)
+    await db_session.refresh(negative_dependent)
+    assert negative.status == TaskStatus.COMPLETED
+    assert negative.plan_output["compute_result"]["criterion"]["met"] is False
+    assert negative.context["compute_success_criterion"]["met"] is False
+    negative_docs = await _knowledge_docs_for(db_session, negative)
+    assert len(negative_docs) == 1
+    negative_prereqs = (negative_dependent.context or {}).get(
+        KNOWLEDGE_PREREQUISITES_KEY
+    )
+    assert negative_prereqs and negative_prereqs[0]["source_task_id"] == str(
+        negative.id
+    )
+
+    broken = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    broken.context = {
+        **(broken.context or {}),
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+        ),
+    }
+    broken_dependent = Task(
+        project_id=broken.project_id,
+        title="act on broken measurement",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(broken.id)],
+    )
+    db_session.add(broken)
+    db_session.add(broken_dependent)
+    await db_session.commit()
+    await db_session.refresh(broken)
+    await db_session.refresh(broken_dependent)
+
+    await _handle_compute_experiment_completion(
+        broken, json.dumps({"job_id": "job-broken", "status": "FAILED"}), db_session
+    )
+
+    await db_session.refresh(broken)
+    await db_session.refresh(broken_dependent)
+    assert broken.status == TaskStatus.FAILED
+    assert broken.context["evaluation_gate"]["passed"] is False
+    assert await _knowledge_docs_for(db_session, broken) == []
+    assert (broken_dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
 
 
 # ── Full lifecycle: substrate kill → task completion ────────────────────────

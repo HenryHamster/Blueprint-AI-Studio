@@ -38,6 +38,10 @@ from app.models import (
     TaskStatus,
 )
 from app.compute_jobs import stamp_compute_job_result_reference
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+)
 from app.task_capabilities import WRITE_TASK_TYPES
 from app.task_evaluators import (
     EvaluationVerdict,
@@ -2062,6 +2066,81 @@ async def _handle_compute_experiment_completion(
         crit_context["compute_success_criterion"] = criterion
         task.context = crit_context
         flag_modified(task, "context")
+
+    prerequisite_mode = (
+        (task.context or {}).get(COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY)
+        == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+    )
+
+    if prerequisite_mode:
+        measurement = _extract_compute_measurement(logs)
+        if measurement is None:
+            record_failed_gate(task, verdict)
+            session.add(task)
+            await session.commit()
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(task.id), "status": TaskStatus.FAILED},
+            )
+            logger.info(
+                "[COMPUTE] Prerequisite-mode task %s produced no measured verdict: %s",
+                task.id,
+                verdict.reason,
+            )
+            await _persist_compute_experiment_knowledge_best_effort(
+                task, logs, criterion, session
+            )
+            return
+
+        outcome, cost = measurement
+        plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+        plan_output = dict(plan_output)
+        compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
+        if criterion is not None:
+            compute_result["criterion"] = criterion
+        plan_output["compute_result"] = compute_result
+        task.plan_output = plan_output
+        flag_modified(task, "plan_output")
+        task.latest_status_message = (
+            f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
+        )[:500]
+        result_reference = _extract_compute_result_reference(logs)
+        job_id = None
+        try:
+            payload = json.loads(logs)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            raw_job_id = payload.get("job_id")
+            if raw_job_id is not None:
+                try:
+                    job_id = uuid.UUID(str(raw_job_id))
+                except (TypeError, ValueError):
+                    job_id = None
+        if job_id is not None:
+            await stamp_compute_job_result_reference(
+                session,
+                task_id=task.id,
+                job_id=job_id,
+                result_reference=result_reference,
+            )
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+        )
+        logger.info(
+            "[COMPUTE] Prerequisite-mode task %s completed with measured verdict",
+            task.id,
+        )
+        await _persist_compute_experiment_knowledge_best_effort(
+            task, logs, criterion, session
+        )
+        return
 
     if not verdict.passed:
         record_failed_gate(task, verdict)

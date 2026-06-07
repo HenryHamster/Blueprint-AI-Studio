@@ -4557,6 +4557,8 @@ def _compute_finding(
     spend_cap_usd=2.0,
     deadline_seconds=3600,
     success_criterion=None,
+    accelerator=None,
+    provisioning_model=None,
     nested_key=None,
     title="Measure throughput regression",
 ):
@@ -4579,6 +4581,10 @@ def _compute_finding(
         launch["deadline_seconds"] = deadline_seconds
     if success_criterion is not None:
         launch["success_criterion"] = success_criterion
+    if accelerator is not None:
+        launch["accelerator"] = accelerator
+    if provisioning_model is not None:
+        launch["provisioning_model"] = provisioning_model
     if nested_key:
         finding[nested_key] = launch
     else:
@@ -4861,6 +4867,34 @@ class TestComputeExperimentSpawn:
         assert payload.get("command") == "python3 bench.py --n 1000"
         assert payload.get("spend_cap_usd") == 1.0
         assert children[0].requires_approval is False
+
+    async def test_accelerator_and_provisioning_forwarded(self, db_session, mocker):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx04a")
+        finding = _compute_finding(
+            direction["id"],
+            spend_cap_usd=1.5,
+            deadline_seconds=240,
+            accelerator="V100",
+            provisioning_model="spot",
+            nested_key="compute_experiment",
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        payload = children[0].first_payload or {}
+        assert payload["accelerator"] == "V100"
+        assert payload["provisioning_model"] == "spot"
 
     async def test_malformed_missing_command_defers_no_task(
         self, db_session, mocker, caplog

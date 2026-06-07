@@ -2136,6 +2136,38 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('"type"');
   });
 
+  // ── handlePlan compute_experiment empirical-prerequisite documentation ────────
+  // The plan prompt must advertise the new measurement-prerequisite subtype so a
+  // plan can express "measure this first, then act on the verdict": the
+  // type="compute_experiment" subtask, its launch-contract fields, and the
+  // measured-negative-vs-broken consumption semantics that decide whether a
+  // depends_on dependent still runs.
+  it('handlePlan prompt documents the compute_experiment prerequisite subtype', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('type="compute_experiment"');
+  });
+
+  it('handlePlan prompt lists the compute_experiment launch-contract fields', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"command"');
+    expect(p).toContain('"spend_cap_usd"');
+    expect(p).toContain('"deadline_seconds"');
+    expect(p).toContain('"success_criterion"');
+  });
+
+  it('handlePlan prompt explains measured-negative-is-consumable vs broken-cancels semantics', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // A measured negative is still usable evidence — the dependent still runs.
+    expect(p).toMatch(/MEASURED NEGATIVE/);
+    // A broken run with no usable verdict cancels the dependent follow-on.
+    expect(p).toMatch(/BROKEN run/);
+    // The verdict is consumed via depends_on_indices.
+    expect(p).toContain('depends_on_indices');
+  });
+
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
   // Regression: the plan prompt previously told the agent that any subtask
   // touching backend/app/models.py (or adding tables/columns) must spawn a

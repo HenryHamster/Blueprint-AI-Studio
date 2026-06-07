@@ -37,6 +37,10 @@ from app.cochange_decomposition import (
     auto_decompose_findings_by_cochange,
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
 )
+from app.compute_experiment_contract import (
+    _author_compute_launch_contract,  # noqa: F401 — re-exported for tests
+    _validate_compute_launch_contract,  # noqa: F401 — re-exported for tests
+)
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
@@ -525,72 +529,6 @@ def _compute_prompt_telemetry(
 COMPUTE_EXPERIMENT_FINDING_TYPES: frozenset[str] = frozenset(
     {"compute_experiment", "measurement", "benchmark"}
 )
-
-
-def _author_compute_launch_contract(finding: Dict[str, Any]) -> Dict[str, Any]:
-    """Assemble a compute_experiment launch contract from a research finding.
-
-    A measurement finding may carry the launch fields either flat on the finding
-    or nested under a ``compute_experiment`` / ``launch_contract`` dict. The
-    required fields are ``command``, ``spend_cap_usd`` and ``deadline_seconds``;
-    optional fields (``success_criterion`` and the benchmark/launch metadata) are
-    forwarded only when present. Validation is the caller's responsibility via
-    :func:`_validate_compute_launch_contract` — this only collects the raw spec.
-    """
-    nested = finding.get("compute_experiment") or finding.get("launch_contract") or {}
-    if not isinstance(nested, dict):
-        nested = {}
-
-    def _pick(key: str) -> Any:
-        val = nested.get(key)
-        if val is None:
-            val = finding.get(key)
-        return val
-
-    contract: Dict[str, Any] = {
-        "command": _pick("command"),
-        "spend_cap_usd": _pick("spend_cap_usd"),
-        "deadline_seconds": _pick("deadline_seconds"),
-    }
-    success = _pick("success_criterion")
-    if success is not None:
-        contract["success_criterion"] = success
-    for opt_key in ("machine_type", "experiment", "benchmark", "metric", "cwd", "env", "accelerator", "provisioning_model"):
-        val = _pick(opt_key)
-        if val is not None:
-            contract[opt_key] = val
-    return contract
-
-
-def _validate_compute_launch_contract(
-    contract: Dict[str, Any],
-) -> tuple[bool, str]:
-    """Return ``(ok, reason)`` for a proposed compute_experiment launch contract.
-
-    Requires a non-empty command, a strictly positive ``spend_cap_usd`` and a
-    strictly positive ``deadline_seconds``. ``reason`` names the first failure so
-    the finding can be deferred with a clear logged reason instead of spawning a
-    broken job.
-    """
-    command = contract.get("command")
-    if not (isinstance(command, str) and command.strip()):
-        return False, "missing or empty command"
-    try:
-        spend = float(contract.get("spend_cap_usd"))
-    except (TypeError, ValueError):
-        return False, f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})"
-    if not spend > 0:
-        return False, f"spend_cap_usd must be positive (got {spend})"
-    try:
-        deadline = int(contract.get("deadline_seconds"))
-    except (TypeError, ValueError):
-        return (
-            False,
-            f"deadline_seconds is not an integer ({contract.get('deadline_seconds')!r})",
-        )
-    if not deadline > 0:
-        return False, f"deadline_seconds must be positive (got {deadline})"
-    return True, ""
 
 
 def _resolve_compute_spend_threshold(

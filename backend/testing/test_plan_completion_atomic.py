@@ -18,6 +18,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import select
 
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+)
 from app.models import Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
@@ -462,7 +466,9 @@ async def test_dependent_on_skipped_producer_fails_plan(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES))
+@pytest.mark.parametrize(
+    "knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES - {"compute_experiment"})
+)
 async def test_knowledge_prereq_subtype_spawns_as_itself(
     db_session, mocker, _quiet_mocks, knowledge_type
 ):
@@ -529,6 +535,88 @@ async def test_knowledge_prereq_subtype_spawns_as_itself(
 
 
 @pytest.mark.asyncio
+async def test_compute_experiment_prereq_spawns_launch_payload_and_dependency(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan may spawn a compute_experiment prerequisite as a non-PR producer.
+
+    The child payload must carry the authored launch contract, omit the create
+    prompt suffix, and stamp prerequisite mode so completion treats the success
+    criterion as advisory while downstream dependents still wait on its task ID.
+    """
+    from app.shared_state import runtime_config
+
+    runtime_config["agent_prompt_suffixes"] = {"create": "IMPLEMENTATION SUFFIX"}
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Measure the baseline",
+                    "prompt": "benchmark the current implementation",
+                    "type": "compute_experiment",
+                    "command": "python bench.py --mode baseline",
+                    "spend_cap_usd": 3.5,
+                    "deadline_seconds": 900,
+                    "success_criterion": {
+                        "metric": "accuracy",
+                        "operator": ">=",
+                        "threshold": 0.9,
+                    },
+                    "machine_type": "n2-standard-4",
+                    "experiment": "baseline-accuracy",
+                    "benchmark": "suite-v1",
+                    "metric": "accuracy",
+                    "cwd": "backend",
+                    "env": {"BENCHMARK_MODE": "baseline"},
+                    "accelerator": "T4",
+                    "provisioning_model": "spot",
+                },
+                {
+                    "title": "Implement against the measurement",
+                    "prompt": "use the measured result",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_title = {c.title: c for c in children}
+    producer = by_title["Measure the baseline"]
+    dependent = by_title["Implement against the measurement"]
+
+    payload = producer.first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload["command"] == "python bench.py --mode baseline"
+    assert payload["spend_cap_usd"] == pytest.approx(3.5)
+    assert payload["deadline_seconds"] == 900
+    assert payload["success_criterion"]["metric"] == "accuracy"
+    assert payload["machine_type"] == "n2-standard-4"
+    assert payload["experiment"] == "baseline-accuracy"
+    assert payload["benchmark"] == "suite-v1"
+    assert payload["metric"] == "accuracy"
+    assert payload["cwd"] == "backend"
+    assert payload["env"] == {"BENCHMARK_MODE": "baseline"}
+    assert payload["accelerator"] == "T4"
+    assert payload["provisioning_model"] == "spot"
+    assert "prompt_suffix" not in payload
+    assert "prompt" not in payload
+    assert (producer.context or {})[
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY
+    ] == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+    assert dependent.depends_on == [str(producer.id)]
+
+
+@pytest.mark.asyncio
 async def test_implementation_child_can_depend_on_knowledge_prereq(
     db_session, mocker, _quiet_mocks
 ):
@@ -581,6 +669,49 @@ async def test_implementation_child_can_depend_on_knowledge_prereq(
         f"Dependent create should depend on the knowledge producer, "
         f"got {dependent.depends_on!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_invalid_compute_prereq_contract_fails_when_kept_subtask_depends_on_it(
+    db_session, mocker, _quiet_mocks
+):
+    """An invalid compute prerequisite is skipped, and dependents fail cleanly."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Broken measurement",
+                    "prompt": "measure first",
+                    "type": "compute_experiment",
+                    "command": "   ",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                },
+                {
+                    "title": "Implement using the measurement",
+                    "prompt": "use its result",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.FAILED
+    msg = task.latest_status_message or ""
+    assert "unsatisfiable dependency" in msg.lower()
+    assert "invalid compute_experiment launch contract" in msg
+    assert "missing or empty command" in msg
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert children == []
 
 
 @pytest.mark.asyncio

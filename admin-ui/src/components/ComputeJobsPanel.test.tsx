@@ -10,10 +10,12 @@ import {
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
+const resolveArtifactDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
   killComputeJob: (...args: unknown[]) => killComputeJob(...args),
+  resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -77,6 +79,7 @@ describe('ComputeJobsPanel render + kill', () => {
   afterEach(() => {
     fetchComputeJobs.mockReset();
     killComputeJob.mockReset();
+    resolveArtifactDownloadUrl.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -118,6 +121,27 @@ describe('ComputeJobsPanel render + kill', () => {
     const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const link = await findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i });
     expect(link).toHaveAttribute('href', 'https://storage.example.com/jobs/job-1/result.json');
+  });
+
+  test('resolves a gs:// terminal result link through the admin API before opening', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/jobs/job-1/result.json');
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        result_reference: 'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
+      }),
+    ]);
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-1\/result\.json/i });
+    await act(async () => { button.click(); });
+    await waitFor(() => expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith(
+      'proj-1',
+      'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
+    ));
+    expect(openSpy).toHaveBeenCalled();
   });
 
   test('renders nothing when there are no jobs', async () => {

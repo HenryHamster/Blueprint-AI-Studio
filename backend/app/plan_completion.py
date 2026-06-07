@@ -12,6 +12,12 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+    _author_compute_launch_contract,
+    _validate_compute_launch_contract,
+)
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import (
@@ -572,15 +578,28 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
     # depends on a skipped (non-eligible) producer.
     # A plan child is eligible if it is a PR-producing implementation subtype OR a
-    # knowledge-prerequisite subtype (web_research / design). The latter spawns AS
-    # ITSELF (no branch/PR) so a downstream implementation child can validly depend
-    # on the knowledge it produces.
+    # knowledge-prerequisite subtype (web_research / design / compute_experiment).
+    # The latter spawns AS ITSELF (no branch/PR) so a downstream implementation
+    # child can validly depend on the knowledge it produces.
     plan_child_allowlist = PLAN_SUBTASK_TYPES | PLAN_KNOWLEDGE_SUBTASK_TYPES
     skipped_indices = set()
+    skipped_reasons: dict[int, str] = {}
     for i, subtask_def in enumerate(subtasks):
         raw_type = subtask_def.get("type", "create")
         if raw_type not in plan_child_allowlist:
             skipped_indices.add(i)
+            skipped_reasons[i] = "not a registered plan-spawnable task type"
+            continue
+        if raw_type == "compute_experiment":
+            compute_contract = _author_compute_launch_contract(subtask_def)
+            contract_ok, contract_reason = _validate_compute_launch_contract(
+                compute_contract
+            )
+            if not contract_ok:
+                skipped_indices.add(i)
+                skipped_reasons[i] = (
+                    f"invalid compute_experiment launch contract ({contract_reason})"
+                )
 
     for i, subtask_def in enumerate(subtasks):
         if i in skipped_indices:
@@ -591,10 +610,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 skipped_title = subtasks[dep_idx].get("title", f"#{dep_idx}")
                 skipped_type = subtasks[dep_idx].get("type", "create")
                 dependent_title = subtask_def.get("title", f"#{i}")
+                skipped_reason = skipped_reasons.get(
+                    dep_idx, "not a registered plan-spawnable task type"
+                )
                 task.latest_status_message = (
                     f"Plan has unsatisfiable dependency: {dependent_title!r} "
                     f"depends on {skipped_title!r} (type {skipped_type!r}, "
-                    f"not a registered plan-spawnable task type)"
+                    f"skipped because {skipped_reason})"
                 )[:500]
                 task.status = TaskStatus.FAILED
                 from app.failure_classification import (
@@ -667,12 +689,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         # downstream dependency-injection pass.
         if i in skipped_indices:
             raw_type = subtask_def.get("type", "create")
+            skip_reason = skipped_reasons.get(
+                i, "not a registered plan-spawnable task type"
+            )
             logger.warning(
-                "[PLAN] Skipping subtask %r with non-eligible type %r "
-                "(not a registered plan-spawnable write or knowledge task type) in plan %s",
+                "[PLAN] Skipping subtask %r with type %r in plan %s: %s",
                 subtask_def.get("title", "Untitled subtask"),
                 raw_type,
                 task.id,
+                skip_reason,
             )
             child_tasks.append(None)
             continue
@@ -763,31 +788,63 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             and i in _parent_evidence_targets
         ):
             subtask_acceptance_evidence = _parent_payload_evidence
+        if subtask_type == "compute_experiment":
+            compute_contract = _author_compute_launch_contract(subtask_def)
+            child_payload = validate_internal_payload(
+                {
+                    "type": "compute_experiment",
+                    "command": compute_contract["command"],
+                    "spend_cap_usd": float(compute_contract["spend_cap_usd"]),
+                    "deadline_seconds": int(compute_contract["deadline_seconds"]),
+                    **(
+                        {"success_criterion": compute_contract["success_criterion"]}
+                        if compute_contract.get("success_criterion") is not None
+                        else {}
+                    ),
+                    **{
+                        key: compute_contract[key]
+                        for key in (
+                            "machine_type",
+                            "experiment",
+                            "benchmark",
+                            "metric",
+                            "cwd",
+                            "env",
+                            "accelerator",
+                            "provisioning_model",
+                        )
+                        if compute_contract.get(key) is not None
+                    },
+                    **({"model": subtask_model} if subtask_model else {}),
+                    **({"effort": subtask_effort} if subtask_effort else {}),
+                },
+                "task_completion:plan_subtask:compute_experiment",
+            )
+        else:
+            child_payload = validate_internal_payload(
+                {
+                    "type": subtask_type,
+                    "prompt": full_prompt,
+                    "base_branch": plan_branch,
+                    **({"model": subtask_model} if subtask_model else {}),
+                    **({"effort": subtask_effort} if subtask_effort else {}),
+                    **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                    **({"hotfix": True} if parent_hotfix else {}),
+                    **(
+                        {"acceptance_evidence": subtask_acceptance_evidence}
+                        if subtask_acceptance_evidence
+                        else {}
+                    ),
+                },
+                f"task_completion:plan_subtask:{subtask_type}",
+            )
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
             requires_approval=False,
-            payloads=[
-                validate_internal_payload(
-                    {
-                        "type": subtask_type,
-                        "prompt": full_prompt,
-                        "base_branch": plan_branch,
-                        **({"model": subtask_model} if subtask_model else {}),
-                        **({"effort": subtask_effort} if subtask_effort else {}),
-                        **({"prompt_suffix": create_suffix} if create_suffix else {}),
-                        **({"hotfix": True} if parent_hotfix else {}),
-                        **(
-                            {"acceptance_evidence": subtask_acceptance_evidence}
-                            if subtask_acceptance_evidence
-                            else {}
-                        ),
-                    },
-                    f"task_completion:plan_subtask:{subtask_type}",
-                )
-            ],
+            payloads=[child_payload],
             context={
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
@@ -811,6 +868,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 **(
                     {"research_task_id": parent_research_task_id}
                     if parent_research_task_id
+                    else {}
+                ),
+                **(
+                    {
+                        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+                            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+                        )
+                    }
+                    if subtask_type == "compute_experiment"
                     else {}
                 ),
                 **({"hotfix": True} if parent_hotfix else {}),

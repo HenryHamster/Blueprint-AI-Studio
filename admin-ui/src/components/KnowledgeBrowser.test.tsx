@@ -46,6 +46,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: vi.fn(() =>
     Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
   ),
+  resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
 }));
 
 describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
@@ -76,10 +77,12 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
       );
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const buttons = (host as HTMLDivElement).querySelectorAll('button');
-    const docButton = Array.from(buttons).find(b => b.textContent?.includes('Survey of reachable web sources'));
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
     expect(docButton).toBeTruthy();
-    await act(async () => { docButton!.click(); });
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { docButton.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
   }
 
@@ -111,5 +114,40 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Grounded 1 of 1 citation');
     expect(text).not.toContain('1 of 1 citations');
+  });
+
+  test('resolves gs:// citations through the signed download API', async () => {
+    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: ['gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf'],
+    } as never);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    await openDetail();
+    const citationButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(
+      (button) => button.textContent?.includes('gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf'),
+    );
+    expect(citationButton).toBeTruthy();
+    if (!citationButton) throw new Error('expected gs:// citation button');
+    await act(async () => { citationButton.click(); });
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledWith(
+      'project-test',
+      'gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf',
+    );
+    expect(openSpy).toHaveBeenCalled();
+  });
+
+  test('renders null citations as plain text instead of crashing', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: [null, 'https://example.com/live'],
+    } as never);
+    await openDetail();
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('null');
+    expect(text).toContain('https://example.com/live');
   });
 });

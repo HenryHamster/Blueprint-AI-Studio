@@ -59,6 +59,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: vi.fn(() =>
     Promise.resolve({ ...sampleDocs[0], body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' }),
   ),
+  resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-0000-1111-2222-3333')),
 }));
 
 describe('KnowledgeBrowser — viewport regression', () => {
@@ -104,8 +105,9 @@ describe('KnowledgeBrowser — viewport regression', () => {
   test('detail view renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       await renderList();
-      const buttons = (host as HTMLDivElement).querySelectorAll('button');
-      const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('Resilient connection pooling'),
+      );
       if (docButton) {
         await act(async () => { docButton.click(); });
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
@@ -114,7 +116,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {
-    await expectMinTouchTargetAt(375, async () => { await renderList(); }, { selector: 'button, a[href]' });
+    await expectMinTouchTargetAt(375, async () => { await renderList(); }, { selector: 'button, a[href], [role="button"]' });
   });
 
   test('empty-state CTA launches web research for the search term at 375px', async () => {
@@ -138,8 +140,9 @@ describe('KnowledgeBrowser — viewport regression', () => {
     const onLaunchWebResearchTask = vi.fn();
     await expectNoOverflowAt(375, async () => {
       await renderList(onLaunchWebResearchTask);
-      const buttons = (host as HTMLDivElement).querySelectorAll('button');
-      const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('Resilient connection pooling'),
+      );
       if (docButton) {
         await act(async () => { fireEvent.click(docButton); });
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
@@ -169,7 +172,8 @@ describe('KnowledgeBrowser — viewport regression', () => {
       b => b.textContent?.trim() === 'Design' && b.hasAttribute('data-viewport-allow-small-target'),
     );
     expect(designFilter).toBeTruthy();
-    await act(async () => { designFilter!.click(); });
+    if (!designFilter) throw new Error('expected design filter button');
+    await act(async () => { designFilter.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
     expect(mock).toHaveBeenCalledWith(
       'project-test',
@@ -179,10 +183,12 @@ describe('KnowledgeBrowser — viewport regression', () => {
 
   test('detail view renders provenance branch and sha when present', async () => {
     await renderList();
-    const buttons = (host as HTMLDivElement).querySelectorAll('button');
-    const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Resilient connection pooling'),
+    );
     expect(docButton).toBeTruthy();
-    await act(async () => { docButton!.click(); });
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { docButton.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     expect((host as HTMLDivElement).textContent).toContain('feature/knowledge-provenance@abc1234');
   });

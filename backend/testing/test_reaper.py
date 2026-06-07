@@ -9350,6 +9350,120 @@ async def test_unblock_sweep_escalates_dead_dependency(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_requeues_completed_measured_negative_compute_prereq(
+    reaper_db, mocker
+):
+    """A measured-negative compute prerequisite is still eligible once completed."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id,
+        title="measure baseline",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+        context={
+            "compute_success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.42,
+                "met": False,
+                "measurable": True,
+            }
+        },
+        status_log=[],
+        plan_output={
+            "compute_result": {
+                "outcome": "SUCCESS",
+                "final_cost_usd": 0.37,
+                "criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                    "value": 0.42,
+                    "met": False,
+                    "measurable": True,
+                },
+            }
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        depends_on=[str(dep.id)],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_escalated") is None
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_escalates_broken_compute_prereq(reaper_db, mocker):
+    """A broken compute prerequisite still cascade-blocks its dependent."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id,
+        title="measure baseline",
+        description="x",
+        status=TaskStatus.FAILED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+        context={"evaluation_gate": {"passed": False, "strategy": "metric"}},
+        status_log=[],
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        depends_on=[str(dep.id)],
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_deadline_escalation(reaper_db, mocker):
     """A blocker older than the escalation deadline gets one ERROR alert, stays parked."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)

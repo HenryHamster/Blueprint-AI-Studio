@@ -18,6 +18,13 @@ class DeployPayload(BaseModel):
     github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
 
 
+class ArtifactDownloadResponse(BaseModel):
+    """Signed, time-limited GET URL minted for a project-owned ``gs://`` artifact
+    reference by ``GET /api/admin/artifacts/download-url``."""
+
+    url: str
+
+
 class TaskEvaluationSummaryItem(BaseModel):
     label: str
     value: str
