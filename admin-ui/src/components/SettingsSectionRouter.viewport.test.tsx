@@ -148,6 +148,7 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
     onRollback: async () => {},
     onMarkStable: async () => {},
     onRepairState: async () => {},
+    failedRollback: null,
     zoneHealth: null,
 
     // Notifications (full panel)

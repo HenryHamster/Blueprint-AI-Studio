@@ -68,6 +68,7 @@ export function useAppState() {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,
+    failedRollback,
     zoneHealth, orchestratorHealth, detailedHealth, diagnostics,
   } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId);
 
@@ -643,6 +644,7 @@ export function useAppState() {
     // Deploy state
     deployState, handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,
+    failedRollback,
     // Zone health
     zoneHealth,
     // Orchestrator health

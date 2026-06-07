@@ -4,7 +4,7 @@ import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHo
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
-import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
@@ -159,6 +159,11 @@ export interface HeaderBarProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  // Standing client-side signal that the last manual rollback failed (the
+  // backend returned status='rollback_failed' and left state untouched). Null
+  // when there is no outstanding failed rollback. Threaded to the deploy panel
+  // so the affordance outlives the transient error toast.
+  failedRollback: FailedRollbackInfo | null;
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
@@ -569,6 +574,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onRollback={props.onRollback}
           onMarkStable={props.onMarkStable}
           onRepairState={props.onRepairState}
+          failedRollback={props.failedRollback}
           zoneHealth={props.zoneHealth}
           userRole={props.userRole}
           userEmail={props.userEmail}

@@ -136,6 +136,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRollback={async () => {}}
             onMarkStable={async () => {}}
             onRepairState={async () => {}}
+            failedRollback={null}
             zoneHealth={null}
             notificationConfig={{
               webhook_url: '',
@@ -293,6 +294,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRollback={async () => {}}
             onMarkStable={async () => {}}
             onRepairState={async () => {}}
+            failedRollback={null}
             zoneHealth={null}
             notificationConfig={{
               webhook_url: '',
@@ -450,6 +452,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRollback={async () => {}}
             onMarkStable={async () => {}}
             onRepairState={async () => {}}
+            failedRollback={null}
             zoneHealth={null}
             notificationConfig={{
               webhook_url: '',

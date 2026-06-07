@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap } from 'lucide-react';
+import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap, AlertTriangle } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
-import type { DeployState } from '../types/settings';
+import type { DeployState, FailedRollbackInfo } from '../types/settings';
 
 const EXTERNAL_DEP_ORDER = ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp'] as const;
 
@@ -35,6 +35,12 @@ interface DeploySectionProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  // Standing failed-rollback signal. When set, the last manual rollback's Cloud
+  // Run traffic shift failed (backend HTTP 200 status='rollback_failed') and
+  // traffic still serves the bad revision. Rendered as a durable banner so the
+  // failure stays visible after the transient error toast auto-dismisses.
+  // Optional so existing callers/tests compile unchanged.
+  failedRollback?: FailedRollbackInfo | null;
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
 }
 
@@ -46,6 +52,7 @@ export function DeploySection({
   onRollback,
   onMarkStable,
   onRepairState,
+  failedRollback,
   zoneHealth,
 }: DeploySectionProps) {
   const lastCheckIso = typeof deployState?.external_health?.last_check === 'string'
@@ -218,6 +225,30 @@ export function DeploySection({
                     </div>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* Durable failed-rollback banner. The rollback error toast
+                auto-dismisses after a few seconds, after which a STABLE surface
+                is indistinguishable from a successful rollback (false success by
+                absence). This standing banner keeps the failure visible until
+                the operator resolves it (a successful rollback, mark-stable, or
+                any deploy-state status change clears it upstream in the hook),
+                and the adjacent Rollback button below invites the retry. */}
+            {failedRollback && (
+              <div className="bg-red-950/30 border border-red-900/50 rounded-lg px-3 py-2.5 flex items-start gap-2" role="alert">
+                <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
+                <div className="space-y-0.5 min-w-0">
+                  <p className="text-xs font-semibold text-red-400">Last rollback failed — traffic still serves the current revision</p>
+                  <p className="text-[11px] text-red-400/80 break-all">
+                    Traffic still serves{' '}
+                    <span className="font-mono">{failedRollback.serving_sha?.slice(0, 8) ?? 'the current revision'}</span>
+                    . Retry the rollback below.
+                  </p>
+                  {failedRollback.gcloud_error && (
+                    <p className="text-[11px] text-red-400/70 font-mono break-all">{failedRollback.gcloud_error}</p>
+                  )}
+                </div>
               </div>
             )}
 

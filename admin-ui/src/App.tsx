@@ -684,6 +684,7 @@ export default function App() {
         onRollback={s.handleRollback}
         onMarkStable={s.handleMarkStable}
         onRepairState={s.handleRepairState}
+        failedRollback={s.failedRollback}
         zoneHealth={s.zoneHealth}
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}

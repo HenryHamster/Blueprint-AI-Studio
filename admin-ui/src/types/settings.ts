@@ -81,6 +81,22 @@ export interface DeployState {
   external_health?: Record<string, unknown>;
 }
 
+// Client-side-only standing signal that the operator's last manual rollback
+// attempt failed: the backend returned HTTP 200 status='rollback_failed' (the
+// Cloud Run traffic shift never happened) and left deploy state untouched
+// (STABLE). There is NO server field for this — it is reconstructed from the
+// rollback response and held in the hook so the failed-rollback affordance
+// survives past the transient error toast. Cleared on the operator's next
+// resolving action (a successful rollback, a mark-stable, or any deploy-state
+// status change away from the at-failure status).
+export interface FailedRollbackInfo {
+  // The SHA still serving traffic (the bad revision the operator wanted to
+  // leave behind). Mirrors the backend `serving_sha` field; null when absent.
+  serving_sha: string | null;
+  // The gcloud traffic-shift error, when the backend included one.
+  gcloud_error?: string | null;
+}
+
 export interface ProviderModeCapabilities {
   [capability: string]: boolean | number | string | null;
 }

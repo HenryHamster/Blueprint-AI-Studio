@@ -482,6 +482,59 @@ describe('SettingsDeploySection — viewport regression', () => {
     expect(text.toLowerCase()).not.toContain('flapping');
   });
 
+  test('renders a durable failed-rollback banner when failedRollback is set', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={baseDeployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          failedRollback={{ serving_sha: 'badc0ffee0000000', gcloud_error: 'traffic shift rejected' }}
+          zoneHealth={null}
+        />
+      );
+    });
+    const banner = host.querySelector('[role="alert"]');
+    expect(banner).toBeTruthy();
+    const text = banner?.textContent ?? '';
+    // States that the rollback failed and traffic still serves the bad revision.
+    expect(text).toContain('Last rollback failed');
+    expect(text).toContain('badc0ffe');
+    // Surfaces the gcloud reason and invites a retry.
+    expect(text).toContain('traffic shift rejected');
+    expect(text.toLowerCase()).toContain('retry');
+  });
+
+  test('omits the failed-rollback banner when failedRollback is null', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={baseDeployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          failedRollback={null}
+          zoneHealth={null}
+        />
+      );
+    });
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(host.textContent ?? '').not.toContain('Last rollback failed');
+  });
+
   test('interactive controls meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
