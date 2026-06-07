@@ -25,7 +25,7 @@ from sqlmodel import select
 
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     Alert,
     AlertSeverity,
@@ -569,6 +569,18 @@ async def _load_outer_loop_original_tasks(
                 Task.status,
                 Task.context,
                 Task.created_at,
+                # Hydrated originals are appended to the task list the
+                # convergence reducer walks, and an in-window original can be
+                # CANCELLED (outside the COMPLETED/FAILED window query), so the
+                # outcome walker (task_outcomes.evaluate_task_outcome) reads
+                # first_payload -> payloads and, on the CANCELLED path,
+                # direction_outcomes._is_cascade_cancelled reads
+                # latest_status_message. Leaving either deferred lazy-loads
+                # inside the async session and raises MissingGreenlet. The set
+                # is small (one original per PR chain), so loading the columns
+                # outright is fine — no projection needed.
+                Task.payloads,
+                Task.latest_status_message,
             )
         )
     )
@@ -577,6 +589,136 @@ async def _load_outer_loop_original_tasks(
 
     originals = list((await session.execute(stmt)).scalars().all())
     return {str(task.id): task for task in originals}
+
+
+# Columns the outer-loop chain reducers AND the per-task outcome walker
+# (task_outcomes.evaluate_task_outcome, reached via the convergence summary's
+# non_code_outcomes block) read directly off each row. ``latest_status_message``
+# is required by the walker's CANCELLED classification
+# (direction_outcomes._is_cascade_cancelled); a deferred read of any of these
+# inside the async session raises MissingGreenlet (prod 2026-06-07: 500s on
+# /api/admin/digest and both outer-loop-convergence endpoints).
+_OUTER_LOOP_TASK_COLUMNS = (
+    Task.id,
+    Task.project_id,
+    Task.status,
+    Task.context,
+    Task.created_at,
+    Task.latest_status_message,
+)
+
+
+async def _fetch_outer_loop_tasks(
+    session: AsyncSession,
+    *,
+    cutoff: datetime,
+    project_id: uuid.UUID | None,
+    limit: int,
+    order_desc: bool = False,
+) -> List[Task]:
+    """Fetch the outer-loop window's terminal tasks with their payload type.
+
+    The convergence summary walks every terminal non-review-chain task through
+    ``task_outcomes.evaluate_task_outcome`` (the ``non_code_outcomes`` block),
+    which resolves the task type from ``Task.first_payload``. Loading the full
+    ``payloads`` JSONB array for a 5000-10000 row scan is the memory blow-up the
+    digest's SQL-side projection exists to avoid, so on PostgreSQL we project
+    just ``payloads[0]['type']`` and stash it for ``first_payload``; SQLite
+    (tests/local) lacks usable JSON-path projection semantics and falls back to
+    loading the column, mirroring ``admin_digest._compute_digest``.
+    """
+    from app.sr_review_quality_metrics import (  # noqa: PLC0415
+        _stash_projected_task_fields,
+    )
+
+    use_projection = resolve_dialect_name(session) == "postgresql"
+    where_clauses = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        Task.created_at >= cutoff,
+    ]
+    if project_id is not None:
+        where_clauses.append(Task.project_id == project_id)
+
+    if use_projection:
+        stmt = select(
+            Task,
+            Task.payloads[0]["type"].as_string().label("_first_payload_type"),
+        ).options(load_only(*_OUTER_LOOP_TASK_COLUMNS))
+    else:
+        stmt = select(Task).options(
+            load_only(*_OUTER_LOOP_TASK_COLUMNS, Task.payloads)
+        )
+    stmt = stmt.where(*where_clauses)
+    if order_desc:
+        stmt = stmt.order_by(Task.created_at.desc())
+    stmt = stmt.limit(limit)
+
+    if not use_projection:
+        return list((await session.execute(stmt)).scalars().all())
+
+    tasks: List[Task] = []
+    for row in (await session.execute(stmt)).all():
+        task = row[0]
+        # Don't clobber a richer projection stashed by an earlier query in the
+        # same session: the digest's 5000-row scan stashes the FULL first
+        # payload (plus a completed-at timestamp) on these same identity-mapped
+        # instances before calling into this endpoint.
+        if not hasattr(task, "_projected_first_payload"):
+            _stash_projected_task_fields(
+                task,
+                first_payload={"type": row[1]} if row[1] else {},
+            )
+        tasks.append(task)
+    return tasks
+
+
+async def _hydrate_outcome_plan_outputs(
+    session: AsyncSession, tasks: List[Task]
+) -> None:
+    """Batch-load ``plan_output`` for the rows whose outcome evaluator reads it.
+
+    The read-only task types' honest success signals (audit findings, memo
+    artifact, verify-tests verdict, compute result, panel verdict, knowledge
+    document) live on ``plan_output``; without it ``evaluate_task_outcome``
+    degrades them to ``neutral`` via ``_task_local_attr`` — silent
+    under-counting in the digest's ``non_code_outcomes`` block. The window
+    scans deliberately do NOT load that JSONB for every row (research
+    plan_output alone can run ~100KB/row), so hydrate just the rows the walker
+    actually reads it on: terminal, outside a review chain, read-only typed —
+    plus legacy research rows lacking the ``research_surviving_findings``
+    context signal. The re-SELECT populates the unloaded attribute on the
+    already-tracked instances via the identity map.
+    """
+    from app.task_outcomes import _READ_ONLY_EVALUATORS  # noqa: PLC0415
+
+    need: List[uuid.UUID] = []
+    for t in tasks:
+        if "plan_output" in vars(t):
+            continue
+        if t.status not in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            continue
+        ctx = t.context or {}
+        if isinstance(ctx.get("review_loop"), dict):
+            continue  # review-chain rows are excluded from the non-code walk
+        t_type = (t.first_payload or {}).get("type")
+        if t_type not in _READ_ONLY_EVALUATORS:
+            continue
+        if t_type == "research" and "research_surviving_findings" in ctx:
+            continue  # modern research rows carry their signal on context
+        need.append(t.id)
+    if not need:
+        return
+    (
+        await session.execute(
+            select(Task)
+            .options(load_only(Task.id, Task.plan_output))
+            .where(Task.id.in_(need))
+        )
+    ).all()
 
 
 @router.get("/outer-loop-convergence")
@@ -598,28 +740,13 @@ async def get_outer_loop_convergence(
 
     cutoff = _utcnow() - timedelta(hours=hours)
 
-    stmt = (
-        select(Task)
-        .where(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.created_at >= cutoff,
-        )
-        .options(
-            load_only(
-                Task.id,
-                Task.project_id,
-                Task.status,
-                Task.context,
-                Task.created_at,
-            )
-        )
-        .order_by(Task.created_at.desc())
-        .limit(_OUTER_LOOP_TASK_CAP)
+    tasks = await _fetch_outer_loop_tasks(
+        session,
+        cutoff=cutoff,
+        project_id=project_id,
+        limit=_OUTER_LOOP_TASK_CAP,
+        order_desc=True,
     )
-    if project_id is not None:
-        stmt = stmt.where(Task.project_id == project_id)
-
-    tasks = list((await session.execute(stmt)).scalars().all())
     if len(tasks) >= _OUTER_LOOP_TASK_CAP:
         logger.warning(
             "[OUTER-LOOP] task query hit the %d-row cap (hours=%d, project=%s); "
@@ -630,6 +757,9 @@ async def get_outer_loop_convergence(
         )
     original_tasks = await _load_outer_loop_original_tasks(
         session, tasks, project_id=project_id
+    )
+    await _hydrate_outcome_plan_outputs(
+        session, [*tasks, *original_tasks.values()]
     )
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
@@ -670,27 +800,12 @@ async def get_outer_loop_convergence_trend(
 
     cutoff = _utcnow() - timedelta(days=days)
 
-    stmt = (
-        select(Task)
-        .where(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.created_at >= cutoff,
-        )
-        .options(
-            load_only(
-                Task.id,
-                Task.project_id,
-                Task.status,
-                Task.context,
-                Task.created_at,
-            )
-        )
-        .limit(_OUTER_LOOP_TREND_TASK_CAP)
+    tasks = await _fetch_outer_loop_tasks(
+        session,
+        cutoff=cutoff,
+        project_id=project_id,
+        limit=_OUTER_LOOP_TREND_TASK_CAP,
     )
-    if project_id is not None:
-        stmt = stmt.where(Task.project_id == project_id)
-
-    tasks = list((await session.execute(stmt)).scalars().all())
     if len(tasks) >= _OUTER_LOOP_TREND_TASK_CAP:
         logger.warning(
             "[OUTER-LOOP] trend task query hit the %d-row cap (days=%d, project=%s); "
@@ -701,6 +816,9 @@ async def get_outer_loop_convergence_trend(
         )
     original_tasks = await _load_outer_loop_original_tasks(
         session, tasks, project_id=project_id
+    )
+    await _hydrate_outcome_plan_outputs(
+        session, [*tasks, *original_tasks.values()]
     )
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
