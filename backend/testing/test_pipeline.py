@@ -2064,6 +2064,14 @@ async def test_rollup_spawn_lock_timeout_poison_recovers_to_bounded_retry(
     project, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="main"
     )
+    # Capture stable identifiers now, while the instances are loaded. The
+    # recovery path under test rolls back rollup_db's session, which expires
+    # every loaded ORM instance (even with expire_on_commit=False). Re-reading
+    # ``project.id`` / ``child.id`` afterwards triggers a *synchronous*
+    # lazy-load of the expired attribute, which raises MissingGreenlet outside
+    # the conftest greenlet context — i.e. exactly under the agent ``./pr``
+    # gate, which runs ``test-backend.sh --standalone`` → ``pytest --noconftest``.
+    project_id, parent_id, child_id = project.id, parent.id, child.id
 
     async def _poison_and_raise(source_task, task_type, sess, *args, **kwargs):
         # Genuinely abort the transaction (duplicate-PK flush) the way a
@@ -2105,17 +2113,19 @@ async def test_rollup_spawn_lock_timeout_poison_recovers_to_bounded_retry(
     # next sweep's existing-PR resume path.
     assert (parent.context or {}).get("rollup_pr_number") == 777
 
-    # The session is clean and the poison rows were rolled back.
-    rows = (
+    # The session is clean and the poison rows were rolled back. Select the id
+    # column directly (not the ORM entity) so the assertion reads raw values and
+    # never materialises an expired instance / triggers a sync lazy-load.
+    row_ids = set(
         (
             await rollup_db.execute(
-                _select(Task).where(Task.project_id == project.id)
+                _select(Task.id).where(Task.project_id == project_id)
             )
         )
         .scalars()
         .all()
     )
-    assert {t.id for t in rows} == {parent.id, child.id}
+    assert row_ids == {parent_id, child_id}
 
 
 # ── Rollup Merge Deferred Counter / Escalation ──────────────────────────────
