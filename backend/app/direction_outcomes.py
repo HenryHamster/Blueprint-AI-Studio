@@ -30,10 +30,12 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     acceptance_blocks_success,
+    acceptance_is_proven,
+    acceptance_was_declared,
 )
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
-from app.task_capabilities import PRODUCT_TASK_TYPES
+from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
 
@@ -147,6 +149,21 @@ def verified_merged_count(entry: dict) -> int:
     if "verified_prs_merged" in entry:
         return int(entry.get("verified_prs_merged") or 0)
     return int(entry.get("prs_merged") or 0)
+
+
+def proven_merged_count(entry: dict) -> int:
+    """Machine-checked PROVEN merged-PR count for a research_history entry.
+
+    The honest counterpart to :func:`verified_merged_count`: counts only merges
+    proven by machine-checked evidence (a satisfied ``named_test``), as recorded
+    in the additive ``acceptance_proven_merged`` field by
+    ``_update_direction_research_outcomes``. Strictly distinct from — and never
+    larger than — ``verified_prs_merged``: a soft (behavior/artifact) or
+    undeclared merge counts as verified but NOT proven. Legacy entries written
+    before the field existed degrade to ``0`` (nothing is retroactively claimed
+    as proven), never to the raw merged count.
+    """
+    return int(entry.get("acceptance_proven_merged") or 0)
 
 
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
@@ -455,6 +472,47 @@ async def _update_direction_research_outcomes(
         and not acceptance_blocks_success(
             (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
         )
+    )
+    # Honest proven-by-evidence + declaration-coverage aggregates. These are
+    # STRICTLY ADDITIVE: they do not change verified_prs_merged, prs_merged, or
+    # conversion_rate above — they expose a separate, stronger truth distinct
+    # from "merely delivered". Restricted to merged WRITE tasks (the code-
+    # producing types that can carry an acceptance declaration) so read-only
+    # children never dilute the coverage denominator.
+    #
+    #   * acceptance_proven_merged — merges machine-checked PROVEN: a satisfied
+    #     named_test that ran green under a real merge-test verdict and exercises
+    #     a changed production seam (acceptance_is_proven). A soft
+    #     observable_behavior / downstream_artifact merge (satisfied by a shipped
+    #     diff only) and every undeclared merge are EXCLUDED — they prove nothing
+    #     about the specific claim.
+    #   * acceptance_declared_merged — merges that DECLARED any acceptance
+    #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
+    #     stamped). Undeclared / legacy merges are excluded.
+    #   * acceptance_declaration_coverage — declared / merged-write, the fraction
+    #     of merged code work that committed to forward evidence. None when no
+    #     merged write task exists (no denominator), never retro-failing legacy
+    #     rows.
+    _merged_write_rows = [
+        ct
+        for ct in _merged_rows
+        if (ct.first_payload or {}).get("type") in WRITE_TASK_TYPES
+    ]
+    entry["acceptance_proven_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_is_proven((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_declared_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_was_declared((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    _merged_write_count = len(_merged_write_rows)
+    entry["acceptance_declaration_coverage"] = (
+        round(entry["acceptance_declared_merged"] / _merged_write_count, 3)
+        if _merged_write_count > 0
+        else None
     )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(

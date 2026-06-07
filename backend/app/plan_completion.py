@@ -308,6 +308,53 @@ def _break_dependency_cycles(items: List[Dict], label: str = "PLAN") -> List[Dic
     return dropped
 
 
+def _distribute_parent_acceptance_evidence(
+    subtasks: List[Dict], skipped_indices: set, seam_path: str | None
+) -> set:
+    """Pick the child subtask indices that should inherit the parent plan task's
+    declared acceptance evidence when they do not declare their own.
+
+    "Deliver the seam" policy: a finding's declared acceptance evidence must
+    survive one decomposition hop STRUCTURALLY, but blindly copying one named
+    test onto every child would make every unrelated child fail its gate. So:
+
+      * If the declaration names a concrete path (``seam_path`` — a test file or
+        selector), target the kept subtasks whose ``related_files`` or prompt
+        reference that path — the children that actually deliver the seam.
+      * Otherwise (behavior/artifact evidence with no path, or no subtask
+        references the path), fall back to the TERMINAL children — kept subtasks
+        no other kept subtask depends on. These are the integrating sinks; the
+        requirement lands on the work that ties the decomposition together
+        rather than being smeared across every leaf.
+
+    Returns the set of target subtask indices (subset of the kept indices).
+    """
+    kept = [i for i in range(len(subtasks)) if i not in skipped_indices]
+    if not kept:
+        return set()
+
+    if seam_path:
+        path_part = seam_path.partition("::")[0].strip()
+        if path_part:
+            matched = {
+                i
+                for i in kept
+                if path_part in (subtasks[i].get("related_files", []) or [])
+                or path_part in (subtasks[i].get("prompt", "") or "")
+            }
+            if matched:
+                return matched
+
+    # Fallback: terminal children (sinks) — kept subtasks no other kept subtask
+    # depends on. With no dependency structure every kept subtask is terminal.
+    depended_on: set = set()
+    for i in kept:
+        for dep in subtasks[i].get("depends_on_indices", []) or []:
+            depended_on.add(dep)
+    sinks = {i for i in kept if i not in depended_on}
+    return sinks or set(kept)
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     from app.alert_dispatch import _maybe_create_failure_alert
@@ -577,6 +624,38 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 )
                 return
 
+    # Acceptance-evidence forward-carry through decomposition (parent → child).
+    # A finding routed through the plan agent carries its declared acceptance
+    # evidence on the PLAN task in two channels: the payload (AcceptanceEvidence
+    # vocabulary, consumed by the merge gate) and the context
+    # (PlanAcceptanceEvidence vocabulary, the proof the agent renders). The plan
+    # agent MAY re-declare per-subtask evidence; when it does NOT, the parent's
+    # declaration must still survive this one decomposition hop. Read both
+    # channels once here, then distribute to the children that deliver the
+    # declared seam. Fail-safe: an absent/malformed parent declaration degrades
+    # to None (the helpers never raise) and the children are unchanged from today.
+    _parent_payload_ev_obj = read_acceptance_evidence(parent_payload)
+    _parent_payload_evidence = (
+        _parent_payload_ev_obj.model_dump(exclude_none=True)
+        if _parent_payload_ev_obj is not None
+        else None
+    )
+    _parent_context_evidence = parse_acceptance_evidence(
+        (task.context or {}).get("acceptance_evidence")
+    )
+    # The seam path the declaration points at (payload test_path preferred, then
+    # the context selector) drives which children are judged to deliver it.
+    _seam_path = None
+    if _parent_payload_ev_obj is not None and _parent_payload_ev_obj.test_path:
+        _seam_path = _parent_payload_ev_obj.test_path
+    elif _parent_context_evidence is not None:
+        _seam_path = _parent_context_evidence.get("selector")
+    _parent_evidence_targets = (
+        _distribute_parent_acceptance_evidence(subtasks, skipped_indices, _seam_path)
+        if (_parent_payload_evidence or _parent_context_evidence)
+        else set()
+    )
+
     child_tasks = []
     for i, subtask_def in enumerate(subtasks):
         # Gate the child type on the registry-derived plan-subtask allowlist
@@ -644,6 +723,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_acceptance_evidence = parse_acceptance_evidence(
             subtask_def.get("acceptance_evidence")
         )
+        # Inherit the parent's context-channel declaration onto a child that
+        # delivers the declared seam but did NOT self-declare. A subtask that
+        # declared its own evidence is never overwritten.
+        if (
+            child_acceptance_evidence is None
+            and _parent_context_evidence is not None
+            and i in _parent_evidence_targets
+        ):
+            child_acceptance_evidence = _parent_context_evidence
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
@@ -666,6 +754,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             is None
         ):
             subtask_acceptance_evidence = None
+        # Inherit the parent's payload-channel declaration onto a child that
+        # delivers the declared seam but did NOT self-declare its own — so the
+        # merge gate still has the parent finding's proof to check.
+        if (
+            subtask_acceptance_evidence is None
+            and _parent_payload_evidence is not None
+            and i in _parent_evidence_targets
+        ):
+            subtask_acceptance_evidence = _parent_payload_evidence
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),

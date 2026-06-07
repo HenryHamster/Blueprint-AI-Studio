@@ -114,12 +114,24 @@ class AcceptanceGateVerdict:
     answers whether the declared evidence is genuinely present/exercised to the
     extent checkable at completion; a False ``satisfied`` is the honest
     fail-closed outcome.
+
+    ``proven`` is a STRICTER axis than ``satisfied``: it is True only when the
+    claim was machine-checked — a satisfied ``named_test`` (the test is in the
+    diff, ran green under a real merge-test verdict, and exercises a changed
+    production seam). A satisfied ``observable_behavior`` / ``downstream_artifact``
+    is ``satisfied=True`` but ``proven=False`` (it proves only that a diff
+    shipped, not that the specific claim holds), and every fail-closed /
+    unsatisfied / undeclared case is ``proven=False``. ``satisfied`` semantics
+    and every downstream consumer of it are unchanged; ``proven`` is purely
+    additive so callers can distinguish machine-checked proof from
+    merely-delivered work.
     """
 
     declared: bool
     satisfied: bool
     kind: str | None
     reason: str
+    proven: bool = False
 
 
 def _changed_files(task: Task) -> list[str]:
@@ -219,6 +231,7 @@ def _evaluate_named_test(
         f"named_test {declared_path!r} was added/modified, ran green under a "
         f"verified merge, and exercises a changed production seam "
         f"({len(seam_files)} non-test file(s))",
+        proven=True,
     )
 
 
@@ -277,10 +290,10 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
 
     No-op (returns ``None``, writes nothing) when the task declared no acceptance
     evidence, so undeclared/legacy tasks keep their context untouched and their
-    scoring unchanged. Otherwise records ``{satisfied, kind, reason}`` under
-    :data:`CODE_ACCEPTANCE_VERDICT_KEY` so later scoring
-    (:func:`acceptance_blocks_success`) can consume it. The caller is responsible
-    for committing.
+    scoring unchanged. Otherwise records ``{satisfied, proven, kind, reason}``
+    under :data:`CODE_ACCEPTANCE_VERDICT_KEY` so later scoring
+    (:func:`acceptance_blocks_success`, :func:`acceptance_is_proven`) can consume
+    it. The caller is responsible for committing.
     """
     verdict = evaluate_code_acceptance(task)
     if not verdict.declared:
@@ -288,6 +301,7 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
     ctx = dict(task.context or {})
     ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
         "satisfied": verdict.satisfied,
+        "proven": verdict.proven,
         "kind": verdict.kind,
         "reason": verdict.reason,
     }
@@ -307,3 +321,34 @@ def acceptance_blocks_success(recorded: Any) -> bool:
     if not isinstance(recorded, dict):
         return False
     return recorded.get("satisfied") is False
+
+
+def acceptance_was_declared(recorded: Any) -> bool:
+    """Whether a task DECLARED acceptance evidence (any kind) at plan time.
+
+    ``True`` exactly when a verdict dict was recorded — the verdict is stamped
+    only for tasks that declared evidence (see
+    :func:`record_code_acceptance_verdict`, which no-ops on the undeclared case),
+    so the presence of the key is itself the declaration signal. Undeclared and
+    legacy rows (no key, ``None``, or any non-dict) return ``False``. Feeds the
+    additive declaration-coverage aggregate without touching any existing count.
+    """
+    return isinstance(recorded, dict)
+
+
+def acceptance_is_proven(recorded: Any) -> bool:
+    """Whether a recorded verdict is machine-checked PROVEN, not merely delivered.
+
+    ``True`` only when a verdict was recorded AND it carries ``proven is True`` —
+    i.e. a satisfied ``named_test`` that ran green under a real merge-test verdict
+    and exercises a changed production seam. A satisfied
+    ``observable_behavior`` / ``downstream_artifact`` (soft / asserted by a
+    shipped diff only), every unsatisfied / fail-closed case, and all undeclared
+    or legacy rows return ``False``. This is the additive TRUE proven signal,
+    strictly distinct from ``verified_prs_merged`` (which still credits soft and
+    undeclared merges). Tolerant of legacy verdict dicts written before the
+    ``proven`` key existed — a missing key reads as ``False``, never proven.
+    """
+    if not isinstance(recorded, dict):
+        return False
+    return recorded.get("proven") is True

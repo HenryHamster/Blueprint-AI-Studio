@@ -313,7 +313,13 @@ class RefactorPayload(_AcceptanceEvidenceMixin, _PromptRequired):
     pass
 
 
-class PlanPayload(_PromptRequired):
+class PlanPayload(_AcceptanceEvidenceMixin, _PromptRequired):
+    # A plan task carries the parent finding's declared acceptance evidence so
+    # the requirement survives the parent→child decomposition hop. Typed slot
+    # (instead of relying on BasePayload's extra='allow' pass-through) so the
+    # forward-carried declaration is validated the same as on a code task, and
+    # _handle_plan_completion can read it via read_acceptance_evidence. Optional
+    # + exclude_none means a plan with no declaration round-trips identically.
     pass
 
 
