@@ -44,6 +44,29 @@ from app.routers.admin_debug import _build_stuck_tasks
 
 logger = logging.getLogger(__name__)
 
+# Column set for the QUEUED-task scan in _compute_health_overview. Module-level
+# (and covered by a regression test in test_diagnostics.py) because it is a
+# load-bearing contract with _build_stuck_tasks: every attribute the shared
+# stuck-entry tail reads on a QUEUED row must be loaded here, or the first
+# access sync-lazy-loads under the async session → MissingGreenlet → the whole
+# health overview 500s. Heavy JSONB (context / payloads / status_log /
+# api_call_summary) is intentionally absent — the QUEUED backlog can be
+# thousands of rows (OOM risk) and _classify_stuck_failure skips classification
+# when those are deferred rather than loading them.
+QUEUED_SCAN_COLUMNS = (
+    Task.id,
+    Task.status,
+    Task.title,
+    Task.project_id,
+    Task.created_at,
+    Task.started_at,
+    Task.last_heartbeat,
+    Task.vm_instance_id,
+    Task.depends_on,
+    Task.attempt_count,
+    Task.latest_status_message,
+)
+
 router = APIRouter(
     prefix="/api/admin", tags=["admin-health"], dependencies=[Depends(get_current_user)]
 )
@@ -307,27 +330,22 @@ async def _compute_health_overview(
     #      Loading context/payloads/status_log for up to _ACTIVE_TASKS_LIMIT QUEUED
     #      rows is exactly the wrong direction.
     #
-    # QUEUED tasks only ever hit the cheap-column branch of _build_stuck_tasks
-    # (status/created_at/depends_on), so load only scalar columns for them — this
-    # is the set that can be large. The heavy-column branches run exclusively for
+    # QUEUED tasks hit the cheap-column stuck branches of _build_stuck_tasks
+    # (status/created_at/depends_on) PLUS the shared stuck-entry tail, which
+    # reads attempt_count and (via _classify_stuck_failure) latest_status_message
+    # — so all of those scalars must be in the load set. The heavy JSONB columns
+    # stay deferred for QUEUED rows; _classify_stuck_failure detects that and
+    # reports unclassified instead of lazy-loading (prod 2026-06-04..07: a stuck
+    # QUEUED task reaching the tail sync-loaded the deferred attempt_count →
+    # MissingGreenlet → every health-overview request and digest health tick
+    # 500'd for the duration of a rate-limit pause — exactly when the operator
+    # needed the panel). The heavy-column branches run exclusively for
     # PROVISIONING / IN_PROGRESS / EVALUATING tasks, which are bounded by fleet
     # capacity, so load those in full and the diagnostic reads stay in-memory.
     queued_result = await session.execute(
         select(Task)
         .where(*active_filters, Task.status == TaskStatus.QUEUED)
-        .options(
-            load_only(
-                Task.id,
-                Task.status,
-                Task.title,
-                Task.project_id,
-                Task.created_at,
-                Task.started_at,
-                Task.last_heartbeat,
-                Task.vm_instance_id,
-                Task.depends_on,
-            )
-        )
+        .options(load_only(*QUEUED_SCAN_COLUMNS))
         .limit(_ACTIVE_TASKS_LIMIT)
     )
     queued_tasks = list(queued_result.scalars().all())

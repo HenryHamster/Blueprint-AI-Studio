@@ -2731,6 +2731,107 @@ class TestExternalHealthGate:
         assert "db" not in result
 
 
+class TestGateContinuesRefreshHealth:
+    """Source invariant: every dispatch-gate ``continue`` in orchestrator_worker
+    must refresh external health and stamp the cycle marker before continuing.
+
+    Regression for the 2026-06-07 five-hour dispatch latch: the external-health
+    gate branch ``continue``d past the bottom-of-loop monitoring block, so
+    ``consecutive_failures`` — which only ``_check_external_health`` updates —
+    froze at its pre-gate snapshot and the gate could never reopen on its own
+    (every account cooldown had expired hours before; only a coincidental
+    instance restart cleared the in-memory latch). The cycle marker froze with
+    it, so the dashboard showed a dead orchestrator ("last cycle 299min ago")
+    while the loop was healthy. Same sticky-state class as the idle-cycle /
+    auto-pause fix that already carries these calls.
+
+    A gate branch is identified structurally: an ``if`` branch inside
+    ``orchestrator_worker`` whose BODY contains both a ``continue`` and a
+    reference to ``ORCHESTRATOR_THROTTLE_SECONDS`` (the back-off sleep both
+    gates use). Each such body must also reference ``_check_external_health``
+    and assign ``_orchestrator_last_cycle``. Only the ``if`` body is scanned —
+    markers in an ``else:`` branch must not satisfy the invariant.
+    """
+
+    @staticmethod
+    def _gate_branches():
+        import ast
+        from pathlib import Path
+
+        src = Path(_orch_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        worker = next(
+            (
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.AsyncFunctionDef)
+                and n.name == "orchestrator_worker"
+            ),
+            None,
+        )
+        assert worker is not None, (
+            "orchestrator_worker not found in app/orchestrator.py — if the loop "
+            "was renamed/refactored, update this invariant to follow it"
+        )
+
+        parents = {}
+        for node in ast.walk(worker):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def _body_names(if_node):
+            names = set()
+            for stmt in if_node.body:  # body only — never orelse
+                names.update(
+                    n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                )
+            return names
+
+        branches = []
+        seen_ifs = set()
+        for node in ast.walk(worker):
+            if not isinstance(node, ast.Continue):
+                continue
+            # Climb to the nearest enclosing If whose BODY (not orelse)
+            # contains this continue.
+            anc, child = parents.get(node), node
+            while anc is not None:
+                if isinstance(anc, ast.If) and child in anc.body:
+                    break
+                child, anc = anc, parents.get(anc)
+            if anc is None or id(anc) in seen_ifs:
+                continue
+            names = _body_names(anc)
+            if "ORCHESTRATOR_THROTTLE_SECONDS" in names:
+                seen_ifs.add(id(anc))
+                branches.append((node.lineno, names))
+        return branches
+
+    def test_throttle_gate_continues_refresh_health_and_stamp_cycle(self):
+        branches = self._gate_branches()
+        # Positive sanity: both known gates (external-health + failure-rate)
+        # must be detected — zero matches means the AST walk is broken and the
+        # assertions below would silently pass on regressions.
+        assert len(branches) >= 2, (
+            f"Expected >=2 throttle-gate continue branches in "
+            f"orchestrator_worker, found {len(branches)} — the AST detection "
+            "is broken or the gates were restructured; update this invariant."
+        )
+        for lineno, names in branches:
+            assert "_check_external_health" in names, (
+                f"Gate branch with continue at orchestrator.py:{lineno} does "
+                "not call _check_external_health before continuing — the gate "
+                "reads consecutive_failures, which ONLY that check updates, so "
+                "skipping it latches the gate shut forever (2026-06-07: 5h of "
+                "zero dispatch, cleared only by an instance restart)."
+            )
+            assert "_orchestrator_last_cycle" in names, (
+                f"Gate branch with continue at orchestrator.py:{lineno} does "
+                "not stamp _orchestrator_last_cycle — a gated-but-healthy loop "
+                "then renders as a dead orchestrator in the dashboard."
+            )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test — mergeable=None close/reopen cap stops retrying after N attempts
 # ══════════════════════════════════════════════════════════════════════════════

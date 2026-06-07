@@ -200,8 +200,35 @@ def _classify_stuck_failure(task: Task) -> Optional[str]:
     that just hasn't emitted a status yet) both return None so the UI shows
     'unclassified' instead.
     """
+    from sqlalchemy import inspect as _sa_inspect  # noqa: PLC0415
+    from sqlalchemy.exc import NoInspectionAvailable  # noqa: PLC0415
+
     from app.failure_classification import classify_failure  # noqa: PLC0415
 
+    # classify_failure reads the heavy JSONB columns (context, payloads,
+    # api_call_summary). QUEUED rows arrive from the health-overview scan via
+    # load_only() with those columns deferred — a first access would sync-
+    # lazy-load under the async session → MissingGreenlet → the whole health
+    # overview 500s (prod 2026-06-04..07, every digest health tick during a
+    # rate-limit pause). Deliberately NOT loading them for a potentially
+    # thousands-deep QUEUED backlog (OOM history on this endpoint); a task
+    # that is merely stuck-in-queue reports unclassified instead. Transient
+    # instances have no identity key, and mocks/non-ORM stand-ins are not
+    # inspectable — both skip the guard since plain attribute access on them
+    # never emits IO.
+    try:
+        state = _sa_inspect(task)
+    except NoInspectionAvailable:
+        state = None
+    if (
+        state is not None
+        and state.key is not None
+        and (
+            {"context", "payloads", "api_call_summary", "latest_status_message"}
+            & state.unloaded
+        )
+    ):
+        return None
     if not (task.latest_status_message or "").strip():
         return None
     result = classify_failure(task)
