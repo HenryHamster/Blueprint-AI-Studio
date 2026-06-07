@@ -118,9 +118,11 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
     ("anthropic", "claude-haiku-4-5-20251001"): (0.8e-6, 4e-6),
-    # OpenAI (openai.com/api/pricing, 2026-05)
-    ("openai", "gpt-5.4"): (5e-6, 25e-6),
-    ("openai", "gpt-5.4-mini"): (0.5e-6, 2e-6),
+    # OpenAI (developers.openai.com/api/docs/pricing, refreshed 2026-06 at
+    # gpt-5.5 launch — 5.4-generation rates dropped at the same time).
+    ("openai", "gpt-5.5"): (5e-6, 30e-6),
+    ("openai", "gpt-5.4"): (2.5e-6, 15e-6),
+    ("openai", "gpt-5.4-mini"): (0.75e-6, 4.5e-6),
     ("openai", "gpt-5.3-codex"): (3e-6, 12e-6),
     # gpt-5.3-codex-spark is ChatGPT-Pro-only with no separately published API
     # rate; priced at the gpt-5.3-codex rate as the closest GA equivalent

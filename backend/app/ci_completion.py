@@ -215,7 +215,7 @@ async def _attempt_merge_with_retry_and_escalation(
                         ),
                         project_id=str(task.project_id),
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "[CI] Migration finalization attempt failed for PR #%s: %s",
                         ci_pr_number,
@@ -459,6 +459,27 @@ async def _attempt_merge_with_retry_and_escalation(
                 from app.task_completion import (
                     _finalize_migration_reservation_after_merge,
                 )
+
+                # Self-orig guard: on a DIRECT merge (the common lane —
+                # research/plan/create tasks merging their own PR),
+                # original_task_id points back at THIS task. The dedicated
+                # ``_orig_session`` below then UPDATEs the same ``tasks`` row
+                # this session still holds FOR UPDATE (relocked above), so its
+                # Query-invoked autoflush blocked for the full 30s lock_timeout
+                # and died with LockNotAvailableError — silently dropping
+                # pr_merged, the direction-outcome refresh, and the migration-
+                # reservation finalize on EVERY direct merge (prod 2026-06-01
+                # through 06-07, 144 drops). Commit the terminal state
+                # NOW (mirrors the CI-failure path's commit-before-accounting)
+                # so COMPLETED is durable and the row lock is released before
+                # the dedicated session touches the row. If this commit fails,
+                # the next CI sweep's merged-PR recheck path re-lands COMPLETED.
+                _orig_is_self = False
+                with contextlib.suppress(ValueError, TypeError):
+                    _orig_is_self = uuid.UUID(str(ci_orig_id)) == task.id
+                if _orig_is_self:
+                    session.add(task)
+                    await session.commit()
 
                 async with AsyncSessionLocal() as _orig_session:
                     orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
