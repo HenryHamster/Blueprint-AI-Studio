@@ -23,6 +23,8 @@ from app.direction_outcomes import (
     _refresh_pipeline_scope_merge_rates,
     _update_cochange_index,
     _update_direction_research_outcomes,
+    acceptance_metric_invariant_violations,
+    acceptance_metrics_consistent,
     refresh_direction_outcomes_after_merge,
 )
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
@@ -4725,6 +4727,333 @@ async def test_declaration_coverage_none_when_no_merged_write_tasks(
     assert entry["acceptance_declared_merged"] == 0
     assert entry["acceptance_declaration_coverage"] is None
     assert entry["acceptance_merged_write_total"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence metric invariant guard
+#
+# A durable, non-gameable guard over the SEMANTIC relationships between the
+# acceptance-evidence aggregates (acceptance_proven_merged /
+# acceptance_declared_merged / acceptance_declaration_coverage /
+# acceptance_merged_write_total alongside verified_prs_merged / prs_merged). It
+# asserts the ordering + identity guarantees ALWAYS hold across a wide range of
+# constructed merge mixes, so a future refactor of any definition cannot silently
+# let proven drift above verified, or let a soft / undeclared / test-only /
+# degraded merge be counted as proven, with nothing failing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Each scenario is one merged child task. The flags record what the scenario
+# SHOULD contribute to each aggregate, derived from the REAL gate semantics
+# (acceptance_is_proven / acceptance_was_declared / merge_verification_status /
+# WRITE_TASK_TYPES) — never a contradictory shape the real gate cannot emit
+# (e.g. proven=True on a degraded merge, which the gate makes impossible because
+# a degraded fall-open is not test-verified).
+_ACCEPT_SCENARIOS: dict[str, dict] = {
+    # Machine-checked proven named_test merge.
+    "proven": {
+        "context": {
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+            },
+        },
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": True,
+        "declared": True,
+        "verified": True,
+    },
+    # Satisfied-but-soft observable_behavior merge: declared + verified, not proven.
+    "soft": {
+        "context": {
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": False,
+                "kind": "observable_behavior",
+            },
+        },
+        "type": "fix",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "declared": True,
+        "verified": True,
+    },
+    # Declared but unsatisfied: declared, but blocks success → not verified, not proven.
+    "declared_unsat": {
+        "context": {
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+            },
+        },
+        "type": "refactor",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "declared": True,
+        "verified": False,
+    },
+    # Undeclared / legacy write merge: verified, never declared, never proven.
+    "undeclared": {
+        "context": {"pr_merged": True},
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "declared": False,
+        "verified": True,
+    },
+    # Degraded-verification write merge: not verified, not declared, not proven.
+    "degraded": {
+        "context": {
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "declared": False,
+        "verified": False,
+    },
+    # Read-only (non-write) merge: counts toward prs_merged/verified but is OUTSIDE
+    # the merged-write denominator, so it can never raise declared/proven.
+    "readonly": {
+        "context": {"pr_merged": True},
+        "type": "research",
+        "write": False,
+        "merged": True,
+        "proven": False,
+        "declared": False,
+        "verified": True,
+    },
+}
+
+
+def _expected_acceptance_aggregates(mix: list[str]) -> dict:
+    """Compute the aggregate values a mix of scenarios SHOULD produce."""
+    rows = [_ACCEPT_SCENARIOS[name] for name in mix]
+    merged = [r for r in rows if r["merged"]]
+    merged_write = [r for r in merged if r["write"]]
+    declared = sum(1 for r in merged_write if r["declared"])
+    proven = sum(1 for r in merged_write if r["proven"])
+    verified = sum(1 for r in merged if r["verified"])
+    prs_merged = len(merged)
+    mw = len(merged_write)
+    return {
+        "acceptance_proven_merged": proven,
+        "acceptance_declared_merged": declared,
+        "acceptance_merged_write_total": mw,
+        "verified_prs_merged": verified,
+        "prs_merged": prs_merged,
+        "acceptance_declaration_coverage": (
+            round(declared / mw, 3) if mw > 0 else None
+        ),
+    }
+
+
+async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) -> dict:
+    """Create one merged child per scenario, run the aggregator, return the entry."""
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=max(len(mix), 1))
+    ]
+    await db_session.flush()
+
+    for i, name in enumerate(mix):
+        scenario = _ACCEPT_SCENARIOS[name]
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context=dict(scenario["context"]),
+            payloads=[{"type": scenario["type"], "scope": "small"}],
+            title=f"{name}-{i}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    return project.directions[0]["research_history"][0]
+
+
+@pytest.mark.parametrize(
+    "mix",
+    [
+        # All distinct scenario kinds together.
+        ["proven", "soft", "declared_unsat", "undeclared", "degraded", "readonly"],
+        # Proven-heavy.
+        ["proven", "proven", "proven", "soft"],
+        # No proven at all (soft + undeclared + degraded).
+        ["soft", "undeclared", "degraded"],
+        # Only read-only merges → no merged-write denominator.
+        ["readonly", "readonly"],
+        # Only declared-unsatisfied write merges.
+        ["declared_unsat", "declared_unsat"],
+        # Duplicated full mix to exercise larger counts.
+        ["proven", "proven", "soft", "soft", "declared_unsat", "undeclared",
+         "degraded", "readonly", "readonly"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_acceptance_metric_invariants_hold_across_mixes(
+    db_session: AsyncSession, mix: list[str]
+):
+    """The acceptance-evidence metric invariants ALWAYS hold, and the aggregates
+    match the values derived independently from the real gate semantics.
+
+    Drives the production code under test end-to-end: builds the child-task mix,
+    runs ``_update_direction_research_outcomes`` to produce the real aggregates,
+    and asserts the production guard ``acceptance_metric_invariant_violations``
+    finds NO violation — proven ⊆ declared ⊆ merged-write, proven ⊆ verified ⊆
+    merged, and the declaration-coverage identity. Also pins each aggregate to its
+    independently-computed expected value so the guard cannot pass on
+    always-true / degenerate metrics.
+    """
+    entry = await _run_mix(db_session, "d-accept-inv", mix)
+
+    # The production invariant guard finds no violation on real aggregates.
+    violations = acceptance_metric_invariant_violations(entry)
+    assert violations == [], violations
+    assert acceptance_metrics_consistent(entry) is True
+
+    # And the aggregates equal the values derived from the real gate semantics —
+    # the ordering holds because the values are genuinely what the mix implies,
+    # not because the metrics collapsed to zero.
+    expected = _expected_acceptance_aggregates(mix)
+    for key, value in expected.items():
+        assert entry[key] == value, (key, entry.get(key), value)
+
+    # Spell out the ordering chain explicitly on the real values.
+    assert (
+        0
+        <= entry["acceptance_proven_merged"]
+        <= entry["acceptance_declared_merged"]
+        <= entry["acceptance_merged_write_total"]
+    )
+    assert (
+        0
+        <= entry["acceptance_proven_merged"]
+        <= entry["verified_prs_merged"]
+        <= entry["prs_merged"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_declaration_coverage_identity_and_readonly_excluded(
+    db_session: AsyncSession,
+):
+    """Coverage == declared / merged-write, and read-only children are excluded
+    from the merged-write denominator entirely (they never raise declared or
+    proven, even though they DO count toward prs_merged/verified)."""
+    # 2 declared write merges (1 proven, 1 soft) + 2 read-only merges.
+    entry = await _run_mix(
+        db_session,
+        "d-accept-cov",
+        ["proven", "soft", "readonly", "readonly"],
+    )
+    # Read-only merges do NOT enter the merged-write denominator.
+    assert entry["acceptance_merged_write_total"] == 2
+    assert entry["acceptance_declared_merged"] == 2
+    assert entry["acceptance_proven_merged"] == 1
+    # ...but they DO count as merged PRs.
+    assert entry["prs_merged"] == 4
+    assert entry["verified_prs_merged"] == 4
+    # Coverage is taken over merged-write only: 2/2 == 1.0, not 2/4.
+    assert entry["acceptance_declaration_coverage"] == 1.0
+    assert acceptance_metric_invariant_violations(entry) == []
+
+
+def test_acceptance_metric_invariant_violations_detects_drift():
+    """The guard is non-vacuous: it flags every relationship it promises to lock.
+
+    Pure-dict unit test (no DB) that feeds the production guard deliberately
+    inconsistent entries — exactly the regressions a future refactor could
+    introduce — and asserts each is caught. A guard that returned ``[]`` here
+    would be an always-true assertion; this is what makes it a real invariant.
+    """
+    # A clean, consistent entry has no violations.
+    clean = {
+        "acceptance_proven_merged": 1,
+        "acceptance_declared_merged": 2,
+        "acceptance_merged_write_total": 3,
+        "verified_prs_merged": 2,
+        "prs_merged": 4,
+        "acceptance_declaration_coverage": round(2 / 3, 3),
+    }
+    assert acceptance_metric_invariant_violations(clean) == []
+    assert acceptance_metrics_consistent(clean) is True
+
+    # proven drifts above declared.
+    assert acceptance_metric_invariant_violations({**clean, "acceptance_proven_merged": 3})
+    # proven drifts above verified.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_proven_merged": 1, "verified_prs_merged": 0}
+    )
+    # verified drifts above prs_merged.
+    assert acceptance_metric_invariant_violations({**clean, "verified_prs_merged": 5})
+    # declared drifts above merged-write.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_declared_merged": 4}
+    )
+    # merged-write drifts above prs_merged.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_merged_write_total": 5}
+    )
+    # coverage no longer equals declared / merged-write.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_declaration_coverage": 0.999}
+    )
+    # coverage is non-None despite a zero merged-write denominator.
+    assert acceptance_metric_invariant_violations(
+        {
+            "acceptance_proven_merged": 0,
+            "acceptance_declared_merged": 0,
+            "acceptance_merged_write_total": 0,
+            "verified_prs_merged": 0,
+            "prs_merged": 0,
+            "acceptance_declaration_coverage": 0.5,
+        }
+    )
+
+
+def test_acceptance_metric_invariants_fail_safe_on_legacy_entries():
+    """Legacy entries written before a field existed never spuriously violate."""
+    # No acceptance fields at all (pre-acceptance history).
+    assert acceptance_metric_invariant_violations({"prs_merged": 5}) == []
+    # Pre-denominator entry: coverage present but no merged-write count → the
+    # identity check is skipped; only the [0,1] sanity bound applies.
+    assert acceptance_metric_invariant_violations(
+        {
+            "acceptance_proven_merged": 1,
+            "acceptance_declared_merged": 2,
+            "verified_prs_merged": 3,
+            "prs_merged": 4,
+            "acceptance_declaration_coverage": 0.5,
+        }
+    ) == []
+    # A pre-denominator entry with an out-of-range coverage is still caught.
+    assert acceptance_metric_invariant_violations(
+        {"prs_merged": 4, "acceptance_declaration_coverage": 1.5}
+    )
+    # Completely empty entry is vacuously consistent.
+    assert acceptance_metric_invariant_violations({}) == []
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from app.strategic_completion import (
     _compute_churn_metrics,
     _compute_lifetime_burn_metrics,
     _direction_still_productive,
+    _recent_merges_mostly_unproven,
     _already_built_signature,
     already_built_completion_suggestion,
     _compute_outcome_progress_signal,
@@ -10184,3 +10185,88 @@ def test_spawn_title_is_redundant_below_threshold_not_matched():
 
 def test_spawn_title_is_redundant_empty_title_returns_none():
     assert spawn_title_is_redundant("", ["anything here at all"], threshold=4) is None
+
+
+# ── Proof-aware auto-pause: undeclared merges forfeit pause-protection ─────────
+
+
+def _accept_history(n, *, proven, declared, merged, completed, prs_merged=None):
+    """n identical acceptance-contract cycles (proven ⊆ declared ⊆ merged-write)."""
+    pm = merged if prs_merged is None else prs_merged
+    return [
+        {
+            "tasks_created": completed,
+            "tasks_completed": completed,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": pm,
+            "verified_prs_merged": pm,
+            "acceptance_merged_write_total": merged,
+            "acceptance_proven_merged": proven,
+            "acceptance_declared_merged": declared,
+        }
+        for _ in range(n)
+    ]
+
+
+class TestProofAwarePause:
+    def test_undeclared_merges_forfeit_pause_shield_while_proven_keep_it(self):
+        # Identical merge VOLUME (5 cycles, 1 verified merge + 6 completed each →
+        # non_merge_finished = 30-5 = 25 ≥ churn threshold). Both mark the last
+        # cycle productive, which normally SHIELDS Rules 5/6. Only the proof state
+        # differs: the undeclared direction's proof-weighted merge rate falls below
+        # the churn minimum AND it forfeits the productivity shield, so it pauses;
+        # the proven direction keeps a healthy rate and its shield, so it does not.
+        undeclared = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_accept_history(
+                5, proven=0, declared=0, merged=1, completed=6
+            ),
+        )
+        proven = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_accept_history(
+                5, proven=1, declared=1, merged=1, completed=6
+            ),
+        )
+        undeclared_reason = _check_direction_health(undeclared)
+        proven_reason = _check_direction_health(proven)
+        assert undeclared_reason is not None
+        assert "Churn guardrail" in undeclared_reason
+        assert proven_reason is None
+
+    def test_recent_merges_mostly_unproven_gates_on_acceptance_data(self):
+        # All-undeclared recent merges → shield forfeit.
+        undeclared = _direction(
+            research_history=_accept_history(
+                5, proven=0, declared=0, merged=2, completed=2
+            )
+        )
+        assert _recent_merges_mostly_unproven(undeclared) is True
+        # All-proven → shield kept.
+        proven = _direction(
+            research_history=_accept_history(
+                5, proven=2, declared=2, merged=2, completed=2
+            )
+        )
+        assert _recent_merges_mostly_unproven(proven) is False
+        # Legacy / read-only directions (no acceptance fields) are never stripped.
+        legacy = _direction(
+            research_history=_history(5, prs_merged=2, tasks_completed=2)
+        )
+        assert _recent_merges_mostly_unproven(legacy) is False
+        assert _recent_merges_mostly_unproven(_direction()) is False
+
+    def test_churn_merge_rate_is_proof_weighted_but_legacy_unchanged(self):
+        # Legacy churn metrics are byte-for-byte unchanged (no acceptance fields):
+        # merged stays an integer and the displayed string keeps "N merged".
+        legacy = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(legacy)
+        assert m["merged"] == 0
+        assert m["merge_rate"] == 0.0

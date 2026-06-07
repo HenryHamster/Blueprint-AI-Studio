@@ -10968,3 +10968,88 @@ def test_direction_activity_score_legacy_falls_back_to_prs_merged():
     legacy = {"prs_merged": 4}
     # 4 merges * 3 = 12, no other signals.
     assert _direction_activity_score(legacy) == 12
+
+
+# ---------------------------------------------------------------------------
+# Direction-health/prioritization consumes the proven-vs-delivered signal.
+#
+# These exercise the strategic-DECISION consumption layer: the same scorers that
+# feed prioritization (autonomous_research._direction_score), health/quality, and
+# difficulty must distinguish a direction shipping PROVEN merges from one shipping
+# an equal pile of UNDECLARED merges — additively and fail-safe over legacy data.
+# ---------------------------------------------------------------------------
+
+
+def _accept_cycle(*, proven, declared, merged=2, **extra):
+    """A research_history cycle that recorded the acceptance contract.
+
+    ``merged`` verified write-task merges, of which ``proven`` are machine-proven
+    and ``declared`` declared forward evidence (proven ⊆ declared ⊆ merged).
+    """
+    entry = {
+        "tasks_created": merged,
+        "tasks_completed": merged,
+        "tasks_failed": 0,
+        "tasks_failed_infra": 0,
+        "prs_merged": merged,
+        "verified_prs_merged": merged,
+        "acceptance_merged_write_total": merged,
+        "acceptance_proven_merged": proven,
+        "acceptance_declared_merged": declared,
+        "acceptance_declaration_coverage": round(declared / merged, 3) if merged else None,
+    }
+    entry.update(extra)
+    return entry
+
+
+def test_direction_health_reflects_declaration_coverage():
+    """Proven-merge directions out-score equal-volume undeclared ones across the
+    automated health/prioritization scorers; legacy data is untouched."""
+    from app.direction_metrics import (
+        _compute_difficulty_index,
+        _compute_direction_quality_score,
+        _compute_productivity_score,
+        proof_weighted_merged,
+    )
+    from app.direction_outcomes import verified_merged_count
+
+    # Equal MERGE VOLUME (3 cycles, 2 verified merges each); only proof differs.
+    proven_dir = {"research_history": [_accept_cycle(proven=2, declared=2) for _ in range(3)]}
+    undeclared_dir = {"research_history": [_accept_cycle(proven=0, declared=0) for _ in range(3)]}
+
+    # 1. Quality/health: the undeclared pile no longer reads as fully healthy.
+    q_proven = _compute_direction_quality_score(proven_dir)
+    q_undeclared = _compute_direction_quality_score(undeclared_dir)
+    assert q_proven > q_undeclared
+
+    # 2. Productivity (prioritization input): proven work is more productive.
+    assert _compute_productivity_score(proven_dir) > _compute_productivity_score(
+        undeclared_dir
+    )
+
+    # 3. Difficulty (prioritization input): undeclared work reads as HARDER
+    #    (more tasks per proven merge) so it is deprioritized, not credited.
+    assert _compute_difficulty_index(undeclared_dir) > _compute_difficulty_index(
+        proven_dir
+    )
+
+    # 4. Proof-weighting only ever DISCOUNTS — never inflates above verified.
+    for entry in undeclared_dir["research_history"] + proven_dir["research_history"]:
+        assert proof_weighted_merged(entry) <= verified_merged_count(entry)
+
+    # 5. Fail-safe: the proof discount is GATED on acceptance data being present.
+    #    Stripping the acceptance_* fields yields the legacy twin of the undeclared
+    #    direction — no proof component, no discount — so it scores strictly HIGHER
+    #    than the undeclared one and its merges keep full (verified) credit.
+    legacy_twin = {
+        "research_history": [
+            {k: v for k, v in e.items() if not k.startswith("acceptance_")}
+            for e in undeclared_dir["research_history"]
+        ]
+    }
+    for entry in legacy_twin["research_history"]:
+        assert proof_weighted_merged(entry) == float(verified_merged_count(entry))
+    assert _compute_direction_quality_score(legacy_twin) > q_undeclared
+    assert _compute_productivity_score(legacy_twin) > _compute_productivity_score(
+        undeclared_dir
+    )

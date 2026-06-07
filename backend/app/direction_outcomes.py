@@ -181,6 +181,89 @@ def declared_merged_count(entry: dict) -> int:
     return int(entry.get("acceptance_declared_merged") or 0)
 
 
+def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
+    """Return the acceptance-evidence metric invariants VIOLATED by ``entry``.
+
+    Empty list ⇒ every guarantee holds. Pure and read-only over a single
+    research_history entry's already-computed aggregates — it never mutates,
+    recomputes, or changes any metric value. It is the durable guard that locks
+    the SEMANTIC relationships between the acceptance-evidence metrics so a future
+    refactor of their definitions cannot silently let, say, ``proven`` drift above
+    ``verified``, or a soft / undeclared / degraded merge be retro-counted as
+    proven, with nothing failing:
+
+      * proven ⊆ declared ⊆ merged-write
+        (0 ≤ acceptance_proven_merged ≤ acceptance_declared_merged
+         ≤ acceptance_merged_write_total)
+      * proven ⊆ verified ⊆ merged
+        (0 ≤ acceptance_proven_merged ≤ verified_prs_merged ≤ prs_merged)
+      * declared ⊆ merged          (acceptance_declared_merged ≤ prs_merged)
+      * coverage identity          (acceptance_declaration_coverage ==
+        round(declared / merged-write, 3), or None ⇔ merged-write == 0)
+
+    Fail-safe over legacy rows: a field written before it existed reads as 0 via
+    :func:`proven_merged_count` / :func:`verified_merged_count` and ``.get``
+    defaults, and the merged-write denominator / coverage identity checks are
+    skipped when the denominator was never recorded — so historical entries never
+    spuriously "violate".
+    """
+    violations: list[str] = []
+    proven = proven_merged_count(entry)
+    declared = int(entry.get("acceptance_declared_merged") or 0)
+    verified = verified_merged_count(entry)
+    prs_merged = int(entry.get("prs_merged") or 0)
+
+    if proven < 0:
+        violations.append(f"proven ({proven}) is negative")
+    if proven > declared:
+        violations.append(f"proven ({proven}) exceeds declared ({declared})")
+    if proven > verified:
+        violations.append(f"proven ({proven}) exceeds verified ({verified})")
+    if verified > prs_merged:
+        violations.append(f"verified ({verified}) exceeds prs_merged ({prs_merged})")
+    if declared > prs_merged:
+        violations.append(f"declared ({declared}) exceeds prs_merged ({prs_merged})")
+
+    coverage = entry.get("acceptance_declaration_coverage")
+    if "acceptance_merged_write_total" in entry:
+        merged_write = int(entry.get("acceptance_merged_write_total") or 0)
+        if declared > merged_write:
+            violations.append(
+                f"declared ({declared}) exceeds merged-write ({merged_write})"
+            )
+        if merged_write > prs_merged:
+            violations.append(
+                f"merged-write ({merged_write}) exceeds prs_merged ({prs_merged})"
+            )
+        if merged_write <= 0:
+            if coverage is not None:
+                violations.append(
+                    f"coverage ({coverage}) is not None with zero merged-write"
+                )
+        else:
+            expected = round(declared / merged_write, 3)
+            if coverage != expected:
+                violations.append(
+                    f"coverage ({coverage}) != declared/merged-write "
+                    f"({declared}/{merged_write} = {expected})"
+                )
+    elif coverage is not None and not (0.0 <= coverage <= 1.0):
+        # Legacy entry without the explicit denominator — at minimum coverage
+        # must be a fraction.
+        violations.append(f"coverage ({coverage}) outside [0, 1]")
+
+    return violations
+
+
+def acceptance_metrics_consistent(entry: dict) -> bool:
+    """Whether ``entry``'s acceptance-evidence metrics satisfy every invariant.
+
+    Thin boolean wrapper over :func:`acceptance_metric_invariant_violations`
+    (True ⇔ no violations) for call sites that only need the verdict.
+    """
+    return not acceptance_metric_invariant_violations(entry)
+
+
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
 
 
@@ -743,7 +826,12 @@ async def _update_direction_research_outcomes(
     _merged_write_count = len(_merged_write_rows)
     # Persist the coverage denominator so lifetime/window coverage can be
     # recomputed as declared / merged_write_total (summing counts) rather than
-    # averaging per-cycle fractions — the latter is lossy across cycles.
+    # averaging per-cycle fractions — the latter is lossy across cycles. It is
+    # also the merged WRITE-task count over which acceptance_declaration_coverage
+    # is taken; exposing it makes the coverage identity auditable and lets the
+    # acceptance-metric invariant guard (acceptance_metric_invariant_violations)
+    # pin proven ≤ declared ≤ merged-write without re-deriving it from a rounded
+    # ratio.
     entry["acceptance_merged_write_total"] = _merged_write_count
     entry["acceptance_declaration_coverage"] = (
         round(entry["acceptance_declared_merged"] / _merged_write_count, 3)

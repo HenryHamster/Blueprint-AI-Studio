@@ -18,7 +18,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import strategic_cycle
-from app.direction_metrics import _compute_direction_quality_score
+from app.direction_metrics import (
+    _agg_proof_weighted_merged,
+    _compute_direction_quality_score,
+    proof_weighted_merged,
+)
 from app.direction_outcomes import verified_merged_count
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -919,6 +923,12 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     # count (and so count as non-merge finished work) to match the per-task
     # outcome layer. Benign-unverified and verified merges still count.
     merged = sum(verified_merged_count(e) for e in window)
+    # Proof-weighted merge volume drives the RATE gate so a direction whose merges
+    # are mostly undeclared/unproven (the "merely delivered" proxy) reads as a lower
+    # merge rate than one shipping proven work, and trips the churn guardrail where
+    # the proven direction does not. The displayed ``merged`` count stays the integer
+    # verified total. Legacy/read-only cycles degrade to the verified value.
+    proof_merged = sum(proof_weighted_merged(e) for e in window)
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -933,7 +943,7 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
         0, (tasks_complete - no_pr_completions) + code_failed - merged
     )
     total_finished = merged + non_merge_finished
-    merge_rate = merged / total_finished if total_finished > 0 else 0.0
+    merge_rate = proof_merged / total_finished if total_finished > 0 else 0.0
     return {
         "window_cycles": len(window),
         "merged": merged,
@@ -985,7 +995,14 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     total_finished = lifetime_merged + lifetime_non_merge_finished
     if total_finished == 0:
         return None
-    lifetime_merge_rate = lifetime_merged / total_finished
+    # Proof-weighted lifetime merge volume drives the RATE gate (same rationale as
+    # _compute_churn_metrics): undeclared/unproven lifetime merges count for less, so
+    # a slow-burn direction shipping only unprovable work trips the backstop where a
+    # proven one does not. Displayed lifetime_merged stays the integer verified total.
+    proof_lifetime_merged = sum(
+        proof_weighted_merged(e) for e in history
+    ) + _agg_proof_weighted_merged(agg)
+    lifetime_merge_rate = proof_lifetime_merged / total_finished
     return {
         "lifetime_merged": lifetime_merged,
         "lifetime_non_merge_finished": lifetime_non_merge_finished,
@@ -1024,6 +1041,36 @@ def _direction_still_productive(direction: dict) -> bool:
     )
     consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
     return consecutive < skip_max
+
+
+def _recent_merges_mostly_unproven(direction: dict) -> bool:
+    """True when a direction's recent VERIFIED merges are essentially all
+    undeclared/unproven — the "merely delivered" proxy.
+
+    Used to STRIP the still-productive pause shield (Rules 2/5/6) from a direction
+    that keeps shipping merges no acceptance evidence backs, so a pile of
+    unprovable merges no longer out-protects a direction shipping proven work.
+    A proven (or even merely declared) direction keeps its shield: the proof-
+    weighted fraction stays at or above ``direction_proof_shield_min_fraction``.
+
+    Fail-safe: returns False when the rolling window has NO acceptance-aware merges
+    (legacy / read-only / research directions), so their shield is untouched and
+    behavior is unchanged for pre-acceptance data.
+    """
+    history = direction.get("research_history") or []
+    window_cycles = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    if window_cycles <= 0:
+        return False
+    window = history[-window_cycles:]
+    acc = [e for e in window if "acceptance_merged_write_total" in e]
+    verified = sum(verified_merged_count(e) for e in acc)
+    if verified <= 0:
+        return False
+    weighted = sum(proof_weighted_merged(e) for e in acc)
+    threshold = float(
+        _runtime_config.get("direction_proof_shield_min_fraction", 0.6) or 0.6
+    )
+    return (weighted / verified) < threshold
 
 
 def _already_built_signature(direction: dict) -> dict | None:
@@ -1098,8 +1145,13 @@ def _check_direction_health(direction: dict) -> str | None:
     # direction that is still demonstrably productive must not be pause-retired by a
     # zero-merge / churn / lifetime-burn signal. Code-failure rules (3, 4) below are
     # deliberately left UNGATED — a crashing direction pauses no matter how productive
-    # its last cycle looked.
-    still_productive = _direction_still_productive(direction)
+    # its last cycle looked. The shield is also FORFEIT when the direction's recent
+    # merges are essentially all undeclared/unproven (_recent_merges_mostly_unproven):
+    # "productive" must mean proven work, not a pile of merely-delivered merges, so
+    # such a direction no longer out-protects one shipping proven work.
+    still_productive = _direction_still_productive(
+        direction
+    ) and not _recent_merges_mostly_unproven(direction)
 
     if not in_grace:
         # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task

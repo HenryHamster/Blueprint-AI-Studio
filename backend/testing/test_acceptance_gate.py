@@ -359,6 +359,188 @@ def test_acceptance_was_declared_and_is_proven_contract():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Verdict-axis invariant guard — proven ⟹ satisfied ⟹ declared, over a full mix
+#
+# A durable, non-gameable guard at the per-task verdict level that complements
+# the aggregate-level guard in test_direction_outcomes.py. Across every kind of
+# constructed task, it asserts the implication chain between the three truth axes
+# always holds, and that ONLY a verified, satisfied named_test exercising a
+# changed seam is ever proven — a soft, undeclared, test-only, or
+# degraded/unverified merge is never proven.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# (label, kwargs-for-_make_code_task, expected_declared, expected_satisfied,
+#  expected_proven)
+_VERDICT_MIX = [
+    (
+        "proven_named_test",
+        {
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": [
+                "backend/app/widget.py",
+                "backend/testing/test_widget.py",
+            ],
+            "unverified_reason": None,
+        },
+        True,
+        True,
+        True,
+    ),
+    (
+        "soft_observable_behavior",
+        {
+            "acceptance_evidence": {
+                "kind": "observable_behavior",
+                "description": "the widget renders the empty state without error",
+            },
+            "changed_files": ["backend/app/widget.py"],
+        },
+        True,
+        True,
+        False,
+    ),
+    (
+        "soft_downstream_artifact",
+        {
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "widget_metrics_v2",
+            },
+            "changed_files": ["backend/app/widget.py"],
+        },
+        True,
+        True,
+        False,
+    ),
+    (
+        "declared_unsatisfied_named_test_missing",
+        {
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": ["backend/app/widget.py"],  # test not in diff
+            "unverified_reason": None,
+        },
+        True,
+        False,
+        False,
+    ),
+    (
+        "test_only_diff",
+        {
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": ["backend/testing/test_widget.py"],  # no production seam
+            "unverified_reason": None,
+        },
+        True,
+        False,
+        False,
+    ),
+    (
+        "degraded_unverified_named_test",
+        {
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_widget.py",
+            },
+            "changed_files": [
+                "backend/app/widget.py",
+                "backend/testing/test_widget.py",
+            ],
+            "unverified_reason": "verify_setup_failed",  # fell open, no real verdict
+        },
+        True,
+        False,
+        False,
+    ),
+    (
+        "undeclared_legacy",
+        {"acceptance_evidence": None, "changed_files": ["backend/app/widget.py"]},
+        False,
+        True,  # undeclared is vacuously satisfied (never blocks)
+        False,
+    ),
+]
+
+
+def test_verdict_axis_implication_invariant_over_mix():
+    """proven ⟹ satisfied ⟹ declared, and only a verified satisfied named_test
+    exercising a changed seam is proven — checked over a full mix of task kinds.
+
+    Drives the REAL gate (evaluate_code_acceptance) and the REAL recorded-verdict
+    predicates (acceptance_was_declared / acceptance_blocks_success /
+    acceptance_is_proven), never a reimplementation."""
+    for label, kwargs, exp_declared, exp_satisfied, exp_proven in _VERDICT_MIX:
+        task = _make_code_task(**kwargs)
+        verdict = evaluate_code_acceptance(task)
+
+        # The verdict matches the expected per-axis outcome for this kind.
+        assert verdict.declared is exp_declared, label
+        assert verdict.satisfied is exp_satisfied, label
+        assert verdict.proven is exp_proven, label
+
+        # Core implication chain on the live verdict: proven ⟹ satisfied ⟹ declared.
+        if verdict.proven:
+            assert verdict.satisfied, label
+        if verdict.satisfied and not verdict.declared:
+            # Only the undeclared case is satisfied-without-declared; it is the
+            # documented fail-safe (undeclared work is never blocked) and is
+            # NEVER proven.
+            assert not verdict.proven, label
+
+        # Only a satisfied named_test is ever proven.
+        if verdict.proven:
+            assert verdict.kind == "named_test", label
+
+        # Now exercise the recorded-verdict predicates the aggregates consume.
+        recorded = record_code_acceptance_verdict(task)
+        stamped = task.context.get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not verdict.declared:
+            # Undeclared tasks record nothing and are never declared/proven.
+            assert recorded is None, label
+            assert stamped is None, label
+            assert acceptance_was_declared(stamped) is False, label
+            assert acceptance_is_proven(stamped) is False, label
+            continue
+
+        assert acceptance_was_declared(stamped) is True, label
+        # proven ⟹ declared, and proven ⟹ not-blocking (it is satisfied).
+        assert acceptance_is_proven(stamped) is exp_proven, label
+        if acceptance_is_proven(stamped):
+            assert acceptance_was_declared(stamped) is True, label
+            assert acceptance_blocks_success(stamped) is False, label
+
+
+def test_soft_undeclared_testonly_degraded_never_proven():
+    """The non-gameability promise: a soft, undeclared, test-only, or
+    degraded/unverified merge is NEVER counted as proven."""
+    never_proven_labels = {
+        "soft_observable_behavior",
+        "soft_downstream_artifact",
+        "declared_unsatisfied_named_test_missing",
+        "test_only_diff",
+        "degraded_unverified_named_test",
+        "undeclared_legacy",
+    }
+    for label, kwargs, _decl, _sat, _proven in _VERDICT_MIX:
+        if label not in never_proven_labels:
+            continue
+        task = _make_code_task(**kwargs)
+        verdict = evaluate_code_acceptance(task)
+        assert verdict.proven is False, label
+        record_code_acceptance_verdict(task)
+        assert acceptance_is_proven(task.context.get(CODE_ACCEPTANCE_VERDICT_KEY)) is False, label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Consolidated axis invariant tests: universal laws across full verdict matrix
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -413,13 +595,24 @@ def test_invariant_proven_implies_declared_and_satisfied():
 
 def test_invariant_soft_kinds_are_satisfied_not_proven():
     """Observable_behavior / downstream_artifact: satisfied but never proven."""
-    for kind, extra in (
-        ("observable_behavior", {"description": "the dashboard shows the SHA banner"}),
-        ("downstream_artifact", {"artifact_id": "release-deploy-artifact-registry"}),
+    # downstream_artifact must be GROUNDED — the declared artifact_id token has
+    # to be reflected in a shipped changed-file path (here "promotion" appears in
+    # release_promotion.py). A real diff alone is sufficient for observable_behavior.
+    for kind, extra, changed in (
+        (
+            "observable_behavior",
+            {"description": "the dashboard shows the SHA banner"},
+            ["backend/app/x.py"],
+        ),
+        (
+            "downstream_artifact",
+            {"artifact_id": "release-promotion-record"},
+            ["backend/app/release_promotion.py"],
+        ),
     ):
         task = _make_code_task(
             acceptance_evidence={"kind": kind, **extra},
-            changed_files=["backend/app/x.py"],  # shipped a real diff
+            changed_files=changed,  # shipped a real, grounded diff
         )
         verdict = evaluate_code_acceptance(task)
         # Soft kinds CAN be satisfied (they shipped a real diff)...
@@ -720,11 +913,10 @@ def test_aggregate_invariant_coverage_never_exceeds_bounds():
         total = case["total"]
         # Synthesize the coverage value as the code would compute it.
         coverage = round(declared / total, 3) if total > 0 else None
-        if coverage is not None:
-            # Coverage should be in [0, 1].
-            # If declared > total, coverage would exceed 1 — that's a bug in the
-            # source code (declared should never exceed total), not a test issue.
-            # But we document the invariant: if it ever happens, coverage > 1 is
-            # detectable evidence of the bug.
-            if declared <= total:
-                assert coverage <= 1.0
+        # Coverage should be in [0, 1].
+        # If declared > total, coverage would exceed 1 — that's a bug in the
+        # source code (declared should never exceed total), not a test issue.
+        # But we document the invariant: if it ever happens, coverage > 1 is
+        # detectable evidence of the bug.
+        if coverage is not None and declared <= total:
+            assert coverage <= 1.0
