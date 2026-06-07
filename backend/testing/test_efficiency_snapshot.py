@@ -9,6 +9,7 @@ from httpx import AsyncClient
 
 from app.efficiency_snapshot import (
     ALL_AXES,
+    AXIS_CONSUMERS,
     AXIS_COST_PER_MERGED_PR,
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
@@ -3224,3 +3225,53 @@ async def test_efficiency_axes_endpoint_exposes_timeout_rate(
     assert atr["timeout_count"] == 1
     assert atr["denominator"] == 2
     assert atr["overall"]["current"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Standalone-smoke-compatible invariant tests (no DB session required)
+# ---------------------------------------------------------------------------
+
+
+def test_all_axes_have_named_consumer_or_retired_record():
+    """Every ALL_AXES member has an entry in AXIS_CONSUMERS with a non-empty
+    consumer, pending, or retired disposition, and every entry claiming an
+    active consumer is still a member of ALL_AXES (no stale records).
+
+    This test runs under --standalone --no-postgres (no DB session needed).
+    It is the distributed invariant guard: adding a new drift-alertable axis
+    without a named consumer or retired-with-record annotation MUST fail CI.
+    """
+    all_axes_set = set(ALL_AXES)
+    manifest_keys = set(AXIS_CONSUMERS)
+
+    # (a) Every ALL_AXES member must appear in AXIS_CONSUMERS.
+    missing = all_axes_set - manifest_keys
+    assert not missing, (
+        f"ALL_AXES members missing from AXIS_CONSUMERS: {sorted(missing)}. "
+        "Add an entry with a 'consumer', 'pending', or 'retired'+'date' disposition."
+    )
+
+    # (b) Every manifest entry must have at least one valid disposition key.
+    for axis_key, entry in AXIS_CONSUMERS.items():
+        has_consumer = bool(entry.get("consumer"))
+        has_pending = "pending" in entry
+        has_retired = "retired" in entry and "date" in entry
+        assert has_consumer or has_pending or has_retired, (
+            f"AXIS_CONSUMERS['{axis_key}'] has no valid disposition. "
+            "Provide 'consumer', 'pending', or both 'retired' and 'date'."
+        )
+
+    # (c) Every manifest key claiming an active consumer must still be in ALL_AXES
+    # (prevents stale consumer records from outliving their axis).
+    stale = {
+        k for k, v in AXIS_CONSUMERS.items() if v.get("consumer") and k not in all_axes_set
+    }
+    assert not stale, (
+        f"AXIS_CONSUMERS entries claiming active consumers for axes no longer in ALL_AXES: "
+        f"{sorted(stale)}. Remove or update the manifest entry."
+    )
+
+
+def test_axis_llm_cost_constant_value():
+    """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
+    assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"

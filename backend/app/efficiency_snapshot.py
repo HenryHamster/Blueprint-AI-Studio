@@ -99,6 +99,41 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LLM_COST_PER_MERGED_PR,
 )
 
+# ---------------------------------------------------------------------------
+# Durable axis-consumer manifest (governance pattern — mirrors
+# RESEARCH_HISTORY_METRIC_MANIFEST in direction_outcomes.py).
+#
+# Every ALL_AXES member MUST have an entry. Valid dispositions:
+#   {"consumer": "<surface>"} — active axis with a named reader.
+#   {"retired": "<reason>", "date": "YYYY-MM-DD"} — retired with record.
+#   {"pending": "<reason>"} — tracked but awaiting a consumer.
+#
+# Invariant (test_efficiency_snapshot.py::test_all_axes_have_named_consumer):
+#   (a) every ALL_AXES member is in this dict, and
+#   (b) every dict key with a "consumer" entry is still in ALL_AXES
+#       (so stale consumer records don't outlive their axis).
+# ---------------------------------------------------------------------------
+AXIS_CONSUMERS: dict[str, dict] = {
+    AXIS_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_VM_COLD_START_P50_MS: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_VM_REUSE_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_MEDIAN_API_CALLS_PER_TASK: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_MEDIAN_REVIEW_ITERATIONS: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LLM_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+}
+
 # LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
 # Per-token rates = per-million-token rate / 1_000_000.
 #

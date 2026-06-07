@@ -340,6 +340,7 @@ const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'vm_reuse_rate', label: 'VM reuse rate', unit: '%', favorableDirection: 'higher' },
   { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },
   { key: 'median_review_iterations', label: 'Median review iterations', unit: '', favorableDirection: 'lower' },
+  { key: 'llm_cost_per_merged_pr', label: 'LLM token cost per merged PR', unit: '$', favorableDirection: 'lower' },
 ];
 
 function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'higher'): string {
