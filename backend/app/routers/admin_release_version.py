@@ -259,14 +259,6 @@ async def get_version_lifecycle(
                 merged_since_verdict = await count_merged_since(
                     session, project_id, finalized_at_dt
                 )
-        qual_state = _release_version.summarize_qualification_state(
-            qual,
-            open_row.serving_status,
-            open_row.deploy_failure_reason,
-            aggregate_serving_status=aggregate_serving["serving_status"],
-            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-            artifact_evidence=artifact_evidence,
-        )
         # Surface the open version's audit findings/score so a verdict is
         # explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
@@ -277,6 +269,19 @@ async def get_version_lifecycle(
         # provenance and ``audit_evidence_state`` explains which case applies.
         audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
         latest_audit = audit_evidence["latest_audit"]
+        # Feed the version-scoped audit child into the qualification-state summary
+        # so a crashed audit (terminal-failed, no report) reconciles to
+        # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
+        # badge and the audit-findings section then agree by construction.
+        qual_state = _release_version.summarize_qualification_state(
+            qual,
+            open_row.serving_status,
+            open_row.deploy_failure_reason,
+            audit_child=latest_audit,
+            aggregate_serving_status=aggregate_serving["serving_status"],
+            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+            artifact_evidence=artifact_evidence,
+        )
 
         # Fetch live current_focus from the project's problem_model
         live_current_focus = None

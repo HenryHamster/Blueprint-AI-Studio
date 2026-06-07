@@ -422,11 +422,49 @@ def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
     return f" — {phrase}"
 
 
+# Audit-child task statuses that are NOT a crash when no report is present.
+# Mirrors the frontend ``classifyAuditNoReport`` (VersionLifecyclePanel.tsx) so
+# the operator panel's top badge and its audit-findings section agree by
+# construction:
+#   - non-terminal (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) → still running
+#   - BLOCKED → waiting on a precondition, distinct from a crash
+#   - COMPLETED with no report → finished-but-empty anomaly, not a crash
+# FAILED / CANCELLED / any other (unknown) terminal status with no report is a
+# genuine crash.
+_AUDIT_NONCRASH_STATUSES = frozenset(
+    {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "BLOCKED", "COMPLETED"}
+)
+
+
+def _audit_child_crashed(audit_child: dict[str, Any] | None) -> bool:
+    """Return True when the audit child reached a terminal-failed state with no report.
+
+    ``audit_child`` is the version-scoped audit-evidence envelope (the
+    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence`` /
+    ``get_latest_release_audit_report``), carrying ``task_status`` and ``report``.
+    ``None`` (no current audit child resolved) → not a crash, so callers that
+    pass no signal preserve the prior ``qualifying`` behavior. Pure/sync — no I/O.
+    """
+    if not isinstance(audit_child, dict):
+        return False
+    if audit_child.get("report"):
+        # The audit produced a report — by construction not a crashed-no-report.
+        return False
+    status = str(audit_child.get("task_status") or "").strip().upper()
+    if not status:
+        # No status signal — do not assert a crash.
+        return False
+    # FAILED / CANCELLED / unknown terminal status, with no report → crashed;
+    # everything in the noncrash set (running / blocked / completed-empty) is not.
+    return status not in _AUDIT_NONCRASH_STATUSES
+
+
 def summarize_qualification_state(
     last_qualification: dict[str, Any] | None,
     serving_status: str | None = None,
     deploy_failure_reason: str | None = None,
     *,
+    audit_child: dict[str, Any] | None = None,
     aggregate_serving_status: str | None = None,
     aggregate_deploy_failure_reason: str | None = None,
     artifact_evidence: list[dict[str, Any]] | None = None,
@@ -448,9 +486,22 @@ def summarize_qualification_state(
     explicit sub-state from the raw verdict — pure data, no I/O.
 
     Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
-    ``promotion_in_flight`` | ``promotion_failed`` | ``not_promoted`` |
-    ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
+    ``audit_crashed`` | ``promotion_in_flight`` | ``promotion_failed`` |
+    ``not_promoted`` | ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
     ``promotion_deploy_failed``), or ``None`` when unqualified (no verdict yet).
+
+    Audit-crash reconciliation: when ``status == "pending"`` with no
+    ``promotion_pending`` sub-key, the bare result was always ``qualifying``
+    ("audit in flight, wait"). But the audit child can crash (terminal-failed,
+    no report) while the verdict is still pending — and the operator panel's
+    audit-findings section already reads that crashed status, so the two
+    surfaces contradicted each other. When the optional ``audit_child`` envelope
+    (the version-scoped ``latest_audit`` dict carrying ``task_status``/``report``)
+    shows a crash, return ``audit_crashed`` instead of ``qualifying`` so neither
+    the panel badge nor the strategic payload tells the reader to wait for a dead
+    audit. A still-running smoketest child does NOT mask an already-crashed audit
+    child. ``audit_child=None`` preserves the prior behavior for callers without
+    the signal.
 
     Post-promotion serving disambiguation: when ``status == "promoted"`` the
     optional ``serving_status`` (with ``deploy_failure_reason``) splits the bare
@@ -495,6 +546,17 @@ def summarize_qualification_state(
                 "promotion_pr_number": promo.get("pr_number"),
                 "promotion_pr_url": promo.get("pr_url"),
                 **freshness,
+            }
+        if _audit_child_crashed(audit_child):
+            return {
+                "state": "audit_crashed",
+                "summary": (
+                    "The qualification audit child CRASHED (terminal-failed with "
+                    "no report) while the verdict is still pending. The audit is "
+                    "DEAD — do NOT treat this as 'audit in flight' and do NOT wait "
+                    "for a verdict from it; it will never produce one. Re-run the "
+                    "qualifier on a fresh candidate to get a new audit."
+                ),
             }
         return {
             "state": "qualifying",
@@ -617,6 +679,7 @@ def summarize_qualification_state(
 
 def to_phase_block(
     version: ReleaseVersion,
+    audit_child: dict[str, Any] | None = None,
     *,
     aggregate_serving_status: str | None = None,
     aggregate_deploy_failure_reason: str | None = None,
@@ -626,6 +689,12 @@ def to_phase_block(
 
     Shape matches the ``version_phase`` block described in Phase 2 of the
     design doc (strategic_spawning.py ``_STRATEGIC_REVIEW_SCHEMA``).
+
+    ``audit_child`` (optional, defaults to ``None`` to preserve existing
+    callers/tests) is the version-scoped audit-evidence envelope. When the
+    strategic caller resolves the open version's audit child, threading it here
+    lets ``qualification_state`` reflect an ``audit_crashed`` reconciliation
+    instead of a misleading ``qualifying`` while the audit is dead.
     """
     effective_serving_status = (
         aggregate_serving_status
@@ -650,6 +719,7 @@ def to_phase_block(
             version.last_qualification,
             version.serving_status,
             version.deploy_failure_reason,
+            audit_child=audit_child,
             aggregate_serving_status=aggregate_serving_status,
             aggregate_deploy_failure_reason=aggregate_deploy_failure_reason,
             artifact_evidence=artifact_evidence,

@@ -697,6 +697,27 @@ def test_to_phase_block_carries_promotion_freshness():
     assert "promotion_past_timeout" in qstate
 
 
+def test_to_phase_block_carries_audit_crashed_state():
+    """Given a crashed audit child, to_phase_block surfaces the reconciled
+    ``audit_crashed`` qualification_state so the strategic payload never tells the
+    agent to wait on a dead audit. Default (no audit_child) stays ``qualifying``."""
+    version = ReleaseVersion(
+        version_number=5,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"status": "pending"},
+    )
+    # No audit-child signal: unchanged behavior.
+    assert rv.to_phase_block(version)["qualification_state"]["state"] == "qualifying"
+    # Crashed audit child: reconciled to audit_crashed.
+    block = rv.to_phase_block(
+        version, {"task_status": "FAILED", "report": None}
+    )
+    assert block["qualification_state"]["state"] == "audit_crashed"
+    assert "wait for the verdict" not in block["qualification_state"]["summary"].lower()
+
+
 def test_to_phase_block_qualification_state_none_when_unqualified():
     """An unqualified version (no verdict) yields qualification_state=None."""
     version = ReleaseVersion(
@@ -746,6 +767,76 @@ def test_qual_state_pending_with_promotion_is_promotion_in_flight():
     # The summary must NOT tell the agent the audit is still running.
     assert "passed" in state["summary"].lower()
     assert "armed" in state["summary"].lower()
+
+
+def test_summarize_qualification_state_audit_crashed_overrides_pending():
+    """A pending verdict whose audit child crashed (FAILED/CANCELLED, no report)
+    must reconcile to ``audit_crashed`` — NOT the misleading ``qualifying``/'wait
+    for the verdict' — so the panel badge and the audit-findings section agree.
+    """
+    for crashed_status in ("FAILED", "CANCELLED"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": crashed_status, "report": None},
+        )
+        assert state["state"] == "audit_crashed", crashed_status
+        # The reconciled summary must NOT tell the reader to wait for the verdict.
+        summary = state["summary"].lower()
+        assert "wait for the verdict" not in summary, crashed_status
+        assert "crashed" in summary, crashed_status
+
+    # An unknown terminal status with no report is also a crash (matches the
+    # frontend default branch).
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "ABORTED", "report": None},
+    )
+    assert state["state"] == "audit_crashed"
+
+
+def test_qual_state_pending_no_audit_signal_stays_qualifying():
+    """Without an audit-child signal (default None), behavior is unchanged."""
+    state = rv.summarize_qualification_state({"status": "pending"})
+    assert state["state"] == "qualifying"
+    # A crashed-but-with-report audit is NOT a crashed-no-report case.
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "FAILED", "report": {"score": 0.9}},
+    )
+    assert state["state"] == "qualifying"
+
+
+def test_qual_state_pending_running_audit_child_stays_qualifying():
+    """A non-terminal audit child (still running) must keep ``qualifying``."""
+    for running in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": running, "report": None},
+        )
+        assert state["state"] == "qualifying", running
+
+
+def test_qual_state_pending_blocked_and_completed_not_crashed():
+    """BLOCKED (waiting on a precondition) and COMPLETED-without-report (a
+    finished-but-empty anomaly) must NOT be misclassified as crashed."""
+    for non_crash in ("BLOCKED", "COMPLETED"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": non_crash, "report": None},
+        )
+        assert state["state"] == "qualifying", non_crash
+
+
+def test_qual_state_running_smoketest_does_not_mask_crashed_audit():
+    """When the audit child has already crashed, the reconciled crash state must
+    win even though finalization legitimately still waits on the smoketest — the
+    audit-child signal we thread in describes the audit, and a crashed audit is
+    reported as crashed regardless of a still-running sibling."""
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "FAILED", "report": None},
+    )
+    assert state["state"] == "audit_crashed"
 
 
 def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():

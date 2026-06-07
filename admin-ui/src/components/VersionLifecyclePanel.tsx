@@ -139,6 +139,10 @@ function classifyAuditNoReport(taskStatus: string | null | undefined): AuditNoRe
 }
 const QUAL_STATE_STYLE: Record<string, string> = {
   qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // The audit child crashed (terminal-failed, no report) while the verdict is
+  // still pending — loud red, NOT the amber 'qualifying' look. Keeps the top
+  // badge in agreement with the audit-findings section's 'audit crashed' cue.
+  audit_crashed: 'bg-red-500/10 border-red-500/30 text-red-400',
   promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',

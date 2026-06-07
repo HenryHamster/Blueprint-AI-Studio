@@ -3918,9 +3918,29 @@ async def _spawn_strategic_review(
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
                 )
+                # Resolve the open version's audit child so a crashed audit
+                # (terminal-failed, no report) reconciles the qualification_state
+                # to ``audit_crashed`` instead of telling the strategic agent to
+                # wait on a dead audit (it would otherwise burn a cycle). Same
+                # version-scoped evidence the operator panel reads. Best-effort.
+                _audit_child = None
+                try:
+                    from app.release_qualifier_audit import (
+                        resolve_lifecycle_audit_evidence,
+                    )
+
+                    _audit_evidence = await resolve_lifecycle_audit_evidence(
+                        session, _open_version
+                    )
+                    _audit_child = _audit_evidence["latest_audit"]
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] audit-child resolution failed; continuing"
+                    )
                 _version_phase_block = {
                     **to_phase_block(
                         _open_version,
+                        audit_child=_audit_child,
                         aggregate_serving_status=_open_aggregate["serving_status"],
                         aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
                         artifact_evidence=_open_artifacts,

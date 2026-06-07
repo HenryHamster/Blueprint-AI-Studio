@@ -952,6 +952,40 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
     });
 
+    it('does not contradict itself: a crashed audit child with a pending verdict shows the reconciled crash state, not "in flight / wait for the verdict"', () => {
+      // Backend reconciles a pending verdict whose audit child crashed
+      // (FAILED/CANCELLED, no report) into the audit_crashed qualification_state.
+      // The panel must render that reconciled top badge/summary in agreement with
+      // the audit-findings section's 'audit crashed — no report' cue — never the
+      // old 'qualifying / wait for the verdict' contradiction.
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ status: 'pending' }),
+              qualification_state: {
+                state: 'audit_crashed',
+                summary:
+                  'The qualification audit child CRASHED (terminal-failed with no report) while the verdict is still pending. The audit is DEAD — do NOT treat this as audit in flight.',
+              },
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'FAILED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // The audit-findings section reports the crash...
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+      // ...and the top qualification surface AGREES — no 'in flight / wait' copy.
+      expect(screen.queryByText(/wait for the verdict/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/audit is in flight/i)).not.toBeInTheDocument();
+      // The reconciled crash badge renders (red audit_crashed style).
+      expect(screen.getByText('audit crashed')).toBeInTheDocument();
+    });
+
     it.each(['IN_PROGRESS', 'QUEUED', 'PROVISIONING', 'EVALUATING'])(
       'shows an in-flight no-report audit (%s) as running, not crashed',
       (status) => {
