@@ -679,6 +679,26 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     extra_guidance, existing_suffix, clone_ctx
                 )
 
+        # Escalate effort one tier when the requeued child execution-timed-out
+        # (pure wall-clock), so the retry gets a larger budget (and a stronger
+        # model where effort drives model selection) instead of repeating the
+        # same doomed budget. Gated to the execution_timeout subtype only —
+        # oom/crash/heartbeat-loss/rate-limit never escalate. Written to
+        # clone_ctx["effort"] where the agent reads effort (Layer-1 routing wins).
+        try:
+            from app.failure_classification import (
+                escalated_effort_for_execution_timeout,
+            )
+
+            _escalated_effort = escalated_effort_for_execution_timeout(child)
+            if _escalated_effort:
+                clone_ctx["_effort_escalated_from"] = clone_ctx.get("effort")
+                clone_ctx["effort"] = _escalated_effort
+        except Exception:
+            logger.exception(
+                "[REQUEUE] Failed to escalate effort for task %s", child.id
+            )
+
         new_payloads = [
             validate_internal_payload(p, "task_lifecycle:requeue_child")
             for p in new_payloads

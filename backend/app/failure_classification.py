@@ -2264,3 +2264,58 @@ def classify_failure(
         task, logs, at_time=at_time, db_rl_override=db_rl_override
     ).failure_class
 
+
+def is_pure_execution_timeout(task: "Task") -> bool:
+    """Return True iff a task failed PURELY because its wall-clock budget ran out.
+
+    True only for the ``AGENT_TIMEOUT`` failure class whose sub-type is
+    ``TIMEOUT_EXECUTION`` ("execution timed out" / "sigterm"). This deliberately
+    EXCLUDES oom / process_crash / heartbeat_lost (resource or code issues that
+    route to a separate timeout investigation and that more wall-clock will not
+    fix), as well as every non-timeout class (rate-limit, spot-preemption,
+    provisioning, external-API, code error). Side-effect-free.
+    """
+    if classify_failure(task) != AGENT_TIMEOUT:
+        return False
+    ctx = task.context or {}
+    subtype = ctx.get("timeout_subtype") or classify_timeout_subtype(task)
+    return subtype == TIMEOUT_EXECUTION
+
+
+def escalated_effort_for_execution_timeout(task: "Task") -> str | None:
+    """Return the next-higher effort tier to use when retrying ``task``, or None.
+
+    The single shared policy for the "retry a wall-clock-timed-out task with a
+    bigger budget" behavior. Returns a new effort string ONLY when ALL hold:
+
+      * the kill-switch ``effort_escalation_on_execution_timeout_enabled`` is on;
+      * the failure is a pure execution timeout (see
+        :func:`is_pure_execution_timeout`); and
+      * the task's currently-resolved effort can step up a tier (i.e. it is not
+        already at the top tier "max").
+
+    Otherwise returns None and the caller leaves the effort unchanged. The
+    returned value is the per-attempt effort the requeue site should persist
+    where the agent reads it (``context["effort"]``). Does NOT mutate the task.
+    """
+    # Deferred imports: avoid import cycles (max_plan_pool imports
+    # runtime_config_state which the branch_resolution facade also touches).
+    from app.branch_resolution import escalate_effort
+    from app.max_plan_pool import resolve_effective_effort
+    from app.shared_state import runtime_config
+
+    if not runtime_config.get(
+        "effort_escalation_on_execution_timeout_enabled", True
+    ):
+        return None
+    if not is_pure_execution_timeout(task):
+        return None
+
+    payload = task.first_payload or {}
+    ctx = task.context or {}
+    task_type = payload.get("type") if isinstance(payload, dict) else None
+    current_effort = resolve_effective_effort(
+        payload, ctx, task_type, runtime_config
+    )
+    return escalate_effort(current_effort)
+

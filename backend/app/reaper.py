@@ -2789,6 +2789,32 @@ async def reaper_service():
                                             "[REAPER] Failed to inject retry guidance for task %s",
                                             task.id,
                                         )
+                                # Escalate effort one tier for a pure wall-clock
+                                # execution timeout so the retry gets a larger
+                                # budget (and a stronger model where effort drives
+                                # model selection) instead of repeating the same
+                                # doomed budget. Gated to the execution_timeout
+                                # subtype only — oom/crash/heartbeat-loss/rate-limit
+                                # never escalate. Persisted on reaper_ctx["effort"]
+                                # (Layer-1 routing wins) before task.context is set.
+                                try:
+                                    from app.failure_classification import (
+                                        escalated_effort_for_execution_timeout,
+                                    )
+
+                                    _escalated_effort = (
+                                        escalated_effort_for_execution_timeout(task)
+                                    )
+                                    if _escalated_effort:
+                                        reaper_ctx["_effort_escalated_from"] = (
+                                            reaper_ctx.get("effort")
+                                        )
+                                        reaper_ctx["effort"] = _escalated_effort
+                                except Exception:
+                                    logger.exception(
+                                        "[REAPER] Failed to escalate effort for task %s",
+                                        task.id,
+                                    )
                                 if is_provision_failure and (task.context or {}).get(
                                     "_infra_wait"
                                 ):

@@ -2525,6 +2525,29 @@ async def update_agent_status(
                 # Agent reached the point of POSTing a result, so provisioning worked —
                 # don't carry a stale provision budget into the retry.
                 ctx.pop("provision_failures", None)
+                # Escalate effort one tier when the agent reported a pure
+                # wall-clock execution timeout (ClaudeTimeoutError /
+                # "execution timed out"), so the retry gets a larger budget (and
+                # a stronger model where effort drives model selection) instead
+                # of repeating the same doomed budget. Gated to the
+                # execution_timeout subtype only — oom/crash/heartbeat-loss never
+                # reach this branch as execution timeouts, and rate-limit /
+                # provision are handled above. Written to ctx["effort"] where the
+                # agent reads effort (Layer-1 routing wins).
+                try:
+                    from app.failure_classification import (
+                        escalated_effort_for_execution_timeout,
+                    )
+
+                    _escalated_effort = escalated_effort_for_execution_timeout(task)
+                    if _escalated_effort:
+                        ctx["_effort_escalated_from"] = ctx.get("effort")
+                        ctx["effort"] = _escalated_effort
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Failed to escalate effort for task %s",
+                        task.id,
+                    )
             task.context = ctx
             session.add(task)
 

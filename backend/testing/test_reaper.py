@@ -538,6 +538,66 @@ async def test_in_progress_heartbeat_timeout_reaped(
 
 
 @pytest.mark.asyncio
+async def test_execution_timeout_retry_escalates_effort(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A pure wall-clock execution-timeout requeue escalates effort one tier so
+    the retry gets a larger budget, while an OOM requeue leaves effort
+    unchanged. This is the acceptance evidence for the escalation feature."""
+    project = await _make_project(reaper_db)
+
+    # Execution timeout: AGENT_TIMEOUT + execution_timeout subtype → escalate.
+    exec_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-exec-timeout",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        latest_status_message="execution timed out after 3600s",
+        context={
+            "failure_class": "AGENT_TIMEOUT",
+            "timeout_subtype": "execution_timeout",
+            "effort": "medium",
+        },
+    )
+    # OOM: AGENT_TIMEOUT + oom subtype → must NOT escalate.
+    oom_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-oom",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        latest_status_message="exit code 137 out of memory",
+        context={
+            "failure_class": "AGENT_TIMEOUT",
+            "timeout_subtype": "oom",
+            "effort": "medium",
+        },
+    )
+    reaper_db.add(exec_task)
+    reaper_db.add(oom_task)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(exec_task)
+    await reaper_db.refresh(oom_task)
+
+    # Both requeued in place (attempt_count < class budget).
+    assert exec_task.status == TaskStatus.QUEUED
+    assert oom_task.status == TaskStatus.QUEUED
+
+    # Execution-timeout retry escalated medium → high, with a breadcrumb.
+    assert exec_task.context["effort"] == "high"
+    assert exec_task.context["_effort_escalated_from"] == "medium"
+
+    # OOM retry left effort unchanged and recorded no escalation.
+    assert oom_task.context["effort"] == "medium"
+    assert "_effort_escalated_from" not in oom_task.context
+
+
+@pytest.mark.asyncio
 async def test_in_progress_heartbeat_just_inside_threshold_not_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

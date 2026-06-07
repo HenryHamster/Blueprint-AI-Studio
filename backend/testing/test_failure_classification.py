@@ -179,6 +179,114 @@ class TestPersistFailureCategoryTimeoutSubtype:
         assert "timeout_subtype" not in task.context
 
 
+def _effort_timeout_task(subtype: str, *, effort: str = "medium") -> Task:
+    """Build a task that classify_failure() resolves to AGENT_TIMEOUT with the
+    given timeout subtype and a context-level effort tier.
+
+    Uses the persisted-verdict short-circuit (``failure_class``) so the
+    classifier returns AGENT_TIMEOUT deterministically without depending on
+    status-message regex, and pins ``timeout_subtype`` so the subtype gate is
+    explicit. ``effort`` lands in context where Layer-2 routing reads it.
+    """
+    t = MagicMock(spec=Task)
+    t.latest_status_message = ""
+    t.id = "task-timeout"
+    t.context = {
+        "failure_class": AGENT_TIMEOUT,
+        "timeout_subtype": subtype,
+        "effort": effort,
+    }
+    t.first_payload = {"type": "create"}
+    return t
+
+
+class TestIsPureExecutionTimeout:
+    def test_execution_timeout_is_pure(self):
+        from app.failure_classification import is_pure_execution_timeout
+
+        assert is_pure_execution_timeout(_effort_timeout_task(TIMEOUT_EXECUTION)) is True
+
+    @pytest.mark.parametrize(
+        "subtype",
+        [
+            TIMEOUT_OOM,
+            TIMEOUT_PROCESS_CRASH,
+            TIMEOUT_HEARTBEAT_LOST,
+            TIMEOUT_CASCADE,
+            TIMEOUT_ITERATION_LIMIT,
+            TIMEOUT_UNKNOWN,
+        ],
+    )
+    def test_other_timeout_subtypes_are_not_pure(self, subtype):
+        from app.failure_classification import is_pure_execution_timeout
+
+        assert is_pure_execution_timeout(_effort_timeout_task(subtype)) is False
+
+    def test_non_timeout_failure_is_not_pure(self):
+        from app.failure_classification import is_pure_execution_timeout
+
+        t = MagicMock(spec=Task)
+        t.latest_status_message = "AssertionError: boom"
+        t.context = {"failure_class": CODE_ERROR}
+        t.first_payload = {"type": "create"}
+        assert is_pure_execution_timeout(t) is False
+
+
+class TestEscalatedEffortForExecutionTimeout:
+    def test_execution_timeout_escalates_one_tier(self):
+        from app.failure_classification import (
+            escalated_effort_for_execution_timeout,
+        )
+
+        task = _effort_timeout_task(TIMEOUT_EXECUTION, effort="medium")
+        assert escalated_effort_for_execution_timeout(task) == "high"
+
+    def test_execution_timeout_at_max_does_not_escalate(self):
+        from app.failure_classification import (
+            escalated_effort_for_execution_timeout,
+        )
+
+        task = _effort_timeout_task(TIMEOUT_EXECUTION, effort="max")
+        assert escalated_effort_for_execution_timeout(task) is None
+
+    @pytest.mark.parametrize(
+        "subtype",
+        [TIMEOUT_OOM, TIMEOUT_PROCESS_CRASH, TIMEOUT_HEARTBEAT_LOST],
+    )
+    def test_resource_timeouts_do_not_escalate(self, subtype):
+        from app.failure_classification import (
+            escalated_effort_for_execution_timeout,
+        )
+
+        task = _effort_timeout_task(subtype, effort="medium")
+        assert escalated_effort_for_execution_timeout(task) is None
+
+    def test_non_timeout_does_not_escalate(self):
+        from app.failure_classification import (
+            escalated_effort_for_execution_timeout,
+        )
+
+        t = MagicMock(spec=Task)
+        t.latest_status_message = ""
+        t.context = {"failure_class": RATE_LIMIT, "effort": "medium"}
+        t.first_payload = {"type": "create"}
+        assert escalated_effort_for_execution_timeout(t) is None
+
+    def test_kill_switch_off_disables_escalation(self, monkeypatch):
+        import app.runtime_config_state as rcs
+        from app.failure_classification import (
+            escalated_effort_for_execution_timeout,
+        )
+
+        monkeypatch.setitem(
+            rcs.runtime_config,
+            "effort_escalation_on_execution_timeout_enabled",
+            False,
+        )
+        task = _effort_timeout_task(TIMEOUT_EXECUTION, effort="medium")
+        assert escalated_effort_for_execution_timeout(task) is None
+
+
 class TestStuckLlmCallHelper:
     """Unit tests for the 0-output-token stuck-call detector used by both the
     classifier (agent-reported timeouts) and the reaper (agent_stalled reaps)."""

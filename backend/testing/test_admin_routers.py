@@ -12542,3 +12542,64 @@ class TestStrategistSpawnableRegistry:
         assert STRATEGIST_SPAWNABLE_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
         for impl in ("create", "fix", "refactor", "migrate", "qa"):
             assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES
+
+
+@pytest.mark.asyncio
+async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_session):
+    """A qa task's claim ships project_context.rejection_patterns.
+
+    qa writes real test code and ships through the same code-review gate as
+    create/fix; widening CODE_REVIEW_GATED_TASK_TYPES brings it into the same
+    per-type rejection-pattern launch context that create/fix already receive.
+    """
+    from app.auth import create_agent_token
+    from testing.factories import _utcnow, make_project, make_task
+
+    project = make_project(name="QA Rejection Patterns")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from datetime import timedelta
+
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="qa task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "qa", "prompt": "do work"}],
+                context={
+                    "_first_attempt_rejection_categories": {
+                        "test-coverage": 2,
+                        "correctness": 1,
+                    }
+                },
+                created_at=_utcnow() - timedelta(hours=1),
+            )
+        )
+    await db_session.commit()
+
+    vm_id = f"agent-vm-qa-rej-{uuid.uuid4().hex[:8]}"
+    task = make_task(
+        project_id=project.id,
+        title="qa claim",
+        payloads=[{"type": "qa", "prompt": "Add tests"}],
+        vm_instance_id=vm_id,
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    block = project_ctx.get("rejection_patterns")
+    assert block is not None, (
+        f"expected rejection_patterns in project_context, got {list(project_ctx.keys())}"
+    )
+    assert block["task_type"] == "qa"
+    categories = {c["category"] for c in block["categories"]}
+    assert "test-coverage" in categories

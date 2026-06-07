@@ -6941,6 +6941,56 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_self_review_catch_rate_for_qa(
+    client: AsyncClient, db_session
+):
+    """qa ships reviewed test code, so it receives the SR catch-rate calibration
+    just like create/fix — the gate keys on CODE_REVIEW_GATED_TASK_TYPES."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "test-coverage": {"miss_rate": 0.35, "weighted_miss_rate": 0.40},
+            },
+            "by_task_type": {
+                "qa": {"test-coverage": {"miss_rate": 0.45}},
+            },
+        },
+    }
+    project = Project(
+        name="SR QA Calibration Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "qa", "prompt": "Add tests"}],
+        vm_instance_id="agent-vm-sr-qa-calib",
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sr-qa-calib")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    sr = project_ctx.get("self_review_catch_rate")
+    assert sr is not None, (
+        f"expected self_review_catch_rate in project_context for qa, got {list(project_ctx.keys())}"
+    )
+    assert "test-coverage" in sr["categories"]
+    assert sr["for_task_type"]["test-coverage"]["miss_rate"] == 0.45
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     client: AsyncClient, db_session
 ):
@@ -7938,6 +7988,61 @@ async def test_reassigned_lands_cancelled_no_retry_no_alert(
     assert task.status != TaskStatus.QUEUED, "REASSIGNED must not retry"
     assert (task.context or {}).get("failure_category") == "REASSIGNED"
     alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execution_timeout_retry_escalates_effort(
+    client: AsyncClient, db_session, mocker
+):
+    """An agent-reported pure wall-clock execution timeout ("execution timed
+    out") requeues with its effort tier bumped one step (medium → high), so the
+    retry gets a larger budget. An OOM failure requeues with effort unchanged."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Effort Escalation", user_id="test-user-escalate")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _post_failure(vm_suffix: str, logs: str) -> Task:
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "build x"}],
+            vm_instance_id=f"agent-vm-{vm_suffix}",
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            context={"effort": "medium"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-{vm_suffix}")
+        payload = {"task_id": str(task.id), "status": "FAILED", "logs": logs}
+        resp = await client.post(
+            "/api/agent/status", json=payload, headers={"x-agent-token": token}
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        return task
+
+    exec_task = await _post_failure("exec-timeout", "execution timed out after 3600s")
+    oom_task = await _post_failure("oom", "exit code 137 out of memory")
+
+    # Both AGENT_TIMEOUT failures requeue rather than terminal-fail.
+    assert exec_task.status == TaskStatus.QUEUED
+    assert oom_task.status == TaskStatus.QUEUED
+
+    # Execution timeout escalates effort one tier; OOM leaves it unchanged.
+    assert exec_task.context["effort"] == "high"
+    assert exec_task.context["_effort_escalated_from"] == "medium"
+    assert oom_task.context["effort"] == "medium"
+    assert "_effort_escalated_from" not in oom_task.context
 
 
 @pytest.mark.asyncio

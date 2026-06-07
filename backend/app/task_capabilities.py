@@ -750,6 +750,22 @@ COMPLETION_HANDLER_BY_TASK_TYPE: dict[str, str] = {
 EVALUATION_STRATEGY_BY_TASK_TYPE: dict[str, str] = {
     capability.id.value: capability.evaluation for capability in TASK_CAPABILITIES
 }
+# Canonical registry-derived set of task types whose output ships through the
+# CI-green + reviewer-sign-off code-review merge gate (``evaluation ==
+# "code-ci-review"``). This is the SINGLE source of truth for "does this type's
+# work get reviewed like code?" — currently {create, fix, refactor, migrate, qa,
+# deps, docs}. Launch-context learning signals that are only meaningful for
+# reviewed code work (the per-type first-review rejection patterns and the
+# self-review catch-rate calibration injected by routers/agent.py) gate on this
+# set rather than a hardcoded type tuple, so a newly registered code-review type
+# is equipped automatically. NOTE: this is intentionally BROADER than the
+# narrower "code-change" SR-metrics filter {create, fix, refactor, migrate};
+# qa/docs/deps also pass through review and so belong in the launch-context gate.
+CODE_REVIEW_GATED_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.evaluation == "code-ci-review"
+)
 # Map of task-type value -> declared run-shape, derived from the registry. This
 # is the SINGLE source of truth for "how does this type run?" that future
 # dispatchers (the multi-agent-workflow engine, the experiment-loop engine) read

@@ -459,6 +459,14 @@ runtime_config: Dict = {
     # admin UI response stays under Cloud Run's 32 MB body limit and analytics
     # endpoints don't OOM loading a week of rows.
     "auto_archive_enabled": True,
+    # Effort-escalation-on-execution-timeout kill-switch. When True (default),
+    # a task requeued purely because its wall-clock execution budget ran out
+    # (the AGENT_TIMEOUT "execution_timeout" subtype — NOT oom/crash/heartbeat
+    # loss) has its per-attempt effort tier bumped one step before the retry, so
+    # the retry gets a larger wall-clock budget (and a stronger model where
+    # effort drives model selection) instead of repeating the same doomed
+    # budget. False restores the prior same-effort retry behavior fleet-wide.
+    "effort_escalation_on_execution_timeout_enabled": True,
     # Auto-debug spawn kill-switch (#8528): gates should_auto_debug in
     # agent_status.py. False stops Debug:/Fix: replacement spawns fleet-wide —
     # the storm brake for usage-exhaustion nights where debug children burn

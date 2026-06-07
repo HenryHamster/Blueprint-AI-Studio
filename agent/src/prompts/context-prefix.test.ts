@@ -225,4 +225,48 @@ describe('buildContextPrefix rejection patterns', () => {
     });
     expect(prefix).not.toContain('## Recent rejection patterns');
   });
+
+  // qa/docs/deps also ship reviewed code through the same gate, so they receive
+  // the same launch context as create/fix/refactor/migrate.
+  for (const type of ['qa', 'docs', 'deps']) {
+    it(`renders the rejection-pattern section for review-gated type '${type}'`, () => {
+      const prefix = buildContextPrefix({
+        payloads: [{ type }],
+        project_context: { rejection_patterns: { ...rejectionPatterns, task_type: type } },
+      });
+      expect(prefix).toContain('## Recent rejection patterns (context, not a checklist)');
+      expect(prefix).toContain('**regression_risk**');
+    });
+  }
+});
+
+// ── buildContextPrefix — self-review calibration wiring ──────────────────────
+describe('buildContextPrefix self-review calibration', () => {
+  const srSource = {
+    by_task_type: {
+      qa: { 'test-coverage': { miss_rate: 0.7, below_floor: true } },
+      docs: { documentation: { miss_rate: 0.7, below_floor: true } },
+      deps: { correctness: { miss_rate: 0.7, below_floor: true } },
+    },
+  };
+
+  // The calibration section only renders inside the formatProjectContext block,
+  // which is gated on at least one array-valued project_context key (hasData).
+  for (const type of ['qa', 'docs', 'deps']) {
+    it(`renders the calibration section for review-gated type '${type}'`, () => {
+      const prefix = buildContextPrefix({
+        payloads: [{ type }],
+        project_context: { open_prs: ['Some PR'], self_review_catch_rate: srSource },
+      });
+      expect(prefix).toContain('## Self-review calibration');
+    });
+  }
+
+  it('omits the calibration section for non-code-change task types', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      project_context: { open_prs: ['Some PR'], self_review_catch_rate: srSource },
+    });
+    expect(prefix).not.toContain('## Self-review calibration');
+  });
 });

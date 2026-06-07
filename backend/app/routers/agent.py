@@ -52,7 +52,10 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_integration_branch,
 )
-from app.task_capabilities import agent_capability_slice
+from app.task_capabilities import (
+    CODE_REVIEW_GATED_TASK_TYPES,
+    agent_capability_slice,
+)
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.github import (
@@ -2913,8 +2916,9 @@ async def claim_task(
                     module_warnings
                 )
 
-    # Inject SR catch-rate blind spots for create/fix/refactor tasks
-    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+    # Inject SR catch-rate blind spots for every code-review-gated task type
+    # (create/fix/refactor/migrate/qa/docs/deps) — all ship reviewed code.
+    if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
             sr_trends = (project_for_playbook.design_doc or {}).get(
                 "sr_catch_rate_trends"
@@ -3279,7 +3283,7 @@ async def claim_task(
     # the fully-assembled project_context leaves room under its soft byte budget,
     # so under budget pressure this advisory field drops first and never displaces
     # the mission-critical fields assembled above.
-    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+    if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
             from app.rejection_patterns import (
                 aggregate_rejection_patterns,

@@ -10,6 +10,7 @@ from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
     ALL_TASK_TYPES,
     agent_capability_slice,
+    CODE_REVIEW_GATED_TASK_TYPES,
     COMPLETION_HANDLER_BY_TASK_TYPE,
     COMPUTE_JOB_LAUNCH_TASK_TYPES,
     EVALUATION_STRATEGY_BY_TASK_TYPE,
@@ -210,6 +211,33 @@ def test_code_pr_types_keep_code_ci_review_gate():
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["panel_review"] == "structured-verdict"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
+
+
+def test_code_review_gated_task_types_derived_from_registry():
+    """CODE_REVIEW_GATED_TASK_TYPES is exactly the code-ci-review capabilities.
+
+    This locks the membership of the launch-context learning-signal gate (the
+    per-type rejection patterns + self-review calibration injected by
+    routers/agent.py): every reviewed-code type — including qa/docs/deps — is in,
+    and read-only / knowledge types stay out. Derived, not a parallel literal."""
+    assert CODE_REVIEW_GATED_TASK_TYPES == {
+        "create",
+        "fix",
+        "refactor",
+        "migrate",
+        "qa",
+        "deps",
+        "docs",
+    }
+    derived = frozenset(
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.evaluation == "code-ci-review"
+    )
+    assert CODE_REVIEW_GATED_TASK_TYPES == derived
+    # Read-only / knowledge types are never gated in.
+    for t in ("research", "plan", "review", "memo", "security_audit"):
+        assert t not in CODE_REVIEW_GATED_TASK_TYPES
 
 
 def test_every_capability_declares_a_valid_run_shape():
