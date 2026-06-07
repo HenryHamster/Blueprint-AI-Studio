@@ -1609,6 +1609,17 @@ class ComputeJob(SQLModel, table=True):
     machine_type: str | None = Field(
         default=None, sa_column=Column(String(128), nullable=True)
     )
+    # Single-GPU accelerator request. ``accelerator_type`` is the canonical short
+    # name (e.g. "T4"/"L4"/"V100"); ``accelerator_count`` defaults to 1 when an
+    # accelerator is requested. Both are NULL for CPU-only jobs — the create path
+    # leaves them unset unless a valid single-GPU accelerator is paired with a
+    # GPU machine type, so existing CPU jobs are byte-for-byte unchanged.
+    accelerator_type: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    accelerator_count: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
 
     status: ComputeJobStatus = Field(
         default=ComputeJobStatus.QUEUED,

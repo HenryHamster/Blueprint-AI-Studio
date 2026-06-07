@@ -328,6 +328,99 @@ AGENT_IMAGE_FAMILY = os.getenv(
     f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2",
 )
 
+# --- Single-GPU provisioning FACTS — ADDITIVE & INERT ---
+# These constants/helpers describe how to provision a single-GPU VM. They are
+# NOT consumed by _provision_gcp / provision_ephemeral_vm yet; a later subtask
+# wires them into the existing cooldown / success-rate / quota machinery. All
+# facts come from the gce-gpu-provisioning knowledge document.
+
+# Driver-preinstalled GPU boot image family (Google Deep Learning VM, NVIDIA
+# drivers + ML stack + gVNIC preinstalled). Pinned and overridable the same way
+# AGENT_IMAGE_FAMILY is. A later subtask may resolve this family to a concrete
+# versioned image.
+GPU_IMAGE_FAMILY = os.getenv(
+    "GPU_IMAGE_FAMILY",
+    "projects/deeplearning-platform-release/global/images/family/"
+    "common-cu128-ubuntu-2204-nvidia-570",
+)
+
+# Per-region subnet names derived from the fleet FALLBACK_ZONES ring, so GPU
+# zones reuse the existing per-region subnets rather than inventing new ones.
+_REGION_SUBNETS: dict[str, str] = {}
+for _gpu_zone, _gpu_subnet in FALLBACK_ZONES:
+    _REGION_SUBNETS.setdefault(_gpu_zone.rsplit("-", 1)[0], _gpu_subnet)
+
+# GPU-availability zone lists per accelerator (GCP type string), from the
+# knowledge doc's GPU-locations table. INDEPENDENT of the fleet FALLBACK_ZONES
+# ring: GPU zones differ per accelerator and per region.
+_GPU_ZONE_NAMES: dict[str, list[str]] = {
+    "nvidia-tesla-t4": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-central1-f",
+        "us-east1-b",
+        "us-east1-c",
+        "us-east1-d",
+        "us-east4-a",
+        "us-east4-b",
+        "us-east4-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+    "nvidia-l4": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-east1-b",
+        "us-east1-c",
+        "us-east1-d",
+        "us-east4-a",
+        "us-east4-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+    "nvidia-tesla-v100": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-central1-f",
+        "us-east1-b",
+        "us-east1-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+}
+
+# Resolved per-accelerator (zone, subnet) rings, reusing the fleet per-region
+# subnets. Keyed by GCP accelerator type string.
+GPU_FALLBACK_ZONES: dict[str, list[tuple[str, str]]] = {
+    _accel: [(_zone, _REGION_SUBNETS[_zone.rsplit("-", 1)[0]]) for _zone in _zones]
+    for _accel, _zones in _GPU_ZONE_NAMES.items()
+}
+
+
+def gpu_zone_candidates(accelerator: str) -> list[tuple[str, str]]:
+    """Ordered (zone, subnet) candidates where ``accelerator`` is available.
+
+    Pure helper: returns a fresh list drawn from ``GPU_FALLBACK_ZONES``,
+    independent of the fleet ``FALLBACK_ZONES`` ring. Accepts either a GCP
+    accelerator type string (e.g. ``"nvidia-tesla-t4"``) or a canonical short
+    name (e.g. ``"T4"``). Returns ``[]`` for unknown accelerators.
+
+    The dependent subtask feeds this into the existing cooldown / success-rate /
+    quota machinery; it does nothing on its own.
+    """
+    accel = accelerator
+    if accel not in GPU_FALLBACK_ZONES:
+        from app.vm_cost_rates import resolve_accelerator_spec
+
+        spec = resolve_accelerator_spec(accelerator)
+        if spec is not None:
+            accel = spec.gcp_type
+    return list(GPU_FALLBACK_ZONES.get(accel, []))
+
+
 # Scripts baked into the startup script as base64 blobs. Loaded at module
 # import time so a missing file fails fast instead of during VM provisioning.
 # See backend/app/_agent_scripts/__init__.py for rationale.
@@ -1509,18 +1602,47 @@ async def _provision_gcp(
     provisioning_model: str | None = None,
     startup_script_override: str | None = None,
     machine_type: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ):
     """Provision a GCP VM. When ``startup_script_override`` is provided it is used
     verbatim as the instance startup-script (the taskless warm-pool path passes
     a pre-built pool script + a pre-stored secret), and ``task_id`` may be None.
+
+    When ``accelerator`` names a supported single-GPU shape, the VM is provisioned
+    as a GPU instance: GPU-availability zone candidates (not the fleet ring), a
+    guest accelerator for N1+T4/V100 (built-in for G2+L4), the driver-preinstalled
+    GPU image family, and ``on_host_maintenance=TERMINATE`` (GPUs cannot
+    live-migrate). CPU jobs and agent/pool VMs are unaffected — every GPU branch is
+    gated on ``accel_spec`` being non-None.
     """
     from google.cloud import compute_v1
 
+    # Resolve the accelerator request to a supported single-GPU shape. None ⇒ a
+    # plain CPU VM, so all GPU-specific branches below are inert for CPU jobs.
+    accel_spec = None
+    if accelerator is not None:
+        from app.vm_cost_rates import resolve_accelerator_spec
+
+        accel_spec = resolve_accelerator_spec(accelerator)
+        if accel_spec is None:
+            # A GPU was requested but is not a supported single-GPU shape. Fail
+            # loudly rather than silently falling back to a CPU VM.
+            raise RuntimeError(
+                f"unsupported accelerator {accelerator!r} for GPU provisioning"
+            )
+    is_gpu = accel_spec is not None
+
     logger.info(
         f"Starting provisioning for VM: {vm_instance_id} "
-        f"(Task: {task_id if task_id is not None else 'pool'})"
+        f"(Task: {task_id if task_id is not None else 'pool'}"
+        f"{f', GPU: {accel_spec.name}' if is_gpu else ''})"
     )
-    effective_machine_type = machine_type or MACHINE_TYPE
+    # GPU jobs boot the GPU machine shape (n1-standard-1 / g2-standard-4); CPU
+    # jobs keep the caller's machine type or the fleet default, unchanged.
+    effective_machine_type = machine_type or (
+        accel_spec.machine_type if is_gpu else MACHINE_TYPE
+    )
 
     if secret_version_name is None and task_id is not None:
         # Secret was not pre-computed by the caller — build and store it now.
@@ -1566,7 +1688,9 @@ async def _provision_gcp(
     instance_config.name = vm_instance_id
 
     initialize_params = compute_v1.AttachedDiskInitializeParams()
-    initialize_params.source_image = AGENT_IMAGE_FAMILY
+    # GPU jobs boot the driver-preinstalled Deep Learning VM GPU image family
+    # (NVIDIA drivers + ML stack baked in); CPU jobs keep the agent image.
+    initialize_params.source_image = GPU_IMAGE_FAMILY if is_gpu else AGENT_IMAGE_FAMILY
     initialize_params.disk_size_gb = 50
 
     disk = compute_v1.AttachedDisk()
@@ -1625,6 +1749,7 @@ async def _provision_gcp(
     _effective_provisioning_model = (
         provisioning_model or VM_PROVISIONING_MODEL
     ).upper()
+    scheduling = None
     if _effective_provisioning_model == "SPOT":
         scheduling = compute_v1.Scheduling()
         scheduling.provisioning_model = "SPOT"
@@ -1633,6 +1758,16 @@ async def _provision_gcp(
         # mid-run interruption). Letting GCP DELETE them on preemption avoids
         # accumulating TERMINATED zombies that cleanup has to chase.
         scheduling.instance_termination_action = "DELETE"
+    if is_gpu:
+        # GPUs cannot live-migrate — the instance MUST terminate on host
+        # maintenance or the insert is rejected. automatic_restart is allowed
+        # (and useful) only for STANDARD VMs; SPOT GPU VMs are best-effort
+        # capacity, so leave restart at its preemption default.
+        scheduling = scheduling or compute_v1.Scheduling()
+        scheduling.on_host_maintenance = "TERMINATE"
+        if _effective_provisioning_model != "SPOT":
+            scheduling.automatic_restart = True
+    if scheduling is not None:
         instance_config.scheduling = scheduling
 
     _cancel_event = threading.Event()
@@ -1655,9 +1790,20 @@ async def _provision_gcp(
                 f"Global quota cooldown active — project-wide quota exhausted "
                 f"(e.g. CPUS_ALL_REGIONS); retry in {remaining:.0f}s"
             )
-        # _active_fallback_zones() filters out admin-disabled regions (DISABLED_REGIONS env)
-        # so spawn attempts skip regions with no subnet provisioned.
-        active_zones = _active_fallback_zones()
+        # GPU jobs draw from the per-accelerator GPU-availability (zone, subnet)
+        # ring (GPU zones differ per accelerator and from the fleet ring); CPU
+        # jobs use the fleet ring. Either way admin-disabled regions (no subnet)
+        # are filtered out, and the SAME cooldown / success-rate / quota machinery
+        # below applies. An empty GPU ring (all zones disabled) fails loudly via
+        # the "All zones exhausted" path rather than falling back to a CPU VM.
+        if is_gpu:
+            active_zones = [
+                (z, s)
+                for z, s in gpu_zone_candidates(accel_spec.gcp_type)
+                if not _zone_in_disabled_region(z)
+            ]
+        else:
+            active_zones = _active_fallback_zones()
         healthy_zones = [
             (z, s) for z, s in active_zones if _zone_blocked_until(z, now_pre) is None
         ]
@@ -1693,6 +1839,17 @@ async def _provision_gcp(
                 instance_config.machine_type = (
                     f"zones/{zone}/machineTypes/{effective_machine_type}"
                 )
+                # GPU jobs attach a zone-qualified guest accelerator for N1+T4/V100;
+                # G2+L4 carries the GPU in the machine type (bundled), so no guest
+                # accelerator entry. CPU jobs never touch guest_accelerators.
+                if is_gpu and not accel_spec.bundled:
+                    gpu_accel = compute_v1.AcceleratorConfig()
+                    gpu_accel.accelerator_type = (
+                        f"projects/{GCP_PROJECT_ID}/zones/{zone}"
+                        f"/acceleratorTypes/{accel_spec.gcp_type}"
+                    )
+                    gpu_accel.accelerator_count = accelerator_count
+                    instance_config.guest_accelerators = [gpu_accel]
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
                 # pd-balanced (SSD-backed) boots faster than the pd-standard
@@ -1926,6 +2083,16 @@ async def _provision_gcp(
                     instance_config.machine_type = (
                         f"zones/{wait_zone}/machineTypes/{effective_machine_type}"
                     )
+                    # Re-point the zone-qualified guest accelerator at the wait zone
+                    # (the URL is zonal). G2+L4 stays bundled in the machine type.
+                    if is_gpu and not accel_spec.bundled:
+                        gpu_accel = compute_v1.AcceleratorConfig()
+                        gpu_accel.accelerator_type = (
+                            f"projects/{GCP_PROJECT_ID}/zones/{wait_zone}"
+                            f"/acceleratorTypes/{accel_spec.gcp_type}"
+                        )
+                        gpu_accel.accelerator_count = accelerator_count
+                        instance_config.guest_accelerators = [gpu_accel]
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
                     disk.initialize_params.disk_type = (
@@ -2047,12 +2214,17 @@ async def provision_ephemeral_vm(
     startup_script: str,
     machine_type: str | None = None,
     provisioning_model: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ) -> bool:
     """Provision a non-agent VM that runs a caller-supplied startup script.
 
     This reuses the shared GCP fallback-zone, secret-free boot, and teardown
     plumbing already used by agent VMs while keeping cloud imports hidden from
-    the higher-level compute-job service layer.
+    the higher-level compute-job service layer. When ``accelerator`` is provided
+    (a supported single-GPU short name or GCP type string) the VM is provisioned
+    as a GPU instance — GPU-availability zones, guest accelerator, driver image,
+    and TERMINATE host-maintenance — instead of a plain CPU VM.
     """
     _ensure_image_family_valid()
     if LOCAL_MODE:
@@ -2065,6 +2237,8 @@ async def provision_ephemeral_vm(
         provisioning_model=provisioning_model,
         startup_script_override=startup_script,
         machine_type=machine_type,
+        accelerator=accelerator,
+        accelerator_count=accelerator_count,
     )
 
 

@@ -73,6 +73,9 @@ class ComputeLaunchSpec:
     cwd: str | None = None
     env: dict[str, str] | None = None
     provisioning_model: str = "STANDARD"
+    # Single-GPU accelerator (canonical short name, e.g. "T4"); None for CPU jobs.
+    accelerator: str | None = None
+    accelerator_count: int = 1
 
 
 @dataclass(slots=True)
@@ -112,20 +115,17 @@ class _LocalProcessHandle:
 class ComputeBackend(Protocol):
     name: str
 
-    def external_id_for(self, job: ComputeJob) -> str:
-        ...
+    def external_id_for(self, job: ComputeJob) -> str: ...
 
-    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
-        ...
+    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult: ...
 
-    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
-        ...
+    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult: ...
 
-    async def poll_cost(self, job: ComputeJob, *, as_of: datetime) -> ComputeCostResult:
-        ...
+    async def poll_cost(
+        self, job: ComputeJob, *, as_of: datetime
+    ) -> ComputeCostResult: ...
 
-    async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
-        ...
+    async def terminate(self, job: ComputeJob, *, reason: str) -> bool: ...
 
 
 def _utcnow() -> datetime:
@@ -301,6 +301,8 @@ class GcpComputeBackend:
             startup_script=_build_gcp_startup_script(spec),
             machine_type=spec.machine_type,
             provisioning_model=spec.provisioning_model,
+            accelerator=spec.accelerator,
+            accelerator_count=spec.accelerator_count,
         )
         if not ok:
             raise RuntimeError("GCP compute-job VM provisioning failed")
@@ -326,7 +328,9 @@ class GcpComputeBackend:
         zone = await asyncio.to_thread(_resolve_job_zone, job)
         # All GCP RPCs are synchronous; off-load to a thread so a slow serial /
         # instance-status call can't stall the event loop and unrelated services.
-        serial = await asyncio.to_thread(compute.get_vm_serial_output, external_id, zone)
+        serial = await asyncio.to_thread(
+            compute.get_vm_serial_output, external_id, zone
+        )
         serial_status = _parse_serial_status(serial or "")
         if serial_status is not None:
             return serial_status
@@ -557,7 +561,9 @@ def _local_state_dir_for_external_id(external_id: str | None) -> str:
 
 
 def _local_pid_path_for_external_id(external_id: str | None) -> str:
-    return os.path.join(_local_state_dir_for_external_id(external_id), _LOCAL_PID_FILENAME)
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id), _LOCAL_PID_FILENAME
+    )
 
 
 def _local_started_at_path_for_external_id(external_id: str | None) -> str:

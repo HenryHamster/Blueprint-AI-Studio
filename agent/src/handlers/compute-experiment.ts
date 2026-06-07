@@ -247,6 +247,10 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   if (backendName) body.backend_name = backendName;
   const provisioningModel = strVal(payload.provisioning_model);
   if (provisioningModel) body.provisioning_model = provisioningModel;
+  // Forward the optional single-GPU accelerator only when present, so CPU jobs
+  // (no accelerator) keep their exact existing launch body.
+  const accelerator = strVal(payload.accelerator);
+  if (accelerator) body.accelerator = accelerator;
   return body;
 }
 

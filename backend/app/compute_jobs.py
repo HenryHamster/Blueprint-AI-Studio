@@ -22,6 +22,7 @@ from sqlalchemy import func
 from sqlmodel import select
 
 from app.compute_backends import (
+    LOCAL_BACKEND_NAME,
     ComputeLaunchSpec,
     default_compute_backend_name,
     get_compute_backend,
@@ -36,7 +37,7 @@ from app.models import (
     TaskStatus,
 )
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_vm_rate_per_second, is_supported_machine_type
+from app.vm_cost_rates import get_compute_rate_per_second, validate_compute_request
 
 logger = logging.getLogger(__name__)
 
@@ -115,19 +116,38 @@ async def create_compute_job(
     env: dict[str, str] | None = None,
     backend_name: str | None = None,
     provisioning_model: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
-    if not is_supported_machine_type(machine_type):
-        raise ValueError(f"unsupported machine_type: {machine_type}")
+    # Single gate for CPU and GPU shapes: a GPU machine type is accepted ONLY when
+    # paired with a supported single-GPU accelerator (rejects A100/over-quota,
+    # count != 1, unknown accelerators, and GPU/machine-family mismatch); a CPU
+    # request still requires an explicitly priced e2 machine type, unchanged.
+    accel_spec, reject_reason = validate_compute_request(
+        accelerator, machine_type, accelerator_count
+    )
+    if reject_reason is not None:
+        raise ValueError(reject_reason)
 
     normalized_backend = backend_name or default_compute_backend_name()
     # Validate BEFORE persisting: an unknown / mode-incompatible backend would
     # otherwise wedge the row in QUEUED forever (monitor raises every pass).
     validate_backend_name(normalized_backend)
+    # A GPU can never be provisioned by the local-subprocess backend — reject
+    # loudly at create time rather than silently running the command CPU-only.
+    if accel_spec is not None and normalized_backend == LOCAL_BACKEND_NAME:
+        raise ValueError(
+            "GPU compute jobs are unavailable on the local-subprocess backend"
+        )
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
     capped_deadline = clamp_deadline_seconds(deadline_seconds)
+    # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
+    # cost rate, and provisioning path all resolve the same supported shape.
+    persisted_accelerator = accel_spec.name if accel_spec is not None else None
+    persisted_accelerator_count = accelerator_count if accel_spec is not None else None
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=machine_type,
@@ -137,22 +157,26 @@ async def create_compute_job(
         env=env,
         backend_name=normalized_backend,
         provisioning_model=normalized_provisioning,
+        accelerator=persisted_accelerator,
+        accelerator_count=persisted_accelerator_count,
     )
     locked_task = await _lock_task_for_compute_job(session, task.id)
     if locked_task is None:
         raise ValueError("task not found")
     if locked_task.status in _TASK_TERMINAL_STATUSES:
         raise ValueError("cannot launch a compute job for a terminal task")
-    existing = await _get_active_compute_job_for_task(
-        session, task_id=locked_task.id
-    )
+    existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
         if _launch_request_matches(existing, launch_request_fingerprint):
             return existing
         raise ValueError("task already has an active compute job")
     deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
-    rate = get_vm_rate_per_second(
+    # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
+    # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
+    rate = get_compute_rate_per_second(
         machine_type=machine_type,
+        accelerator=persisted_accelerator,
+        count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
     )
     job = ComputeJob(
@@ -161,6 +185,8 @@ async def create_compute_job(
         backend=normalized_backend,
         status=ComputeJobStatus.QUEUED,
         machine_type=machine_type,
+        accelerator_type=persisted_accelerator,
+        accelerator_count=persisted_accelerator_count,
         spend_cap_usd=capped_spend,
         accrued_cost_usd=0.0,
         wall_clock_deadline=deadline_at,
@@ -217,8 +243,12 @@ def _build_launch_request_fingerprint(
     env: dict[str, str] | None,
     backend_name: str,
     provisioning_model: str,
+    accelerator: str | None = None,
+    accelerator_count: int | None = None,
 ) -> str:
     payload = {
+        "accelerator": accelerator,
+        "accelerator_count": accelerator_count,
         "backend": backend_name,
         "command": command,
         "cwd": cwd,
@@ -341,7 +371,10 @@ async def list_compute_jobs(
             ComputeJob.project_id == project_id,
             (
                 ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | (ComputeJob.completed_at.is_not(None) & (ComputeJob.completed_at >= cutoff))
+                | (
+                    ComputeJob.completed_at.is_not(None)
+                    & (ComputeJob.completed_at >= cutoff)
+                )
             ),
         )
         .order_by(ComputeJob.created_at.desc())
@@ -469,7 +502,9 @@ async def _process_single_compute_job(session, job: ComputeJob) -> None:
     if status.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         finished = status.finished_at or now
         cost = await backend.poll_cost(job, as_of=finished)
-        job.accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
+        job.accrued_cost_usd = max(
+            float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
+        )
         # Persist any command-reported result metrics under a dedicated
         # polling_metadata key. polling_metadata already serializes to the agent
         # via serialize_compute_job_response, so the metrics reach the handler
@@ -571,6 +606,8 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         cwd=meta.get("cwd"),
         env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
+        accelerator=job.accelerator_type,
+        accelerator_count=int(job.accelerator_count or 1),
     )
 
 
@@ -578,7 +615,9 @@ def _meta_message(job: ComputeJob) -> str | None:
     return (job.polling_metadata or {}).get("status_message")
 
 
-def _set_meta(job: ComputeJob, *, status_message: str | None = None, **extra: Any) -> None:
+def _set_meta(
+    job: ComputeJob, *, status_message: str | None = None, **extra: Any
+) -> None:
     meta = dict(job.polling_metadata or {})
     if status_message is not None:
         meta["status_message"] = status_message

@@ -656,6 +656,10 @@ class ComputeExperimentPayload(_SystemPopulated):
     env: dict[str, str] | None = None
     backend_name: str | None = None
     provisioning_model: str | None = None
+    # Optional single-GPU accelerator (canonical short name "T4"/"L4"/"V100").
+    # Absent ⇒ a CPU job, unchanged. When set it must be paired with a matching
+    # GPU machine_type; the backend rejects A100/over-quota and mismatches loudly.
+    accelerator: str | None = None
     # Benchmark/evaluation metadata — informational; echoed back into the result
     # artifact so operators can correlate a job with the experiment that ran it.
     experiment: str | None = None

@@ -262,6 +262,8 @@ class ComputeJobResponse(BaseModel):
     backend: str
     external_compute_id: str | None = None
     machine_type: str | None = None
+    accelerator_type: str | None = None
+    accelerator_count: int | None = None
     status: ComputeJobStatus
     terminal_reason: str | None = None
     outcome: ComputeJobOutcome | None = None

@@ -185,9 +185,13 @@ class TestStoreAgentSecretIamRetry:
         side_effects = [Aborted(f"etag mismatch {i}") for i in range(6)]
         client = _make_client(set_iam_side_effects=side_effects)
 
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ), pytest.raises(Aborted):
+        with (
+            patch(
+                "google.cloud.secretmanager.SecretManagerServiceClient",
+                return_value=client,
+            ),
+            pytest.raises(Aborted),
+        ):
             compute._store_agent_secret("vm123", '{"token": "abc"}')
 
         assert client.set_iam_policy.call_count == 5
@@ -455,7 +459,9 @@ async def test_gcp_compute_backend_uses_persisted_zone_for_restart_serial_recove
         )
 
     def fail_get_vm_status(*args, **kwargs):
-        raise AssertionError("serial marker should finalize the job before VM status lookup")
+        raise AssertionError(
+            "serial marker should finalize the job before VM status lookup"
+        )
 
     monkeypatch.setattr(compute, "get_vm_serial_output", fake_get_vm_serial_output)
     monkeypatch.setattr(compute, "get_vm_status", fail_get_vm_status)
@@ -489,6 +495,99 @@ async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
 
     assert result.started_at == started_at
     assert result.metadata["zone"] == "us-central1-f"
+
+
+@pytest.mark.asyncio
+async def test_gpu_compute_job_builds_accelerator_instance_config(
+    monkeypatch, clean_zone_health
+):
+    """A GPU compute-job provision builds a GCE instance config with the GPU
+    machine type, an attached guest accelerator (correct zonal type + count=1),
+    the driver-preinstalled GPU image, ``on_host_maintenance=TERMINATE``, and a
+    zone drawn from the GPU-availability ring — NOT the plain fleet ring.
+
+    Exercises the production ``compute._provision_gcp`` GPU branch end-to-end with
+    a fake GCE client capturing the built ``Instance`` proto (no real GCP calls).
+    """
+    from google.cloud import compute_v1
+
+    # Force GPU zone selection to a single candidate so the insert zone is
+    # deterministic; the candidate is returned by gpu_zone_candidates, proving
+    # _provision_gcp consults the GPU ring rather than the fleet ring.
+    gpu_zone = "us-east4-c"
+    monkeypatch.setattr(
+        compute,
+        "gpu_zone_candidates",
+        lambda accel: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+
+    def _fail_fleet():
+        raise AssertionError("GPU job must not draw zones from the fleet ring")
+
+    monkeypatch.setattr(compute, "_active_fallback_zones", _fail_fleet)
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+
+    captured: dict = {}
+
+    class _FakeOp:
+        name = "op-gpu-1"
+
+        def result(self, timeout=None):
+            return None
+
+    class _FakeInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            captured["zone"] = zone
+            captured["instance"] = instance_resource
+            return _FakeOp()
+
+        def delete(self, project, zone, instance):
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FakeInstancesClient())
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gputest",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        machine_type="n1-standard-1",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+
+    assert ok is True
+    # Zone drawn from the GPU-availability ring.
+    assert captured["zone"] == gpu_zone
+    instance = captured["instance"]
+    # GPU machine type.
+    assert instance.machine_type == f"zones/{gpu_zone}/machineTypes/n1-standard-1"
+    # Attached guest accelerator: correct zonal type URL + count=1.
+    assert len(instance.guest_accelerators) == 1
+    accel = instance.guest_accelerators[0]
+    assert accel.accelerator_type == (
+        f"projects/{compute.GCP_PROJECT_ID}/zones/{gpu_zone}"
+        f"/acceleratorTypes/nvidia-tesla-t4"
+    )
+    assert accel.accelerator_count == 1
+    # Driver-preinstalled GPU image family, not the agent image.
+    src_image = instance.disks[0].initialize_params.source_image
+    assert src_image == compute.GPU_IMAGE_FAMILY
+    assert src_image != compute.AGENT_IMAGE_FAMILY
+    # GPUs cannot live-migrate.
+    assert instance.scheduling.on_host_maintenance == "TERMINATE"
+    # STANDARD GPU VM keeps automatic_restart.
+    assert instance.scheduling.automatic_restart is True
 
 
 def _metrics_marker(payload: object) -> str:
@@ -639,7 +738,9 @@ async def test_local_state_file_parse_no_result_file_yields_no_metrics():
 
 
 @pytest.mark.asyncio
-async def test_process_compute_jobs_once_persists_result_metrics(db_session, monkeypatch):
+async def test_process_compute_jobs_once_persists_result_metrics(
+    db_session, monkeypatch
+):
     project = Project(name="Compute Job Metrics", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -691,7 +792,9 @@ async def test_process_compute_jobs_once_persists_result_metrics(db_session, mon
         async def terminate(self, persisted_job, *, reason):
             raise AssertionError("terminate should not be called")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -772,7 +875,9 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         async def terminate(self, persisted_job, *, reason):
             raise AssertionError("terminate should not be called")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -826,6 +931,125 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     assert len(jobs) == 1
 
 
+async def _make_compute_task(db_session):
+    project = Project(name="GPU Compute Job", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_accepts_prices_persists_and_forwards_gpu(
+    db_session, monkeypatch
+):
+    """A GPU accelerator request is accepted, priced (base+GPU), persisted on the
+    row, and forwarded into the launch spec the GCP backend hands to the
+    provisioner."""
+    from app.vm_cost_rates import (
+        get_compute_rate_per_second,
+        get_vm_rate_per_second,
+    )
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+
+    # Persisted on the row.
+    assert job.accelerator_type == "T4"
+    assert job.accelerator_count == 1
+
+    # Priced base (n1-standard-1) + GPU surcharge (T4): the persisted rate matches
+    # the accelerator-aware accessor and exceeds the bare base-machine rate.
+    expected_rate = get_compute_rate_per_second(
+        machine_type="n1-standard-1", accelerator="T4", count=1, spot=False
+    )
+    assert job.polling_metadata["cost_rate_per_second"] == pytest.approx(expected_rate)
+    base_only = get_vm_rate_per_second(machine_type="n1-standard-1", spot=False)
+    assert expected_rate > base_only  # GPU surcharge is included
+
+    # Forwarded into the launch spec (which GcpComputeBackend.launch passes to
+    # provision_ephemeral_vm → _provision_gcp).
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.accelerator == "T4"
+    assert spec.accelerator_count == 1
+    assert spec.machine_type == "n1-standard-1"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
+    """An A100 (over-quota, count=0) request is rejected loudly at create time."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="unsupported accelerator"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator="A100",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_gpu_machine_family_mismatch(
+    db_session, monkeypatch
+):
+    """A GPU paired with a mismatched machine family (T4 + g2) is rejected."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="not a valid single-GPU shape"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="g2-standard-4",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator="T4",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_gpu_on_local_backend(db_session, monkeypatch):
+    """A GPU can never be provisioned by the local-subprocess backend."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="local-subprocess"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="local-subprocess",
+            accelerator="T4",
+        )
+
+
 @pytest.mark.asyncio
 async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypatch):
     project = Project(name="Compute Job Budget Kill", user_id="test-user")
@@ -871,7 +1095,9 @@ async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypa
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -933,7 +1159,9 @@ async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypat
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -981,7 +1209,9 @@ async def test_kill_compute_job_cancels_active_and_terminates(db_session, monkey
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
 
     killed = await compute_jobs.kill_compute_job(
         db_session,
@@ -1660,8 +1890,7 @@ _QUOTA_SCOPE_MATRIX = [
     # Global: the error text literally says "globally" / names an
     # ALL_REGIONS quota metric.
     (
-        "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. "
-        "Limit: 32.0 globally.",
+        "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. Limit: 32.0 globally.",
         provision_error_scope.QUOTA_SCOPE_GLOBAL,
     ),
     (
@@ -1675,8 +1904,7 @@ _QUOTA_SCOPE_MATRIX = [
     ("Quota exceeded. Limit: 64.0 globally.", provision_error_scope.QUOTA_SCOPE_GLOBAL),
     # Regional: region-scoped quota metrics.
     (
-        "403 QUOTA_EXCEEDED: Quota 'CPUS' exceeded. "
-        "Limit: 24.0 in region us-central1.",
+        "403 QUOTA_EXCEEDED: Quota 'CPUS' exceeded. Limit: 24.0 in region us-central1.",
         provision_error_scope.QUOTA_SCOPE_REGIONAL,
     ),
     (
@@ -1726,7 +1954,8 @@ class TestQuotaScopeClassification:
             "see quota documentation"
         )
         assert (
-            provision_error_scope.classify_provision_error_scope(err) == provision_error_scope.QUOTA_SCOPE_ZONAL
+            provision_error_scope.classify_provision_error_scope(err)
+            == provision_error_scope.QUOTA_SCOPE_ZONAL
         )
 
 
@@ -1743,7 +1972,9 @@ class TestGlobalQuotaBackoff:
     """Project-level backoff for global quota exhaustion — NO zone marks."""
 
     def test_record_sets_cooldown_and_marks_no_zones(self, clean_zone_health):
-        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(
+            _GLOBAL_QUOTA_ERR
+        )
         assert cooldown_secs == provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS
         expires = provision_error_scope._global_quota_state["cooldown_expires_at"]
         assert expires > datetime.now(timezone.utc)
@@ -1755,7 +1986,9 @@ class TestGlobalQuotaBackoff:
         provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
         assert compute.any_zone_available() is False
         recovery = compute.soonest_zone_recovery()
-        assert recovery == provision_error_scope._global_quota_state["cooldown_expires_at"]
+        assert (
+            recovery == provision_error_scope._global_quota_state["cooldown_expires_at"]
+        )
         wait = compute.zone_recovery_wait_seconds()
         assert wait is not None and wait > 0
 
@@ -1779,7 +2012,9 @@ class TestGlobalQuotaBackoff:
         provision_error_scope._global_quota_state["last_event"] = datetime.now(
             timezone.utc
         ) - timedelta(seconds=provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS + 1)
-        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(
+            _GLOBAL_QUOTA_ERR
+        )
         assert provision_error_scope._global_quota_state["consecutive"] == 2
         assert cooldown_secs == min(
             provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS * 2,
@@ -1788,7 +2023,9 @@ class TestGlobalQuotaBackoff:
 
     def test_backoff_capped(self):
         assert (
-            provision_error_scope._quota_backoff_seconds(100, provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS)
+            provision_error_scope._quota_backoff_seconds(
+                100, provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS
+            )
             == provision_error_scope._QUOTA_COOLDOWN_CAP_SECONDS
         )
 
@@ -1833,7 +2070,9 @@ class TestRegionQuotaBackoff:
     region's zones, marks no individual zone."""
 
     def test_record_blocks_only_that_region(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
         now = datetime.now(timezone.utc)
         assert compute._zone_blocked_until("us-central1-f", now) is not None
         assert compute._zone_blocked_until("us-central1-a", now) is not None
@@ -1845,32 +2084,53 @@ class TestRegionQuotaBackoff:
         assert compute._zone_health == {}
 
     def test_all_regions_blocked_means_nothing_available(self, clean_zone_health):
-        regions = {provision_error_scope._zone_region(z) for z, _ in compute.FALLBACK_ZONES}
+        regions = {
+            provision_error_scope._zone_region(z) for z, _ in compute.FALLBACK_ZONES
+        }
         for region in regions:
-            provision_error_scope._record_region_quota_exhaustion(region, _REGIONAL_QUOTA_ERR)
+            provision_error_scope._record_region_quota_exhaustion(
+                region, _REGIONAL_QUOTA_ERR
+            )
         assert compute.any_zone_available() is False
 
     def test_success_in_region_clears_its_cooldown_only(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        provision_error_scope._record_region_quota_exhaustion("us-east4", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-east4", _REGIONAL_QUOTA_ERR
+        )
         provision_error_scope._clear_quota_cooldowns_after_success("us-central1-f")
         assert "us-central1" not in provision_error_scope._region_quota_state
         assert "us-east4" in provision_error_scope._region_quota_state
 
     def test_summary_surfaces_region_cooldowns(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
         summary = compute.get_zone_health_summary()
         assert "us-central1" in summary["region_quota_cooldowns"]
 
     def test_region_debounce_and_escalation(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 1
-        provision_error_scope._region_quota_state["us-central1"]["last_event"] = datetime.now(
-            timezone.utc
-        ) - timedelta(seconds=provision_error_scope.REGION_QUOTA_COOLDOWN_SECONDS + 1)
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 2
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        assert (
+            provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 1
+        )
+        provision_error_scope._region_quota_state["us-central1"]["last_event"] = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=provision_error_scope.REGION_QUOTA_COOLDOWN_SECONDS + 1)
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        assert (
+            provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 2
+        )
 
 
 class TestZoneSuspectCorroboration:
@@ -1900,9 +2160,7 @@ class TestZoneSuspectCorroboration:
         health = compute._zone_health[zone]
         assert health["consecutive_failures"] == 1
         assert health["cooldown_expires_at"] > datetime.now(timezone.utc)
-        assert (
-            health["last_failure_reason"] == "HEARTBEAT_STARVATION_CORROBORATED"
-        )
+        assert health["last_failure_reason"] == "HEARTBEAT_STARVATION_CORROBORATED"
         # Exactly one success-rate hit for the whole corroborated event.
         assert list(health["recent_outcomes"]) == [False]
         # Evidence consumed: the next charge needs fresh corroboration.
@@ -2346,3 +2604,157 @@ async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_s
         db_session, project_id=None, since=today_start
     )
     assert cross == pytest.approx(4.75)
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU FACTS — pricing, accelerator gate, and zone candidates (inert).
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_rate_includes_base_plus_accelerator():
+    """N1 GPU rate = base machine + GPU surcharge (on-demand and spot)."""
+    from app import vm_cost_rates as vcr
+
+    # N1 + T4: base n1-standard-1 + T4 surcharge.
+    t4_on = vcr.get_compute_rate_per_second("n1-standard-1", accelerator="T4")
+    t4_spot = vcr.get_compute_rate_per_second(
+        "n1-standard-1", accelerator="T4", spot=True
+    )
+    assert t4_on == pytest.approx(0.39749975 / 3600)
+    assert t4_spot == pytest.approx(0.17481125 / 3600)
+    # Explicitly = base + surcharge, not a bundled lookup.
+    assert t4_on == pytest.approx((0.04749975 + 0.35) / 3600)
+    assert t4_spot == pytest.approx((0.01381125 + 0.161) / 3600)
+
+    # N1 + V100.
+    v100_on = vcr.get_compute_rate_per_second("n1-standard-1", accelerator="V100")
+    v100_spot = vcr.get_compute_rate_per_second(
+        "n1-standard-1", accelerator="V100", spot=True
+    )
+    assert v100_on == pytest.approx(2.52749975 / 3600)
+    assert v100_spot == pytest.approx(1.10501125 / 3600)
+    assert v100_on == pytest.approx((0.04749975 + 2.48) / 3600)
+
+
+def test_gpu_rate_g2_l4_is_bundled():
+    """G2 + L4 rate comes from the bundled machine price (no separate surcharge)."""
+    from app import vm_cost_rates as vcr
+
+    l4_on = vcr.get_compute_rate_per_second("g2-standard-4", accelerator="L4")
+    l4_spot = vcr.get_compute_rate_per_second(
+        "g2-standard-4", accelerator="L4", spot=True
+    )
+    assert l4_on == pytest.approx(0.70683228 / 3600)
+    assert l4_spot == pytest.approx(0.058736 / 3600)
+    # L4 has no entry in the per-GPU surcharge table — it is bundled into G2.
+    assert "nvidia-l4" not in vcr.GPU_ACCELERATOR_SURCHARGE_RATES
+
+
+def test_compute_rate_without_accelerator_matches_cpu_rate():
+    """accelerator=None falls through to the unchanged CPU (e2) accessor."""
+    from app import vm_cost_rates as vcr
+
+    for mt in vcr.supported_machine_types():
+        assert vcr.get_compute_rate_per_second(mt) == vcr.get_vm_rate_per_second(mt)
+        assert vcr.get_compute_rate_per_second(
+            mt, spot=True
+        ) == vcr.get_vm_rate_per_second(mt, spot=True)
+
+
+def test_accelerator_gate_rejects_a100_count_and_unknown():
+    """A100 (out of quota), count!=1, and unknown names are rejected."""
+    from app import vm_cost_rates as vcr
+
+    spec, reason = vcr.validate_accelerator_request("A100")
+    assert spec is None and reason and "A100" in reason
+
+    spec, reason = vcr.validate_accelerator_request("T4", count=2)
+    assert spec is None and reason and "count" in reason
+
+    spec, reason = vcr.validate_accelerator_request("nvidia-tesla-h100")
+    assert spec is None and reason
+
+    # The accessor surfaces the same rejections as exceptions.
+    with pytest.raises(vcr.AcceleratorRejection):
+        vcr.get_compute_rate_per_second("a2-highgpu-1g", accelerator="A100")
+    with pytest.raises(vcr.AcceleratorRejection):
+        vcr.get_compute_rate_per_second("n1-standard-1", accelerator="T4", count=4)
+
+
+def test_supported_accelerators_type_strings_and_families():
+    """Each accelerator maps to the correct GCP type string and machine family."""
+    from app import vm_cost_rates as vcr
+
+    assert set(vcr.SUPPORTED_ACCELERATORS) == {"T4", "L4", "V100"}
+    assert "A100" not in vcr.SUPPORTED_ACCELERATORS
+
+    t4 = vcr.SUPPORTED_ACCELERATORS["T4"]
+    assert t4.gcp_type == "nvidia-tesla-t4"
+    assert t4.machine_family == "n1" and not t4.bundled
+    assert t4.machine_type == "n1-standard-1"
+
+    v100 = vcr.SUPPORTED_ACCELERATORS["V100"]
+    assert v100.gcp_type == "nvidia-tesla-v100"
+    assert v100.machine_family == "n1" and not v100.bundled
+
+    l4 = vcr.SUPPORTED_ACCELERATORS["L4"]
+    assert l4.gcp_type == "nvidia-l4"
+    assert l4.machine_family == "g2" and l4.bundled
+    assert l4.machine_type == "g2-standard-4"
+
+
+def test_gpu_facts_do_not_leak_into_cpu_create_gate():
+    """Regression guard: GPU shapes must NOT enter the CPU-only create gate."""
+    from app import vm_cost_rates as vcr
+
+    assert set(vcr.supported_machine_types()) == {
+        "e2-standard-2",
+        "e2-standard-4",
+        "e2-standard-8",
+        "e2-standard-16",
+        "e2-standard-32",
+    }
+    assert all(mt.startswith("e2-") for mt in vcr.supported_machine_types())
+    for gpu_mt in ("n1-standard-1", "g2-standard-4"):
+        assert not vcr.is_supported_machine_type(gpu_mt)
+        assert gpu_mt not in vcr.VM_COST_RATES
+
+
+def test_gpu_zone_candidates_non_empty_mapped_and_distinct_from_fleet():
+    """Per-accelerator zone candidates are non-empty, subnet-correct, and not the fleet ring."""
+    from app import compute
+
+    fleet_zones = {z for z, _ in compute.FALLBACK_ZONES}
+
+    region_subnets = {}
+    for z, s in compute.FALLBACK_ZONES:
+        region_subnets.setdefault(z.rsplit("-", 1)[0], s)
+
+    for accel in ("T4", "L4", "V100", "nvidia-tesla-t4"):
+        candidates = compute.gpu_zone_candidates(accel)
+        assert candidates, f"expected non-empty zone list for {accel}"
+        for zone, subnet in candidates:
+            assert subnet == region_subnets[zone.rsplit("-", 1)[0]]
+
+    # V100 has no us-east4 zones; T4 does — the maps are genuinely per-accelerator.
+    t4_zones = {z for z, _ in compute.gpu_zone_candidates("T4")}
+    v100_zones = {z for z, _ in compute.gpu_zone_candidates("V100")}
+    assert any(z.startswith("us-east4") for z in t4_zones)
+    assert not any(z.startswith("us-east4") for z in v100_zones)
+
+    # Independent of the fleet ring: the GPU lists include zones not in FALLBACK_ZONES.
+    assert t4_zones - fleet_zones, "GPU zone ring should differ from the fleet ring"
+
+    # Unknown accelerators yield an empty candidate list.
+    assert compute.gpu_zone_candidates("nvidia-a100") == []
+
+
+def test_gpu_image_family_is_driver_preinstalled():
+    """GPU image family defaults to a driver-preinstalled DLVM family."""
+    from app import compute
+
+    # Driver-preinstalled Deep Learning VM family (NVIDIA driver baked in).
+    assert "nvidia" in compute.GPU_IMAGE_FAMILY
+    assert "deeplearning-platform-release" in compute.GPU_IMAGE_FAMILY
+    # Pinned the same way AGENT_IMAGE_FAMILY is (fully-qualified family path).
+    assert compute.GPU_IMAGE_FAMILY.startswith("projects/")

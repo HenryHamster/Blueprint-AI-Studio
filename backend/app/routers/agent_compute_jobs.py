@@ -30,6 +30,10 @@ class LaunchComputeJobRequest(BaseModel):
     env: Dict[str, str] | None = None
     backend_name: str | None = Field(default=None, max_length=32)
     provisioning_model: str | None = Field(default=None, max_length=16)
+    # Optional single-GPU accelerator. Omission = CPU job (existing clients
+    # unaffected); when set, a matching GPU machine_type is required and
+    # create_compute_job rejects A100/over-quota, count!=1, and mismatches.
+    accelerator: str | None = Field(default=None, max_length=32)
 
 
 @router.post("/compute-jobs")
@@ -48,7 +52,11 @@ async def launch_compute_job(
     except ValueError as exc:
         raise HTTPException(status_code=403, detail="Invalid token: bad sub") from exc
 
-    if req.machine_type not in supported_machine_types():
+    # CPU machine-type gate is unchanged. A GPU shape (accelerator present) is
+    # NOT rejected here — it is accepted only when create_compute_job confirms it
+    # is paired with a valid single-GPU accelerator (which also rejects
+    # A100/over-quota, count!=1, the local backend, and family mismatches).
+    if req.accelerator is None and req.machine_type not in supported_machine_types():
         raise HTTPException(
             status_code=422,
             detail={
@@ -83,6 +91,7 @@ async def launch_compute_job(
             env=req.env,
             backend_name=req.backend_name,
             provisioning_model=req.provisioning_model,
+            accelerator=req.accelerator,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

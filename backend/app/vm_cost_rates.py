@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
@@ -108,3 +109,198 @@ def idle_cost_usd(
     if spot is None:
         spot = fleet_provisioning_is_spot()
     return idle_seconds * get_vm_rate_per_second(machine_type, spot=spot)
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU accelerator FACTS — ADDITIVE & INERT.
+#
+# These structures are deliberately SEPARATE from ``VM_COST_RATES`` so the
+# CPU-only create gate (``supported_machine_types`` / ``is_supported_machine_type``)
+# is unchanged: GPU machine types are NOT priced through ``VM_COST_RATES`` and
+# therefore still report as unsupported until a later subtask wires GPU
+# acceptance through the new accessor / gate below.
+#
+# Facts (machine/accelerator pairings, GCP type strings, prices) come from the
+# gce-gpu-provisioning knowledge document; do not edit without re-grounding.
+# ---------------------------------------------------------------------------
+
+# N1 base machine pricing for guest-accelerator GPU shapes
+# (on_demand_hourly, spot_hourly). For N1 GPU VMs the total cost is the base
+# machine rate PLUS a separate per-GPU surcharge (kept as distinct components).
+GPU_BASE_MACHINE_RATES: dict[str, Tuple[float, float]] = {
+    "n1-standard-1": (0.04749975, 0.01381125),
+}
+
+# Per-GPU surcharge for N1 guest-accelerator shapes (on_demand_hourly,
+# spot_hourly), keyed by GCP accelerator type string.
+GPU_ACCELERATOR_SURCHARGE_RATES: dict[str, Tuple[float, float]] = {
+    "nvidia-tesla-t4": (0.35, 0.161),
+    "nvidia-tesla-v100": (2.48, 1.0912),
+}
+
+# Bundled machine pricing for G2 shapes: the L4 GPU is built into the machine
+# price, so there is no separate surcharge (on_demand_hourly, spot_hourly).
+GPU_BUNDLED_MACHINE_RATES: dict[str, Tuple[float, float]] = {
+    "g2-standard-4": (0.70683228, 0.058736),
+}
+
+
+@dataclass(frozen=True)
+class AcceleratorSpec:
+    """A supported single-GPU accelerator and how it attaches to a VM."""
+
+    name: str  # canonical short name, e.g. "T4"
+    gcp_type: str  # GCP accelerator type string, e.g. "nvidia-tesla-t4"
+    machine_family: str  # "n1" (guest accelerator) or "g2" (built-in)
+    machine_type: str  # canonical single-GPU machine type
+    bundled: bool  # True when the machine price already includes the GPU (G2)
+
+
+# The supported-accelerator gate as DATA. A100 is deliberately ABSENT — its
+# quota is 0 (see the knowledge doc). Keyed by canonical short name.
+SUPPORTED_ACCELERATORS: dict[str, AcceleratorSpec] = {
+    "T4": AcceleratorSpec("T4", "nvidia-tesla-t4", "n1", "n1-standard-1", False),
+    "L4": AcceleratorSpec("L4", "nvidia-l4", "g2", "g2-standard-4", True),
+    "V100": AcceleratorSpec("V100", "nvidia-tesla-v100", "n1", "n1-standard-1", False),
+}
+
+# Reverse lookup so requests may name an accelerator by its GCP type string.
+_ACCELERATOR_BY_GCP_TYPE: dict[str, AcceleratorSpec] = {
+    spec.gcp_type: spec for spec in SUPPORTED_ACCELERATORS.values()
+}
+
+
+class AcceleratorRejection(ValueError):
+    """Raised when an accelerator request is not a supported single-GPU shape."""
+
+
+def resolve_accelerator_spec(accelerator: str | None) -> AcceleratorSpec | None:
+    """Look up an ``AcceleratorSpec`` by short name or GCP type string.
+
+    Case-insensitive on the short name. Returns ``None`` for unknown names
+    (callers that need a rejection reason should use
+    :func:`validate_accelerator_request`).
+    """
+    if accelerator is None:
+        return None
+    spec = SUPPORTED_ACCELERATORS.get(accelerator.upper())
+    if spec is not None:
+        return spec
+    return _ACCELERATOR_BY_GCP_TYPE.get(accelerator)
+
+
+def validate_accelerator_request(
+    accelerator: str, count: int = 1
+) -> Tuple[AcceleratorSpec | None, str | None]:
+    """Validate a single-GPU accelerator request.
+
+    Returns ``(spec, None)`` when the request is a supported single-GPU shape,
+    or ``(None, reason)`` with a clear rejection message for unsupported
+    accelerators (e.g. A100, which is out of quota), counts other than 1, or
+    unknown accelerator names.
+    """
+    spec = resolve_accelerator_spec(accelerator)
+    if spec is None:
+        return None, (
+            f"unsupported accelerator {accelerator!r}: only "
+            f"{sorted(SUPPORTED_ACCELERATORS)} are supported "
+            "(A100 is excluded — quota is 0)"
+        )
+    if count != 1:
+        return None, (
+            f"unsupported accelerator count {count!r} for {spec.name}: "
+            "only single-GPU (count=1) requests are supported"
+        )
+    return spec, None
+
+
+def supported_gpu_machine_types() -> tuple[str, ...]:
+    """Return the explicitly priced single-GPU machine types the platform accepts."""
+    return tuple(sorted(set(GPU_BASE_MACHINE_RATES) | set(GPU_BUNDLED_MACHINE_RATES)))
+
+
+def validate_compute_request(
+    accelerator: str | None,
+    machine_type: str | None,
+    count: int = 1,
+) -> Tuple[AcceleratorSpec | None, str | None]:
+    """Validate a (machine_type, optional accelerator) compute request.
+
+    Three outcomes:
+      * ``(None, None)`` — a valid CPU request (no accelerator, priced machine type).
+      * ``(spec, None)`` — a valid single-GPU request (supported accelerator paired
+        with a matching, priced GPU machine type).
+      * ``(None, reason)`` — a rejection with a clear message (unsupported/over-quota
+        accelerator like A100, count != 1, unknown accelerator, or a
+        GPU/machine-family mismatch).
+
+    This does NOT loosen the CPU gate: when ``accelerator`` is ``None`` it still
+    requires an explicitly priced (e2) machine type, exactly as before.
+    """
+    if accelerator is None:
+        if not is_supported_machine_type(machine_type):
+            return None, f"unsupported machine_type: {machine_type}"
+        return None, None
+
+    spec, reason = validate_accelerator_request(accelerator, count)
+    if reason is not None:
+        return None, reason
+    assert spec is not None  # narrowed by validate_accelerator_request
+
+    # The machine type must match the accelerator's machine family AND be priced.
+    # GPU_BUNDLED_MACHINE_RATES holds only G2 (built-in L4) shapes;
+    # GPU_BASE_MACHINE_RATES holds only N1 (guest-accelerator T4/V100) shapes — so
+    # this single membership check rejects a GPU/machine-family mismatch (e.g. T4
+    # with g2-standard-4, or L4 with n1-standard-1) as well as an unpriced shape.
+    if spec.bundled:
+        if machine_type not in GPU_BUNDLED_MACHINE_RATES:
+            return None, (
+                f"machine_type {machine_type!r} is not a valid single-GPU shape for "
+                f"{spec.name}; expected one of {sorted(GPU_BUNDLED_MACHINE_RATES)}"
+            )
+    else:
+        if machine_type not in GPU_BASE_MACHINE_RATES:
+            return None, (
+                f"machine_type {machine_type!r} is not a valid single-GPU shape for "
+                f"{spec.name}; expected one of {sorted(GPU_BASE_MACHINE_RATES)}"
+            )
+    return spec, None
+
+
+def get_compute_rate_per_second(
+    machine_type: str | None = None,
+    accelerator: str | None = None,
+    count: int = 1,
+    spot: bool = False,
+) -> float:
+    """Per-second cost rate for a (machine type, optional accelerator) request.
+
+    When ``accelerator`` is ``None`` this falls through to
+    :func:`get_vm_rate_per_second`, so existing CPU (e2) callers are unchanged.
+
+    When an accelerator is requested, the rate is:
+      * N1 guest-accelerator shapes (T4/V100): base machine rate + GPU surcharge.
+      * G2 bundled shapes (L4): the machine rate, which already includes the GPU.
+
+    Raises :class:`AcceleratorRejection` for unsupported accelerators, counts
+    other than 1, or unknown names.
+    """
+    if accelerator is None:
+        return get_vm_rate_per_second(machine_type, spot=spot)
+
+    spec, reason = validate_accelerator_request(accelerator, count)
+    if reason is not None:
+        raise AcceleratorRejection(reason)
+    assert spec is not None  # narrowed by validate_accelerator_request
+
+    if spec.bundled:
+        hourly = GPU_BUNDLED_MACHINE_RATES[spec.machine_type]
+        rate = hourly[1] if spot else hourly[0]
+        return rate / 3600
+
+    base_machine = machine_type or spec.machine_type
+    base_hourly = GPU_BASE_MACHINE_RATES[base_machine]
+    surcharge_hourly = GPU_ACCELERATOR_SURCHARGE_RATES[spec.gcp_type]
+    base_rate = base_hourly[1] if spot else base_hourly[0]
+    surcharge_rate = surcharge_hourly[1] if spot else surcharge_hourly[0]
+    return (base_rate + surcharge_rate) / 3600
