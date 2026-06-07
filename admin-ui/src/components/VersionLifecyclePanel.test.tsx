@@ -53,6 +53,18 @@ function makeQualification(overrides: Partial<api.VersionQualification> = {}): a
   };
 }
 
+function makePromotionInFlightState(
+  overrides: Partial<api.QualificationState> = {},
+): api.QualificationState {
+  return {
+    state: 'promotion_in_flight',
+    summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
+    promotion_pr_number: 4242,
+    promotion_pr_url: 'https://example/pr/4242',
+    ...overrides,
+  };
+}
+
 function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
   return {
     audit_task_id: 'task-1',
@@ -774,12 +786,12 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               version_number: 6,
-              qualification_state: {
-                state: 'promotion_in_flight',
-                summary: 'Audit PASSED; a promotion PR is open and auto-merging.',
+              qualification_state: makePromotionInFlightState({
                 promotion_pr_number: 7357,
                 promotion_pr_url: 'https://example/pr/7357',
-              },
+                promotion_age_seconds: 7500,
+                promotion_timeout_seconds: 14400,
+              }),
             }),
             staged_directions: [],
           })}
@@ -791,14 +803,19 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
 
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #7357 open & auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+      );
       const consequences = screen.getByTestId('cut-consequences');
-      expect(consequences).toHaveTextContent('Promotion PR #7357 is open and auto-merging');
+      expect(consequences).toHaveTextContent(
+        'Promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+      );
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       await waitFor(() => {
         expect(window.confirm).toHaveBeenCalledWith(
-          expect.stringContaining('promotion PR #7357 is open and auto-merging')
+          expect.stringContaining('promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))')
         );
       });
       await waitFor(() => {
@@ -1096,12 +1113,7 @@ describe('VersionLifecyclePanel', () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
     });
 
-    const promotionInFlightState: api.QualificationState = {
-      state: 'promotion_in_flight',
-      summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
-      promotion_pr_number: 4242,
-      promotion_pr_url: 'https://example/pr/4242',
-    };
+    const promotionInFlightState = makePromotionInFlightState();
 
     it('disables Run Qualify and the phase flip while a promotion is in flight', () => {
       render(
@@ -1123,6 +1135,86 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
       // The note makes the locked state legible.
       expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent('#4242');
+    });
+
+    it('degrades cleanly to the PR-only lock copy when freshness timing is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: promotionInFlightState,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging — qualify & phase locked until it lands or is canceled'
+      );
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
+        'title',
+        'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying'
+      );
+    });
+
+    it('surfaces a nearing-timeout warning consistently across the status and lock copy', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makePromotionInFlightState({
+                promotion_age_seconds: 12600,
+                promotion_timeout_seconds: 14400,
+                promotion_nearing_timeout: true,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout)'
+      );
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — qualify & phase locked until it lands or is canceled'
+      );
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
+        'title',
+        'A promotion PR is open and auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — wait for it to land or cancel it before re-qualifying'
+      );
+    });
+
+    it('surfaces a past-timeout warning consistently across the status and lock copy', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makePromotionInFlightState({
+                promotion_age_seconds: 14700,
+                promotion_timeout_seconds: 14400,
+                promotion_past_timeout: true,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout)'
+      );
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout) — qualify & phase locked until it lands or is canceled'
+      );
     });
 
     it('leaves qualify + phase controls actionable when no promotion is in flight', () => {

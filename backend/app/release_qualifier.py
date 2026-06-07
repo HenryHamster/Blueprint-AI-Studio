@@ -449,11 +449,18 @@ def _promotion_in_flight_result(
         version.last_qualification
     )
     if qual_state and qual_state.get("state") == "promotion_in_flight":
-        return {
+        result = {
             "status": "promotion_in_flight",
             "promotion_pr_number": qual_state.get("promotion_pr_number"),
             "promotion_pr_url": qual_state.get("promotion_pr_url"),
         }
+        # Carry the additive age / auto-timeout freshness keys so the qualify 409
+        # can surface elapsed age and near/past-timeout state (keys absent when
+        # promotion_pending had no usable enabled_at).
+        for key in release_version._PROMOTION_FRESHNESS_KEYS:
+            if key in qual_state:
+                result[key] = qual_state[key]
+        return result
     return None
 
 

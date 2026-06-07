@@ -418,6 +418,7 @@ async def set_version_phase(
             if pr_url:
                 detail += f" {pr_url}"
             detail += ")"
+        detail += _release_version.format_promotion_freshness(_qual_state)
         raise HTTPException(status_code=409, detail=detail)
 
     operator_id = current_user.get("email") or current_user["user_id"]
@@ -554,6 +555,7 @@ async def cut_version(
             if exc.promotion_pr_url:
                 detail += f" {exc.promotion_pr_url}"
             detail += ")"
+        detail += _release_version.format_promotion_freshness(exc.promotion_freshness)
         raise HTTPException(status_code=409, detail=detail) from exc
     if abandoned is None or new_version is None:
         raise HTTPException(

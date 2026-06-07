@@ -43,8 +43,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,12 +52,17 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.landed_signal import landed_signal_predicate
 from app.models import Project, ReleaseVersion, Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
 _VALID_PHASES = frozenset({"build", "stabilize"})
 _PHASE_REASONING_MAX = 500
+
+# Fraction of the promotion auto-timeout cap past which an in-flight promotion is
+# flagged as ``promotion_nearing_timeout`` (so operators/strategist get a warning
+# before the reconciliation sweep force-reverts it to stabilize).
+_PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 
 # Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
 # which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
@@ -71,10 +76,15 @@ class VersionCutBlockedByPromotion(RuntimeError):
         self,
         promotion_pr_number: int | None = None,
         promotion_pr_url: str | None = None,
+        promotion_freshness: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__("promotion PR is open and auto-merging")
         self.promotion_pr_number = promotion_pr_number
         self.promotion_pr_url = promotion_pr_url
+        # Additive freshness context (age / auto-timeout) so the version-cut 409
+        # can surface elapsed age and near/past-timeout state. ``None`` when the
+        # promotion_pending record had no usable ``enabled_at``.
+        self.promotion_freshness = dict(promotion_freshness) if promotion_freshness else None
 
 
 async def open_version(
@@ -321,6 +331,88 @@ async def recent_closed_versions(
     return list((await session.execute(stmt)).scalars().all())
 
 
+_PROMOTION_FRESHNESS_KEYS = (
+    "promotion_enabled_at",
+    "promotion_age_seconds",
+    "promotion_timeout_seconds",
+    "promotion_timeout_at",
+    "promotion_past_timeout",
+    "promotion_nearing_timeout",
+)
+
+
+def _humanize_seconds(seconds: float) -> str:
+    """Render a duration as a compact ``Xh Ym`` / ``Xh`` / ``Ym`` string."""
+    total = int(max(0, seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, _ = divmod(rem, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
+    """Derive additive age / auto-timeout context for an in-flight promotion.
+
+    Reads ``promotion_pending.enabled_at`` (the moment auto-merge was armed) and
+    the SAME configurable cap the reconciliation sweep uses to force-fail a
+    stranded ``promotion_pending`` (``_promotion_pending_timeout_seconds``), so
+    every consumer of the shared qualification summary agrees by construction on
+    elapsed age and whether the promotion is nearing or past the auto-timeout.
+
+    Returns ``{}`` (today's timeless behavior) when ``enabled_at`` is missing or
+    unparseable — callers fall back to the PR-number-only summary rather than
+    erroring.
+    """
+    enabled_at_raw = promo.get("enabled_at")
+    if not isinstance(enabled_at_raw, str) or not enabled_at_raw:
+        return {}
+    try:
+        enabled_at = _coerce_naive_utc(datetime.fromisoformat(enabled_at_raw))
+    except (ValueError, TypeError):
+        return {}
+    # Lazy import: release_reconciliation imports release_version at module load,
+    # so a top-level import here would form a cycle.
+    from app.release_reconciliation import _promotion_pending_timeout_seconds
+
+    cap_seconds = _promotion_pending_timeout_seconds()
+    age_seconds = max(0.0, (_utcnow() - enabled_at).total_seconds())
+    past_timeout = age_seconds >= cap_seconds
+    nearing_timeout = (not past_timeout) and age_seconds >= (
+        cap_seconds * _PROMOTION_NEARING_TIMEOUT_FRACTION
+    )
+    return {
+        "promotion_enabled_at": enabled_at.isoformat(),
+        "promotion_age_seconds": age_seconds,
+        "promotion_timeout_seconds": cap_seconds,
+        "promotion_timeout_at": (enabled_at + timedelta(seconds=cap_seconds)).isoformat(),
+        "promotion_past_timeout": past_timeout,
+        "promotion_nearing_timeout": nearing_timeout,
+    }
+
+
+def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
+    """Return a short operator-facing age / auto-timeout suffix for 409 details.
+
+    Reads the additive freshness keys carried on the shared qualification
+    summary (or the version-cut exception). Returns ``""`` when no freshness is
+    available (missing/invalid ``enabled_at``) so messages fall back unchanged.
+    """
+    if not state:
+        return ""
+    age = state.get("promotion_age_seconds")
+    if age is None:
+        return ""
+    phrase = f"in flight ~{_humanize_seconds(age)}"
+    if state.get("promotion_past_timeout"):
+        phrase += ", past auto-timeout"
+    elif state.get("promotion_nearing_timeout"):
+        phrase += ", nearing auto-timeout"
+    return f" — {phrase}"
+
+
 def summarize_qualification_state(
     last_qualification: dict[str, Any] | None,
     serving_status: str | None = None,
@@ -362,17 +454,34 @@ def summarize_qualification_state(
         promo = lq.get("promotion_pending")
         if isinstance(promo, dict):
             armed = promo.get("auto_merge_enabled")
+            summary = (
+                "Audit PASSED; a promotion PR is open and auto-merge is "
+                f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                "auditing' — the audit already cleared. Watch the promotion "
+                "PR's CI: if it goes red the version bounces back to "
+                "stabilize and needs a fresh qualify on a synced candidate."
+            )
+            freshness = _promotion_in_flight_freshness(promo)
+            if freshness:
+                age_str = _humanize_seconds(freshness["promotion_age_seconds"])
+                cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
+                summary += f" In flight ~{age_str} (auto-timeout cap {cap_str})."
+                if freshness["promotion_past_timeout"]:
+                    summary += (
+                        " It has PASSED the auto-timeout — the reconciliation "
+                        "sweep will force-fail it back to stabilize."
+                    )
+                elif freshness["promotion_nearing_timeout"]:
+                    summary += (
+                        " It is NEARING the auto-timeout that reverts it to "
+                        "stabilize."
+                    )
             return {
                 "state": "promotion_in_flight",
-                "summary": (
-                    "Audit PASSED; a promotion PR is open and auto-merge is "
-                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
-                    "auditing' — the audit already cleared. Watch the promotion "
-                    "PR's CI: if it goes red the version bounces back to "
-                    "stabilize and needs a fresh qualify on a synced candidate."
-                ),
+                "summary": summary,
                 "promotion_pr_number": promo.get("pr_number"),
                 "promotion_pr_url": promo.get("pr_url"),
+                **freshness,
             }
         return {
             "state": "qualifying",
@@ -766,6 +875,7 @@ async def abandon_current_version(
         raise VersionCutBlockedByPromotion(
             qual_state.get("promotion_pr_number"),
             qual_state.get("promotion_pr_url"),
+            promotion_freshness=qual_state,
         )
 
     project = await session.get(Project, project_id)

@@ -20,7 +20,7 @@ import {
   type PromotionReadiness,
   type QualificationState,
 } from '../api';
-import { timeAgo, deployWindowStatus } from '../utils/time';
+import { timeAgo, formatDurationSec, deployWindowStatus } from '../utils/time';
 
 // Generate a client idempotency key for a version cut. Prefers the native UUID
 // generator and falls back to a timestamp+random token for older runtimes (and
@@ -149,6 +149,44 @@ const QUAL_STATE_STYLE: Record<string, string> = {
   not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
+
+type PromotionFreshnessContext = {
+  detailText: string;
+  toneClassName: string;
+};
+
+function finiteSeconds(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Math.max(0, value);
+}
+
+function formatPromotionFreshnessContext(
+  state: QualificationState | null | undefined,
+): PromotionFreshnessContext | null {
+  const ageSeconds = finiteSeconds(state?.promotion_age_seconds);
+  if (ageSeconds == null) return null;
+  const timeoutSeconds = finiteSeconds(state?.promotion_timeout_seconds);
+  let detailText = `in flight ~${formatDurationSec(ageSeconds)}`;
+  if (timeoutSeconds != null && timeoutSeconds > 0) {
+    detailText += ` (auto-timeout cap ${formatDurationSec(timeoutSeconds)})`;
+  }
+  if (state?.promotion_past_timeout) {
+    return {
+      detailText: `${detailText}, past auto-timeout`,
+      toneClassName: 'text-red-400',
+    };
+  }
+  if (state?.promotion_nearing_timeout) {
+    return {
+      detailText: `${detailText}, nearing auto-timeout`,
+      toneClassName: 'text-amber-400',
+    };
+  }
+  return {
+    detailText,
+    toneClassName: 'text-emerald-300',
+  };
+}
 
 // Distinct, operator-readable serving-confirmation badge for a promoted version.
 // Green = confirmed live; amber = still awaiting deploy confirmation; red = a
@@ -450,6 +488,7 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
   const activating = stagedActivatedByCut(staged, cv.version_number);
   const inFlight = cv.in_flight_task_count ?? 0;
   const qualState: QualificationState | null = cv.qualification_state ?? null;
+  const promotionFreshness = formatPromotionFreshnessContext(qualState);
   return (
     <div
       data-testid="cut-consequences"
@@ -479,8 +518,9 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
           : 'No tasks are currently in flight.'}
       </p>
       {qualState?.state === 'promotion_in_flight' && (
-        <p className="text-emerald-300">
-          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging — this cut will be rejected until it lands or is canceled.
+        <p className={promotionFreshness?.toneClassName ?? 'text-emerald-300'}>
+          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging
+          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — this cut will be rejected until it lands or is canceled.
         </p>
       )}
     </div>
@@ -529,6 +569,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // the controls here so the panel presents the same truth, consistent with how
   // the cut lever already surfaces this state.
   const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  const promotionFreshness = formatPromotionFreshnessContext(cv?.qualification_state);
+  const promotionLockContext = promotionFreshness ? ` (${promotionFreshness.detailText})` : '';
   const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
   // Admin-only lever: a promoted version latched to deploy_failed (current open
   // version after promotion, or a recent promoted one) can be cleared once the
@@ -637,6 +679,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
     const qualState: QualificationState | null = cv.qualification_state ?? null;
+    const cutPromotionFreshness = formatPromotionFreshnessContext(qualState);
     const consequences = [
       activating.length > 0
         ? `${activating.length} staged direction${activating.length !== 1 ? 's' : ''} will start now`
@@ -645,7 +688,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
         : null,
       qualState?.state === 'promotion_in_flight'
-        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging`
+        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''}`
         : null,
     ].filter(Boolean);
     const msg = consequences.length
@@ -899,6 +942,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
                 </div>
+                {cv.qualification_state.state === 'promotion_in_flight' && promotionFreshness && (
+                  <p
+                    data-testid="promotion-in-flight-freshness"
+                    className={`text-[10px] ${promotionFreshness.toneClassName}`}
+                  >
+                    Promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging ({promotionFreshness.detailText})
+                  </p>
+                )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
               </div>
             )}
@@ -980,7 +1031,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={() => handleSetPhase('stabilize')}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
@@ -989,7 +1040,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={() => handleSetPhase('build')}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
@@ -999,15 +1050,18 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={handleQualify}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before re-qualifying` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
                 )}
                 {promotionInFlight && (
-                  <span data-testid="promotion-in-flight-note" className="text-[10px] text-emerald-300 italic">
-                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging — qualify & phase locked until it lands or is canceled
+                  <span
+                    data-testid="promotion-in-flight-note"
+                    className={`text-[10px] italic ${promotionFreshness?.toneClassName ?? 'text-emerald-300'}`}
+                  >
+                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging{promotionLockContext} — qualify & phase locked until it lands or is canceled
                   </span>
                 )}
                 {cuttingVersion ? (

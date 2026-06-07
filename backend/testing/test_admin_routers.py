@@ -6883,6 +6883,9 @@ class TestSetVersionPhase:
         """A phase flip while a promotion PR is open and auto-merging is rejected
         with a 409 — flipping back to build would clear the in-flight indication
         without cancelling anything, leaving the operator levers disagreeing."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         version.last_qualification = {
@@ -6891,6 +6894,7 @@ class TestSetVersionPhase:
                 "pr_number": 8642,
                 "pr_url": "https://example/pr/8642",
                 "auto_merge_enabled": True,
+                "enabled_at": (_utcnow() - timedelta(minutes=15)).isoformat(),
             },
         }
         db_session.add(version)
@@ -6902,6 +6906,8 @@ class TestSetVersionPhase:
         )
         assert resp.status_code == 409
         assert "promotion PR is open and auto-merging" in resp.text
+        # The 409 surfaces the in-flight age derived from enabled_at.
+        assert "in flight ~" in resp.text
 
         # Phase unchanged — the flip was refused before any mutation.
         await db_session.refresh(version)
@@ -7326,6 +7332,9 @@ class TestCutVersion:
     ):
         """A version with an open promotion PR is rejected before any state
         mutation and returns a clear 409 explanation."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         version.last_qualification = {
@@ -7334,6 +7343,7 @@ class TestCutVersion:
                 "pr_number": 7357,
                 "pr_url": "https://example/pr/7357",
                 "auto_merge_enabled": True,
+                "enabled_at": (_utcnow() - timedelta(hours=2)).isoformat(),
             },
         }
         db_session.add(version)
@@ -7345,6 +7355,8 @@ class TestCutVersion:
         )
         assert resp.status_code == 409
         assert "promotion PR is open and auto-merging" in resp.text
+        # The version-cut 409 carries the in-flight age via the widened exception.
+        assert "in flight ~" in resp.text
 
         await db_session.refresh(version)
         assert version.status == "open"
@@ -10125,6 +10137,9 @@ class TestTriggerQualify:
         is rejected with a 409 — run_qualification no-ops (promotion_in_flight)
         and the endpoint surfaces it, mirroring the version-cut lever, instead of
         spawning a fresh audit/smoketest pair that clobbers the pending record."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         # A terminal audit child — by the child-task definition this is NOT "in
@@ -10149,6 +10164,7 @@ class TestTriggerQualify:
                 "pr_number": 9753,
                 "pr_url": "https://example/pr/9753",
                 "auto_merge_enabled": True,
+                "enabled_at": (_utcnow() - timedelta(minutes=45)).isoformat(),
             },
         }
         db_session.add(version)
@@ -10157,6 +10173,8 @@ class TestTriggerQualify:
         resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
         assert resp.status_code == 409
         assert "promotion PR is open and auto-merging" in resp.text
+        # The qualify 409 surfaces the in-flight age derived from enabled_at.
+        assert "in flight ~" in resp.text
 
         # The promotion-pending record survives untouched.
         await db_session.refresh(version)

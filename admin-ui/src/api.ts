@@ -1076,6 +1076,14 @@ export interface QualificationState {
   summary: string;
   promotion_pr_number?: number | null;
   promotion_pr_url?: string | null;
+  // Additive promotion freshness context for the shared "promotion in flight"
+  // state. When absent, callers must fall back to the timeless PR-only copy.
+  promotion_enabled_at?: string | null;
+  promotion_age_seconds?: number | null;
+  promotion_timeout_seconds?: number | null;
+  promotion_timeout_at?: string | null;
+  promotion_past_timeout?: boolean | null;
+  promotion_nearing_timeout?: boolean | null;
   error?: string | null;
   blocker?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:

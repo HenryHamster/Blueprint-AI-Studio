@@ -5410,6 +5410,7 @@ async def test_qualification_substate_hint_promotion_in_flight(
                 "pr_number": 7357,
                 "pr_url": "https://github.com/x/y/pull/7357",
                 "auto_merge_enabled": True,
+                "enabled_at": (now - timedelta(minutes=30)).isoformat(),
             },
         },
     )
@@ -5434,7 +5435,12 @@ async def test_qualification_substate_hint_promotion_in_flight(
     assert "still running" in suffix  # the explicit "do NOT read as ..." clause
 
     vp = payload.get("version_phase") or {}
-    assert vp.get("qualification_state", {}).get("state") == "promotion_in_flight"
+    qstate = vp.get("qualification_state", {})
+    assert qstate.get("state") == "promotion_in_flight"
+    # The additive freshness context flows through to the strategic payload.
+    assert qstate.get("promotion_age_seconds", 0) >= 1700  # ~30 min
+    assert "promotion_past_timeout" in qstate
+    assert "promotion_timeout_seconds" in qstate
 
 
 @pytest.mark.asyncio

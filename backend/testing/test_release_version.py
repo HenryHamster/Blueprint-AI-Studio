@@ -672,6 +672,31 @@ def test_to_phase_block_carries_qualification_state():
     assert block["qualification_state"]["state"] == "qualifying"
 
 
+def test_to_phase_block_carries_promotion_freshness():
+    """The strategic version_phase payload inherits the in-flight freshness keys
+    via the shared qualification_state pass-through."""
+    enabled_at = (_utcnow() - timedelta(minutes=10)).isoformat()
+    version = ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        },
+    )
+    qstate = rv.to_phase_block(version)["qualification_state"]
+    assert qstate["state"] == "promotion_in_flight"
+    assert qstate["promotion_enabled_at"] == enabled_at
+    assert qstate["promotion_age_seconds"] >= 590
+    assert "promotion_past_timeout" in qstate
+
+
 def test_to_phase_block_qualification_state_none_when_unqualified():
     """An unqualified version (no verdict) yields qualification_state=None."""
     version = ReleaseVersion(
@@ -721,6 +746,146 @@ def test_qual_state_pending_with_promotion_is_promotion_in_flight():
     # The summary must NOT tell the agent the audit is still running.
     assert "passed" in state["summary"].lower()
     assert "armed" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():
+    """A fresh enabled_at yields additive age / auto-timeout context without
+    disturbing the existing state name or PR keys."""
+    enabled_at = (_utcnow() - timedelta(minutes=5)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    assert state["promotion_pr_number"] == 7357
+    assert state["promotion_enabled_at"] == enabled_at
+    assert state["promotion_age_seconds"] >= 290  # ~5 min, allow clock slack
+    assert state["promotion_age_seconds"] < 600
+    assert state["promotion_timeout_seconds"] > 0
+    assert state["promotion_past_timeout"] is False
+    assert state["promotion_nearing_timeout"] is False
+    # The freshness is reflected in the human summary.
+    assert "in flight" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_past_timeout():
+    """An enabled_at older than the cap flags promotion_past_timeout."""
+    from app import release_reconciliation
+
+    cap = release_reconciliation._promotion_pending_timeout_seconds()
+    enabled_at = (_utcnow() - timedelta(seconds=cap + 3600)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_past_timeout"] is True
+    assert state["promotion_nearing_timeout"] is False
+    assert "passed the auto-timeout" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_nearing_timeout():
+    """An enabled_at past 80% of the cap (but under it) flags nearing."""
+    from app import release_reconciliation
+
+    cap = release_reconciliation._promotion_pending_timeout_seconds()
+    # 90% of the cap — nearing but not past.
+    enabled_at = (_utcnow() - timedelta(seconds=cap * 0.9)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_past_timeout"] is False
+    assert state["promotion_nearing_timeout"] is True
+    assert "nearing the auto-timeout" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_respects_runtime_cap_override(monkeypatch):
+    """The cap is the same configurable one the reconciliation sweep uses."""
+    from app.shared_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "promotion_pending_timeout_seconds", 600.0)
+    enabled_at = (_utcnow() - timedelta(seconds=700)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_timeout_seconds"] == 600.0
+    assert state["promotion_past_timeout"] is True
+
+
+def test_qual_state_promotion_in_flight_missing_enabled_at_is_timeless():
+    """Missing enabled_at falls back to the prior keyless behavior, no error."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    assert state["promotion_pr_number"] == 7357
+    for key in rv._PROMOTION_FRESHNESS_KEYS:
+        assert key not in state
+
+
+def test_qual_state_promotion_in_flight_invalid_enabled_at_is_timeless():
+    """An unparseable enabled_at falls back to keyless behavior, no error."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": "not-a-timestamp",
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    for key in rv._PROMOTION_FRESHNESS_KEYS:
+        assert key not in state
+
+
+def test_format_promotion_freshness_phrasing():
+    """The shared 409 suffix formatter renders age + timeout state, '' when bare."""
+    assert rv.format_promotion_freshness(None) == ""
+    assert rv.format_promotion_freshness({"promotion_pr_number": 1}) == ""
+    past = rv.format_promotion_freshness(
+        {"promotion_age_seconds": 7200, "promotion_past_timeout": True}
+    )
+    assert "in flight ~2h" in past
+    assert "past auto-timeout" in past
+    nearing = rv.format_promotion_freshness(
+        {"promotion_age_seconds": 3600, "promotion_nearing_timeout": True}
+    )
+    assert "nearing auto-timeout" in nearing
 
 
 def test_qual_state_promotion_failed_surfaces_reason():
