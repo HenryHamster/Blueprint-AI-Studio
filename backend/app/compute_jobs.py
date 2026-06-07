@@ -24,12 +24,15 @@ from sqlmodel import select
 from app.compute_backends import (
     LOCAL_BACKEND_NAME,
     ComputeLaunchSpec,
+    collect_terminal_artifact_reference,
     default_compute_backend_name,
     get_compute_backend,
     validate_backend_name,
 )
 from app.database import AsyncSessionLocal
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -347,6 +350,9 @@ async def kill_compute_job(
         now=now,
         terminate_ok=terminated,
     )
+    # An operator-killed job may still have written durable artifacts before
+    # teardown — link them as a first-class result (best-effort, see helper).
+    await _link_terminal_artifact(session, job)
     await session.commit()
     await session.refresh(job)
     return job
@@ -451,6 +457,12 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
                 continue
             try:
                 await _process_single_compute_job(session, live)
+                # On any terminal transition (success, failure, deadline, budget,
+                # task-terminal cancel) link the durable artifact location as a
+                # first-class result before committing. Best-effort: never blocks
+                # the finalize commit (see _link_terminal_artifact).
+                if live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+                    await _link_terminal_artifact(session, live)
                 await session.commit()
             except Exception as exc:
                 await session.rollback()
@@ -649,3 +661,62 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+
+
+async def _link_terminal_artifact(session, job: ComputeJob) -> None:
+    """Turn a terminal job's durable artifact location into a first-class result.
+
+    When a terminal compute job produced durable, non-metric output (checkpoints,
+    plots, logs) that survived VM teardown, create one ``Artifact`` row for that
+    stored result and stamp ``ComputeJob.artifact_id`` + ``ComputeJob.result_reference``
+    to point at it — reusing the existing artifact/compute-job columns rather than
+    a parallel persistence channel. The agent's terminal COMPUTE_RESULT payload
+    then forwards the durable reference it reads back off the row.
+
+    Best-effort and idempotent:
+      * skips a job with no owning task or one already linked (re-entry safe);
+      * only a location with at least one durable object becomes an Artifact —
+        an empty artifact directory degrades to 'no artifact';
+      * the Artifact INSERT runs inside a SAVEPOINT so a failure (e.g. the owning
+        task was concurrently deleted) rolls back ONLY the linkage, never the
+        job's terminal completion, and is logged rather than raised.
+    """
+    if job.task_id is None or job.artifact_id is not None:
+        return
+    reference = await collect_terminal_artifact_reference(job)
+    if reference is None:
+        return
+    try:
+        async with session.begin_nested():
+            artifact = Artifact(
+                task_id=job.task_id,
+                artifact_type=ArtifactType.COMPUTE_RESULT,
+                storage_uri=reference.uri,
+                logs=json.dumps(
+                    {
+                        "compute_job_id": str(job.id),
+                        "backend": reference.backend,
+                        "artifact_uri": reference.uri,
+                        "file_count": reference.file_count,
+                        "outcome": (
+                            job.outcome.value if job.outcome is not None else None
+                        ),
+                        "final_cost_usd": job.final_cost_usd,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            session.add(artifact)
+            await session.flush()  # assign artifact.id before stamping the job
+        # SAVEPOINT released cleanly — safe to point the job at the durable result.
+        job.artifact_id = artifact.id
+        job.result_reference = reference.uri
+        job.updated_at = _utcnow()
+        session.add(job)
+    except Exception:
+        logger.warning(
+            "[COMPUTE_JOB] durable-artifact linkage failed for job=%s; "
+            "completing without an artifact link",
+            job.id,
+            exc_info=True,
+        )

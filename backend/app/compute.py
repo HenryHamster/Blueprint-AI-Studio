@@ -2452,6 +2452,74 @@ def _delete_single_vm(vm_name: str, zone: str) -> bool:
         return False
 
 
+async def stop_vm(vm_instance_id: str, *, reason: str) -> bool:
+    """Best-effort graceful stop for a Blueprint-managed GCE VM.
+
+    Used by compute-job teardown before delete so the guest has a window to run
+    its shutdown trap and flush durable artifacts.
+    """
+
+    def _find_and_stop():
+        from google.cloud import compute_v1
+
+        instance_client = compute_v1.InstancesClient()
+        zones_to_try = []
+        with _zone_lock:
+            known_zone = _vm_zones.get(vm_instance_id)
+        if known_zone:
+            zones_to_try.append(known_zone)
+        zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
+
+        for zone in zones_to_try:
+            try:
+                instance = instance_client.get(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
+                status = getattr(instance, "status", "") or ""
+                if status in ("TERMINATED", "STOPPING"):
+                    return True
+                operation = instance_client.stop(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
+                operation.result(timeout=180)
+                logger.info(
+                    "[VM STOP] Successfully stopped %s in %s for %s",
+                    vm_instance_id,
+                    zone,
+                    reason,
+                )
+                return True
+            except Exception as e:
+                if "was not found" in str(e) or "404" in str(e):
+                    continue
+                raise
+        logger.warning("[VM STOP] %s not found in any zone", vm_instance_id)
+        return True
+
+    try:
+        async with _gcp_ops_semaphore:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_find_and_stop),
+                timeout=210,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("[VM STOP] Timeout stopping VM %s (>210s)", vm_instance_id)
+        return False
+    except Exception as e:
+        from google.api_core.exceptions import GoogleAPICallError, RetryError
+
+        if isinstance(e, (RetryError, GoogleAPICallError)):
+            logger.warning(
+                "[VM STOP] Failed to stop VM %s: GCE API transient: %s: %s",
+                vm_instance_id,
+                type(e).__name__,
+                e,
+            )
+        else:
+            logger.warning("[VM STOP] Failed to stop VM %s", vm_instance_id, exc_info=True)
+        return False
+
+
 def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
     """List all Blueprint-managed instances in a single zone.
 

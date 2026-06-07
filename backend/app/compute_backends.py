@@ -18,6 +18,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import math
 import os
 import shlex
@@ -26,12 +27,15 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Protocol
 
 from app import compute
+from app import storage
 from app.models import ComputeJob, ComputeJobStatus
 from app.vm_lifecycle import _ensure_vm_deleted
+
+logger = logging.getLogger(__name__)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -44,9 +48,24 @@ _SERIAL_METRICS_PREFIX = "BLUEPRINT_COMPUTE_METRICS="
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
 RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
+# Well-known env var pointing the launched command at a durable, writable
+# directory for ALL non-metric outputs (checkpoints, plots, logs, large files).
+# The narrow numeric RESULT_FILE channel keeps working unchanged alongside it;
+# this directory is the channel for everything that doesn't fit there. Its
+# contents survive process/VM teardown: the local backend keeps the directory on
+# disk under the job's state root, and the GCP backend uploads it to a per-job
+# durable object prefix before poweroff.
+ARTIFACT_DIR_ENV = "BLUEPRINT_ARTIFACT_DIR"
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
+# On-VM artifact directory the GCP startup script provisions and uploads.
+_GCP_ARTIFACT_DIR_PATH = "/tmp/blueprint_compute_artifacts"
+_GCP_ARTIFACT_BUNDLE_PATH = "/tmp/blueprint_compute_artifacts.tar.gz"
+# Hard ceiling on the artifact upload so an oversized tree can never wedge
+# poweroff — the upload is abandoned (best-effort) once it elapses.
+_GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 180
 _LOCAL_RESULT_FILENAME = "result.json"
+_LOCAL_ARTIFACT_DIRNAME = "artifacts"
 # Defensive bounds on the reported-metrics payload — a garbled/oversized marker
 # must be tolerated as simply ABSENT, never raise.
 _MAX_RESULT_METRICS = 64
@@ -107,6 +126,23 @@ class ComputeCostResult:
 
 
 @dataclass(slots=True)
+class TerminalArtifactReference:
+    """Durable location of a terminal compute job's non-metric artifacts.
+
+    ``uri`` is the canonical durable reference (``file://`` for the local
+    backend, ``gs://`` for GCP), ``backend`` is the producing backend's name,
+    and ``file_count`` is the number of durable objects detected under the
+    location. A reference is only ever produced for a NON-empty location, so
+    ``file_count`` is always >= 1 — an empty/absent location yields ``None``,
+    never a zero-count reference.
+    """
+
+    uri: str
+    backend: str
+    file_count: int
+
+
+@dataclass(slots=True)
 class _LocalProcessHandle:
     proc: subprocess.Popen
     started_at: datetime
@@ -143,6 +179,7 @@ class LocalSubprocessComputeBackend:
 
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         external_id = spec.external_id or f"local-{spec.job_id}"
+        artifact_meta = _local_artifact_metadata(external_id)
         existing = self._processes.get(external_id)
         if existing is not None and existing.proc.poll() is None:
             # Idempotent re-launch: the reserved id is already running.
@@ -151,6 +188,7 @@ class LocalSubprocessComputeBackend:
                 started_at=existing.started_at,
                 cost_rate_per_second=0.0,
                 message=f"local subprocess already running pid={existing.proc.pid}",
+                metadata=dict(artifact_meta),
             )
         persisted_pid = _local_subprocess_pid_for_external_id(external_id)
         if persisted_pid is not None and _is_pid_running(persisted_pid):
@@ -160,10 +198,10 @@ class LocalSubprocessComputeBackend:
                 or _utcnow(),
                 cost_rate_per_second=0.0,
                 message=f"adopted existing local subprocess pid={persisted_pid}",
-                metadata={"pid": persisted_pid},
+                metadata={"pid": persisted_pid, **artifact_meta},
             )
         if _read_local_terminal_status_for_external_id(external_id) is not None:
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = dict(artifact_meta)
             if persisted_pid is not None:
                 metadata["pid"] = persisted_pid
             return ComputeLaunchResult(
@@ -206,7 +244,7 @@ class LocalSubprocessComputeBackend:
             started_at=started_at,
             cost_rate_per_second=0.0,
             message=f"spawned local subprocess pid={proc.pid}",
-            metadata={"pid": proc.pid},
+            metadata={"pid": proc.pid, **artifact_meta},
         )
 
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
@@ -281,6 +319,7 @@ class GcpComputeBackend:
 
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         external_id = spec.external_id or f"compute-job-vm-{spec.job_id.hex[:12]}"
+        artifact_uri = storage.compute_job_artifact_uri(spec.job_id)
         # Idempotent re-launch: if the reserved VM already exists (a crash between
         # the durable STARTING commit and this point), adopt it instead of
         # provisioning a second VM and double-spending the budget.
@@ -294,11 +333,15 @@ class GcpComputeBackend:
                 started_at=started_at or _utcnow(),
                 cost_rate_per_second=0.0,
                 message="adopted existing compute-job VM",
-                metadata={"zone": existing_zone},
+                metadata={"zone": existing_zone, "artifact_uri": artifact_uri},
             )
+        artifact_upload_url = await storage.generate_compute_job_artifact_upload_signed_url(
+            spec.job_id,
+            expires_at=_artifact_upload_expiry(spec.deadline_at),
+        )
         ok = await compute.provision_ephemeral_vm(
             external_id,
-            startup_script=_build_gcp_startup_script(spec),
+            startup_script=_build_gcp_startup_script(spec, artifact_upload_url=artifact_upload_url),
             machine_type=spec.machine_type,
             provisioning_model=spec.provisioning_model,
             accelerator=spec.accelerator,
@@ -307,7 +350,7 @@ class GcpComputeBackend:
         if not ok:
             raise RuntimeError("GCP compute-job VM provisioning failed")
         zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
-        metadata: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = {"artifact_uri": artifact_uri}
         if zone and zone != "unknown":
             metadata["zone"] = zone
         return ComputeLaunchResult(
@@ -369,6 +412,9 @@ class GcpComputeBackend:
         external_id = job.external_compute_id or ""
         if not external_id:
             return True
+        # Give the guest a graceful stop window so the startup script can flush
+        # its artifact bundle before the instance is deleted.
+        await compute.stop_vm(external_id, reason=f"compute_job_{reason}")
         # _ensure_vm_deleted records the orchestrator-initiated-delete marker
         # before its first GCP call, so the reaper never misclassifies an
         # intentional budget/deadline teardown as a spot preemption. It returns
@@ -526,12 +572,17 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
     result_path = shlex.quote(_local_result_path_for_external_id(external_id))
+    artifact_dir = shlex.quote(_local_artifact_dir_for_external_id(external_id))
     command_literal = shlex.quote(command)
+    # The artifact dir is created but NOT removed: its contents are the durable
+    # output channel and must survive the subprocess (and an idempotent relaunch).
     return f"""mkdir -p {state_dir}
+mkdir -p {artifact_dir}
 printf '%s\\n' "$$" > {pid_path}
 rm -f {terminal_path}
 rm -f {result_path}
 export {RESULT_FILE_ENV}={result_path}
+export {ARTIFACT_DIR_ENV}={artifact_dir}
 EXIT_CODE=0
 if bash -lc {command_literal}; then
   STATUS=SUCCEEDED
@@ -587,6 +638,100 @@ def _local_result_path_for_external_id(external_id: str | None) -> str:
     )
 
 
+def _local_artifact_dir_for_external_id(external_id: str | None) -> str:
+    """Durable on-disk artifact directory for a local job.
+
+    Lives under the job's state root (in the system temp dir), so its contents
+    outlive the subprocess and remain re-readable after exit/restart — the local
+    analogue of the GCP per-job object prefix.
+    """
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        _LOCAL_ARTIFACT_DIRNAME,
+    )
+
+
+def _local_artifact_metadata(external_id: str | None) -> dict[str, str]:
+    """Durable artifact-location metadata persisted into ``polling_metadata``.
+
+    ``artifact_dir`` is the raw on-disk path (convenient for re-reads/tests);
+    ``artifact_uri`` is the canonical durable location key both backends populate.
+    """
+    path = _local_artifact_dir_for_external_id(external_id)
+    return {"artifact_dir": path, "artifact_uri": f"file://{path}"}
+
+
+async def collect_terminal_artifact_reference(
+    job: ComputeJob,
+) -> TerminalArtifactReference | None:
+    """Best-effort durable-artifact detection for a terminal compute job.
+
+    Returns a reference to the job's durable artifact location IFF that location
+    holds at least one object, else ``None``. The detection is backend-aware:
+    the local backend inspects the on-disk artifact directory that survives the
+    subprocess; the GCP backend lists the per-job object prefix the startup
+    script uploaded to before poweroff.
+
+    Fail-soft by contract: an empty artifact directory, a missing location, or
+    ANY detection error degrades to ``None`` (interpreted upstream as 'no
+    artifact') and never raises — artifact linkage must never block a job's
+    terminal completion.
+    """
+    try:
+        if job.backend == LOCAL_BACKEND_NAME:
+            return _collect_local_artifact_reference(job)
+        if job.backend == GCP_BACKEND_NAME:
+            return await _collect_gcp_artifact_reference(job)
+    except Exception:
+        logger.warning(
+            "Durable-artifact detection failed for compute job %s",
+            getattr(job, "id", None),
+            exc_info=True,
+        )
+    return None
+
+
+def _collect_local_artifact_reference(
+    job: ComputeJob,
+) -> TerminalArtifactReference | None:
+    meta = job.polling_metadata or {}
+    artifact_dir = str(meta.get("artifact_dir") or "").strip()
+    if not artifact_dir:
+        artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
+    file_count = _count_files_in_tree(artifact_dir)
+    if file_count <= 0:
+        return None
+    uri = str(meta.get("artifact_uri") or "").strip() or f"file://{artifact_dir}"
+    return TerminalArtifactReference(
+        uri=uri, backend=LOCAL_BACKEND_NAME, file_count=file_count
+    )
+
+
+async def _collect_gcp_artifact_reference(
+    job: ComputeJob,
+) -> TerminalArtifactReference | None:
+    meta = job.polling_metadata or {}
+    artifact_uri = str(meta.get("artifact_uri") or "").strip()
+    if not artifact_uri:
+        artifact_uri = storage.compute_job_artifact_uri(job.id)
+    file_count = await storage.count_compute_job_artifacts(job.id)
+    if file_count <= 0:
+        return None
+    return TerminalArtifactReference(
+        uri=artifact_uri, backend=GCP_BACKEND_NAME, file_count=file_count
+    )
+
+
+def _count_files_in_tree(path: str) -> int:
+    """Count regular files anywhere under ``path`` (0 if missing/empty/unreadable)."""
+    if not path or not os.path.isdir(path):
+        return 0
+    total = 0
+    for _root, _dirs, files in os.walk(path):
+        total += len(files)
+    return total
+
+
 def _read_local_state_text(path: str) -> str | None:
     try:
         with open(path, encoding="utf-8") as file_handle:
@@ -637,7 +782,21 @@ def _accrued_cost(job: ComputeJob, as_of: datetime) -> float:
     return max(float(job.accrued_cost_usd or 0.0), elapsed * rate)
 
 
-def _build_gcp_startup_script(spec: ComputeLaunchSpec) -> str:
+def _artifact_upload_expiry(deadline_at: datetime | None) -> datetime:
+    """Self-expiry for the compute-job artifact upload URL.
+
+    Set comfortably past the job's deadline so the on-VM upload (which runs right
+    before poweroff, after the command finishes at/near the deadline) still has a
+    live URL, while bounding the lifetime of the upload credential if teardown
+    never runs.
+    """
+    base = deadline_at or (_utcnow() + timedelta(hours=1))
+    return base + timedelta(hours=1)
+
+
+def _build_gcp_startup_script(
+    spec: ComputeLaunchSpec, *, artifact_upload_url: str
+) -> str:
     env_lines = []
     for key, value in sorted((spec.env or {}).items()):
         env_lines.append(f"export {key}={shlex.quote(value)}")
@@ -652,9 +811,58 @@ def _build_gcp_startup_script(spec: ComputeLaunchSpec) -> str:
         deadline_seconds = 3600
     command = shlex.quote(spec.command)
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
+    artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
+    artifact_upload_url = shlex.quote(artifact_upload_url)
+    upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
+ARTIFACTS_UPLOADED=0
+upload_artifacts() {{
+  if [ "$ARTIFACTS_UPLOADED" -ne 0 ]; then
+    return 0
+  fi
+  if [ ! -d {artifact_dir} ] || [ -z "$(ls -A {artifact_dir} 2>/dev/null)" ]; then
+    return 0
+  fi
+  rm -f {artifact_bundle}
+  if tar -C {artifact_dir} -czf {artifact_bundle} . >/dev/null 2>&1; then
+    if [ -s {artifact_bundle} ]; then
+      if command -v curl >/dev/null 2>&1; then
+        if timeout {upload_timeout} curl --fail --silent --show-error \
+          --request PUT \
+          --upload-file {artifact_bundle} \
+          --header "Content-Type: application/gzip" \
+          {artifact_upload_url} >/dev/null 2>&1; then
+          ARTIFACTS_UPLOADED=1
+        fi
+      elif command -v python3 >/dev/null 2>&1; then
+        if timeout {upload_timeout} python3 - {artifact_upload_url} {artifact_bundle} <<'PY' >/dev/null 2>&1; then
+import pathlib
+import sys
+import urllib.request
+
+url = sys.argv[1]
+path = pathlib.Path(sys.argv[2])
+request = urllib.request.Request(
+    url,
+    data=path.read_bytes(),
+    method="PUT",
+    headers={{"Content-Type": "application/gzip"}},
+)
+with urllib.request.urlopen(request, timeout=120) as response:
+    response.read()
+PY
+          ARTIFACTS_UPLOADED=1
+        fi
+      fi
+    fi
+  fi
+  rm -f {artifact_bundle}
+  return 0
+}}
+trap upload_artifacts EXIT HUP INT TERM QUIT
 (
   sleep "$TTL_SECONDS"
   echo "{_SERIAL_REASON_PREFIX}startup_ttl"
@@ -666,7 +874,9 @@ TTL_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
+export {ARTIFACT_DIR_ENV}={artifact_dir}
 rm -f {result_file}
+mkdir -p {artifact_dir}
 {cwd_line}
 EXIT_CODE=0
 if bash -lc {command}; then
@@ -685,6 +895,7 @@ if [ -f {result_file} ]; then
     echo "{_SERIAL_METRICS_PREFIX}$METRICS_B64"
   fi
 fi
+upload_artifacts
 kill "$TTL_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"

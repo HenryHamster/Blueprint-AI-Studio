@@ -302,6 +302,43 @@ describe('handleComputeExperiment', () => {
     expect(result.outcome).toBe('SUCCESS');
   });
 
+  it('forwards the durable artifact linkage (result_reference + artifact_id) and sets storage_uri', async () => {
+    const durableUri = 'gs://blueprint-agent-artifacts/compute-jobs/job-123/artifacts';
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
+    vi.mocked(apiGet).mockResolvedValue(jobResponse({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      result_reference: durableUri,
+      artifact_id: 'artifact-xyz',
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const completion = lastCompletionPayload();
+    // The durable reference rides on the artifact's storage_uri so the
+    // task-completion/knowledge paths cite the stored result, not just the JSON.
+    expect(completion.storage_uri).toBe(durableUri);
+    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
+    expect(result.result_reference).toBe(durableUri);
+    expect(result.artifact_id).toBe('artifact-xyz');
+  });
+
+  it('omits storage_uri when the terminal job produced no durable artifact', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
+    vi.mocked(apiGet).mockResolvedValue(jobResponse({
+      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0,
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const completion = lastCompletionPayload();
+    expect(completion.storage_uri).toBeUndefined();
+    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
+    expect(result.result_reference).toBeNull();
+    expect(result.artifact_id).toBeNull();
+  });
+
   it('does not let a metric colliding with a reserved key overwrite the job-level field', async () => {
     vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
     vi.mocked(apiGet).mockResolvedValue(jobResponse({

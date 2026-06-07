@@ -13,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 import os
+import shlex
 import signal
 import uuid
 
@@ -25,6 +26,7 @@ from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
 from app import provision_error_scope
+from app import storage
 from app.compute_backends import (
     ComputeCostResult,
     GcpComputeBackend,
@@ -35,6 +37,8 @@ from app.compute_backends import (
 )
 from app.database import resolve_async_engine
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -738,6 +742,193 @@ async def test_local_state_file_parse_no_result_file_yields_no_metrics():
 
 
 @pytest.mark.asyncio
+async def test_local_backend_artifact_dir_survives_subprocess_exit():
+    """The durable artifact-dir contract: a command writes a non-metric file to
+    $BLUEPRINT_ARTIFACT_DIR, and that file is still readable from the persisted
+    durable location after the subprocess has fully exited."""
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command='echo "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.txt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+
+    # Launch result records the durable artifact location for finalization/tests.
+    artifact_dir = result.metadata["artifact_dir"]
+    assert result.metadata["artifact_uri"] == f"file://{artifact_dir}"
+
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    for _ in range(60):
+        if compute_backends_module._read_local_terminal_status(compute_job) is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("expected local terminal marker for completed subprocess")
+
+    # Subprocess is gone; the artifact written to the contract dir is still on disk.
+    assert not compute_backends_module._is_pid_running(result.metadata["pid"])
+    artifact_path = os.path.join(artifact_dir, "model.txt")
+    with open(artifact_path, encoding="utf-8") as handle:
+        assert handle.read().strip() == "checkpoint-bytes"
+
+
+def test_local_wrapper_command_provisions_and_exports_artifact_dir():
+    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id("local-z")
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-z"
+    )
+    assert f"export BLUEPRINT_ARTIFACT_DIR={shlex.quote(artifact_dir)}" in wrapper
+    assert f"mkdir -p {shlex.quote(artifact_dir)}" in wrapper
+    # The artifact dir is durable: it must NOT be removed by the wrapper.
+    assert f"rm -f {shlex.quote(artifact_dir)}" not in wrapper
+    assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
+
+
+def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    assert "export BLUEPRINT_ARTIFACT_DIR=" in script
+    assert "mkdir -p" in script and compute_backends_module._GCP_ARTIFACT_DIR_PATH in script
+    # Upload targets ONLY this job's bundle object, bounded by a hard timeout, best-effort.
+    assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in script
+    assert "https://storage.example.com/upload" in script
+    assert "curl --fail --silent --show-error" in script
+    assert "python3 - " in script
+    assert (
+        f"timeout {compute_backends_module._GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS}"
+        in script
+    )
+    # Upload must never change the job's exit code (always `|| true`).
+    assert "|| true" in script
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+
+    signed_url_calls: list[dict] = []
+    provision_calls: list[dict] = []
+
+    async def fake_signed_url(jid, *, expires_at=None):
+        signed_url_calls.append({"job_id": jid, "expires_at": expires_at})
+        return "https://storage.example.com/upload"
+
+    async def fake_provision(vm_id, *, startup_script, machine_type, provisioning_model, accelerator=None, accelerator_count=1):
+        provision_calls.append(
+            {
+                "vm_id": vm_id,
+                "startup_script": startup_script,
+                "machine_type": machine_type,
+                "provisioning_model": provisioning_model,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(
+        storage,
+        "generate_compute_job_artifact_upload_signed_url",
+        fake_signed_url,
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    result = await backend.launch(spec)
+
+    assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
+    assert len(signed_url_calls) == 1
+    assert signed_url_calls[0]["job_id"] == job_id
+    assert signed_url_calls[0]["expires_at"] is not None
+    assert len(provision_calls) == 1
+    startup_script = provision_calls[0]["startup_script"]
+    assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in startup_script
+    assert "https://storage.example.com/upload" in startup_script
+    assert "gcloud storage cp" not in startup_script
+    assert "gsutil -m cp -r" not in startup_script
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_terminate_stops_before_delete(monkeypatch):
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        project_id=uuid.uuid4(),
+        backend=compute_backends_module.GCP_BACKEND_NAME,
+        external_compute_id="compute-job-vm-123456789abc",
+    )
+
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_stop(vm_instance_id, *, reason):
+        calls.append(("stop", vm_instance_id, reason))
+        return True
+
+    async def fake_delete(vm_instance_id, *, reason):
+        calls.append(("delete", vm_instance_id, reason))
+        return True
+
+    monkeypatch.setattr(compute, "stop_vm", fake_stop)
+    monkeypatch.setattr(compute_backends_module, "_ensure_vm_deleted", fake_delete)
+
+    assert await backend.terminate(job, reason="budget") is True
+    assert calls == [
+        ("stop", "compute-job-vm-123456789abc", "compute_job_budget"),
+        ("delete", "compute-job-vm-123456789abc", "compute_job_budget"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_adopt_existing_vm_records_artifact_uri(monkeypatch):
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    started_at = datetime(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: "us-central1-f")
+    monkeypatch.setattr(compute, "get_vm_created_at", lambda *_args: started_at)
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=job_id,
+            command="echo ok",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+        )
+    )
+
+    assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
+    assert result.metadata["zone"] == "us-central1-f"
+
+
+@pytest.mark.asyncio
 async def test_process_compute_jobs_once_persists_result_metrics(
     db_session, monkeypatch
 ):
@@ -895,6 +1086,161 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
     assert job.final_cost_usd == pytest.approx(0.03)
     assert job.polling_metadata["exit_code"] == 0
     assert job.polling_metadata["terminal_status"] == ComputeJobStatus.SUCCEEDED.value
+
+
+@pytest.mark.asyncio
+async def test_artifact_survives_teardown_and_is_linked(db_session, monkeypatch):
+    """End-to-end (local backend): a job writes a file into the durable artifact
+    directory, reaches terminal, and the monitor links that surviving location as
+    a first-class result.
+
+    Proves the whole contract in one pass: the file is re-readable from the
+    durable location AFTER the subprocess (the local analogue of VM teardown) is
+    gone, and the persisted ``Artifact`` row, ``ComputeJob.artifact_id`` and
+    ``ComputeJob.result_reference`` all agree on that location.
+    """
+    # Drive the real local-subprocess backend through the create+monitor path.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Artifact Link", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command='printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+    assert job.status == ComputeJobStatus.QUEUED
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Pass 1 launches the subprocess; subsequent passes poll it to terminal and
+    # link the artifact. The command is trivial, so a handful of passes suffices.
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+    # The durable artifact directory outlived the (now-exited) subprocess and the
+    # checkpoint is still re-readable from the persisted location.
+    external_id = job.external_compute_id
+    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
+        external_id
+    )
+    assert not compute_backends_module._is_pid_running(
+        int(job.polling_metadata["pid"])
+    )
+    with open(os.path.join(artifact_dir, "model.ckpt"), encoding="utf-8") as handle:
+        assert handle.read() == "checkpoint-bytes"
+
+    durable_uri = f"file://{artifact_dir}"
+
+    # The job is now linked to one first-class Artifact row, and all three
+    # references agree on the durable location.
+    assert job.artifact_id is not None
+    assert job.result_reference == durable_uri
+
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    assert artifact.task_id == task.id
+    assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
+    assert artifact.storage_uri == durable_uri
+
+    # The artifact cites the durable result (no parallel persistence channel).
+    logged = json.loads(artifact.logs)
+    assert logged["compute_job_id"] == str(job.id)
+    assert logged["artifact_uri"] == durable_uri
+    assert logged["file_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_with_empty_artifact_dir_links_no_artifact(
+    db_session, monkeypatch
+):
+    """Fail-soft: a job that writes NOTHING to the artifact dir completes with no
+    Artifact row and no stamped linkage — an empty location is not a result."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Empty Artifact", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",  # writes nothing to $BLUEPRINT_ARTIFACT_DIR
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.artifact_id is None
+    assert job.result_reference is None
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -2872,3 +3218,184 @@ class TestGpuImageFamilyValidation:
         # GPU gate raises.
         with pytest.raises(RuntimeError, match="GPU"):
             compute._ensure_gpu_image_family_valid()
+
+
+# ---------------------------------------------------------------------------
+# Storage artifact IAM / signed-URL helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeIamPolicy:
+    """Minimal stand-in for the storage IAM Policy used by the artifact grant."""
+
+    def __init__(self, bindings=None, version=1):
+        self.bindings = list(bindings or [])
+        self.version = version
+
+
+class _FakeBucket:
+    def __init__(self, policy):
+        self._policy = policy
+        self.set_calls = []
+
+    def get_iam_policy(self, requested_policy_version=1):
+        return self._policy
+
+    def set_iam_policy(self, policy):
+        self.set_calls.append(policy)
+        self._policy = policy
+
+
+class _FakeStorageClient:
+    def __init__(self, bucket):
+        self._bucket = bucket
+
+    def bucket(self, _name):
+        return self._bucket
+
+
+def test_compute_job_artifact_uri_and_prefix_are_per_job():
+    job_id = uuid.uuid4()
+    prefix = storage.compute_job_artifact_object_prefix(job_id)
+    assert prefix == f"compute-jobs/{job_id}/artifacts"
+    assert storage.compute_job_artifact_uri(job_id) == (
+        f"gs://{storage.ARTIFACT_BUCKET_NAME}/{prefix}/bundle.tar.gz"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_job_artifact_upload_signed_url_targets_bundle_object(monkeypatch):
+    job_id = uuid.uuid4()
+    expected_object = storage.compute_job_artifact_object_name(job_id)
+    expires_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    blob = MagicMock()
+    blob.generate_signed_url.return_value = "https://storage.example.com/upload"
+    bucket = MagicMock()
+    bucket.blob.return_value = blob
+    client = MagicMock()
+    client.bucket.return_value = bucket
+
+    with patch("google.cloud.storage.Client", return_value=client):
+        url = await storage.generate_compute_job_artifact_upload_signed_url(
+            job_id, expires_at=expires_at
+        )
+
+    assert url == "https://storage.example.com/upload"
+    client.bucket.assert_called_once_with(storage.ARTIFACT_BUCKET_NAME)
+    bucket.blob.assert_called_once_with(expected_object)
+    blob.generate_signed_url.assert_called_once()
+    call_kwargs = blob.generate_signed_url.call_args.kwargs
+    assert call_kwargs["version"] == "v4"
+    assert call_kwargs["method"] == "PUT"
+    assert call_kwargs["content_type"] == "application/gzip"
+    assert call_kwargs["expiration"] == expires_at
+
+
+def test_artifact_condition_scopes_writes_to_one_job_prefix_only():
+    job_id = uuid.uuid4()
+    expression = storage._compute_job_artifact_condition_expression(job_id)
+    expected_prefix = (
+        f"projects/_/buckets/{storage.ARTIFACT_BUCKET_NAME}/objects/"
+        f"compute-jobs/{job_id}/artifacts/"
+    )
+    assert expression == f'resource.name.startsWith("{expected_prefix}")'
+    # Never the whole bucket: a bare bucket-root prefix must not appear.
+    assert (
+        f'resource.name.startsWith("projects/_/buckets/{storage.ARTIFACT_BUCKET_NAME}/objects/")'
+        not in expression
+    )
+
+
+def test_artifact_condition_includes_self_expiry_when_given():
+    job_id = uuid.uuid4()
+    expires_at = datetime(2026, 6, 7, 12, 0, 0)
+    expression = storage._compute_job_artifact_condition_expression(job_id, expires_at)
+    assert 'request.time < timestamp("2026-06-07T12:00:00Z")' in expression
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_adds_prefix_scoped_binding(monkeypatch):
+    job_id = uuid.uuid4()
+    bucket = _FakeBucket(_FakeIamPolicy())
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    ok = await storage.grant_compute_job_artifact_writer(
+        job_id, member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+
+    assert ok is True
+    assert len(bucket.set_calls) == 1
+    binding = bucket._policy.bindings[-1]
+    assert binding["role"] == "roles/storage.objectAdmin"
+    assert binding["members"] == {"serviceAccount:vpm@example.iam.gserviceaccount.com"}
+    assert str(job_id) in binding["condition"]["expression"]
+    assert binding["condition"]["title"] == (
+        storage._compute_job_artifact_condition_title(job_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_replaces_stale_binding_for_same_job(monkeypatch):
+    job_id = uuid.uuid4()
+    title = storage._compute_job_artifact_condition_title(job_id)
+    stale = {
+        "role": "roles/storage.objectAdmin",
+        "members": {"serviceAccount:old@example.iam.gserviceaccount.com"},
+        "condition": {"title": title, "expression": "stale"},
+    }
+    other = {"role": "roles/storage.objectViewer", "members": {"user:keep@example.com"}}
+    bucket = _FakeBucket(_FakeIamPolicy(bindings=[stale, other]))
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    await storage.grant_compute_job_artifact_writer(
+        job_id, member="serviceAccount:new@example.iam.gserviceaccount.com"
+    )
+
+    titled = [
+        b for b in bucket._policy.bindings if (b.get("condition") or {}).get("title") == title
+    ]
+    assert len(titled) == 1
+    assert titled[0]["members"] == {"serviceAccount:new@example.iam.gserviceaccount.com"}
+    # Unrelated bindings are preserved.
+    assert other in bucket._policy.bindings
+
+
+@pytest.mark.asyncio
+async def test_revoke_artifact_writer_removes_only_its_binding(monkeypatch):
+    job_id = uuid.uuid4()
+    title = storage._compute_job_artifact_condition_title(job_id)
+    mine = {
+        "role": "roles/storage.objectAdmin",
+        "members": {"serviceAccount:vpm@example.iam.gserviceaccount.com"},
+        "condition": {"title": title, "expression": "expr"},
+    }
+    other = {"role": "roles/storage.objectViewer", "members": {"user:keep@example.com"}}
+    bucket = _FakeBucket(_FakeIamPolicy(bindings=[mine, other]))
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    ok = await storage.revoke_compute_job_artifact_writer(
+        job_id, member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+
+    assert ok is True
+    assert mine not in bucket._policy.bindings
+    assert other in bucket._policy.bindings
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_is_best_effort_on_error(monkeypatch):
+    def _boom(project=None):
+        raise RuntimeError("iam down")
+
+    monkeypatch.setattr(storage.storage, "Client", _boom)
+    ok = await storage.grant_compute_job_artifact_writer(
+        uuid.uuid4(), member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+    assert ok is False

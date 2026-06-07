@@ -77,7 +77,7 @@ function numOrNull(v: unknown): number | null {
 const RESERVED_RESULT_KEYS = new Set<string>([
   'job_id', 'backend', 'machine_type', 'status', 'outcome', 'intentional_terminal',
   'killed_by', 'final_cost_usd', 'accrued_cost_usd', 'spend_cap_usd', 'terminal_reason',
-  'poll_attempts', 'result_reference', 'experiment',
+  'poll_attempts', 'result_reference', 'artifact_id', 'experiment',
 ]);
 
 type JobResponse = Record<string, unknown>;
@@ -368,7 +368,10 @@ export async function handleComputeExperiment(
     spend_cap_usd: numOrNull(finalJob.spend_cap_usd),
     terminal_reason: strVal(finalJob.terminal_reason) || null,
     poll_attempts: pollResult.polls,
+    // Durable result linkage the backend stamped on the row at finalize: the
+    // canonical artifact reference and the id of the first-class Artifact row.
     result_reference: strVal(finalJob.result_reference) || null,
+    artifact_id: strVal(finalJob.artifact_id) || null,
     experiment,
   };
 
@@ -381,11 +384,16 @@ export async function handleComputeExperiment(
   const killedSuffix = classification.killedBy ? ` (killed by ${classification.killedBy})` : '';
   sendLog(ws, `Compute job ${jobId} terminal: outcome=${(outcome || status) || 'unknown'}${killedSuffix}, final_cost=$${finalCost ?? 'n/a'}\n`);
 
+  // Carry the durable reference onto the COMPUTE_RESULT artifact's storage_uri so
+  // the task-completion/knowledge paths keep citing the stored result, not just
+  // the JSON envelope. Omitted when the job produced no durable artifact.
+  const durableReference = strVal(finalJob.result_reference) || '';
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: classification.taskStatus,
     artifact_type: 'COMPUTE_RESULT',
     logs: sanitize(JSON.stringify(result)),
+    ...(durableReference ? { storage_uri: durableReference } : {}),
     ...(classification.taskStatus === 'FAILED'
       ? { failure_category: 'compute_job_failed' }
       : {}),
