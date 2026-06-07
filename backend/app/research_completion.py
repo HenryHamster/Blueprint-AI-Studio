@@ -6,6 +6,7 @@ and the large _handle_research_completion handler.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -1247,6 +1249,53 @@ def converge_spawn_batch_foundations(
             len(converged),
         )
     return converged
+
+
+async def _commit_or_handle_duplicate_spawn(
+    session: AsyncSession, task: Task, *, stage: str
+) -> bool:
+    """Commit the spawn batch, treating an idempotency-key collision as benign.
+
+    Returns True when the commit landed. Returns False when the commit was
+    rejected by ``ux_task_active_idempotency_key`` — the duplicate-spawn guard
+    WORKING: a peer (a concurrent post-commit retry, or a pipelined duplicate
+    research cycle) already holds the colliding key in an active status, so
+    this batch is a duplicate and its rollback loses nothing. Without the
+    rollback here the poisoned session cascaded PendingRollbackError through
+    the rest of the request (prod burst 2026-06-07 00:56). Any other
+    IntegrityError re-raises into the generic handler-failure recovery.
+
+    On the False path the session has been rolled back — which expires every
+    loaded ORM instance even with expire_on_commit=False — and ``task`` has
+    been force re-populated from its DB row so the caller (and
+    _process_post_commit after it) can keep reading its attributes without
+    tripping a sync lazy-load (MissingGreenlet).
+    """
+    _task_pk = task.id
+    _task_id_str = str(_task_pk)
+    try:
+        await session.commit()
+    except IntegrityError as _dup_exc:
+        if "ux_task_active_idempotency_key" not in str(_dup_exc):
+            raise
+        await session.rollback()
+        logger.warning(
+            f"[RESEARCH] Task {_task_id_str}: {stage} commit hit "
+            f"ux_task_active_idempotency_key (a peer already spawned this work "
+            f"— duplicate-spawn guard working). Rolled back this duplicate "
+            f"batch; the peer owns the post-spawn state: {str(_dup_exc)[:200]}"
+        )
+        # ``populate_existing`` (not refresh()) so any rolled-back in-memory
+        # task mutation is discarded rather than re-flushed; ``no_autoflush``
+        # so the re-load itself cannot autoflush it and re-raise.
+        with contextlib.suppress(Exception), session.no_autoflush:
+            await session.execute(
+                select(Task)
+                .where(Task.id == _task_pk)
+                .execution_options(populate_existing=True)
+            )
+        return False
+    return True
 
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
@@ -3580,7 +3629,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _record_research_survival_signal(task, surviving=_surviving_findings)
     session.add(task)
 
-    await session.commit()
+    # This commit flushes the child-task INSERTs — the collision point for the
+    # duplicate-spawn guard when a peer already spawned this batch.
+    if not await _commit_or_handle_duplicate_spawn(
+        session, task, stage="child-task spawn"
+    ):
+        return
     for ct in child_tasks:
         await session.refresh(ct)
 
@@ -3884,7 +3938,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     for _dep in converge_spawn_batch_foundations(child_tasks, existing_tasks):
         session.add(_dep)
 
-    await session.commit()
+    if not await _commit_or_handle_duplicate_spawn(
+        session, task, stage="spawn-batch wiring"
+    ):
+        return
 
     await apply_post_spawn_state(
         session=session,

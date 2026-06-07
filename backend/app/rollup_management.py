@@ -10,6 +10,7 @@ and preserve test-patchability.
 """
 
 # fmt: off
+import contextlib
 import logging
 import time
 from datetime import timedelta
@@ -3774,6 +3775,34 @@ async def _check_and_trigger_rollup(
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
             except Exception as e:
+                # Session-poison recovery (prod burst 2026-06-07 01:05): a
+                # DB-level failure inside the try — e.g. _spawn_pipeline_task's
+                # spawn commit cancelled by lock_timeout — aborts the
+                # transaction, and every session use below (including the
+                # lazy-refreshing ``parent.context`` read in the retry-counter
+                # branch) then raises PendingRollbackError, escaping this
+                # handler entirely and cascading through the rest of
+                # post-commit. When (and only when) the transaction is already
+                # dead, roll back FIRST so the recovery below runs on a clean
+                # transaction, then re-fetch ``parent`` by its pre-captured id
+                # — rollback() expires every loaded instance even with
+                # expire_on_commit=False, and an attribute read on the expired
+                # instance would sync-lazy-load and raise MissingGreenlet.
+                # Non-DB failures (GitHub HTTPException, etc.) keep their
+                # pending session state exactly as before.
+                _sess_poisoned = False
+                with contextlib.suppress(Exception):
+                    _sess_poisoned = not session.is_active
+                if _sess_poisoned:
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                    if parent_id_local is not None:
+                        with contextlib.suppress(Exception):
+                            _refetched_parent = await session.get(
+                                Task, parent_id_local
+                            )
+                            if _refetched_parent is not None:
+                                parent = _refetched_parent
                 # Orphan PR rescue: if we created a rollup PR during this try
                 # but the marker commit failed (connection loss, session invalid),
                 # the local variable still holds the PR number while the DB has

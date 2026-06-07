@@ -2020,6 +2020,104 @@ async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
     assert "retr" in msg.lower()
 
 
+@pytest.mark.asyncio
+async def test_rollup_spawn_lock_timeout_poison_recovers_to_bounded_retry(
+    rollup_db, mocker
+):
+    """Burst-2 regression (prod 2026-06-07 01:05): the review spawn's commit
+    was cancelled by Postgres' lock_timeout, leaving _check_and_trigger_rollup's
+    session in pending-rollback. Pre-fix the except handler kept using the
+    poisoned session (the ``parent.context`` retry-counter read, the trailing
+    parent commit), so PendingRollbackError escaped the handler and cascaded
+    through the rest of post-commit. The hardened handler must detect the dead
+    transaction, roll back FIRST, re-fetch the parent, and land in the existing
+    bounded transient-retry branch (parent stays EVALUATING, _rollup_retries
+    increments, next sweep retries) — no exception escapes."""
+    import contextlib as _contextlib
+    import uuid as _uuid
+
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+    from sqlalchemy.exc import OperationalError as _OperationalError
+    from sqlmodel import select as _select
+
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+
+    # target_branch="main" (not intermediate) routes the rollup to the
+    # review-spawn path regardless of diff size.
+    project, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="main"
+    )
+
+    async def _poison_and_raise(source_task, task_type, sess, *args, **kwargs):
+        # Genuinely abort the transaction (duplicate-PK flush) the way a
+        # lock_timeout-cancelled INSERT leaves it, then surface the asyncpg
+        # lock-timeout shape SQLAlchemy wraps.
+        dup = _uuid.uuid4()
+        for _ in range(2):
+            sess.add(
+                Task(
+                    id=dup,
+                    project_id=source_task.project_id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        with _contextlib.suppress(_IntegrityError):
+            await sess.flush()
+        raise _OperationalError(
+            "INSERT INTO task ...",
+            {},
+            Exception("canceling statement due to lock timeout"),
+        )
+
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        side_effect=_poison_and_raise,
+    )
+
+    # Pre-fix this raised PendingRollbackError out of the rollup check.
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"transient lock-timeout must defer, not fail: {parent.latest_status_message}"
+    )
+    assert (parent.context or {}).get("_rollup_retries") == 1
+    assert "will retry" in (parent.latest_status_message or "").lower()
+    # The rollup PR marker (committed before the spawn) survives for the
+    # next sweep's existing-PR resume path.
+    assert (parent.context or {}).get("rollup_pr_number") == 777
+
+    # The session is clean and the poison rows were rolled back.
+    rows = (
+        (
+            await rollup_db.execute(
+                _select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {t.id for t in rows} == {parent.id, child.id}
+
+
 # ── Rollup Merge Deferred Counter / Escalation ──────────────────────────────
 
 

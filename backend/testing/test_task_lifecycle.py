@@ -3247,6 +3247,168 @@ async def test_process_post_commit_nontransient_handler_failure_fails_persisted(
     assert "handler failed" in (refetched.latest_status_message or "").lower()
 
 
+def _poison_session_factory(project_id):
+    """Build a coroutine that GENUINELY aborts a session's transaction.
+
+    Inserts a duplicate-PK pair and flushes (suppressing the IntegrityError)
+    so the underlying DB transaction is really dead — the way a lock_timeout /
+    statement_timeout-cancelled statement leaves it in production. A fake
+    raise without the aborted flush would leave the transaction active and
+    hide ordering bugs in the recovery path (rollback-before-read, re-fetch
+    after rollback). Mirrors the real-poison pattern in test_reaper's per-row
+    collision test.
+    """
+
+    async def _poison(sess):
+        dup = uuid.uuid4()
+        for _ in range(2):
+            sess.add(
+                Task(
+                    id=dup,
+                    project_id=project_id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+        with contextlib.suppress(_IntegrityError):
+            await sess.flush()
+
+    return _poison
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_rollup_poison_recovers_and_completes(
+    tl_db, mocker
+):
+    """Burst-2 regression (prod 2026-06-07 01:05): a lock-timeout inside the
+    rollup trigger (_spawn_pipeline_task's spawn commit) left the post-commit
+    session in pending-rollback; the rollup except block then read ``task.id``
+    on the poisoned session and re-raised PendingRollbackError out of
+    _process_post_commit entirely (500 to the live agent), and the sections
+    after it (direction outcomes, terminal-record helpers, final commit) never
+    ran. The hardened except must roll back FIRST, re-fetch the task, and
+    complete the request cleanly without corrupting the task."""
+    from sqlalchemy.exc import OperationalError as _OperationalError
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, task_type="plan", status=TaskStatus.EVALUATING
+    )
+    child = await _make_task(
+        session,
+        project.id,
+        # "create" with no pr_url in the payload skips the review-pipeline
+        # section and flows straight to the rollup gate (same shape as
+        # test_process_post_commit_completed_child_triggers_rollup_check).
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    poison = _poison_session_factory(project.id)
+
+    async def _poison_and_raise(t, sess):
+        await poison(sess)
+        # Expire the caller's instance the way rollup-internal relock/rollback
+        # machinery can in production, then surface the asyncpg lock-timeout
+        # shape SQLAlchemy wraps. (The root-conftest no-op expire shim keeps
+        # the attributes readable in this harness; the genuine aborted
+        # transaction is what exercises the recovery ordering.)
+        sess.expire(t)
+        raise _OperationalError(
+            "INSERT INTO task ...",
+            {},
+            Exception("canceling statement due to lock timeout"),
+        )
+
+    mocker.patch(
+        "app.task_lifecycle._check_and_trigger_rollup",
+        side_effect=_poison_and_raise,
+    )
+
+    payload = AgentStatusPayload(task_id=child.id, status=TaskStatus.COMPLETED)
+    result = await _process_post_commit(child.id, payload, _session_factory=factory)
+
+    # The request path completed — no PendingRollbackError cascade.
+    assert result.get("status") == "received"
+
+    async with factory() as verify_session:
+        refetched = (
+            (await verify_session.execute(select(Task).where(Task.id == child.id)))
+            .scalars()
+            .first()
+        )
+    assert refetched is not None
+    # The task is NOT corrupted by the rollup failure: it keeps the
+    # agent-reported terminal status (the rollup retries via its own sweep).
+    assert refetched.status == TaskStatus.COMPLETED
+    # The poison rows were rolled back, not committed by a later section.
+    async with factory() as verify_session:
+        stray = (
+            (
+                await verify_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.id.notin_([parent.id, child.id]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert stray == []
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_handler_genuine_poison_still_requeues(
+    tl_db, mocker
+):
+    """Burst-1 cascade class (prod 2026-06-07 00:56): a completion handler
+    that dies with the transaction GENUINELY aborted (failed commit inside the
+    handler) must still reach the transient-requeue recovery — rollback first,
+    re-fetch, persist the requeue — instead of poisoning the recovery writes."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    poison = _poison_session_factory(project.id)
+
+    async def _failing_handler(t, logs, sess):
+        await poison(sess)
+        sess.expire(t)
+        raise Exception("canceling statement due to statement timeout")
+
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        side_effect=_failing_handler,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result.get("status") == "received"
+
+    async with factory() as verify_session:
+        refetched = (
+            (await verify_session.execute(select(Task).where(Task.id == task.id)))
+            .scalars()
+            .first()
+        )
+    assert refetched is not None
+    assert refetched.status == TaskStatus.QUEUED
+    assert refetched.attempt_count == 1
+    assert (refetched.latest_status_message or "").startswith(
+        "Handler hit transient error, requeuing"
+    )
+
+
 @pytest.mark.asyncio
 async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     """Phase 2d: when the APPROVE branch hits CI failure and spawns a fix,

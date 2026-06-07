@@ -8,11 +8,13 @@ direction notes and proposals, writes the summary artifact, and broadcasts the
 completion event.
 """
 
+import contextlib
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -778,6 +780,109 @@ async def apply_post_spawn_state(
         )
     )
 
+    # Snapshot plain values for the final log/broadcast below: the
+    # duplicate-spawn catch around the terminal transition rolls the session
+    # back, and rollback() expires every loaded ORM instance (even with
+    # expire_on_commit=False) — a ``task.id`` / ``task.project_id`` read after
+    # that would issue a sync lazy refresh and raise MissingGreenlet.
+    _task_pk = task.id
+    _task_id_str = str(_task_pk)
+    _project_id = task.project_id
+    _child_pks = [ct.id for ct in child_tasks]
+
+    try:
+        await _apply_terminal_transition(
+            session,
+            task,
+            child_tasks=child_tasks,
+            findings=findings,
+            direction_notes=direction_notes,
+            direction_proposals=direction_proposals,
+            status_msg=status_msg,
+            research_branch=research_branch,
+            original_base=original_base,
+            direction_id=direction_id,
+            skipped_duplicates=skipped_duplicates,
+            hash_dedup_count=hash_dedup_count,
+            word_overlap_count=word_overlap_count,
+            file_overlap_count=file_overlap_count,
+            type_filtered_count=type_filtered_count,
+            empty_prompt_count=empty_prompt_count,
+        )
+    except IntegrityError as _dup_exc:
+        if "ux_task_active_idempotency_key" not in str(_dup_exc):
+            raise
+        # Benign duplicate-spawn guard (prod burst 2026-06-07 00:56): the
+        # terminal→EVALUATING flip tried to re-enter the active-status window
+        # of ``ux_task_active_idempotency_key`` while a peer task (a pipelined
+        # duplicate research cycle, or a concurrent post-commit retry) already
+        # holds this idempotency key in an active status. The constraint doing
+        # its job is not a failure — roll back and leave the task in its
+        # already-committed terminal state; the peer owns the direction's
+        # active claim. Without this rollback the poisoned session cascaded
+        # PendingRollbackError through the rest of post-commit and 500'd live
+        # agents.
+        await session.rollback()
+        logger.warning(
+            f"[RESEARCH] Task {_task_id_str}: post-spawn terminal transition hit "
+            f"ux_task_active_idempotency_key (a peer already holds this "
+            f"direction's active claim) — treating as already-spawned: "
+            f"{str(_dup_exc)[:200]}"
+        )
+        # rollback() expired every loaded instance; the caller
+        # (research_completion) keeps reading task/child attributes after this
+        # returns, so re-load them while still inside the async greenlet
+        # bridge (their rows are all committed — children before this call,
+        # the task by the agent-status early commit). ``populate_existing``
+        # (not refresh()) so the discarded EVALUATING mutation cannot survive
+        # in-memory and re-flush; ``no_autoflush`` so the re-load itself cannot
+        # autoflush that mutation and re-raise the violation.
+        with contextlib.suppress(Exception), session.no_autoflush:
+            await session.execute(
+                select(Task)
+                .where(Task.id.in_([_task_pk, *_child_pks]))
+                .execution_options(populate_existing=True)
+            )
+
+    logger.info(
+        f"[RESEARCH] Task {_task_id_str}: {len(findings)} raw findings, "
+        f"{skipped_duplicates} deduped, {len(child_tasks)} tasks created "
+        f"(direction: {str(direction_id)[:8]})"
+    )
+    await broadcast_to_project(
+        str(_project_id),
+        "autonomous_activity",
+        {"research_task_id": _task_id_str, "tasks_created": len(child_tasks)},
+    )
+
+
+async def _apply_terminal_transition(
+    session: AsyncSession,
+    task: Task,
+    *,
+    child_tasks: List[Task],
+    findings: List[Dict[str, Any]],
+    direction_notes: List[Dict[str, Any]],
+    direction_proposals: List[Dict[str, Any]],
+    status_msg: str,
+    research_branch: str,
+    original_base: str,
+    direction_id,
+    skipped_duplicates: int,
+    hash_dedup_count: int,
+    word_overlap_count: int,
+    file_overlap_count: int,
+    type_filtered_count: int,
+    empty_prompt_count: int,
+) -> None:
+    """Flip the research task to its post-spawn status and commit.
+
+    Extracted from ``apply_post_spawn_state`` so the caller can wrap the
+    whole transition (status mutation + zero-children note + commit) in the
+    duplicate-spawn IntegrityError guard. The commits here can violate
+    ``ux_task_active_idempotency_key`` when a peer already holds the task's
+    idempotency key in an active status — the caller treats that as benign.
+    """
     if not child_tasks:
         # findings_documented: research produced only metadata findings (direction_notes,
         # direction_proposals, or design_doc_observations counted in type_filtered_count)
@@ -871,14 +976,3 @@ async def apply_post_spawn_state(
         }
         session.add(task)
         await session.commit()
-
-    logger.info(
-        f"[RESEARCH] Task {task.id}: {len(findings)} raw findings, "
-        f"{skipped_duplicates} deduped, {len(child_tasks)} tasks created "
-        f"(direction: {str(direction_id)[:8]})"
-    )
-    await broadcast_to_project(
-        str(task.project_id),
-        "autonomous_activity",
-        {"research_task_id": str(task.id), "tasks_created": len(child_tasks)},
-    )
