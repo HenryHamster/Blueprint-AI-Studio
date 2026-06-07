@@ -563,8 +563,11 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
 
-      // Retry after the failure (the cut UI stays open on error).
-      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      // Retry after the failure (the cut UI stays open on error). The waitFor
+      // above resolves as soon as the mock is INVOKED — the rejection may not
+      // have settled yet, so the button can still wear its in-flight
+      // "Cutting v…" label; findByRole waits for it to revert to "Cut".
+      fireEvent.click(await screen.findByRole('button', { name: /^Cut$/ }));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
 
       // Both calls carried the SAME generated key (a lost-response retry must

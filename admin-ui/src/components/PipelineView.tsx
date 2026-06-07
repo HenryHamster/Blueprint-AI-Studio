@@ -139,6 +139,18 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
   const dimmed = !taskMatchesFilter(task, activeFilter);
 
+  // Surface the durable blocker metadata (backend models.py) on the pipeline node
+  // tooltip — the only board view that renders its own compact card instead of
+  // <TaskCard> (which already shows these). All fields are nullable and absent on
+  // non-BLOCKED / legacy tasks, so guard on presence before adding a line.
+  const blockerTooltip = task.status === 'BLOCKED'
+    ? [
+        task.blocker_kind ? `Blocked: ${task.blocker_kind}` : 'Blocked',
+        task.blocked_reason || null,
+        task.recheck_after ? `Rechecks ${new Date(parseTimestamp(task.recheck_after).getTime()).toLocaleString()}` : null,
+      ].filter(Boolean).join('\n')
+    : null;
+
   return (
     <div
       role="button"
@@ -147,7 +159,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       onClick={() => onViewLogs(task)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
       className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'} ${dimmed ? 'opacity-40 grayscale' : ''}`}
-      title={`${task.title}\n${task.status} • ${task.task_type || 'create'}\nClick to view logs`}
+      title={`${task.title}\n${task.status} • ${task.task_type || 'create'}${blockerTooltip ? `\n${blockerTooltip}` : ''}\nClick to view logs`}
     >
       {/* Status dot */}
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor}`} />
