@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import type { JsonExtractionMissReason } from './json-extract.js';
 
 // ── Error fingerprinting ──────────────────────────────────────────────────────
 
@@ -72,6 +73,68 @@ export function resetLlmTelemetry(): void {
   _llmCallCount = 0;
   _totalInputTokens = 0;
   _totalOutputTokens = 0;
+}
+
+// ── Per-task structured-output format-compliance telemetry (equipping d-46468a41) ─
+// Mirrors the LLM telemetry vertical above: cumulative per-run counters posted
+// on every heartbeat and persisted next to api_call_summary as
+// format_compliance_summary. Records straight from the extraction layer's own
+// verdicts (json-extract.ts) — the verdict is GROUND TRUTH, never re-derived.
+//
+// A "format miss" is a FINAL structured output the extraction layer could not
+// parse, bucketed by the layer's reason class. `malformed_json` is the bucket
+// for a JsonExtractionError (a candidate parsed-but-threw), which carries no
+// JsonExtractionMissReason. Handlers that self-repair an unparseable final
+// output with a focused re-ask also record the attempt and whether it succeeded.
+
+/** Reason class for an unparseable final output. The extraction layer's miss
+ *  reasons plus `malformed_json` for a thrown JsonExtractionError. */
+export type FormatMissReason = JsonExtractionMissReason | 'malformed_json';
+
+let _formatMissByReason: Record<string, number> = {};
+let _formatErrorTotal = 0;
+let _formatRepairAttempts = 0;
+let _formatRepairSuccesses = 0;
+
+/** Record one unparseable final output, bucketed by the extraction verdict's
+ *  reason class. Bumps the per-reason count and the format-error total. */
+export function recordFormatMiss(reason: FormatMissReason): void {
+  _formatMissByReason[reason] = (_formatMissByReason[reason] ?? 0) + 1;
+  _formatErrorTotal += 1;
+}
+
+/** Record that a handler attempted a self-repair re-ask after a format miss. */
+export function recordFormatRepairAttempt(): void {
+  _formatRepairAttempts += 1;
+}
+
+/** Record that a self-repair re-ask then produced a parseable final output. */
+export function recordFormatRepairSuccess(): void {
+  _formatRepairSuccesses += 1;
+}
+
+/** Snapshot the cumulative format-compliance telemetry for heartbeat / status
+ *  posts. Returns a plain dict (fresh copy of the per-reason map). */
+export function getFormatComplianceTelemetry(): {
+  format_miss_by_reason: Record<string, number>;
+  format_error_total: number;
+  format_repair_attempts: number;
+  format_repair_successes: number;
+} {
+  return {
+    format_miss_by_reason: { ..._formatMissByReason },
+    format_error_total: _formatErrorTotal,
+    format_repair_attempts: _formatRepairAttempts,
+    format_repair_successes: _formatRepairSuccesses,
+  };
+}
+
+/** Reset between roles so per-task counters don't bleed across warm-VM continuity. */
+export function resetFormatComplianceTelemetry(): void {
+  _formatMissByReason = {};
+  _formatErrorTotal = 0;
+  _formatRepairAttempts = 0;
+  _formatRepairSuccesses = 0;
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).

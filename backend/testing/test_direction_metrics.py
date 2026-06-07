@@ -22,12 +22,14 @@ from app.direction_metrics import (
 from app.direction_outcomes import verified_merged_count
 
 
-def _entry(*, proven, declared, merged, verified=None):
+def _entry(*, proven, declared, merged, verified=None, verified_write=None):
     """An acceptance-contract research_history entry."""
     v = merged if verified is None else verified
+    vw = v if verified_write is None else verified_write
     return {
         "prs_merged": v,
         "verified_prs_merged": v,
+        "acceptance_verified_write_merged": vw,
         "acceptance_merged_write_total": merged,
         "acceptance_proven_merged": proven,
         "acceptance_declared_merged": declared,
@@ -67,8 +69,13 @@ class TestProofWeightedMerged:
     def test_read_only_cycle_not_penalized(self):
         # Acceptance-aware cycle with zero merged WRITE tasks (coverage undefined):
         # any non-write verified merges keep full credit, never discounted to 0.
-        e = _entry(proven=0, declared=0, merged=0, verified=2)
+        e = _entry(proven=0, declared=0, merged=0, verified=2, verified_write=0)
         assert proof_weighted_merged(e) == 2.0
+
+    def test_read_only_slice_keeps_full_credit_next_to_write_slice(self):
+        e = _entry(proven=1, declared=2, merged=2, verified=4, verified_write=2)
+        expected = 2 + (1.0 + _PROOF_WEIGHT_DECLARED_UNPROVEN)
+        assert proof_weighted_merged(e) == expected
 
     def test_weight_merged_clamps_inconsistent_inputs(self):
         # proven/declared above verified are clamped so the result never inflates.
@@ -84,6 +91,7 @@ class TestFoldAcceptanceTotals:
         ]
         agg = _fold_evicted_into_aggregate(None, evicted)
         assert agg["total_acceptance_verified_merged"] == 6  # 4 + 2 verified
+        assert agg["total_acceptance_verified_write_merged"] == 6
         assert agg["total_acceptance_proven_merged"] == 3
         assert agg["total_acceptance_declared_merged"] == 4
         assert agg["total_acceptance_merged_write_total"] == 6
@@ -92,6 +100,7 @@ class TestFoldAcceptanceTotals:
         evicted = [{"prs_merged": 5, "verified_prs_merged": 5}]  # pre-contract
         agg = _fold_evicted_into_aggregate(None, evicted)
         assert agg["total_acceptance_verified_merged"] == 0
+        assert agg["total_acceptance_verified_write_merged"] == 0
         assert agg["total_acceptance_merged_write_total"] == 0
         # But the verified merge is still counted in the unweighted lifetime total.
         assert agg["total_verified_prs_merged"] == 5
@@ -104,6 +113,7 @@ class TestAggProofWeightedMerged:
         agg = {
             "total_verified_prs_merged": 10,
             "total_acceptance_verified_merged": 4,
+            "total_acceptance_verified_write_merged": 4,
             "total_acceptance_merged_write_total": 4,
             "total_acceptance_proven_merged": 0,
             "total_acceptance_declared_merged": 0,
@@ -111,6 +121,18 @@ class TestAggProofWeightedMerged:
         expected = 6 + 4 * _PROOF_WEIGHT_UNDECLARED
         assert _agg_proof_weighted_merged(agg) == expected
         assert _agg_proof_weighted_merged(agg) <= agg["total_verified_prs_merged"]
+
+    def test_read_only_slice_keeps_full_credit_in_aggregate(self):
+        agg = {
+            "total_verified_prs_merged": 10,
+            "total_acceptance_verified_merged": 4,
+            "total_acceptance_verified_write_merged": 2,
+            "total_acceptance_merged_write_total": 2,
+            "total_acceptance_proven_merged": 1,
+            "total_acceptance_declared_merged": 2,
+        }
+        expected = 6 + 2 + (1.0 + _PROOF_WEIGHT_DECLARED_UNPROVEN)
+        assert _agg_proof_weighted_merged(agg) == expected
 
     def test_no_acceptance_key_falls_back_to_total_verified(self):
         agg = {"total_verified_prs_merged": 7}
@@ -120,6 +142,7 @@ class TestAggProofWeightedMerged:
         agg = {
             "total_verified_prs_merged": 5,
             "total_acceptance_verified_merged": 5,
+            "total_acceptance_verified_write_merged": 5,
             "total_acceptance_merged_write_total": 5,
             "total_acceptance_proven_merged": 5,
             "total_acceptance_declared_merged": 5,

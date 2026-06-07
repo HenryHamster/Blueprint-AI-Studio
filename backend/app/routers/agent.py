@@ -195,9 +195,7 @@ _AGENT_INACTIVE_TASK_STATUSES = (
 # Single source of truth for the two claim-path context gates below. These reuse
 # the existing per-project queries — no new heavy computation on the hot claim
 # path; the expensive review-only analytics stay gated to their narrower sets.
-_PEER_CODE_ANALYSIS_TYPES = frozenset(
-    {"qa", "migrate", "debug", "perf", "investigate"}
-)
+_PEER_CODE_ANALYSIS_TYPES = frozenset({"qa", "migrate", "debug", "perf", "investigate"})
 
 # Issue M3 (warm-VM continuity audit): JWTs for terminated tasks remain valid
 # for the JWT's full TTL (1h). The is_idempotent_path branch accepts these
@@ -273,9 +271,7 @@ async def verify_agent_token(
                 token_vm_instance_id=payload.get("vm_instance_id"),
                 token_project_id=payload.get("project_id"),
             )
-            raise HTTPException(
-                status_code=401, detail="vm_scoped_token_missing_vm"
-            )
+            raise HTTPException(status_code=401, detail="vm_scoped_token_missing_vm")
         return payload
     token_vm = payload.get("vm_instance_id")
     # /next-role and /vm-heartbeat are reached AFTER a task has terminated
@@ -2167,7 +2163,8 @@ async def claim_task(
             )
             direction_implementation_constraints = (
                 _impl_constraints_raw.strip()[:500]
-                if isinstance(_impl_constraints_raw, str) and _impl_constraints_raw.strip()
+                if isinstance(_impl_constraints_raw, str)
+                and _impl_constraints_raw.strip()
                 else None
             )
             history = direction.get("research_history", [])
@@ -2859,7 +2856,10 @@ async def claim_task(
             _plan_impl_constraints = (direction_for_decomp.get("context") or {}).get(
                 "implementation_constraints"
             )
-            if isinstance(_plan_impl_constraints, str) and _plan_impl_constraints.strip():
+            if (
+                isinstance(_plan_impl_constraints, str)
+                and _plan_impl_constraints.strip()
+            ):
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["implementation_constraints"] = (
@@ -3388,7 +3388,9 @@ async def claim_task(
                 "check_run_name", "Blueprint Code Review"
             )
             _check_run_fut = asyncio.ensure_future(
-                _create_review_check_run_bg(_claimed_task_id, _pr_number, _check_run_name)
+                _create_review_check_run_bg(
+                    _claimed_task_id, _pr_number, _check_run_name
+                )
             )
             _bg_tasks.add(_check_run_fut)
             _check_run_fut.add_done_callback(_bg_tasks.discard)
@@ -3899,6 +3901,27 @@ async def agent_heartbeat(
             "last_updated_at": _utcnow().isoformat(),
         }
 
+    # Per-task structured-output format-compliance telemetry (equipping
+    # direction d-46468a41), sibling to api_call_summary. Cumulative counters
+    # posted on every heartbeat — last write wins. Backwards-compatible: older
+    # agents that don't ship these fields leave format_compliance_summary NULL.
+    if (
+        req.format_miss_by_reason is not None
+        or req.format_error_total is not None
+        or req.format_repair_attempts is not None
+        or req.format_repair_successes is not None
+    ):
+        task.format_compliance_summary = {
+            "format_miss_by_reason": {
+                str(reason): int(count)
+                for reason, count in (req.format_miss_by_reason or {}).items()
+            },
+            "format_error_total": int(req.format_error_total or 0),
+            "format_repair_attempts": int(req.format_repair_attempts or 0),
+            "format_repair_successes": int(req.format_repair_successes or 0),
+            "last_updated_at": _utcnow().isoformat(),
+        }
+
     # Record VM image identity so the orchestrator can detect stale Packer images.
     # Called on every heartbeat that carries image fields; no-ops when both are None.
     if req.vm_image_name is not None or req.vm_image_build_ts is not None:
@@ -4175,9 +4198,7 @@ async def merge_operator_reviewer_findings(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_token_project_id(
-    session: AsyncSession, token: dict
-) -> uuid.UUID:
+async def _resolve_token_project_id(session: AsyncSession, token: dict) -> uuid.UUID:
     """Resolve the authenticated task's project_id from the agent token.
 
     The agent never supplies a project_id; scope is bound to the task the token
@@ -4201,8 +4222,12 @@ async def agent_list_knowledge_documents(
     q: str | None = Query(default=None, description="Full-text search term"),
     topic: str | None = Query(default=None, description="Exact topic filter"),
     tag: str | None = Query(default=None, description="Exact tag filter"),
-    direction: str | None = Query(default=None, description="Exact direction_id filter"),
-    source_kind: str | None = Query(default=None, description="Exact source_kind filter"),
+    direction: str | None = Query(
+        default=None, description="Exact direction_id filter"
+    ),
+    source_kind: str | None = Query(
+        default=None, description="Exact source_kind filter"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),

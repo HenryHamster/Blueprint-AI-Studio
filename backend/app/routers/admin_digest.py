@@ -56,6 +56,7 @@ from app.digest_metrics import (
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
     compute_direction_progress,
     compute_failure_grouping,  # noqa: F401  re-exported for external importers
+    compute_format_compliance_metrics,
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_migration_slot_contention,
@@ -349,6 +350,10 @@ async def _compute_digest(
                     Task.llm_input_tokens_banked_db,
                     Task.llm_output_tokens_banked_db,
                     Task.llm_call_count_banked_db,
+                    # Structured-output format-compliance telemetry for the
+                    # windowed compute_format_compliance_metrics measure; loaded
+                    # here so the direct access doesn't trigger a lazy-load.
+                    Task.format_compliance_summary,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -401,6 +406,10 @@ async def _compute_digest(
                     Task.llm_input_tokens_banked_db,
                     Task.llm_output_tokens_banked_db,
                     Task.llm_call_count_banked_db,
+                    # Structured-output format-compliance telemetry for the
+                    # windowed compute_format_compliance_metrics measure; loaded
+                    # here so the direct access doesn't trigger a lazy-load.
+                    Task.format_compliance_summary,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -1324,6 +1333,9 @@ async def _compute_digest(
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
     )
+    _format_compliance = compute_format_compliance_metrics(
+        completed_tasks + failed_tasks
+    )
 
     # Migration-serialization-slot contention (read-only) — surfaces whether a
     # migration task currently holds the per-project slot and for how long, how
@@ -1349,6 +1361,7 @@ async def _compute_digest(
         "total_merge_retries_saved": total_merge_retries_saved,
         "first_attempt_success_rate": _first_attempt_success_rate,
         "first_review_approval_rate": _first_review_approval_rate,
+        "format_compliance": _format_compliance,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality[
             "self_review_prediction_accuracy"

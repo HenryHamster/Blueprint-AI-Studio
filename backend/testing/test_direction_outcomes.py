@@ -4845,12 +4845,14 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
     merged_write = [r for r in merged if r["write"]]
     declared = sum(1 for r in merged_write if r["declared"])
     proven = sum(1 for r in merged_write if r["proven"])
+    verified_write = sum(1 for r in merged_write if r["verified"])
     verified = sum(1 for r in merged if r["verified"])
     prs_merged = len(merged)
     mw = len(merged_write)
     return {
         "acceptance_proven_merged": proven,
         "acceptance_declared_merged": declared,
+        "acceptance_verified_write_merged": verified_write,
         "acceptance_merged_write_total": mw,
         "verified_prs_merged": verified,
         "prs_merged": prs_merged,
@@ -4949,6 +4951,11 @@ async def test_acceptance_metric_invariants_hold_across_mixes(
     )
     assert (
         0
+        <= entry["acceptance_verified_write_merged"]
+        <= entry["acceptance_merged_write_total"]
+    )
+    assert (
+        0
         <= entry["acceptance_proven_merged"]
         <= entry["verified_prs_merged"]
         <= entry["prs_merged"]
@@ -4970,6 +4977,7 @@ async def test_declaration_coverage_identity_and_readonly_excluded(
     )
     # Read-only merges do NOT enter the merged-write denominator.
     assert entry["acceptance_merged_write_total"] == 2
+    assert entry["acceptance_verified_write_merged"] == 2
     assert entry["acceptance_declared_merged"] == 2
     assert entry["acceptance_proven_merged"] == 1
     # ...but they DO count as merged PRs.
@@ -4978,6 +4986,9 @@ async def test_declaration_coverage_identity_and_readonly_excluded(
     # Coverage is taken over merged-write only: 2/2 == 1.0, not 2/4.
     assert entry["acceptance_declaration_coverage"] == 1.0
     assert acceptance_metric_invariant_violations(entry) == []
+    from app.direction_metrics import proof_weighted_merged
+
+    assert proof_weighted_merged(entry) == 3.7
 
 
 def test_acceptance_metric_invariant_violations_detects_drift():
@@ -4992,6 +5003,7 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     clean = {
         "acceptance_proven_merged": 1,
         "acceptance_declared_merged": 2,
+        "acceptance_verified_write_merged": 2,
         "acceptance_merged_write_total": 3,
         "verified_prs_merged": 2,
         "prs_merged": 4,
@@ -5011,6 +5023,10 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     # declared drifts above merged-write.
     assert acceptance_metric_invariant_violations(
         {**clean, "acceptance_declared_merged": 4}
+    )
+    # verified-write drifts above merged-write.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_verified_write_merged": 4}
     )
     # merged-write drifts above prs_merged.
     assert acceptance_metric_invariant_violations(

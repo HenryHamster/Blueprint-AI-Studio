@@ -189,7 +189,9 @@ async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, db_session):
+async def test_agent_claim_includes_task_capability_slice(
+    client: AsyncClient, db_session
+):
     project = Project(name="Agent Claim Capability Test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
@@ -288,7 +290,9 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 async def test_agent_claim_includes_compute_experiment_capability_slice(
     client: AsyncClient, db_session
 ):
-    project = Project(name="Agent Claim Compute Capability Test", user_id="test-user-123")
+    project = Project(
+        name="Agent Claim Compute Capability Test", user_id="test-user-123"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -307,7 +311,9 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
 
     assert resp.status_code == 200
     data = resp.json()
-    expected = {entry["id"]: entry for entry in task_type_catalog()}["compute_experiment"]
+    expected = {entry["id"]: entry for entry in task_type_catalog()}[
+        "compute_experiment"
+    ]
     assert data["task_capability"] == expected
 
 
@@ -420,7 +426,9 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
-async def test_agent_compute_job_launch_creates_pending_row(client: AsyncClient, db_session):
+async def test_agent_compute_job_launch_creates_pending_row(
+    client: AsyncClient, db_session
+):
     import app.compute_jobs as compute_jobs_module
 
     project = Project(name="Agent Compute Launch", user_id="test-user-123")
@@ -620,9 +628,7 @@ async def test_completed_teardown_defer_is_provider_aware_noop_single_provider(
     import app.shared_state as _ss
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    mock_teardown = mocker.patch(
-        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
-    )
+    mock_teardown = mocker.patch("app.vm_lifecycle.schedule_deferred_backlog_teardown")
     mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
     monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
 
@@ -674,9 +680,7 @@ async def test_completed_teardown_proceeds_when_backlog_provider_mismatch(
     import app.shared_state as _ss
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    mock_teardown = mocker.patch(
-        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
-    )
+    mock_teardown = mocker.patch("app.vm_lifecycle.schedule_deferred_backlog_teardown")
     mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
     monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
 
@@ -934,9 +938,7 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
         "task_id": str(task.id),
         "tool_trace": [{"t": older, "tool": "Read", "input_preview": "x"}],
     }
-    resp2 = await client.post(
-        "/api/agent/heartbeat", json=payload_old, headers=headers
-    )
+    resp2 = await client.post("/api/agent/heartbeat", json=payload_old, headers=headers)
     assert resp2.status_code == 200
     contact2 = await db_session.get(VmContact, vm_id)
     assert contact2.last_tool_use_at >= recorded
@@ -1543,7 +1545,9 @@ async def test_agent_claim_project_metadata_empty_build_config(
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_surfaces_approval_gate_config(client: AsyncClient, db_session):
+async def test_agent_claim_surfaces_approval_gate_config(
+    client: AsyncClient, db_session
+):
     """A project's approval_gate_config is surfaced in project_metadata so the
     agent's fresh-reviewer can derive per-project sensitive paths."""
     project = Project(
@@ -3197,9 +3201,7 @@ async def _claim_with_playbook_provenance(
     await db_session.commit()
 
     token = create_agent_token(str(claim_task.id), "agent-vm-div-reader")
-    resp = await client.post(
-        "/api/agent/claim", headers={"x-agent-token": token}
-    )
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200, resp.text
     playbook = resp.json().get("playbook") or {}
     return playbook, str(claim_task.id)
@@ -3478,9 +3480,7 @@ async def test_design_doc_get_reconciles_absent_capability_entry(
 
     import app.source_ref_validation as srv
 
-    monkeypatch.setattr(
-        srv, "_path_exists_at_head", AsyncMock(return_value=False)
-    )
+    monkeypatch.setattr(srv, "_path_exists_at_head", AsyncMock(return_value=False))
     monkeypatch.setattr(
         "app.routers.admin_agent_ops.ground_design_doc_value",
         partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
@@ -4157,9 +4157,7 @@ async def test_playbook_set_rejects_when_nothing_evictable(
     # Patch _playbook_size_bytes to always report > 30KB cap, and
     # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
     with (
-        patch(
-            "app.routers.admin_agent_ops._playbook_size_bytes", return_value=32_000
-        ),
+        patch("app.routers.admin_agent_ops._playbook_size_bytes", return_value=32_000),
         patch(
             "app.routers.admin_agent_ops._maybe_archive_for_capacity",
             side_effect=lambda doc, est=0: doc,
@@ -8377,9 +8375,7 @@ async def test_post_commit_disconnect_on_retry_returns_pending_not_500(
     pc = mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=mocker.AsyncMock,
-        side_effect=InterfaceError(
-            "SELECT 1", {}, Exception("connection is closed")
-        ),
+        side_effect=InterfaceError("SELECT 1", {}, Exception("connection is closed")),
     )
 
     project = Project(name="PostCommit Disc Test", user_id="test-user-pc-disc")
@@ -8435,9 +8431,7 @@ async def test_post_commit_disconnect_inline_returns_pending_not_500(
     pc = mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=mocker.AsyncMock,
-        side_effect=InterfaceError(
-            "SELECT 1", {}, Exception("connection is closed")
-        ),
+        side_effect=InterfaceError("SELECT 1", {}, Exception("connection is closed")),
     )
 
     project = Project(name="PostCommit Disc Inline", user_id="test-user-pc-disc2")
@@ -8913,7 +8907,9 @@ async def test_failed_pool_served_task_feeds_pool_breaker(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
         # Stamp the warm-claim origin exactly as the pool dispatch path does.
-        context={"_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}},
+        context={
+            "_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}
+        },
     )
     db_session.add(task)
     await db_session.commit()
@@ -8968,7 +8964,9 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+        new=AsyncMock(
+            return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}
+        ),
     )
 
     project = Project(
@@ -9015,9 +9013,7 @@ async def test_failed_with_merged_pr_marks_completed(
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -9051,7 +9047,9 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+        new=AsyncMock(
+            return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}
+        ),
     )
 
     project = Project(
@@ -9066,9 +9064,7 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
 
     task = Task(
         project_id=project.id,
-        payloads=[
-            {"type": "create", "prompt": "do work", "base_branch": "automain"}
-        ],
+        payloads=[{"type": "create", "prompt": "do work", "base_branch": "automain"}],
         vm_instance_id="agent-vm-merged-promotion-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -9100,9 +9096,7 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is None
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -10123,7 +10117,9 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "migrate", "prompt": "add Alembic migration for PoolVm registry"}],
+        payloads=[
+            {"type": "migrate", "prompt": "add Alembic migration for PoolVm registry"}
+        ],
         vm_instance_id="agent-vm-already-done-1",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -10163,10 +10159,10 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
     from sqlalchemy import select as _select
 
     artifacts = (
-        await db_session.execute(
-            _select(Artifact).where(Artifact.task_id == task.id)
-        )
-    ).scalars().all()
+        (await db_session.execute(_select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
     assert all(a.artifact_type != ArtifactType.PULL_REQUEST for a in artifacts)
 
 
@@ -12193,18 +12189,25 @@ async def test_smoketest_passing_does_not_spawn_plan_task(
 
 
 @pytest.mark.asyncio
-async def test_smoketest_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+async def test_smoketest_result_plan_output_is_dict(
+    client: AsyncClient, db_session, mocker
+):
     """SMOKETEST_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
+
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-dict")
     token = create_agent_token(str(task.id), "agent-vm-smoke-dict")
     resp = await client.post(
         "/api/agent/status",
-        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "SMOKETEST_RESULT",
-              "logs": _json.dumps({"passed": True, "tests": [], "suites": {}})},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "SMOKETEST_RESULT",
+            "logs": _json.dumps({"passed": True, "tests": [], "suites": {}}),
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
@@ -12484,27 +12487,38 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(
 
 
 @pytest.mark.asyncio
-async def test_debug_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+async def test_debug_result_plan_output_is_dict(
+    client: AsyncClient, db_session, mocker
+):
     """DEBUG_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
+
     project = Project(name="Debug Dict", user_id="test-user-debug-dict2")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    task = Task(project_id=project.id, title="Debug: dict test",
-                payloads=[{"type": "debug", "base_branch": "main"}],
-                vm_instance_id="agent-vm-debug-dict2", status=TaskStatus.IN_PROGRESS)
+    task = Task(
+        project_id=project.id,
+        title="Debug: dict test",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-dict2",
+        status=TaskStatus.IN_PROGRESS,
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
     token = create_agent_token(str(task.id), "agent-vm-debug-dict2")
     resp = await client.post(
         "/api/agent/status",
-        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "DEBUG_RESULT",
-              "logs": _json.dumps({"confidence": "low", "root_cause": "test"})},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "DEBUG_RESULT",
+            "logs": _json.dumps({"confidence": "low", "root_cause": "test"}),
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
@@ -12632,10 +12646,7 @@ async def test_agent_claim_injects_strategic_intent(client: AsyncClient, db_sess
     intent = resp.json().get("strategic_intent")
     assert intent is not None
     assert intent["purpose"] == "Build an autonomous coding studio."
-    assert (
-        intent["current_focus"]
-        == "Thread operator steering into tactical prompts."
-    )
+    assert intent["current_focus"] == "Thread operator steering into tactical prompts."
 
 
 @pytest.mark.asyncio
@@ -15400,6 +15411,79 @@ async def test_heartbeat_omits_api_call_summary_when_fields_absent(
 
     await db_session.refresh(task)
     assert task.api_call_summary is None
+    # Sibling format-compliance column is likewise untouched.
+    assert task.format_compliance_summary is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_format_compliance_summary(
+    client: AsyncClient, db_session
+):
+    """Heartbeat persists structured-output format-compliance telemetry into
+    Task.format_compliance_summary (sibling to api_call_summary), last-write-wins."""
+    project = Project(name="Format Compliance Summary", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-fmt-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.format_compliance_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-fmt-summary")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 2, "missing_required_key": 1},
+            "format_error_total": 3,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_miss_by_reason"] == {
+        "unbalanced_json": 2,
+        "missing_required_key": 1,
+    }
+    assert summary["format_error_total"] == 3
+    assert summary["format_repair_attempts"] == 2
+    assert summary["format_repair_successes"] == 1
+    assert "last_updated_at" in summary
+
+    # Subsequent heartbeat with higher cumulative counts overwrites (last-write-wins).
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 4},
+            "format_error_total": 4,
+            "format_repair_attempts": 3,
+            "format_repair_successes": 3,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.format_compliance_summary["format_miss_by_reason"] == {
+        "unbalanced_json": 4
+    }
+    assert task.format_compliance_summary["format_error_total"] == 4
+    assert task.format_compliance_summary["format_repair_successes"] == 3
+    # LLM telemetry column stays NULL when only format fields are sent.
+    assert task.api_call_summary is None
 
 
 # ===========================================================================
@@ -16213,7 +16297,9 @@ async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(db_session, m
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Hotfix-Plan", user_id="hotfix-user")
@@ -16286,7 +16372,9 @@ async def test_non_hotfix_plan_subtasks_do_not_carry_hotfix(db_session, mocker):
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Normal-Plan", user_id="hotfix-user")

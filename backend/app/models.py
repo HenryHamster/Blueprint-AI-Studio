@@ -979,6 +979,15 @@ class Task(SQLModel, table=True):
     api_call_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Cumulative per-task structured-output format-compliance telemetry posted
+    # by the agent on every heartbeat, sibling to api_call_summary. Shape:
+    # {"format_miss_by_reason": {<reason>: int, ...}, "format_error_total": int,
+    # "format_repair_attempts": int, "format_repair_successes": int,
+    # "last_updated_at": iso8601}. Backwards-compatible — older agents that
+    # don't ship these fields leave this column NULL.
+    format_compliance_summary: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Retry-attribution banking now has dedicated nullable columns. The
     # accessors below still fall back to legacy context keys so in-flight rows
     # written before the migration keep their banked totals during rollout.
@@ -3710,9 +3719,7 @@ class MigrationReservation(SQLModel, table=True):
     provisional_revision: str = Field(
         sa_column=Column(String(64), nullable=False, index=True)
     )
-    provisional_down_revision: str = Field(
-        sa_column=Column(String(64), nullable=False)
-    )
+    provisional_down_revision: str = Field(sa_column=Column(String(64), nullable=False))
 
     status: MigrationReservationStatus = Field(
         default=MigrationReservationStatus.ACTIVE,

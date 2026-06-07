@@ -8,6 +8,10 @@ import {
   DEFAULT_TOOL_GUIDANCE, buildContextPrefix,
 } from '../prompt.js';
 import { extractJsonObjectDetailed, describeJsonExtractionResult, JsonExtractionError } from '../json-extract.js';
+import {
+  recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  type FormatMissReason,
+} from '../telemetry.js';
 
 // Scan raw Codex JSONL output for agent_message events and return ALL
 // candidate item.text values, prioritising item.completed over item.updated
@@ -152,15 +156,21 @@ Rules:
   const requiredKeys = ['summary', 'reasoning', 'citations', 'tags'];
 
   // Try to extract a valid memo object from any of the given text sources.
-  // Returns the parsed object on first match, or null if no source yields one.
+  // Returns the parsed object on first match (with missReason null), or null
+  // with the extraction layer's reason for the FIRST schema-bearing source that
+  // failed — so the caller can record format-compliance telemetry straight from
+  // the verdict (it is GROUND TRUTH; do not re-derive). `malformed_json` is the
+  // reason for a thrown JsonExtractionError (candidate parsed-but-malformed).
   const tryExtractMemoObject = (
     sources: Array<{ label: string; text: string }>,
-  ): Record<string, unknown> | null => {
+  ): { value: Record<string, unknown> | null; missReason: FormatMissReason | null } => {
+    let missReason: FormatMissReason | null = null;
     for (const src of sources) {
       if (!src.text.includes('"summary"') || !src.text.includes('"reasoning"')) continue;
       try {
         const res = extractJsonObjectDetailed(src.text, 'summary', 'reasoning');
         if (!res.ok) {
+          if (missReason === null) missReason = res.reason;
           sendLog(ws, `[WARNING] Could not parse memo JSON from ${src.label}: ${describeJsonExtractionResult(res)}\n`);
           continue;
         }
@@ -169,15 +179,17 @@ Rules:
         // membership as the primary gate, so this path is rarely reached.
         const missing = requiredKeys.filter(k => !(k in obj));
         if (missing.length > 0) {
+          if (missReason === null) missReason = 'parsed_object_missing_key';
           sendLog(ws, `[WARNING] Memo JSON from ${src.label} missing required keys: ${missing.join(', ')}\n`);
           continue;
         }
-        return obj;
+        return { value: obj, missReason: null };
       } catch (e) {
+        if (missReason === null) missReason = 'malformed_json';
         sendLog(ws, `[WARNING] Memo JSON extraction from ${src.label} failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
       }
     }
-    return null;
+    return { value: null, missReason };
   };
 
   const buildSources = (
@@ -206,7 +218,8 @@ Rules:
 
   // Prefer the final result text (cheapest, usually clean JSON) and fall
   // back to scanning the full transcript for the schema's required keys.
-  let memoObj = tryExtractMemoObject(buildSources(lastResultText, allOutput));
+  const firstAttempt = tryExtractMemoObject(buildSources(lastResultText, allOutput));
+  let memoObj = firstAttempt.value;
   let retryExitCode: number | null = null;
   let retryAllOutput = '';
   let retryLastResultText = '';
@@ -223,6 +236,11 @@ Rules:
   // is itself a fresh Claude session (stateless), so we hand it the prior
   // reasoning as context to fill the schema fields from.
   if (memoObj === null && exitCode === 0) {
+    // Record the initial unparseable FINAL output straight from the extraction
+    // verdict (ground truth), then that a self-repair re-ask is being attempted.
+    // Whether it succeeded is recorded after re-extraction below.
+    if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason);
+    recordFormatRepairAttempt();
     const priorText = (lastResultText || allOutput || '').slice(-8000);
     sendLog(ws, `[INFO] First memo attempt produced no JSON (allOutput=${(allOutput || '').length}b, lastResultText=${(lastResultText || '').length}b). Reopening with focused continuation.\n`);
     statusRef.value = 'Writing memo (retry)...';
@@ -250,9 +268,11 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no add
     retryLastResultText = retryRun.lastResultText;
     retryCodexTurnCompleted = retryRun.codexTurnCompleted;
     retryStderrTail = retryRun.stderrTail || '';
-    memoObj = tryExtractMemoObject(
+    const retryAttempt = tryExtractMemoObject(
       buildSources(retryRun.lastResultText, retryRun.allOutput),
     );
+    memoObj = retryAttempt.value;
+    if (memoObj !== null) recordFormatRepairSuccess();
   }
 
   if (memoObj === null) {

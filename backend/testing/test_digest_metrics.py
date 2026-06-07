@@ -19,6 +19,7 @@ from app.digest_metrics import (
     compute_effort_model_efficiency,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_format_compliance_metrics,
     compute_migration_health,
     compute_migration_slot_contention,
     compute_migration_slot_contention_summary,
@@ -4443,3 +4444,129 @@ async def test_migration_slot_contention_query_filters_and_scopes(db_session):
     assert result["threshold_exceeded"] is True
     assert len(result["projects"]) == 1
     assert result["projects"][0]["project_id"] == str(project.id)
+
+
+# ── compute_format_compliance_metrics ──────────────────────────────────────
+
+
+def _fc_task(task_type, summary, status=TaskStatus.COMPLETED):
+    """Build a terminal task carrying a format_compliance_summary (or None)."""
+    return make_task(
+        status=status,
+        payloads=[{"type": task_type}],
+        format_compliance_summary=summary,
+    )
+
+
+def test_format_compliance_metrics_malformed_then_repaired_run():
+    """A malformed-then-repaired run is non-compliant (0.0) but its repair counts
+    as a success (1.0); a clean run is well-formed; a NULL-summary task is excluded."""
+    tasks = [
+        # create #1: one unparseable final output, repaired successfully on re-ask.
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"unbalanced_json": 1},
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        ),
+        # create #2: clean run — no format error, no repair needed.
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {},
+                "format_error_total": 0,
+                "format_repair_attempts": 0,
+                "format_repair_successes": 0,
+            },
+        ),
+        # fix: two misses, only one repair succeeded.
+        _fc_task(
+            "fix",
+            {
+                "format_miss_by_reason": {"missing_required_key": 1, "no_json_start": 1},
+                "format_error_total": 2,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+            },
+            status=TaskStatus.FAILED,
+        ),
+        # NULL summary (older agent) — excluded entirely from the measure.
+        _fc_task("create", None),
+    ]
+
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+
+    # Three tasks carry telemetry (the NULL one is excluded).
+    assert overall["tasks_measured"] == 3
+    # Only the clean create run is well-formed (format_error_total == 0).
+    assert overall["well_formed_tasks"] == 1
+    assert overall["format_compliance_rate"] == round(1 / 3, 3)
+    # Self-repair: 2 of 3 attempts succeeded across the window.
+    assert overall["format_error_total"] == 3
+    assert overall["repair_attempts"] == 3
+    assert overall["repair_successes"] == 2
+    assert overall["self_repair_success_rate"] == round(2 / 3, 3)
+
+    # By-type breakdown.
+    by_type = result["by_type"]
+    assert set(by_type) == {"create", "fix"}
+
+    create = by_type["create"]
+    assert create["tasks_measured"] == 2
+    assert create["well_formed_tasks"] == 1
+    assert create["format_compliance_rate"] == 0.5
+    # One repair attempt, one success.
+    assert create["self_repair_success_rate"] == 1.0
+
+    fix = by_type["fix"]
+    assert fix["tasks_measured"] == 1
+    assert fix["well_formed_tasks"] == 0
+    assert fix["format_compliance_rate"] == 0.0
+    assert fix["self_repair_success_rate"] == 0.5
+
+
+def test_format_compliance_metrics_null_summaries_excluded():
+    """Tasks whose format_compliance_summary is NULL are not counted (neutral)."""
+    tasks = [
+        _fc_task("create", None),
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+    ]
+    result = compute_format_compliance_metrics(tasks)
+    assert result["overall"]["tasks_measured"] == 0
+    assert result["overall"]["format_compliance_rate"] is None
+    assert result["overall"]["self_repair_success_rate"] is None
+    assert result["by_type"] == {}
+
+
+def test_format_compliance_metrics_zero_repair_denominator_is_none():
+    """A measured task with format errors but no repair attempt yields a defined
+    compliance rate (0.0) but a None self-repair rate (empty denominator)."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"no_matching_candidate": 1},
+                "format_error_total": 1,
+                "format_repair_attempts": 0,
+                "format_repair_successes": 0,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["tasks_measured"] == 1
+    assert overall["format_compliance_rate"] == 0.0
+    assert overall["repair_attempts"] == 0
+    assert overall["self_repair_success_rate"] is None
+
+
+def test_format_compliance_metrics_empty_list():
+    """An empty terminal-task list returns an empty/None-rate structure."""
+    result = compute_format_compliance_metrics([])
+    assert result["overall"]["tasks_measured"] == 0
+    assert result["overall"]["format_compliance_rate"] is None
+    assert result["overall"]["self_repair_success_rate"] is None
+    assert result["by_type"] == {}

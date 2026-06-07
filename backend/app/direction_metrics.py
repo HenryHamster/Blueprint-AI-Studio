@@ -73,17 +73,26 @@ def proof_weighted_merged(entry: dict) -> float:
     no ``acceptance_merged_write_total`` key, so the proof state is unknown and the
     raw verified count is returned unchanged (the same legacy gate the acceptance-
     metric invariant guard uses). Read-only / research cycles (zero merged write
-    tasks) likewise degrade to the verified count inside :func:`_weight_merged`.
+    tasks) keep full credit, because only the verified WRITE slice is proof-weighted.
     """
     verified = verified_merged_count(entry)
     if "acceptance_merged_write_total" not in entry:
         return float(verified)
+    if "acceptance_verified_write_merged" not in entry:
+        return _weight_merged(
+            verified,
+            int(entry.get("acceptance_merged_write_total") or 0),
+            proven_merged_count(entry),
+            int(entry.get("acceptance_declared_merged") or 0),
+        )
+    verified_write = int(entry.get("acceptance_verified_write_merged") or 0)
+    read_only_verified = max(0, verified - verified_write)
     return _weight_merged(
-        verified,
+        verified_write,
         int(entry.get("acceptance_merged_write_total") or 0),
         proven_merged_count(entry),
         int(entry.get("acceptance_declared_merged") or 0),
-    )
+    ) + read_only_verified
 
 
 def _agg_proof_weighted_merged(agg: dict) -> float:
@@ -102,16 +111,30 @@ def _agg_proof_weighted_merged(agg: dict) -> float:
     if "total_acceptance_merged_write_total" not in agg:
         return float(total_verified)
     acc_verified = int(agg.get("total_acceptance_verified_merged") or 0)
-    # Pre-contract verified merges keep full credit; only the acceptance-aware
-    # slice is weighted. Clamp so a stale/partial aggregate can't go negative.
+    if "total_acceptance_verified_write_merged" not in agg:
+        # Legacy aggregate: no write/read-only split was persisted yet.
+        legacy_verified = max(0, total_verified - acc_verified)
+        weighted_acc = _weight_merged(
+            acc_verified,
+            int(agg.get("total_acceptance_merged_write_total") or 0),
+            int(agg.get("total_acceptance_proven_merged") or 0),
+            int(agg.get("total_acceptance_declared_merged") or 0),
+        )
+        return legacy_verified + weighted_acc
+    acc_verified_write = int(agg.get("total_acceptance_verified_write_merged") or 0)
+    # Pre-contract verified merges keep full credit; within the acceptance-aware
+    # slice, read-only verified merges also keep full credit and only the verified
+    # WRITE slice is proof-weighted. Clamp so stale/partial aggregates cannot go
+    # negative.
     legacy_verified = max(0, total_verified - acc_verified)
-    weighted_acc = _weight_merged(
-        acc_verified,
+    read_only_verified = max(0, acc_verified - acc_verified_write)
+    weighted_write = _weight_merged(
+        acc_verified_write,
         int(agg.get("total_acceptance_merged_write_total") or 0),
         int(agg.get("total_acceptance_proven_merged") or 0),
         int(agg.get("total_acceptance_declared_merged") or 0),
     )
-    return legacy_verified + weighted_acc
+    return legacy_verified + read_only_verified + weighted_write
 
 
 _HISTORY_AGG_DEFAULTS = {
@@ -157,10 +180,13 @@ _HISTORY_AGG_DEFAULTS = {
     # _agg_proof_weighted_merged and are never retro-penalized.
     #   * total_acceptance_verified_merged — verified merges from acceptance-aware
     #     cycles (the universe _agg_proof_weighted_merged partitions and weights).
+    #   * total_acceptance_verified_write_merged — the verified WRITE slice within
+    #     that acceptance-aware universe; this is the part that gets proof-weighted.
     # total_acceptance_proven_merged / total_acceptance_declared_merged /
     # total_acceptance_merged_write_total are folded above (shared with the
     # established acceptance-coverage consumers) and reused here.
     "total_acceptance_verified_merged": 0,
+    "total_acceptance_verified_write_merged": 0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -473,10 +499,15 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         # denominator). Pre-contract entries lack the key and contribute nothing
         # here, so their verified merges stay outside the proof-weighted slice and
         # keep full credit. proven / declared / merged_write_total are folded above
-        # (shared with the established acceptance-coverage consumers); only the
-        # acceptance-aware verified slice is new to the proof-weighting path.
+        # (shared with the established acceptance-coverage consumers); the
+        # acceptance-aware verified slice is split into write vs read-only so only
+        # the WRITE subset is proof-weighted.
         if "acceptance_merged_write_total" in ev:
             agg["total_acceptance_verified_merged"] += verified_merged_count(ev)
+            agg["total_acceptance_verified_write_merged"] += ev.get(
+                "acceptance_verified_write_merged",
+                0,
+            )
         agg["total_generalized_successes"] += _entry_generalized_successes(ev)
         agg["total_generalized_terminal_outcomes"] += (
             _entry_generalized_terminal_outcomes(ev)

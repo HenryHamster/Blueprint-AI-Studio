@@ -227,6 +227,7 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
     coverage = entry.get("acceptance_declaration_coverage")
     if "acceptance_merged_write_total" in entry:
         merged_write = int(entry.get("acceptance_merged_write_total") or 0)
+        verified_write = int(entry.get("acceptance_verified_write_merged") or 0)
         if declared > merged_write:
             violations.append(
                 f"declared ({declared}) exceeds merged-write ({merged_write})"
@@ -234,6 +235,15 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
         if merged_write > prs_merged:
             violations.append(
                 f"merged-write ({merged_write}) exceeds prs_merged ({prs_merged})"
+            )
+        if verified_write > merged_write:
+            violations.append(
+                "verified-write "
+                f"({verified_write}) exceeds merged-write ({merged_write})"
+            )
+        if verified_write > verified:
+            violations.append(
+                f"verified-write ({verified_write}) exceeds verified ({verified})"
             )
         if merged_write <= 0:
             if coverage is not None:
@@ -471,6 +481,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "acceptance_merged_write_total": {
         "consumer": "digest_direction_progress.py + strategic_spawning.py (coverage denominator), direction_metrics.py (total_acceptance_merged_write_total)"
     },
+    "acceptance_verified_write_merged": {
+        "consumer": "direction_metrics.py (proof_weighted_merged / _agg_proof_weighted_merged write-slice weighting)"
+    },
     "acceptance_declaration_coverage": {
         "consumer": "digest_direction_progress.py (per-cycle + lifetime coverage surface), strategic_spawning.py"
     },
@@ -507,6 +520,24 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "outcome_kind_breakdown": {
         "consumer": "digest_direction_progress.py, direction_metrics.py, DirectionCard.tsx"
+    },
+    # --- Structured-output format-compliance (equipping direction d-46468a41) ---
+    # Per-cycle copies of the windowed digest measure
+    # (digest_metrics.compute_format_compliance_metrics, surfaced as the
+    # admin_digest "format_compliance" key). Both are built straight from the
+    # extraction layer's own parse verdict, so they are non-gameable. The live
+    # decision/operator surface today is the windowed digest measure; these
+    # per-direction copies are emitted for a future strategic/operator reader and
+    # carry no consumer yet, so they are declared pending (not consumer).
+    "format_compliance_rate": {
+        "status": "pending",
+        "reason": "per-cycle well-formed-output rate over child tasks' format_compliance_summary; live decision surface is the windowed digest measure compute_format_compliance_metrics (digest_metrics.py -> routers/admin_digest.py 'format_compliance'). Per-direction copy awaits a strategic/operator reader",
+        "date": "2026-06-07",
+    },
+    "self_repair_success_rate": {
+        "status": "pending",
+        "reason": "per-cycle self-repair success rate (Σ successes / Σ attempts) over child tasks' format_compliance_summary; live decision surface is the windowed digest measure compute_format_compliance_metrics (digest_metrics.py -> routers/admin_digest.py 'format_compliance'). Per-direction copy awaits a strategic/operator reader",
+        "date": "2026-06-07",
     },
     # --- Review-quality signals ---
     "reviews_dismissed": {
@@ -795,6 +826,9 @@ async def _update_direction_research_outcomes(
     # producing types that can carry an acceptance declaration) so read-only
     # children never dilute the coverage denominator.
     #
+    #   * acceptance_verified_write_merged — verified merged WRITE tasks only.
+    #     This is the write-only slice used by proof_weighted_merged so read-only
+    #     merged work keeps full credit instead of being tier-weighted.
     #   * acceptance_proven_merged — merges machine-checked PROVEN: a satisfied
     #     named_test that ran green under a real merge-test verdict and exercises
     #     a changed production seam (acceptance_is_proven). A soft
@@ -813,6 +847,14 @@ async def _update_direction_research_outcomes(
         for ct in _merged_rows
         if (ct.first_payload or {}).get("type") in WRITE_TASK_TYPES
     ]
+    entry["acceptance_verified_write_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if merge_verification_status(ct) != "unverified_degraded"
+        and not acceptance_blocks_success(
+            (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        )
+    )
     entry["acceptance_proven_merged"] = sum(
         1
         for ct in _merged_write_rows
@@ -916,6 +958,18 @@ async def _update_direction_research_outcomes(
     )
     if _outcome_kind_counts:
         entry["outcome_kind_breakdown"] = _outcome_kind_counts
+    # Structured-output format-compliance for this cycle's child tasks. Reuses
+    # the same windowed aggregator the digest measure uses (the extraction
+    # layer's own parse verdict is ground truth, so neither rate is gameable).
+    # Tasks with a NULL format_compliance_summary are skipped. None when no
+    # child task carried the telemetry.
+    from app.digest_metrics import (  # noqa: PLC0415
+        compute_format_compliance_metrics,
+    )
+
+    _fc_overall = compute_format_compliance_metrics(child_tasks_rows)["overall"]
+    entry["format_compliance_rate"] = _fc_overall["format_compliance_rate"]
+    entry["self_repair_success_rate"] = _fc_overall["self_repair_success_rate"]
     # Review quality signals: track how users respond to Blueprint's reviews
     entry["reviews_dismissed"] = sum(
         1

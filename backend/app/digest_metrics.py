@@ -229,6 +229,93 @@ def _compute_first_attempt_breakdowns(
     }
 
 
+def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
+    """Roll a list of tasks' ``format_compliance_summary`` into one count+rate block.
+
+    Tasks whose ``format_compliance_summary`` is NULL/missing or not a dict are
+    skipped (fail-safe neutral — older agents leave it NULL). ``format_error_total``
+    is the extraction layer's count of unparseable FINAL outputs (a "format miss");
+    a task is *well-formed* when that count is zero. Self-repair counts are the
+    focused re-ask attempts after a miss and how many of them parsed.
+    """
+    measured = 0
+    well_formed = 0
+    error_total = 0
+    repair_attempts = 0
+    repair_successes = 0
+    for t in tasks:
+        summary = getattr(t, "format_compliance_summary", None)
+        if not isinstance(summary, dict):
+            continue
+        measured += 1
+        e = int(summary.get("format_error_total") or 0)
+        a = int(summary.get("format_repair_attempts") or 0)
+        s = int(summary.get("format_repair_successes") or 0)
+        error_total += e
+        repair_attempts += a
+        repair_successes += s
+        if e == 0:
+            well_formed += 1
+    return {
+        "tasks_measured": measured,
+        "well_formed_tasks": well_formed,
+        # Per-case well-formed rate (Aider's percent_cases_well_formed): the
+        # share of measured tasks that produced no unparseable final output.
+        "format_compliance_rate": round(well_formed / measured, 3)
+        if measured
+        else None,
+        "format_error_total": error_total,
+        "repair_attempts": repair_attempts,
+        "repair_successes": repair_successes,
+        # Share of self-repair re-asks that produced a parseable output. None
+        # (not 0) when no repair was ever attempted — an empty denominator.
+        "self_repair_success_rate": round(repair_successes / repair_attempts, 3)
+        if repair_attempts
+        else None,
+    }
+
+
+def compute_format_compliance_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
+    """Windowed structured-output format-compliance + self-repair-success measure.
+
+    Pure function — no database calls. Aggregates the per-task
+    ``format_compliance_summary`` JSONB (written by the ``/heartbeat`` endpoint
+    from the agent's structured-output extraction-layer telemetry) into a
+    windowed pipeline measure, overall and grouped by task type. The caller
+    passes a pre-windowed terminal-task list, mirroring
+    ``_compute_first_attempt_breakdowns`` / ``compute_failure_grouping``.
+
+    The measure reports two rates that Aider's edit leaderboard treats as
+    SEPARATE axes from task success (knowledge doc 5c6a2b4c — "evaluate format
+    adherence and task success as separate axes"; percent_cases_well_formed):
+      * ``format_compliance_rate`` — share of measured tasks whose structured
+        output was well-formed (``format_error_total == 0``), i.e. no unparseable
+        final output was observed.
+      * ``self_repair_success_rate`` — share of self-repair attempts that then
+        produced a parseable output (Σ successes / Σ attempts) (knowledge doc
+        6f14116c — format-error self-correction).
+
+    The counts come straight from the extraction layer's own parse verdict
+    (ground truth), so neither rate is gameable by the agent's self-report.
+    Tasks with a NULL/missing ``format_compliance_summary`` are not counted.
+
+    Returns ``{"overall": <block>, "by_type": {<task type>: <block>}}`` where
+    each block is the dict produced by ``_accumulate_format_compliance``.
+    """
+    overall = _accumulate_format_compliance(terminal_tasks)
+    by_type_groups: Dict[str, list] = {}
+    for t in terminal_tasks:
+        if not isinstance(getattr(t, "format_compliance_summary", None), dict):
+            continue
+        task_type = (t.first_payload or {}).get("type", "create")
+        by_type_groups.setdefault(task_type, []).append(t)
+    by_type = {
+        task_type: _accumulate_format_compliance(tasks)
+        for task_type, tasks in by_type_groups.items()
+    }
+    return {"overall": overall, "by_type": by_type}
+
+
 def _compute_first_review_approval_breakdowns(
     terminal_tasks: List[Task],
 ) -> Dict[str, Any]:

@@ -1735,6 +1735,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   resetCheckSynthesizerState();
   // Per-task LLM call/token telemetry (efficiency direction d-91d8dede).
   resetLlmTelemetry();
+  // Per-task structured-output format-compliance telemetry (equipping d-46468a41).
+  resetFormatComplianceTelemetry();
   // Structured provider-run error report. enrichStatusPayload already guards
   // attachment by task_id, but clear between roles anyway so a warm role can
   // never observe the prior role's run report through the getter.
@@ -1807,6 +1809,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
+        ...getFormatComplianceTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
@@ -1862,6 +1865,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
+        ...getFormatComplianceTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
@@ -1892,6 +1896,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               tool_trace: retryToolTrace,
               ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
               ...getLlmTelemetry(),
+              ...getFormatComplianceTelemetry(),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
             traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
@@ -1980,6 +1985,7 @@ export function sendHeartbeatSync(
       status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
       metrics,
       ...getLlmTelemetry(),
+      ...getFormatComplianceTelemetry(),
       ...(extras || {}),
     });
     execFileSync('curl', [
@@ -2594,6 +2600,11 @@ import {
   recordLlmTokens,
   getLlmTelemetry,
   resetLlmTelemetry,
+  recordFormatMiss,
+  recordFormatRepairAttempt,
+  recordFormatRepairSuccess,
+  getFormatComplianceTelemetry,
+  resetFormatComplianceTelemetry,
   estimateTokensFromChars,
 } from './telemetry.js';
 export {
@@ -2605,6 +2616,11 @@ export {
   recordLlmTokens,
   getLlmTelemetry,
   resetLlmTelemetry,
+  recordFormatMiss,
+  recordFormatRepairAttempt,
+  recordFormatRepairSuccess,
+  getFormatComplianceTelemetry,
+  resetFormatComplianceTelemetry,
   estimateTokensFromChars,
 };
 
