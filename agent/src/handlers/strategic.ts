@@ -37,6 +37,8 @@ import {
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
   buildPortfolioComposition,
+  buildAvailableCapabilitiesSection,
+  CAPABILITY_DECLARATION_DOC,
 } from './research-plan.js';
 import {
   buildSystemMaturitySection,
@@ -76,6 +78,19 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
  * (not in strategic-sections.ts) so it does not have to be threaded through that
  * module's exhaustive vi.mock in strategic.test.ts.
  */
+/**
+ * Render the shared capability vocabulary section (canonical registry names +
+ * statuses) followed by the uniform provides_capability / prerequisite
+ * declaration guidance, so the strategist declares cross-lane capability refs
+ * from the SAME registry namespace research, plan, and design use. Returns ''
+ * when no capabilities are available so the prompt is unchanged.
+ */
+export function buildStrategicAvailableCapabilitiesSection(caps: unknown): string {
+  const section = buildAvailableCapabilitiesSection(caps);
+  if (!section) return '';
+  return `${section}${CAPABILITY_DECLARATION_DOC}\n`;
+}
+
 export function buildStagedDirectionsSection(staged: Array<Record<string, unknown>>): string {
   if (!Array.isArray(staged) || staged.length === 0) return '';
   const lines = staged.map(d => {
@@ -578,6 +593,12 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
+      // Shared capability vocabulary + uniform provides_capability / prerequisite
+      // declaration guidance, so the strategist draws cross-lane capability refs
+      // from the same registry namespace every other task type uses.
+      availableCapabilitiesSection: buildStrategicAvailableCapabilitiesSection(
+        payload.available_capabilities,
+      ),
     });
 
     // Append the backend-supplied prompt_suffix as "Additional instructions"

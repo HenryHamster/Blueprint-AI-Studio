@@ -37,6 +37,7 @@ from app.blocked_need_resolution import (
     completed_foundation_for_need,
     resolve_blocked_need,
 )
+from app.capability_registry import normalize_capability_name
 from app.database import resolve_dialect_name
 from app.finding_deduplication import normalize_prerequisite
 from app.landed_signal import has_merge_unblock_signal
@@ -401,7 +402,10 @@ async def fetch_missing_demand_for_spawn(
         return {"total": 0, "demands": []}
 
 
-def missing_demand_prompt_hint(demand: Optional[Dict[str, Any]]) -> Optional[str]:
+def missing_demand_prompt_hint(
+    demand: Optional[Dict[str, Any]],
+    registry_names: Optional[List[str]] = None,
+) -> Optional[str]:
     """Build an advisory prompt suffix describing missing-foundation demand.
 
     Returns ``None`` when there is no demand so callers omit the hint (and the
@@ -410,16 +414,30 @@ def missing_demand_prompt_hint(demand: Optional[Dict[str, Any]]) -> Optional[str
     OR record an explicit retirement of the stranded dependents — without
     prescribing either. The top :data:`_HINT_ENTRY_LIMIT` demands are named inline;
     the full bounded list rides along in the ``missing_capability_demand`` field.
+
+    ``registry_names`` is the optional strategist-curated capability vocabulary
+    (canonical kebab-case names from ``problem_model.capabilities``). When a
+    capability demand ref corresponds to a registry capability (its normalized
+    form matches a registry name), the CANONICAL registry name is shown instead of
+    the consumer's free-prose label, so producers and consumers converge on one
+    string over time. Omitted/None leaves today's label-preferred behavior.
     """
     if not demand:
         return None
     demands = demand.get("demands") or []
     if not demands:
         return None
+    registry_set = {n for n in (registry_names or []) if isinstance(n, str)}
     lines: List[str] = []
     for entry in demands[:_HINT_ENTRY_LIMIT]:
         ref = entry.get("label") or entry.get("ref") or "(unnamed)"
         kind = entry.get("kind") or "capability"
+        # Vocabulary convergence: when this capability demand maps onto a curated
+        # registry capability, name it by its canonical registry name.
+        if kind == "capability" and registry_set:
+            _canonical = normalize_capability_name(entry.get("ref"))
+            if _canonical and _canonical in registry_set:
+                ref = _canonical
         dependent_count = entry.get("dependent_count", 0)
         still_blocked = entry.get("still_blocked", 0)
         already_cancelled = entry.get("already_cancelled", 0)

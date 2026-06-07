@@ -1236,6 +1236,47 @@ export function buildCapabilityVerificationSection(
   return vlines.join('\n') + '\n\n';
 }
 
+/**
+ * Renders the shared "AVAILABLE CAPABILITIES" vocabulary section from the
+ * backend-supplied `available_capabilities` payload field. This is the SINGLE
+ * shared namespace both producers (a `provides_capability` stamp) and consumers
+ * (a `prerequisite` capability ref) draw from, so they converge on the same
+ * string instead of inventing divergent free prose that the EXACT (non-fuzzy)
+ * matcher can never bridge.
+ *
+ * Each entry is `{name, status?}` where `name` is a canonical kebab-case
+ * capability name from `problem_model.capabilities` and `status` is its declared
+ * working/partial/planned state. Rendered uniformly across research, plan,
+ * strategic, and design prompts. Returns '' when the field is absent/empty so
+ * existing prompts are byte-for-byte unchanged.
+ */
+export function buildAvailableCapabilitiesSection(caps: unknown): string {
+  if (!Array.isArray(caps) || caps.length === 0) return '';
+  const lines: string[] = [];
+  for (const c of caps) {
+    if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+    const rec = c as Record<string, unknown>;
+    const name = strVal(rec.name);
+    if (!name) continue;
+    const status = strVal(rec.status);
+    lines.push(status ? `- \`${name}\` (${status})` : `- \`${name}\``);
+  }
+  if (lines.length === 0) return '';
+  return [
+    '# AVAILABLE CAPABILITIES (shared vocabulary)',
+    'These are the project\'s canonical capability names — the strategist-curated registry (`problem_model.capabilities`). It is the SHARED VOCABULARY for cross-lane prerequisites: when you declare a `prerequisite` capability ref OR a `provides_capability` stamp, DRAW THE NAME FROM THIS LIST so producers and consumers converge on the SAME string (the matcher is EXACT, never fuzzy). Propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed here.',
+    ...lines,
+  ].join('\n') + '\n\n';
+}
+
+// Shared, uniform documentation of the capability-declaration framework, embedded
+// identically in the research, plan, strategic, and design prompts so EVERY task
+// type participates in the same vocabulary (not research special-casing). Frames
+// both the producer stamp and the consumer ref as drawn from AVAILABLE CAPABILITIES.
+export const CAPABILITY_DECLARATION_DOC = [
+  '**Shared capability vocabulary (applies to this and every other task type):** you may declare a `provides_capability` stamp (a capability your work ADVERTISES) and/or a `prerequisite` capability ref (a capability your work DEPENDS ON). BOTH must be drawn from the AVAILABLE CAPABILITIES list above when one fits — the registry is the shared namespace, and the resolver matches EXACTLY (no fuzzy matching), so a free-prose name a different lane will never reproduce leaves the dependency stranded. Use the SAME kebab-case convention and propose a NEW name ONLY for a genuinely new capability absent from the list. An off-registry ref is still accepted (never rejected) and flagged advisory for the strategist to fold into the registry.',
+].join('\n');
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1289,6 +1330,11 @@ export async function handlePlan(
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const cochangeHintsSection = formatCochangeHints(task.direction_context as Record<string, unknown> | undefined);
   const decompositionOutcomesSection = formatDecompositionOutcomes(task.direction_context as Record<string, unknown> | undefined);
+  // Shared capability vocabulary — the canonical registry names a subtask draws
+  // its prerequisite / provides_capability refs from (additive; '' when absent).
+  const planAvailableCapabilitiesSection = buildAvailableCapabilitiesSection(
+    payload.available_capabilities,
+  );
 
   // Greenfield mode: when the cloned tree has effectively no source (only
   // config/scaffolding), the plan agent must NOT treat absent code as "nothing
@@ -1306,7 +1352,7 @@ Do NOT treat absent source as "nothing to decompose". This is a first-class boot
 Task to decompose:
 ${prompt}
 ${greenfieldBranch}
-Instructions:
+${planAvailableCapabilitiesSection}Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.${isGreenfield ? ' (On a greenfield repo there is little to read — lean on the project goal and design-doc specs to decide the foundation.)' : ''}
 2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
 3. Identify dependencies between subtasks — which must complete before others can start.
@@ -1326,7 +1372,9 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "risk": "low",
       "type": "create",
       "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)",
-      "acceptance_evidence": { "kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar" }
+      "acceptance_evidence": { "kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar" },
+      "prerequisite": null,
+      "provides_capability": null
     },
     {
       "title": "feat: second subtask",
@@ -1375,6 +1423,8 @@ Rules:
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs.
 - EMPIRICAL PREREQUISITE (optional, additive): besides the implementation subtypes above, a plan MAY emit a measurement prerequisite subtask of type="compute_experiment" when a later subtask should "measure this first, then act on the verdict". It does NOT produce a PR — it launches a budgeted, auto-torn-down compute job and persists a durable MEASURED VERDICT as knowledge. It carries a launch contract: "command" (the experiment to run), a positive "spend_cap_usd", a positive "deadline_seconds", and an OPTIONAL "success_criterion": {"metric", "operator", "threshold"}. A later implementation subtask consumes the verdict by naming this subtask's index in its depends_on_indices — it is handed the experiment's knowledge at launch. A MEASURED NEGATIVE result (success_criterion honestly missed) is still consumable evidence: the dependent still runs and acts on the verdict. Only a BROKEN run that produced no usable verdict cancels the dependent follow-on work.
 - acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
+- prerequisite (OPTIONAL, default null): a FOUNDATION this subtask depends on that is built OUTSIDE this plan (another lane / an already-built capability). Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` or \`{"kind": "capability", "ref": "<capability-name>"}\`. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to whichever task advertises it (the matcher is EXACT). Use depends_on_indices — NOT prerequisite — to order subtasks WITHIN this plan; prerequisite is only for cross-lane/cross-plan foundations.
+- provides_capability (OPTIONAL, default null): a short kebab-case capability name THIS subtask advertises so another lane's prerequisite \`{"kind": "capability", "ref": "<name>"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability. ${CAPABILITY_DECLARATION_DOC}
 - ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds/changes tables or columns, that SAME subtask must also generate the Alembic migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject). Set the subtask's type="migrate" and include in its related_files the model file(s) (backend/app/models.py), the new Alembic file (backend/alembic/versions/...), and backend/app/main.py for EXPECTED_SCHEMA_REVISION. The migration agent will handle Alembic generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
@@ -1771,6 +1821,11 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
   const capabilityVerificationSection = buildCapabilityVerificationSection(
     payload.capability_verification as Record<string, Record<string, unknown>> | undefined,
   );
+  // Shared capability vocabulary — the canonical registry names a finding draws
+  // its prerequisite / provides_capability refs from (additive; '' when absent).
+  const researchAvailableCapabilitiesSection = buildAvailableCapabilitiesSection(
+    payload.available_capabilities,
+  );
 
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
@@ -1812,7 +1867,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 # CODEBASE CONTEXT
 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
-${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}# DIRECTIONS
+${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
@@ -1960,11 +2015,11 @@ implementation findings. Add metadata alongside them when relevant.
 
 **sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
 
-**prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
+**prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to the registry's canonical string (the matcher is EXACT, never fuzzy). When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
 
 **compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Omit entirely on non-experiment findings.
 
-**provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
+**provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 
 **acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact", "descriptor": "short human-readable proof", "selector": "optional test path/selector or artifact ref"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
 

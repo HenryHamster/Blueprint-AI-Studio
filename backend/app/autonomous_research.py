@@ -59,6 +59,10 @@ from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
+from app.capability_registry import (
+    registry_capability_names,
+    registry_capability_vocabulary,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1816,6 +1820,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             research_payload["system_verification"] = system_verification
         if capability_verification:
             research_payload["capability_verification"] = capability_verification
+        # Surface the strategist-curated capability vocabulary (canonical names +
+        # statuses) so the research agent declares prerequisite / provides_capability
+        # refs from the SAME shared namespace consumers draw from. Additive and
+        # optional: omitted on the empty path, older agents ignore it and still
+        # validate.
+        _available_capabilities = registry_capability_vocabulary(
+            project.problem_model
+        )
+        if _available_capabilities:
+            research_payload["available_capabilities"] = _available_capabilities
         if chosen_direction and chosen_direction.get("category") == "product":
             append_prompt_suffix(
                 research_payload,
@@ -1909,7 +1923,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
         if _missing_demand.get("demands"):
             research_payload["missing_capability_demand"] = _missing_demand
-            _demand_hint = missing_demand_prompt_hint(_missing_demand)
+            _demand_hint = missing_demand_prompt_hint(
+                _missing_demand,
+                registry_names=registry_capability_names(project.problem_model),
+            )
             if _demand_hint:
                 append_prompt_suffix(research_payload, _demand_hint)
         # Compact, body-omitted index of existing knowledge documents

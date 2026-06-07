@@ -38,6 +38,7 @@ from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
 from datetime import datetime, timezone
+from app.capability_registry import derive_provider_marker
 from app.time_utils import _utcnow
 from app.vm_cost_rates import get_vm_rate_per_second
 
@@ -83,6 +84,17 @@ _TASK_BANKED_LLM_INPUT_TOKENS_KEY = "llm_input_tokens_banked"
 _TASK_BANKED_LLM_OUTPUT_TOKENS_KEY = "llm_output_tokens_banked"
 _TASK_BANKED_LLM_CALL_COUNT_KEY = "llm_call_count_banked"
 _TASK_ATTEMPT_HISTORY_KEY = "attempt_history"
+
+
+def _coerce_provider_context_values(raw: object) -> list[str]:
+    values: list[str] = []
+    if isinstance(raw, str) and raw.strip():
+        values.append(raw.strip())
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                values.append(item.strip())
+    return values
 
 
 class ProjectStatus(str, Enum):
@@ -2006,6 +2018,37 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
                 emit_task_revived_notify(session, str(instance.id))
     except Exception as exc:  # noqa: BLE001 — never block the flush
         logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
+
+
+@event.listens_for(Task, "before_insert")
+def _stamp_task_provider_floor(mapper, connection, target: Task):
+    """Persist the namespaced provider floor marker onto every new task.
+
+    The matcher layer also derives this marker on the fly, but stamping it into
+    ``context['provides_capability']`` ensures persisted rows are never silent
+    non-providers and keeps future read paths JSONB-compatible without extra
+    task-type wiring. Fail-open by construction: a stamp failure must never
+    abort the insert.
+    """
+    try:
+        derived = derive_provider_marker(target)
+        if not derived:
+            return
+        existing_ctx = target.context if isinstance(target.context, dict) else {}
+        # Treat EITHER accepted marker key as already-providing.  If the task
+        # already advertises an explicit capability via `provides_capability` OR
+        # `capability`, leave the stored value completely untouched — the floor
+        # must never clobber or augment an explicit stamp.
+        already_provides = _coerce_provider_context_values(
+            existing_ctx.get("provides_capability")
+        ) or _coerce_provider_context_values(existing_ctx.get("capability"))
+        if already_provides:
+            return
+        new_ctx = dict(existing_ctx)
+        new_ctx["provides_capability"] = derived
+        target.context = new_ctx
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning("[MODELS] before_insert provider-floor stamp failed: %s", exc)
 
 
 @event.listens_for(Task.status, "set")

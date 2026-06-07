@@ -107,6 +107,13 @@ export interface ThinkerPromptParams {
   versionPhaseSection: string;
   memoCitationsSection: string;
   efficiencySnapshotSection: string;
+  /**
+   * Shared capability vocabulary section (canonical registry names + statuses)
+   * plus the uniform provides_capability / prerequisite declaration guidance.
+   * Built from the strategic payload's `available_capabilities` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  availableCapabilitiesSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -173,7 +180,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 

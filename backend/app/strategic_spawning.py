@@ -42,6 +42,10 @@ from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
+from app.capability_registry import (
+    registry_capability_names,
+    registry_capability_vocabulary,
+)
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.problem_model import compute_model_size_signal, parse_problem_model
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
@@ -2148,6 +2152,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # under budget rather than trimming. Actionable: the strategist can open a
     # foundation direction or record an explicit retirement.
     "missing_capability_demand": {"priority": "medium"},
+    # Shared capability vocabulary (canonical registry name + status) the strategist
+    # draws prerequisite / provides_capability refs from. Small and bounded; medium
+    # priority so it survives typical pressure but degrades before load-bearing state.
+    "available_capabilities": {"priority": "medium"},
 }
 
 
@@ -2192,6 +2200,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
     # whole under budget; full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
+    "available_capabilities": {"priority": "medium"},
 }
 
 
@@ -3244,9 +3254,13 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Read-only, fail-open, additive: included only when demand is non-empty.
     _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
     _missing_demand_present = bool(_missing_demand.get("demands"))
+    _dd_registry_names = registry_capability_names(project.problem_model)
     _missing_demand_hint = (
-        missing_demand_prompt_hint(_missing_demand) if _missing_demand_present else None
+        missing_demand_prompt_hint(_missing_demand, registry_names=_dd_registry_names)
+        if _missing_demand_present
+        else None
     )
+    _dd_available_capabilities = registry_capability_vocabulary(project.problem_model)
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
@@ -3266,6 +3280,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 else {}
             ),
             **({"prompt_suffix": _missing_demand_hint} if _missing_demand_hint else {}),
+            **(
+                {"available_capabilities": _dd_available_capabilities}
+                if _dd_available_capabilities
+                else {}
+            ),
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
                 **verification_kwargs,
@@ -4937,8 +4956,12 @@ async def _spawn_strategic_review(
     # the advisory hint is appended to the cycle prompt_suffix.
     _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
     _missing_demand_present = bool(_missing_demand.get("demands"))
+    _sr_registry_names = registry_capability_names(project.problem_model)
+    _sr_available_capabilities = registry_capability_vocabulary(project.problem_model)
     if _missing_demand_present:
-        _missing_demand_hint = missing_demand_prompt_hint(_missing_demand)
+        _missing_demand_hint = missing_demand_prompt_hint(
+            _missing_demand, registry_names=_sr_registry_names
+        )
         if _missing_demand_hint:
             prompt_suffix = (
                 f"{prompt_suffix}\n{_missing_demand_hint}"
@@ -5107,6 +5130,11 @@ async def _spawn_strategic_review(
             **(
                 {"missing_capability_demand": _missing_demand}
                 if _missing_demand_present
+                else {}
+            ),
+            **(
+                {"available_capabilities": _sr_available_capabilities}
+                if _sr_available_capabilities
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

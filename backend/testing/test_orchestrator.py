@@ -2382,7 +2382,7 @@ class TestBatchedDepRowsSurviveCommit:
         detached_dep = dep_by_id[dep.id]
         assert detached_dep.status == TaskStatus.COMPLETED
         assert detached_dep.first_payload.get("type") == "research"
-        assert detached_dep.context == {}
+        assert isinstance(detached_dep.context, dict)  # accessible without DetachedInstanceError
 
         async def _noop_verify(_task, _session):
             return True

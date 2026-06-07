@@ -21,6 +21,7 @@ import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
 } from '../json-extract.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { buildAvailableCapabilitiesSection, CAPABILITY_DECLARATION_DOC } from './research-plan.js';
 
 // Reads the design progress markdown the agent writes for retry context.
 // Mirrors readWebResearchProgress but for the design kind. Returns the content
@@ -170,12 +171,22 @@ export async function handleDesign(
   }
   const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
 
+  // Shared capability vocabulary — the canonical registry names the design should
+  // reference (and the uniform provides_capability / prerequisite framing every
+  // task type shares). Additive: '' when the payload carries no capabilities.
+  const designVocabSection = buildAvailableCapabilitiesSection(
+    payload.available_capabilities,
+  );
+  const designAvailableCapabilitiesSection = designVocabSection
+    ? `${designVocabSection}${CAPABILITY_DECLARATION_DOC}\n\n`
+    : '';
+
   const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Design question:
 ${prompt}
 
-${priorKnowledgeSection}# HOW TO DESIGN
+${priorKnowledgeSection}${designAvailableCapabilitiesSection}# HOW TO DESIGN
 1. Explore the codebase THOROUGHLY — read the real modules, types, and call sites relevant to the question. Use subagents for parallel exploration.
 2. Ground every design decision in what the code ACTUALLY does today. Reference concrete files and symbols; do not invent structure that isn't there.
 3. Propose a concrete, reviewable design: the components involved, how they interact, the data/contract shapes, the trade-offs, and the migration/rollout path where relevant.

@@ -14,7 +14,9 @@ from app.blocked_need_resolution import (
     need_satisfied_by_completed,
     resolve_blocked_need,
 )
+from app.capability_registry import derive_provider_marker, registry_capability_names
 from app.models import Task, TaskStatus
+from app.problem_model import Capability, ProblemModel
 
 
 def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
@@ -166,6 +168,40 @@ def test_capability_resolves_on_marker_in_list():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "auth-tokens"}  # case-insensitive
     assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_floor_stamped_provider_resolves_without_false_match():
+    foundation = _task(
+        title="Build seeded evaluation harness",
+        payloads=[{"type": "plan"}],
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    floor_marker = derive_provider_marker(foundation)
+
+    assert floor_marker is not None
+    assert resolve_blocked_need(
+        blocked, {"kind": "capability", "ref": floor_marker}, [foundation]
+    ) is foundation
+    assert resolve_blocked_need(
+        blocked,
+        {"kind": "capability", "ref": "seeded-evaluation-harness"},
+        [foundation],
+    ) is None
+
+
+def test_registry_capability_names_canonicalize_problem_model_names():
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="Seeded evaluation harness", status="working"),
+            Capability(name="seeded-evaluation-harness", status="planned"),
+            Capability(name=" PR Promotion ", status="partial"),
+        ]
+    )
+
+    assert registry_capability_names(model) == [
+        "seeded-evaluation-harness",
+        "pr-promotion",
+    ]
 
 
 def test_capability_ambiguous_resolves_to_canonical():

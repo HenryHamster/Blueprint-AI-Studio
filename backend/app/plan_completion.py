@@ -12,6 +12,10 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.capability_registry import (
+    off_registry_capability_refs,
+    registry_capability_names,
+)
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -19,6 +23,7 @@ from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
 )
 from app.depends_on_provenance import remember_structural_depends_on
+from app.finding_deduplication import normalize_prerequisite
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import (
     parse_acceptance_evidence,
@@ -678,6 +683,12 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         else set()
     )
 
+    # Strategist-curated capability vocabulary for soft, fail-open off-registry
+    # flagging of a subtask's declared prerequisite / provides_capability refs.
+    _plan_registry_names = registry_capability_names(
+        getattr(project, "problem_model", None)
+    )
+
     child_tasks = []
     for i, subtask_def in enumerate(subtasks):
         # Gate the child type on the registry-derived plan-subtask allowlist
@@ -788,6 +799,32 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             and i in _parent_evidence_targets
         ):
             subtask_acceptance_evidence = _parent_payload_evidence
+        # Shared-vocabulary capability declarations: carry a subtask's declared
+        # provides_capability stamp and normalize its prerequisite onto the child
+        # context exactly as research_completion does for findings, so a plan
+        # subtask participates in the same cross-lane capability framework. The
+        # floor marker (derive_provider_marker) still rides alongside these via
+        # compose_capability_markers — they coexist, never overwrite. Off-registry
+        # refs are flagged advisory (never dropped); matchers stay exact.
+        _child_provides = subtask_def.get("provides_capability") or subtask_def.get(
+            "capability"
+        )
+        _child_provides = (
+            _child_provides.strip()
+            if isinstance(_child_provides, str) and _child_provides.strip()
+            else None
+        )
+        _child_prereq = normalize_prerequisite(
+            subtask_def.get("prerequisite") or subtask_def.get("requires")
+        )
+        _child_cap_refs: List[str] = []
+        if _child_provides:
+            _child_cap_refs.append(_child_provides)
+        if _child_prereq is not None and _child_prereq.get("kind") == "capability":
+            _child_cap_refs.append(_child_prereq["ref"])
+        _child_off_registry = off_registry_capability_refs(
+            _child_cap_refs, _plan_registry_names
+        )
         if subtask_type == "compute_experiment":
             compute_contract = _author_compute_launch_contract(subtask_def)
             child_payload = validate_internal_payload(
@@ -868,6 +905,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 **(
                     {"research_task_id": parent_research_task_id}
                     if parent_research_task_id
+                    else {}
+                ),
+                **({"provides_capability": _child_provides} if _child_provides else {}),
+                **({"prerequisite": _child_prereq} if _child_prereq else {}),
+                **(
+                    {"off_registry_capabilities": _child_off_registry}
+                    if _child_off_registry
                     else {}
                 ),
                 **(

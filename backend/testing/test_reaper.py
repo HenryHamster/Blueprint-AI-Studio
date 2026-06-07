@@ -24,6 +24,7 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select as _select
 
+from app.capability_registry import derive_provider_marker
 from app.models import (
     Alert,
     AlertSeverity,
@@ -8284,6 +8285,67 @@ async def test_unblock_sweep_resolves_capability_marker_need_into_dep_edge(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resolves_floor_stamped_capability_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A non-research task's persisted floor marker resolves a blocked need.
+
+    The insert listener must stamp the derived namespaced provider marker into
+    context so future exact-match consumers can depend on any task type without
+    per-path wiring.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id,
+        title="build schema models foundation",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "plan"}],
+        context={},
+        status_log=[],
+    )
+    floor_marker = derive_provider_marker(foundation)
+    assert floor_marker is not None
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    assert floor_marker in (
+        [foundation.context["provides_capability"]]
+        if isinstance(foundation.context.get("provides_capability"), str)
+        else foundation.context.get("provides_capability", [])
+    )
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the exact foundation task",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": floor_marker,
+                "reason": "BLOCKER: needs the exact foundation task",
+                "need": {"kind": "capability", "ref": floor_marker},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_resolves_legacy_capability_description_need_into_dep_edge(
     reaper_db, mocker
 ):
@@ -11386,3 +11448,211 @@ async def test_migration_slot_contention_sweep_silent_with_no_waiters(reaper_db,
 
     created = await _rs.sweep_migration_slot_contention(reaper_db)
     assert created == 0
+
+
+# ── event_driven_unblock_dependents ──────────────────────────────────────────
+
+from app.reaper_sweeps import event_driven_unblock_dependents  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_landing_event_resumes_blocked_dependent_immediately(reaper_db, mocker):
+    """A BLOCKED dependent whose capability need is satisfied by a just-landed
+    foundation is immediately resumed to QUEUED by event_driven_unblock_dependents
+    — without waiting for the next periodic sweep."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation: COMPLETED and carries the merge-unblock signal.
+    foundation = Task(
+        project_id=project.id,
+        title="build auth layer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "auth-layer"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    # Dependent: BLOCKED waiting on the capability "auth-layer".
+    # recheck_after is in the future — the periodic sweep would NOT pick this up.
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),  # not yet due for the sweep
+    )
+
+    # The periodic sweep would NOT pick this up (recheck_after is in the future).
+    # The event-driven path must resume it immediately.
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 1
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.QUEUED
+    assert "blocker" not in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_skips_without_merge_signal(reaper_db, mocker):
+    """If the foundation is COMPLETED but has NO merge-unblock signal, the
+    event-driven path returns 0 and leaves the dependent BLOCKED."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation: COMPLETED but NO pr_merged signal.
+    foundation = Task(
+        project_id=project.id,
+        title="incomplete foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "auth-layer"},  # no pr_merged
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_no_match_leaves_dependent_blocked(reaper_db, mocker):
+    """A foundation that does NOT provide the needed capability leaves the
+    dependent BLOCKED (no false-positive resume)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation provides a DIFFERENT capability.
+    foundation = Task(
+        project_id=project.id,
+        title="unrelated foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "database-schema"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
+    """An exception inside the disposition logic is swallowed; the function
+    returns 0 rather than propagating the error (fail-open guarantee)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    foundation = Task(
+        project_id=project.id,
+        title="error-prone foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "some-cap"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs some-cap",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "some-cap",
+                "reason": "BLOCKER: needs some-cap",
+                "need": {"kind": "capability", "ref": "some-cap"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    # Inject a failure into _classify_blocker_needs to simulate an unexpected error.
+    import app.reaper_sweeps as _rs_mod
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("simulated classification error")
+
+    monkeypatch.setattr(_rs_mod, "_classify_blocker_needs", _raise)
+
+    # Must not raise; must return 0.
+    result = await event_driven_unblock_dependents(foundation, reaper_db)
+    assert result == 0

@@ -1744,6 +1744,113 @@ async def sweep_unblock_blocked_tasks(
     return requeued
 
 
+async def event_driven_unblock_dependents(
+    landed_task: "Task",
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Fast-path event-driven re-resolution of BLOCKED dependents when a foundation lands.
+
+    Called immediately after a task commits to COMPLETED + merge-unblock signal.
+    Scans same-project BLOCKED dependents with machine-resolvable needs and
+    resumes any whose needs are now satisfied by the just-landed foundation.
+
+    Fail-open: any per-task error is swallowed and logged; the function never
+    propagates an exception to its caller. Bounded: scans at most ``batch_size``
+    BLOCKED rows per call. Idempotent alongside the periodic sweep: uses
+    ``FOR UPDATE SKIP LOCKED`` so a row being evaluated by the sweep is skipped
+    here, and vice versa.
+
+    Returns the number of tasks resumed (0 on error or no-match).
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.landed_signal import has_merge_unblock_signal
+    from app.task_blocked import get_blocker_needs
+
+    if not has_merge_unblock_signal(landed_task):
+        return 0
+
+    now = _utcnow()
+
+    # Fetch BLOCKED dependents in the same project; skip-lock for sweep parity.
+    due_stmt = (
+        select(Task)
+        .where(
+            Task.status == TaskStatus.BLOCKED,
+            Task.project_id == landed_task.project_id,
+        )
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    candidates = (await session.execute(due_stmt)).scalars().all()
+    if not candidates:
+        return 0
+
+    requeued = 0
+    changed = False
+    pending_broadcasts: list[tuple[str, dict]] = []
+    candidate_cache: dict = {}
+    completed_cache: dict = {}
+    dead_cache: dict = {}
+
+    for task in candidates:
+        # Skip tasks with no machine-resolvable needs; the sweep handles those.
+        if not get_blocker_needs(task):
+            continue
+        ctx = task.context or {}
+        parked = bool(ctx.get("_blocked_escalated"))
+        try:
+            disp = await _classify_blocker_needs(
+                task,
+                session,
+                candidate_cache=candidate_cache,
+                completed_cache=completed_cache,
+                dead_cache=dead_cache,
+            )
+            if not disp["had_needs"]:
+                continue
+            outcome = await _apply_needs_disposition(
+                task,
+                ctx,
+                session,
+                now,
+                disp,
+                completed_cache=completed_cache,
+                pending_broadcasts=pending_broadcasts,
+                parked=parked,
+            )
+            if outcome == "resumed":
+                requeued += 1
+                changed = True
+            elif outcome in ("cancelled", "held"):
+                changed = True
+        except Exception:
+            logger.exception(
+                "[REAPER] event_driven_unblock_dependents failed for task %s — skipping",
+                task.id,
+            )
+
+    if changed:
+        await session.commit()
+    for project_id, payload in pending_broadcasts:
+        try:
+            await _bcast(project_id, "task_updated", payload)
+        except Exception:
+            logger.debug(
+                "[REAPER] event-driven unblock broadcast failed for %s",
+                payload.get("task_id"),
+                exc_info=True,
+            )
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock: landing of %s unblocked %d dependent(s) → QUEUED",
+            landed_task.id,
+            requeued,
+        )
+    return requeued
+
+
 # ── Step 13: staged-direction auto-activation backstop ─────────────────────
 #
 # A "staged" direction (status="staged", staged_for_version=N) is inert work

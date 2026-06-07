@@ -94,6 +94,8 @@ import {
   buildEfficiencySnapshotSection,
   buildEmptyRepoGuidance,
   buildCapabilityVerificationSection,
+  buildAvailableCapabilitiesSection,
+  CAPABILITY_DECLARATION_DOC,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -1152,6 +1154,54 @@ describe('buildCapabilityVerificationSection', () => {
     expect(section).toContain('**cap-partial**');
     expect(section).toContain('Verified');
     expect(section).toContain('**cap-verified**');
+  });
+});
+
+describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
+  it('returns empty string when the field is absent or empty', () => {
+    expect(buildAvailableCapabilitiesSection(undefined)).toBe('');
+    expect(buildAvailableCapabilitiesSection([])).toBe('');
+  });
+
+  it('renders canonical names with statuses and the draw-from-registry framing', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working' },
+      { name: 'seeded-eval-harness', status: 'planned' },
+    ]);
+    // Header + the load-bearing "shared vocabulary" / draw-from-list framing.
+    expect(section).toContain('AVAILABLE CAPABILITIES');
+    expect(section).toContain('shared vocabulary');
+    expect(section).toMatch(/DRAW THE NAME FROM THIS LIST/);
+    // Canonical names and their statuses both render.
+    expect(section).toContain('`payment-core`');
+    expect(section).toContain('(working)');
+    expect(section).toContain('`seeded-eval-harness`');
+    expect(section).toContain('(planned)');
+    // The matcher is framed as exact, never fuzzy.
+    expect(section).toContain('EXACT');
+  });
+
+  it('renders a name without status when status is omitted, and skips blank entries', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'auth-core' },
+      { name: '' },
+      { status: 'working' } as Record<string, unknown>,
+    ]);
+    expect(section).toContain('`auth-core`');
+    // No status parens for the status-less entry on its own line.
+    expect(section).toMatch(/- `auth-core`\n/);
+  });
+});
+
+describe('CAPABILITY_DECLARATION_DOC (uniform across task types)', () => {
+  it('documents both the provides_capability stamp and the prerequisite ref drawn from the registry', () => {
+    expect(CAPABILITY_DECLARATION_DOC).toContain('provides_capability');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('prerequisite');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('AVAILABLE CAPABILITIES');
+    // Applies to every task type, not research special-casing.
+    expect(CAPABILITY_DECLARATION_DOC).toContain('every other task type');
+    // Off-registry refs are accepted (advisory), never rejected.
+    expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
   });
 });
 
@@ -2297,6 +2347,57 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('deadline_seconds');
     // Optional machine-checkable success criterion.
     expect(p).toContain('success_criterion');
+  });
+
+  // ── shared capability vocabulary (research + plan, uniform) ──────────────────
+  // Both research and plan must render the AVAILABLE CAPABILITIES vocabulary from
+  // the new payload field and document provides_capability / prerequisite as
+  // drawn from the registry — a capability framework ALL task types share.
+  const VOCAB_PAYLOAD = {
+    base_branch: 'main',
+    prompt: 'analyze the codebase',
+    available_capabilities: [
+      { name: 'seeded-eval-harness', status: 'working' },
+      { name: 'payment-core', status: 'planned' },
+    ],
+  };
+
+  it('handlePlan renders the AVAILABLE CAPABILITIES vocabulary from the payload field', async () => {
+    await handlePlan(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('AVAILABLE CAPABILITIES');
+    expect(p).toContain('`seeded-eval-harness`');
+    expect(p).toContain('shared vocabulary');
+  });
+
+  it('handlePlan documents provides_capability AND prerequisite drawn from the registry on plan subtasks', async () => {
+    await handlePlan(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The plan subtask schema now carries both fields (today it emitted only depends_on_indices).
+    expect(p).toContain('"provides_capability"');
+    expect(p).toContain('"prerequisite"');
+    // And documents drawing the name from the vocabulary, plan-side (not research-only).
+    expect(p).toContain('DRAW THE NAME from the AVAILABLE CAPABILITIES');
+    expect(p).toContain('every other task type');
+  });
+
+  it('handleResearch renders the AVAILABLE CAPABILITIES vocabulary and draws finding declarations from it', async () => {
+    await handleResearch(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('AVAILABLE CAPABILITIES');
+    expect(p).toContain('`payment-core`');
+    // provides_capability / prerequisite docs reference the vocabulary.
+    expect(p).toContain('provides_capability');
+    expect(p).toContain('DRAW THE NAME from the AVAILABLE CAPABILITIES');
+  });
+
+  it('omits the rendered vocabulary section when the payload has no capabilities (back-compat)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The rendered list section (with its "shared vocabulary" header framing) is
+    // absent — the field-doc rules may still REFERENCE the vocabulary, but no
+    // capability list is injected when none were supplied.
+    expect(p).not.toContain('# AVAILABLE CAPABILITIES (shared vocabulary)');
   });
 });
 

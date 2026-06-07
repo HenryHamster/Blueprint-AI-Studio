@@ -27,6 +27,7 @@ from app.research_completion import (
     _DOWNGRADED_VERIFICATION_BASIS,
     _HIGH_EVIDENCE_BASES,
     VALID_VERIFICATION_BASES,
+    _annotate_capability_declarations,
     _apply_structural_actionability_downgrade,
     _handle_research_completion,
     _reconcile_verification_basis,
@@ -34,6 +35,7 @@ from app.research_completion import (
     _research_findings_would_spawn,
     _summarize_ungrounded_claims_grounded,
 )
+from app.finding_deduplication import resolve_prerequisite_task
 from app.task_evaluators import (
     QUALITY_GRADER_SOURCE_KEY,
     QUALITY_GRADER_VERDICT_KEY,
@@ -5247,3 +5249,84 @@ class TestAcceptanceEvidencePropagation:
             "kind": "behavior",
             "descriptor": "endpoint scopes audit to the open candidate",
         }
+
+
+# ── Shared capability vocabulary: off-registry advisory marking ───────────────
+# A declared prerequisite / provides_capability capability ref that is NOT in the
+# strategist-curated problem_model.capabilities registry must be FLAGGED ADVISORY
+# and carried through — never rejected or dropped — and must still resolve EXACTLY
+# against any provider that advertises it (matchers stay exact, no fuzzy matching).
+
+
+def test_off_registry_capability_ref_marked_advisory_not_rejected():
+    registry_names = ["payment-core"]  # the only curated capability
+    findings = [
+        # Consumer naming an off-registry capability as a prerequisite.
+        {
+            "title": "consumer off-registry",
+            "prerequisite": {"kind": "capability", "ref": "seeded-eval-harness"},
+        },
+        # Producer advertising an off-registry capability.
+        {
+            "title": "producer off-registry",
+            "provides_capability": "seeded-eval-harness",
+        },
+        # Consumer naming an ON-registry capability (different casing/spacing that
+        # normalizes onto the canonical registry name) — must NOT be flagged.
+        {
+            "title": "consumer on-registry",
+            "prerequisite": {"kind": "capability", "ref": "Payment Core"},
+        },
+    ]
+
+    _annotate_capability_declarations(findings, registry_names)
+
+    # The off-registry declarations are PRESERVED, not dropped.
+    assert findings[0]["_prerequisite"] == {
+        "kind": "capability",
+        "ref": "seeded-eval-harness",
+    }
+    assert findings[1]["_provides_capability"] == "seeded-eval-harness"
+    # ... and each is flagged with the advisory off-registry marker.
+    assert findings[0]["_off_registry_capabilities"] == ["seeded-eval-harness"]
+    assert findings[1]["_off_registry_capabilities"] == ["seeded-eval-harness"]
+
+    # The on-registry ref normalizes onto a registry name → NOT flagged advisory,
+    # but still carried through normalized.
+    assert findings[2]["_prerequisite"] == {"kind": "capability", "ref": "Payment Core"}
+    assert "_off_registry_capabilities" not in findings[2]
+
+    # The off-registry prerequisite STILL resolves EXACTLY against a provider that
+    # advertises the same marker — the advisory flag never breaks resolution.
+    provider = _Task(
+        id=uuid.uuid4(),
+        title="provider",
+        context={"provides_capability": "seeded-eval-harness"},
+    )
+    resolved = resolve_prerequisite_task(findings[0]["_prerequisite"], [provider])
+    assert resolved is provider
+
+    # A provider advertising a DIFFERENT capability does not satisfy it (exact only).
+    other = _Task(
+        id=uuid.uuid4(),
+        title="other",
+        context={"provides_capability": "payment-core"},
+    )
+    assert resolve_prerequisite_task(findings[0]["_prerequisite"], [other]) is None
+
+
+def test_annotate_capability_declarations_clears_stale_markers_and_skips_non_dicts():
+    """Re-annotating drops a stale advisory marker once the registry catches up,
+    and non-dict finding entries are skipped without raising."""
+    findings = [
+        {
+            "title": "now on-registry",
+            "provides_capability": "seeded-eval-harness",
+            "_off_registry_capabilities": ["seeded-eval-harness"],  # stale
+        },
+        "not-a-dict",
+    ]
+    # Registry now contains the capability → the stale marker must be cleared.
+    _annotate_capability_declarations(findings, ["seeded-eval-harness"])
+    assert "_off_registry_capabilities" not in findings[0]
+    assert findings[0]["_provides_capability"] == "seeded-eval-harness"

@@ -65,6 +65,11 @@ from app.finding_deduplication import (
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
+from app.capability_registry import (
+    off_registry_capability_refs,
+    registry_capability_names,
+    registry_capability_vocabulary,
+)
 from app.payload_schemas import (
     parse_acceptance_evidence,
     read_acceptance_evidence,
@@ -442,6 +447,58 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
                 except json.JSONDecodeError:
                     pass
     return None
+
+
+def _annotate_capability_declarations(
+    findings: List[Dict[str, Any]], registry_names: List[str]
+) -> None:
+    """Normalize each finding's capability declarations and softly flag off-registry refs.
+
+    For every finding this:
+
+      * normalizes an optional declared ``prerequisite`` (machine-resolvable
+        ``{kind, ref}`` need) onto ``_prerequisite`` — malformed/unknown-kind
+        declarations are dropped so only explicit references ever drive an edge;
+      * carries an explicit ``provides_capability`` string onto
+        ``_provides_capability`` so a sibling finding can structurally depend on it.
+
+    It then attaches a SOFT, FAIL-OPEN advisory marker: any declared capability ref
+    (the ``provides_capability`` stamp, or a ``{kind: capability}`` prerequisite ref)
+    that is NOT in ``problem_model.capabilities`` (``registry_names``) is recorded on
+    ``_off_registry_capabilities`` so the strategist can fold it into the shared
+    vocabulary. The off-registry ref is NEVER rejected or dropped — it still
+    resolves EXACTLY against any provider that advertises it (matchers stay exact);
+    the marker is purely informational. Mutates ``findings`` in place.
+    """
+    for _f in findings:
+        if not isinstance(_f, dict):
+            continue
+        _prereq_raw = _f.get("prerequisite") or _f.get("requires")
+        _prereq = normalize_prerequisite(_prereq_raw)
+        if _prereq is not None:
+            _f["_prerequisite"] = _prereq
+        else:
+            _f.pop("_prerequisite", None)
+        # An explicit capability a finding's task advertises, so a sibling
+        # finding declaring {kind:capability, ref:<name>} can structurally
+        # depend on it (intra-batch foundation sharing). Explicit string only.
+        _cap = _f.get("provides_capability") or _f.get("capability")
+        if isinstance(_cap, str) and _cap.strip():
+            _f["_provides_capability"] = _cap.strip()
+        else:
+            _f.pop("_provides_capability", None)
+        # Soft, fail-open vocabulary convergence: flag (never drop) any declared
+        # capability ref absent from the strategist-curated registry.
+        _cap_refs: List[str] = []
+        if _f.get("_provides_capability"):
+            _cap_refs.append(_f["_provides_capability"])
+        if _prereq is not None and _prereq.get("kind") == "capability":
+            _cap_refs.append(_prereq["ref"])
+        _off = off_registry_capability_refs(_cap_refs, registry_names)
+        if _off:
+            _f["_off_registry_capabilities"] = _off
+        else:
+            _f.pop("_off_registry_capabilities", None)
 
 
 async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
@@ -1092,6 +1149,13 @@ _NON_SPAWNING_FINDING_TYPES = frozenset(
 # scores as success instead of shipped-but-unproven.
 _REPRODUCE_VERDICT_FINDING_TYPES = frozenset({"bug"})
 
+# Child task types whose agent handler renders the shared capability vocabulary
+# (research/plan via research-plan.ts, design via design.ts). The additive,
+# optional ``available_capabilities`` payload field is injected only for these
+# read-only planning/knowledge children — implementation children (create/fix/
+# refactor) do not render it, so the field is omitted to keep their payload lean.
+_VOCAB_RENDERING_TASK_TYPES = frozenset({"plan", "research", "design"})
+
 
 def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
     """True if at least one finding would spawn downstream implementation work.
@@ -1514,25 +1578,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # and ungrounded-claim signals already in hand (no new I/O).
         _reconcile_verification_basis(_f, _broken_provenance, _ungrounded)
 
-    # Normalize an optional declared prerequisite (machine-resolvable {kind, ref}
-    # need) onto each finding. A finding may name an in-flight foundation task or
-    # a named capability it depends on; malformed/unknown-kind declarations are
-    # dropped so only explicit references ever drive a dependency edge later.
-    for _f in findings:
-        _prereq_raw = _f.get("prerequisite") or _f.get("requires")
-        _prereq = normalize_prerequisite(_prereq_raw)
-        if _prereq is not None:
-            _f["_prerequisite"] = _prereq
-        else:
-            _f.pop("_prerequisite", None)
-        # An explicit capability a finding's task advertises, so a sibling
-        # finding declaring {kind:capability, ref:<name>} can structurally
-        # depend on it (intra-batch foundation sharing). Explicit string only.
-        _cap = _f.get("provides_capability") or _f.get("capability")
-        if isinstance(_cap, str) and _cap.strip():
-            _f["_provides_capability"] = _cap.strip()
-        else:
-            _f.pop("_provides_capability", None)
+    # Normalize each finding's declared prerequisite / provides_capability and
+    # softly flag any off-registry capability ref (advisory — never rejected; the
+    # ref still resolves EXACTLY against any provider that advertises it). The
+    # registry is the strategist-curated problem_model.capabilities vocabulary.
+    _registry_names = registry_capability_names(
+        getattr(project_obj, "problem_model", None)
+    )
+    # The agent-facing capability vocabulary (canonical name + status) surfaced
+    # into read-only planning/knowledge child payloads below so producers and
+    # consumers draw declared capabilities from the SAME shared namespace.
+    _registry_vocab = registry_capability_vocabulary(
+        getattr(project_obj, "problem_model", None)
+    )
+    _annotate_capability_declarations(findings, _registry_names)
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 
@@ -3163,6 +3222,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         if _finding_acceptance_evidence
                         else {}
                     ),
+                    # Additive, optional shared-vocabulary field: the canonical
+                    # registry capability names (with statuses) the planning /
+                    # knowledge handlers render so the child draws prerequisite /
+                    # provides_capability refs from the same namespace. Older
+                    # agents ignore the field and still validate.
+                    **(
+                        {"available_capabilities": _registry_vocab}
+                        if _registry_vocab
+                        and task_type in _VOCAB_RENDERING_TASK_TYPES
+                        else {}
+                    ),
                 },
                 f"research_completion:finding:{task_type}",
             )
@@ -3207,6 +3277,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"provides_capability": finding["_provides_capability"]}
                     if finding.get("_provides_capability")
+                    else {}
+                ),
+                **(
+                    {"off_registry_capabilities": finding["_off_registry_capabilities"]}
+                    if finding.get("_off_registry_capabilities")
                     else {}
                 ),
                 **(
