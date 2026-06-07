@@ -128,6 +128,42 @@ build {
     destination = "/opt/agent/package-lock.json"
   }
 
+  # Upload the backend deps build context (Dockerfile + requirements.txt) so the
+  # next shell provisioner can bake the expensive `deps` stage into the VM's
+  # local docker store. The `deps` stage only COPYs requirements.txt, so these
+  # two files are the entire context it needs — no full backend tree required.
+  provisioner "file" {
+    source      = "../../backend/Dockerfile"
+    destination = "/tmp/backend-deps-ctx/Dockerfile"
+  }
+
+  provisioner "file" {
+    source      = "../../backend/requirements.txt"
+    destination = "/tmp/backend-deps-ctx/requirements.txt"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "# Bake the backend test image's `deps` stage (apt shellcheck + ~37 pip",
+      "# packages) into the VM's local docker store, keyed by the SAME reqhash",
+      "# scheme scripts/test-backend.sh + CI use:",
+      "#   sha256(requirements.txt + Dockerfile)[:16].",
+      "# On a fresh agent VM this stage costs 1-19 min of `docker build` per test",
+      "# run; baking it here makes scripts/test-backend.sh's local fast path a",
+      "# zero-build `docker image inspect` hit. python:3.11-slim (the FROM base)",
+      "# was pre-pulled above, so no base pull is needed here. The image persists",
+      "# into booted instances via /var/lib/docker exactly like the postgres:15",
+      "# and python:3.11-slim pre-pulls above (proven pattern).",
+      "REQHASH=$(cat /tmp/backend-deps-ctx/requirements.txt /tmp/backend-deps-ctx/Dockerfile | sha256sum | cut -c1-16)",
+      "echo \"backend deps reqhash: $REQHASH\"",
+      "sudo docker build --target deps -t \"blueprint-backend-test-deps:$REQHASH\" /tmp/backend-deps-ctx && echo PACKER_BACKEND_DEPS_IMAGE_OK",
+      "# Verify the reqhash-tagged image is resolvable locally — the exact lookup",
+      "# scripts/test-backend.sh's local fast path performs (docker image inspect).",
+      "sudo docker image inspect \"blueprint-backend-test-deps:$REQHASH\" >/dev/null && echo PACKER_BACKEND_DEPS_INSPECT_OK",
+      "sudo rm -rf /tmp/backend-deps-ctx"
+    ]
+  }
+
   provisioner "shell" {
     inline = [
       "sudo useradd -m -s /bin/bash agent",
