@@ -38,6 +38,7 @@ from app.knowledge_query import (
 )
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
+from app.autonomous_research import project_parallelism_cap
 from app.reaper import _heartbeat_stale_cutoff
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.payload_schemas import _MAX_PAYLOAD_BYTES
@@ -702,7 +703,9 @@ async def get_autonomy_debug(
         )
 
     # Guard 4: research_task_active — parallel-research cap (now matches spawn logic)
-    max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
+    max_parallel = project_parallelism_cap(
+        project, "max_parallel_research", "max_parallel_research_per_project", 3
+    )
     if active_research_count >= max_parallel:
         blocking_guards.append(
             {
@@ -728,7 +731,9 @@ async def get_autonomy_debug(
     tasks_this_hour = sum(
         1 for t in recent_tasks if (t.first_payload).get("type") == "research"
     )
-    max_per_hour = _runtime_config.get("max_autonomous_tasks_per_hour", 5)
+    max_per_hour = project_parallelism_cap(
+        project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 5
+    )
     if tasks_this_hour >= max_per_hour:
         blocking_guards.append(
             {

@@ -1311,6 +1311,25 @@ def test_override_merge_preserves_existing_requires_ci_checks_true():
     assert merged["requires_ci_checks"] is True
 
 
+def test_override_merge_preserves_parallelism_caps():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    # Repo detection never emits the per-project parallelism caps; stored
+    # values must carry forward so re-detect does not silently lift a throttle.
+    detected = {"language": "python", "directories": []}
+    merged = apply_operator_build_config_overrides(
+        detected,
+        {
+            "max_parallel_research": 2,
+            "max_total_research": 4,
+            "max_autonomous_tasks_per_hour": 8,
+        },
+    )
+    assert merged["max_parallel_research"] == 2
+    assert merged["max_total_research"] == 4
+    assert merged["max_autonomous_tasks_per_hour"] == 8
+
+
 # ── Acceptance probe: classify_merge_test_verdict (detected=false fall-open) ──
 def test_classify_verdict_probe_fail_blocks_with_output():
     # A clear acceptance-probe failure on a no-suite fall-open flips the

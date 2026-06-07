@@ -52,6 +52,12 @@ export interface BuildConfig {
    *  `requires_ci_checks` is turned off); `null`/undefined = undetected/legacy. Read-only:
    *  detection + guidance only, never auto-flips `requires_ci_checks`. */
   has_ci?: boolean | null;
+  /** Per-project parallelism overrides (1..50). Undefined/null = use the global
+   *  runtime settings (`max_parallel_research_per_project`,
+   *  `max_total_research_per_project`, `max_autonomous_tasks_per_hour`). */
+  max_parallel_research?: number | null;
+  max_total_research?: number | null;
+  max_autonomous_tasks_per_hour?: number | null;
 }
 
 export interface StagingBranchPrefixesConfig {

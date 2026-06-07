@@ -1434,6 +1434,139 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
         _runtime_config["max_parallel_research_per_project"] = old_val
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. Per-project parallelism overrides (build_config caps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_project_parallelism_cap_override_resolution():
+    """A positive-int build_config override wins; bool/zero/str/absent fall back to the global."""
+    from app.autonomous_research import project_parallelism_cap
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_val = _runtime_config.get("max_parallel_research_per_project", 2)
+    _runtime_config["max_parallel_research_per_project"] = 4
+    try:
+        project = Project(name="Cap Resolution", user_id="test-user-123")
+
+        def _cap() -> int:
+            return project_parallelism_cap(
+                project,
+                "max_parallel_research",
+                "max_parallel_research_per_project",
+                3,
+            )
+
+        project.build_config = {"max_parallel_research": 2}
+        assert _cap() == 2
+        # bool is an int subclass but is NOT a valid cap
+        project.build_config = {"max_parallel_research": True}
+        assert _cap() == 4
+        for invalid in (0, -1, "2", None):
+            project.build_config = {"max_parallel_research": invalid}
+            assert _cap() == 4
+        project.build_config = None
+        assert _cap() == 4
+    finally:
+        _runtime_config["max_parallel_research_per_project"] = old_val
+
+
+@pytest.mark.asyncio
+async def test_project_override_caps_parallel_research_below_global(db_session):
+    """build_config max_parallel_research=1 throttles the project even when the global allows more."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_val = _runtime_config.get("max_parallel_research_per_project", 2)
+    _runtime_config["max_parallel_research_per_project"] = 5
+    try:
+        project = Project(
+            name="Per-Project Throttle",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-ppthrt1")],
+            vision={"purpose": "test"},
+            build_config={"max_parallel_research": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        existing = Task(
+            project_id=project.id,
+            title="Research: existing",
+            payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(existing)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        research = [
+            t
+            for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 1, (
+            "Project override must throttle below the permissive global cap"
+        )
+    finally:
+        _runtime_config["max_parallel_research_per_project"] = old_val
+
+
+@pytest.mark.asyncio
+async def test_project_override_lifts_parallel_cap_above_global(db_session):
+    """build_config max_parallel_research=2 wins over a global cap of 1 (override wins both ways)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_val = _runtime_config.get("max_parallel_research_per_project", 2)
+    _runtime_config["max_parallel_research_per_project"] = 1
+    try:
+        project = Project(
+            name="Per-Project Lift",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-pplift1")],
+            vision={"purpose": "test"},
+            build_config={"max_parallel_research": 2},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        existing = Task(
+            project_id=project.id,
+            title="Research: existing",
+            payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(existing)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        research = [
+            t
+            for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 2, (
+            "Override above the global cap must allow the second spawn"
+        )
+    finally:
+        _runtime_config["max_parallel_research_per_project"] = old_val
+
+
 @pytest.mark.asyncio
 async def test_evaluating_blocks_direction_when_recent(db_session):
     """A recent EVALUATING research task blocks new research on the same direction."""

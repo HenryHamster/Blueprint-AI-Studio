@@ -493,6 +493,18 @@ class BuildConfig(BaseModel):
     # Round-tripped unchanged through detect/save/PATCH so an operator-supplied
     # build_config.migration actually reaches the agent's claim response.
     migration: MigrationConfig | None = None
+    # Per-project parallelism overrides. None means "use the global runtime
+    # settings" (``max_parallel_research_per_project``,
+    # ``max_total_research_per_project``, ``max_autonomous_tasks_per_hour``
+    # respectively). Set on a project to throttle it independently of the
+    # fleet — e.g. a trial-run project on an external repo sharing VM
+    # capacity with Blueprint's own pipeline. Bounds mirror the
+    # admin-settings validation for the corresponding global knobs. Resolved
+    # at spawn time by ``autonomous_research.project_parallelism_cap`` and
+    # carried across re-detect by ``apply_operator_build_config_overrides``.
+    max_parallel_research: int | None = Field(None, ge=1, le=50)
+    max_total_research: int | None = Field(None, ge=1, le=50)
+    max_autonomous_tasks_per_hour: int | None = Field(None, ge=1, le=50)
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"
