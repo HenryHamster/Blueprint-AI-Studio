@@ -4882,6 +4882,111 @@ async def test_version_phase_includes_recent_versions(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_recent_versions_use_aggregate_pending_truth(
+    db_session, mocker, _lts_split_active
+):
+    """A backend-confirmed promotion stays unshipped in the strategist payload
+    while another required artifact is still unconfirmed."""
+    from app import release_artifacts as artifact_registry
+    from app.models import ReleaseDeployArtifact, ReleaseVersion
+    from app.release_artifacts import (
+        BACKEND_REVISION_ARTIFACT_KIND,
+        ReleaseArtifactProvider,
+    )
+
+    await _ensure_releaseversion_table(db_session)
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=2),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        qualification_attempts=0,
+        last_qualification=None,
+    )
+    db_session.add_all([closed, open_v])
+    await db_session.commit()
+    await db_session.refresh(closed)
+
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=closed.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier="abc123def456",
+                served_at=now - timedelta(days=2),
+            ),
+            ReleaseDeployArtifact(
+                version_id=closed.id,
+                artifact_kind="synthetic_required",
+                serving_status="unconfirmed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+
+    recent = (payload.get("version_phase") or {}).get("recent_versions") or []
+    assert recent, "recent_versions should include the promoted version"
+    latest = recent[0]
+    artifacts = {entry["artifact_kind"]: entry for entry in latest["artifacts"]}
+    assert latest["serving_status"] == "unconfirmed"
+    assert latest["qualification_state"]["state"] == "promoted_unconfirmed"
+    assert artifacts["synthetic_required"]["serving_status"] == "unconfirmed"
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "NOT yet confirmed serving" in suffix, suffix
+    assert "synthetic_required" in suffix, suffix
+
+
+@pytest.mark.asyncio
 async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     """Version-phase LTS context is active only when the resolver sees distinct branches."""
     await _ensure_releaseversion_table(db_session)
@@ -6800,6 +6905,119 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     assert ds["open_status"] == "open"
     assert ds["tasks_merged_unpromoted"] >= 1
     assert ds["automain_ahead_of_main"] is True
+
+
+@pytest.mark.asyncio
+async def test_deployment_state_and_failed_directive_use_aggregate_failed_truth(
+    db_session, mocker, _lts_split_active
+):
+    """A required non-backend artifact failure must keep the strategist in
+    deploy-failed mode even when the backend artifact is serving_confirmed."""
+    from app import release_artifacts as artifact_registry
+    from app.models import ReleaseDeployArtifact, ReleaseVersion
+    from app.release_artifacts import (
+        BACKEND_REVISION_ARTIFACT_KIND,
+        ReleaseArtifactProvider,
+    )
+
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "not_promoted", "confidence": 0.75},
+        qualification_attempts=1,
+    )
+    db_session.add_all([failed_version, current_version])
+    await db_session.commit()
+    await db_session.refresh(failed_version)
+
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=failed_version.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier="abc123def456",
+                served_at=now - timedelta(hours=3),
+            ),
+            ReleaseDeployArtifact(
+                version_id=failed_version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+
+    deployment_state = payload.get("deployment_state") or {}
+    assert deployment_state["deployed_sha"] is None
+    assert deployment_state["promoted_serving_status"] == "deploy_failed"
+    assert (
+        deployment_state["promoted_deploy_failure_reason"]
+        == "synthetic_deadline_elapsed"
+    )
+    assert "synthetic_required" in (deployment_state["promoted_artifact_gap"] or "")
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "deployment crisis" in suffix.lower(), suffix
+    assert "synthetic_required" in suffix, suffix
 
 
 @pytest.mark.asyncio

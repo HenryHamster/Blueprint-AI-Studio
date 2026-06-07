@@ -11,6 +11,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8074,6 +8075,289 @@ class TestVersionLifecycleInfraFailureFields:
         assert current["qualification_state"]["state"] == "promotion_in_flight"
         assert current["qualification_state"]["promotion_pr_number"] == 7357
         assert "auto-merge is armed" in current["qualification_state"]["summary"].lower()
+
+
+class TestVersionLifecycleArtifactServingState:
+    """GET /version-lifecycle exposes aggregate artifact serving truth."""
+
+    @staticmethod
+    def _lifecycle_patches():
+        return (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_use_aggregate_pending_artifact_truth(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A backend-confirmed promotion remains aggregate-unconfirmed while a
+        required non-backend artifact is still pending."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 1, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 2, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.95},
+            serving_status="serving_confirmed",
+            served_sha="abc123def456",
+        )
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=datetime(2026, 5, 3, 0, 0, 0),
+        )
+        db_session.add_all([promoted, open_version])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        db_session.add_all(
+            [
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                    serving_status="serving_confirmed",
+                    served_identifier="abc123def456",
+                    served_at=datetime(2026, 5, 2, 0, 5, 0),
+                ),
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind="synthetic_required",
+                    serving_status="unconfirmed",
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        readiness, audit, merged = self._lifecycle_patches()
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["current_version"]["aggregate_serving_status"] is None
+        assert "artifacts" in body["current_version"]
+
+        recent = body["recent_versions"][0]
+        artifacts = {entry["artifact_kind"]: entry for entry in recent["artifacts"]}
+        assert recent["serving_status"] == "serving_confirmed"
+        assert recent["aggregate_serving_status"] == "unconfirmed"
+        assert recent["qualification_state"]["state"] == "promoted_unconfirmed"
+        assert artifacts["synthetic_required"]["serving_status"] == "unconfirmed"
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_use_aggregate_failed_artifact_truth(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A backend-confirmed promotion remains aggregate-deploy-failed while a
+        required non-backend artifact has failed."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 1, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 2, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.95},
+            serving_status="serving_confirmed",
+            served_sha="abc123def456",
+        )
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=datetime(2026, 5, 3, 0, 0, 0),
+        )
+        db_session.add_all([promoted, open_version])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        db_session.add_all(
+            [
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                    serving_status="serving_confirmed",
+                    served_identifier="abc123def456",
+                    served_at=datetime(2026, 5, 2, 0, 5, 0),
+                ),
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind="synthetic_required",
+                    serving_status="deploy_failed",
+                    reason_code="synthetic_deadline_elapsed",
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        readiness, audit, merged = self._lifecycle_patches()
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        recent = resp.json()["recent_versions"][0]
+        artifacts = {entry["artifact_kind"]: entry for entry in recent["artifacts"]}
+        assert recent["serving_status"] == "serving_confirmed"
+        assert recent["aggregate_serving_status"] == "deploy_failed"
+        assert (
+            recent["aggregate_deploy_failure_reason"]
+            == "synthetic_deadline_elapsed"
+        )
+        assert recent["qualification_state"]["state"] == "promotion_deploy_failed"
+        assert artifacts["synthetic_required"]["serving_status"] == "deploy_failed"
+        assert (
+            artifacts["synthetic_required"]["reason_code"]
+            == "synthetic_deadline_elapsed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_include_recovered_and_backend_only_compat_truth(
+        self, client: AsyncClient, db_session
+    ):
+        """Aggregate fields stay aligned with shipped truth both after recovery
+        and on the backend-only compatibility path."""
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        project = await _make_project(db_session)
+        backend_only = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 1, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 2, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.91},
+            serving_status="serving_confirmed",
+            served_sha="backendonly123",
+        )
+        recovered = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 3, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 4, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.94},
+            serving_status="serving_confirmed",
+            served_sha="recovered12345",
+        )
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="build",
+            status="open",
+            opened_at=datetime(2026, 5, 5, 0, 0, 0),
+        )
+        db_session.add_all([backend_only, recovered, open_version])
+        await db_session.commit()
+        await db_session.refresh(recovered)
+
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=recovered.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier="recovered12345",
+                served_at=datetime(2026, 5, 4, 0, 5, 0),
+            )
+        )
+        await db_session.commit()
+
+        readiness, audit, merged = self._lifecycle_patches()
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        recent = resp.json()["recent_versions"]
+        assert recent[0]["aggregate_serving_status"] == "serving_confirmed"
+        assert recent[0]["qualification_state"]["state"] == "promoted"
+        assert recent[1]["aggregate_serving_status"] == "serving_confirmed"
+        assert recent[1]["qualification_state"]["state"] == "promoted"
 
 
 class TestVersionLifecycleAuditEvidence:

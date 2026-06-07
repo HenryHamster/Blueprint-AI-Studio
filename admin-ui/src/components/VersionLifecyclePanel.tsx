@@ -14,6 +14,7 @@ import {
   type CurrentVersion,
   type LatestAudit,
   type QualificationVerdictRecord,
+  type ReleaseArtifactEvidence,
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
@@ -271,6 +272,55 @@ function ServingStatusBadge({
     );
   }
   return null;
+}
+
+// Per-artifact serving label/colour for the evidence breakdown. The backend
+// emits serving_status as serving_confirmed | deploy_failed | unconfirmed | null;
+// a confirmed artifact that follows a prior failure reads as 'recovered'.
+const ARTIFACT_STATUS_STYLE: Record<string, { cls: string; label: string }> = {
+  serving_confirmed: { cls: 'text-emerald-400', label: '✓ serving' },
+  deploy_failed: { cls: 'text-red-400', label: '⚠ failed' },
+  unconfirmed: { cls: 'text-amber-400', label: '… pending' },
+};
+
+// Per-artifact serving evidence so an operator can see WHICH registered deploy
+// artifact is pending/failed/recovered behind the aggregate headline. Renders
+// nothing for the legacy single-artifact case (or when the API omits the list),
+// so a backend-only response looks exactly as it did before this breakdown.
+function ArtifactEvidenceList({ artifacts }: { artifacts?: ReleaseArtifactEvidence[] | null }) {
+  if (!artifacts || artifacts.length <= 1) return null;
+  return (
+    <div
+      data-testid="artifact-evidence-list"
+      className="flex flex-col gap-0.5 pl-2 border-l border-neutral-700/50"
+    >
+      {artifacts.map((a) => {
+        const style =
+          ARTIFACT_STATUS_STYLE[a.serving_status ?? ''] ??
+          { cls: 'text-neutral-500', label: a.serving_status ?? 'n/a' };
+        return (
+          <div
+            key={a.artifact_kind}
+            data-testid="artifact-evidence-row"
+            data-artifact-kind={a.artifact_kind}
+            data-artifact-status={a.serving_status ?? 'none'}
+            className="flex flex-wrap items-center gap-1.5 text-[9px]"
+          >
+            <span className="font-mono text-neutral-400">{a.artifact_kind}</span>
+            {a.required && <span className="text-neutral-600 uppercase tracking-wide">required</span>}
+            <span className={`font-semibold ${style.cls}`}>{style.label}</span>
+            {a.served_identifier && (
+              <span className="font-mono text-neutral-500 truncate max-w-[160px]">{a.served_identifier}</span>
+            )}
+            {a.served_at && <span className="text-neutral-600">{timeAgo(a.served_at)}</span>}
+            {a.reason_code && (
+              <span className="text-red-300/80 truncate max-w-[180px]" title={a.reason_code}>{a.reason_code}</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // Provenance for scoped audit evidence. Shows which commit the audit ran
@@ -577,6 +627,11 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // deploy is verified or attested live. The backend endpoint is project-scoped
   // and targets the latest promoted deploy_failed version.
   const isAdmin = userRole === 'admin';
+  // The clear lever is backed by a project-scoped endpoint that still targets
+  // the latest promoted version latched to the scalar serving_status field.
+  // Keep this predicate on that same backend-owned latch; aggregate-only
+  // required-artifact failures still surface in the badges/breakdown, but the
+  // clear endpoint cannot currently recover them directly.
   const hasDeployFailed = cv?.serving_status === 'deploy_failed'
     || recent.some(v => v.serving_status === 'deploy_failed');
 
@@ -935,10 +990,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
-                    servingStatus={cv.serving_status ?? cv.qualification_state.serving_status}
+                    servingStatus={cv.aggregate_serving_status ?? cv.serving_status ?? cv.qualification_state.serving_status}
                     servedSha={cv.served_sha}
                     servedAt={cv.served_at}
-                    deployFailureReason={cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    deployFailureReason={cv.aggregate_deploy_failure_reason ?? cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
                     deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
                 </div>
@@ -951,6 +1006,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </p>
                 )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
+                <ArtifactEvidenceList artifacts={cv.artifacts} />
               </div>
             )}
             {cv.last_qualification && (
@@ -1174,24 +1230,27 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-0.5">
               {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
-                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
-                  <span className="text-neutral-500">{v.status}</span>
-                  <ServingStatusBadge
-                    servingStatus={v.serving_status ?? v.qualification_state?.serving_status}
-                    servedSha={v.served_sha}
-                    servedAt={v.served_at}
-                    deployFailureReason={v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
-                    deployConfirmDeadline={v.deploy_confirm_deadline}
-                  />
-                  <QualSummary q={v.last_qualification} />
-                  {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
-                    <span className="text-neutral-400">
-                      cut by {v.abandoned_by ?? 'unknown'}
-                      {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
-                      {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
-                    </span>
-                  )}
+                <div key={v.version_number} className="space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                    <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                    <span className="text-neutral-500">{v.status}</span>
+                    <ServingStatusBadge
+                      servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
+                      servedSha={v.served_sha}
+                      servedAt={v.served_at}
+                      deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                      deployConfirmDeadline={v.deploy_confirm_deadline}
+                    />
+                    <QualSummary q={v.last_qualification} />
+                    {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                      <span className="text-neutral-400">
+                        cut by {v.abandoned_by ?? 'unknown'}
+                        {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                        {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <ArtifactEvidenceList artifacts={v.artifacts} />
                 </div>
               ))}
             </div>

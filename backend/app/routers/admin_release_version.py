@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field as _Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import load_only, selectinload
 from sqlmodel import select
 
 from app.database import get_session
@@ -22,6 +22,7 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
+from app.release_artifacts import summarize_release_artifacts
 from app import release_version as _release_version
 
 router = APIRouter()
@@ -118,6 +119,65 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _version_serving_summary(version: ReleaseVersion) -> tuple[dict[str, Any], list[dict]]:
+    aggregate, artifacts = summarize_release_artifacts(
+        version,
+        getattr(version, "deploy_artifacts", None),
+    )
+    return aggregate, artifacts
+
+
+def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
+    aggregate, artifacts = _version_serving_summary(version)
+    return {
+        "version_number": version.version_number,
+        "status": version.status,
+        "opened_at": version.opened_at.isoformat(),
+        "promoted_at": version.promoted_at.isoformat()
+        if version.promoted_at
+        else None,
+        "qualification_attempts": version.qualification_attempts,
+        "last_qualification": _format_qualification(version.last_qualification)
+        if version.last_qualification
+        else None,
+        # Post-promotion serving confirmation — disambiguates a merged
+        # promotion from one that actually shipped (additive fields).
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "deploy_confirm_deadline": version.deploy_confirm_deadline.isoformat()
+        if version.deploy_confirm_deadline
+        else None,
+        "aggregate_serving_status": aggregate["serving_status"],
+        "aggregate_deploy_failure_reason": aggregate["reason_code"],
+        "artifacts": artifacts,
+        "qualification_state": _release_version.summarize_qualification_state(
+            version.last_qualification,
+            version.serving_status,
+            version.deploy_failure_reason,
+            aggregate_serving_status=aggregate["serving_status"],
+            aggregate_deploy_failure_reason=aggregate["reason_code"],
+            artifact_evidence=artifacts,
+        ),
+        "abandoned_at": (
+            (version.last_qualification or {}).get("abandoned_at")
+            if version.status == "abandoned"
+            else None
+        ),
+        "abandoned_by": (
+            (version.last_qualification or {}).get("operator")
+            if version.status == "abandoned"
+            else None
+        ),
+        "abandon_reason": (
+            (version.last_qualification or {}).get("reason")
+            if version.status == "abandoned"
+            else None
+        ),
+    }
+
+
 @router.get("/projects/{project_id}/version-lifecycle")
 async def get_version_lifecycle(
     project_id: uuid.UUID,
@@ -156,6 +216,7 @@ async def get_version_lifecycle(
         (
             await session.execute(
                 select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
                 .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status == "open",
@@ -173,6 +234,7 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
+        aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
         # Verdict-staleness signal: how many tasks merged AT/AFTER the open
         # version's last qualification verdict was finalized. Each verdict is
         # evaluated against one candidate commit; merges landing after
@@ -194,7 +256,12 @@ async def get_version_lifecycle(
                     session, project_id, finalized_at_dt
                 )
         qual_state = _release_version.summarize_qualification_state(
-            qual, open_row.serving_status, open_row.deploy_failure_reason
+            qual,
+            open_row.serving_status,
+            open_row.deploy_failure_reason,
+            aggregate_serving_status=aggregate_serving["serving_status"],
+            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+            artifact_evidence=artifact_evidence,
         )
         # Surface the open version's audit findings/score so a verdict is
         # explainable (the verdict record only keeps the composite, and the
@@ -254,6 +321,9 @@ async def get_version_lifecycle(
             if open_row.served_at
             else None,
             "deploy_failure_reason": open_row.deploy_failure_reason,
+            "aggregate_serving_status": aggregate_serving["serving_status"],
+            "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
+            "artifacts": artifact_evidence,
             "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
             if open_row.deploy_confirm_deadline
             else None,
@@ -263,6 +333,7 @@ async def get_version_lifecycle(
         (
             await session.execute(
                 select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
                 .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status != "open",
@@ -280,44 +351,7 @@ async def get_version_lifecycle(
     return {
         "current_version": current_version_out,
         "recent_versions": [
-            {
-                "version_number": v.version_number,
-                "status": v.status,
-                "opened_at": v.opened_at.isoformat(),
-                "promoted_at": v.promoted_at.isoformat() if v.promoted_at else None,
-                "qualification_attempts": v.qualification_attempts,
-                "last_qualification": _format_qualification(v.last_qualification)
-                if v.last_qualification
-                else None,
-                # Post-promotion serving confirmation — disambiguates a merged
-                # promotion from one that actually shipped (additive fields).
-                "serving_status": v.serving_status,
-                "served_sha": v.served_sha,
-                "served_at": v.served_at.isoformat() if v.served_at else None,
-                "deploy_failure_reason": v.deploy_failure_reason,
-                "deploy_confirm_deadline": v.deploy_confirm_deadline.isoformat()
-                if v.deploy_confirm_deadline
-                else None,
-                "qualification_state": _release_version.summarize_qualification_state(
-                    v.last_qualification, v.serving_status, v.deploy_failure_reason
-                ),
-                "abandoned_at": (
-                    (v.last_qualification or {}).get("abandoned_at")
-                    if v.status == "abandoned"
-                    else None
-                ),
-                "abandoned_by": (
-                    (v.last_qualification or {}).get("operator")
-                    if v.status == "abandoned"
-                    else None
-                ),
-                "abandon_reason": (
-                    (v.last_qualification or {}).get("reason")
-                    if v.status == "abandoned"
-                    else None
-                ),
-            }
-            for v in history_rows
+            _serialize_version_history_entry(version) for version in history_rows
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         # Per-project live-promotion enablement. ``promotion_enabled_effective``

@@ -48,6 +48,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.landed_signal import landed_signal_predicate
@@ -142,6 +143,8 @@ async def open_version(
 async def current_open_version(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    include_artifacts: bool = False,
 ) -> ReleaseVersion | None:
     """Return the current open ``ReleaseVersion`` for ``project_id``, or None.
 
@@ -158,6 +161,8 @@ async def current_open_version(
         .order_by(ReleaseVersion.opened_at.desc())
         .limit(2)
     )
+    if include_artifacts:
+        stmt = stmt.options(selectinload(ReleaseVersion.deploy_artifacts))
     rows = list((await session.execute(stmt)).scalars().all())
     if not rows:
         return None
@@ -311,6 +316,8 @@ async def recent_closed_versions(
     session: AsyncSession,
     project_id: uuid.UUID,
     limit: int = 5,
+    *,
+    include_artifacts: bool = False,
 ) -> list[ReleaseVersion]:
     """Return the most recently closed (non-open) ``ReleaseVersion`` rows.
 
@@ -328,6 +335,8 @@ async def recent_closed_versions(
         .order_by(ReleaseVersion.opened_at.desc())
         .limit(limit)
     )
+    if include_artifacts:
+        stmt = stmt.options(selectinload(ReleaseVersion.deploy_artifacts))
     return list((await session.execute(stmt)).scalars().all())
 
 
@@ -417,6 +426,10 @@ def summarize_qualification_state(
     last_qualification: dict[str, Any] | None,
     serving_status: str | None = None,
     deploy_failure_reason: str | None = None,
+    *,
+    aggregate_serving_status: str | None = None,
+    aggregate_deploy_failure_reason: str | None = None,
+    artifact_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Disambiguate the overloaded ``last_qualification.status`` for the agent.
 
@@ -530,7 +543,18 @@ def summarize_qualification_state(
             ),
         }
     if status == "promoted":
-        if serving_status == "serving_confirmed":
+        effective_serving_status = (
+            aggregate_serving_status
+            if artifact_evidence is not None
+            else serving_status
+        )
+        effective_failure_reason = (
+            aggregate_deploy_failure_reason
+            if artifact_evidence is not None
+            else deploy_failure_reason
+        )
+        artifact_fields = {"artifacts": artifact_evidence} if artifact_evidence else {}
+        if effective_serving_status == "serving_confirmed":
             return {
                 "state": "promoted",
                 "serving_status": "serving_confirmed",
@@ -538,23 +562,29 @@ def summarize_qualification_state(
                     "Candidate was promoted AND its deploy is CONFIRMED serving "
                     "in production — the version actually shipped."
                 ),
+                **artifact_fields,
             }
-        if serving_status == "deploy_failed":
+        if effective_serving_status == "deploy_failed":
             return {
                 "state": "promotion_deploy_failed",
                 "serving_status": "deploy_failed",
-                "deploy_failure_reason": deploy_failure_reason,
+                "deploy_failure_reason": effective_failure_reason,
                 "summary": (
                     "Candidate merged to the promotion target but its deploy "
                     "NEVER confirmed serving"
-                    + (f" ({deploy_failure_reason})" if deploy_failure_reason else "")
+                    + (
+                        f" ({effective_failure_reason})"
+                        if effective_failure_reason
+                        else ""
+                    )
                     + ". This promotion did NOT ship — the deployed code is not "
                     "live. Treat the version as NOT shipped: investigate the "
                     "deploy / roll forward a fix rather than advancing as if it "
                     "succeeded."
                 ),
+                **artifact_fields,
             }
-        if serving_status == "unconfirmed":
+        if effective_serving_status == "unconfirmed":
             return {
                 "state": "promoted_unconfirmed",
                 "serving_status": "unconfirmed",
@@ -564,10 +594,12 @@ def summarize_qualification_state(
                     "window. Do not treat it as live-confirmed yet; the sweep "
                     "resolves it to serving_confirmed or deploy_failed."
                 ),
+                **artifact_fields,
             }
         return {
             "state": "promoted",
             "summary": "Candidate was promoted — the version was cut.",
+            **artifact_fields,
         }
     if status == "deferred_unsynced":
         return {
@@ -583,13 +615,29 @@ def summarize_qualification_state(
     return {"state": status, "summary": f"Qualification status: {status}."}
 
 
-def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
+def to_phase_block(
+    version: ReleaseVersion,
+    *,
+    aggregate_serving_status: str | None = None,
+    aggregate_deploy_failure_reason: str | None = None,
+    artifact_evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Return a compact dict for embedding in the strategic agent's payload.
 
     Shape matches the ``version_phase`` block described in Phase 2 of the
     design doc (strategic_spawning.py ``_STRATEGIC_REVIEW_SCHEMA``).
     """
-    return {
+    effective_serving_status = (
+        aggregate_serving_status
+        if artifact_evidence is not None
+        else version.serving_status
+    )
+    effective_failure_reason = (
+        aggregate_deploy_failure_reason
+        if artifact_evidence is not None
+        else version.deploy_failure_reason
+    )
+    block = {
         "version_number": version.version_number,
         "phase": version.phase,
         "goal": version.goal,
@@ -602,12 +650,18 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
             version.last_qualification,
             version.serving_status,
             version.deploy_failure_reason,
+            aggregate_serving_status=aggregate_serving_status,
+            aggregate_deploy_failure_reason=aggregate_deploy_failure_reason,
+            artifact_evidence=artifact_evidence,
         ),
-        "serving_status": version.serving_status,
+        "serving_status": effective_serving_status,
         "served_sha": version.served_sha,
         "served_at": version.served_at.isoformat() if version.served_at else None,
-        "deploy_failure_reason": version.deploy_failure_reason,
+        "deploy_failure_reason": effective_failure_reason,
     }
+    if artifact_evidence is not None:
+        block["artifacts"] = artifact_evidence
+    return block
 
 
 def set_version_phase(

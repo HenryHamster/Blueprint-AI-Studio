@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,16 @@ class ReleaseArtifactProvider:
 
 
 _ARTIFACT_PROVIDERS: dict[str, ReleaseArtifactProvider] = {}
+
+
+@dataclass(frozen=True)
+class ReleaseArtifactEvidence:
+    artifact_kind: str
+    required: bool
+    serving_status: str | None
+    served_identifier: str | None
+    served_at: datetime | None
+    reason_code: str | None
 
 
 def register_release_artifact_provider(
@@ -103,7 +113,9 @@ def artifact_is_unconfirmed(artifact: ReleaseDeployArtifact | None) -> bool:
 
 
 def aggregate_required_artifact_status(
-    artifacts: list[tuple[ReleaseArtifactProvider, ReleaseDeployArtifact]],
+    artifacts: list[
+        tuple[ReleaseArtifactProvider, ReleaseDeployArtifact | ReleaseArtifactEvidence]
+    ],
 ) -> tuple[str, str | None]:
     """Aggregate the required-artifact states for a version."""
 
@@ -121,6 +133,126 @@ def aggregate_required_artifact_status(
     ):
         return ("serving_confirmed", None)
     return ("unconfirmed", None)
+
+
+def summarize_release_artifacts(
+    version: ReleaseVersion,
+    artifacts: Iterable[ReleaseDeployArtifact] | None,
+) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
+    """Summarize aggregate serving truth plus per-provider evidence.
+
+    The aggregate status follows the required-artifact registry semantics:
+
+    * ``deploy_failed`` iff any required artifact failed,
+    * ``serving_confirmed`` iff every required artifact confirmed serving,
+    * otherwise ``unconfirmed`` while any required artifact is pending.
+
+    For backward compatibility, a missing backend artifact row falls back to the
+    legacy ``ReleaseVersion`` scalar projection. When no artifact evidence exists
+    at all (for example, an open version that has never promoted), the helper
+    preserves the scalar truth instead of inventing a serving state.
+    """
+
+    artifact_by_kind = {
+        artifact.artifact_kind: artifact
+        for artifact in (artifacts or [])
+        if artifact.artifact_kind
+    }
+    evidence_rows: list[ReleaseArtifactEvidence] = []
+    aggregate_rows: list[tuple[ReleaseArtifactProvider, ReleaseArtifactEvidence]] = []
+
+    for provider in iter_release_artifact_providers():
+        artifact = artifact_by_kind.get(provider.artifact_kind)
+        if artifact is not None:
+            evidence = ReleaseArtifactEvidence(
+                artifact_kind=provider.artifact_kind,
+                required=provider.required,
+                serving_status=artifact.serving_status,
+                served_identifier=artifact.served_identifier,
+                served_at=artifact.served_at,
+                reason_code=artifact.reason_code,
+            )
+        elif is_backend_revision_artifact(provider.artifact_kind):
+            evidence = ReleaseArtifactEvidence(
+                artifact_kind=provider.artifact_kind,
+                required=provider.required,
+                serving_status=(
+                    version.serving_status
+                    if version.serving_status is not None
+                    else ("unconfirmed" if version.status == "promoted" else None)
+                ),
+                served_identifier=version.served_sha,
+                served_at=version.served_at,
+                reason_code=version.deploy_failure_reason,
+            )
+        else:
+            evidence = ReleaseArtifactEvidence(
+                artifact_kind=provider.artifact_kind,
+                required=provider.required,
+                serving_status="unconfirmed"
+                if provider.required and version.status == "promoted"
+                else None,
+                served_identifier=None,
+                served_at=None,
+                reason_code=None,
+            )
+        evidence_rows.append(evidence)
+        if evidence.serving_status is not None:
+            aggregate_rows.append((provider, evidence))
+
+    if aggregate_rows:
+        aggregate_status, aggregate_reason = aggregate_required_artifact_status(
+            aggregate_rows
+        )
+    else:
+        aggregate_status = version.serving_status
+        aggregate_reason = version.deploy_failure_reason
+
+    return (
+        {
+            "serving_status": aggregate_status,
+            "reason_code": aggregate_reason,
+        },
+        [
+            {
+                "artifact_kind": evidence.artifact_kind,
+                "required": evidence.required,
+                "serving_status": evidence.serving_status,
+                "served_identifier": evidence.served_identifier,
+                "served_at": (
+                    evidence.served_at.isoformat() if evidence.served_at else None
+                ),
+                "reason_code": evidence.reason_code,
+            }
+            for evidence in evidence_rows
+        ],
+    )
+
+
+def summarize_required_artifact_gap(
+    artifact_evidence: Iterable[dict[str, Any]] | None,
+) -> str | None:
+    """Return a compact description of pending/failed required artifacts."""
+
+    failed_parts: list[str] = []
+    pending_parts: list[str] = []
+    for artifact in artifact_evidence or []:
+        if not artifact.get("required"):
+            continue
+        artifact_kind = str(artifact.get("artifact_kind") or "?")
+        status = artifact.get("serving_status")
+        reason = artifact.get("reason_code")
+        if status == "deploy_failed":
+            failed_parts.append(
+                f"{artifact_kind} (reason={reason})" if reason else artifact_kind
+            )
+        elif status != "serving_confirmed":
+            pending_parts.append(artifact_kind)
+    if failed_parts:
+        return "required artifacts failed: " + ", ".join(failed_parts)
+    if pending_parts:
+        return "waiting on required artifacts: " + ", ".join(pending_parts)
+    return None
 
 
 def project_backend_revision_artifact(

@@ -8,6 +8,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.release_artifacts import summarize_required_artifact_gap
 from app import release_version
 from app.models import Alert, AlertSeverity
 from app.shared_state import runtime_config as _runtime_config
@@ -366,6 +367,9 @@ def _deploy_failed_alert_title(version_number: int) -> str:
 async def _alert_promotion_deploy_failed(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
+    *,
+    artifact_evidence: list[dict] | None = None,
+    aggregate_deploy_failure_reason: str | None = None,
 ) -> bool:
     """Emit a loud ERROR alert when a promoted version's deploy never served.
 
@@ -381,7 +385,7 @@ async def _alert_promotion_deploy_failed(
     if version.deploy_confirm_alerted_at is not None:
         return False
 
-    reason = version.deploy_failure_reason or "unknown"
+    reason = aggregate_deploy_failure_reason or version.deploy_failure_reason or "unknown"
     _reason_text = {
         "no_new_revision": (
             "no new healthy production revision booted within the confirmation "
@@ -393,6 +397,8 @@ async def _alert_promotion_deploy_failed(
             "the live serving SHA does not match the promoted SHA"
         ),
     }.get(reason, reason)
+    _artifact_gap = summarize_required_artifact_gap(artifact_evidence)
+    _artifact_text = f" Aggregate evidence: {_artifact_gap}." if _artifact_gap else ""
 
     session.add(
         Alert(
@@ -405,7 +411,7 @@ async def _alert_promotion_deploy_failed(
                 f"but its deploy is NOT serving: {_reason_text} "
                 f"(reason={reason}). The promotion did NOT ship — the version is "
                 f"flagged deploy_failed and must not be treated as live. "
-                f"Investigate the deploy / roll forward a fix."
+                f"Investigate the deploy / roll forward a fix.{_artifact_text}"
             ),
         )
     )
@@ -420,6 +426,7 @@ async def _alert_promotion_deploy_failed(
                 f"v{version.version_number} promoted to the production branch but "
                 f"its deploy never confirmed serving ({_reason_text}). This "
                 f"promotion did NOT ship; the version is flagged deploy_failed."
+                + (f" {_artifact_gap}." if _artifact_gap else "")
             ),
             extra={
                 "reason": reason,

@@ -1544,6 +1544,23 @@ async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
     assert by_kind["synthetic_required"].serving_status == "unconfirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_A
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "unconfirmed"
+    assert state["state"] == "promoted_unconfirmed"
+    assert {entry["artifact_kind"]: entry["serving_status"] for entry in evidence} == {
+        BACKEND_REVISION_ARTIFACT_KIND: "serving_confirmed",
+        "synthetic_required": "unconfirmed",
+    }
 
     verdict = (
         (
@@ -1581,6 +1598,30 @@ async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
     assert verdict.post_promotion_outcome == "serving_confirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_A
+    refreshed_artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, refreshed_artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "serving_confirmed"
+    assert state["state"] == "promoted"
 
 
 @pytest.mark.asyncio
@@ -1663,6 +1704,22 @@ async def test_required_artifact_deadline_failure_records_reason_code(
     assert version.serving_status == "deploy_failed"
     assert version.served_sha == _SHA_A
     assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "deploy_failed"
+    assert state["state"] == "promotion_deploy_failed"
+    assert "synthetic_required" in artifact_registry.summarize_required_artifact_gap(
+        evidence
+    )
 
     verdict = (
         (
@@ -1676,6 +1733,21 @@ async def test_required_artifact_deadline_failure_records_reason_code(
         .one()
     )
     assert verdict.post_promotion_outcome == "deploy_failed"
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(
+        "synthetic_required" in (alert.message or "") for alert in alerts
+    ), "deploy-failed alert should describe the failed required artifact"
 
 
 @pytest.mark.asyncio

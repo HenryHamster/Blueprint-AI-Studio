@@ -1583,6 +1583,233 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('per-artifact serving evidence', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('drives the headline from the aggregate: backend revision serving but a required artifact pending renders awaiting-confirmation, NOT serving confirmed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Promoted but not every required artifact confirms serving yet.',
+                serving_status: 'serving_confirmed',
+              },
+              // Backend-only scalar says serving — the aggregate must override it.
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              aggregate_serving_status: 'unconfirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+      expect(badge).not.toHaveTextContent(/serving confirmed/);
+    });
+
+    it('aggregate deploy_failed names the failed artifact and reason in the breakdown', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'A required artifact failed to confirm serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              aggregate_serving_status: 'deploy_failed',
+              aggregate_deploy_failure_reason: 'frontend bundle 502 on canary',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'frontend bundle 502 on canary' },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent('frontend bundle 502 on canary');
+
+      const failedRow = screen
+        .getAllByTestId('artifact-evidence-row')
+        .find((r) => r.getAttribute('data-artifact-kind') === 'frontend_bundle');
+      expect(failedRow).toBeDefined();
+      expect(failedRow).toHaveAttribute('data-artifact-status', 'deploy_failed');
+      expect(failedRow).toHaveTextContent('frontend bundle 502 on canary');
+    });
+
+    it('renders one breakdown row per artifact with kind + status', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Awaiting multi-artifact confirmation.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+              aggregate_serving_status: 'unconfirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toHaveAttribute('data-artifact-kind', 'backend_revision');
+      expect(rows[0]).toHaveAttribute('data-artifact-status', 'serving_confirmed');
+      expect(rows[0]).toHaveTextContent('✓ serving');
+      expect(rows[1]).toHaveAttribute('data-artifact-kind', 'frontend_bundle');
+      expect(rows[1]).toHaveAttribute('data-artifact-status', 'unconfirmed');
+      expect(rows[1]).toHaveTextContent('pending');
+    });
+
+    it('recovery: aggregate serving_confirmed with every artifact confirmed renders green', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'All required artifacts now confirm serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              served_at: '2026-01-02T00:00:00Z',
+              aggregate_serving_status: 'serving_confirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'serving_confirmed', served_identifier: 'bundle-42', served_at: '2026-01-02T00:05:00Z', reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(badge.className).toContain('text-emerald-400');
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows.every((r) => r.getAttribute('data-artifact-status') === 'serving_confirmed')).toBe(true);
+    });
+
+    it('backward compatible: a single backend artifact renders no breakdown list', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Single-artifact promotion confirmed serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              aggregate_serving_status: 'serving_confirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('serving-status-badge')).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(screen.queryByTestId('artifact-evidence-list')).not.toBeInTheDocument();
+    });
+
+    it('backward compatible: when the API omits the new fields, the scalar drives the badge unchanged', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Legacy scalar-only response.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(screen.queryByTestId('artifact-evidence-list')).not.toBeInTheDocument();
+    });
+
+    it('shows the per-artifact breakdown for a recent (history) version too', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 4,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'serving_confirmed',
+                aggregate_serving_status: 'deploy_failed',
+                aggregate_deploy_failure_reason: 'bundle never confirmed',
+                artifacts: [
+                  { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc1234', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                  { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'bundle never confirmed' },
+                ],
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows).toHaveLength(2);
+      const failed = rows.find((r) => r.getAttribute('data-artifact-kind') === 'frontend_bundle');
+      expect(failed).toBeDefined();
+      expect(failed).toHaveAttribute('data-artifact-status', 'deploy_failed');
+      expect(failed).toHaveTextContent('bundle never confirmed');
+    });
+  });
+
   describe('clear deploy-failed lever', () => {
     beforeEach(() => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
@@ -1614,6 +1841,30 @@ describe('VersionLifecyclePanel', () => {
           userRole="admin"
         />
       );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('hides the clear control for aggregate-only deploy_failed state', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              serving_status: 'serving_confirmed',
+              aggregate_serving_status: 'deploy_failed',
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'required artifact failed',
+                serving_status: 'deploy_failed',
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
       expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
     });
 

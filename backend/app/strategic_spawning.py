@@ -30,6 +30,10 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.release_artifacts import (
+    summarize_release_artifacts,
+    summarize_required_artifact_gap,
+)
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
@@ -60,6 +64,38 @@ from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
+
+
+def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    aggregate, artifacts = summarize_release_artifacts(
+        version,
+        getattr(version, "deploy_artifacts", None),
+    )
+    return aggregate, artifacts
+
+
+def _strategic_recent_version_entry(version) -> dict[str, Any]:
+    from app.release_version import summarize_qualification_state as _summarize
+
+    aggregate, artifacts = _version_serving_summary(version)
+    return {
+        "version_number": version.version_number,
+        "status": version.status,
+        "phase": version.phase,
+        "last_qualification": version.last_qualification,
+        "qualification_state": _summarize(
+            version.last_qualification,
+            version.serving_status,
+            version.deploy_failure_reason,
+            aggregate_serving_status=aggregate["serving_status"],
+            aggregate_deploy_failure_reason=aggregate["reason_code"],
+            artifact_evidence=artifacts,
+        ),
+        "serving_status": aggregate["serving_status"],
+        "served_sha": (version.served_sha or "")[:12] or None,
+        "deploy_failure_reason": aggregate["reason_code"],
+        "artifacts": artifacts,
+    }
 
 
 def _build_parallelism_hint(
@@ -3799,11 +3835,14 @@ async def _spawn_strategic_review(
                 current_open_version,
                 ensure_initial_release_version,
                 recent_closed_versions,
-                summarize_qualification_state,
                 to_phase_block,
             )
 
-            _open_version = await current_open_version(session, project.id)
+            _open_version = await current_open_version(
+                session,
+                project.id,
+                include_artifacts=True,
+            )
             if _open_version is None:
                 # No open version: bootstrap v1.  Resolve the integration-branch
                 # HEAD SHA so the qualifier's diff is meaningful; fall back to
@@ -3843,11 +3882,19 @@ async def _spawn_strategic_review(
                     promotion_target=_promotion_target,
                 )
             if _open_version is not None:
+                _open_aggregate, _open_artifacts = _version_serving_summary(
+                    _open_version
+                )
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
                 )
                 _version_phase_block = {
-                    **to_phase_block(_open_version),
+                    **to_phase_block(
+                        _open_version,
+                        aggregate_serving_status=_open_aggregate["serving_status"],
+                        aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
+                        artifact_evidence=_open_artifacts,
+                    ),
                     "tasks_merged_this_version": _tasks_merged,
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
@@ -3866,27 +3913,17 @@ async def _spawn_strategic_review(
                 )
             try:
                 _closed = await recent_closed_versions(
-                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                    session,
+                    project.id,
+                    limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                    include_artifacts=True,
                 )
                 if _closed:
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        {
-                            "version_number": v.version_number,
-                            "status": v.status,
-                            "phase": v.phase,
-                            "last_qualification": v.last_qualification,
-                            "qualification_state": summarize_qualification_state(
-                                v.last_qualification,
-                                v.serving_status,
-                                v.deploy_failure_reason,
-                            ),
-                            "serving_status": v.serving_status,
-                            "served_sha": (v.served_sha or "")[:12] or None,
-                            "deploy_failure_reason": v.deploy_failure_reason,
-                        }
-                        for v in _closed
+                        _strategic_recent_version_entry(version)
+                        for version in _closed
                     ]
             except Exception:
                 logger.exception(
@@ -3920,7 +3957,10 @@ async def _spawn_strategic_review(
             _promoted_v = None
             try:
                 for _cv in await _recent_closed_for_deploy(
-                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                    session,
+                    project.id,
+                    limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                    include_artifacts=True,
                 ):
                     if _cv.status == "promoted":
                         _promoted_v = _cv
@@ -3958,12 +3998,23 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] DeploymentState read failed; continuing"
                     )
-            # Real serving SHA only — NEVER a promoted_sha stand-in.  A version's
-            # served_sha is set solely once deploy_health confirms the promotion
-            # is actually serving (serving_status="serving_confirmed"); an
-            # unconfirmed or deploy_failed promotion reports null here, so the
-            # strategist never reads a merged-but-unshipped SHA as "deployed".
-            if not _deployed_sha and _promoted_v is not None:
+            _promoted_aggregate: dict[str, Any] | None = None
+            _promoted_artifacts: list[dict[str, Any]] = []
+            _promoted_gap: str | None = None
+            if _promoted_v is not None:
+                _promoted_aggregate, _promoted_artifacts = _version_serving_summary(
+                    _promoted_v
+                )
+                _promoted_gap = summarize_required_artifact_gap(_promoted_artifacts)
+            # Real serving SHA only — NEVER a promoted_sha stand-in. Fall back to
+            # the promoted version's served_sha only once aggregate required-artifact
+            # truth says that promotion actually shipped.
+            if (
+                not _deployed_sha
+                and _promoted_v is not None
+                and _promoted_aggregate is not None
+                and _promoted_aggregate["serving_status"] == "serving_confirmed"
+            ):
                 _deployed_sha = _promoted_v.served_sha
             _undeployed_dirs = (
                 (recent_interventions or {}).get("undeployed_directions") or []
@@ -4001,11 +4052,17 @@ async def _spawn_strategic_review(
                 # the strategist see whether "promoted" actually shipped vs is
                 # still unconfirmed or failed to deploy.
                 "promoted_serving_status": (
-                    _promoted_v.serving_status if _promoted_v else None
+                    _promoted_aggregate["serving_status"]
+                    if _promoted_aggregate
+                    else None
                 ),
                 "promoted_deploy_failure_reason": (
-                    _promoted_v.deploy_failure_reason if _promoted_v else None
+                    _promoted_aggregate["reason_code"]
+                    if _promoted_aggregate
+                    else None
                 ),
+                "promoted_artifacts": _promoted_artifacts,
+                "promoted_artifact_gap": _promoted_gap,
                 "open_version": (
                     _open_version.version_number if _open_version else None
                 ),
@@ -4261,11 +4318,15 @@ async def _spawn_strategic_review(
         _verdict_txt = ""
         _prior_serving_status: str | None = None
         _prior_deploy_reason: str | None = None
+        _prior_artifact_gap: str | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
             for _v in await _rcv(
-                session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                session,
+                project.id,
+                limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                include_artifacts=True,
             ):
                 if _v.version_number == _prior_n and _v.status == "promoted":
                     if _v.promoted_at is not None:
@@ -4273,8 +4334,12 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
-                    _prior_serving_status = _v.serving_status
-                    _prior_deploy_reason = _v.deploy_failure_reason
+                    _prior_aggregate, _prior_artifacts = _version_serving_summary(_v)
+                    _prior_serving_status = _prior_aggregate["serving_status"]
+                    _prior_deploy_reason = _prior_aggregate["reason_code"]
+                    _prior_artifact_gap = summarize_required_artifact_gap(
+                        _prior_artifacts
+                    )
                     break
         except Exception:
             logger.exception(
@@ -4288,6 +4353,11 @@ async def _spawn_strategic_review(
             _reason_txt = (
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
+            _artifact_txt = (
+                f" Evidence: {_prior_artifact_gap}."
+                if _prior_artifact_gap
+                else ""
+            )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
                 f"{_target}{_promoted_when} but its deploy DID NOT confirm "
@@ -4299,8 +4369,14 @@ async def _spawn_strategic_review(
                 f"Your TOP priority this cycle is recovering the failed deploy "
                 f"(roll forward a fix / investigate why the promoted SHA never "
                 f"served); only after it is serving should you move focus on."
+                f"{_artifact_txt}"
             )
         elif _prior_serving_status == "unconfirmed":
+            _artifact_txt = (
+                f" Evidence: {_prior_artifact_gap}."
+                if _prior_artifact_gap
+                else ""
+            )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
                 f"(merged) to {_target}{_promoted_when}{_verdict_txt}, but its "
@@ -4311,7 +4387,7 @@ async def _spawn_strategic_review(
                 f"resolve it to serving_confirmed or deploy_failed shortly. You "
                 f"may begin setting v{_cur_n}'s mission, but do not declare "
                 f"v{_prior_n} live until serving is confirmed, and do NOT "
-                f"re-promote/re-qualify v{_prior_n}."
+                f"re-promote/re-qualify v{_prior_n}.{_artifact_txt}"
             )
         else:
             _post_promote_hint = (
@@ -4361,7 +4437,7 @@ async def _spawn_strategic_review(
             from app.release_version import recent_closed_versions as _rcv
 
             for _v in await _rcv(
-                session, project.id, limit=1
+                session, project.id, limit=1, include_artifacts=True
             ):
                 if _v.status == "promoted":
                     _latest_promoted_version = _v
@@ -4370,10 +4446,29 @@ async def _spawn_strategic_review(
             logger.exception(
                 "[STRATEGIC] failed-deploy directive: latest promoted lookup failed; continuing"
             )
-        if _latest_promoted_version is not None and _latest_promoted_version.serving_status == "deploy_failed":
+        if _latest_promoted_version is not None:
+            _latest_promoted_aggregate, _latest_promoted_artifacts = (
+                _version_serving_summary(_latest_promoted_version)
+            )
+            _latest_artifact_gap = summarize_required_artifact_gap(
+                _latest_promoted_artifacts
+            )
+        else:
+            _latest_promoted_aggregate = None
+            _latest_artifact_gap = None
+        if (
+            _latest_promoted_version is not None
+            and _latest_promoted_aggregate is not None
+            and _latest_promoted_aggregate["serving_status"] == "deploy_failed"
+        ):
             _reason_txt = (
-                f" (reason={_latest_promoted_version.deploy_failure_reason})"
-                if _latest_promoted_version.deploy_failure_reason
+                f" (reason={_latest_promoted_aggregate['reason_code']})"
+                if _latest_promoted_aggregate["reason_code"]
+                else ""
+            )
+            _artifact_txt = (
+                f" Evidence: {_latest_artifact_gap}."
+                if _latest_artifact_gap
                 else ""
             )
             _failed_deploy_directive = (
@@ -4387,7 +4482,7 @@ async def _spawn_strategic_review(
                 f"THIS deploy is confirmed serving — recovering the SAME promoted SHA "
                 f"(a slow or boot-crashed deploy that later comes up healthy) resolves "
                 f"it automatically; you do NOT need to cut and promote a subsequent "
-                f"version for it to clear."
+                f"version for it to clear.{_artifact_txt}"
             )
             prompt_suffix = (
                 f"{prompt_suffix}\n{_failed_deploy_directive}"

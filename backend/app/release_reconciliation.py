@@ -30,6 +30,7 @@ from app.release_artifacts import (
     is_backend_revision_artifact,
     iter_release_artifact_providers,
     project_backend_revision_artifact,
+    summarize_release_artifacts,
 )
 from app.release_promotion import (
     _candidate_already_on_main,
@@ -999,6 +1000,10 @@ async def _confirm_serving_or_fail(
             version.serving_status = "deploy_failed"
             version.deploy_failure_reason = aggregate_reason
             session.add(version)
+            _aggregate_summary, _artifact_evidence = summarize_release_artifacts(
+                version,
+                [artifact for _provider, artifact in provider_rows],
+            )
             await _record_post_promotion_outcome(
                 session, version, "deploy_failed", _now
             )
@@ -1006,7 +1011,12 @@ async def _confirm_serving_or_fail(
             try:
                 from app.release_stall_alerts import _alert_promotion_deploy_failed
 
-                await _alert_promotion_deploy_failed(session, version)
+                await _alert_promotion_deploy_failed(
+                    session,
+                    version,
+                    artifact_evidence=_artifact_evidence,
+                    aggregate_deploy_failure_reason=_aggregate_summary["reason_code"],
+                )
             except Exception:
                 logger.exception(
                     "[RELEASE_QUALIFIER] deploy-failed alert raised for v%d "

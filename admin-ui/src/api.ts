@@ -1071,6 +1071,20 @@ export interface VersionQualification {
   audit_findings?: AuditFinding[] | null;
 }
 
+/** Per-artifact serving evidence for a release version. One entry per registered
+ *  deploy artifact (e.g. the backend Cloud Run revision, plus any other required
+ *  artifact). serving_status is one of 'unconfirmed' | 'serving_confirmed' |
+ *  'deploy_failed' | null (null = no serving expectation, e.g. a never-promoted
+ *  version). reason_code carries the failure/pending detail. */
+export interface ReleaseArtifactEvidence {
+  artifact_kind: string;
+  required: boolean;
+  serving_status?: string | null;
+  served_identifier?: string | null;
+  served_at?: string | null;
+  reason_code?: string | null;
+}
+
 export interface QualificationState {
   state: string;
   summary: string;
@@ -1132,6 +1146,16 @@ export interface CurrentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Aggregate required-artifact serving truth (additive). The headline
+  // 'is it actually shipped' decision derives from this, NOT the backend-only
+  // scalar: 'serving_confirmed' only when every required artifact confirms,
+  // 'deploy_failed' when any required artifact failed, 'unconfirmed' while any
+  // required artifact is still pending. `artifacts` is the per-artifact evidence
+  // list (one entry per registered deploy artifact). Both may be absent when the
+  // API has no artifact registry — fall back to the scalar fields above.
+  aggregate_serving_status?: string | null;
+  aggregate_deploy_failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
   // Post-promotion deploy-confirmation window deadline (ISO string). The sweep
   // resolves serving_status to confirmed/failed when this elapses; the panel
   // computes remaining/overdue at render time.
@@ -1154,6 +1178,10 @@ export interface RecentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Aggregate required-artifact serving truth (additive) — see CurrentVersion.
+  aggregate_serving_status?: string | null;
+  aggregate_deploy_failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
   // Post-promotion deploy-confirmation window deadline (ISO string) — see
   // CurrentVersion. Present on the recently-promoted history row whose
   // serving_status is still 'unconfirmed'.
