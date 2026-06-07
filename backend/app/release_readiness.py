@@ -201,6 +201,11 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sub(verdict: QualificationVerdict, key: str) -> Any:
+    """Safely read a key from verdict.sub_scores; returns None for legacy rows."""
+    return (verdict.sub_scores or {}).get(key)
+
+
 def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     """Return an operator-facing dict for a single QualificationVerdict row.
 
@@ -254,6 +259,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
+        # --- Acceptance-window signal (additive; None on legacy rows without aggregate) -
+        # Surfaces the proven-vs-delivered distinction: how many landed merges in the
+        # qualification window have verified acceptance evidence vs. raw delivered count.
+        "acceptance_window_total": _sub(verdict, "acceptance_window_total"),
+        "acceptance_window_verified": _sub(verdict, "acceptance_window_verified"),
+        "acceptance_window_fraction": _sub(verdict, "acceptance_window_fraction"),
     }
 
 

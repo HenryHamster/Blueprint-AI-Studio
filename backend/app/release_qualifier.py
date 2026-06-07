@@ -75,6 +75,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import RATE_LIMIT, classify_failure
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
+from app.landed_signal import landed_signal_predicate, merge_verification_status
 from app.models import (
     ArtifactType,
     Project,
@@ -1538,6 +1543,84 @@ async def _resolve_migration_apply_at_finalize(
         return ("defer", f"migration-apply gate error: {exc}")
 
 
+async def _compute_acceptance_window_aggregate(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> dict[str, Any]:
+    """Count merged tasks in this version's window that pass the verified predicate.
+
+    Queries all COMPLETED tasks with the landed-signal predicate that completed
+    at or after ``version.opened_at`` (the version window lower bound), then
+    in-Python applies the same predicate used by ``direction_outcomes.py`` for
+    ``verified_prs_merged``: a merge is acceptance-verified only when it landed,
+    is not ``unverified_degraded``, and its recorded ``code_acceptance_verdict``
+    does not block success.
+
+    Returns:
+      {
+        "acceptance_window_total": int,    # all landed merges in the window
+        "acceptance_window_verified": int, # merges passing the verified predicate
+        "acceptance_window_fraction": float | None,  # None when total == 0
+      }
+    """
+
+    def _task_completed_at(task: Task) -> datetime:
+        """Return the stable terminal timestamp for a task.
+
+        Uses the last status-transition entry in status_log when available;
+        falls back to created_at for legacy rows with no durable completion
+        entry. Message-only writes append to status_log too, so the cutoff must
+        ignore those audit entries.
+        """
+
+        def _strip_tz(dt: datetime) -> datetime:
+            return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+        for entry in reversed(task.status_log or []):
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("msg")
+            if not isinstance(msg, str) or not msg.startswith("Status changed: "):
+                continue
+            try:
+                return _strip_tz(datetime.fromisoformat(entry["t"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        completed_at = task.created_at
+        return _strip_tz(completed_at)
+
+    since = version.opened_at
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == version.project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+        )
+    )
+    rows = [
+        task
+        for task in (await session.execute(stmt)).scalars().all()
+        if _task_completed_at(task) >= since
+    ]
+
+    total = len(rows)
+    verified = sum(
+        1
+        for task in rows
+        if merge_verification_status(task) != "unverified_degraded"
+        and not acceptance_blocks_success(
+            (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        )
+    )
+    fraction = (verified / total) if total > 0 else None
+    return {
+        "acceptance_window_total": total,
+        "acceptance_window_verified": verified,
+        "acceptance_window_fraction": fraction,
+    }
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1874,6 +1957,15 @@ async def _finalize_qualification(
         migration_apply_blocked=migration_apply_blocked,
     )
 
+    # --- Acceptance-window aggregate (additive evidence, no score impact) --
+    # Reuses the same verified-prs-merged predicate from direction_outcomes so
+    # the release qualification surfaces the same proven-vs-delivered signal as
+    # the strategic and direction layers. Merged into sub_scores as additive
+    # keys; the existing audit/test_erosion/smoketest weights are unchanged.
+    acceptance_aggregate = await _compute_acceptance_window_aggregate(session, version)
+    extended_sub_scores = dict(composite["sub_scores"])
+    extended_sub_scores.update(acceptance_aggregate)
+
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
@@ -1881,7 +1973,7 @@ async def _finalize_qualification(
         "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
-        "sub_scores": composite["sub_scores"],
+        "sub_scores": extended_sub_scores,
         "blocker": composite["blocker"],
         "threshold": policy.get("threshold"),
         "started_at": qual.get("started_at"),
