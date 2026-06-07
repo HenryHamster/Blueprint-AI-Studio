@@ -75,6 +75,25 @@ def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     return _spawn_locks[project_id]
 
 
+def project_parallelism_cap(
+    project: Project, override_key: str, runtime_key: str, default: int
+) -> int:
+    """Resolve a per-project parallelism cap.
+
+    A positive-int override in ``project.build_config[override_key]`` wins;
+    otherwise fall back to the global runtime setting ``runtime_key``. The
+    override is operator-set via the project build_config PATCH (validated
+    1..50 by ``schemas.BuildConfig``); the isinstance guard keeps a
+    hand-edited or legacy stored value from crashing the spawn loop. Used by
+    the spawn guards here and mirrored by the spawn-diagnostics endpoint
+    (``admin_debug``) so "why no spawn" reporting matches enforcement.
+    """
+    raw = (getattr(project, "build_config", None) or {}).get(override_key)
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+        return raw
+    return _runtime_config.get(runtime_key, default)
+
+
 # Sentinel segment for undirected (cross-cutting) research claims — undirected
 # cycles target no direction id but must still be claimable one-at-a-time.
 _CLAIM_UNDIRECTED = "cross-cutting"
@@ -896,7 +915,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             return
 
-        max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
+        max_parallel = project_parallelism_cap(
+            project, "max_parallel_research", "max_parallel_research_per_project", 3
+        )
         for d in sorted_eligible:
             did = d.get("id")
             if is_pause_mode(d):
@@ -1333,7 +1354,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
-    max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
+    max_parallel = project_parallelism_cap(
+        project, "max_parallel_research", "max_parallel_research_per_project", 3
+    )
     active_research_count = (
         await session.execute(
             select(func.count())
@@ -1358,7 +1381,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # — each new spawn produces another rollup branch competing for the same
     # base. This cap prevents the pile-up that makes downstream merges
     # incrementally more conflict-prone.
-    max_total = _runtime_config.get("max_total_research_per_project", 5)
+    max_total = project_parallelism_cap(
+        project, "max_total_research", "max_total_research_per_project", 5
+    )
     total_research_count = (
         await session.execute(
             select(func.count())
@@ -1422,13 +1447,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
         )
     ).scalar() or 0
-    if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
+    per_hour_cap = project_parallelism_cap(
+        project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 12
+    )
+    if recent_research_count >= per_hour_cap:
         return
 
     # Also cap by per-project rate limit
-    rate_limit_remaining = (
-        _runtime_config["max_autonomous_tasks_per_hour"] - recent_research_count
-    )
+    rate_limit_remaining = per_hour_cap - recent_research_count
     if rate_limit_remaining < len(chosen_directions):
         chosen_directions = chosen_directions[: max(0, rate_limit_remaining)]
 
@@ -2265,7 +2291,9 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             )
         )
     ).scalar() or 0
-    if recent_auto >= _runtime_config["max_autonomous_tasks_per_hour"]:
+    if recent_auto >= project_parallelism_cap(
+        project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 12
+    ):
         return
 
     # Check when this type last ran (most recent completed task of this type)

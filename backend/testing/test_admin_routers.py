@@ -1676,6 +1676,85 @@ class TestPatchBuildConfigRequiresCiChecks:
         assert resp.json()["build_config"].get("requires_ci_checks") is False
 
 
+class TestPatchBuildConfigParallelismCaps:
+    """PATCH /projects/{id} must persist, preserve, validate, and clear the
+    per-project parallelism cap overrides (see schemas.BuildConfig)."""
+
+    @pytest.mark.asyncio
+    async def test_patch_persists_and_preserves_caps(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-parallel-caps")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "max_parallel_research": 2,
+                    "max_total_research": 4,
+                    "max_autonomous_tasks_per_hour": 8,
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        bc = resp.json()["build_config"]
+        assert bc.get("max_parallel_research") == 2
+        assert bc.get("max_total_research") == 4
+        assert bc.get("max_autonomous_tasks_per_hour") == 8
+
+        # A later PATCH that does not mention the caps must not drop them.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"language": "python"}},
+        )
+        assert resp.status_code == 200, resp.text
+        bc = resp.json()["build_config"]
+        assert bc.get("language") == "python"
+        assert bc.get("max_parallel_research") == 2
+        assert bc.get("max_total_research") == 4
+        assert bc.get("max_autonomous_tasks_per_hour") == 8
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("max_parallel_research") == 2
+
+    @pytest.mark.asyncio
+    async def test_patch_explicit_null_clears_cap(
+        self, client: AsyncClient, db_session
+    ):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="patch-parallel-caps-clear")
+        project.build_config = {"max_parallel_research": 2}
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"max_parallel_research": None}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert "max_parallel_research" not in resp.json()["build_config"]
+
+        await db_session.refresh(project)
+        assert "max_parallel_research" not in (project.build_config or {})
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_out_of_bounds_caps(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-parallel-caps-bounds")
+        for bad in (
+            {"max_parallel_research": 0},
+            {"max_total_research": 51},
+            {"max_autonomous_tasks_per_hour": "fast"},
+        ):
+            resp = await client.patch(
+                f"/api/admin/projects/{project.id}",
+                json={"build_config": bad},
+            )
+            assert resp.status_code == 400, (bad, resp.text)
+
+
 class TestDeleteProject:
     @pytest.mark.asyncio
     async def test_delete_project_no_active_tasks(

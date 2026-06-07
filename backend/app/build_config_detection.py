@@ -44,10 +44,12 @@ def apply_operator_build_config_overrides(
     - ``git_user_email`` / ``git_user_name`` — preserved only when truthy.
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
-      ``protected_branches``, ``enable_self_improvement`` and
-      ``requires_ci_checks`` — preserved whenever the key is present in
-      ``existing`` (including empty-list/falsey values), so deliberate operator
-      customization survives re-detection.
+      ``protected_branches``, ``enable_self_improvement``,
+      ``requires_ci_checks`` and the per-project parallelism caps
+      (``max_parallel_research``, ``max_total_research``,
+      ``max_autonomous_tasks_per_hour``) — preserved whenever the key is
+      present in ``existing`` (including empty-list/falsey values), so
+      deliberate operator customization survives re-detection.
     """
     existing = existing or {}
 
@@ -85,6 +87,16 @@ def apply_operator_build_config_overrides(
     # re-detect and empty-config auto-refresh do not silently re-gate the repo.
     if "requires_ci_checks" in existing:
         detected["requires_ci_checks"] = existing["requires_ci_checks"]
+    # Per-project parallelism overrides are operator-owned and never emitted
+    # by repo detection; carry them forward so re-detect does not silently
+    # lift a deliberate throttle (see schemas.BuildConfig).
+    for _cap_key in (
+        "max_parallel_research",
+        "max_total_research",
+        "max_autonomous_tasks_per_hour",
+    ):
+        if _cap_key in existing:
+            detected[_cap_key] = existing[_cap_key]
 
     return detected
 
