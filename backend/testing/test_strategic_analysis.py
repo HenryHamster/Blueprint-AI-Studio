@@ -1645,6 +1645,40 @@ def test_decision_accuracy_scores_created_directions():
     assert "median_quality_score" in da
 
 
+def test_decision_accuracy_success_requires_verified_merge():
+    """Raw merges alone do not count as created-direction success."""
+    directions = [
+        {
+            "id": "dRawOnly",
+            "status": "active",
+            "research_history": [
+                {"prs_merged": 1, "verified_prs_merged": 0},
+            ],
+        }
+    ]
+    vision = {
+        "_strategic_cycle_history": [
+            {
+                "cycle_id": "c1",
+                "outcome": "completed",
+                "phase2_completed_at": "2026-03-01T00:00:00",
+                "created_direction_ids": ["dRawOnly"],
+                "retired_direction_ids": [],
+            },
+        ]
+    }
+    result = _build_outcome_evaluation(
+        _make_project(directions=directions, vision=vision)
+    )
+    da = result["decision_accuracy"]
+    assert da["created_count"] == 1
+    assert da["created_successful"] == 0
+    assert da["decision_accuracy_rate"] == 0.0
+    created = da["created"][0]
+    assert created["prs_merged"] == 1
+    assert created["success"] is False
+
+
 def test_decision_accuracy_retired_breakdown():
     directions = [
         {"id": "dKeep", "status": "retired", "research_history": []},
@@ -3037,6 +3071,7 @@ def test_retired_summary_uses_recorded_cost_per_merge():
                 {
                     "timestamp": _recent_iso(5),
                     "prs_merged": 4,
+                    "verified_prs_merged": 2,
                     "tasks_created": 999,
                     "avg_time_to_merge_hours": 999.0,
                     "estimated_cost_usd": 8.00,
@@ -3048,7 +3083,8 @@ def test_retired_summary_uses_recorded_cost_per_merge():
     result = _build_retired_directions_summary(project)
     assert len(result) == 1
     entry = result[0]
-    assert entry.get("cost_per_merge") == round(8.00 / 4, 2)
+    assert entry["prs_merged"] == 4
+    assert entry.get("cost_per_merge") == round(8.00 / 2, 2)
 
 
 # ---------------------------------------------------------------------------

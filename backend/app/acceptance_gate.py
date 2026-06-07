@@ -36,6 +36,7 @@ same way the reproduce-on-HEAD verdict does.
 from __future__ import annotations
 
 import operator
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -235,6 +236,80 @@ def _evaluate_named_test(
     )
 
 
+def _artifact_tokens(artifact_id: str) -> list[str]:
+    """Substantive lowercase tokens of an ``artifact_id``, split on non-alphanums.
+
+    ``release-deploy-artifact-registry`` → ``["release", "deploy", "registry"]``.
+    Single-character and generic structural tokens (``artifact``) carry no
+    grounding signal — a changed path almost always contains them — so they are
+    dropped, leaving only tokens that meaningfully tie the declaration to a file.
+    """
+    raw = [t for t in re.split(r"[^a-z0-9]+", artifact_id.lower()) if t]
+    generic = {"artifact", "artifacts"}
+    return [t for t in raw if len(t) > 1 and t not in generic]
+
+
+def _artifact_grounded(artifact_id: str, changed: list[str]) -> bool:
+    """Whether a changed-file path reflects the declared ``artifact_id``.
+
+    Grounds the declaration in what actually shipped: at least one substantive
+    token of the artifact_id must appear as a token within a changed-file path
+    (path split on non-alphanumerics, so ``release_promotion.py`` yields
+    ``release``/``promotion``/``py``). Mirrors ``_paths_match``'s tolerance for
+    differing path/slug conventions without requiring an exact basename match.
+    """
+    tokens = _artifact_tokens(artifact_id)
+    if not tokens:
+        return False
+    for path in changed:
+        path_tokens = {t for t in re.split(r"[^a-z0-9]+", path.lower()) if t}
+        if any(t in path_tokens for t in tokens):
+            return True
+    return False
+
+
+def _evaluate_downstream_artifact(
+    evidence: AcceptanceEvidence, changed: list[str]
+) -> AcceptanceGateVerdict:
+    """Grounded gate for a ``downstream_artifact`` acceptance declaration.
+
+    Unlike ``observable_behavior`` (which only requires a non-empty diff), a
+    ``downstream_artifact`` names a concrete ``artifact_id`` a later task
+    consumes. Satisfied only when that declared artifact_id is reflected in the
+    shipped changed files (a substantive token of the slug appears in a changed
+    path) — so a meaningful-sounding artifact_id paired with a completely
+    unrelated diff fails closed. An empty diff shipped nothing to ground against
+    and also fails closed. Satisfied but never machine-checked (``proven=False``):
+    a path-token match shows the artifact was plausibly delivered, not that a
+    downstream consumer actually exercised it.
+    """
+    if not changed:
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            "declared downstream_artifact acceptance evidence but the task "
+            "shipped no changed files to deliver it",
+        )
+    artifact_id = (evidence.artifact_id or "").strip()
+    if not _artifact_grounded(artifact_id, changed):
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared downstream_artifact {artifact_id!r} is not reflected in "
+            f"any of the {len(changed)} shipped changed file(s) — the diff does "
+            "not deliver the named artifact",
+        )
+    return AcceptanceGateVerdict(
+        True,
+        True,
+        evidence.kind,
+        f"downstream_artifact {artifact_id!r} is reflected in the shipped "
+        "changed files",
+    )
+
+
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     """Evaluate ``task``'s declared acceptance evidence, fail-closed.
 
@@ -256,13 +331,16 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     if evidence.kind == "named_test":
         return _evaluate_named_test(evidence, changed, verified)
 
-    # observable_behavior / downstream_artifact carry no machine-checkable
-    # assertion the backend can independently re-run at completion. To the extent
-    # checkable, require that the task actually shipped a real diff (a non-empty
-    # changed-file set) — a declared behavior/artifact with an empty diff shipped
-    # nothing to exercise, so it fails closed. The declaration's substance
-    # (non-trivial description / artifact_id) is already enforced at validation.
-    if evidence.kind in ("observable_behavior", "downstream_artifact"):
+    if evidence.kind == "downstream_artifact":
+        return _evaluate_downstream_artifact(evidence, changed)
+
+    # observable_behavior carries no machine-checkable assertion the backend can
+    # independently re-run at completion. To the extent checkable, require that
+    # the task actually shipped a real diff (a non-empty changed-file set) — a
+    # declared behavior with an empty diff shipped nothing to exercise, so it
+    # fails closed. The declaration's substance (non-trivial description) is
+    # already enforced at validation.
+    if evidence.kind == "observable_behavior":
         if not changed:
             return AcceptanceGateVerdict(
                 True,

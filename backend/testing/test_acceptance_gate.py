@@ -218,16 +218,56 @@ def test_observable_behavior_empty_diff_fails_closed():
     assert "no changed files" in verdict.reason
 
 
-def test_downstream_artifact_with_real_diff_passes():
+def test_downstream_artifact_grounded_diff_passes():
+    # The declared artifact_id is reflected in a shipped changed-file path
+    # (token "promotion" appears in release_promotion.py) — grounded, satisfied,
+    # but not machine-checked proven.
     task = _make_code_task(
         acceptance_evidence={
             "kind": "downstream_artifact",
-            "artifact_id": "release-deploy-artifact-registry",
+            "artifact_id": "release-promotion-record",
         },
         changed_files=["backend/app/release_promotion.py"],
     )
     verdict = evaluate_code_acceptance(task)
     assert verdict.satisfied is True
+    assert verdict.proven is False
+    assert "reflected in the shipped changed files" in verdict.reason
+
+
+def test_downstream_artifact_unrelated_diff_is_unsatisfied():
+    # A meaningful-sounding artifact_id paired with a completely unrelated diff
+    # is NOT grounded — the declared artifact was not delivered by what shipped,
+    # so the verdict fails closed and blocks verified-success credit.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "deploy-rollback-registry",
+        },
+        changed_files=["admin-ui/src/components/Banner.tsx"],
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "not reflected" in verdict.reason
+    recorded = record_code_acceptance_verdict(task)
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert recorded is not None and stamped["satisfied"] is False
+    assert acceptance_blocks_success(stamped) is True
+
+
+def test_downstream_artifact_empty_diff_fails_closed():
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "deploy-rollback-registry",
+        },
+        changed_files=[],
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert "no changed files" in verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,13 +292,21 @@ def test_acceptance_blocks_success_only_on_explicit_unsatisfied():
 def test_soft_kinds_are_satisfied_but_not_proven():
     # A satisfied observable_behavior / downstream_artifact proves only that a
     # diff shipped — it is satisfied but NOT machine-checked proven.
-    for kind, extra in (
-        ("observable_behavior", {"description": "the dashboard shows the SHA banner"}),
-        ("downstream_artifact", {"artifact_id": "release-deploy-artifact-registry"}),
+    for kind, extra, changed in (
+        (
+            "observable_behavior",
+            {"description": "the dashboard shows the SHA banner"},
+            ["backend/app/x.py"],
+        ),
+        (
+            "downstream_artifact",
+            {"artifact_id": "release-promotion-record"},
+            ["backend/app/release_promotion.py"],
+        ),
     ):
         task = _make_code_task(
             acceptance_evidence={"kind": kind, **extra},
-            changed_files=["backend/app/x.py"],
+            changed_files=changed,
         )
         verdict = evaluate_code_acceptance(task)
         assert verdict.satisfied is True
