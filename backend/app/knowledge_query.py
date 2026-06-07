@@ -14,12 +14,61 @@ omits the (potentially large) markdown body; only get-by-id returns it.
 """
 
 import uuid
+from typing import NamedTuple
 
 from sqlalchemy import String, cast, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import KnowledgeDocument
+
+
+class KnowledgeSubstance(NamedTuple):
+    """Lightweight record for knowledge-doc-based need satisfaction.
+
+    ``finding_hash`` is taken from the source Task's ``context["finding_hash"]``;
+    ``topic`` is the document's own topic field. Either or both may be None when
+    absent from the source or document.
+    """
+
+    finding_hash: str | None
+    topic: str | None
+
+
+async def fetch_knowledge_substance_index(
+    session,
+    project_id: uuid.UUID,
+) -> list[KnowledgeSubstance]:
+    """Build a lightweight substance index for knowledge-doc-based need resolution.
+
+    For each KnowledgeDocument in the project, returns a (finding_hash, topic)
+    record where finding_hash comes from the source Task's context["finding_hash"].
+    The mere presence of a KnowledgeDocument row is the 'durable/shipped' signal —
+    no extra gate needed (the forward-quality gate fires at write time).
+
+    Used by blocked-need resolution to satisfy a dangling kind='task' prerequisite
+    whose originating task is CANCELLED but whose substance persists as a durable
+    KnowledgeDocument, preventing escalation-parking forever.
+    """
+    from app.models import Task
+
+    rows = (
+        await session.execute(
+            select(KnowledgeDocument.topic, Task.context)
+            .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
+            .where(KnowledgeDocument.project_id == project_id)
+        )
+    ).all()
+    result: list[KnowledgeSubstance] = []
+    for topic, context in rows:
+        fh = (context or {}).get("finding_hash") if context is not None else None
+        result.append(
+            KnowledgeSubstance(
+                finding_hash=str(fh).strip() if fh else None,
+                topic=str(topic).strip() if topic else None,
+            )
+        )
+    return result
 
 
 def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) -> dict:

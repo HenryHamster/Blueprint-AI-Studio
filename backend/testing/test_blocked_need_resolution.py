@@ -512,3 +512,62 @@ def test_dead_match_excludes_co_deferred_shelving_by_capability():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "auth-tokens"}
     assert need_matched_dead_foundation(blocked, need, [shelved]) is False
+
+
+# ── knowledge_substance_satisfies_need ────────────────────────────────────────
+
+def test_dangling_task_ref_satisfied_by_completed_knowledge_document():
+    """Incident shape (2026-06-07): task 7186f089 permanently BLOCKED on finding-hash
+    'bfb447f23b6d44f6' whose originating task was CANCELLED, but a KnowledgeDocument
+    persists the substance — the need must be satisfied, not parked or terminated."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="bfb447f23b6d44f6", topic="better-runs-blueprint")]
+    need = {"kind": "task", "ref": "bfb447f23b6d44f6"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_knowledge_topic_equality_satisfies_need():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash=None, topic="auth-subsystem-design")]
+    need = {"kind": "task", "ref": "auth-subsystem-design"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_knowledge_finding_hash_mismatch_returns_false():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="aaaa1111", topic="some-topic")]
+    need = {"kind": "task", "ref": "bbbb2222"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_knowledge_topic_near_miss_not_fuzzy():
+    """Substring/prefix matches must NOT satisfy — exact equality only."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash=None, topic="auth-subsystem-design")]
+    need = {"kind": "task", "ref": "auth"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_knowledge_wrong_kind_not_satisfied():
+    """Only kind='task' is handled — capability/pr needs are not matched."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="abc", topic="abc")]
+    assert knowledge_substance_satisfies_need({"kind": "capability", "ref": "abc"}, substance) is False
+    assert knowledge_substance_satisfies_need({"kind": "pr", "ref": "abc"}, substance) is False
+
+
+def test_knowledge_empty_index_returns_false():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+
+    need = {"kind": "task", "ref": "anything"}
+    assert knowledge_substance_satisfies_need(need, []) is False

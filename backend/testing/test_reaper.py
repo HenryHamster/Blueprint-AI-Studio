@@ -7767,6 +7767,72 @@ async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resumes_when_need_satisfied_by_knowledge_document(
+    reaper_db, mocker
+):
+    """Incident shape (2026-06-07): a blocked dependent's kind='task' need whose ref
+    is a finding_hash is satisfied by a durable KnowledgeDocument even when the
+    originating task is CANCELLED — the dependent must resume (QUEUED), never be
+    routed to the dead-foundation-cancel path."""
+    from app.models import KnowledgeDocument
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Source task: CANCELLED (non-death — scope-empty so it is excluded from
+    # the dead-foundation path), but its finding_hash IS the need's ref.
+    source_task = Task(
+        project_id=project.id, title="source", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "bfb447f23b6d44f6", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    # A KnowledgeDocument was written by that source task — durable substance.
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind="web_research",
+        title="Better runs blueprint",
+        summary="Analysis of better-run patterns.",
+        body="Full analysis body here.",
+        topic="better-runs-blueprint",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    # Blocked dependent: kind='task' need referencing the source task's finding_hash.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs the research finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "bfb447f23b6d44f6",
+                "reason": "BLOCKER: needs the research finding",
+                "need": {"kind": "task", "ref": "bfb447f23b6d44f6"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    # Resumed via knowledge-document satisfaction — not cancelled.
+    assert t.status == TaskStatus.QUEUED
+    # No edge wired (knowledge satisfaction has no live foundation).
+    assert not (t.depends_on or [])
+    # Blocker metadata cleared.
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_treat_ghost_merge_as_completed_foundation(
     reaper_db, mocker
 ):

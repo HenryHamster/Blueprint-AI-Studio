@@ -98,6 +98,7 @@ def unresolved_capability_needs(
     active: List[Task],
     completed: List[Task],
     failed_parent_ids: Optional[set] = None,
+    substance_index=None,
 ) -> List[Dict[str, Any]]:
     """Return a BLOCKED task's UNRESOLVED foundation/capability needs.
 
@@ -110,16 +111,25 @@ def unresolved_capability_needs(
         (:func:`blocked_need_resolution.resolve_blocked_need` returns ``None``), AND
       * no already-shipped COMPLETED foundation satisfies it
         (:func:`blocked_need_resolution.completed_foundation_for_need` returns
-        ``None``).
+        ``None``), AND
+      * no durable KnowledgeDocument already holds its substance
+        (:func:`blocked_need_resolution.knowledge_substance_satisfies_need` returns
+        ``False`` when ``substance_index`` is provided).
 
     A foundation that is absent, dead, or completed-but-unshipped (ghost merge /
     unmerged) matches NEITHER set, so it is reported. A need a real foundation
-    provides — in flight or shipped — is dropped. ``pr`` needs are skipped (they
-    name an external ref, not a foundation this system commissions). ``active`` /
-    ``completed`` are pre-fetched same-project candidate sets;
-    ``failed_parent_ids`` is the stranded-parent set used to reject ghost merges
-    (mirrors ``reaper_sweeps._classify_blocker_needs``).
+    provides — in flight or shipped — is dropped. A need whose substance persists as
+    a durable KnowledgeDocument is also dropped: the work is done, even if the
+    originating task is CANCELLED. ``pr`` needs are skipped (they name an external
+    ref, not a foundation this system commissions). ``active`` / ``completed`` are
+    pre-fetched same-project candidate sets; ``failed_parent_ids`` is the
+    stranded-parent set used to reject ghost merges; ``substance_index`` is the
+    project's knowledge-substance index from
+    :func:`knowledge_query.fetch_knowledge_substance_index` (pass ``None`` or omit
+    to skip the knowledge check).
     """
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+
     unresolved: List[Dict[str, Any]] = []
     for need in get_blocker_needs(task):
         if _demand_identity(need) is None:
@@ -129,6 +139,10 @@ def unresolved_capability_needs(
         if (
             completed_foundation_for_need(task, need, completed, failed_parent_ids)
             is not None
+        ):
+            continue
+        if substance_index is not None and knowledge_substance_satisfies_need(
+            need, substance_index
         ):
             continue
         unresolved.append(need)
@@ -277,6 +291,11 @@ async def collect_missing_capability_demand(
     failed_parent_ids = {c.id for c in dead}
     failed_parent_ids |= {c.id for c in completed if not has_merge_unblock_signal(c)}
 
+    # Knowledge-substance index: a need whose substance is already captured in a
+    # durable KnowledgeDocument is not missing-foundation demand — the work is done.
+    from app.knowledge_query import fetch_knowledge_substance_index
+    substance_index = await fetch_knowledge_substance_index(session, project_id)
+
     entries: Dict[tuple, Dict[str, Any]] = {}
 
     # (a) Live BLOCKED dependents.
@@ -312,6 +331,7 @@ async def collect_missing_capability_demand(
             active=active,
             completed=completed,
             failed_parent_ids=failed_parent_ids,
+            substance_index=substance_index,
         ):
             identity = _demand_identity(need)
             if identity is None:

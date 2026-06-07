@@ -774,8 +774,26 @@ async def _fetch_active_candidates(session, project_id) -> list:
     )
 
 
+async def _fetch_knowledge_substance_index(session, project_id) -> list:
+    """Substance index for durable KnowledgeDocuments in a project.
+
+    Delegates to :func:`knowledge_query.fetch_knowledge_substance_index` so the
+    SQL join lives in one place and the result is cached per project across the
+    sweep batch (exactly as the active/completed/dead candidate caches are).
+    """
+    from app.knowledge_query import fetch_knowledge_substance_index
+
+    return await fetch_knowledge_substance_index(session, project_id)
+
+
 async def _classify_blocker_needs(
-    task, session, *, candidate_cache: dict, completed_cache: dict, dead_cache: dict
+    task,
+    session,
+    *,
+    candidate_cache: dict,
+    completed_cache: dict,
+    dead_cache: dict,
+    knowledge_cache: dict,
 ) -> dict:
     """Classify EVERY recorded need of a blocked task against the live foundations.
 
@@ -786,11 +804,16 @@ async def _classify_blocker_needs(
       ``had_needs``       — the task carried ≥1 machine-resolvable need
       ``edges``           — foundation ids to wire (need → active in-flight task)
       ``completed_needs`` — needs satisfied by already-completed/merged work
+                            (includes knowledge-document-satisfied needs)
       ``residual``        — needs not yet accounted for (no foundation matches)
       ``dead``            — ≥1 need names a terminally FAILED/CANCELLED foundation
 
-    Resolution per need is active → completed → dead → residual, mirroring the
-    single-need ordering. Reuses the shared conservative predicates in
+    Resolution per need is active → completed → knowledge → dead → residual.
+    Knowledge-satisfied needs (a dangling kind='task' ref whose substance persists
+    as a durable KnowledgeDocument) are routed into ``completed_needs`` so the
+    existing resume path handles them without wiring a depends_on edge. This
+    prevents the dead-foundation path from cancelling a dependent whose need IS
+    durably satisfied. Reuses the shared conservative predicates in
     :mod:`app.blocked_need_resolution` (no parallel matcher); candidate sets are
     fetched lazily and cached per project across the sweep batch. A foundation
     already present in ``task.depends_on`` is treated as already-wired (it is not
@@ -801,6 +824,7 @@ async def _classify_blocker_needs(
         resolve_blocked_need,
         completed_foundation_for_need,
         need_matched_dead_foundation,
+        knowledge_substance_satisfies_need,
     )
 
     needs = get_blocker_needs(task)
@@ -829,6 +853,10 @@ async def _classify_blocker_needs(
     if dead is None:
         dead = await _fetch_dead_candidates(session, task.project_id)
         dead_cache[task.project_id] = dead
+    knowledge = knowledge_cache.get(task.project_id)
+    if knowledge is None:
+        knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
+        knowledge_cache[task.project_id] = knowledge
 
     # Stranded-parent set so a ghost-merge / unshipped foundation does NOT satisfy
     # a completed need — mirrors the respawn-dedup layer's "shipped" notion
@@ -854,6 +882,12 @@ async def _classify_blocker_needs(
             completed_foundation_for_need(task, need, completed, failed_parents)
             is not None
         ):
+            disp["completed_needs"].append(need)
+            continue
+        # Durable-knowledge fallback: a dangling kind='task' need whose originating
+        # task is CANCELLED but whose substance persists as a KnowledgeDocument is
+        # satisfied — do NOT route it to the dead-foundation path.
+        if knowledge_substance_satisfies_need(need, knowledge):
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
@@ -1442,6 +1476,10 @@ async def sweep_unblock_blocked_tasks(
     # foundation that has definitively died makes its dependent impossible — it is
     # cancelled rather than parked to re-arm forever.
     dead_cache: dict = {}
+    # Durable knowledge-document substance index: a dangling kind='task' need whose
+    # originating task is CANCELLED but whose substance persists as a durable
+    # KnowledgeDocument is satisfied rather than routed to the dead-foundation path.
+    knowledge_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1487,6 +1525,7 @@ async def sweep_unblock_blocked_tasks(
             candidate_cache=candidate_cache,
             completed_cache=completed_cache,
             dead_cache=dead_cache,
+            knowledge_cache=knowledge_cache,
         )
 
         # Already escalated terminally — leave parked for the operator. On
@@ -1793,6 +1832,7 @@ async def event_driven_unblock_dependents(
     candidate_cache: dict = {}
     completed_cache: dict = {}
     dead_cache: dict = {}
+    knowledge_cache: dict = {}
 
     for task in candidates:
         # Skip tasks with no machine-resolvable needs; the sweep handles those.
@@ -1807,6 +1847,7 @@ async def event_driven_unblock_dependents(
                 candidate_cache=candidate_cache,
                 completed_cache=completed_cache,
                 dead_cache=dead_cache,
+                knowledge_cache=knowledge_cache,
             )
             if not disp["had_needs"]:
                 continue
