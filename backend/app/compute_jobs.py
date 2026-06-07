@@ -531,6 +531,8 @@ async def _process_single_compute_job(session, job: ComputeJob) -> None:
         # without a migration. Absent metrics (None) leave the key unwritten.
         if status.metrics:
             _set_meta(job, result_metrics=dict(status.metrics))
+        if status.command_log:
+            _set_meta(job, command_log=dict(status.command_log))
         outcome = (
             ComputeJobOutcome.SUCCESS
             if status.status == ComputeJobStatus.SUCCEEDED
@@ -696,23 +698,24 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
         return
     try:
         async with session.begin_nested():
+            artifact_logs = {
+                "compute_job_id": str(job.id),
+                "backend": reference.backend,
+                "artifact_uri": reference.uri,
+                "file_count": reference.file_count,
+                "outcome": (
+                    job.outcome.value if job.outcome is not None else None
+                ),
+                "final_cost_usd": job.final_cost_usd,
+            }
+            command_log = (job.polling_metadata or {}).get("command_log")
+            if command_log is not None:
+                artifact_logs["command_log"] = command_log
             artifact = Artifact(
                 task_id=job.task_id,
                 artifact_type=ArtifactType.COMPUTE_RESULT,
                 storage_uri=reference.uri,
-                logs=json.dumps(
-                    {
-                        "compute_job_id": str(job.id),
-                        "backend": reference.backend,
-                        "artifact_uri": reference.uri,
-                        "file_count": reference.file_count,
-                        "outcome": (
-                            job.outcome.value if job.outcome is not None else None
-                        ),
-                        "final_cost_usd": job.final_cost_usd,
-                    },
-                    sort_keys=True,
-                ),
+                logs=json.dumps(artifact_logs, sort_keys=True),
             )
             session.add(artifact)
             await session.flush()  # assign artifact.id before stamping the job

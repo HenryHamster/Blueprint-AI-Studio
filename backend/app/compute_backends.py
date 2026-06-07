@@ -44,6 +44,8 @@ _SERIAL_REASON_PREFIX = "BLUEPRINT_COMPUTE_REASON="
 # no metric value has to survive serial/escape passes — see CLAUDE.md's rule on
 # generating one language from another.
 _SERIAL_METRICS_PREFIX = "BLUEPRINT_COMPUTE_METRICS="
+# Single-line, base64-encoded marker carrying the command's bounded combined log.
+_SERIAL_COMMAND_LOG_PREFIX = "BLUEPRINT_COMPUTE_COMMAND_LOG="
 
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
@@ -70,6 +72,10 @@ _LOCAL_ARTIFACT_DIRNAME = "artifacts"
 # must be tolerated as simply ABSENT, never raise.
 _MAX_RESULT_METRICS = 64
 _MAX_RESULT_METRICS_DECODED_BYTES = 8192
+# Defensive bounds on the command-log payload. Noisy output should be truncated
+# rather than allowed to balloon the durable result or wedge teardown.
+_MAX_COMMAND_LOG_BYTES = 32768
+_MAX_COMMAND_LOG_DECODED_BYTES = 65536
 
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
@@ -117,6 +123,8 @@ class ComputeStatusResult:
     # tokens_per_sec, final_loss, ...). None means the command reported nothing
     # OR the marker was missing/garbled — both treated identically as ABSENT.
     metrics: dict[str, float] | None = None
+    # Bounded combined stdout/stderr from the launched command.
+    command_log: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -274,6 +282,9 @@ class LocalSubprocessComputeBackend:
         if return_code is None:
             return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
         self._processes.pop(job.external_compute_id or "", None)
+        terminal = _read_local_terminal_status(job)
+        if terminal is not None:
+            return terminal
         if return_code == 0:
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
@@ -543,6 +554,7 @@ def _read_local_terminal_status_for_external_id(
         except ValueError:
             finished_at = _utcnow()
     metrics = _decode_result_metrics(data.get("METRICS"))
+    command_log = _decode_command_log(data.get("COMMAND_LOG"))
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -550,6 +562,7 @@ def _read_local_terminal_status_for_external_id(
             exit_code=0 if exit_code is None else exit_code,
             finished_at=finished_at,
             metrics=metrics,
+            command_log=command_log,
         )
     if exit_code is None:
         return ComputeStatusResult(
@@ -557,6 +570,7 @@ def _read_local_terminal_status_for_external_id(
             message="local subprocess exited with unknown code",
             finished_at=finished_at,
             metrics=metrics,
+            command_log=command_log,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -564,6 +578,7 @@ def _read_local_terminal_status_for_external_id(
         exit_code=exit_code,
         finished_at=finished_at,
         metrics=metrics,
+        command_log=command_log,
     )
 
 
@@ -573,6 +588,12 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
     result_path = shlex.quote(_local_result_path_for_external_id(external_id))
     artifact_dir = shlex.quote(_local_artifact_dir_for_external_id(external_id))
+    command_log_path = shlex.quote(
+        os.path.join(
+            _local_artifact_dir_for_external_id(external_id),
+            "command.log.json",
+        )
+    )
     command_literal = shlex.quote(command)
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
@@ -581,10 +602,57 @@ mkdir -p {artifact_dir}
 printf '%s\\n' "$$" > {pid_path}
 rm -f {terminal_path}
 rm -f {result_path}
+rm -f {command_log_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
 EXIT_CODE=0
-if bash -lc {command_literal}; then
+if python3 - \
+  {command_literal} \
+  {command_log_path} <<'PY'; then
+import json
+import pathlib
+import subprocess
+import sys
+
+command = sys.argv[1]
+log_path = pathlib.Path(sys.argv[2])
+log_path.parent.mkdir(parents=True, exist_ok=True)
+proc = subprocess.Popen(
+    ["bash", "-lc", command],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+captured = bytearray()
+truncated = False
+assert proc.stdout is not None
+while True:
+    chunk = proc.stdout.read(8192)
+    if not chunk:
+        break
+    if len(captured) < {_MAX_COMMAND_LOG_BYTES}:
+        remaining = {_MAX_COMMAND_LOG_BYTES} - len(captured)
+        if len(chunk) <= remaining:
+            captured.extend(chunk)
+        else:
+            captured.extend(chunk[:remaining])
+            truncated = True
+    else:
+        truncated = True
+exit_code = proc.wait()
+if proc.stdout is not None:
+    proc.stdout.close()
+if captured or truncated:
+    payload = {{
+        "text": captured.decode("utf-8", "replace"),
+        "truncated": truncated,
+        "byte_count": len(captured),
+    }}
+    log_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+sys.exit(exit_code)
+PY
   STATUS=SUCCEEDED
   EXIT_CODE=0
 else
@@ -596,11 +664,16 @@ METRICS_B64=""
 if [ -f {result_path} ]; then
   METRICS_B64=$(base64 -w0 < {result_path} 2>/dev/null || true)
 fi
+COMMAND_LOG_B64=""
+if [ -s {command_log_path} ]; then
+  COMMAND_LOG_B64=$(base64 -w0 < {command_log_path} 2>/dev/null || true)
+fi
 cat > {terminal_path} <<EOF
 STATUS=$STATUS
 EXIT_CODE=$EXIT_CODE
 FINISHED_AT=$FINISHED_AT
 METRICS=$METRICS_B64
+COMMAND_LOG=$COMMAND_LOG_B64
 EOF
 exit "$EXIT_CODE"
 """
@@ -813,6 +886,9 @@ def _build_gcp_startup_script(
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
+    command_log_path = shlex.quote(
+        os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
+    )
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
     return f"""#!/bin/bash
@@ -876,10 +952,57 @@ echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 export {RESULT_FILE_ENV}={result_file}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
 rm -f {result_file}
+rm -f {command_log_path}
 mkdir -p {artifact_dir}
 {cwd_line}
 EXIT_CODE=0
-if bash -lc {command}; then
+if python3 - \
+  {command} \
+  {command_log_path} <<'PY'; then
+import json
+import pathlib
+import subprocess
+import sys
+
+command = sys.argv[1]
+log_path = pathlib.Path(sys.argv[2])
+log_path.parent.mkdir(parents=True, exist_ok=True)
+proc = subprocess.Popen(
+    ["bash", "-lc", command],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+captured = bytearray()
+truncated = False
+assert proc.stdout is not None
+while True:
+    chunk = proc.stdout.read(8192)
+    if not chunk:
+        break
+    if len(captured) < {_MAX_COMMAND_LOG_BYTES}:
+        remaining = {_MAX_COMMAND_LOG_BYTES} - len(captured)
+        if len(chunk) <= remaining:
+            captured.extend(chunk)
+        else:
+            captured.extend(chunk[:remaining])
+            truncated = True
+    else:
+        truncated = True
+exit_code = proc.wait()
+if proc.stdout is not None:
+    proc.stdout.close()
+if captured or truncated:
+    payload = {{
+        "text": captured.decode("utf-8", "replace"),
+        "truncated": truncated,
+        "byte_count": len(captured),
+    }}
+    log_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+sys.exit(exit_code)
+PY
   EXIT_CODE=0
   echo "{_SERIAL_REASON_PREFIX}completed"
   echo "{_SERIAL_STATUS_PREFIX}SUCCEEDED"
@@ -893,6 +1016,13 @@ if [ -f {result_file} ]; then
   METRICS_B64=$(base64 -w0 < {result_file} 2>/dev/null || true)
   if [ -n "$METRICS_B64" ]; then
     echo "{_SERIAL_METRICS_PREFIX}$METRICS_B64"
+  fi
+fi
+COMMAND_LOG_B64=""
+if [ -s {command_log_path} ]; then
+  COMMAND_LOG_B64=$(base64 -w0 < {command_log_path} 2>/dev/null || true)
+  if [ -n "$COMMAND_LOG_B64" ]; then
+    echo "{_SERIAL_COMMAND_LOG_PREFIX}$COMMAND_LOG_B64"
   fi
 fi
 upload_artifacts
@@ -946,11 +1076,47 @@ def _decode_result_metrics(raw_b64: str | None) -> dict[str, float] | None:
     return metrics or None
 
 
+def _decode_command_log(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode a bounded command-log marker into a structured payload."""
+    if not raw_b64:
+        return None
+    candidate = raw_b64.strip()
+    if not candidate:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _MAX_COMMAND_LOG_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    text = parsed.get("text")
+    truncated = parsed.get("truncated")
+    byte_count = parsed.get("byte_count")
+    if not isinstance(text, str):
+        return None
+    if not isinstance(truncated, bool):
+        return None
+    if not isinstance(byte_count, int) or byte_count < 0:
+        return None
+    return {
+        "text": text,
+        "truncated": truncated,
+        "byte_count": byte_count,
+    }
+
+
 def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     status_line: str | None = None
     exit_code: int | None = None
     reason: str | None = None
     metrics_b64: str | None = None
+    command_log_b64: str | None = None
     for raw_line in serial_output.splitlines():
         line = raw_line.strip()
         if line.startswith(_SERIAL_STATUS_PREFIX):
@@ -964,11 +1130,14 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             reason = line[len(_SERIAL_REASON_PREFIX) :]
         elif line.startswith(_SERIAL_METRICS_PREFIX):
             metrics_b64 = line[len(_SERIAL_METRICS_PREFIX) :]
+        elif line.startswith(_SERIAL_COMMAND_LOG_PREFIX):
+            command_log_b64 = line[len(_SERIAL_COMMAND_LOG_PREFIX) :]
     if status_line is None:
         return None
     if status_line == "RUNNING":
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
     metrics = _decode_result_metrics(metrics_b64)
+    command_log = _decode_command_log(command_log_b64)
     if status_line == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -976,6 +1145,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             exit_code=exit_code,
             finished_at=_utcnow(),
             metrics=metrics,
+            command_log=command_log,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -983,4 +1153,5 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         exit_code=exit_code,
         finished_at=_utcnow(),
         metrics=metrics,
+        command_log=command_log,
     )

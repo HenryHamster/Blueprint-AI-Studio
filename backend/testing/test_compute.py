@@ -598,14 +598,22 @@ def _metrics_marker(payload: object) -> str:
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
 
+def _command_log_marker(payload: object) -> str:
+    return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
 def test_gcp_serial_parse_extracts_result_metrics():
     marker = _metrics_marker({"accuracy": 0.91, "tokens_per_sec": 1234, "ok": True})
+    command_log = _command_log_marker(
+        {"text": "stdout line\nstderr line\n", "truncated": False, "byte_count": 24}
+    )
     serial = "\n".join(
         [
             "BLUEPRINT_COMPUTE_REASON=completed",
             "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
             "BLUEPRINT_COMPUTE_EXIT_CODE=0",
             f"BLUEPRINT_COMPUTE_METRICS={marker}",
+            f"BLUEPRINT_COMPUTE_COMMAND_LOG={command_log}",
         ]
     )
     status = compute_backends_module._parse_serial_status(serial)
@@ -613,6 +621,11 @@ def test_gcp_serial_parse_extracts_result_metrics():
     assert status.status == ComputeJobStatus.SUCCEEDED
     # bool coerced to a number; all values numeric.
     assert status.metrics == {"accuracy": 0.91, "tokens_per_sec": 1234.0, "ok": 1.0}
+    assert status.command_log == {
+        "text": "stdout line\nstderr line\n",
+        "truncated": False,
+        "byte_count": 24,
+    }
 
 
 def test_gcp_serial_parse_missing_marker_yields_no_metrics():
@@ -629,17 +642,20 @@ def test_gcp_serial_parse_missing_marker_yields_no_metrics():
 
 
 def test_gcp_serial_parse_garbled_marker_is_tolerated():
+    bad_log = "not-valid-base64-$$$"
     serial = "\n".join(
         [
             "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
             "BLUEPRINT_COMPUTE_EXIT_CODE=0",
             "BLUEPRINT_COMPUTE_METRICS=not-valid-base64-$$$",
+            f"BLUEPRINT_COMPUTE_COMMAND_LOG={bad_log}",
         ]
     )
     status = compute_backends_module._parse_serial_status(serial)
     assert status is not None
     assert status.status == ComputeJobStatus.SUCCEEDED
     assert status.metrics is None
+    assert status.command_log is None
 
 
 def test_decode_result_metrics_filters_non_numeric_and_bounds():
@@ -707,6 +723,7 @@ async def test_local_state_file_parse_extracts_result_metrics():
 
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.metrics == {"accuracy": 0.88, "loss": 0.12}
+    assert terminal.command_log is None
 
 
 @pytest.mark.asyncio
@@ -739,6 +756,69 @@ async def test_local_state_file_parse_no_result_file_yields_no_metrics():
 
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.metrics is None
+    assert terminal.command_log is None
+
+
+@pytest.mark.asyncio
+async def test_local_compute_job_persists_result_metrics_through_monitor(
+    db_session, monkeypatch
+):
+    """Regression: live-handle exit path must surface metrics just like recovery path.
+
+    When the monitor catches the subprocess still alive in its _processes dict and
+    then sees it exit (the live-handle path), the resulting ComputeStatusResult must
+    include any metrics written to BLUEPRINT_RESULT_FILE — identical to what the
+    restart-recovery path returns from _read_local_terminal_status.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Live Exit Metrics", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="live exit metrics parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command='echo \'{"accuracy": 0.95, "f1": 0.88}\' > "$BLUEPRINT_RESULT_FILE"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+
+    # Use the real LocalSubprocessComputeBackend — do NOT monkeypatch it away.
+    # The singleton _LOCAL_BACKEND is returned by get_compute_backend for the
+    # "local-subprocess" name, so the live _processes handle is retained across calls.
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Drive the monitor until terminal or timeout (subprocess should finish in <2s).
+    for _ in range(60):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in (ComputeJobStatus.SUCCEEDED, ComputeJobStatus.FAILED):
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise AssertionError(
+            f"compute job did not reach terminal status within timeout; status={job.status}"
+        )
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.polling_metadata.get("result_metrics") == {"accuracy": 0.95, "f1": 0.88}
 
 
 @pytest.mark.asyncio
@@ -791,7 +871,8 @@ def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     assert f"export BLUEPRINT_ARTIFACT_DIR={shlex.quote(artifact_dir)}" in wrapper
     assert f"mkdir -p {shlex.quote(artifact_dir)}" in wrapper
     # The artifact dir is durable: it must NOT be removed by the wrapper.
-    assert f"rm -f {shlex.quote(artifact_dir)}" not in wrapper
+    # Use trailing newline to avoid matching files inside the dir (e.g. command.log.json).
+    assert f"rm -f {shlex.quote(artifact_dir)}\n" not in wrapper
     assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
 
 
@@ -810,11 +891,13 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
 
     assert "export BLUEPRINT_ARTIFACT_DIR=" in script
     assert "mkdir -p" in script and compute_backends_module._GCP_ARTIFACT_DIR_PATH in script
+    assert "command.log.json" in script
     # Upload targets ONLY this job's bundle object, bounded by a hard timeout, best-effort.
     assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in script
     assert "https://storage.example.com/upload" in script
     assert "curl --fail --silent --show-error" in script
     assert "python3 - " in script
+    assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in script
     assert (
         f"timeout {compute_backends_module._GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS}"
         in script
@@ -871,6 +954,7 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
     assert len(provision_calls) == 1
     startup_script = provision_calls[0]["startup_script"]
     assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in startup_script
+    assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in startup_script
     assert "https://storage.example.com/upload" in startup_script
     assert "gcloud storage cp" not in startup_script
     assert "gsutil -m cp -r" not in startup_script
@@ -1089,10 +1173,10 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
 
 
 @pytest.mark.asyncio
-async def test_artifact_survives_teardown_and_is_linked(db_session, monkeypatch):
-    """End-to-end (local backend): a job writes a file into the durable artifact
-    directory, reaches terminal, and the monitor links that surviving location as
-    a first-class result.
+async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch):
+    """End-to-end (local backend): a job writes durable output and emits
+    stdout/stderr, and the monitor links that surviving location as a
+    first-class result with a bounded command log.
 
     Proves the whole contract in one pass: the file is re-readable from the
     durable location AFTER the subprocess (the local analogue of VM teardown) is
@@ -1120,7 +1204,11 @@ async def test_artifact_survives_teardown_and_is_linked(db_session, monkeypatch)
     job = await compute_jobs.create_compute_job(
         db_session,
         task,
-        command='printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        command=(
+            'printf "stdout-line\\n"; '
+            'printf "stderr-line\\n" >&2; '
+            'printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"'
+        ),
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
@@ -1172,12 +1260,88 @@ async def test_artifact_survives_teardown_and_is_linked(db_session, monkeypatch)
     assert artifact.task_id == task.id
     assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
     assert artifact.storage_uri == durable_uri
+    assert job.polling_metadata["command_log"]["truncated"] is False
 
     # The artifact cites the durable result (no parallel persistence channel).
     logged = json.loads(artifact.logs)
     assert logged["compute_job_id"] == str(job.id)
     assert logged["artifact_uri"] == durable_uri
     assert logged["file_count"] >= 1
+    assert logged["command_log"]["truncated"] is False
+    assert "stdout-line" in logged["command_log"]["text"]
+    assert "stderr-line" in logged["command_log"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_compute_job_truncates_bounded_log_without_blocking_completion(
+    db_session, monkeypatch
+):
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Noisy Log", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command=(
+            "python3 - <<'PY'\n"
+            "import os, sys\n"
+            "sys.stdout.write('x' * 100000)\n"
+            "sys.stdout.write('\\n')\n"
+            "sys.stderr.write('y' * 100000)\n"
+            "sys.stderr.write('\\n')\n"
+            "path = os.path.join(os.environ['BLUEPRINT_ARTIFACT_DIR'], 'model.ckpt')\n"
+            "with open(path, 'w', encoding='utf-8') as handle:\n"
+            "    handle.write('checkpoint')\n"
+            "PY"
+        ),
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    logged = json.loads(artifact.logs)
+    assert logged["command_log"]["truncated"] is True
+    assert (
+        logged["command_log"]["byte_count"]
+        <= compute_backends_module._MAX_COMMAND_LOG_BYTES
+    )
+    assert (
+        len(logged["command_log"]["text"].encode("utf-8"))
+        <= compute_backends_module._MAX_COMMAND_LOG_BYTES
+    )
 
 
 @pytest.mark.asyncio
@@ -1206,7 +1370,7 @@ async def test_terminal_job_with_empty_artifact_dir_links_no_artifact(
     job = await compute_jobs.create_compute_job(
         db_session,
         task,
-        command="echo ok",  # writes nothing to $BLUEPRINT_ARTIFACT_DIR
+        command="true",  # writes nothing to $BLUEPRINT_ARTIFACT_DIR or stdout/stderr
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
