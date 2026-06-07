@@ -32,6 +32,7 @@ from app.acceptance_gate import (
     acceptance_blocks_success,
     acceptance_is_proven,
     acceptance_was_declared,
+    classify_merged_acceptance,
 )
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
@@ -804,20 +805,20 @@ async def _update_direction_research_outcomes(
     # alongside prs_merged for back-compat; consumers that need "proven fix"
     # counts should prefer this field over the raw prs_merged.
     #
-    # The acceptance exclusion mirrors the per-task outcome layer
-    # (``task_outcomes._evaluate_write``): a code task that DECLARED acceptance
-    # evidence carries a durable verdict under ``code_acceptance_verdict``; when
-    # that evidence was declared but NOT satisfied, the merge does not prove the
-    # claimed behavior and must not inflate verified progress. Rows with no
-    # recorded verdict (no declaration, legacy rows) are never excluded — the
-    # predicate is additive and backward-compatible.
-    entry["verified_prs_merged"] = sum(
-        1
-        for ct in _merged_rows
-        if merge_verification_status(ct) != "unverified_degraded"
-        and not acceptance_blocks_success(
-            (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-        )
+    # The shared acceptance classifier keeps the direction window and release
+    # window in sync: the non-degraded buckets (proven + declared_unsatisfied +
+    # no_declaration) still count as verified, while degraded rows stay out.
+    aggregate_buckets = {
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "merged_unverified_degraded": 0,
+        "no_declaration": 0,
+    }
+    for ct in _merged_rows:
+        aggregate_buckets[classify_merged_acceptance(ct)] += 1
+    entry["verified_prs_merged"] = (
+        aggregate_buckets["proven"]
+        + aggregate_buckets["no_declaration"]
     )
     # Honest proven-by-evidence + declaration-coverage aggregates. These are
     # STRICTLY ADDITIVE: they do not change verified_prs_merged, prs_merged, or

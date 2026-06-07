@@ -710,15 +710,15 @@ async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
     db_session: AsyncSession,
 ):
     """The acceptance exclusion composes with the degraded-unverified one: a
-    merge that is both degraded and acceptance-unsatisfied drops once, and each
-    exclusion independently removes its row."""
+    merge that is both degraded and acceptance-unsatisfied drops once, while an
+    undeclared merge stays neutral and still counts toward verified progress."""
     direction_id = "d-accept-degraded"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
     project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=4)
+        _make_direction(direction_id, research_task_id, tasks_created=5)
     ]
     await db_session.flush()
 
@@ -730,6 +730,15 @@ async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
         title="clean",
+    )
+    # Undeclared merge — neutral, still counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="undeclared",
     )
     # Degraded-unverified merge — excluded by the degraded gate.
     await _create_child_task(
@@ -779,10 +788,10 @@ async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    assert entry["prs_merged"] == 4
-    # Only the clean merge survives both gates.
-    assert entry["verified_prs_merged"] == 1
-    assert entry["conversion_rate"] == round(1 / 4, 3)
+    assert entry["prs_merged"] == 5
+    # Clean + undeclared merges survive; degraded and unsatisfied rows do not.
+    assert entry["verified_prs_merged"] == 2
+    assert entry["conversion_rate"] == round(2 / 5, 3)
 
 
 def test_churn_metrics_excludes_degraded_unverified_merges():

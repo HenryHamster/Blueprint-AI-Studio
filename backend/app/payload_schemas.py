@@ -434,7 +434,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
     # Current LTS version/phase context. Keys: version_number, phase,
-    # phase_changed_at, tasks_merged_this_version, last_qualification.
+    # phase_changed_at, tasks_merged_this_version, last_qualification,
+    # acceptance_aggregate (additive proven-vs-merged version-window aggregate,
+    # carried alongside the raw tasks_merged_this_version count; nullable on
+    # legacy rows). Stays ``dict[str, Any] | None`` with extra='allow', so the
+    # additive key needs no validation change.
     version_phase: dict[str, Any] | None = None
     # Citable memo summaries (terminal reasoning artifacts spawned from dropped
     # research findings) for this cycle window. Optional + default-None so

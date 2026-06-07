@@ -239,6 +239,11 @@ async def get_version_lifecycle(
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
         aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
+        acceptance_aggregate = None
+        if isinstance(qual, dict):
+            acceptance_aggregate = qual.get("acceptance_aggregate")
+        if acceptance_aggregate is None:
+            acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
         # Verdict-staleness signal: how many tasks merged AT/AFTER the open
         # version's last qualification verdict was finalized. Each verdict is
         # evaluated against one candidate commit; merges landing after
@@ -305,6 +310,11 @@ async def get_version_lifecycle(
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # Version-window acceptance aggregate (proven-vs-merged) — additive
+            # and nullable, surfaced ALONGSIDE the raw ``merged_task_count`` (not
+            # replacing it). Computed/stored by the acceptance layer; ``None`` on
+            # legacy open versions that predate the aggregate.
+            "acceptance_aggregate": acceptance_aggregate,
             # Tasks merged AT/AFTER the last qualification verdict's finalized_at
             # (verdict-staleness signal). None when no verdict/finalized_at.
             "merged_since_verdict": merged_since_verdict,

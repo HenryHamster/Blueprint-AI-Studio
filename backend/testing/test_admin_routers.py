@@ -8909,6 +8909,178 @@ class TestVersionLifecycleInFlightCount:
         assert resp.json()["current_version"]["in_flight_task_count"] == 2
 
 
+class TestVersionLifecycleAcceptanceAggregate:
+    """The version-lifecycle current_version and qualification-verdicts rows
+    expose the additive ``acceptance_aggregate`` key (proven-vs-merged) ALONGSIDE
+    the unchanged raw merged-count fields, backward-compatibly defaulting to
+    None on rows with no stored aggregate."""
+
+    @pytest.mark.asyncio
+    async def test_current_version_exposes_acceptance_aggregate_key(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version carries acceptance_aggregate (None default) next to
+        the unchanged merged_task_count."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=2),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        # Additive key is present and backward-compatible (None on legacy rows)...
+        assert "acceptance_aggregate" in current
+        assert current["acceptance_aggregate"] is None
+        # ...and the raw merged-count field is preserved unchanged.
+        assert current["merged_task_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_current_version_surfaces_stored_acceptance_aggregate_after_reload(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version reads acceptance_aggregate back out of persisted
+        last_qualification JSON after the row is reloaded from the database."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        aggregate = {
+            "merged": 3,
+            "proven": 2,
+            "declared_unsatisfied": 1,
+            "merged_unverified_degraded": 0,
+            "no_declaration": 0,
+            "proven_rate": 0.667,
+        }
+        version.last_qualification = {"status": "dry_run", "acceptance_aggregate": aggregate}
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["acceptance_aggregate"] == aggregate
+        assert current["merged_task_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_verdict_row_exposes_acceptance_aggregate_key(
+        self, client: AsyncClient, db_session
+    ):
+        """Each qualification-verdict row carries acceptance_aggregate (None
+        default) without disturbing the existing verdict fields."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="aggsha456",
+            confidence=0.92,
+            would_promote=True,
+            promotion_enabled=False,
+            terminal_status="dry_run",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert "acceptance_aggregate" in verdicts[0]
+        assert verdicts[0]["acceptance_aggregate"] is None
+        assert verdicts[0]["candidate_sha"] == "aggsha456"
+
+    @pytest.mark.asyncio
+    async def test_verdict_row_surfaces_stored_acceptance_aggregate_after_reload(
+        self, client: AsyncClient, db_session
+    ):
+        """qualification-verdict rows read acceptance_aggregate back out of the
+        persisted JSON-backed evidence payload after reload."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+        aggregate = {
+            "merged": 4,
+            "proven": 3,
+            "declared_unsatisfied": 1,
+            "merged_unverified_degraded": 0,
+            "no_declaration": 0,
+            "proven_rate": 0.75,
+        }
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="aggsha789",
+            confidence=0.92,
+            would_promote=True,
+            promotion_enabled=False,
+            terminal_status="dry_run",
+            threshold=0.90,
+            sub_scores={"acceptance_aggregate": aggregate},
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["acceptance_aggregate"] == aggregate
+        assert verdicts[0]["candidate_sha"] == "aggsha789"
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 

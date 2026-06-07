@@ -25,6 +25,10 @@ Public API:
   count_merged_since(session, project_id, since)
       Count tasks whose PR was merged after ``since`` for a project.
 
+  compute_version_acceptance_aggregate(session, project_id, *, since)
+      Classify merged-since tasks by acceptance-evidence outcome
+      (proven / declared_unsatisfied / undeclared / total).
+
   recent_closed_versions(session, project_id, limit=5)
       Return the most recently closed/promoted versions for a project,
       newest first.  Used by the operator version-lifecycle panel.
@@ -51,6 +55,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
 from app.landed_signal import landed_signal_predicate
 from app.models import Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _coerce_naive_utc, _utcnow
@@ -269,6 +277,68 @@ async def count_merged_since(
     )
     result = await session.execute(stmt)
     return int(result.scalar() or 0)
+
+
+async def compute_version_acceptance_aggregate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    since: datetime,
+) -> dict[str, int]:
+    """Classify version-window merged tasks by acceptance-evidence outcome.
+
+    Operates over the same merged-since window as :func:`count_merged_since`
+    (``COMPLETED`` tasks carrying the canonical landing signal with
+    ``updated_at >= since``).  For each landed task it reads the durable
+    per-task code-acceptance verdict
+    (:data:`app.acceptance_gate.CODE_ACCEPTANCE_VERDICT_KEY`, stamped at land
+    time) off ``Task.context`` and buckets it:
+
+      - ``proven`` — a verdict was recorded AND is explicitly satisfied
+        (declared acceptance evidence that passed).
+      - ``declared_unsatisfied`` — a verdict was recorded AND is explicitly
+        unsatisfied per :func:`app.acceptance_gate.acceptance_blocks_success`
+        (declared acceptance evidence that did NOT pass).
+      - ``undeclared`` — no verdict key present.  This is the common, legacy,
+        and "declared no acceptance evidence" case; counted for visibility but
+        it must NEVER be held against promotion readiness.
+
+    Returns ``{proven, declared_unsatisfied, undeclared, total}``.  A malformed
+    recorded verdict (a dict that is neither satisfied nor explicitly
+    unsatisfied) is fail-safe — counted as ``undeclared`` so it never lowers
+    readiness.
+    """
+    stmt = select(Task.context).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        Task.updated_at >= since,
+        landed_signal_predicate(session),
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    proven = 0
+    declared_unsatisfied = 0
+    undeclared = 0
+    for ctx in rows:
+        recorded = (
+            ctx.get(CODE_ACCEPTANCE_VERDICT_KEY) if isinstance(ctx, dict) else None
+        )
+        if recorded is None:
+            undeclared += 1
+        elif acceptance_blocks_success(recorded):
+            declared_unsatisfied += 1
+        elif isinstance(recorded, dict) and recorded.get("satisfied") is True:
+            proven += 1
+        else:
+            # Malformed/indeterminate recorded verdict — fail safe.
+            undeclared += 1
+
+    return {
+        "proven": proven,
+        "declared_unsatisfied": declared_unsatisfied,
+        "undeclared": undeclared,
+        "total": len(rows),
+    }
 
 
 # Non-terminal task statuses — work that is still "in flight" against a version.
@@ -706,6 +776,11 @@ def to_phase_block(
         if artifact_evidence is not None
         else version.deploy_failure_reason
     )
+    acceptance_aggregate = None
+    if isinstance(version.last_qualification, dict):
+        acceptance_aggregate = version.last_qualification.get("acceptance_aggregate")
+    if acceptance_aggregate is None:
+        acceptance_aggregate = getattr(version, "acceptance_aggregate", None)
     block = {
         "version_number": version.version_number,
         "phase": version.phase,
@@ -728,6 +803,13 @@ def to_phase_block(
         "served_sha": version.served_sha,
         "served_at": version.served_at.isoformat() if version.served_at else None,
         "deploy_failure_reason": effective_failure_reason,
+        # Version-window acceptance aggregate (proven-vs-merged) — additive and
+        # nullable. The aggregate itself is computed/stored by the acceptance
+        # layer; this read model only passes it through so the strategist reads
+        # the proven claim state ALONGSIDE the raw merged count
+        # (``tasks_merged_this_version``, added by the caller). ``None`` on legacy
+        # rows that predate the aggregate, keeping the payload backward-compatible.
+        "acceptance_aggregate": acceptance_aggregate,
     }
     if artifact_evidence is not None:
         block["artifacts"] = artifact_evidence

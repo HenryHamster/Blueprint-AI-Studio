@@ -38,10 +38,12 @@ from __future__ import annotations
 import operator
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+from app.landed_signal import merge_verification_status
 from app.models import Task
+from app.models import TaskStatus
 from app.payload_schemas import (
     AcceptanceEvidence,
     _looks_like_test_file,
@@ -430,3 +432,49 @@ def acceptance_is_proven(recorded: Any) -> bool:
     if not isinstance(recorded, dict):
         return False
     return recorded.get("proven") is True
+
+
+def classify_merged_acceptance(task: Task) -> str:
+    """Classify one merged task into the release acceptance buckets.
+
+    Buckets are deliberately additive and fail-safe:
+      * ``proven`` — non-degraded merge with satisfied declared acceptance;
+      * ``declared_unsatisfied`` — non-degraded merge with declared evidence
+        that failed;
+      * ``merged_unverified_degraded`` — merge whose verification was degraded;
+      * ``no_declaration`` — non-degraded merge with no recorded declaration.
+
+    Undeclared / legacy rows stay neutral by falling into ``no_declaration``.
+    """
+    if merge_verification_status(task) == "unverified_degraded":
+        return "merged_unverified_degraded"
+    recorded = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    if not isinstance(recorded, dict):
+        return "no_declaration"
+    if acceptance_blocks_success(recorded):
+        return "declared_unsatisfied"
+    return "proven"
+
+
+def summarize_version_acceptance_aggregate(
+    tasks: Iterable[Task],
+) -> dict[str, Any]:
+    """Summarize one version window's merged tasks into acceptance buckets."""
+    aggregate: dict[str, Any] = {
+        "merged": 0,
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "merged_unverified_degraded": 0,
+        "no_declaration": 0,
+    }
+    for task in tasks:
+        if task.status != TaskStatus.COMPLETED:
+            continue
+        aggregate["merged"] += 1
+        aggregate[classify_merged_acceptance(task)] += 1
+    aggregate["proven_rate"] = (
+        round(aggregate["proven"] / aggregate["merged"], 3)
+        if aggregate["merged"] > 0
+        else None
+    )
+    return aggregate

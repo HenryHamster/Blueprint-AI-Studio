@@ -265,6 +265,188 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
+# compute_version_acceptance_aggregate — proven/declared-unsatisfied/undeclared
+# classification of version-window merged tasks
+# ===========================================================================
+
+
+def _landed_ctx(extra: dict | None = None) -> dict:
+    """A landed-on-integration task context, optionally with extra keys."""
+    ctx = {"pr_merged": True, "landed_on_integration": True}
+    if extra:
+        ctx.update(extra)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_classifies_each_bucket(db_session):
+    """A merged task with a satisfied verdict is `proven`, an explicitly
+    unsatisfied verdict is `declared_unsatisfied`, and one with no verdict key
+    is `undeclared`."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # proven — verdict recorded and satisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": True, "kind": "named_test"}}
+        ),
+        updated_at=_utcnow(),
+    )
+    # declared_unsatisfied — verdict recorded and explicitly NOT satisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": False, "kind": "named_test"}}
+        ),
+        updated_at=_utcnow(),
+    )
+    # undeclared — no verdict key (the common/legacy case).
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 1,
+        "declared_unsatisfied": 1,
+        "undeclared": 1,
+        "total": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_excludes_unlanded_and_non_completed(db_session):
+    """Only COMPLETED + landed tasks are classified; an unmerged completion and
+    a non-completed task are excluded from every bucket."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # Landed + declared-unsatisfied — counted.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow(),
+    )
+    # COMPLETED but never merged — excluded.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context={"code_acceptance_verdict": {"satisfied": False}},
+        updated_at=_utcnow(),
+    )
+    # In-flight with a declared verdict — excluded (not COMPLETED).
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.IN_PROGRESS,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 1,
+        "undeclared": 0,
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_respects_since_window(db_session):
+    """Tasks merged before ``since`` are outside the version window and excluded."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # Before the window — excluded even though declared-unsatisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow() - timedelta(hours=2),
+    )
+    # Inside the window — counted.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": True}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 1,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_empty_window_zeros(db_session):
+    """An empty window returns all-zero counts, not None."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "total": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
+    """A recorded verdict that is neither satisfied nor explicitly unsatisfied
+    is fail-safe — bucketed as undeclared so it never lowers readiness."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"kind": "named_test"}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "undeclared": 1,
+        "total": 1,
+    }
+
+
+# ===========================================================================
 # count_in_flight_tasks — non-terminal task count for the version-cut disclosure
 # ===========================================================================
 
@@ -728,6 +910,47 @@ def test_to_phase_block_qualification_state_none_when_unqualified():
         last_qualification=None,
     )
     assert rv.to_phase_block(version)["qualification_state"] is None
+
+
+def test_to_phase_block_carries_acceptance_aggregate():
+    """to_phase_block surfaces the stored version-window acceptance aggregate
+    additively, without disturbing the existing keys."""
+    version = ReleaseVersion(
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        goal="Ship proven-vs-merged surfacing",
+    )
+    aggregate = {
+        "merged": 5,
+        "proven": 3,
+        "declared_unsatisfied": 1,
+        "merged_unverified_degraded": 1,
+        "no_declaration": 1,
+        "proven_rate": 0.6,
+    }
+    version.last_qualification = {"acceptance_aggregate": aggregate}
+    block = rv.to_phase_block(version)
+    # The aggregate passes through verbatim...
+    assert block["acceptance_aggregate"] == aggregate
+    # ...and the existing shape keys are untouched.
+    assert block["version_number"] == 3
+    assert block["goal"] == "Ship proven-vs-merged surfacing"
+
+
+def test_to_phase_block_acceptance_aggregate_none_on_legacy():
+    """A legacy version with no stored aggregate yields acceptance_aggregate=None
+    (backward-compatible) — the key is always present."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    block = rv.to_phase_block(version)
+    assert "acceptance_aggregate" in block
+    assert block["acceptance_aggregate"] is None
 
 
 # ===========================================================================

@@ -4805,6 +4805,34 @@ async def _ensure_releaseversion_table(session):
     await session.commit()
 
 
+def test_summarize_version_phase_preserves_acceptance_aggregate():
+    """The budget-trim summarizer keeps the additive acceptance_aggregate
+    top-level key (and the raw merged count) intact under trim pressure."""
+    from app.strategic_spawning import _summarize_version_phase
+
+    block = {
+        "version_number": 4,
+        "phase": "stabilize",
+        "tasks_merged_this_version": 6,
+        "acceptance_aggregate": {"merged": 6, "proven": 4, "proven_rate": 0.6667},
+        "promotion_readiness": {
+            "ready": True,
+            "thresholds": {"min_verdicts": 5},
+            "confidence": {"mean": 0.9, "stdev": 0.02, "min": 0.8, "max": 0.95},
+        },
+    }
+    out = _summarize_version_phase(block)
+    # The aggregate and raw merged count survive the trim verbatim.
+    assert out["acceptance_aggregate"] == {
+        "merged": 6,
+        "proven": 4,
+        "proven_rate": 0.6667,
+    }
+    assert out["tasks_merged_this_version"] == 6
+    # The trim still drops verbose thresholds from promotion_readiness.
+    assert "thresholds" not in out["promotion_readiness"]
+
+
 @pytest.mark.asyncio
 async def test_version_phase_includes_promotion_readiness(
     db_session, mocker, _lts_split_active
@@ -5099,7 +5127,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    assert current_open_version.call_count == 1
+    # Two calls: (1) direct version-phase lookup, (2) release_readiness
+    # _compute_acceptance_aggregate — both inside the integration!=promotion gate.
+    assert current_open_version.call_count == 2
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 

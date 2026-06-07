@@ -165,6 +165,7 @@ from app.release_scoring import (
     _score_smoketest,
     compute_composite,
 )
+from app.acceptance_gate import summarize_version_acceptance_aggregate
 from app.release_stall_alerts import (
     _AUTO_MERGE_STALL_SECONDS,  # noqa: F401 — re-exported for back-compat
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
@@ -1967,6 +1968,21 @@ async def _finalize_qualification(
     extended_sub_scores.update(acceptance_aggregate)
 
     finalized_at = _utcnow().isoformat()
+    acceptance_aggregate = None
+    if version.opened_at is not None:
+        merged_rows = (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == version.project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.updated_at >= version.opened_at,
+                    landed_signal_predicate(session),
+                )
+                .order_by(Task.updated_at.asc(), Task.created_at.asc())
+            )
+        ).scalars().all()
+        acceptance_aggregate = summarize_version_acceptance_aggregate(merged_rows)
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
@@ -1990,6 +2006,7 @@ async def _finalize_qualification(
         "migration_safety_detail": migration_detail,
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
+        "acceptance_aggregate": acceptance_aggregate,
     }
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
