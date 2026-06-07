@@ -967,7 +967,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     // assistant/result content events and 0 output tokens. Detect the missing
     // content-event progress (when no tool is legitimately in flight) and report
     // it as a rate-limit so the orchestrator holds/reroutes instead of letting
-    // the call ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry-
+    // the call ride to the wall-clock backstop → AGENT_TIMEOUT → retry-
     // budget burn → terminal failure of a healthy task (incident 2026-05-29).
     let llmProgressWatchdog: NodeJS.Timeout | null = setInterval(() => {
       // Fire ONLY when the content stream is stale AND no tool is in flight.
@@ -995,8 +995,9 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       // to the longer-budget tool-use/workflow stall watchdog above (keyed off
       // lastToolProgressAt ?? lastToolUseAt, so a workflow that streams ANYTHING
       // — including any raw stdout chunk, see the stdout 'data' handler — stays
-      // alive, while one that goes fully dark is killed at 30/45 min as a
-      // correctly-classified ClaudeTimeoutError, never a phantom rate_limit).
+      // alive, while one that goes fully dark is killed at the 30/45-min stall
+      // budget as a correctly-classified ClaudeTimeoutError, never a phantom
+      // rate_limit).
       //
       // A genuinely hung instance is still caught: (1) the raw-stdout stall
       // watchdog SIGTERMs after CLAUDE_STREAM_STALL_MS of ZERO bytes regardless
