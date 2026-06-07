@@ -380,6 +380,64 @@ describe('handleMemo', () => {
     expect(runClaudeCode).toHaveBeenCalledTimes(1);
   });
 
+  it('direction_retirement: synthesizes memo with outcome metrics from retirement_metrics without calling Claude', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_task_id: 'task-ret-1',
+      source_finding: {
+        direction_text: 'Improve DB query performance across the board.',
+        rationale: 'Direction fully achieved — all queries now under 50ms.',
+        success_evidence: 'P95 latency dropped from 800ms to 40ms after 3 PRs.',
+        retirement_condition: 'all_objectives_met',
+        retirement_metrics: {
+          final_quality_score: 0.91,
+          final_prs_merged: 5,
+          final_cycles_active: 3,
+        },
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    // rationale field read from sf.rationale (not sf.retirement_rationale)
+    expect(call.logs).toContain('Direction fully achieved');
+    // Outcome metrics must appear (from sf.retirement_metrics, not top-level sf)
+    expect(call.logs).toContain('quality_score=0.91');
+    expect(call.logs).toContain('prs_merged=5');
+    expect(call.logs).toContain('cycles_active=3');
+    // success_evidence and retirement_condition should also appear
+    expect(call.logs).toContain('P95 latency dropped');
+    expect(call.logs).toContain('all_objectives_met');
+  });
+
+  it('direction_retirement: falls through to Claude when both direction_text and rationale are absent', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: { retirement_condition: 'timeout' },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+  });
+
+  it('direction_retirement: omits Outcome metrics block when retirement_metrics is absent', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: {
+        direction_text: 'Refactor auth module.',
+        rationale: 'Scope too large; retired.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).not.toContain('Outcome metrics');
+  });
+
 
   // ── Codex JSONL path regression tests ────────────────────────────────────
 

@@ -85,6 +85,31 @@ function _synthesizeDispatcherMemo(
     if (outcome) parts.push(`Outcome: ${outcome}`);
     return { summary: summary.slice(0, 200) || `Investigation concluded: ${outcome}`, reasoning: parts.join('\n\n'), citations: cite, tags: ['investigation-unactionable', ...(outcome ? [outcome] : [])] };
   }
+  if (reasoningKind === 'direction_retirement') {
+    const directionText = sv(sf.direction_text);
+    const rationale = sv(sf.rationale);
+    if (!directionText && !rationale) return null;
+    const parts: string[] = [];
+    if (directionText) parts.push(`Direction: ${directionText}`);
+    const rationaleOrDefault = rationale || 'Direction retired by automated review.';
+    parts.push(`Retirement rationale: ${rationaleOrDefault}`);
+    const se = sv(sf.success_evidence);
+    if (se) parts.push(`Success evidence: ${se}`);
+    const rc = sv(sf.retirement_condition);
+    if (rc) parts.push(`Retirement condition: ${rc}`);
+    const rm = sf.retirement_metrics != null && typeof sf.retirement_metrics === 'object'
+      ? sf.retirement_metrics as Record<string, unknown>
+      : {};
+    const qs = typeof rm.final_quality_score === 'number' ? String(rm.final_quality_score) : null;
+    const pm = typeof rm.final_prs_merged === 'number' ? String(rm.final_prs_merged) : null;
+    const ca = typeof rm.final_cycles_active === 'number' ? String(rm.final_cycles_active) : null;
+    if (qs || pm || ca) {
+      const metrics = [qs && `quality_score=${qs}`, pm && `prs_merged=${pm}`, ca && `cycles_active=${ca}`].filter(Boolean).join(', ');
+      parts.push(`Outcome metrics: ${metrics}`);
+    }
+    const summary = (rationale || directionText || 'Direction retired.').slice(0, 200);
+    return { summary, reasoning: parts.join('\n\n'), citations: cite, tags: ['direction-retirement'] };
+  }
   return null;
 }
 

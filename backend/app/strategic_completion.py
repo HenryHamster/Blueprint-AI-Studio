@@ -855,8 +855,10 @@ async def _spawn_retirement_memos(
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(memo_task)
-        # Synthesize the memo artifact at spawn time when rationale is available
-        # so the task is immediately COMPLETED and citable without provisioning a VM.
+        # Synthesize the memo artifact at spawn time when source_finding is
+        # available — works for both rationale-present and rationale-absent paths.
+        # The source_finding snapshot carries all decision context so synthesis
+        # is substantive even on auto-retirement paths with no rationale note.
         synthesized = False
         if rationale:
             parts = []
