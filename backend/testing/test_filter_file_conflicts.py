@@ -34,12 +34,12 @@ def _queued(project_id, files, scope="small", ttype="fix", parent=None):
     return task
 
 
-def _in_progress(project_id, files, parent=None):
+def _in_progress(project_id, files, parent=None, ttype="fix"):
     return make_task(
         project_id=project_id,
         status=TaskStatus.IN_PROGRESS,
         context={"related_files": files},
-        payloads=[{"type": "fix"}],
+        payloads=[{"type": ttype}],
         parent_task_id=parent,
     )
 
@@ -181,6 +181,75 @@ class TestFilterFileConflicts:
         result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
         assert result == []
         assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_in_progress_review_does_not_defer_fix_candidate(self):
+        """Incident repro (prod 2026-06-07, PR #8742): an IN_PROGRESS review
+        inherits the PR's full related_files via propagated_ctx but pushes no
+        diff, so it must NOT contribute to the claim set — the PR's own fix task
+        was starved ~7h on this phantom file conflict. A fix candidate fully
+        overlapping an IN_PROGRESS review must dispatch."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="fix")
+        ip = _in_progress(pid, ["a.py", "b.py"], ttype="review")
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_in_progress_write_task_still_defers_fix_candidate(self):
+        """Guardrail: an IN_PROGRESS WRITE task (create/fix) DOES contribute to
+        the claim set — a significantly-overlapping candidate still defers."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="fix")
+        ip = _in_progress(pid, ["a.py", "b.py"], ttype="create")
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_large_scope_candidate_not_deferred_by_in_progress_review(self):
+        """Collateral repro: a large-scope candidate (defers on ANY overlap)
+        overlapping only an IN_PROGRESS review on 2 files must NOT defer — the
+        review contributes nothing to the claim set. (Prod: an unrelated
+        large-scope task was blocked 6h then escalation-parked.)"""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="large", ttype="fix")
+        ip = _in_progress(pid, ["a.py", "b.py"], ttype="review")
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_blocker_attribution_never_names_a_review(self):
+        """When a WRITE blocker and a review both overlap the candidate's files,
+        the deferral message ('blocked by: <title>') must name the WRITE task,
+        never the review — the review is not a blocker (it pushes no diff)."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="fix")
+        write_ip = _in_progress(pid, ["a.py", "b.py"], ttype="fix")
+        write_ip.title = "Fix the bug"
+        review_ip = _in_progress(pid, ["a.py", "b.py"], ttype="review")
+        review_ip.title = "Review PR #8742"
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [c.id], [c], [write_ip, review_ip], session, broadcast_fn
+        )
+        assert result == []
+        msg = c.latest_status_message or ""
+        assert "blocked by: Fix the bug" in msg
+        assert "Review PR #8742" not in msg
 
     @pytest.mark.asyncio
     async def test_cross_parent_overlap_not_deferred(self):
@@ -701,6 +770,147 @@ class TestFilterFileConflicts:
             [c.id for c in candidates], candidates, active, db_session, AsyncMock()
         )
         assert result == [cand.id]
+
+    @pytest.mark.asyncio
+    async def test_in_progress_payloads_loaded_no_lazy_load(self, db_session):
+        """Regression: the read-only claim-set exemption reads ``first_payload``
+        (payloads) on IN_PROGRESS tasks via _is_read_only_task. The dispatch loop
+        loads active tasks with ACTIVE_TASKS_LIGHT_COLUMNS, so payloads MUST be in
+        that set — deferring it makes the access a sync IO load from async context
+        (MissingGreenlet) that crashes the whole dispatch cycle. CI's identity-map
+        pre-population masks this in unit tests; loading load_only-deferred ORM
+        instances from a real session reproduces the production access pattern."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # IN_PROGRESS review: its payloads.type must be read (and the review
+        # excluded) without a lazy load. A fix candidate fully overlaps it.
+        ip = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"related_files": ["a.py", "b.py"]},
+            payloads=[{"type": "review"}],
+        )
+        cand = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["a.py", "b.py"], "scope": "large"},
+            payloads=[{"type": "fix"}],
+        )
+        db_session.add_all([ip, cand])
+        await db_session.commit()
+        db_session.expunge_all()
+
+        active = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        )
+                    )
+                    .options(load_only(*ACTIVE_TASKS_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.status == TaskStatus.QUEUED)
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Reading active[*].first_payload (read-only exemption) must not raise
+        # MissingGreenlet; the review contributes nothing so the fix dispatches.
+        result = await filter_file_conflicts(
+            [c.id for c in candidates], candidates, active, db_session, AsyncMock()
+        )
+        assert result == [cand.id]
+
+    @pytest.mark.asyncio
+    async def test_blocked_conflict_payloads_loaded_no_lazy_load(self, db_session):
+        """Regression: the seniority-set build now reads ``first_payload`` on
+        parked BLOCKED file-conflict holders via _is_read_only_task. They are
+        loaded with BLOCKED_CONFLICT_LIGHT_COLUMNS, so payloads MUST be in that
+        set or the access is a MissingGreenlet that crashes the dispatch cycle."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        t0 = _now() - timedelta(hours=2)
+        senior = make_task(
+            project_id=project.id,
+            status=TaskStatus.BLOCKED,
+            blocker_kind="file_conflict",
+            context={
+                "related_files": ["models.py"],
+                "scope": "large",
+                "_precondition_defer": {
+                    "key": "file conflict on models.py",
+                    "count": 3,
+                    "files": ["models.py"],
+                },
+            },
+            payloads=[{"type": "fix"}],
+            created_at=t0,
+        )
+        newer = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["models.py", "x.py"], "scope": "large"},
+            payloads=[{"type": "fix"}],
+            created_at=_now(),
+        )
+        db_session.add_all([senior, newer])
+        await db_session.commit()
+        db_session.expunge_all()
+
+        blocked = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.BLOCKED,
+                        Task.blocker_kind == "file_conflict",
+                    )
+                    .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.status == TaskStatus.QUEUED)
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Reading the holder's first_payload (seniority-set build) must not raise
+        # MissingGreenlet; the newer task defers behind the senior reservation.
+        result = await filter_file_conflicts(
+            [c.id for c in candidates],
+            candidates,
+            [],
+            db_session,
+            AsyncMock(),
+            blocked,
+        )
+        assert result == []
 
 
 class TestFileConflictSeniority:

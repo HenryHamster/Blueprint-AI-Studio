@@ -227,6 +227,20 @@ def _prod_files(files) -> set[str]:
     return {f for f in (files or []) if not _is_test_file(f)}
 
 
+def _is_read_only_task(task: Task) -> bool:
+    """True if *task* runs the agent in read-only mode (review/plan/research/...).
+
+    Read-only types produce a verdict / plan / findings, never a diff — they push
+    no branch and open no PR, so they cannot cause a merge conflict and must be
+    excluded from BOTH sides of the file-conflict gate: they are never deferred
+    as a candidate, and never contribute their related_files to the IN_PROGRESS
+    claim set (a review inherits the PR's full file list via propagated_ctx, so
+    leaving it in the claim set starved real write work on a phantom conflict —
+    prod 2026-06-07, PR #8742).
+    """
+    return task.first_payload.get("type", "") in READ_ONLY_TASK_TYPES
+
+
 # A candidate earns *seniority* over its contested files once it has been
 # deferred on the SAME file-conflict blocker for this many dispatch cycles.
 # Past this point, strictly-newer candidates that would step on those files
@@ -425,10 +439,17 @@ async def filter_file_conflicts(
     Updates the candidate's latest_status_message and broadcasts a deferral
     event when a task is deferred.  Returns the filtered list of eligible_ids.
     """
-    # Build per-project sets of files being modified by IN_PROGRESS tasks
+    # Build per-project sets of files being modified by IN_PROGRESS tasks.
+    # Read-only tasks (review, plan, research, the audits, memo, ...) never push
+    # a branch or open a PR — they produce a verdict / plan / findings, not a
+    # diff — so they can NEVER cause a merge conflict and must not contribute to
+    # the claim set. This mirrors the candidate-side exemption below: a review
+    # inheriting a PR's full related_files (review_pipeline propagated_ctx) was
+    # otherwise IN_PROGRESS at nearly every recheck and starved the PR's own
+    # fix-task on a phantom file conflict (prod 2026-06-07, PR #8742, ~7h hold).
     in_progress_files_by_project: dict[uuid.UUID, set[str]] = {}
     for t in active_tasks:
-        if t.status == TaskStatus.IN_PROGRESS:
+        if t.status == TaskStatus.IN_PROGRESS and not _is_read_only_task(t):
             files = _prod_files((t.context or {}).get("related_files", []))
             if files:
                 in_progress_files_by_project.setdefault(t.project_id, set()).update(
@@ -437,9 +458,16 @@ async def filter_file_conflicts(
 
     # Build per-project seniority reservations from tasks already waiting on a
     # file conflict (parked BLOCKED, or QUEUED past the seniority threshold).
+    # Read-only tasks are exempt from the gate (below) so they can never accrue a
+    # file-conflict reservation, but filter here too so the set can never name a
+    # read-only blocker even if upstream state is inconsistent.
     senior_holders_by_project: dict[uuid.UUID, list[Task]] = {}
     for t in list(candidate_tasks) + list(blocked_conflict_tasks or ()):
-        if _is_senior_file_conflict_waiter(t) and _file_conflict_reserved_files(t):
+        if (
+            not _is_read_only_task(t)
+            and _is_senior_file_conflict_waiter(t)
+            and _file_conflict_reserved_files(t)
+        ):
             senior_holders_by_project.setdefault(t.project_id, []).append(t)
 
     # Nothing in flight and no reservations → no candidate can conflict.
@@ -461,8 +489,7 @@ async def filter_file_conflicts(
         # read-only work (e.g. a code review) behind unrelated in-flight writes.
         # Real write-write conflicts are still caught on the WRITE-type tasks
         # (create/fix/refactor/migrate/docs/deps/qa).
-        task_type = (candidate.first_payload).get("type", "")
-        if task_type in READ_ONLY_TASK_TYPES:
+        if _is_read_only_task(candidate):
             non_conflicting.append(eid)
             continue
         candidate_files = _prod_files(
@@ -506,11 +533,16 @@ async def filter_file_conflicts(
             len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5
         )
         if should_defer:
+            # Read-only tasks are excluded from in_progress_files_by_project
+            # above, so they can never contribute to ``overlap`` — but filter
+            # them here too so blocker attribution ("blocked by: <title>") can
+            # never name a read-only task even if the two scans ever diverge.
             overlapping_blockers = [
                 t
                 for t in active_tasks
                 if t.status == TaskStatus.IN_PROGRESS
                 and t.project_id == candidate.project_id
+                and not _is_read_only_task(t)
                 and _prod_files((t.context or {}).get("related_files", [])) & overlap
             ]
             # Senior reservation holders that overlap also count as blockers so
