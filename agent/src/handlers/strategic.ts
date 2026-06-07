@@ -13,6 +13,10 @@ import {
   writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
+import {
+  recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+} from '../telemetry.js';
+import { attemptStructuredRepair } from './structured-repair.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
 import {
@@ -164,6 +168,11 @@ export function renderDesignDocIndexOverview(index: Record<string, unknown> | un
   );
   return blocks.join('\n\n');
 }
+
+// Schema restated to the agent on a bounded self-repair re-ask when a clean exit
+// emitted the legacy inline strategic markers but the JSON failed to extract.
+const STRATEGIC_COMPLETION_SCHEMA_HINT =
+  `{\n  "problem_model": { ... } | "vision": "...",\n  "direction_operations": [ { "op": "create_direction" | "update_direction" | "retire_direction", ... } ]\n}\nThe object MUST contain "direction_operations" and at least one of "problem_model" or "vision".`;
 
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -923,7 +932,43 @@ ${analysisText.slice(0, 50_000)}
       logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
     }
     if (!logs) {
-      const completionLogs = buildStrategicCompletionLogs(allOutput, lastResultText);
+      let completionLogs = buildStrategicCompletionLogs(allOutput, lastResultText);
+      // Bounded single self-repair. buildStrategicCompletionLogs sets `warning`
+      // ONLY when the legacy inline markers (direction_operations AND
+      // (problem_model OR vision)) ARE present but the JSON failed to extract —
+      // a command-based run that legitimately emits no inline JSON produces no
+      // warning and is NOT re-asked. On that markers-present-but-unparseable
+      // path, with a clean exit, re-ask ONCE for the JSON only and re-extract.
+      // Mirrors handleMemo / the audit handlers (see structured-repair.ts).
+      if (completionLogs.warning && exitCode === 0) {
+        recordFormatMiss('no_matching_candidate');
+        recordFormatRepairAttempt();
+        const retryRun = await attemptStructuredRepair(
+          lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,
+          'Running strategic execution (retry: emitting decisions)...',
+          ws, statusRef, model, effort, disallowedTools,
+          runClaudeCode, sendLog,
+        );
+        // For JSON-stream providers, lastResultText is the clean final answer
+        // while allOutput is the raw provider stream where JSON keys may be
+        // escaped inside outer events. Combine them so marker detection and
+        // extraction work regardless of provider stream format.
+        const retryEffective = retryRun.lastResultText
+          ? retryRun.allOutput + '\n' + retryRun.lastResultText
+          : retryRun.allOutput;
+        const retryLogs = buildStrategicCompletionLogs(retryEffective, retryRun.lastResultText);
+        // Only count success when the retry actually carried the inline markers
+        // AND extracted cleanly (no warning) — otherwise a marker-less fallback
+        // would masquerade as a successful repair.
+        const retryHasMarkers = retryEffective.includes('"direction_operations"')
+          && (retryEffective.includes('"problem_model"') || retryEffective.includes('"vision"'));
+        if (retryHasMarkers && !retryLogs.warning) {
+          recordFormatRepairSuccess();
+          completionLogs = retryLogs;
+        } else {
+          sendLog(ws, `[WARNING] Strategic self-repair re-ask did not yield parseable inline JSON; keeping fallback.\n`);
+        }
+      }
       if (completionLogs.warning) {
         sendLog(ws, `[WARNING] ${completionLogs.warning}\n`);
       }

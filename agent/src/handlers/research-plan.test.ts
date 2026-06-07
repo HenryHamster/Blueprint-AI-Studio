@@ -81,10 +81,10 @@ import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
 import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -2787,6 +2787,135 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('_call "set_evidence_progress"');
     // Usage string advertises the new op.
     expect(script).toContain('set-evidence-progress <json-or-file>');
+  });
+});
+
+// ── handleStrategic — bounded self-repair on a legacy-strategic-JSON format miss ─
+//
+// The strategic completion path consumes buildStrategicCompletionLogs (a pure
+// function in research-plan.ts). When the executor emits the legacy inline
+// markers (direction_operations AND (problem_model OR vision)) but the JSON
+// fails to extract on a clean exit, the handler now issues exactly ONE bounded
+// re-ask before falling through. A command-based run with no inline JSON (no
+// warning) is NOT re-asked — preserved by the existing buildStrategicCompletionLogs
+// gate tests above.
+describe('handleStrategic — bounded self-repair on legacy strategic JSON format miss', () => {
+  const SR_TASK_ID = 'sr-strategic-001';
+  const SR_TASK = { title: 'Strategic cycle', description: 'strategic', context: {}, project_context: {} };
+  const SR_PAYLOAD = { base_branch: 'main', research_mode: 'strategic', prompt: 'run the cycle' };
+
+  // Thinker mock must return parseable problem-model JSON with "intent" so that
+  // repairStructuredOutput in runThinkerWithGate is NOT triggered (otherwise it
+  // makes an extra runClaudeCode call that shifts the mock sequence).
+  const THINKER_OUTPUT = '{"intent":{"purpose":"test","current_focus":"test"}}';
+
+  // Executor output that satisfies the three required-call post-checks AND carries
+  // the legacy inline markers in prose (so buildStrategicCompletionLogs sets a
+  // warning) but contains no parseable JSON object.
+  const EXECUTOR_MARKERS_NO_JSON =
+    './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
+    'I prepared the "problem_model" and "direction_operations" but never emitted the JSON object.';
+  const REPAIRED_STRATEGIC_JSON = '{"problem_model":{"revision":1},"direction_operations":[]}';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+    // Thinker gate needs both handoff files present; returning true everywhere
+    // also makes the legacy /tmp/strategic_output read attempt fire (it then
+    // yields null via the readHandlerOutput mock, so the completion-logs path runs).
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
+  });
+
+  function lastPostedStatus(): Record<string, unknown> {
+    const calls = vi.mocked(persistAndPostStatus).mock.calls;
+    return calls[calls.length - 1][1];
+  }
+
+  it('re-asks exactly once and COMPLETES with the recovered inline strategic JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: REPAIRED_STRATEGIC_JSON, lastResultText: REPAIRED_STRATEGIC_JSON });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    // thinker + executor + exactly one bounded re-ask = 3 invocations.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const posted = lastPostedStatus();
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
+    expect(parsed.problem_model.revision).toBe(1);
+  });
+
+  it('does NOT record repair success when the re-ask still yields no inline JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'fallback summary' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still no parseable json here', lastResultText: '' });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    // Still COMPLETED (clean exit) with the fallback logs.
+    expect(lastPostedStatus().status).toBe('COMPLETED');
+  });
+
+  it('counts repair success when the retry delivers JSON only in lastResultText (JSON-stream provider)', async () => {
+    // Simulate a JSON-stream provider: allOutput is the raw stream with escaped JSON,
+    // lastResultText is the clean final answer with the parseable JSON.
+    const STREAM_RAW = './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
+      '{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"problem_model\\":{\\"revision\\":2},\\"direction_operations\\":[]}"}}';
+    // allOutput has the keys only as escaped substrings; lastResultText has the literal keys.
+    const CLEAN_JSON = '{"problem_model":{"revision":2},"direction_operations":[]}';
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: STREAM_RAW, lastResultText: CLEAN_JSON });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+    const posted = lastPostedStatus();
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
+    expect(parsed.problem_model.revision).toBe(2);
+  });
+
+  it('does NOT re-ask a command-based run that emits no inline strategic JSON (no warning gate)', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 40.',
+        lastResultText: 'Commands ran successfully.',
+      });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Only thinker + executor — no re-ask, no format telemetry.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    expect(lastPostedStatus().status).toBe('COMPLETED');
   });
 });
 

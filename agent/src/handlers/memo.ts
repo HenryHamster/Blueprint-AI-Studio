@@ -12,6 +12,7 @@ import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
   type FormatMissReason,
 } from '../telemetry.js';
+import { attemptStructuredRepair } from './structured-repair.js';
 
 // Scan raw Codex JSONL output for agent_message events and return ALL
 // candidate item.text values, prioritising item.completed over item.updated
@@ -45,6 +46,9 @@ function extractCodexAgentMessageTexts(text: string): string[] {
   // item.completed takes priority over item.updated.
   return [...completedTexts, ...updatedTexts];
 }
+
+const MEMO_SCHEMA_HINT =
+  `{\n  "summary": "One- to two-sentence summary of the reasoning.",\n  "reasoning": "Detailed reasoning (a few paragraphs at most).",\n  "citations": ["task:<id>", "direction:<id>", "file:path/to/x.py", ...],\n  "tags": ["tag-1", "tag-2", ...]\n}\nAll four keys are required. summary and reasoning must be non-empty strings; citations and tags must be arrays of strings (empty arrays allowed).`;
 
 // ── Handler: Memo (terminal reasoning artifact, no repo clone, no PR) ────────
 //
@@ -286,27 +290,11 @@ Rules:
     // Whether it succeeded is recorded after re-extraction below.
     if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason);
     recordFormatRepairAttempt();
-    const priorText = (lastResultText || allOutput || '').slice(-8000);
-    sendLog(ws, `[INFO] First memo attempt produced no JSON (allOutput=${(allOutput || '').length}b, lastResultText=${(lastResultText || '').length}b). Reopening with focused continuation.\n`);
-    statusRef.value = 'Writing memo (retry)...';
-    const reopenPrompt = `You were asked to produce a memo as a single JSON object. Your previous response contained reasoning but did NOT include the required JSON object as the final part. The memo schema is:
-
-{
-  "summary": "One- to two-sentence summary of the reasoning.",
-  "reasoning": "Detailed reasoning (a few paragraphs at most).",
-  "citations": ["task:<id>", "direction:<id>", "file:path/to/x.py", ...],
-  "tags": ["tag-1", "tag-2", ...]
-}
-
-Your previous reasoning (use this verbatim or condense as needed to fill the schema):
----
-${priorText}
----
-
-Output ONLY the JSON object now — no preamble, no markdown code fences, no additional commentary. All four keys are required. summary and reasoning must be non-empty strings; citations and tags must be arrays of strings (empty arrays allowed).`;
-    const retryRun = await runClaudeCode(
-      reopenPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    const retryRun = await attemptStructuredRepair(
+      lastResultText || allOutput, MEMO_SCHEMA_HINT,
+      'Writing memo (retry)...',
       ws, statusRef, model, effort, disallowedTools,
+      runClaudeCode, sendLog,
     );
     retryExitCode = retryRun.exitCode;
     retryAllOutput = retryRun.allOutput;

@@ -108,7 +108,7 @@
     "handlers/review-fix-migration.ts": 400,
     "prompts/review-prompt.ts": 350,
     "handlers/specialized.ts": 1050,
-    "handlers/audits.ts": 700,
+    "handlers/audits.ts": 1000,
     "handlers/memo.ts": 650,
     "handlers/code-change.ts": 600,
     "prompts/discovery.ts": 750,

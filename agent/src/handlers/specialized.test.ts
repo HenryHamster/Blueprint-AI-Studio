@@ -139,10 +139,10 @@ import {
 } from '../index.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -617,6 +617,68 @@ describe('handleInvestigate — report reading and status mapping', () => {
         GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
       ),
     ).rejects.toThrow(/No prompt found/);
+  });
+});
+
+// ── handleInvestigate — bounded self-repair on a clean-exit-but-unparseable run ─
+describe('handleInvestigate — bounded self-repair on format miss', () => {
+  const RECOVERED = {
+    summary: 'Token not invalidated on logout',
+    root_cause: 'logout handler never calls invalidate()',
+    affected_files: [{ path: 'backend/app/auth.py', issue: 'no invalidation' }],
+    recommended_fix: 'Call invalidate() in the logout handler',
+    severity: 'high',
+    confidence: 'high',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('makes exactly one focused re-ask when exitCode=0 but no report parses, and COMPLETES with the recovered report', async () => {
+    // First call: clean exit, narrative but no JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I read auth.py but never emitted the JSON.', lastResultText: '' });
+    // Second call (repair): valid investigation report in lastResultText.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(RECOVERED) });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(RECOVERED));
+  });
+
+  it('does NOT record repair success and posts FAILED/parse_failed when the re-ask is also unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'still no json', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+  });
+
+  it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crash', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
   });
 });
 

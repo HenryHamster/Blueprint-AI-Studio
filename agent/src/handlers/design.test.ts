@@ -35,6 +35,16 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -69,10 +79,10 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 import fs from 'fs';
 import { handleDesign, groundDesignCitations } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 const TASK_ID = 'task-design-1';
 const WS = null;
@@ -354,6 +364,79 @@ describe('handleDesign', () => {
       file_citations: 1, grounded: 0, checked: true,
       unresolved: ['file:backend/app/reaper_sweeps.py'],
     });
+  });
+});
+
+// ── Bounded self-repair on a clean-exit-but-unparseable first response ────────
+describe('handleDesign — bounded self-repair on format miss', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('makes exactly one focused re-ask when exitCode=0 but no document extracts, and COMPLETES with the recovered document', async () => {
+    // First call: clean exit, narrative but no document JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'I explored the reaper but forgot the JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Second call (repair): valid document JSON in lastResultText.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Exactly one re-ask (two runClaudeCode invocations total — strictly bounded).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
+    // Recovered document path still grounds citations for the backend gate.
+    expect((parsed as Record<string, unknown>)._citation_grounding).toBeDefined();
+    // Success path omits artifact_type (backend is the sole KnowledgeDocument writer).
+    expect(payload.artifact_type).toBeUndefined();
+  });
+
+  it('does NOT record repair success when the re-ask is also unparseable; falls back to raw output (still bounded to one re-ask)', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: 'no json', lastResultText: 'raw fallback',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    // exitCode=0 → still COMPLETED with the raw fallback for the backend gate.
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+  });
+
+  it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1, allOutput: 'boom', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    expect(lastPostedPayload().status).toBe('FAILED');
   });
 });
 

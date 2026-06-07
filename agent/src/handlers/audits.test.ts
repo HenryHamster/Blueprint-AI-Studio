@@ -410,7 +410,9 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'fetch',
     );
     expect((fetchCalls[0][1] as string[])).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    // The agent ran at least once (main audit run). A repair attempt follows
+    // when the mock returns no JSON, so total is 2 — both are correct behavior.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('runs the agent when the diff range resolves (rev-parse + rev-list succeed)', async () => {
@@ -430,8 +432,9 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(revListCall).toBeDefined();
     expect(revListCall?.[0]).toContain('--count');
     expect(revListCall?.[0]).toContain(DIFF_RANGE);
-    // Agent runs and a RELEASE_AUDIT_REPORT is emitted.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    // Agent runs (1st call: main audit). The mock returns no JSON so a bounded
+    // self-repair re-ask fires (2nd call) — both are correct new behavior.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('interpolates main...<candidate_sha> into the agent prompt — never the bare automain name', async () => {
