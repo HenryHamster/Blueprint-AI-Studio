@@ -798,6 +798,135 @@ async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_sessi
     assert task2.id == task1.id
 
 
+@pytest.mark.asyncio
+async def test_spawn_lock_timeout_defers_without_poisoning_session(
+    db_session, mocker
+):
+    """Regression for prod burst 2026-06-07 01:05: the spawn commit was
+    cancelled by Postgres' lock_timeout (asyncpg LockNotAvailableError waiting
+    on a peer's uncommitted same-key insert). Pre-fix the error propagated with
+    the session left in pending-rollback, cascading PendingRollbackError
+    through the rollup caller and the rest of post-commit. _spawn_pipeline_task
+    must roll back, mark the source DEFERRED (next sweep retries), return
+    (None, False), and leave the session usable."""
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+    from sqlalchemy.exc import OperationalError as _OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+    import contextlib as _contextlib
+
+    from app.review_pipeline import SPAWN_REASON_DEFERRED
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 333,
+                "branch": "feat/y",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Fail the spawn commit ONLY when the new pipeline task is pending. Inject
+    # a GENUINE flush-level abort first (duplicate-PK insert) so the underlying
+    # transaction is really dead — the way a lock_timeout-cancelled INSERT
+    # leaves it — then raise the asyncpg lock-timeout shape SQLAlchemy wraps.
+    # (Mirrors the real-poison pattern in test_reaper's per-row collision test.)
+    real_commit = _AsyncSession.commit
+    fired = {"n": 0}
+
+    async def patched_commit(self):
+        pending_pipeline = any(
+            isinstance(o, Task)
+            and str(getattr(o, "idempotency_key", "") or "").startswith(
+                "review_pipeline:"
+            )
+            for o in self.new
+        )
+        if pending_pipeline and fired["n"] == 0:
+            fired["n"] += 1
+            dup = uuid.uuid4()
+            for _ in range(2):
+                self.add(
+                    Task(
+                        id=dup,
+                        project_id=project.id,
+                        payloads=[{"type": "create"}],
+                        status=TaskStatus.QUEUED,
+                    )
+                )
+            with _contextlib.suppress(_IntegrityError):
+                await self.flush()  # real duplicate-PK abort
+            raise _OperationalError(
+                "INSERT INTO task ...",
+                {},
+                Exception("canceling statement due to lock timeout"),
+            )
+        return await real_commit(self)
+
+    mocker.patch.object(_AsyncSession, "commit", patched_commit)
+
+    # "fix" routes through _spawn_pipeline_task's main-body INSERT + commit —
+    # the path the prod burst hit (verify_tests delegates to a separate
+    # spawner and is not the regression surface here).
+    spawned, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=333, branch="feat/y", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback on PR #333",
+    )
+
+    assert fired["n"] == 1, "the injected lock-timeout must have fired exactly once"
+    assert spawned is None
+    assert created is False
+    # Deferral marker set on the (re-fetched) source so the rollup caller's
+    # existing DEFERRED branch leaves the parent EVALUATING for the next sweep.
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
+    assert "lock timeout" in (source_task.latest_status_message or "").lower()
+
+    # The session must be CLEAN: committing the deferral marker (what the
+    # rollup caller's final commit does) must not raise PendingRollbackError.
+    await db_session.commit()
+
+    # Nothing was spawned and the poison rows were rolled back.
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ids = {t.id for t in rows}
+    assert ids == {original_task.id, source_task.id}, (
+        f"only the seed tasks may exist after the deferred spawn, got {ids}"
+    )
+
+
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────
 
 

@@ -7,6 +7,8 @@ Tests three areas:
 3. Research task spawning — deduplication guard and depends_on_indices ordering
 """
 
+import os
+
 import pytest
 import json
 import uuid
@@ -1207,6 +1209,120 @@ class TestResearchCompletion:
             "tracing" in children[0].title.lower()
             or "middleware" in children[0].title.lower()
         )
+
+    # ── Burst-1 regression: duplicate active claim during post-spawn apply ───
+
+    @pytest.mark.skipif(
+        not (
+            os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
+            and os.getenv("DATABASE_URL", "").startswith("postgresql")
+        ),
+        reason=(
+            "genuine ux_task_active_idempotency_key violation message (constraint "
+            "name included) requires PostgreSQL"
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_duplicate_active_claim_during_post_spawn_is_benign(
+        self, db_session, mocker
+    ):
+        """Regression for prod burst 2026-06-07 00:56: a research task reported
+        COMPLETED (its idempotency claim left the active-status index), a
+        pipelined duplicate research cycle then claimed the same key, and
+        apply_post_spawn_state's COMPLETED→EVALUATING flip violated
+        ux_task_active_idempotency_key at session.commit(). Pre-fix the
+        IntegrityError escaped with the session in pending-rollback, the
+        handler-failure recovery itself died on PendingRollbackError, and the
+        request 500'd live agents. The duplicate-spawn guard firing is benign:
+        the handler must catch it, roll back, keep the task in its committed
+        terminal state, keep the spawned children, and complete cleanly."""
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("fake-token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="abc123",
+        )
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.research_completion._apply_structural_actionability_downgrade",
+            return_value=0,
+        )
+
+        project = Project(name="Dup claim benign test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        claim_key = f"research:{project.id}:d-dupclaim"
+        research_task = Task(
+            project_id=project.id,
+            title="Research: autonomous scan",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            status=TaskStatus.COMPLETED,  # agent-reported terminal (early commit)
+            created_by="ORCHESTRATOR",
+            idempotency_key=claim_key,
+        )
+        db_session.add(research_task)
+        # The pipelined duplicate cycle: holds the SAME claim key in an ACTIVE
+        # status, so the original's flip back to EVALUATING genuinely violates
+        # the partial unique index.
+        peer_task = Task(
+            project_id=project.id,
+            title="Pipelined duplicate cycle placeholder",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            idempotency_key=claim_key,
+        )
+        db_session.add(peer_task)
+        await db_session.commit()
+        await db_session.refresh(research_task)
+
+        logs = self._findings_json(
+            {
+                "title": "add request tracing middleware",
+                "prompt": "Instrument HTTP handlers with OpenTelemetry trace IDs.",
+                "priority": "medium",
+            },
+        )
+
+        # Pre-fix this raised IntegrityError (then PendingRollbackError in the
+        # post-commit recovery path).
+        await _handle_research_completion(research_task, logs, db_session)
+
+        await db_session.refresh(research_task)
+        # Not corrupted: the task keeps its committed terminal status — the
+        # EVALUATING flip was correctly blocked by the duplicate-spawn guard.
+        assert research_task.status == TaskStatus.COMPLETED
+        # The spawned child survived (it committed before the blocked flip).
+        from sqlmodel import select as sql_select
+
+        children = (
+            (
+                await db_session.execute(
+                    sql_select(Task).where(
+                        Task.parent_task_id == research_task.id,
+                        Task.status == TaskStatus.QUEUED,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        # The session is clean — a follow-up commit must not raise
+        # PendingRollbackError.
+        await db_session.commit()
 
     # ── Knowledge findings route to web_research/design task types ───────────
 

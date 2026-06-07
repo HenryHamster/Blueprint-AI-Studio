@@ -461,19 +461,27 @@ async def _resolve_quality_grader_completion(
     await session.commit()
 
     # Source is now terminal — propagate to its parent rollup and broadcast.
+    # Snapshot plain values first: the rollup can poison the session (its
+    # rollback also expires ``source``), and reading source.<attr> afterwards
+    # would raise PendingRollbackError / MissingGreenlet.
+    _source_id_str = str(source.id)
+    _source_project_id_str = str(source.project_id)
+    _source_status = source.status
     if source.parent_task_id:
         try:
             await _check_and_trigger_rollup(source, session)
         except Exception:
             logger.error(
-                "[GRADER] rollup after grade failed for %s", source.id, exc_info=True
+                "[GRADER] rollup after grade failed for %s",
+                _source_id_str,
+                exc_info=True,
             )
             await session.rollback()
     try:
         await broadcast_to_project(
-            str(source.project_id),
+            _source_project_id_str,
             "task_updated",
-            {"task_id": str(source.id), "status": source.status},
+            {"task_id": _source_id_str, "status": _source_status},
         )
     except Exception:
         logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
@@ -614,6 +622,46 @@ async def _process_post_commit(
             await asyncio.sleep(2)
         if task is None:
             raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
+
+        async def _rollback_and_refetch_task() -> Task | None:
+            """Recover the shared session after a failed post-commit section.
+
+            A handler/helper that died on a DB error (statement_timeout,
+            LockNotAvailableError, IntegrityError, ...) leaves the transaction
+            aborted: every later session use raises PendingRollbackError, so
+            one failed section poisons every section after it (prod bursts
+            2026-06-07 00:56 / 01:05). Roll back FIRST, then re-fetch ``task``
+            by its (plain, argument-supplied) id — rollback() expires every
+            loaded ORM instance even with expire_on_commit=False, so reading
+            ``task.<attr>`` without the re-fetch would issue a sync lazy
+            refresh and raise MissingGreenlet. Returns None when the row is
+            gone (archived/deleted mid-flight); callers bail out cleanly.
+
+            ``populate_existing`` discards any of the failed section's
+            rolled-back in-memory mutations still riding the identity-mapped
+            instance, and ``no_autoflush`` keeps the re-fetch itself from
+            flushing them back out (which could re-raise the original error).
+            """
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[LIFECYCLE] Rollback after post-commit section failure "
+                    "failed for task %s",
+                    task_id,
+                )
+            with session.no_autoflush:
+                return (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .execution_options(populate_existing=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
 
         # Phase 0 telemetry: persist warm-VM continuity timing fields into
         # task.context["_timing"] so cold-vs-warm setup cost is observable.
@@ -4263,8 +4311,15 @@ async def _process_post_commit(
                     else:
                         await _handler(task, _handler_logs, session)
             except Exception as handler_exc:
+                # NB: this log line must use the plain ``task_id`` argument,
+                # NOT ``task.id`` — when the handler poisoned the session AND
+                # expired ``task`` (an internal rollback inside the handler),
+                # the attribute read issues a refresh against the aborted
+                # transaction and re-raises PendingRollbackError OUT of this
+                # except block, skipping all recovery below (prod burst
+                # 2026-06-07 00:56).
                 logger.error(
-                    f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",
+                    f"[STATUS] Completion handler failed for {task_type} task {task_id}: {handler_exc!r}",
                     exc_info=True,
                 )
                 # A handler that raised on a DB error (asyncpg QueryCanceledError
@@ -4285,18 +4340,7 @@ async def _process_post_commit(
                 # its (stable, argument-supplied) id before reading or mutating
                 # it — attribute access on the now-expired instance would issue a
                 # synchronous lazy-load and raise MissingGreenlet.
-                try:
-                    await session.rollback()
-                except Exception:
-                    logger.exception(
-                        "[HANDLER] Rollback after handler failure failed for task %s",
-                        task_id,
-                    )
-                _recovered_task = (
-                    (await session.execute(select(Task).where(Task.id == task_id)))
-                    .scalars()
-                    .first()
-                )
+                _recovered_task = await _rollback_and_refetch_task()
                 if _recovered_task is None:
                     # Row vanished (archived/deleted) during post-commit — nothing
                     # left to recover.
@@ -4371,8 +4415,13 @@ async def _process_post_commit(
             try:
                 await _check_and_trigger_rollup(task, session)
             except Exception as e:
+                # NB: ``task_id`` (plain argument), never ``task.id`` — on a
+                # poisoned session with an expired instance the attribute read
+                # re-raised PendingRollbackError out of this except block
+                # (prod burst 2026-06-07 01:05: lock_timeout inside
+                # _spawn_pipeline_task).
                 logger.error(
-                    f"[ROLLUP] Rollup check failed for task {task.id}: {e!r}",
+                    f"[ROLLUP] Rollup check failed for task {task_id}: {e!r}",
                     exc_info=True,
                 )
                 # C1: _check_and_trigger_rollup does FOR UPDATE selects +
@@ -4381,9 +4430,12 @@ async def _process_post_commit(
                 # rollback every subsequent post-terminal helper (direction
                 # outcomes, remediation/regression, strategic backstop) and the
                 # final commit silently fail or 500 the agent with
-                # PendingRollbackError. Roll back so the chain continues clean.
-                with contextlib.suppress(Exception):
-                    await session.rollback()
+                # PendingRollbackError. Roll back so the chain continues clean,
+                # and re-fetch ``task`` — the sections below keep reading
+                # task.context / task.first_payload on it.
+                task = await _rollback_and_refetch_task()
+                if task is None:
+                    return {"status": "accepted"}
 
         # 6b. Update direction research history outcomes for child tasks of a research cycle
         _task_ctx = task.context or {}
@@ -4404,15 +4456,17 @@ async def _process_post_commit(
                 )
             except Exception as _outcome_exc:
                 logger.warning(
-                    f"[RESEARCH] Failed to update direction research outcomes for task {task.id}: {_outcome_exc!r}"
+                    f"[RESEARCH] Failed to update direction research outcomes for task {task_id}: {_outcome_exc!r}"
                 )
                 # C1: _update_direction_research_outcomes takes the directions
                 # FOR NO KEY UPDATE lock and commits; an IntegrityError /
                 # serialization failure there leaves this session aborted. Roll
                 # back so the terminal-record helpers below + the final commit
-                # don't inherit the PendingRollback.
-                with contextlib.suppress(Exception):
-                    await session.rollback()
+                # don't inherit the PendingRollback, and re-fetch ``task`` (the
+                # rollback expired it; the helpers below read its attributes).
+                task = await _rollback_and_refetch_task()
+                if task is None:
+                    return {"status": "accepted"}
 
         # C1: the terminal-record helper does its own session writes (it calls
         # _record_remediation_outcome which commits). It is an independent
@@ -4424,11 +4478,12 @@ async def _process_post_commit(
         except Exception as _helper_exc:
             logger.error(
                 f"[LIFECYCLE] Terminal-record helper _record_remediation_if_terminal "
-                f"failed for task {task.id}: {_helper_exc!r}",
+                f"failed for task {task_id}: {_helper_exc!r}",
                 exc_info=True,
             )
-            with contextlib.suppress(Exception):
-                await session.rollback()
+            task = await _rollback_and_refetch_task()
+            if task is None:
+                return {"status": "accepted"}
         try:
             from app.task_completion import (  # noqa: PLC0415
                 _expire_migration_reservation_if_terminal,
@@ -4440,11 +4495,12 @@ async def _process_post_commit(
         except Exception as _mr_exc:
             logger.error(
                 f"[LIFECYCLE] Migration-reservation terminal cleanup failed for "
-                f"task {task.id}: {_mr_exc!r}",
+                f"task {task_id}: {_mr_exc!r}",
                 exc_info=True,
             )
-            with contextlib.suppress(Exception):
-                await session.rollback()
+            task = await _rollback_and_refetch_task()
+            if task is None:
+                return {"status": "accepted"}
 
         # Release-qualifier finalization — fires from EVERY terminal path
         # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
@@ -4511,7 +4567,7 @@ async def _process_post_commit(
                 except Exception as _qual_exc:
                     logger.error(
                         f"[RELEASE_QUALIFIER] maybe_finalize_qualification failed "
-                        f"for terminal task {task.id} (status={payload.status}): "
+                        f"for terminal task {task_id} (status={payload.status}): "
                         f"{_qual_exc!r}",
                         exc_info=True,
                     )
@@ -4523,8 +4579,9 @@ async def _process_post_commit(
                     # session. Roll back to match the sibling terminal-record /
                     # backstop / final-commit guards so the chain below stays
                     # poison-free.
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
+                    task = await _rollback_and_refetch_task()
+                    if task is None:
+                        return {"status": "accepted"}
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
@@ -4688,15 +4745,17 @@ async def _process_post_commit(
                     await session.commit()
         except Exception as _bk_exc:
             logger.error(
-                f"[STRATEGIC] Lifecycle backstop failed for task {task.id}: {_bk_exc!r}",
+                f"[STRATEGIC] Lifecycle backstop failed for task {task_id}: {_bk_exc!r}",
                 exc_info=True,
             )
             # C1: strategic_cycle.mark_failure + the commit inside the backstop
             # can raise (lock contention / DB error), leaving the session
             # aborted. Roll back so the final commit below does not raise
-            # PendingRollbackError and return a 500 to the agent.
-            with contextlib.suppress(Exception):
-                await session.rollback()
+            # PendingRollbackError and return a 500 to the agent, and re-fetch
+            # ``task`` (the final broadcast/backstop below read its attributes).
+            task = await _rollback_and_refetch_task()
+            if task is None:
+                return {"status": "accepted"}
 
         # Final commit for any deferred changes (status, artifacts, spawned tasks).
         # C1: guard the commit. The task's own terminal status was already
@@ -4722,14 +4781,14 @@ async def _process_post_commit(
             except Exception as _commit_exc:
                 logger.error(
                     f"[LIFECYCLE] Final post-commit commit failed for task "
-                    f"{task.id}: {_commit_exc!r} — preserving post_commit_pending "
+                    f"{task_id}: {_commit_exc!r} — preserving post_commit_pending "
                     f"marker for sweep retry (deferred side effects not persisted)",
                     exc_info=True,
                 )
                 with contextlib.suppress(Exception):
                     await session.rollback()
                 raise PostCommitFinalCommitFailed(
-                    f"final post-commit commit failed for task {task.id}: "
+                    f"final post-commit commit failed for task {task_id}: "
                     f"{_commit_exc!r}"
                 ) from _commit_exc
 

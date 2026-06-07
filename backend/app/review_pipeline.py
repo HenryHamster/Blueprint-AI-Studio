@@ -13,7 +13,7 @@ import uuid
 from datetime import timedelta
 
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -517,6 +517,26 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
     ctx[SPAWN_REASON_KEY] = reason
     task.context = ctx
+
+
+def _is_lock_timeout_error(exc: BaseException) -> bool:
+    """True when a DBAPI error is Postgres' bounded lock_timeout firing.
+
+    On Postgres a ``lock_timeout`` surfaces as asyncpg
+    ``LockNotAvailableError`` (sqlstate 55P03, message "canceling statement
+    due to lock timeout"), wrapped by SQLAlchemy into a ``DBAPIError``
+    subclass. There is no stable wrapped type across driver versions, so
+    match the canonical message/sqlstate markers — same string-matching
+    convention as ``_POST_COMMIT_TRANSIENT_SUBSTRINGS`` in recovery_sweeps.
+    """
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "lock timeout" in msg
+        or "lock_timeout" in msg
+        or "locknotavailable" in msg
+        or "lock not available" in msg
+        or "55p03" in msg
+    )
 
 
 _FINGERPRINT_NOISE_RE = (
@@ -2482,6 +2502,37 @@ async def _spawn_pipeline_task(
             session.add(reloaded_source)
             await session.commit()
         return (existing, False)
+    except DBAPIError as _spawn_db_exc:
+        if not _is_lock_timeout_error(_spawn_db_exc):
+            raise
+        # Transient row/index contention (prod burst 2026-06-07 01:05): the
+        # INSERT waited on a peer's uncommitted same-key insert (or a held
+        # row) until Postgres' bounded lock_timeout cancelled the statement.
+        # Letting this propagate left the caller's session in pending-rollback
+        # and cascaded PendingRollbackError through the rest of post-commit
+        # (rollup retry-counter read, final commit, agent_status 500s). Treat
+        # it exactly like the in-flight-peer deferral above: roll back, mark
+        # the source DEFERRED, and let the next rollup sweep retry. The
+        # rollback expires every loaded instance (even with
+        # expire_on_commit=False), so re-fetch the source by id before
+        # touching it — session.get refreshes the caller's identity-mapped
+        # instance in place. The deferral marker rides the caller's eventual
+        # commit, mirroring the in-flight-defer path.
+        await session.rollback()
+        logger.warning(
+            f"[PIPELINE] {task_type} spawn for PR #{pr_number} hit a lock "
+            f"timeout on commit — deferring to the next sweep: "
+            f"{str(_spawn_db_exc)[:200]}"
+        )
+        reloaded_source = await session.get(Task, source_task_id)
+        if reloaded_source is not None:
+            reloaded_source.latest_status_message = (
+                f"{task_type.title()} deferred for PR #{pr_number} — "
+                f"spawn commit hit a lock timeout; next sweep retries"
+            )
+            _set_spawn_reason(reloaded_source, SPAWN_REASON_DEFERRED)
+            session.add(reloaded_source)
+        return (None, False)
     await session.refresh(new_task)
 
     history = TaskHistory(

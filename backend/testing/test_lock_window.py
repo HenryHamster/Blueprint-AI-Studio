@@ -1877,9 +1877,31 @@ async def test_reaper_orphan_idempotency_preguard_skips_active_dup(
             await db_session.rollback()
 
     async def _recreate_active_idem_index():
+        # CREATE UNIQUE INDEX validates EXISTING rows, and the body
+        # deliberately leaves two active-status rows sharing one key (the
+        # exact state the guard inspects) — the index can NOT come back while
+        # they sit inside the predicate window. Park every keyed row in
+        # FAILED first (outside the predicate; the fixture teardown deletes
+        # them right after this returns). The recreate must not be
+        # best-effort: a silently-missing index poisons every later
+        # index-dependent test in this pytest process — exactly how
+        # test_orchestrator's dup-claim regression saw the EVALUATING flip
+        # COMMIT instead of raise on CI shard 5 (PR #8635).
         with contextlib.suppress(Exception):
-            async with bind.begin() as conn:
-                await conn.run_sync(_idx.create)
+            # End any aborted transaction the body left on db_session so its
+            # held locks cannot block the CREATE INDEX below.
+            await db_session.rollback()
+        async with bind.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE task SET status='FAILED' "
+                    "WHERE idempotency_key IS NOT NULL"
+                )
+            )
+            # checkfirst: if the DROP above was the part that failed, the
+            # index never left — skip the CREATE instead of masking the
+            # body's real failure with a spurious "already exists".
+            await conn.run_sync(_idx.create, checkfirst=True)
 
     await _drop_active_idem_index()
     try:
