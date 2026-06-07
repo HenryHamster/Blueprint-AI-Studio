@@ -75,6 +75,7 @@ from app.orchestrator_filters import (
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
+    reorder_by_completion_priority,
     _project_fairness_weight,
     collect_dep_uuids,
 )
@@ -2492,6 +2493,21 @@ async def orchestrator_worker():
                 }
                 eligible_ids = apply_project_fairness(
                     eligible_ids, _project_by_id, _fairness_weight
+                )
+
+                # Step 2.97: Finish-before-start — reorder eligible tasks so
+                # tree-completing work wins scarce slots over brand-new work.
+                # Tier order: (1) rollup-PR reviews/fixes (whole-tree release),
+                # (2) ordinary review/fix, (3) children of already-running plans,
+                # (4) new research / top-level work. Pure permutation — no tasks
+                # are dropped. The downstream slot reservation still provides the
+                # anti-starvation floor for create/research.
+                _active_task_ids = {t.id for t in active_tasks_result}
+                eligible_ids = await reorder_by_completion_priority(
+                    eligible_ids,
+                    candidate_tasks,
+                    _active_task_ids,
+                    session,
                 )
 
                 # Slot reservation: ensure high-priority task types (e.g. create,

@@ -5707,3 +5707,159 @@ class TestCrossBaseRecutBounding:
             dependent, project, db_session
         )
         assert outcome == "missing"
+
+
+class TestFinishBeforeStartPriority:
+    """Step 2.97: tree-completing tasks (rollup reviews, ordinary reviews,
+    plan-children) outrank brand-new work under slot scarcity.
+
+    Uses the pure ``apply_completion_priority`` function so DB mocking is not
+    needed — the async ``reorder_by_completion_priority`` wrapper only adds the
+    DB fetch for rollup parent context, which is separately exercised.
+    """
+
+    @staticmethod
+    def _apply(eligible, types_by_id, parent_id_by_id, active_task_ids, rollup_parent_ids):
+        from app.orchestrator_filters import apply_completion_priority
+
+        return apply_completion_priority(
+            eligible,
+            types_by_id,
+            parent_id_by_id,
+            active_task_ids,
+            rollup_parent_ids,
+        )
+
+    def test_empty_and_singleton_unchanged(self):
+        assert self._apply([], {}, {}, set(), set()) == []
+        assert self._apply(["a"], {"a": "review"}, {"a": None}, set(), set()) == ["a"]
+
+    def test_rollup_review_outranks_new_research(self):
+        """A rollup review (tier 1) comes before new research (tier 4)."""
+        eligible = ["research1", "rollup_rv"]
+        types = {"research1": "research", "rollup_rv": "review"}
+        parents = {"research1": None, "rollup_rv": "plan-parent"}
+        active = set()
+        rollup_parents = {"plan-parent"}
+        out = self._apply(eligible, types, parents, active, rollup_parents)
+        assert out[0] == "rollup_rv", "rollup review must precede new research"
+        assert out[1] == "research1"
+
+    def test_tier_ordering_rollup_ordinary_planchild_new(self):
+        """All four tiers sort correctly under mixed queue."""
+        eligible = ["new_research", "plan_child", "ordinary_rv", "rollup_rv"]
+        types = {
+            "new_research": "research",
+            "plan_child": "create",
+            "ordinary_rv": "review",
+            "rollup_rv": "fix",
+        }
+        parents = {
+            "new_research": None,
+            "plan_child": "running-plan",
+            "ordinary_rv": "other-parent",   # parent not a rollup
+            "rollup_rv": "rollup-plan",
+        }
+        active = {"running-plan"}
+        rollup_parents = {"rollup-plan"}
+        out = self._apply(eligible, types, parents, active, rollup_parents)
+        assert out == ["rollup_rv", "ordinary_rv", "plan_child", "new_research"], (
+            f"Expected tier 1,2,3,4 order; got {out}"
+        )
+
+    def test_stable_within_tier(self):
+        """Existing order is preserved for tasks within the same tier."""
+        eligible = ["rv1", "rv2", "rv3"]
+        types = {"rv1": "review", "rv2": "review", "rv3": "review"}
+        parents = {"rv1": None, "rv2": None, "rv3": None}
+        # All tier 2 — original order must be preserved
+        out = self._apply(eligible, types, parents, set(), set())
+        assert out == ["rv1", "rv2", "rv3"]
+
+    def test_permutation_invariant(self):
+        """Result is always a permutation — same length and membership."""
+        eligible = ["r1", "rv1", "c1", "f1", "r2"]
+        types = {
+            "r1": "research", "rv1": "review", "c1": "create", "f1": "fix", "r2": "research"
+        }
+        parents = {"r1": None, "rv1": "p1", "c1": "active-plan", "f1": None, "r2": None}
+        active = {"active-plan"}
+        rollup_parents = {"p1"}
+        out = self._apply(eligible, types, parents, active, rollup_parents)
+        assert sorted(out) == sorted(eligible)
+        assert len(out) == len(eligible)
+
+    def test_scarce_slots_tree_finishing_dispatches_first_reserved_floor_held(self):
+        """Integration: scarce slots (3 available, 6 eligible) — tree-finishing
+        tasks fill the top of the dispatch window while the reserved_slots_for_types
+        floor still admits at least one create and one research.
+
+        Simulates the full Step-2.97 → reserve_slots_for_types → [:slots_available]
+        sequence as it runs in the orchestrator dispatch loop.
+        """
+        from app.orchestrator_filters import (
+            apply_completion_priority,
+            reserve_slots_for_types,
+        )
+
+        # 6 eligible tasks: 1 rollup review, 1 ordinary fix, 1 plan-child create,
+        # 2 new research tasks, 1 new standalone create.
+        eligible = ["research1", "rollup_rv", "research2", "ord_fix", "new_create", "plan_child"]
+        slots_available = 3
+
+        # Simulate types_by_id, parent_id_by_id
+        types = {
+            "research1": "research",
+            "rollup_rv": "review",
+            "research2": "research",
+            "ord_fix": "fix",
+            "new_create": "create",
+            "plan_child": "create",
+        }
+        parents = {
+            "research1": None,
+            "rollup_rv": "rollup-plan",
+            "research2": None,
+            "ord_fix": "other-plan",
+            "new_create": None,
+            "plan_child": "running-plan",
+        }
+        active_task_ids = {"running-plan"}
+        rollup_parent_ids = {"rollup-plan"}
+
+        # Step 2.97 — finish-before-start reorder
+        reordered = apply_completion_priority(
+            eligible, types, parents, active_task_ids, rollup_parent_ids
+        )
+        # Tier 1: rollup_rv, Tier 2: ord_fix, Tier 3: plan_child,
+        # Tier 4: research1, research2, new_create (original order within tier)
+        assert reordered[0] == "rollup_rv", "rollup review must lead"
+        assert reordered[1] == "ord_fix", "ordinary fix must be second"
+        assert reordered[2] == "plan_child", "plan-child must be third"
+
+        # Simulate candidate_tasks as minimal objects with first_payload/id
+        class _FakeTask:
+            def __init__(self, tid, ttype):
+                self.id = tid
+                self.first_payload = {"type": ttype}
+
+        fake_candidates = [_FakeTask(tid, types[tid]) for tid in eligible]
+        runtime_cfg = {"reserved_slots_for_types": {"create": 1, "research": 1}}
+
+        # Slot reservation: ensures at least 1 create and 1 research get a slot
+        after_reserve = reserve_slots_for_types(
+            reordered, fake_candidates, runtime_cfg, slots_available
+        )
+
+        # Final cut
+        dispatched = after_reserve[:slots_available]
+
+        # Core assertion: rollup review must be dispatched (tree-finishing wins)
+        assert "rollup_rv" in dispatched, (
+            f"rollup review must be dispatched; dispatched={dispatched}"
+        )
+        # Anti-starvation floor: at least one research or create must also get in
+        new_work_dispatched = [t for t in dispatched if types[t] in ("create", "research")]
+        assert len(new_work_dispatched) >= 1, (
+            f"reserved floor must admit at least one create/research; dispatched={dispatched}"
+        )

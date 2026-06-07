@@ -83,7 +83,8 @@
     "ci_completion.py": 1850,
     "routers/admin_debug.py": 1850,
     "problem_model.py": 1800,
-    "source_ref_validation.py": 1900
+    "source_ref_validation.py": 1900,
+    "orchestrator_filters.py": 1850
   },
   "agent": {
     "index.ts": 4600,

@@ -1457,3 +1457,125 @@ def apply_project_fairness(
         if not progressed:  # safety: all buckets drained
             break
     return ordered
+
+
+# Task types that are part of the review/fix pipeline (tree-finishing candidates).
+_PIPELINE_TASK_TYPES = frozenset({"review", "fix"})
+# Task types that represent brand-new top-level work (lowest completion priority).
+_NEW_WORK_TASK_TYPES = frozenset({"research", "web_research"})
+
+
+def apply_completion_priority(
+    eligible_ids: list,
+    types_by_id: dict,
+    parent_id_by_id: dict,
+    active_task_ids: set,
+    rollup_parent_ids: set,
+) -> list:
+    """Reorder eligible tasks so tree-completing work outranks new work.
+
+    Assigns completion tiers and stably sorts so that tasks closer to finishing
+    an already-started tree appear before brand-new top-level work:
+
+      1. review/fix tasks whose parent plan already issued a rollup PR
+         (``parent_id`` in ``rollup_parent_ids``) — these close whole plan trees.
+      2. review/fix tasks on ordinary in-flight PRs (parent not a rollup).
+      3. Children of already-running plans (``parent_id`` in ``active_task_ids``).
+      4. Brand-new top-level work: research, web_research, and unparented tasks.
+
+    This is a pure permutation — no tasks are added or removed. The existing
+    order from per-project fairness is preserved within each tier (stable sort).
+    The downstream ``reserve_slots_for_types`` pass still provides the
+    anti-starvation floor so new research/create tasks are never fully starved.
+
+    Args:
+        eligible_ids: candidate ids in current dispatch order.
+        types_by_id: mapping ``id -> task type string``.
+        parent_id_by_id: mapping ``id -> parent_task_id`` (None if top-level).
+        active_task_ids: set of task IDs currently PROVISIONING/IN_PROGRESS.
+        rollup_parent_ids: set of plan-task IDs whose context contains
+            ``rollup_pr_number`` (indicating the tree has rolled up).
+
+    Returns:
+        The reordered ``eligible_ids`` (same length / membership, stable within tier).
+    """
+    if len(eligible_ids) <= 1:
+        return eligible_ids
+
+    def _tier(tid) -> int:
+        task_type = types_by_id.get(tid) or ""
+        parent_id = parent_id_by_id.get(tid)
+        if task_type in _PIPELINE_TASK_TYPES:
+            if parent_id and parent_id in rollup_parent_ids:
+                return 1  # rollup tree-completing review/fix — highest priority
+            return 2  # ordinary review/fix on in-flight PR
+        if parent_id and parent_id in active_task_ids:
+            return 3  # child of already-running plan
+        return 4  # new research / new top-level work — lowest priority
+
+    tiers = [(_tier(tid), i, tid) for i, tid in enumerate(eligible_ids)]
+    tiers.sort(key=lambda x: (x[0], x[1]))
+    result = [x[2] for x in tiers]
+
+    # Log when the reorder actually changes the order (scarcity signal).
+    if result != eligible_ids:
+        tier_counts: dict[int, int] = {}
+        for tier, _, _ in tiers:
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        logger.info(
+            "[ORCHESTRATOR] Finish-before-start: tier distribution "
+            f"{tier_counts} (1=rollup-review, 2=review/fix, 3=plan-child, 4=new-work)"
+        )
+    return result
+
+
+async def reorder_by_completion_priority(
+    eligible_ids: list,
+    candidate_tasks: list[Task],
+    active_task_ids: set,
+    session,
+) -> list:
+    """Step 2.97: reorder eligible tasks so tree-completing work wins scarce slots.
+
+    Fetches parent-task contexts for review/fix candidates in a single batched
+    query to identify rollup parents, then delegates to the pure
+    ``apply_completion_priority`` for the stable-sort reorder.  Only issues a
+    DB query when review/fix candidates with a parent_task_id are present.
+    """
+    if len(eligible_ids) <= 1:
+        return eligible_ids
+
+    types_by_id = {
+        t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
+    }
+    parent_id_by_id = {t.id: t.parent_task_id for t in candidate_tasks}
+
+    # Collect parent IDs for review/fix candidates — only these need rollup check.
+    parent_ids_to_fetch = set()
+    for tid in eligible_ids:
+        task_type = types_by_id.get(tid) or ""
+        parent_id = parent_id_by_id.get(tid)
+        if task_type in _PIPELINE_TASK_TYPES and parent_id:
+            parent_ids_to_fetch.add(parent_id)
+
+    # Query parent contexts in one batch to find rollup parents.
+    rollup_parent_ids: set = set()
+    if parent_ids_to_fetch:
+        rows = (
+            await session.execute(
+                select(Task.id, Task.context).where(
+                    Task.id.in_(parent_ids_to_fetch)
+                )
+            )
+        ).all()
+        for row_id, row_context in rows:
+            if row_context and row_context.get("rollup_pr_number"):
+                rollup_parent_ids.add(row_id)
+
+    return apply_completion_priority(
+        eligible_ids,
+        types_by_id,
+        parent_id_by_id,
+        active_task_ids,
+        rollup_parent_ids,
+    )
