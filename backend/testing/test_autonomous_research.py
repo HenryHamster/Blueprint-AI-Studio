@@ -6614,6 +6614,69 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     assert tasks[0].payloads[0].get("type") in ("design_doc_update", "strategic_review")
 
 
+def test_project_has_purpose_resolves_problem_model_then_vision():
+    """problem_model.intent.purpose is canonical; vision.purpose is the legacy fallback."""
+    from app.problem_model import project_has_purpose
+
+    project = Project(name="Purpose Resolution", user_id="test-user-123")
+
+    project.problem_model = {"intent": {"purpose": "build a bot"}}
+    project.vision = {}
+    assert project_has_purpose(project) is True
+
+    project.problem_model = {}
+    project.vision = {"purpose": "legacy purpose"}
+    assert project_has_purpose(project) is True
+
+    project.problem_model = {"intent": {"purpose": "   "}}
+    project.vision = {"purpose": ""}
+    assert project_has_purpose(project) is False
+
+    project.problem_model = None
+    project.vision = None
+    assert project_has_purpose(project) is False
+
+
+@pytest.mark.asyncio
+async def test_problem_model_purpose_suppresses_force_strategic(db_session):
+    """A purpose living only in problem_model.intent (vision empty — the
+    post-deprecation shape every onboarded project has) must NOT trip the
+    no-purpose arm of force_strategic. Before the fix, the trigger read only
+    vision.purpose, so such projects force-spawned a strategic cycle on every
+    tick, rate-limited only by the spawn cooldown (stsbot2 2026-06-07:
+    6 cycles in ~3h against a frequency of 6 spawns/cycle)."""
+    project = Project(
+        name="Problem Model Purpose Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pmpurp1")],
+        vision={},  # deprecated field, empty — purpose lives in problem_model
+        problem_model={"intent": {"purpose": "build a combat bot"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    strategic = [
+        t
+        for t in tasks
+        if (t.payloads or [{}])[0].get("type")
+        in ("strategic_review", "design_doc_update")
+    ]
+    assert strategic == [], (
+        "problem_model purpose must satisfy the no-purpose force-strategic arm"
+    )
+    # The active direction still gets normal research — the spawn itself works.
+    research = [
+        t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1
+
+
 @pytest.mark.asyncio
 async def test_strategic_failures_no_decay_when_recent(db_session):
     """When _strategic_failures >= 3 and last failure was recent (<48h), force_strategic stays blocked."""

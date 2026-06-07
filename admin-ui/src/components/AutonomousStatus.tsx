@@ -617,7 +617,7 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
         <div className="rounded-md bg-amber-500/5 border border-amber-500/20 px-2 py-1 flex items-start gap-1.5">
           <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />
           <span className="text-[11px] leading-tight text-amber-300">
-            Vision has no purpose — strategic cycles will bootstrap once, then stall on failure.
+            No purpose set (problem model or legacy vision) — strategic cycles will bootstrap once, then stall on failure.
           </span>
         </div>
       )}

@@ -759,8 +759,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         for d in (project.directions or [])
         if d.get("status") == "active"
     )
+    # Purpose resolves through problem_model.intent.purpose (vision.purpose is
+    # the deprecated legacy fallback) — reading only vision here made every
+    # problem-model project look purposeless, forcing a strategic cycle on
+    # every tick (rate-limited only by the spawn cooldown).
+    from app.problem_model import project_has_purpose as _project_has_purpose
+
     force_strategic = strategic_failures < 3 and (
-        not vision_data.get("purpose")
+        not _project_has_purpose(project)
         or not any_active_in_project
         or all_dirs_saturated
     )

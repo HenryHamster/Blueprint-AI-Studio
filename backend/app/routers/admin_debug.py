@@ -982,9 +982,14 @@ async def get_strategic_debug(
             }
         )
 
-    # Vision bootstrapping — without purpose, strategic can only attempt once
+    # Purpose bootstrapping — without purpose, strategic can only attempt once
     # and won't auto-advance if it fails (strategic_failures gates the retry loop).
-    has_purpose = bool(vision.get("purpose"))
+    # Resolves problem_model.intent.purpose first (vision.purpose is the
+    # deprecated legacy fallback) via the same helper the force-trigger uses,
+    # so the UI warning and actual trigger behavior cannot disagree.
+    from app.problem_model import project_has_purpose
+
+    has_purpose = project_has_purpose(project)
 
     # Recent cycle history (last 3, most recent first)
     cycle_history = list(vision.get("_strategic_cycle_history") or [])
