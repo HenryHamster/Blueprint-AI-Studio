@@ -1553,7 +1553,11 @@ async def _provision_gcp(
     metadata_item.value = startup_script
     serial_logging_item = compute_v1.Items()
     serial_logging_item.key = "serial-port-logging-enable"
-    serial_logging_item.value = "TRUE"
+    # Disable Cloud Logging ingestion of serial console output. Diagnostics use
+    # the Compute API getSerialPortOutput (in-memory ring buffer, ~compute.py:2063),
+    # which is independent of this flag, so disabling it saves Cloud Logging
+    # ingestion costs with no loss of observability.
+    serial_logging_item.value = "FALSE"
     metadata.items = [metadata_item, serial_logging_item]
     instance_config.metadata = metadata
 
