@@ -1613,7 +1613,7 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
         provider="anthropic",
         model="claude-sonnet-4-6",
     )
-    # OpenAI gpt-5.4 (priced): 1000 in @ 5e-6, 200 out @ 25e-6 = 0.010
+    # OpenAI gpt-5.4 (priced): 1000 in @ 2.5e-6, 200 out @ 15e-6 = 0.0055
     openai_a = make_task(
         project_id=project_id,
         status=TaskStatus.COMPLETED,
@@ -1659,8 +1659,8 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     assert by_provider["anthropic"]["total_cost_usd"] == round(0.0315, 6)
     assert by_provider["anthropic"]["llm_call_count"] == 12
 
-    # 1000 * 5e-6 + 200 * 25e-6 = 0.005 + 0.005 = 0.010
-    assert by_provider["openai"]["total_cost_usd"] == round(0.010, 6)
+    # 1000 * 2.5e-6 + 200 * 15e-6 = 0.0025 + 0.003 = 0.0055
+    assert by_provider["openai"]["total_cost_usd"] == round(0.0055, 6)
     assert by_provider["fakeprovider"]["total_cost_usd"] == 0.0
     # no_meta has tokens but no provider/model — routed to unattributed sentinel at zero cost
     assert by_provider["unattributed"]["task_count"] == 1
@@ -1682,7 +1682,7 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     # unattributed tasks are unpriced (no pricing entry for sentinel key)
     assert totals["unpriced_task_count"] == 2
     assert totals["unpriced_coverage_fraction"] == round(3 / 5, 4)
-    assert totals["total_cost_usd"] == round(0.0315 + 0.010, 6)
+    assert totals["total_cost_usd"] == round(0.0315 + 0.0055, 6)
 
     assert "fakeprovider:mystery-model" in result["unpriced_combos"]
     assert "unattributed:unknown" in result["unpriced_combos"]
