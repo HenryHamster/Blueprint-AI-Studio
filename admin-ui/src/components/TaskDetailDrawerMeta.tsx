@@ -10,7 +10,7 @@ import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
-import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
+import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import {
@@ -1294,6 +1294,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           <>
             <SectionHeader>Context</SectionHeader>
             <FailureDetailPanel task={task} />
+            <TeardownForensicsPanel task={task} />
             <div>
               {/* reason: inline expand toggle; text-xs single-line height for raw context section */}
               <button

@@ -207,6 +207,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     onConfigureTargets?.();
   }, [onConfigureTargets]);
 
+  const handleOpenDirections = selectedProjectId && onDirectionClick
+    ? () => onDirectionClick('')
+    : undefined;
+
   const handleToggleBlindSpotTheme = useCallback((theme: string) => {
     setExpandedBlindSpotThemes(prev => {
       const newSet = new Set(prev);
@@ -531,7 +535,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       <AnomalyThrottleBanner digest={digest} onRestored={refetchDashboard} />
 
       {/* System Health — actionable issues with remediation hints */}
-      <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
+      <SystemHealthCard
+        data={healthOverview}
+        loading={loading}
+        tasks={tasks}
+        onViewTask={onViewTask}
+        onOpenDirections={handleOpenDirections}
+      />
 
       {/* Fleet Capacity — global slot utilization and saturation */}
       <FleetCapacityCard data={fleetUtilization} loading={loading} />

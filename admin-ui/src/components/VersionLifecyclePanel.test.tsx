@@ -1737,6 +1737,163 @@ describe('VersionLifecyclePanel', () => {
       const history = await screen.findByTestId('verdict-history');
       expect(within(history).getByText(/deploy failed/)).toBeInTheDocument();
     });
+
+    it('renders serving_confirmed outcome badge in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v2',
+            release_version_id: 'rv1',
+            candidate_sha: 'aabbccdd1234',
+            confidence: 0.95,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'serving_confirmed',
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const history = await screen.findByTestId('verdict-history');
+      const badge = within(history).getByTestId('post-promotion-outcome-badge');
+      expect(badge).toHaveAttribute('data-outcome', 'serving_confirmed');
+      expect(badge).toHaveTextContent('✓ serving');
+      expect(badge.className).toContain('text-emerald-400');
+    });
+
+    it('renders awaiting-outcome badge for promoted verdict with null outcome in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v3',
+            release_version_id: 'rv1',
+            candidate_sha: 'eeff11221234',
+            confidence: 0.92,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: null,
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const history = await screen.findByTestId('verdict-history');
+      const badge = within(history).getByTestId('post-promotion-outcome-badge');
+      expect(badge).toHaveAttribute('data-outcome', 'awaiting');
+      expect(badge).toHaveTextContent('awaiting outcome');
+      expect(badge.className).toContain('text-amber-400');
+    });
+
+    it('shows no outcome badge for non-promoted verdicts', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v4',
+            release_version_id: 'rv1',
+            candidate_sha: 'ff001122abcd',
+            confidence: 0.75,
+            sub_scores: null,
+            blocker: 'confidence below threshold',
+            audit_missing_reason: null,
+            would_promote: false,
+            promotion_enabled: true,
+            terminal_status: 'not_promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: null,
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const history = await screen.findByTestId('verdict-history');
+      expect(within(history).queryByTestId('post-promotion-outcome-badge')).not.toBeInTheDocument();
+    });
+
+    it('renders post-promotion outcome for current candidate matched by candidate_sha', async () => {
+      const candidateSha = 'abcdef1234567890';
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v5',
+            release_version_id: 'rv1',
+            candidate_sha: candidateSha,
+            confidence: 0.93,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'serving_confirmed',
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: candidateSha }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Wait for verdicts to load, then verify the badge appears in the last_qualification block
+      await waitFor(() => {
+        const badges = screen.getAllByTestId('post-promotion-outcome-badge');
+        // Should have at least one badge (the one from current candidate cross-reference)
+        expect(badges.length).toBeGreaterThanOrEqual(1);
+        const servingBadge = badges.find(b => b.getAttribute('data-outcome') === 'serving_confirmed');
+        expect(servingBadge).toBeDefined();
+      });
+    });
   });
 
   describe('per-artifact serving evidence', () => {

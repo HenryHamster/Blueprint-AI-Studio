@@ -130,6 +130,13 @@ export interface Task {
   research_findings?: ResearchFinding[] | null;
   context?: {
     fix_loop_abandoned?: { loop: string; exit_reason: string; at: string };
+    teardown_forensics?: {
+      reason: string;
+      serial_tail: string;
+      captured_at: string;
+      vm_instance_id: string;
+      zone?: string | null;
+    };
     [key: string]: unknown;
   };
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];

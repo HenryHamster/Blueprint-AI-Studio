@@ -208,6 +208,7 @@ function setupApiMocks({
   systemMaturity,
   directionSrBreakdown,
   promptFingerprintAnalytics,
+  healthOverview,
 }: {
   digest?: unknown;
   diagnostics?: unknown;
@@ -218,6 +219,7 @@ function setupApiMocks({
   systemMaturity?: unknown;
   directionSrBreakdown?: unknown;
   promptFingerprintAnalytics?: unknown;
+  healthOverview?: unknown;
 }) {
   apiFetchMock.mockImplementation((url: string) => {
     if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(digest ?? {}));
@@ -230,7 +232,7 @@ function setupApiMocks({
     if (url.includes('/version-lifecycle')) return Promise.resolve(notFoundResponse());
     if (url.includes('/direction-sr-breakdown')) return Promise.resolve(directionSrBreakdown ? jsonResponse(directionSrBreakdown) : notFoundResponse());
     if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
-    if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+    if (url.includes('/health-overview')) return Promise.resolve(jsonResponse(healthOverview ?? { overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
     // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
     // sr-recent-misses, task-duration-stats, etc.) return 404 so the
     // component leaves the corresponding state slot at its initial null/[] sentinel rather
@@ -295,6 +297,47 @@ describe('DashboardHome', () => {
     expect(screen.getByText('No recent activity')).toBeInTheDocument();
     expect(screen.getByText('Completed')).toBeInTheDocument();
     expect(screen.getAllByText('0').length).toBeGreaterThan(2);
+  });
+
+  it('renders directions needing attention and opens the directions view when clicked', async () => {
+    const onDirectionClick = vi.fn();
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+      healthOverview: {
+        overall_status: 'healthy',
+        success_rate: { current: null, trend: null, window_hours: 24 },
+        queue_depth: { queued: 0, active: 0, evaluating: 0 },
+        actionable_issues: [],
+        direction_portfolio: {
+          possibly_complete_count: 2,
+          missing_criteria_count: 1,
+        },
+      },
+    });
+
+    const user = userEvent.setup();
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+        onDirectionClick={onDirectionClick}
+      />,
+    );
+
+    const button = await screen.findByRole('button', { name: 'Open directions view' });
+    expect(button).toHaveTextContent('2 possibly complete');
+    expect(button).toHaveTextContent('1 missing criteria');
+    await user.click(button);
+    expect(onDirectionClick).toHaveBeenCalledWith('');
   });
 
   it('renders populated digest metrics, failure pills, and latest cycle text', async () => {

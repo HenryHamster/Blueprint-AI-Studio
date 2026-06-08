@@ -16,6 +16,11 @@ export interface HealthOverviewResponse {
   success_rate: { current: number | null; trend: string | null; window_hours: number };
   queue_depth: { queued: number; active: number; evaluating: number };
   actionable_issues: HealthOverviewIssue[];
+  direction_portfolio?: {
+    possibly_complete_count: number;
+    missing_criteria_count: number;
+    [key: string]: number;
+  };
   // Precompute provenance, stamped by the backend when the overview is served
   // from the leader-precomputed cross-instance cache (absent on the on-demand
   // live-compute path, which is fresh-by-definition). Used to surface when the
@@ -54,17 +59,23 @@ export function SystemHealthCard({
   loading,
   tasks,
   onViewTask,
+  onOpenDirections,
 }: {
   data: HealthOverviewResponse | null;
   loading: boolean;
   tasks: Task[];
   onViewTask: (task: Task) => void;
+  onOpenDirections?: () => void;
 }) {
   const status = data?.overall_status ?? 'healthy';
   const statusStyle = _HEALTH_STATUS_STYLE[status] ?? _HEALTH_STATUS_STYLE.healthy;
   const sr = data?.success_rate;
   const qd = data?.queue_depth;
   const issues = data?.actionable_issues ?? [];
+  const directionAttention = data?.direction_portfolio ?? null;
+  const possiblyCompleteCount = directionAttention?.possibly_complete_count ?? 0;
+  const missingCriteriaCount = directionAttention?.missing_criteria_count ?? 0;
+  const hasDirectionAttention = directionAttention != null;
   const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
   const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
   const { asOfLabel, stale: freshnessStale } = snapshotFreshness(
@@ -122,6 +133,38 @@ export function SystemHealthCard({
                 </div>
               )}
             </div>
+          )}
+          {hasDirectionAttention && (
+            onOpenDirections ? (
+              <button
+                type="button"
+                onClick={onOpenDirections}
+                aria-label="Open directions view"
+                className="w-full mb-2 rounded-lg border border-neutral-800/50 bg-neutral-900/40 px-2.5 py-2 text-left text-xs transition-colors hover:border-neutral-700 hover:bg-neutral-900/70 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-neutral-500 uppercase tracking-wide text-[10px] font-semibold">Directions</span>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                    {possiblyCompleteCount} possibly complete
+                  </span>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                    {missingCriteriaCount} missing criteria
+                  </span>
+                </div>
+              </button>
+            ) : (
+              <div className="mb-2 rounded-lg border border-neutral-800/50 bg-neutral-900/40 px-2.5 py-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-neutral-500 uppercase tracking-wide text-[10px] font-semibold">Directions</span>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                    {possiblyCompleteCount} possibly complete
+                  </span>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                    {missingCriteriaCount} missing criteria
+                  </span>
+                </div>
+              </div>
+            )
           )}
           {issues.length === 0 ? (
             <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
