@@ -604,6 +604,29 @@ async def _deliver_knowledge_to_dependents(
             touched,
         )
 
+    # Fast-path event-driven unblock: the QUEUED-dependent stamp above does NOT
+    # cover BLOCKED waiters (it filters on status == QUEUED). A blocked task whose
+    # kind='task' / finding-hash prerequisite is now durably satisfied by this
+    # freshly-committed document would otherwise sit BLOCKED until the slow periodic
+    # sweep re-checks it (often hours out, or only every 6h once escalated). The doc
+    # is already committed at this point (both _persist_document and
+    # _persist_compute_knowledge_document commit + refresh before delivering), so the
+    # substance index sees it. Re-evaluate the project's BLOCKED set through the SAME
+    # shared resolution machinery and resume any task whose needs are now satisfied.
+    # Best-effort: a failure here must never break the producing task's completion.
+    try:
+        from app.reaper_sweeps import event_driven_unblock_on_knowledge
+
+        await event_driven_unblock_on_knowledge(task.project_id, session)
+    except Exception:  # noqa: BLE001 — best-effort; must never break completion
+        logger.warning(
+            "[%s] event-driven unblock-on-knowledge failed for doc %s in project %s",
+            _kind_tag(doc.source_kind),
+            doc.id,
+            task.project_id,
+            exc_info=True,
+        )
+
 
 async def _persist_document(
     task: Task,

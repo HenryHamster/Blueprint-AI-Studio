@@ -11777,6 +11777,354 @@ async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
     assert result == 0
 
 
+# ── event_driven_unblock_on_knowledge (knowledge-doc creation trigger) ─────────
+#
+# A KnowledgeDocument making a BLOCKED task's kind='task' / finding-hash
+# prerequisite durably satisfiable must resume the waiter immediately — without
+# waiting for the slow periodic Step-12 sweep (recheck_after may be far out, or
+# only every 6h once escalated). These exercise the new fast path AND assert the
+# conservative matching + all-needs-resolved gate are preserved.
+
+from app.reaper_sweeps import event_driven_unblock_on_knowledge
+
+
+async def _knowledge_doc(db, project, source_task_id, *, topic):
+    """Persist a durable KnowledgeDocument whose substance can satisfy a need.
+
+    The finding-hash substance is read by the index from the SOURCE TASK's
+    ``context['finding_hash']`` (mirroring production), so the caller controls
+    finding-hash matching via the source task; this helper supplies the topic."""
+    from app.models import KnowledgeDocument
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task_id,
+        source_kind="web_research",
+        title="finding doc",
+        summary="substance summary",
+        body="full body",
+        topic=topic,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_knowledge_event_resumes_blocked_task_immediately(reaper_db, mocker):
+    """A BLOCKED task whose kind='task' / finding-hash need is now satisfied by a
+    freshly-created KnowledgeDocument is resumed to QUEUED by
+    event_driven_unblock_on_knowledge — WITHOUT running the periodic sweep, and
+    even though recheck_after is far in the future."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Source task: CANCELLED, but its finding_hash is the substance the doc carries.
+    source_task = Task(
+        project_id=project.id, title="research", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "abc123def4561111", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    await _knowledge_doc(
+        reaper_db, project, source_task.id, topic="some-topic",
+    )
+
+    # Dependent BLOCKED on that finding_hash; recheck_after in the future, so the
+    # periodic sweep would NOT pick it up this tick.
+    dependent = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs the research finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "abc123def4561111",
+                "reason": "BLOCKER: needs the research finding",
+                "need": {"kind": "task", "ref": "abc123def4561111"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 1
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.QUEUED
+    # No edge wired (knowledge satisfaction has no live foundation).
+    assert not (dependent.depends_on or [])
+    # Blocker metadata cleared.
+    assert "blocker" not in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_knowledge_event_resumes_escalated_parked_task(reaper_db, mocker):
+    """A PARKED (escalated) BLOCKED task — which the sweep only re-checks every 6h —
+    is resumed immediately when matching knowledge lands (the incident shape)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._resolve_blocked_escalation_alert",
+        new_callable=AsyncMock,
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    source_task = Task(
+        project_id=project.id, title="research", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "9999888877776666", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    await _knowledge_doc(
+        reaper_db, project, source_task.id, topic="parked-topic",
+    )
+
+    dependent = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs the research finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "9999888877776666",
+                "reason": "BLOCKER: needs the research finding",
+                "need": {"kind": "task", "ref": "9999888877776666"},
+            },
+            "_blocked_escalated": True,  # parked — 6h re-eval cadence
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 1
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.QUEUED
+    assert "blocker" not in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_knowledge_event_no_match_leaves_task_blocked(reaper_db, mocker):
+    """A KnowledgeDocument whose substance (topic AND finding_hash) does NOT match
+    the need's ref leaves the dependent BLOCKED — no false-positive resume."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Source task whose finding_hash is UNRELATED to the need.
+    source_task = Task(
+        project_id=project.id, title="other research", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "1111222233334444", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    await _knowledge_doc(
+        reaper_db, project, source_task.id, topic="unrelated-topic",
+    )
+
+    dependent = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs the research finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "aaaabbbbccccdddd",
+                "reason": "BLOCKER: needs the research finding",
+                "need": {"kind": "task", "ref": "aaaabbbbccccdddd"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+    assert "blocker" in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_knowledge_event_holds_task_with_unsatisfied_sibling_need(
+    reaper_db, mocker
+):
+    """A multi-need BLOCKED task whose new knowledge satisfies ONLY one of its two
+    needs must stay BLOCKED — the all-needs-resolved resume gate is preserved. The
+    satisfied need is dropped; the still-unsatisfied one is re-persisted."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    source_task = Task(
+        project_id=project.id, title="research", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "5555666677778888", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    # Doc satisfies ONLY the first need's ref.
+    await _knowledge_doc(
+        reaper_db, project, source_task.id, topic="satisfied-topic",
+    )
+
+    # Two needs: one satisfied by the doc, one (still-missing-foundation) is not.
+    dependent = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs two findings",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "5555666677778888",
+                "reason": "BLOCKER: needs two findings",
+                "need": {"kind": "task", "ref": "5555666677778888"},
+                "needs": [
+                    {"kind": "task", "ref": "5555666677778888"},
+                    {"kind": "task", "ref": "eeeeffff00001111"},
+                ],
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    # Still BLOCKED — the second need is unsatisfied.
+    assert dependent.status == TaskStatus.BLOCKED
+    # The structured blocker is retained and now carries ONLY the unsatisfied need.
+    from app.task_blocked import get_blocker_needs
+
+    residual_refs = {n["ref"] for n in get_blocker_needs(dependent)}
+    assert residual_refs == {"eeeeffff00001111"}
+
+
+@pytest.mark.asyncio
+async def test_knowledge_completion_path_unblocks_waiter_end_to_end(
+    reaper_db, mocker
+):
+    """End-to-end: driving the real knowledge-completion delivery chokepoint
+    (_deliver_knowledge_to_dependents) fires the event-driven unblock and resumes a
+    BLOCKED waiter — proving the trigger is wired at the shared persistence seam."""
+    from app.models import KnowledgeDocument
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Producing task carrying the finding_hash, with a freshly-committed doc.
+    producer = Task(
+        project_id=project.id, title="producer", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "abcabcabc1234567"},
+        status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_kind="web_research",
+        title="e2e doc",
+        summary="e2e summary",
+        body="e2e body",
+        topic="e2e-topic",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    dependent = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs e2e finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "abcabcabc1234567",
+                "reason": "BLOCKER: needs e2e finding",
+                "need": {"kind": "task", "ref": "abcabcabc1234567"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    # Drive the real delivery chokepoint (where the trigger is wired).
+    await _deliver_knowledge_to_dependents(
+        producer, doc, {"title": "e2e doc", "summary": "e2e summary"}, reaper_db
+    )
+
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.QUEUED
+    assert "blocker" not in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monkeypatch):
+    """If the event-driven unblock raises, the knowledge-completion chokepoint
+    swallows it — document delivery must never break the producing task."""
+    from app.models import KnowledgeDocument
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+    import app.reaper_sweeps as _rs_mod
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+
+    producer = Task(
+        project_id=project.id, title="producer", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}], context={}, status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+    doc = KnowledgeDocument(
+        project_id=project.id, source_task_id=producer.id, source_kind="web_research",
+        title="d", summary="s", body="b", topic="t",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("simulated unblock failure")
+
+    monkeypatch.setattr(_rs_mod, "event_driven_unblock_on_knowledge", _raise)
+
+    # Must not raise — the chokepoint is best-effort.
+    await _deliver_knowledge_to_dependents(
+        producer, doc, {"title": "d", "summary": "s"}, reaper_db
+    )
+
+
 # ── Fix: file_conflict blockers must not hard-park or survive requeue ──────────
 #
 # Regression tests for the three-part fix:

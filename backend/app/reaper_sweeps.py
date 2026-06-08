@@ -1823,32 +1823,33 @@ async def sweep_unblock_blocked_tasks(
     return requeued
 
 
-async def event_driven_unblock_dependents(
-    landed_task: "Task",
+async def _event_driven_unblock_project(
+    project_id,
     session,
     *,
-    batch_size: int = 50,
+    batch_size: int,
 ) -> int:
-    """Fast-path event-driven re-resolution of BLOCKED dependents when a foundation lands.
+    """Shared engine for the event-driven BLOCKED re-resolution fast paths.
 
-    Called immediately after a task commits to COMPLETED + merge-unblock signal.
-    Scans same-project BLOCKED dependents with machine-resolvable needs and
-    resumes any whose needs are now satisfied by the just-landed foundation.
+    Scans same-project BLOCKED tasks that carry a machine-resolvable need and runs
+    the SAME classification (:func:`_classify_blocker_needs`, which consults the
+    active / completed / dead candidate sets AND the durable knowledge substance
+    index) + disposition (:func:`_apply_needs_disposition`) the periodic Step-12
+    sweep uses. A task is resumed to QUEUED only when EVERY recorded need is
+    accounted for — the disposition's all-needs-resolved gate is preserved, so a
+    task with a still-unsatisfied sibling need stays BLOCKED.
 
-    Fail-open: any per-task error is swallowed and logged; the function never
-    propagates an exception to its caller. Bounded: scans at most ``batch_size``
-    BLOCKED rows per call. Idempotent alongside the periodic sweep: uses
-    ``FOR UPDATE SKIP LOCKED`` so a row being evaluated by the sweep is skipped
-    here, and vice versa.
+    Fail-open: any per-task error is swallowed and logged; never propagated.
+    Bounded: scans at most ``batch_size`` BLOCKED rows per call. Idempotent
+    alongside the periodic sweep and the sibling fast paths — ``FOR UPDATE SKIP
+    LOCKED`` means a row being evaluated elsewhere is skipped here, and vice versa,
+    so a task can never be double-resumed.
 
-    Returns the number of tasks resumed (0 on error or no-match).
+    Returns the number of tasks resumed (0 on error or no match). Callers own the
+    contextual log line; this helper only mutates + commits the resolved rows.
     """
     from app.broadcast import broadcast_to_project as _bcast
-    from app.landed_signal import has_merge_unblock_signal
     from app.task_blocked import get_blocker_needs
-
-    if not has_merge_unblock_signal(landed_task):
-        return 0
 
     now = _utcnow()
 
@@ -1857,7 +1858,7 @@ async def event_driven_unblock_dependents(
         select(Task)
         .where(
             Task.status == TaskStatus.BLOCKED,
-            Task.project_id == landed_task.project_id,
+            Task.project_id == project_id,
         )
         .limit(batch_size)
         .with_for_update(skip_locked=True)
@@ -1908,25 +1909,99 @@ async def event_driven_unblock_dependents(
                 changed = True
         except Exception:
             logger.exception(
-                "[REAPER] event_driven_unblock_dependents failed for task %s — skipping",
+                "[REAPER] event-driven unblock failed for task %s — skipping",
                 task.id,
             )
 
     if changed:
         await session.commit()
-    for project_id, payload in pending_broadcasts:
+    # Loop var renamed off ``project_id`` so it can't shadow the engine's
+    # ``project_id`` parameter (the broadcast tuple already carries its own).
+    for bcast_pid, payload in pending_broadcasts:
         try:
-            await _bcast(project_id, "task_updated", payload)
+            await _bcast(bcast_pid, "task_updated", payload)
         except Exception:
             logger.debug(
                 "[REAPER] event-driven unblock broadcast failed for %s",
                 payload.get("task_id"),
                 exc_info=True,
             )
+    return requeued
+
+
+async def event_driven_unblock_dependents(
+    landed_task: "Task",
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Fast-path event-driven re-resolution of BLOCKED dependents when a foundation lands.
+
+    Called immediately after a task commits to COMPLETED + merge-unblock signal.
+    Scans same-project BLOCKED dependents with machine-resolvable needs and
+    resumes any whose needs are now satisfied by the just-landed foundation.
+
+    Fail-open: any per-task error is swallowed and logged; the function never
+    propagates an exception to its caller. Bounded: scans at most ``batch_size``
+    BLOCKED rows per call. Idempotent alongside the periodic sweep: uses
+    ``FOR UPDATE SKIP LOCKED`` so a row being evaluated by the sweep is skipped
+    here, and vice versa.
+
+    Returns the number of tasks resumed (0 on error or no-match).
+    """
+    from app.landed_signal import has_merge_unblock_signal
+
+    if not has_merge_unblock_signal(landed_task):
+        return 0
+
+    requeued = await _event_driven_unblock_project(
+        landed_task.project_id, session, batch_size=batch_size
+    )
     if requeued:
         logger.info(
             "[REAPER] event_driven_unblock: landing of %s unblocked %d dependent(s) → QUEUED",
             landed_task.id,
+            requeued,
+        )
+    return requeued
+
+
+async def event_driven_unblock_on_knowledge(
+    project_id,
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Fast-path event-driven re-resolution of BLOCKED tasks when a KnowledgeDocument lands.
+
+    A knowledge document making a BLOCKED task's ``kind='task'`` / finding-hash
+    prerequisite durably satisfiable (matching ``finding_hash`` or exact ``topic``)
+    used to leave waiters BLOCKED until the slow periodic sweep re-checked them at
+    ``recheck_after`` (or, once escalated, only every 6h). This fires immediately
+    after the producing task commits the document, so waiters resume at once.
+
+    Unlike :func:`event_driven_unblock_dependents` there is no single landed task —
+    a knowledge doc satisfies a need by substance, not by a depends_on edge — so it
+    is keyed on ``project_id`` and re-evaluates the whole project's BLOCKED set
+    through the SAME shared engine (:func:`_event_driven_unblock_project`), which in
+    turn consults the durable knowledge substance index via
+    :func:`_classify_blocker_needs`. The conservative finding-hash/exact-topic
+    matching and the all-needs-resolved resume gate are preserved unchanged.
+
+    Fail-open + bounded + idempotent (``FOR UPDATE SKIP LOCKED``) alongside the
+    periodic sweep and the landed-task path; must be called best-effort by the
+    knowledge-completion chokepoint so it can never break document persistence.
+
+    Returns the number of tasks resumed (0 on error or no match).
+    """
+    requeued = await _event_driven_unblock_project(
+        project_id, session, batch_size=batch_size
+    )
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock_on_knowledge: new knowledge in project %s "
+            "unblocked %d task(s) → QUEUED",
+            project_id,
             requeued,
         )
     return requeued
