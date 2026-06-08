@@ -76,6 +76,12 @@ export interface CodeChangeTaskOpts {
    *  so the generated ./check runs the project's configured per-directory
    *  commands instead of the hardcoded Blueprint blocks. */
   buildConfig?: BuildConfig;
+  /** Exact pytest node-id selectors CI reported failing (ci_failure fix only).
+   *  Forwarded to writeCodeChangeHelpers so the generated ./check verifies
+   *  these selectors pass LOCALLY before ./pr open can push — closing the
+   *  fix→verify→push loop that previously shipped blind and re-failed in CI.
+   *  Empty/undefined for non-ci_failure tasks. */
+  ciFailureSelectors?: string[];
   /** When true, this task was auto-decomposed from a larger finding into a
    *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
    *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
@@ -372,6 +378,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     promotionTarget: opts.promotionTarget,
     regressingCategories: opts.regressingCategories,
     buildConfig: opts.buildConfig,
+    ciFailureSelectors: opts.ciFailureSelectors,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

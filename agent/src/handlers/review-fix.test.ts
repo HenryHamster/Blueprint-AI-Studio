@@ -1796,6 +1796,101 @@ describe('handleFix — CI failure context is injected into the prompt', () => {
   });
 });
 
+// ── ci_failure closed-loop verify gate ──────────────────────────────────────
+// The CI fix loop was previously OPEN: Claude fixed, ran ./check (lint/typecheck
+// + the standalone-3 backend smoke files), then ./pr open pushed — but ./check
+// never ran the actual CI-failing selectors, so the fix shipped blind and CI
+// re-failed (~20-min provision+CI round-trip burned per iteration). handleFix
+// now threads the exact CI-failing selectors to runCodeChangeTask, which wires
+// them into ./check so ./pr open can't push until they pass locally.
+describe('handleFix — ci_failure selectors wired into the ./check gate', () => {
+  it('forwards extracted selectors to runCodeChangeTask for a ci_failure fix', async () => {
+    await handleFix(
+      'task-fix-ci-gate-1',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'CI failed:\nFAILED backend/testing/test_models.py::test_create - AssertionError',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // The selectors CI reported failing are forwarded so ./check can verify
+    // them before ./pr open pushes (closing the open loop).
+    expect(capturedFixOpts().ciFailureSelectors).toEqual([
+      'backend/testing/test_models.py::test_create',
+    ]);
+  });
+
+  it('tells the agent the selectors are now part of the ./check gate', async () => {
+    vi.mocked(testLoopMod.testFixLoop).mockResolvedValueOnce({
+      passed: false,
+      testFailuresDetected: true,
+      failureSummary: 'AssertionError at backend/testing/test_models.py::test_create',
+    });
+
+    await handleFix(
+      'task-fix-ci-gate-2',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'CI failed:\nFAILED backend/testing/test_models.py::test_create - AssertionError',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    // Closed-loop framing: ./check runs the selectors, ./pr open blocks on them.
+    expect(prompt).toMatch(/\.\/check runs them[\s\S]*\.\/pr open will NOT push until they pass/);
+  });
+
+  it('does NOT wire selectors for a non-ci_failure (review-feedback) fix', async () => {
+    await handleFix(
+      'task-fix-ci-gate-3',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        // A review-feedback fix prompt that incidentally mentions a failing
+        // test must NOT trip the gate — only fixReason === 'ci_failure' does.
+        pr_number: 7,
+        prompt: 'Address review feedback. FAILED backend/testing/test_models.py::test_create',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'code_review' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Non-ci_failure fixes keep the existing gate untouched: no selectors, no
+    // gate note in the prompt.
+    const selectors = capturedFixOpts().ciFailureSelectors;
+    expect(selectors === undefined || selectors.length === 0).toBe(true);
+    expect(capturedFixPrompt()).not.toContain('.ci/pr open will NOT push');
+    expect(capturedFixPrompt()).not.toMatch(/\.\/pr open will NOT push until they pass/);
+  });
+
+  it('forwards an empty selector list when none can be extracted from a ci_failure', async () => {
+    await handleFix(
+      'task-fix-ci-gate-4',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        // No parseable pytest selector in the logs.
+        prompt: 'CI failed: the deploy step timed out, no test node-ids present',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // ci_failure with no extractable selectors degrades to an empty list (no
+    // gate run) rather than blocking — CI remains the backstop.
+    expect(capturedFixOpts().ciFailureSelectors).toEqual([]);
+  });
+});
+
 describe('handleFix — reviewer working set propagation', () => {
   it("prepends a Reviewer's Working Set section when task.context.investigated_files is present", async () => {
     await handleFix(

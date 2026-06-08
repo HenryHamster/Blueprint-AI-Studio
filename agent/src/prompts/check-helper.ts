@@ -7,11 +7,68 @@ import {
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
+  sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
 
+/** Emit the ci_failure closed-loop verify block for the generated ./check.
+ *
+ *  For a ci_failure fix task we know the EXACT pytest node-ids CI reported
+ *  failing. The fix loop was previously open: Claude edited, ran ./check
+ *  (lint/typecheck + the standalone-3 backend smoke files), then ./pr open
+ *  pushed — but ./check never ran the actual CI-failing selectors (the
+ *  standalone gate covers ~3 of ~100 test files), so the fix shipped blind and
+ *  CI re-failed, burning a ~20-min provision+CI round-trip per iteration.
+ *
+ *  This block runs those exact selectors LOCALLY via the sanctioned Docker
+ *  harness (`scripts/test-backend.sh --postgres <selector...>`). Targeted
+ *  single-selector runs fit the agent VM's memory headroom — only the FULL
+ *  suite OOMs (that's why the standalone gate exists), and the harness's own
+ *  memory guard explicitly exempts `*.py` / `*::*` args. A genuine failure of
+ *  a target selector lands in FAILED, so ./check fails closed and ./pr open
+ *  (which gates on ./check) cannot push until the CI-failing tests pass.
+ *
+ *  Infra degradation is graceful: if Docker is unavailable on this VM, the
+ *  block can't run the sanctioned harness and a bare local pytest would be the
+ *  unfaithful SQLite fallback — so it WARNS and does NOT block (CI remains the
+ *  authoritative backstop). A real, runnable, still-failing target test always
+ *  blocks. Selectors are pre-sanitized (shell-safe pytest node-ids) by the
+ *  caller, so single-quote interpolation here is injection-safe.
+ *
+ *  Runs on EVERY ./check (not behind WITH_TESTS): a CI failure can occur on a
+ *  non-LTS branch where the WITH_TESTS gate is off, and ./pr open gates on
+ *  plain ./check there. Verifying the targeted selectors is cheap and exact. */
+function buildCiFailureVerifyBlock(selectors: string[], taskId: string): string {
+  if (selectors.length === 0) return '';
+  // Single-quoted bash literals — selectors cleared PYTEST_SELECTOR_RE.
+  const quoted = selectors.map(s => `'${s}'`).join(' ');
+  return `
+# ── ci_failure closed-loop verify ───────────────────────────────────────────
+# This is a CI-failure fix: verify the EXACT CI-failing pytest selector(s)
+# pass locally BEFORE ./pr open can push. Targeted selectors (never the full
+# suite — that OOMs the 8 GB agent VM); the harness memory guard exempts them.
+# A still-failing target test fails this gate; ./pr open blocks until green.
+CI_FAIL_SELECTORS=(${quoted})
+if [ \${#CI_FAIL_SELECTORS[@]} -gt 0 ]; then
+  if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
+    echo "[check] ci_failure verify: running \${#CI_FAIL_SELECTORS[@]} targeted CI-failing selector(s) via the sanctioned harness..."
+    run "ci_failure selectors verify" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ "\${CI_FAIL_SELECTORS[@]}"
+  else
+    # No Docker → the sanctioned harness can't run here and a bare local pytest
+    # would be the unfaithful SQLite fallback. Don't block on an infra artifact
+    # (CI runs the authoritative Postgres suite on the PR after ./pr open); warn
+    # and record a GATE-ENVIRONMENT marker ./pr surfaces after the gate.
+    echo "[check] ci_failure verify: SKIPPED — Docker unavailable, can't run the sanctioned harness for the CI-failing selectors on this VM."
+    echo "[check]   The targeted CI-failing tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
+    printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ci_failure selector verify skipped — no Docker for the sanctioned harness; CI verifies the failing selectors on the PR" >> /tmp/check_gate_env_${taskId}.txt
+  fi
+fi
+`;
+}
+
 export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
+  const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -384,24 +441,22 @@ if touches backend/; then
     run "backend migration chain" bash -c 'python3 backend/app/migration_chain.py 2>&1'
   fi
 fi
+${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
 
 # Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
 # the line-count caps that backend/testing/test_invariants.py enforces, so a
 # size breach surfaces HERE (before ./pr open) instead of only after a PR is
-# open and a full CI/Docker round-trip is burned. Scope to whichever stacks
-# the diff touched, mapping admin-ui -> frontend (the JSON's section name).
+# open and a full CI/Docker round-trip is burned. Runs UNCONDITIONALLY (all
+# sections, not diff-scoped): a rebase/merge can grow a file in a stack the
+# diff never touched (e.g. landing a feature whose merge balloons models.py),
+# and a size breach is a common, trivial CI failure we never want to burn a
+# fix iteration on. The checker is sub-second and skips any section whose
+# source tree is absent here, so always-on costs nothing.
 # Invoked BY REFERENCE as a committed script (exactly like the migration-chain
 # guard above) — no embedded Python heredoc (see CLAUDE.md). A breach makes
 # the checker exit non-zero, which \`run\` records in FAILED so ./check fails.
 # Remediate with: python3 backend/testing/check_size_limits.py --fix
-SIZE_SECTIONS=""
-if touches backend/;          then SIZE_SECTIONS="$SIZE_SECTIONS,backend"; fi
-if touches agent/;            then SIZE_SECTIONS="$SIZE_SECTIONS,agent"; fi
-if admin_ui_runtime_touched;  then SIZE_SECTIONS="$SIZE_SECTIONS,frontend"; fi
-SIZE_SECTIONS="\${SIZE_SECTIONS#,}"
-if [ -n "$SIZE_SECTIONS" ]; then
-  run "size guardrail ($SIZE_SECTIONS)" bash -c "python3 backend/testing/check_size_limits.py --sections $SIZE_SECTIONS 2>&1"
-fi
+run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"
 `;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
