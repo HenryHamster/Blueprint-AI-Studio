@@ -348,10 +348,10 @@ async def stamp_compute_job_result_reference(
         artifact = await session.get(Artifact, job.artifact_id)
         if artifact is not None and logical_key:
             artifact.logical_key = logical_key
-            if not artifact.storage_uri:
+            if not artifact.storage_uri and _is_durable_artifact_uri(reference):
                 artifact.storage_uri = reference
             session.add(artifact)
-    elif logical_key:
+    elif logical_key and _is_durable_artifact_uri(reference):
         artifact = Artifact(
             task_id=task_id,
             artifact_type=ArtifactType.COMPUTE_RESULT,
@@ -1197,6 +1197,26 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+
+
+def _is_durable_artifact_uri(reference: str) -> bool:
+    """True only for references that are durable cloud-storage or file URIs.
+
+    Rejects bare http:// / https:// references (transient signed URLs, arbitrary
+    web endpoints) so they cannot create Artifact rows or trigger downstream
+    delivery. Accepts gs://, s3://, az://, file: URIs and path-like strings
+    containing a ``/`` separator (including metric fragment refs such as
+    ``gs://...#metric:name=value``). Empty strings are rejected.
+    """
+    text = reference.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in text
 
 
 def _coerce_metric_number(value: Any) -> float | int | None:

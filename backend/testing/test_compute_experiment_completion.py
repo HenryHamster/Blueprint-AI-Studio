@@ -172,6 +172,83 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+    # An https:// reference must not create an Artifact row even when the task
+    # carries no downstream_artifact acceptance_evidence.
+    assert job.artifact_id is None
+
+
+@pytest.mark.asyncio
+async def test_compute_downstream_artifact_rejects_transient_result_reference(
+    db_session, _quiet_compute_io
+):
+    """A transient https:// result_reference must not create an Artifact row or
+    deliver a prerequisite pointer to dependents, even when the task declares a
+    downstream_artifact logical key.  The reference is still recorded on
+    job.result_reference for diagnostics.
+    """
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    transient_ref = "https://signed.example.com/jobs/abc/result.json?token=xyz"
+    await compute_jobs.stamp_compute_job_result_reference(
+        db_session,
+        task_id=task.id,
+        job_id=job.id,
+        result_reference=transient_ref,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(job)
+    # Diagnostic reference is always recorded.
+    assert job.result_reference == transient_ref
+    # No Artifact row created for a transient https:// reference.
+    assert job.artifact_id is None
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs is None, (
+        "transient https:// result_reference must not deliver artifact prerequisites "
+        "to dependents"
+    )
 
 
 @pytest.mark.asyncio
