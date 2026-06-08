@@ -355,8 +355,15 @@ AGENT_IMAGE_FAMILY = os.getenv(
 # versioned image.
 GPU_IMAGE_FAMILY = os.getenv(
     "GPU_IMAGE_FAMILY",
+    # Google retires dated CUDA image families: common-cu128-ubuntu-2204-nvidia-570
+    # was deleted upstream (provision attempts 404'd, GPU provisioning self-disabled
+    # via _ensure_gpu_image_family_valid). Verified-current successor as of 2026-06-08
+    # is the cu129 / driver-580 series (see `gcloud compute images list
+    # --project deeplearning-platform-release --filter family~common-cu129`). The
+    # startup/recheck validation in this module is the live tripwire if this is
+    # retired again — no silent fallback list, so a future deprecation stays visible.
     "projects/deeplearning-platform-release/global/images/family/"
-    "common-cu128-ubuntu-2204-nvidia-570",
+    "common-cu129-ubuntu-2204-nvidia-580",
 )
 
 # Per-region subnet names derived from the fleet FALLBACK_ZONES ring, so GPU
@@ -1020,7 +1027,7 @@ async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
         ).first()
         if match is not None:
             return True
-    except Exception as e:  # noqa: BLE001 — observation must never raise
+    except Exception as e:
         logger.debug(f"[COMPUTE] fleet_serving_source_sha DB read failed: {e}")
     # In-memory heartbeat fallback (warm before a PoolVm row is persisted).
     return any(sha == promoted_sha for sha in _vm_source_shas.values())
