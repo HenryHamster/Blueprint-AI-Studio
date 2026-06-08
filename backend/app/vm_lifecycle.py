@@ -22,8 +22,10 @@ and the teardown helpers via ``app.vm_lifecycle.<name>``.
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Dict
 
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.compute import delete_agent_vm
@@ -31,6 +33,10 @@ from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+# Best-effort serial-console forensics capture is time-boxed so a hung GCE
+# serial RPC can never block or delay an actual VM teardown.
+_TEARDOWN_FORENSICS_TIMEOUT = 15
 
 # GCP VM count cache — updated by cleanup service, used by orchestrator concurrency check
 _last_gcp_vm_count: int = 0
@@ -119,11 +125,11 @@ async def _vm_is_governed_pool_member(vm_id: str) -> bool:
     cold-provisioned teardown pays nothing while the pool is dark.
     """
     try:
-        from app.warm_pool import is_warm_pool_enabled  # noqa: PLC0415
+        from app.warm_pool import is_warm_pool_enabled
 
         if not is_warm_pool_enabled():
             return False
-        from app.warm_pool import LIVE_POOL_STATES, get_pool_vm  # noqa: PLC0415
+        from app.warm_pool import LIVE_POOL_STATES, get_pool_vm
 
         async with AsyncSessionLocal() as s:
             member = await get_pool_vm(s, vm_id)
@@ -135,6 +141,56 @@ async def _vm_is_governed_pool_member(vm_id: str) -> bool:
             vm_id,
         )
         return False
+
+
+async def _capture_and_persist_teardown_forensics(vm_id: str, reason: str) -> None:
+    """Capture a VM's serial-console tail BEFORE it is deleted and persist it
+    onto the owning task's ``context['teardown_forensics']``.
+
+    GCE ``get-serial-port-output`` returns "not ready" once an instance stops,
+    so a silently-dead agent's last serial output is lost the instant the VM is
+    deleted. Capturing at the single teardown chokepoint (``_ensure_vm_deleted``)
+    means every teardown path — fire-and-forget completion delete, deferred
+    backlog teardown, the reaper's post-commit delete loop, and ad-hoc
+    orchestrator deletes — records the tail before the VM goes away.
+
+    Entirely best-effort: the zone is resolved from the in-memory cache only (no
+    cross-zone probe), and the tail is persisted ONLY when a non-empty tail is
+    actually returned. Existing keys in ``task.context`` are preserved. The
+    caller time-boxes this with ``asyncio.wait_for`` and swallows every
+    exception so forensics can never block or delay the real teardown.
+    """
+    from app import compute
+
+    zone = compute.get_vm_zone(vm_id)
+    # Synchronous GCE RPC — keep it off the event loop.
+    serial_tail = await asyncio.to_thread(
+        compute._capture_serial_for_vm, vm_id, zone
+    )
+    if not serial_tail:
+        return
+
+    forensics = {
+        "reason": reason,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "vm_instance_id": vm_id,
+        "zone": zone,
+        "serial_tail": serial_tail,
+    }
+
+    async with AsyncSessionLocal() as s:
+        task = (
+            await s.execute(select(Task).where(Task.vm_instance_id == vm_id).limit(1))
+        ).scalar_one_or_none()
+        if task is None:
+            return
+        # Preserve any existing context keys; reassign a new dict + flag_modified
+        # so SQLAlchemy persists the JSONB mutation.
+        new_context = dict(task.context or {})
+        new_context["teardown_forensics"] = forensics
+        task.context = new_context
+        flag_modified(task, "context")
+        await s.commit()
 
 
 async def _ensure_vm_deleted(
@@ -183,6 +239,22 @@ async def _ensure_vm_deleted(
     # orchestrator action — preventing a spot_preemption misclassification
     # if the VM is later cleaned up by another path.
     _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
+
+    # Best-effort serial-console forensics BEFORE the delete loop: once the VM
+    # is deleted (or even stopped) its serial output is unrecoverable. Time-boxed
+    # and fully guarded so a hung/erroring capture never blocks the teardown.
+    try:
+        await asyncio.wait_for(
+            _capture_and_persist_teardown_forensics(vm_id, reason),
+            _TEARDOWN_FORENSICS_TIMEOUT,
+        )
+    except Exception as e:
+        logger.warning(
+            "[VM CLEANUP] teardown forensics capture failed/timed out for VM %s "
+            "(%s) — proceeding with teardown",
+            vm_id,
+            type(e).__name__,
+        )
 
     for attempt in range(3):
         try:
