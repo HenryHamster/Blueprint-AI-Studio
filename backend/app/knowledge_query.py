@@ -14,13 +14,78 @@ omits the (potentially large) markdown body; only get-by-id returns it.
 """
 
 import uuid
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from sqlalchemy import String, cast, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import KnowledgeDocument
+
+
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_MEASURED_ONLY = "measured_only"
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY = "compute_acceptance_grade"
+KNOWLEDGE_ACCEPTANCE_EVIDENCE_KEY = "knowledge_acceptance_evidence"
+
+
+def classify_knowledge_acceptance(
+    *,
+    source_kind: str | None,
+    forward_quality_verdict: dict[str, Any] | None,
+    source_citations: list[Any] | None,
+) -> dict[str, Any]:
+    """Return the canonical acceptance signal for a KnowledgeDocument.
+
+    Non-compute knowledge documents already passed their forward-quality gate, so
+    they remain acceptable for strict knowledge-substance consumers. Compute
+    knowledge is stricter: only the cited LLM analysis path, with a grounding
+    probe resolving at least one citation and no grounding-miss flag, qualifies
+    as acceptance evidence. Deterministic fallback and unresolved-citation
+    documents remain durable measured knowledge, but classify as measured-only.
+    """
+    if source_kind != "compute_experiment":
+        return {
+            "knowledge_acceptance_evidence": True,
+            "compute_acceptance_grade": None,
+            "compute_acceptance_reason": "non_compute_forward_quality_gate",
+        }
+
+    verdict = (
+        forward_quality_verdict if isinstance(forward_quality_verdict, dict) else {}
+    )
+    citations = source_citations if isinstance(source_citations, list) else []
+    reason = None
+    if str(verdict.get("analysis_mode") or "").strip().lower() != "llm":
+        reason = "analysis_mode_not_llm"
+    elif verdict.get("citation_grounding_miss") is True:
+        reason = "citation_grounding_miss"
+    elif not any(isinstance(c, str) and c.strip() for c in citations):
+        reason = "no_source_citations"
+    else:
+        probes = (
+            verdict.get("probes") if isinstance(verdict.get("probes"), dict) else {}
+        )
+        grounding = (
+            probes.get("grounding")
+            if isinstance(probes.get("grounding"), dict)
+            else None
+        )
+        if grounding is None:
+            reason = "missing_grounding_probe"
+        elif int(grounding.get("grounded") or 0) <= 0:
+            reason = "no_grounded_artifact_citation"
+
+    accepted = reason is None
+    return {
+        "knowledge_acceptance_evidence": accepted,
+        "compute_acceptance_grade": (
+            COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE
+            if accepted
+            else COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_MEASURED_ONLY
+        ),
+        "compute_acceptance_reason": reason or "llm_artifact_cited",
+    }
 
 
 class KnowledgeSubstance(NamedTuple):
@@ -33,6 +98,8 @@ class KnowledgeSubstance(NamedTuple):
 
     finding_hash: str | None
     topic: str | None
+    knowledge_acceptance_evidence: bool = True
+    compute_acceptance_grade: str | None = None
 
 
 async def fetch_knowledge_substance_index(
@@ -54,18 +121,33 @@ async def fetch_knowledge_substance_index(
 
     rows = (
         await session.execute(
-            select(KnowledgeDocument.topic, Task.context)
+            select(
+                KnowledgeDocument.topic,
+                Task.context,
+                KnowledgeDocument.source_kind,
+                KnowledgeDocument.forward_quality_verdict,
+                KnowledgeDocument.source_citations,
+            )
             .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
             .where(KnowledgeDocument.project_id == project_id)
         )
     ).all()
     result: list[KnowledgeSubstance] = []
-    for topic, context in rows:
+    for topic, context, source_kind, verdict, citations in rows:
         fh = (context or {}).get("finding_hash") if context is not None else None
+        acceptance = classify_knowledge_acceptance(
+            source_kind=source_kind,
+            forward_quality_verdict=verdict,
+            source_citations=citations,
+        )
         result.append(
             KnowledgeSubstance(
                 finding_hash=str(fh).strip() if fh else None,
                 topic=str(topic).strip() if topic else None,
+                knowledge_acceptance_evidence=bool(
+                    acceptance["knowledge_acceptance_evidence"]
+                ),
+                compute_acceptance_grade=acceptance["compute_acceptance_grade"],
             )
         )
     return result
@@ -79,6 +161,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
     source_task_id, created_at, updated_at, forward_quality_verdict (plus
     body only when ``include_body``).
     """
+    acceptance = classify_knowledge_acceptance(
+        source_kind=doc.source_kind,
+        forward_quality_verdict=doc.forward_quality_verdict,
+        source_citations=doc.source_citations,
+    )
     out = {
         "id": str(doc.id),
         "title": doc.title,
@@ -92,6 +179,9 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
         "forward_quality_verdict": doc.forward_quality_verdict,
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
     }
@@ -217,6 +307,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
     collapsed = " ".join(summary.split())
     if len(collapsed) > summary_chars:
         collapsed = collapsed[: summary_chars - 1].rstrip() + "…"
+    acceptance = classify_knowledge_acceptance(
+        source_kind=doc.source_kind,
+        forward_quality_verdict=doc.forward_quality_verdict,
+        source_citations=doc.source_citations,
+    )
     return {
         "id": str(doc.id),
         "title": doc.title,
@@ -224,6 +319,8 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "topic": doc.topic,
         "direction_id": doc.direction_id,
         "source_kind": doc.source_kind,
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
 

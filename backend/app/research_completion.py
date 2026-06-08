@@ -40,6 +40,8 @@ from app.cochange_decomposition import (
 from app.compute_experiment_contract import (
     _author_compute_launch_contract,  # noqa: F401 — re-exported for tests
     _validate_compute_launch_contract,  # noqa: F401 — re-exported for tests
+    resolve_compute_spend_approval,
+    resolve_compute_spend_threshold,
 )
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
     _HISTORY_AGG_DEFAULTS,
@@ -618,21 +620,8 @@ def _resolve_compute_spend_threshold(
     runtime_config: Dict[str, Any],
     direction: Dict[str, Any] | None,
 ) -> float:
-    """Resolve the compute_experiment approval threshold (USD).
-
-    A per-direction override wins when the direction dict carries a positive
-    ``compute_experiment_spend_threshold_usd`` (directions are flat JSON dicts
-    that already hold per-direction floats like ``cost_budget_usd`` — no new
-    column/migration). Otherwise the global runtime_config default applies.
-    """
-    if direction:
-        override = direction.get("compute_experiment_spend_threshold_usd")
-        if isinstance(override, (int, float)) and override > 0:
-            return float(override)
-    try:
-        return float(runtime_config.get("compute_experiment_spend_threshold_usd", 0.0))
-    except (TypeError, ValueError):
-        return 0.0
+    """Backward-compatible wrapper for tests/callers importing the old helper."""
+    return resolve_compute_spend_threshold(runtime_config, direction)
 
 
 def _outcome_complexity_threshold(
@@ -2657,11 +2646,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _cc_direction = (
                 _directions_by_id.get(str(_cc_dir_id)) if _cc_dir_id else None
             )
-            _compute_threshold = _resolve_compute_spend_threshold(
-                _runtime_config, _cc_direction
-            )
-            _compute_requires_approval = (
-                float(_compute_contract["spend_cap_usd"]) > _compute_threshold
+            _compute_requires_approval, _compute_threshold = (
+                resolve_compute_spend_approval(
+                    runtime_config=_runtime_config,
+                    direction=_cc_direction,
+                    spend_cap_usd=float(_compute_contract["spend_cap_usd"]),
+                )
             )
 
         # Apply failure-feedback mitigation: downscope when rejection patterns are high
@@ -3192,6 +3182,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # handler+metric gate read budget/deadline kills as intentional
             # terminal outcomes unchanged.
             _cc = _compute_contract or {}
+            # Forward-carry the finding's declared acceptance_evidence using the
+            # same lenient pre-validation pattern used by the else-branch below.
+            # A malformed LLM-authored declaration must NOT abort the completion.
+            _ce_finding_acceptance_evidence = finding.get("acceptance_evidence")
+            if _ce_finding_acceptance_evidence is not None and (
+                read_acceptance_evidence(
+                    {"acceptance_evidence": _ce_finding_acceptance_evidence}
+                )
+                is None
+            ):
+                _ce_finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": "compute_experiment",
@@ -3219,6 +3220,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     },
                     **({"model": finding_model} if finding_model else {}),
                     **({"effort": finding_effort} if finding_effort else {}),
+                    **(
+                        {"acceptance_evidence": _ce_finding_acceptance_evidence}
+                        if _ce_finding_acceptance_evidence
+                        else {}
+                    ),
                 },
                 "research_completion:finding:compute_experiment",
             )
@@ -3445,7 +3451,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # marker-convention note in spawn_calibration.py.
                 **(
                     {"approval_hold_reason": SPEND_BUDGET_APPROVAL_HOLD_REASON}
-                    if _budget_requires_approval
+                    if _budget_requires_approval or _compute_requires_approval
                     else {}
                 ),
                 **(

@@ -757,6 +757,16 @@ export default function App() {
         userRole={s.userRole}
         onNewProject={() => setShowNewProjectModal(true)}
         onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
+        onNavigateToTask={(taskId) => {
+          const target = s.tasks.find(t => t.id === taskId);
+          if (target) {
+            s.handleViewLogs(target);
+          } else {
+            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+              s.addToast('Could not load task — it may have been deleted', 'error');
+            });
+          }
+        }}
         onProjectDeleted={(projectId) => {
           if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
           void s.fetchProjects(true);
@@ -1149,6 +1159,8 @@ export default function App() {
           newTaskEffort={s.newTaskEffort}
           setNewTaskModel={s.setNewTaskModel}
           setNewTaskEffort={s.setNewTaskEffort}
+          computeExperiment={s.computeExperiment}
+          setComputeExperiment={s.setComputeExperiment}
           getDefaultModelForType={s.getDefaultModelForType}
           getDefaultEffortForType={s.getDefaultEffortForType}
           repoOptions={s.repoOptions}

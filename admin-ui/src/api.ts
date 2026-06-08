@@ -145,6 +145,10 @@ export interface TaskTypeCatalogEntry {
   agent_mode: 'write' | 'read_only';
   default_category: string | null;
   user_launchable: boolean;
+  // True for a non-user-launchable type that still has a dedicated structured
+  // launch-contract path (compute_experiment → POST /api/admin/tasks/compute-experiment).
+  // Optional so an older catalog payload that omits the flag still type-checks.
+  operator_contract_launchable?: boolean;
   provider_configurable: boolean;
   filter_visible: boolean;
   run_shape: 'single_agent' | 'workflow' | 'experiment_loop';
@@ -168,6 +172,74 @@ export async function fetchTaskTypeCatalog(
   if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
+/** The closed set of comparison operators a compute success criterion may use.
+ * Mirrors the backend `ComputeSuccessCriterion.operator` Literal verbatim. */
+export type ComputeSuccessOperator = '>=' | '<=' | '>' | '<' | '==' | '!=';
+
+/** A cheap, machine-checkable acceptance criterion for a compute_experiment.
+ * Mirrors backend `ComputeSuccessCriterion` ({metric, operator, threshold}). */
+export interface ComputeSuccessCriterion {
+  metric: string;
+  operator: ComputeSuccessOperator;
+  threshold: number;
+}
+
+/**
+ * Operator-supplied launch contract for the dedicated compute_experiment path
+ * (POST /api/admin/tasks/compute-experiment). The backend validates the launch
+ * rules (non-empty command, positive spend cap + deadline) and the spend-approval
+ * threshold before creating the task. Field names mirror the backend launch
+ * contract / `ComputeExperimentPayload`; optional fields are omitted when blank.
+ */
+export interface ComputeExperimentLaunchRequest {
+  github_repo: string;
+  base_branch: string;
+  title: string;
+  prompt: string;
+  command: string;
+  spend_cap_usd: number;
+  deadline_seconds: number;
+  accelerator?: string;
+  machine_type?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  experiment?: string;
+  benchmark?: string;
+  hypothesis?: string;
+  metric?: string;
+  success_criterion?: ComputeSuccessCriterion;
+  model?: string;
+  effort?: string;
+}
+
+/** Response from the dedicated compute_experiment launch endpoint — the created
+ * task. Kept loose (only `id` is relied on) so additive backend fields don't
+ * force a frontend change. */
+export interface ComputeExperimentLaunchResponse {
+  id: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Launch a bounded compute_experiment through its dedicated contract endpoint.
+ * Throws an Error carrying the backend message (error.message / detail) on a
+ * non-2xx response so callers can surface a precise inline error.
+ */
+export async function createComputeExperiment(
+  body: ComputeExperimentLaunchRequest,
+): Promise<ComputeExperimentLaunchResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
 }
 
 export interface TaskTypeCostAdherenceEntry {
@@ -2159,6 +2231,18 @@ export interface KnowledgeDocument {
   created_at: string | null;
   updated_at: string | null;
   forward_quality_verdict: KnowledgeForwardQualityVerdict | null;
+  // Backend-classified acceptance signal (app.knowledge_query.classify_knowledge_acceptance,
+  // the single source of truth). For compute_experiment documents the backend grades
+  // LLM-grounded, artifact-cited analyses as 'acceptance' and deterministic fallback /
+  // grounding-miss / unresolved-citation documents as 'measured_only'; non-compute docs
+  // grade as null (they cleared their own forward-quality gate). `knowledge_acceptance_evidence`
+  // is the boolean strict-acceptance flag, and `compute_acceptance_reason` carries the
+  // classifier's reason code (e.g. 'llm_artifact_cited', 'analysis_mode_not_llm',
+  // 'citation_grounding_miss'). All optional/nullable to stay back-compatible with docs
+  // serialized before the fields existed.
+  knowledge_acceptance_evidence?: boolean;
+  compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
+  compute_acceptance_reason?: string;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }

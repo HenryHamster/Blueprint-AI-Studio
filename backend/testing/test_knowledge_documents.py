@@ -2085,8 +2085,12 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "direction_id",
         "source_kind",
         "created_at",
+        "knowledge_acceptance_evidence",
+        "compute_acceptance_grade",
     }
     assert "body" not in entry
+    assert entry["knowledge_acceptance_evidence"] is True
+    assert entry["compute_acceptance_grade"] is None  # non-compute doc
     assert entry["title"] == "Doc A"
     assert entry["summary"] == "Summary A"
     assert entry["topic"] == "auth"

@@ -2971,12 +2971,20 @@ def test_counts_as_failure_excludes_cascade_cancelled():
     assert _counts_as_failure(t)
 
 
-def _compute_experiment_task(outcome, *, status=TaskStatus.COMPLETED):
+def _compute_experiment_task(
+    outcome, *, status=TaskStatus.COMPLETED, acceptance_grade=None
+):
     plan_output = (
         {"compute_result": {"outcome": outcome, "final_cost_usd": 1.0}}
         if outcome is not None
         else None
     )
+    if isinstance(plan_output, dict) and acceptance_grade is not None:
+        plan_output["knowledge_document"] = {
+            "source_kind": "compute_experiment",
+            "knowledge_acceptance_evidence": acceptance_grade == "acceptance",
+            "compute_acceptance_grade": acceptance_grade,
+        }
     return Task(
         project_id=uuid.uuid4(),
         title="compute",
@@ -2989,13 +2997,19 @@ def _compute_experiment_task(outcome, *, status=TaskStatus.COMPLETED):
 
 
 def test_compute_experiment_outcome_feeds_success_predicate():
-    """A SUCCESS compute_experiment is a successful outcome; budget/deadline
-    terminations are neutral (not successes, not failures)."""
+    """Only acceptance-grade SUCCESS compute knowledge is a successful outcome;
+    budget/deadline terminations and measured-only results are neutral."""
     from app.task_outcomes import evaluate_task_outcome, is_successful_outcome
 
-    success = _compute_experiment_task("SUCCESS")
+    success = _compute_experiment_task("SUCCESS", acceptance_grade="acceptance")
     assert is_successful_outcome(success) is True
     assert evaluate_task_outcome(success).status == "success"
+
+    measured_only = _compute_experiment_task(
+        "SUCCESS", acceptance_grade="measured_only"
+    )
+    assert is_successful_outcome(measured_only) is False
+    assert evaluate_task_outcome(measured_only).status == "neutral"
 
     spend_cap = _compute_experiment_task("SPEND_CAP_EXCEEDED")
     assert is_successful_outcome(spend_cap) is False

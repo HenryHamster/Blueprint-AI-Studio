@@ -12613,6 +12613,189 @@ class TestGetProjectFindings:
         assert resp.status_code == 404
 
 
+class TestComputeExperimentTaskLaunch:
+    async def _project_with_repo(self, session, repo="compute"):
+        project = Project(
+            name=f"acme/{repo}",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await session.commit()
+        return project
+
+    def _valid_payload(self, repo="compute", **overrides):
+        payload = {
+            "github_repo": f"acme/{repo}",
+            "title": "Measure GPU throughput",
+            "prompt": "Run the throughput benchmark and persist the result.",
+            "base_branch": "automain",
+            "command": "python bench.py --json result.json",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 900,
+            "accelerator": "L4",
+            "machine_type": "g2-standard-4",
+            "cwd": "/workspace",
+            "env": {"BENCHMARK_MODE": "smoke"},
+            "experiment": "gpu-throughput",
+            "benchmark": "tokens-per-second",
+            "hypothesis": "L4 throughput exceeds the acceptance floor.",
+            "metric": "tokens_per_second",
+            "success_criterion": {
+                "metric": "tokens_per_second",
+                "operator": ">=",
+                "threshold": 100.0,
+            },
+        }
+        payload.update(overrides)
+        return payload
+
+    @pytest.mark.asyncio
+    async def test_valid_launch_persists_compute_experiment_contract(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(idempotency_key="gpu-smoke"),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is False
+        task = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert task.status == TaskStatus.QUEUED
+        assert task.requires_approval is False
+        payload = task.payloads[0]
+        assert payload["type"] == "compute_experiment"
+        assert payload["command"] == "python bench.py --json result.json"
+        assert payload["spend_cap_usd"] == 5.0
+        assert payload["deadline_seconds"] == 900
+        assert payload["accelerator"] == "L4"
+        assert payload["machine_type"] == "g2-standard-4"
+        assert payload["cwd"] == "/workspace"
+        assert payload["env"] == {"BENCHMARK_MODE": "smoke"}
+        assert payload["experiment"] == "gpu-throughput"
+        assert payload["benchmark"] == "tokens-per-second"
+        assert payload["hypothesis"] == "L4 throughput exceeds the acceptance floor."
+        assert payload["metric"] == "tokens_per_second"
+        assert payload["success_criterion"] == {
+            "metric": "tokens_per_second",
+            "operator": ">=",
+            "threshold": 100.0,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("override", "expected_detail"),
+        [
+            ({"command": None}, "command"),
+            ({"spend_cap_usd": 0}, "spend_cap_usd must be positive"),
+            ({"deadline_seconds": 0}, "deadline_seconds must be positive"),
+        ],
+    )
+    async def test_malformed_contract_is_rejected_without_task(
+        self, client: AsyncClient, db_session, override, expected_detail
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 422, resp.text
+        assert expected_detail in resp.text
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_spend_above_threshold_requires_approval_with_status_message(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.01, deadline_seconds=1200),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is True
+        assert task.context["approval_hold_reason"] == "spend_budget"
+        assert task.latest_status_message == (
+            "Held for operator approval: compute_experiment proposes "
+            "$5.01 spend cap / 1200s deadline, exceeding "
+            "the $5.00 approval threshold."
+        )
+
+    @pytest.mark.asyncio
+    async def test_spend_at_threshold_is_runnable(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.0),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is False
+        assert task.latest_status_message is None
+
+
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.
 

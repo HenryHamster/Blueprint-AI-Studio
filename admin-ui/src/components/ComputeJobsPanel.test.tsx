@@ -123,6 +123,15 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(await findByText('Kill')).toBeTruthy();
   });
 
+  test('calls onNavigateToTask when task title is clicked', async () => {
+    const onNavigate = vi.fn();
+    fetchComputeJobs.mockResolvedValue([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" onNavigateToTask={onNavigate} />);
+    const taskTitle = await findByText('compute_experiment: sweep');
+    await act(async () => { taskTitle.click(); });
+    expect(onNavigate).toHaveBeenCalledWith('task-1');
+  });
+
   test('kill button calls killComputeJob and shows killed reason', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     const active = makeJob();

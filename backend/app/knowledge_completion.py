@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.knowledge_query import classify_knowledge_acceptance
 from app.models import (
     Artifact,
     ComputeJob,
@@ -1583,6 +1584,20 @@ async def _persist_compute_knowledge_document(
     # artifacts not found in the durable store). Additive — never blocks completion.
     if _compute_grounding_miss(document) is not None:
         verdict_record["citation_grounding_miss"] = True
+    acceptance = classify_knowledge_acceptance(
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        forward_quality_verdict=verdict_record,
+        source_citations=citations,
+    )
+    verdict_record["knowledge_acceptance_evidence"] = acceptance[
+        "knowledge_acceptance_evidence"
+    ]
+    verdict_record["compute_acceptance_grade"] = acceptance[
+        "compute_acceptance_grade"
+    ]
+    verdict_record["compute_acceptance_reason"] = acceptance[
+        "compute_acceptance_reason"
+    ]
 
     existing = (
         (
@@ -1647,6 +1662,11 @@ async def _persist_compute_knowledge_document(
         "citation_count": len(doc.source_citations or citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
         "analysis_mode": stored_verdict.get("analysis_mode", mode),
+        "knowledge_acceptance_evidence": acceptance[
+            "knowledge_acceptance_evidence"
+        ],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")

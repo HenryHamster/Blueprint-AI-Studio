@@ -2,10 +2,16 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { NewTaskModal } from './NewTaskModal';
+import { defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
+  API_BASE_URL: '',
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
+  authHeaders: vi.fn(async () => ({})),
+  fetchTaskTypeCatalog: vi.fn(async () => []),
+  createComputeExperiment: vi.fn(async () => ({ id: 'compute-experiment-test' })),
 }));
 
 const LAUNCHABLE_OPTIONS = [
@@ -60,6 +66,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[
@@ -120,6 +128,8 @@ describe('NewTaskModal — viewport regression', () => {
           newTaskEffort=""
           setNewTaskModel={() => {}}
           setNewTaskEffort={() => {}}
+          computeExperiment={defaultComputeExperimentForm()}
+          setComputeExperiment={() => {}}
           getDefaultModelForType={() => 'claude-opus-4-7'}
           getDefaultEffortForType={() => 'medium'}
           repoOptions={[{ full_name: 'example/repo', default_branch: 'develop' }]}
@@ -180,6 +190,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
@@ -242,6 +254,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
@@ -299,6 +313,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[
@@ -359,6 +375,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
@@ -416,6 +434,8 @@ describe('NewTaskModal — viewport regression', () => {
             newTaskEffort=""
             setNewTaskModel={() => {}}
             setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
             getDefaultModelForType={() => 'claude-opus-4-7'}
             getDefaultEffortForType={() => 'medium'}
             repoOptions={[
@@ -474,6 +494,8 @@ describe('NewTaskModal — viewport regression', () => {
           newTaskEffort=""
           setNewTaskModel={() => {}}
           setNewTaskEffort={() => {}}
+          computeExperiment={defaultComputeExperimentForm()}
+          setComputeExperiment={() => {}}
           getDefaultModelForType={() => 'claude-opus-4-7'}
           getDefaultEffortForType={() => 'medium'}
           repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}

@@ -1553,3 +1553,52 @@ async def test_plan_subtask_malformed_acceptance_evidence_is_dropped(
     )
     assert len(children) == 1
     assert "acceptance_evidence" not in (children[0].context or {})
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_subtask_carries_downstream_artifact_evidence(
+    db_session, mocker, _quiet_mocks
+):
+    """A compute_experiment plan subtask with downstream_artifact acceptance_evidence
+    carries that evidence onto its spawned first_payload.
+
+    The artifact delivery contract reads first_payload via read_acceptance_evidence
+    to find the downstream_artifact logical key; before this fix the evidence was
+    dropped from compute_experiment payloads and the COMPUTE_RESULT Artifact was
+    never stamped with the declared logical key.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Measure the baseline",
+                    "prompt": "benchmark the current implementation",
+                    "type": "compute_experiment",
+                    "command": "python bench.py --mode baseline",
+                    "spend_cap_usd": 3.5,
+                    "deadline_seconds": 900,
+                    "acceptance_evidence": {
+                        "kind": "downstream_artifact",
+                        "artifact_id": "benchmark-result-bundle",
+                    },
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    payload = child.first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    child_evidence = payload.get("acceptance_evidence")
+    assert child_evidence is not None, "acceptance_evidence missing from compute_experiment payload"
+    assert child_evidence["kind"] == "downstream_artifact"
+    assert child_evidence["artifact_id"] == "benchmark-result-bundle"

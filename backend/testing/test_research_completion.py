@@ -4848,6 +4848,9 @@ class TestComputeExperimentSpawn:
         msg = child.latest_status_message or ""
         assert "$50.00" in msg
         assert "approval" in msg.lower()
+        # Compute spend-threshold holds must carry the approval_hold_reason marker so
+        # recovery sweeps route them through the longer non-failure CANCELLED path.
+        assert child.context.get("approval_hold_reason") == "spend_budget"
 
     async def test_per_direction_override_holds_below_global(self, db_session, mocker):
         """A per-direction override below the global threshold holds a spend that
@@ -4881,6 +4884,7 @@ class TestComputeExperimentSpawn:
         children = await _children_of(db_session, task)
         assert len(children) == 1
         assert children[0].requires_approval is True
+        assert children[0].context.get("approval_hold_reason") == "spend_budget"
 
     async def test_nested_contract_below_threshold_dispatches(self, db_session, mocker):
         """A launch contract nested under `compute_experiment` is authored +
@@ -5034,6 +5038,86 @@ class TestComputeExperimentSpawn:
             d.get("deferred_reason") == "compute_contract_invalid" for d in deferred
         )
 
+    @_pytest.mark.asyncio
+    async def test_compute_experiment_spawn_carries_downstream_artifact_evidence(
+        self, db_session, mocker
+    ):
+        """A compute_experiment finding with downstream_artifact acceptance_evidence
+        carries that evidence onto the spawned task's first_payload.
+
+        The artifact delivery contract reads first_payload via read_acceptance_evidence
+        to find the downstream_artifact logical key; if the field is absent the
+        terminal COMPUTE_RESULT Artifact is never stamped and queued dependents never
+        receive the artifact prerequisite pointer.
+        """
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx-ae01")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=2.0, deadline_seconds=3600
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "downstream_artifact",
+            "artifact_id": "benchmark-result-bundle",
+        }
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        child = children[0]
+        payload = child.first_payload or {}
+        assert payload.get("type") == "compute_experiment"
+        evidence = payload.get("acceptance_evidence")
+        assert evidence is not None, "acceptance_evidence missing from compute_experiment payload"
+        assert evidence["kind"] == "downstream_artifact"
+        assert evidence["artifact_id"] == "benchmark-result-bundle"
+
+    @_pytest.mark.asyncio
+    async def test_compute_experiment_malformed_acceptance_evidence_degrades_not_aborts(
+        self, db_session, mocker
+    ):
+        """A malformed acceptance_evidence on a compute_experiment finding degrades
+        to absent without aborting the spawn — same lenient pattern as non-compute
+        findings."""
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx-ae02")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=2.0, deadline_seconds=3600
+        )
+        # downstream_artifact with empty artifact_id → AcceptanceEvidence rejects it
+        finding["acceptance_evidence"] = {
+            "kind": "downstream_artifact",
+            "artifact_id": "",
+        }
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1, "malformed evidence must not abort the spawn"
+        payload = children[0].first_payload or {}
+        assert payload.get("type") == "compute_experiment"
+        assert "acceptance_evidence" not in payload, (
+            "malformed acceptance_evidence must degrade to omitted, "
+            f"got {payload.get('acceptance_evidence')!r}"
+        )
 
 
 class TestAcceptanceEvidencePropagation:

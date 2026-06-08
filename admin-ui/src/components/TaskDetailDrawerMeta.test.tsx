@@ -974,3 +974,207 @@ describe('DetailsTab — Liveness signals', () => {
     expect(screen.getByText('No tool use recorded')).toBeInTheDocument();
   });
 });
+
+// ── Compute experiment contract helpers ──────────────────────────────────────
+
+function makeComputeJob(overrides: Partial<import('../api').ComputeJob> = {}): import('../api').ComputeJob {
+  return {
+    id: 'job-exp-1',
+    project_id: 'proj-1',
+    task_id: 'task-verify-1',
+    backend: 'gcp_compute_engine',
+    external_compute_id: 'vm-instance-1',
+    machine_type: 'n1-standard-4',
+    status: 'SUCCEEDED',
+    terminal_reason: null,
+    outcome: 'SUCCESS',
+    spend_cap_usd: 10,
+    wall_clock_deadline: '2026-06-08T01:00:00Z',
+    created_at: '2026-06-08T00:00:00Z',
+    updated_at: '2026-06-08T00:30:00Z',
+    started_at: '2026-06-08T00:00:00Z',
+    completed_at: '2026-06-08T00:30:00Z',
+    last_polled_at: '2026-06-08T00:30:00Z',
+    accrued_cost_usd: 3.5,
+    final_cost_usd: 3.5,
+    result_reference: null,
+    accelerator_type: null,
+    accelerator_count: null,
+    task_title: 'compute_experiment: benchmark run',
+    task_type: 'compute_experiment',
+    ...overrides,
+  };
+}
+
+describe('DetailsTab — Compute Experiment Contract', () => {
+  afterEach(() => cleanup());
+
+  it('renders the launch contract block for compute_experiment tasks', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob()]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{
+        type: 'compute_experiment',
+        command: 'python3 benchmark.py --epochs 10',
+        spend_cap_usd: 10,
+        deadline_seconds: 3600,
+      }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('Launch Contract')).toBeInTheDocument();
+    expect(screen.getByText('python3 benchmark.py --epochs 10')).toBeInTheDocument();
+    expect(screen.getByText('$10.00')).toBeInTheDocument();
+    expect(screen.getByText('1h 0m')).toBeInTheDocument();
+  });
+
+  it('renders success criterion row when present on the payload', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob()]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{
+        type: 'compute_experiment',
+        command: 'python3 eval.py',
+        spend_cap_usd: 5,
+        deadline_seconds: 1800,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('Success criterion')).toBeInTheDocument();
+    expect(screen.getByText('accuracy >= 0.9')).toBeInTheDocument();
+  });
+
+  it('renders machine type from the ComputeJob for compute_experiment tasks', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob({ machine_type: 'n1-highmem-8' })]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 5, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('n1-highmem-8')).toBeInTheDocument();
+  });
+
+  it('renders accelerator type and count from the ComputeJob', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ accelerator_type: 'T4', accelerator_count: 2 }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 5, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('Accelerator')).toBeInTheDocument();
+    expect(screen.getByText(/2× T4/)).toBeInTheDocument();
+  });
+
+  it('styles a SPEND_CAP_EXCEEDED kill as amber, not red', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ status: 'FAILED', outcome: 'SPEND_CAP_EXCEEDED', terminal_reason: 'budget exhausted' }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 10, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    const badge = await screen.findByText('Killed: budget cap');
+    expect(badge.className).toContain('amber');
+    expect(badge.className).not.toContain('red');
+  });
+
+  it('styles a TIMED_OUT kill as amber, not red', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ status: 'TIMED_OUT', outcome: 'TIMED_OUT', terminal_reason: 'deadline exceeded' }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 10, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    const badge = await screen.findByText('Killed: deadline');
+    expect(badge.className).toContain('amber');
+    expect(badge.className).not.toContain('red');
+  });
+
+  it('styles an operator-cancelled job as amber, not red', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ status: 'CANCELLED', outcome: 'CANCELLED', terminal_reason: 'cancelled by operator' }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 10, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    const badge = await screen.findByText('Killed by operator');
+    expect(badge.className).toContain('amber');
+    expect(badge.className).not.toContain('red');
+  });
+
+  it('styles a genuine FAILURE as red, not amber', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ status: 'FAILED', outcome: 'FAILURE', terminal_reason: 'process exited with code 1' }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 10, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    const badge = await screen.findByText('Failed');
+    expect(badge.className).toContain('red');
+    expect(badge.className).not.toContain('amber');
+  });
+
+  it('shows terminal_reason text when non-null on a terminal job', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ status: 'FAILED', outcome: 'FAILURE', terminal_reason: 'OOM killed at epoch 5' }),
+    ]);
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'compute_experiment', command: 'run.sh', spend_cap_usd: 10, deadline_seconds: 600 }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('OOM killed at epoch 5')).toBeInTheDocument();
+  });
+
+  it('omits the launch contract block for non-compute_experiment task types', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob({ task_type: 'create' })]);
+    const task = makeTask({
+      task_type: 'create',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      payloads: [{ type: 'create', prompt: 'do something' }],
+    });
+    render(<DetailsTab task={task} />);
+    await screen.findByText('Compute Jobs');
+    expect(screen.queryByText('Launch Contract')).toBeNull();
+    expect(screen.queryByText('Success criterion')).toBeNull();
+  });
+
+  it('shows analysis_mode badge on the knowledge document section', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-1',
+          title: 'Benchmark Results: GPU throughput',
+          summary: 'The model achieves 95% accuracy.',
+          citation_count: 2,
+          analysis_mode: 'llm',
+          source_kind: 'compute_experiment',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Knowledge Document')).toBeInTheDocument();
+    expect(screen.getByText('Benchmark Results: GPU throughput')).toBeInTheDocument();
+    expect(screen.getByText('llm')).toBeInTheDocument();
+    expect(screen.getByText('compute experiment')).toBeInTheDocument();
+  });
+});

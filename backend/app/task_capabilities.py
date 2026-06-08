@@ -118,6 +118,7 @@ class TaskCapability:
     agent_mode: AgentMode
     default_category: str | None = None
     user_launchable: bool = False
+    operator_contract_launchable: bool = False
     provider_configurable: bool = True
     filter_visible: bool = True
     description: str = ""
@@ -539,6 +540,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="ops",
         user_launchable=False,
+        operator_contract_launchable=True,
         plan_knowledge_prereq_eligible=True,
         # No LLM provider runs — the handler is a programmatic launch+poll loop,
         # so it never selects a model/account.
@@ -885,6 +887,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "default_category": capability.default_category,
         "description": capability.description,
         "user_launchable": capability.user_launchable,
+        "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
         "filter_visible": capability.filter_visible,
         "delivers_product": capability.delivers_product,
@@ -938,6 +941,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "agent_mode": capability.agent_mode,
         "default_category": capability.default_category,
         "user_launchable": capability.user_launchable,
+        "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
         "filter_visible": capability.filter_visible,
         "run_shape": capability.run_shape,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { previewOnboardProject } from './api';
+import { previewOnboardProject, createComputeExperiment } from './api';
 
 vi.mock('./firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
@@ -27,5 +27,57 @@ describe('previewOnboardProject', () => {
       preview_only: true,
       build_config_override: { requires_ci_checks: false },
     });
+  });
+});
+
+describe('createComputeExperiment', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('POSTs the launch contract to the dedicated endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 'task-ce-1' }), { status: 200 }),
+    );
+
+    const result = await createComputeExperiment({
+      github_repo: 'acme/repo',
+      base_branch: 'main',
+      title: 'experiment',
+      prompt: 'run it',
+      command: 'python train.py',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    });
+
+    expect(result).toEqual({ id: 'task-ce-1' });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/admin/tasks/compute-experiment');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toMatchObject({
+      command: 'python train.py',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    });
+  });
+
+  it('throws the backend error message on a non-2xx response', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'spend cap exceeds approval threshold' }), { status: 400 }),
+    );
+
+    await expect(
+      createComputeExperiment({
+        github_repo: 'acme/repo',
+        base_branch: 'main',
+        title: 't',
+        prompt: 'p',
+        command: 'python x.py',
+        spend_cap_usd: 999,
+        deadline_seconds: 1800,
+      }),
+    ).rejects.toThrow('spend cap exceeds approval threshold');
   });
 });

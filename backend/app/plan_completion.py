@@ -854,6 +854,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     },
                     **({"model": subtask_model} if subtask_model else {}),
                     **({"effort": subtask_effort} if subtask_effort else {}),
+                    **(
+                        {"acceptance_evidence": subtask_acceptance_evidence}
+                        if subtask_acceptance_evidence
+                        else {}
+                    ),
                 },
                 "task_completion:plan_subtask:compute_experiment",
             )

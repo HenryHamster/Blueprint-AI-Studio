@@ -172,7 +172,7 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 1900,
-    "api.ts": 2250,
+    "api.ts": 2650,
     "components/WarmVmPanel.tsx": 1800
   }
 }

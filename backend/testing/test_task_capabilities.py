@@ -431,6 +431,7 @@ def test_task_capability_contract_covers_every_registered_type():
         "default_category",
         "description",
         "user_launchable",
+        "operator_contract_launchable",
         "provider_configurable",
         "filter_visible",
         "delivers_product",
@@ -503,6 +504,7 @@ _CATALOG_FIELDS = {
     "agent_mode",
     "default_category",
     "user_launchable",
+    "operator_contract_launchable",
     "provider_configurable",
     "filter_visible",
     "run_shape",
@@ -547,6 +549,9 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
     launchable = {e["id"] for e in catalog if e["user_launchable"]}
     assert launchable == set(USER_LAUNCHABLE_TASK_TYPES)
     by_id = {e["id"]: e for e in catalog}
+    assert {
+        e["id"] for e in catalog if e["operator_contract_launchable"]
+    } == {"compute_experiment"}
     assert by_id["create"]["run_shape"] == "workflow"
     # Code-change types open a PR and are CI+review gated.
     assert by_id["create"]["output_kind"] == "pr"
@@ -567,6 +572,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "agent_mode": "read_only",
         "default_category": "ops",
         "user_launchable": False,
+        "operator_contract_launchable": True,
         "provider_configurable": False,
         "filter_visible": True,
         "output_kind": "verdict",

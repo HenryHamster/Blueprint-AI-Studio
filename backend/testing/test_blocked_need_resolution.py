@@ -595,6 +595,28 @@ def test_knowledge_topic_equality_satisfies_need():
     assert knowledge_substance_satisfies_need(need, substance) is True
 
 
+def test_measured_only_compute_knowledge_does_not_satisfy_strict_acceptance_need():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    need = {"kind": "task", "ref": "gpu-proof"}
+    measured_only = [
+        KnowledgeSubstance(
+            finding_hash=None,
+            topic="gpu-proof",
+            knowledge_acceptance_evidence=False,
+            compute_acceptance_grade="measured_only",
+        )
+    ]
+    assert knowledge_substance_satisfies_need(need, measured_only) is True
+    assert (
+        knowledge_substance_satisfies_need(
+            need, measured_only, require_acceptance_evidence=True
+        )
+        is False
+    )
+
+
 def test_knowledge_finding_hash_mismatch_returns_false():
     from app.blocked_need_resolution import knowledge_substance_satisfies_need
     from app.knowledge_query import KnowledgeSubstance

@@ -156,9 +156,25 @@ function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: str
     </div>
   );
 }
+/** Classify whether a terminal kill was intentional (budget cap / deadline /
+ *  operator cancel) vs a genuine crash — drives amber vs red badge styling. */
+function isIntentionalKill(job: ComputeJob): boolean {
+  if (job.outcome === 'SPEND_CAP_EXCEEDED' || job.outcome === 'TIMED_OUT') return true;
+  if (job.outcome === 'CANCELLED' && (job.terminal_reason ?? '').toLowerCase().includes('operator')) return true;
+  return false;
+}
+
+function fmtDeadlineSeconds(s: number): string {
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${s}s`;
+}
+
 /** Surface any compute jobs this task launched, linking the non-code compute
- *  work into the task detail view. Active jobs are managed (kill, live budget)
- *  from the dashboard's Compute Jobs panel; here we show a compact status link. */
+ *  work into the task detail view. For compute_experiment tasks the launch
+ *  contract (command, spend cap, deadline, success criterion) is shown above
+ *  the per-job rows. Intentional kills (budget/deadline/operator) are styled
+ *  amber to distinguish them from genuine crashes (red). */
 function TaskComputeJobsSection({ task }: { task: Task }) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const projectId = task.project_id;
@@ -175,27 +191,99 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
   }, [projectId, taskId]);
 
   if (jobs.length === 0) return null;
+
+  const isComputeExperiment = (task.task_type as string) === 'compute_experiment' ||
+    (task.payloads?.[0] as Record<string, unknown> | undefined)?.type === 'compute_experiment';
+  const firstPayload = isComputeExperiment
+    ? (task.payloads?.[0] as Record<string, unknown> | undefined)
+    : undefined;
+  const contractCommand = firstPayload?.command as string | undefined;
+  const contractSpendCap = firstPayload?.spend_cap_usd as number | undefined;
+  const contractDeadline = firstPayload?.deadline_seconds as number | undefined;
+  const contractCriterion = firstPayload?.success_criterion as
+    | { metric: string; operator: string; threshold: number }
+    | undefined;
+
   return (
     <>
       <SectionHeader>Compute Jobs</SectionHeader>
+      {isComputeExperiment && (contractCommand || contractSpendCap != null || contractDeadline != null) && (
+        <div className="mb-3 rounded-lg border border-sky-900/30 bg-sky-950/10 p-3 space-y-2">
+          <div className="text-xs font-semibold text-sky-400 uppercase tracking-wider mb-1">Launch Contract</div>
+          {contractCommand && (
+            <div className="flex items-start gap-2">
+              <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Command</span>
+              <pre className="text-xs text-neutral-200 font-mono whitespace-pre-wrap break-words min-w-0 flex-1">{contractCommand}</pre>
+            </div>
+          )}
+          {contractSpendCap != null && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-500 w-28 shrink-0">Spend cap</span>
+              <span className="text-sm font-mono text-neutral-200">${contractSpendCap.toFixed(2)}</span>
+            </div>
+          )}
+          {contractDeadline != null && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-500 w-28 shrink-0">Deadline</span>
+              <span className="text-sm font-mono text-neutral-200">{fmtDeadlineSeconds(contractDeadline)}</span>
+            </div>
+          )}
+          {contractCriterion && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-500 w-28 shrink-0">Success criterion</span>
+              <span className="text-sm font-mono text-neutral-200">
+                {contractCriterion.metric} {contractCriterion.operator} {contractCriterion.threshold}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
       {jobs.map(job => {
         const active = isComputeJobActive(job);
         const cap = job.spend_cap_usd ?? 0;
         const spent = (active ? job.accrued_cost_usd : job.final_cost_usd ?? job.accrued_cost_usd) ?? 0;
+        const terminalLabel = computeJobTerminalLabel(job);
+        const intentional = !active && isIntentionalKill(job);
+        const badgeClass = active
+          ? 'bg-sky-900/40 text-sky-300'
+          : job.outcome === 'SUCCESS'
+            ? 'bg-emerald-900/40 text-emerald-400'
+            : intentional
+              ? 'bg-amber-900/40 text-amber-400'
+              : job.outcome === 'FAILURE'
+                ? 'bg-red-900/40 text-red-400'
+                : 'bg-neutral-800/60 text-neutral-400';
         return (
-          <div key={job.id} className="space-y-1">
+          <div key={job.id} className="space-y-1 mb-2">
             <DetailRow label={job.backend}>
               <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
-                <span className={`text-xs px-1.5 py-0.5 rounded ${active ? 'bg-sky-900/40 text-sky-300' : job.outcome === 'SUCCESS' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
-                  {active ? job.status : computeJobTerminalLabel(job)}
+                <span className={`text-xs px-1.5 py-0.5 rounded ${badgeClass}`}>
+                  {active ? job.status : terminalLabel}
                 </span>
                 <span className="text-xs text-neutral-400 font-mono break-words">
                   ${spent.toFixed(2)} / ${cap.toFixed(2)}
                 </span>
               </span>
             </DetailRow>
+            {isComputeExperiment && job.machine_type && (
+              <DetailRow label="Machine">
+                <span className="font-mono text-xs text-neutral-300">{job.machine_type}</span>
+              </DetailRow>
+            )}
+            {isComputeExperiment && job.accelerator_type && (
+              <DetailRow label="Accelerator">
+                <span className="font-mono text-xs text-neutral-300">
+                  {job.accelerator_count != null && job.accelerator_count > 1 ? `${job.accelerator_count}× ` : ''}{job.accelerator_type}
+                </span>
+              </DetailRow>
+            )}
+            {!active && job.terminal_reason && (
+              <DetailRow label="Terminal reason">
+                <span className="text-xs text-neutral-400 break-words">{job.terminal_reason}</span>
+              </DetailRow>
+            )}
             {job.result_reference && (
-              <DetailRow label="Result">
+              <DetailRow label="Artifact">
                 <ResolvedReferenceLink
                   projectId={projectId}
                   reference={job.result_reference}
@@ -285,6 +373,8 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
     title?: string;
     summary?: string;
     citation_count?: number;
+    source_kind?: string;
+    analysis_mode?: string;
     forward_quality_verdict?: { passed?: boolean; reason?: string } | null;
   } | undefined;
   const [expanded, setExpanded] = useState(false);
@@ -323,6 +413,14 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
               {verdict.passed ? <CheckCircle className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
               Forward quality: {verdict.passed ? 'passed' : 'failed'}
             </span>
+          )}
+          {doc.analysis_mode && (
+            <span className="text-[11px] px-2 py-0.5 rounded border border-neutral-700/40 bg-neutral-800/40 text-neutral-300">
+              {doc.analysis_mode}
+            </span>
+          )}
+          {doc.source_kind && (
+            <span className="text-[11px] text-neutral-500">{doc.source_kind.replace(/_/g, ' ')}</span>
           )}
           {typeof doc.citation_count === 'number' && (
             <span className="text-[11px] text-neutral-500">{doc.citation_count} citation{doc.citation_count !== 1 ? 's' : ''}</span>

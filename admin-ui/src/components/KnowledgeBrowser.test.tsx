@@ -19,6 +19,9 @@ const computeDoc = {
   source_kind: 'compute_experiment',
   created_at: '2026-06-01T00:00:00Z',
   updated_at: '2026-06-01T00:00:00Z',
+  knowledge_acceptance_evidence: true,
+  compute_acceptance_grade: 'acceptance',
+  compute_acceptance_reason: 'llm_artifact_cited',
   forward_quality_verdict: {
     passed: true,
     reason: 'Artifact-cited analysis passed acceptance gate.',
@@ -31,6 +34,35 @@ const computeDoc = {
       },
       topic_responsiveness: { passed: true, overlap: 3, total: 3 },
     },
+  },
+};
+
+// A compute_experiment document graded measured-only: a deterministic fallback
+// summary whose analysis mode is not LLM, so the backend classifier withholds the
+// acceptance grade. It must stay visible in the list (this is a labeling change,
+// not a hide/drop behavior) and carry the 'Measured only' badge.
+const measuredOnlyComputeDoc = {
+  id: 'doc-compute-experiment-measured',
+  title: 'GPU fallback summary: deterministic stats',
+  summary: 'Deterministic fallback summary — no LLM analysis.',
+  topic: 'compute-performance',
+  direction_id: 'd-compute-1',
+  tags: ['gpu'],
+  source_citations: ['gs://blueprint-agent-artifacts/jobs/job-2/results.json'],
+  source_task_id: 'task-ce-2',
+  authoring_branch: null,
+  head_sha: null,
+  source_kind: 'compute_experiment',
+  created_at: '2026-06-01T00:00:00Z',
+  updated_at: '2026-06-01T00:00:00Z',
+  knowledge_acceptance_evidence: false,
+  compute_acceptance_grade: 'measured_only',
+  compute_acceptance_reason: 'analysis_mode_not_llm',
+  forward_quality_verdict: {
+    passed: true,
+    reason: 'Deterministic fallback persisted as measured knowledge.',
+    strategy: 'forward-quality',
+    analysis_mode: 'deterministic',
   },
 };
 
@@ -426,5 +458,99 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Grounded 1 of 1 citation');
     expect(text).toContain('Acceptance probes');
+  });
+});
+
+describe('KnowledgeBrowser — compute acceptance grade', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  // Locate a rendered badge by its exact trimmed label. Trimming on the exact
+  // string keeps 'Acceptance' distinct from the 'Acceptance probes' panel header.
+  function findBadge(scope: ParentNode, label: string): Element | undefined {
+    return Array.from(scope.querySelectorAll('span')).find(
+      s => s.textContent?.trim() === label,
+    );
+  }
+
+  async function renderList(documents: unknown[]) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: documents as never,
+      total: documents.length,
+      limit: 50,
+      offset: 0,
+    });
+    vi.mocked(fetchKnowledgeDocument).mockImplementation((_pid, id) =>
+      Promise.resolve({
+        ...(documents.find(d => (d as { id: string }).id === id) as object),
+        body: '# Compute analysis\n\nResults here.',
+      } as never),
+    );
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+  }
+
+  test('renders_compute_acceptance_grade_and_measured_only_badges', async () => {
+    await renderList([computeDoc, measuredOnlyComputeDoc]);
+
+    // Both documents stay visible in the list — measured-only is labeled, not hidden.
+    const acceptanceCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU benchmark'),
+    );
+    const measuredCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU fallback summary'),
+    );
+    expect(acceptanceCard).toBeTruthy();
+    expect(measuredCard).toBeTruthy();
+
+    // Each card carries its own acceptance-grade badge alongside the 'Compute' source badge.
+    expect(acceptanceCard && findBadge(acceptanceCard, 'Acceptance')).toBeTruthy();
+    expect(acceptanceCard?.textContent).toContain('Compute');
+    expect(measuredCard && findBadge(measuredCard, 'Measured only')).toBeTruthy();
+    expect(measuredCard?.textContent).toContain('Compute');
+
+    // Open the acceptance-grade document — its badge also renders in the detail meta row.
+    if (!acceptanceCard) throw new Error('expected acceptance compute card');
+    await act(async () => { (acceptanceCard as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    expect(findBadge(host as HTMLDivElement, 'Acceptance')).toBeTruthy();
+  });
+
+  test('non-acceptance grade is absent for documents without the compute grade', async () => {
+    // A compute doc serialized before the grade field existed (grade undefined)
+    // renders no acceptance badge but stays a first-class 'Compute' document.
+    const ungraded = { ...computeDoc, id: 'doc-ungraded', title: 'GPU legacy doc', compute_acceptance_grade: undefined, compute_acceptance_reason: undefined };
+    await renderList([ungraded]);
+    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU legacy doc'),
+    );
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('Compute');
+    expect(card && findBadge(card, 'Acceptance')).toBeFalsy();
+    expect(card && findBadge(card, 'Measured only')).toBeFalsy();
   });
 });

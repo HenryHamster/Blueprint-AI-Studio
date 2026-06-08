@@ -323,7 +323,7 @@ async def test_compute_completion_classifies_outcome_after_gate(
     db_session, _quiet_compute_io
 ):
     """The terminal classification of a completed compute_experiment matches the
-    stored compute_result: a SUCCESS run is a success outcome while a spend-cap
+    stored compute_result: a measured-only SUCCESS is neutral while a spend-cap
     kill is neutral — tying the analytics verdict to the gated terminal result."""
     from app.task_outcomes import evaluate_task_outcome
 
@@ -332,7 +332,7 @@ async def test_compute_completion_classifies_outcome_after_gate(
         success, _result_artifact(), db_session
     )
     await db_session.refresh(success)
-    assert evaluate_task_outcome(success).status == "success"
+    assert evaluate_task_outcome(success).status == "neutral"
 
     spend_cap = await _make_compute_task(db_session)
     await _handle_compute_experiment_completion(
@@ -1147,7 +1147,7 @@ def _mock_anthropic_returning(citations: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_compute_experiment_knowledge_uses_llm_with_artifact_citations(
+async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acceptance_grade(
     db_session, mocker, _quiet_compute_io
 ):
     """The PRIMARY path persists a cited LLM analysis over the durable artifacts.
@@ -1155,8 +1155,17 @@ async def test_compute_experiment_knowledge_uses_llm_with_artifact_citations(
     Runs a compute_experiment to terminal completion, simulates VM teardown,
     re-reads the durable artifact, and asserts the persisted KnowledgeDocument
     carries REAL artifact/metric citations (resolving to durable evidence, not a
-    bare result_reference) and was produced by the LLM path.
+    bare result_reference) and was produced by the LLM path. The paired fallback
+    run remains searchable measured knowledge, but not acceptance evidence.
     """
+    from app.knowledge_query import (
+        build_knowledge_index,
+        fetch_knowledge_substance_index,
+        list_knowledge_documents,
+        serialize_knowledge_document,
+    )
+    from app.task_outcomes import evaluate_task_outcome
+
     # Signed-URL minting hits GCS; force the optional best-effort path to no-op so
     # the candidate citation set is deterministic (artifact + metric refs only).
     mocker.patch(
@@ -1210,11 +1219,84 @@ async def test_compute_experiment_knowledge_uses_llm_with_artifact_citations(
     assert verdict["outcome"] == "SUCCESS"
     assert verdict["criterion_met"] is True
     assert verdict["criterion"]["value"] == pytest.approx(0.93)
+    assert verdict["knowledge_acceptance_evidence"] is True
+    assert verdict["compute_acceptance_grade"] == "acceptance"
+    assert verdict["compute_acceptance_reason"] == "llm_artifact_cited"
     # The LLM-authored prose replaced the deterministic template body.
     assert "analysis" in doc.body.lower()
     assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
+    assert (
+        task.plan_output["knowledge_document"]["knowledge_acceptance_evidence"]
+        is True
+    )
+    assert (
+        task.plan_output["knowledge_document"]["compute_acceptance_grade"]
+        == "acceptance"
+    )
     # The compute_result the handler owns is untouched by the knowledge pass.
     assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+    assert evaluate_task_outcome(task).status == "success"
+
+    listing = await list_knowledge_documents(
+        db_session, task.project_id, source_kind="compute_experiment"
+    )
+    assert listing["documents"][0]["knowledge_acceptance_evidence"] is True
+    assert listing["documents"][0]["compute_acceptance_grade"] == "acceptance"
+    detail = serialize_knowledge_document(doc, include_body=True)
+    assert detail["knowledge_acceptance_evidence"] is True
+    assert detail["compute_acceptance_grade"] == "acceptance"
+    index = await build_knowledge_index(db_session, task.project_id)
+    assert index[0]["knowledge_acceptance_evidence"] is True
+    assert index[0]["compute_acceptance_grade"] == "acceptance"
+    substance = await fetch_knowledge_substance_index(db_session, task.project_id)
+    assert substance[0].knowledge_acceptance_evidence is True
+    assert substance[0].compute_acceptance_grade == "acceptance"
+
+    fallback_task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    fallback_job, _ = await _setup_durable_job_with_artifact(
+        db_session, fallback_task
+    )
+    fallback_logs = _result_artifact(
+        job_id=str(fallback_job.id),
+        accuracy=0.93,
+        result_reference=result_reference,
+    )
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(
+            fallback_task, fallback_logs, db_session
+        )
+
+    await db_session.refresh(fallback_task)
+    fallback_docs = await _knowledge_docs_for(db_session, fallback_task)
+    assert len(fallback_docs) == 1
+    fallback_verdict = fallback_docs[0].forward_quality_verdict
+    assert fallback_verdict["analysis_mode"] == "fallback"
+    assert fallback_verdict["knowledge_acceptance_evidence"] is False
+    assert fallback_verdict["compute_acceptance_grade"] == "measured_only"
+    assert fallback_verdict["compute_acceptance_reason"] == "analysis_mode_not_llm"
+    fallback_detail = serialize_knowledge_document(
+        fallback_docs[0], include_body=True
+    )
+    assert fallback_detail["knowledge_acceptance_evidence"] is False
+    assert fallback_detail["compute_acceptance_grade"] == "measured_only"
+    fallback_substance = await fetch_knowledge_substance_index(
+        db_session, fallback_task.project_id
+    )
+    assert fallback_substance[0].knowledge_acceptance_evidence is False
+    assert fallback_substance[0].compute_acceptance_grade == "measured_only"
+    assert (
+        fallback_task.plan_output["knowledge_document"][
+            "knowledge_acceptance_evidence"
+        ]
+        is False
+    )
+    assert (
+        fallback_task.plan_output["knowledge_document"]["compute_acceptance_grade"]
+        == "measured_only"
+    )
+    assert evaluate_task_outcome(fallback_task).status == "neutral"
 
 
 @pytest.mark.asyncio
@@ -1394,6 +1476,126 @@ async def test_compute_experiment_knowledge_requires_durable_citations(
         "gs:// result_reference backed by a real Artifact must be preserved as "
         "durable citation evidence"
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evidence(
+    db_session, _quiet_compute_io, mocker
+):
+    """A compute_experiment spawned by plan_completion with downstream_artifact
+    acceptance_evidence stamps the terminal COMPUTE_RESULT Artifact with the
+    declared logical key and delivers the artifact prerequisite pointer to queued
+    dependents.
+
+    This is the end-to-end path: plan_completion sets the evidence on the payload;
+    _handle_compute_experiment_completion reads it via artifact_prerequisites and
+    stamps the artifact.
+    """
+    import json as _json
+
+    from sqlmodel import select as _select
+
+    from app.plan_completion import _handle_plan_completion
+    from testing.factories import make_project, make_task
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="PlanComputeEvidenceE2E")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = make_task(
+        project_id=project.id,
+        title="Plan: measure and implement",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    plan_logs = _json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Measure baseline",
+                    "prompt": "run the benchmark",
+                    "type": "compute_experiment",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "acceptance_evidence": {
+                        "kind": "downstream_artifact",
+                        "artifact_id": "plan-result-bundle",
+                    },
+                },
+            ]
+        }
+    )
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    # Grab the spawned compute_experiment child.
+    compute_child = (
+        (
+            await db_session.execute(
+                _select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert compute_child is not None
+    payload = compute_child.first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload.get("acceptance_evidence", {}).get("artifact_id") == "plan-result-bundle", (
+        f"acceptance_evidence not in payload after plan_completion spawn: {payload}"
+    )
+
+    # Now wire the child to complete and verify artifact stamp.
+    compute_child.status = TaskStatus.IN_PROGRESS
+    db_session.add(compute_child)
+    await db_session.commit()
+    await db_session.refresh(compute_child)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        compute_child,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        deadline_seconds=600,
+    )
+    from datetime import datetime as _dt
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.25
+    job.final_cost_usd = 0.25
+    job.terminal_reason = "compute job finished"
+    job.completed_at = _dt.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    result_reference = "gs://blueprint-agent-artifacts/compute-jobs/plan-result.json"
+    await _handle_compute_experiment_completion(
+        compute_child,
+        _result_artifact(job_id=str(job.id), result_reference=result_reference),
+        db_session,
+    )
+
+    await db_session.refresh(job)
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    assert artifact.logical_key == "plan-result-bundle"
+    assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
 
 
 # ── Reentry upgrade: fallback → llm ─────────────────────────────────────────

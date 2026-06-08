@@ -641,7 +641,7 @@ def parse_acceptance_evidence(raw: Any) -> dict | None:
     return result
 
 
-class ComputeExperimentPayload(_SystemPopulated):
+class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     """Reference compute-heavy task (benchmark/evaluation style).
 
     The agent forwards the launch fields below to ``POST /api/agent/compute-jobs``
@@ -673,6 +673,7 @@ class ComputeExperimentPayload(_SystemPopulated):
     # artifact so operators can correlate a job with the experiment that ran it.
     experiment: str | None = None
     benchmark: str | None = None
+    hypothesis: str | None = None
     metric: str | None = None
     # Optional goal-level acceptance criterion. When declared, the metric gate
     # checks the reported result against it at completion (a compute artifact

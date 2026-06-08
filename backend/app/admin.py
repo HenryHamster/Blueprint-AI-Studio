@@ -33,6 +33,7 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     limiter,
     resolve_task_branch as _resolve_task_branch,
+    runtime_config,
 )
 from app.models import (
     Task,
@@ -53,10 +54,15 @@ from app.auth import get_current_user
 from app.task_locking import task_lock
 
 from app.payload_schemas import (
+    ComputeSuccessCriterion,
     TaskType,
     validate_task_payload,
 )
 from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
+from app.compute_experiment_contract import (
+    _validate_compute_launch_contract,
+    resolve_compute_spend_approval,
+)
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -1350,6 +1356,44 @@ class CreateTaskPayload(BaseModel):
         return self
 
 
+class ComputeExperimentTaskPayload(BaseModel):
+    github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+    title: str = Field(..., min_length=1, max_length=200)
+    prompt: str = Field(..., min_length=1, max_length=50000)
+    base_branch: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
+    )
+    command: str = Field(..., min_length=1)
+    spend_cap_usd: float
+    deadline_seconds: int
+    accelerator: str | None = None
+    machine_type: str | None = None
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    experiment: str | None = None
+    benchmark: str | None = None
+    hypothesis: str | None = None
+    metric: str | None = None
+    success_criterion: ComputeSuccessCriterion | None = None
+    idempotency_key: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
+    )
+
+    @field_validator("base_branch")
+    @classmethod
+    def validate_branch_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        for part in v.split("/"):
+            if part in (".git", ".lock"):
+                raise ValueError(f"Branch name contains reserved component: {part}")
+            if part.startswith("."):
+                raise ValueError(f"Branch component cannot start with a dot: {part}")
+            if ".." in part:
+                raise ValueError(f"Branch component cannot contain '..': {part}")
+        return v
+
+
 @router.post("/tasks")
 @limiter.limit("60/minute")
 async def create_task_manually(
@@ -1719,6 +1763,250 @@ async def create_task_manually(
         "title": new_task.title,
         "status": new_task.status,
         "vm_instance_id": new_task.vm_instance_id,
+    }
+
+
+@router.post("/tasks/compute-experiment")
+@limiter.limit("60/minute")
+async def create_compute_experiment_task(
+    request: Request,
+    payload: ComputeExperimentTaskPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create an operator-launched compute_experiment with a full launch contract."""
+    github_owner, github_repo = payload.github_repo.split("/", 1)
+
+    stmt = select(Project).where(
+        Project.github_owner == github_owner,
+        Project.github_repo == github_repo,
+        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    )
+    project = (await session.execute(stmt)).scalars().first()
+
+    if not project:
+        project = Project(
+            name=payload.github_repo,
+            user_id=current_user.get("user_id", "admin"),
+            github_owner=github_owner,
+            github_repo=github_repo,
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(
+                project_id=project.id, user_id=current_user["user_id"], role="owner"
+            )
+        )
+        await session.commit()
+
+    await backfill_branch_columns(session, project_id=project.id)
+
+    resolved_base_branch = (
+        payload.base_branch or _get_project_promotion_target_for_task(project)
+    )
+    launch_contract: dict[str, Any] = {
+        "command": payload.command,
+        "spend_cap_usd": payload.spend_cap_usd,
+        "deadline_seconds": payload.deadline_seconds,
+    }
+    if payload.success_criterion is not None:
+        launch_contract["success_criterion"] = payload.success_criterion.model_dump()
+    for opt_key in (
+        "accelerator",
+        "machine_type",
+        "cwd",
+        "env",
+        "experiment",
+        "benchmark",
+        "hypothesis",
+        "metric",
+    ):
+        val = getattr(payload, opt_key)
+        if val is not None:
+            launch_contract[opt_key] = val
+
+    ok, reason = _validate_compute_launch_contract(launch_contract)
+    if not ok:
+        raise HTTPException(status_code=422, detail=reason)
+
+    requires_approval, threshold = resolve_compute_spend_approval(
+        runtime_config=runtime_config,
+        direction=None,
+        spend_cap_usd=float(launch_contract["spend_cap_usd"]),
+    )
+    task_payload_raw = {
+        "type": "compute_experiment",
+        "prompt": payload.prompt,
+        "title": payload.title,
+        "base_branch": resolved_base_branch,
+        "command": launch_contract["command"],
+        "spend_cap_usd": float(launch_contract["spend_cap_usd"]),
+        "deadline_seconds": int(launch_contract["deadline_seconds"]),
+        **(
+            {"success_criterion": launch_contract["success_criterion"]}
+            if launch_contract.get("success_criterion") is not None
+            else {}
+        ),
+        **{
+            k: launch_contract[k]
+            for k in (
+                "accelerator",
+                "machine_type",
+                "cwd",
+                "env",
+                "experiment",
+                "benchmark",
+                "hypothesis",
+                "metric",
+            )
+            if launch_contract.get(k) is not None
+        },
+    }
+    try:
+        task_payload = validate_task_payload(task_payload_raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    active_count = (
+        await session.execute(
+            select(func.count(Task.id)).where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+    ).scalar() or 0
+    if active_count >= 200:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Project has {active_count} active tasks (limit: 200)",
+        )
+
+    scoped_idempotency_key = (
+        f"admin_compute_launcher:{project.id}:{payload.idempotency_key}"
+        if payload.idempotency_key
+        else None
+    )
+    if scoped_idempotency_key:
+        existing = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == scoped_idempotency_key,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                                TaskStatus.PARKED,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing:
+            return {
+                "id": str(existing.id),
+                "project_id": str(existing.project_id),
+                "title": existing.title,
+                "status": existing.status,
+                "vm_instance_id": existing.vm_instance_id,
+                "is_duplicate": True,
+            }
+
+    vm_name = f"agent-vm-{uuid.uuid4().hex}"
+    new_task = Task(
+        project_id=project.id,
+        title=payload.title,
+        description=payload.prompt,
+        payloads=[task_payload],
+        vm_instance_id=vm_name,
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
+        requires_approval=requires_approval,
+        idempotency_key=scoped_idempotency_key,
+        context={"approval_hold_reason": "spend_budget"} if requires_approval else {},
+    )
+    if requires_approval:
+        new_task.latest_status_message = (
+            "Held for operator approval: compute_experiment proposes "
+            f"${float(launch_contract['spend_cap_usd']):.2f} spend cap / "
+            f"{int(launch_contract['deadline_seconds'])}s deadline, exceeding "
+            f"the ${threshold:.2f} approval threshold."
+        )
+    session.add(new_task)
+    try:
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        if scoped_idempotency_key and "ux_task_active_idempotency_key" in str(e):
+            existing = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.idempotency_key == scoped_idempotency_key,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                    TaskStatus.BLOCKED,
+                                    TaskStatus.PARKED,
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing:
+                return {
+                    "id": str(existing.id),
+                    "project_id": str(existing.project_id),
+                    "title": existing.title,
+                    "status": existing.status,
+                    "vm_instance_id": existing.vm_instance_id,
+                    "is_duplicate": True,
+                }
+        raise
+    await session.refresh(new_task)
+
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="CREATED",
+        details={
+            "created_by": "USER",
+            "method": "admin_compute_experiment_launcher",
+            "github_repo": payload.github_repo,
+            "base_branch": resolved_base_branch,
+        },
+    )
+    session.add(history)
+    await session.commit()
+
+    return {
+        "id": str(new_task.id),
+        "project_id": str(project.id),
+        "title": new_task.title,
+        "status": new_task.status,
+        "vm_instance_id": new_task.vm_instance_id,
+        "requires_approval": new_task.requires_approval,
     }
 
 

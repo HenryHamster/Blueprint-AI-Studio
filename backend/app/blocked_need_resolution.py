@@ -347,6 +347,8 @@ def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool
 def knowledge_substance_satisfies_need(
     need: Dict[str, Any],
     substance_index,
+    *,
+    require_acceptance_evidence: bool = False,
 ) -> bool:
     """True iff a durable KnowledgeDocument already holds the substance of this need.
 
@@ -356,7 +358,9 @@ def knowledge_substance_satisfies_need(
     ``topic`` (no fuzzy/substring/keyword heuristics), so independent work is never
     falsely satisfied. ``substance_index`` is a pre-fetched list of
     ``KnowledgeSubstance`` records (or any objects with ``.finding_hash`` and
-    ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``.
+    ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``. When
+    ``require_acceptance_evidence`` is true, measured-only compute knowledge can
+    still be discovered elsewhere but does not satisfy the strict need.
     """
     if not isinstance(need, dict):
         return False
@@ -367,6 +371,10 @@ def knowledge_substance_satisfies_need(
         return False
     ref = str(ref).strip()
     for record in substance_index:
+        if require_acceptance_evidence and not getattr(
+            record, "knowledge_acceptance_evidence", True
+        ):
+            continue
         if record.finding_hash and record.finding_hash == ref:
             return True
         if record.topic and record.topic == ref:

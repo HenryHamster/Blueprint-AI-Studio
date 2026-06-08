@@ -142,7 +142,7 @@ def unresolved_capability_needs(
         ):
             continue
         if substance_index is not None and knowledge_substance_satisfies_need(
-            need, substance_index
+            need, substance_index, require_acceptance_evidence=True
         ):
             continue
         unresolved.append(need)

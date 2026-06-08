@@ -379,6 +379,7 @@ def _make_compute_task(
     *,
     status: TaskStatus = TaskStatus.COMPLETED,
     final_cost_usd: float | None = 1.25,
+    acceptance_grade: str | None = None,
 ) -> Task:
     """Build a compute_experiment task carrying a terminal compute_result."""
     plan_output = None
@@ -389,12 +390,23 @@ def _make_compute_task(
                 "final_cost_usd": final_cost_usd,
             }
         }
+        if acceptance_grade is not None:
+            plan_output["knowledge_document"] = {
+                "source_kind": "compute_experiment",
+                "knowledge_acceptance_evidence": acceptance_grade == "acceptance",
+                "compute_acceptance_grade": acceptance_grade,
+            }
     return _make_task("compute_experiment", status=status, plan_output=plan_output)
 
 
-def test_compute_experiment_success_is_success():
-    task = _make_compute_task("SUCCESS")
+def test_compute_experiment_acceptance_grade_success_is_success():
+    task = _make_compute_task("SUCCESS", acceptance_grade="acceptance")
     assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_measured_only_success_is_neutral():
+    task = _make_compute_task("SUCCESS")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
 
 
 def test_compute_experiment_failure_is_failure():
