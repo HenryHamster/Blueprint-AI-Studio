@@ -1168,17 +1168,32 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
           phaseLabel: 'CI failure repro',
         },
       );
+      // ./check now VERIFIES these exact selectors locally (sanctioned
+      // harness, targeted run) and ./pr open gates on ./check — so the push
+      // is blocked until the CI-failing tests pass. Tell the agent so the
+      // gate failure is expected, not a surprise.
+      const ciGateNote =
+        `These selector(s) are now part of your ./check gate: ./check runs them via the sanctioned ` +
+        `test harness and ./pr open will NOT push until they pass locally. Iterate edit → ./check until ` +
+        `the targeted CI selector(s) are green, then ./pr open.\n`;
       if (repro.failureSummary) {
         enrichedPrompt =
           `## Local targeted CI repro\n` +
           `The CI-failing pytest selector(s) were reproduced locally before edits. Use this focused output as the primary failure evidence:\n\n` +
           `${repro.failureSummary.slice(-5000)}\n\n` +
+          ciGateNote + `\n` +
           enrichedPrompt;
       } else if (repro.passed) {
         enrichedPrompt =
           `## Local targeted CI repro\n` +
           `The CI-failing pytest selector(s) passed locally before edits. Re-check whether the CI failure is stale, environment-specific, or covered by another failing check before changing code.\n\n` +
+          ciGateNote + `\n` +
           enrichedPrompt;
+      } else {
+        // Repro neither produced a failure summary nor cleanly passed (e.g.
+        // an infra error in the pre-edit repro). The ./check gate still runs
+        // the selectors, so the agent must know it's there.
+        enrichedPrompt = `## CI failure selectors\n` + ciGateNote + `\n` + enrichedPrompt;
       }
     } else {
       sendLog(ws, 'No pytest selectors could be extracted from CI failure logs — skipping targeted repro and relying on CI context plus impact tests.\n');
@@ -1221,6 +1236,11 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
     buildConfig: fixBuildConfig,
+    // Close the ci_failure fix loop: thread the exact CI-failing selectors
+    // into ./check so ./pr open can't push until they pass locally. Empty for
+    // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===
+    // 'ci_failure'), so review-feedback fixes keep the existing gate untouched.
+    ciFailureSelectors,
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix

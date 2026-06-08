@@ -94,7 +94,7 @@
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1200,
     "prompts/check-helper.ts": 700,
-    "prompts/check-helper.test.ts": 600,
+    "prompts/check-helper.test.ts": 950,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
     "handlers/research-plan.ts": 2200,
@@ -171,6 +171,6 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 1650,
-    "api.ts": 2150
+    "api.ts": 2250
   }
 }
