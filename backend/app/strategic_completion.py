@@ -2765,6 +2765,19 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Updated problem_model for project {project.id} "
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                 )
+                try:
+                    from app import release_version as _rv
+
+                    _new_focus = (new_pm_raw.get("intent") or {}).get(
+                        "current_focus"
+                    )
+                    await _rv.refresh_open_version_goal_if_auto_derived(
+                        session, project.id, _new_focus
+                    )
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] Failed to refresh open version goal (non-fatal)"
+                    )
         except Exception:
             logger.exception(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"

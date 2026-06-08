@@ -906,6 +906,76 @@ def set_version_goal(
     )
 
 
+async def refresh_open_version_goal_if_auto_derived(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    current_focus: str | None,
+) -> ReleaseVersion | None:
+    """Refresh the open version's goal when it is still auto-derived.
+
+    Called after the strategic agent rewrites ``Project.problem_model.intent.current_focus``
+    so the operator-facing Version Lifecycle Goal stays in sync with the new
+    version's mission without requiring a manual operator resync.
+
+    No-ops when:
+    - ``current_focus`` is None or blank.
+    - No open version exists for the project.
+    - The version's ``goal_editor_info`` is non-null (operator-edited — never clobber).
+    - The version's ``goal`` already equals the new focus (already in sync).
+
+    Does NOT set ``goal_editor_info`` so the goal stays auto-derived.
+    Caller is responsible for committing the session.
+    """
+    if not current_focus or not current_focus.strip():
+        return None
+
+    try:
+        async with session.begin_nested():
+            locked = (
+                (
+                    await session.execute(
+                        select(ReleaseVersion)
+                        .where(
+                            ReleaseVersion.project_id == project_id,
+                            ReleaseVersion.status == "open",
+                        )
+                        .order_by(ReleaseVersion.opened_at.desc())
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if locked is None:
+                return None
+            if locked.goal_editor_info is not None:
+                # Operator-edited goal — never auto-clobber.
+                return None
+            new_goal = current_focus[:_GOAL_MAX]
+            if locked.goal == new_goal:
+                return None
+
+            old_goal = locked.goal
+            locked.goal = new_goal
+            locked.goal_updated_at = _utcnow()
+            session.add(locked)
+            logger.info(
+                "[RELEASE_VERSION] auto-refresh goal for open version v%d project=%s "
+                "(old: %.50s) (new: %.50s)",
+                locked.version_number,
+                project_id,
+                old_goal or "(none)",
+                new_goal,
+            )
+            return locked
+    except Exception:
+        logger.exception(
+            "[RELEASE_VERSION] Failed to refresh open version goal for project %s",
+            project_id,
+        )
+        return None
+
+
 async def _resolve_integration_head_sha(
     session: AsyncSession,
     project: Project | None,

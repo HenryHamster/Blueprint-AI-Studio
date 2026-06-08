@@ -10998,3 +10998,134 @@ async def test_spawn_retirement_memo_empty_snapshot_stays_queued(db_session):
         .all()
     )
     assert len(artifacts) == 0, "empty-snapshot memo must not have a pre-baked artifact"
+
+
+# ===========================================================================
+# refresh_open_version_goal_if_auto_derived via _handle_strategic_completion
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
+    db_session, mocker
+):
+    """After a strategic focus rewrite, the open version goal follows current_focus
+    for auto-derived goals and is preserved for operator-edited goals."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FocusSync",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "intent": {"current_focus": "old v7 focus"},
+            "revision": 1,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open a version with auto-derived goal (no goal_editor_info).
+    version = await rv.open_version(
+        db_session, project.id, version_number=8, goal="old v7 focus"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal_editor_info is None
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "problem_model": {
+                "intent": {"current_focus": "new v8 build mission"},
+                "revision": 2,
+            }
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(version)
+
+    # Auto-derived goal must now reflect the new strategic focus.
+    assert version.goal == "new v8 build mission", (
+        f"Expected 'new v8 build mission', got {version.goal!r}"
+    )
+    assert version.goal_editor_info is None
+
+    # === Operator-edited goal must not be clobbered ===
+    project2 = Project(
+        name="FocusSyncProtected",
+        user_id="u2",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "intent": {"current_focus": "old v7 focus"},
+            "revision": 1,
+        },
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    version2 = await rv.open_version(
+        db_session, project2.id, version_number=8, goal="old v7 focus"
+    )
+    await db_session.commit()
+
+    rv.set_version_goal(version2, "operator-chosen goal", editor_id="op@example.com")
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+    assert version2.goal_editor_info == "[operator:op@example.com]"
+
+    task2 = Task(
+        project_id=project2.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    logs2 = json.dumps(
+        {
+            "problem_model": {
+                "intent": {"current_focus": "strategic new focus — must not overwrite"},
+                "revision": 2,
+            }
+        }
+    )
+
+    await _handle_strategic_completion(task2, logs2, db_session)
+    await db_session.refresh(version2)
+
+    assert version2.goal == "operator-chosen goal", (
+        f"Operator goal must not be clobbered; got {version2.goal!r}"
+    )
+    assert version2.goal_editor_info == "[operator:op@example.com]"
