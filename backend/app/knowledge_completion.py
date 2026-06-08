@@ -1402,22 +1402,30 @@ async def _analyze_compute_experiment_with_llm(
     logs: str | None,
     session: AsyncSession,
     fallback: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Produce a cited LLM analysis over the durable artifacts, or ``None``.
+) -> tuple[dict[str, Any] | None, str]:
+    """Produce a cited LLM analysis over the durable artifacts, or ``(None, reason)``.
 
-    Returns ``None`` — signalling the caller to persist the deterministic
+    Returns ``(None, reason)`` — signalling the caller to persist the deterministic
     fallback — when the analysis is opted out, the API key is absent, there are
     no usable durable artifacts, the LLM call fails/times out, the output is
     unparseable, or the produced document does not clear the SAME citation gate
     the web_research/design lanes use (``_usable_citations``) AND ground itself in
     at least one real artifact/metric citation rather than only the bare result
-    reference.
+    reference. ``reason`` is a compact machine-readable token identifying WHY the
+    fallback was chosen (e.g. ``"analysis-disabled"``, ``"precondition-not-met"``,
+    ``"no-evidence"``, ``"llm-error"``, ``"citations-ungrounded"``).
     """
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
-        return None
+        logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
+        return None, "analysis-disabled"
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        return None
+        logger.info(
+            "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
+            "(precondition-not-met); fallback document will be persisted",
+            task.id,
+        )
+        return None, "precondition-not-met"
 
     evidence = await _gather_compute_evidence(
         task,
@@ -1427,7 +1435,7 @@ async def _analyze_compute_experiment_with_llm(
         session=session,
     )
     if evidence is None:
-        return None
+        return None, "no-evidence"
 
     prompt = _build_compute_analysis_prompt(
         task,
@@ -1439,7 +1447,7 @@ async def _analyze_compute_experiment_with_llm(
     )
     document = await _call_compute_analysis_llm(api_key, prompt)
     if document is None:
-        return None
+        return None, "llm-error"
 
     # Citation grounding: keep only citations that are members of the durable
     # candidate set (the LLM cannot fabricate evidence), then run them through the
@@ -1448,7 +1456,7 @@ async def _analyze_compute_experiment_with_llm(
     real_evidence = set(evidence["real_evidence"])
     raw_citations = document.get("source_citations")
     if not isinstance(raw_citations, list):
-        return None
+        return None, "llm-error"
     grounded = [
         c.strip()
         for c in raw_citations
@@ -1463,12 +1471,12 @@ async def _analyze_compute_experiment_with_llm(
             "using deterministic fallback",
             task.id,
         )
-        return None
+        return None, "citations-ungrounded"
 
     summary = str(document.get("summary") or "")
     body = str(document.get("body") or "")
     if not summary.strip() or not body.strip():
-        return None
+        return None, "llm-error"
     title = (
         str(document.get("title"))[:500]
         if document.get("title")
@@ -1500,7 +1508,7 @@ async def _analyze_compute_experiment_with_llm(
         "citations": usable[:_COMPUTE_MAX_CITATIONS],
         "verdict_record": verdict_record,
         "_citation_grounding": grounding_stamp,
-    }
+    }, ""
 
 
 _ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "llm": 1}
@@ -1709,8 +1717,9 @@ async def persist_compute_experiment_knowledge(
 
     document = fallback
     mode = "fallback"
+    fallback_reason: str | None = None
     try:
-        analysis = await _analyze_compute_experiment_with_llm(
+        analysis, _reason = await _analyze_compute_experiment_with_llm(
             task,
             outcome=outcome,
             cost=cost,
@@ -1728,10 +1737,18 @@ async def persist_compute_experiment_knowledge(
             exc_info=True,
         )
         analysis = None
+        _reason = "llm-error"
     if analysis is not None:
         document = analysis
         mode = "llm"
     else:
+        fallback_reason = _reason or "unknown"
+        logger.info(
+            "[COMPUTE] task %s persisting fallback KnowledgeDocument "
+            "(analysis_mode=fallback, reason=%s)",
+            task.id,
+            fallback_reason,
+        )
         # Fallback path: stamp citation grounding based on whether result_reference
         # resolves to a real Artifact row via the ComputeJob. Best-effort — any
         # error here is swallowed; the fallback document persists either way.
@@ -1755,6 +1772,13 @@ async def persist_compute_experiment_knowledge(
                 task.id,
                 exc_info=True,
             )
+        # Stamp the reason the LLM path was skipped so operators can diagnose
+        # misconfigured backends (e.g. missing ANTHROPIC_API_KEY).
+        if fallback_reason:
+            document = dict(document)
+            verdict_record = dict(document.get("verdict_record") or {})
+            verdict_record["fallback_reason"] = fallback_reason
+            document["verdict_record"] = verdict_record
 
     return await _persist_compute_knowledge_document(task, document, mode, session)
 

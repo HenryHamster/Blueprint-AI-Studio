@@ -1545,3 +1545,49 @@ async def test_compute_knowledge_same_mode_retry_is_idempotent(
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_fallback_verdict_records_skip_reason_when_precondition_not_met(
+    db_session, _quiet_compute_io
+):
+    """When the LLM precondition is not met (no API key), the persisted fallback
+    KnowledgeDocument's forward_quality_verdict includes a ``fallback_reason``
+    field naming why the LLM path was skipped."""
+    task = await _make_compute_task(db_session)
+    logs = _result_artifact()
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["analysis_mode"] == "fallback"
+    assert verdict.get("fallback_reason") == "precondition-not-met", (
+        f"expected fallback_reason='precondition-not-met', got {verdict.get('fallback_reason')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_verdict_records_skip_reason_when_analysis_disabled(
+    db_session, _quiet_compute_io
+):
+    """When analysis is explicitly disabled via env, the fallback verdict names
+    ``analysis-disabled`` as the reason."""
+    task = await _make_compute_task(db_session)
+    logs = _result_artifact()
+
+    with patch.dict(
+        os.environ,
+        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": "1"},
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["analysis_mode"] == "fallback"
+    assert verdict.get("fallback_reason") == "analysis-disabled", (
+        f"expected fallback_reason='analysis-disabled', got {verdict.get('fallback_reason')!r}"
+    )
