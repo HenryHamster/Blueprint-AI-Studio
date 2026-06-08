@@ -3610,6 +3610,47 @@ async def test_step5_idempotency_collision_skipped_and_downstream_sweep_survives
     assert stale_retry.retry_after_until is None
 
 
+@pytest.mark.asyncio
+async def test_step5_idempotency_collision_with_parked_holder_skipped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Same collision guard, but the active key-holder is PARKED — a status the
+    ux_task_active_idempotency_key index counts (migration 0199) but the
+    resurrection pre-query historically omitted. Before the guard was widened to
+    include PARKED/BLOCKED, the FAILED dup would be flipped to QUEUED and collide
+    on the partial unique index → the same all-batch PendingRollbackError the
+    QUEUED-holder case guards against. The holder must be detected and the
+    resurrection skipped."""
+    project = await _make_project(reaper_db)
+
+    # Active key-holder is PARKED (non-terminal; index counts it).
+    parked_holder = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PARKED,
+        idempotency_key="dup-key-parked",
+    )
+    failed_dup = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=4,
+        idempotency_key="dup-key-parked",
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add_all([parked_holder, failed_dup])
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    for _t in (parked_holder, failed_dup):
+        await reaper_db.refresh(_t)
+
+    # The PARKED holder is detected by the widened guard → resurrection skipped.
+    assert failed_dup.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (failed_dup.context or {})
+    assert parked_holder.status == TaskStatus.PARKED
+
+
 # ── Dependent-task unblocking on terminal failure ────────────────────────
 
 

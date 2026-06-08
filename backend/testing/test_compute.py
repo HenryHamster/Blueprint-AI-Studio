@@ -45,6 +45,9 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
+    WakeAction,
+    WakeDeliveryState,
 )
 
 
@@ -3410,6 +3413,264 @@ async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_s
         db_session, project_id=None, since=today_start
     )
     assert cross == pytest.approx(4.75)
+
+
+@pytest.mark.asyncio
+async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypatch):
+    """A compute_experiment task parked on its job is woken EXACTLY ONCE.
+
+    Exercises the full park-and-wake compute flow end to end:
+      1. The task launches a budgeted compute job and PARKS on a
+         ``compute_job_terminal`` wake (releasing its agent VM/slot).
+      2. The monitor drives the job to a terminal SUCCESS and fires the wake
+         once, in the same transaction as the job finalization.
+      3. The leader-owned wake-delivery sweep finalizes the parked task through
+         the real compute_experiment completion path — honest outcome + cost.
+      4. Duplicate monitor ticks and duplicate sweeps neither double-fire nor
+         double-finalize (terminal/wake/launch idempotency).
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import park_task
+    from app.time_utils import _utcnow
+
+    project = Project(name="Compute Park Wake", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: parked job",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    # The task parks on the launched job instead of poll-pinning its VM.
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job.id}",
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+    assert task.parked_at is not None
+
+    started_at = datetime.utcnow() - timedelta(seconds=30)
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "park-job-1"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="park-job-1",
+                started_at=started_at,
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.12, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=datetime.utcnow(),
+                message="completed",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Tick 1 launches (QUEUED→RUNNING), tick 2 observes terminal + fires the wake.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+    regs = (
+        (await db_session.execute(select(TaskWakeRegistration)))
+        .scalars()
+        .all()
+    )
+    assert len(regs) == 1, "launch must not create duplicate parked registrations"
+    assert regs[0].delivery_state == WakeDeliveryState.FIRED
+
+    # The leader-owned wake worker finalizes the parked task exactly once.
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.COMPLETED
+    assert task.parked_at is None
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.result_state == "finalized"
+    assert reg.attempt_count == 1
+    compute_result = (task.plan_output or {}).get("compute_result")
+    assert compute_result is not None
+    assert compute_result["outcome"] == "SUCCESS"
+    assert compute_result["final_cost_usd"] == pytest.approx(0.12)
+
+    # Idempotency: a duplicate monitor tick skips the already-terminal job (no
+    # second fire) and a duplicate sweep finds no FIRED row to deliver — the task
+    # is never double-finalized and the registration is never re-delivered.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.COMPLETED
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.attempt_count == 1
+
+
+def test_build_compute_result_logs_shape_metrics_and_disposition():
+    """The backend COMPUTE_RESULT builder mirrors the agent artifact contract.
+
+    Covers the behavior that moved off the agent: honest outcome/cost fields, the
+    intentional/killed_by disposition for a budget kill, command-reported metrics
+    flattened to top-level numeric keys, and reserved-key collisions skipped.
+    """
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="e2-standard-8",
+        status=ComputeJobStatus.FAILED,
+        outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
+        terminal_reason="compute job terminated at spend cap",
+        spend_cap_usd=2.5,
+        accrued_cost_usd=2.5,
+        final_cost_usd=2.5,
+        polling_metadata={
+            "result_metrics": {
+                "accuracy": 0.91,
+                "tokens_per_sec": "1234",
+                "final_cost_usd": 999,  # collides with reserved key → skipped
+                "ignored": "nope",  # non-numeric → dropped
+            },
+        },
+    )
+
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+
+    assert result["job_id"] == str(job.id)
+    assert result["outcome"] == "SPEND_CAP_EXCEEDED"
+    assert result["final_cost_usd"] == pytest.approx(2.5)
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "budget"
+    # Reported metrics flattened to top-level numeric keys.
+    assert result["accuracy"] == pytest.approx(0.91)
+    assert result["tokens_per_sec"] == pytest.approx(1234.0)
+    # Reserved-key collision did not overwrite the job-level field.
+    assert result["final_cost_usd"] == pytest.approx(2.5)
+    # Non-numeric reported metric dropped.
+    assert "ignored" not in result
+
+
+def test_build_compute_result_logs_falls_back_to_accrued_cost():
+    """When final_cost_usd is unset, the builder falls back to accrued cost."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.42,
+        final_cost_usd=None,
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["final_cost_usd"] == pytest.approx(0.42)
+    assert result["outcome"] == "SUCCESS"
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] is None
+
+
+def test_build_compute_result_logs_string_outcome_disposition():
+    """Outcome stored as a raw string (not enum) still resolves intentional/killed_by.
+
+    ComputeJob.outcome is a plain String column; SQLAlchemy may load it as a bare
+    string rather than a ComputeJobOutcome enum instance. The disposition lookup must
+    coerce the normalized string to the enum so the mapping is not silently missed.
+    """
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="e2-standard-8",
+        status=ComputeJobStatus.FAILED,
+        outcome="SPEND_CAP_EXCEEDED",  # raw string, not ComputeJobOutcome enum
+        terminal_reason="spend cap",
+        accrued_cost_usd=1.5,
+        final_cost_usd=1.5,
+    )
+
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+
+    assert result["outcome"] == "SPEND_CAP_EXCEEDED"
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "budget"
+
+
+def test_build_compute_result_logs_string_outcome_timed_out():
+    """TIMED_OUT as a raw string also resolves correctly."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="e2-standard-8",
+        status=ComputeJobStatus.FAILED,
+        outcome="TIMED_OUT",  # raw string
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+    )
+
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+
+    assert result["outcome"] == "TIMED_OUT"
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "deadline"
 
 
 # ---------------------------------------------------------------------------

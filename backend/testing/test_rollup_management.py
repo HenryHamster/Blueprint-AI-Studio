@@ -1547,3 +1547,39 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
         (task.context or {}).get("_non_merge_unblock_reason")
         == "merged_pr_non_integration_branch"
     )
+
+
+@pytest.mark.asyncio
+async def test_rollup_defers_when_sibling_is_parked(cleanup_db, mocker):
+    """A PARKED sibling is non-terminal — the rollup loop must treat it as active
+    (active_count > 0) and return without merging. Without this guard a completed
+    child would trigger a premature rollup that ignores the still-outstanding
+    external job backing the PARKED sibling."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    # One completed child (PR merged).
+    await _make_merged_child(cleanup_db, project.id, parent.id)
+    # One PARKED sibling — non-terminal, waiting on an external signal.
+    await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.PARKED,
+    )
+
+    await _check_and_trigger_rollup(
+        await _make_merged_child(cleanup_db, project.id, parent.id),
+        cleanup_db,
+    )
+
+    # PARKED sibling kept active_count > 0 → no merge should have fired.
+    mock_merge.assert_not_called()

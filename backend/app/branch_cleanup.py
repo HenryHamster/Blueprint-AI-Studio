@@ -295,6 +295,11 @@ async def _run_stale_branch_cleanup():
             TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS,
             TaskStatus.EVALUATING,
+            # PARKED is live work waiting on an external wake: a RESUME wake
+            # re-queues it onto a fresh VM that re-uses its branch. Treating its
+            # branch as unused while parked would delete it out from under the
+            # resumed task — strand. So a parked task pins its branch as active.
+            TaskStatus.PARKED,
         ]
         now = _utcnow()
 

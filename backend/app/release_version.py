@@ -344,7 +344,7 @@ def _task_completed_at(task: Task) -> datetime:
 
 # Non-terminal task statuses — work that is still "in flight" against a version.
 # Mirrors the active-status set used by the idempotency partial index in
-# models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED.
+# models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED/PARKED.
 # COMPLETED/FAILED/CANCELLED are terminal and excluded.
 _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.QUEUED,
@@ -352,6 +352,7 @@ _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
     TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
 )
 
 
@@ -363,8 +364,8 @@ async def count_in_flight_tasks(
 
     "In flight" means the task is in a non-terminal status
     (``QUEUED`` / ``PROVISIONING`` / ``IN_PROGRESS`` / ``EVALUATING`` /
-    ``BLOCKED``) — work that a version cut does NOT stop. Such tasks keep
-    running and land against the freshly-opened next version, so the
+    ``BLOCKED`` / ``PARKED``) — work that a version cut does NOT stop. Such
+    tasks keep running and land against the freshly-opened next version, so the
     version-cut confirmation surfaces this count to make that consequence
     explicit.
 

@@ -56,11 +56,19 @@ _DEGRADED_SPAWN_CAP = 2
 # precondition, occupies no VM/active slot, and must not count against the
 # active-capacity budget (counting it would throttle spawning of genuinely
 # runnable work behind work that cannot run yet).
+#
+# PARKED IS counted (unlike BLOCKED): a parked task is committed in-flight work
+# that will deterministically reclaim a slot when its external wake fires (RESUME
+# re-queues it; FINALIZE completes it). It currently holds no VM, but the budget
+# must reserve for its return — omitting it would let the project over-spawn past
+# the slots its parked siblings are about to take back. BLOCKED has no such
+# guaranteed return (its precondition may never clear), so the cases differ.
 _ACTIVE_SPAWN_HEALTH_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+    TaskStatus.PARKED,
 )
 
 

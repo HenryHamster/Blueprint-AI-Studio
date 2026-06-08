@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from sqlmodel import select
 
 from app.depends_on_provenance import remember_structural_depends_on
-from app.models import Task, TaskStatus
+from app.models import Task, TaskStatus, TaskWakeRegistration, WakeDeliveryState
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -176,9 +176,7 @@ async def sweep_stale_migration_reservations(session) -> int:
             expired += 1
     if expired:
         await session.commit()
-        logger.info(
-            "[REAPER] Expired %d stale migration reservation(s)", expired
-        )
+        logger.info("[REAPER] Expired %d stale migration reservation(s)", expired)
     return expired
 
 
@@ -267,9 +265,7 @@ async def sweep_queued_age_alerts(
                     f"rate-limit retry delay recently expired ({_expired_min:.1f}m ago, "
                     f"reset {_resets} times)"
                 )
-        elif (_qt.latest_status_message or "").startswith(
-            _PRECONDITION_DEFER_PREFIX
-        ):
+        elif (_qt.latest_status_message or "").startswith(_PRECONDITION_DEFER_PREFIX):
             # The dispatcher already recorded the authoritative, actionable
             # blocker at defer time (e.g. waiting on a pending rollup, a file
             # conflict with a running task, or a serializing migration). Surface
@@ -285,10 +281,11 @@ async def sweep_queued_age_alerts(
                 _qt_type, window_minutes=15
             )
             if _sample >= 3 and _rate >= 0.7:
-                _likely_cause = f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
-            elif (
-                _shared_state.tasks_active_gauge
-                >= runtime_config.get("max_concurrent_vms", 8)
+                _likely_cause = (
+                    f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
+                )
+            elif _shared_state.tasks_active_gauge >= runtime_config.get(
+                "max_concurrent_vms", 8
             ):
                 _likely_cause = "all accounts healthy but VM slot limit reached"
             else:
@@ -345,9 +342,7 @@ async def sweep_queued_age_alerts(
                     f"[REAPER] Queued age alert broadcast failed for "
                     f"{payload.get('alert_id')}: {_bcast_err}"
                 )
-        logger.info(
-            f"[REAPER] Fired queued age alerts for {_alerted} stale task(s)"
-        )
+        logger.info(f"[REAPER] Fired queued age alerts for {_alerted} stale task(s)")
 
     return _alerted
 
@@ -414,7 +409,9 @@ async def sweep_stalled_strategic_cycles(
         else:
             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
         if c.failure_reason is None:
-            c.failure_reason = f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
+            c.failure_reason = (
+                f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
+            )
         session.add(c)
         actually_stalled.append(c)
         try:
@@ -492,9 +489,7 @@ async def sweep_stuck_qualifications(session, *, session_factory) -> int:
         session, session_factory=session_factory
     )
     if finalized:
-        logger.info(
-            f"[REAPER] Finalized {finalized} stuck release qualification(s)"
-        )
+        logger.info(f"[REAPER] Finalized {finalized} stuck release qualification(s)")
     return finalized or 0
 
 
@@ -587,8 +582,12 @@ UNRESUMABLE_CANCEL_CONTEXT_KEY = "_unresumable_cancellation"
 # resumes.
 RESUME_MARKER_CONTEXT_KEY = "_blocked_resume"
 # Give-up classes — the two reasons a blocked dependent can provably never resume.
-GIVE_UP_FOUNDATION_DIED = "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
-GIVE_UP_NEVER_SATISFIABLE = "never_satisfiable"  # need outlived its bounded parked re-evals
+GIVE_UP_FOUNDATION_DIED = (
+    "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
+)
+GIVE_UP_NEVER_SATISFIABLE = (
+    "never_satisfiable"  # need outlived its bounded parked re-evals
+)
 
 # Need kinds that name a FOUNDATION (a sibling task / finding-hash, or an explicit
 # capability) rather than an external ref like a PR number. When one of these is
@@ -632,7 +631,9 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
     """
     deps = task.depends_on or []
     blocker_meta = (task.context or {}).get("blocker") or {}
-    blocker_source = blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
+    blocker_source = (
+        blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
+    )
     if not deps:
         if task.blocker_kind in {"file_conflict", "pending_rollup"}:
             # Orchestrator-owned blockers with no dependency edges are still
@@ -656,9 +657,10 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
                 if child.status == TaskStatus.FAILED and (
                     child_ctx.get("failure_category") == "BLOCKED_PRECONDITION"
                     or child_ctx.get("failure_class") == "BLOCKED_PRECONDITION"
-                    or (child.latest_status_message or "").lstrip().lower().startswith(
-                        "blocker:"
-                    )
+                    or (child.latest_status_message or "")
+                    .lstrip()
+                    .lower()
+                    .startswith("blocker:")
                 ):
                     return "waiting"
             # Child blockers have cleared; move the parent back into the
@@ -866,9 +868,7 @@ async def _classify_blocker_needs(
     from app.landed_signal import has_merge_unblock_signal
 
     failed_parents = {c.id for c in dead}
-    failed_parents |= {
-        c.id for c in completed if not has_merge_unblock_signal(c)
-    }
+    failed_parents |= {c.id for c in completed if not has_merge_unblock_signal(c)}
 
     existing_edges = {str(d) for d in (task.depends_on or [])}
     for need in needs:
@@ -1085,9 +1085,7 @@ async def _partition_completed_needs_base_safe(
     foundations = [f for _, f in resolved if f is not None]
     # No foundation resolved (defensive) or a single shared re-cut succeeded / was
     # a no-op → every completed need is base-safe.
-    if not foundations or await ensure_dependent_base_recut(
-        task, foundations, session
-    ):
+    if not foundations or await ensure_dependent_base_recut(task, foundations, session):
         return list(completed_needs), []
     # Re-cut required but not yet clean (conflict / transient error): hold back
     # ONLY the needs whose foundation is the unsafe landed cross-base code dep; the
@@ -1445,6 +1443,7 @@ async def sweep_unblock_blocked_tasks(
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
+
         verify_pr_merged = _verify_pr_merged
 
     due_stmt = (
@@ -1694,9 +1693,7 @@ async def sweep_unblock_blocked_tasks(
             # block episode keeps counting toward the deadline) — unless it has
             # already crossed the deadline and was escalated above. A genuine
             # dependency/parent clear resets all, including the onset.
-            _clear_blocked_fields(
-                task, preserve_first_blocked=is_optimistic_conflict
-            )
+            _clear_blocked_fields(task, preserve_first_blocked=is_optimistic_conflict)
             task.status = TaskStatus.QUEUED
             task.latest_status_message = "Unblocked — requeued for dispatch"
             flag_modified(task, "context")
@@ -1706,16 +1703,17 @@ async def sweep_unblock_blocked_tasks(
             pending_broadcasts.append(
                 (
                     str(task.project_id),
-                    {"task_id": str(task.id), "status": "QUEUED",
-                     "message": task.latest_status_message},
+                    {
+                        "task_id": str(task.id),
+                        "status": "QUEUED",
+                        "message": task.latest_status_message,
+                    },
                 )
             )
         elif state == "re_evaluate":
             _clear_blocked_fields(task, preserve_first_blocked=False)
             task.status = TaskStatus.EVALUATING
-            task.latest_status_message = (
-                "Unblocked — awaiting rollup re-evaluation"
-            )
+            task.latest_status_message = "Unblocked — awaiting rollup re-evaluation"
             flag_modified(task, "context")
             session.add(task)
             changed = True
@@ -1996,8 +1994,7 @@ async def sweep_activate_staged_directions(session) -> int:
             total_activated += len(activated)
         except Exception as e:
             logger.error(
-                "[REAPER] Staged-direction activation sweep error for project "
-                "%s: %s",
+                "[REAPER] Staged-direction activation sweep error for project %s: %s",
                 pid,
                 e,
                 exc_info=True,
@@ -2049,19 +2046,13 @@ async def sweep_stale_staged_directions(session) -> int:
     from app.time_utils import _coerce_naive_utc
 
     stale_days = int(runtime_config.get("staged_direction_stale_alert_days", 21))
-    fallback_days = int(
-        runtime_config.get("staged_direction_stale_fallback_days", 21)
-    )
+    fallback_days = int(runtime_config.get("staged_direction_stale_fallback_days", 21))
 
     # Same prefilter as the activation sweep: candidate projects via the
     # normalised direction table. We read the staged rows' ``data`` blobs here
     # (verbatim ``Project.directions`` shape) rather than the project blob.
     rows = (
-        (
-            await session.execute(
-                select(Direction).where(Direction.status == "staged")
-            )
-        )
+        (await session.execute(select(Direction).where(Direction.status == "staged")))
         .scalars()
         .all()
     )
@@ -2772,10 +2763,15 @@ async def sweep_resolve_open_owned_bug_messages(
     """
     from app.broadcast import broadcast_to_project as _bcast
     from app.models import ProjectMessage
-    from app.message_convergence import BUG_CLASS_TYPES, OPEN_STATUS, SYSTEM_AUTHORED_FROM_TYPES
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        OPEN_STATUS,
+        SYSTEM_AUTHORED_FROM_TYPES,
+    )
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
+
         verify_pr_merged = _verify_pr_merged
 
     msgs = (
@@ -2831,9 +2827,7 @@ async def sweep_resolve_open_owned_bug_messages(
         msg.context = ctx
         session.add(msg)
         resolved += 1
-        pending_broadcasts.append(
-            (str(msg.project_id), {"message_id": str(msg.id)})
-        )
+        pending_broadcasts.append((str(msg.project_id), {"message_id": str(msg.id)}))
         logger.info(
             "[REAPER] Step 17: auto-resolved owned message %s — %s",
             msg.id,
@@ -2902,7 +2896,9 @@ _STALE_AUTO_RESOLUTION_KEY = "_stale_auto_resolution"
 _STALE_AUTO_CITATION_SIGNAL_KEY = "_stale_auto_citation_signal"
 
 
-async def _stale_bug_message_resolution(session, msg, project_cache) -> tuple[str, dict] | None:
+async def _stale_bug_message_resolution(
+    session, msg, project_cache
+) -> tuple[str, dict] | None:
     """`(audit, signal)` when ``msg``'s citations are absent on HEAD, else None.
 
     Re-grounds the message's citations FRESH against the current integration
@@ -2959,7 +2955,11 @@ async def sweep_resolve_stale_open_bug_messages(
     """
     from app.broadcast import broadcast_to_project as _bcast
     from app.models import ProjectMessage
-    from app.message_convergence import BUG_CLASS_TYPES, OPEN_STATUS, SYSTEM_AUTHORED_FROM_TYPES
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        OPEN_STATUS,
+        SYSTEM_AUTHORED_FROM_TYPES,
+    )
 
     msgs = (
         (
@@ -3016,9 +3016,7 @@ async def sweep_resolve_stale_open_bug_messages(
         msg.context = ctx
         session.add(msg)
         resolved += 1
-        pending_broadcasts.append(
-            (str(msg.project_id), {"message_id": str(msg.id)})
-        )
+        pending_broadcasts.append((str(msg.project_id), {"message_id": str(msg.id)}))
         logger.info(
             "[REAPER] Step 18: auto-resolved stale message %s — %s",
             msg.id,
@@ -3042,6 +3040,135 @@ async def sweep_resolve_stale_open_bug_messages(
         )
 
     return resolved
+
+
+async def sweep_deliver_task_wakes(
+    session, now: datetime, *, batch_size: int = 200
+) -> int:
+    """Leader-owned wake-delivery worker for the task park-and-wake primitive.
+
+    Three passes, each claiming rows ``FOR UPDATE SKIP LOCKED`` so two sweeps (or
+    a sweep racing the external firing side) never double-process a registration:
+
+    1. **Deliver** FIRED registrations — advance each PARKED task *exactly once*
+       via ``task_lifecycle.deliver_wake``.
+    2. **Expire** PENDING registrations whose ``deadline_at`` passed before the
+       source fired — age the task out (FAILED) rather than strand it.
+    3. **Strand-guard** PARKED tasks older than the strand threshold that have no
+       remaining PENDING/FIRED registration (e.g. their registration row was lost)
+       — fail them so a parked task can never sit forever with nothing to wake it.
+
+    Returns the number of tasks actually woken (pass 1 deliveries). Idempotent and
+    safe to run every reaper cycle.
+    """
+    from app.task_lifecycle import (
+        _PARK_STRAND_SECONDS,
+        deliver_wake,
+        expire_wake,
+    )
+
+    delivered = 0
+    touched = False
+
+    # Pass 1: deliver fired registrations.
+    fired = (
+        (
+            await session.execute(
+                select(TaskWakeRegistration)
+                .where(TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED)
+                .order_by(TaskWakeRegistration.fired_at.asc().nullsfirst())
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for reg in fired:
+        touched = True
+        if await deliver_wake(session, reg, now=now):
+            delivered += 1
+
+    # Pass 2: expire due, never-fired registrations.
+    due = (
+        (
+            await session.execute(
+                select(TaskWakeRegistration)
+                .where(
+                    TaskWakeRegistration.delivery_state == WakeDeliveryState.PENDING,
+                    TaskWakeRegistration.deadline_at.is_not(None),
+                    TaskWakeRegistration.deadline_at <= now,
+                )
+                .order_by(TaskWakeRegistration.deadline_at.asc())
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for reg in due:
+        touched = True
+        await expire_wake(session, reg, now=now)
+
+    # Pass 3: strand-guard. A PARKED task whose parked_at is older than the strand
+    # threshold and which has no live (PENDING/FIRED) registration cannot be woken
+    # by anything — fail it rather than leave it stranded. Uses ix_task_parked_at.
+    strand_cutoff = now - timedelta(seconds=_PARK_STRAND_SECONDS)
+    stranded = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.PARKED,
+                    Task.parked_at.is_not(None),
+                    Task.parked_at <= strand_cutoff,
+                )
+                .order_by(Task.parked_at.asc())
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for task in stranded:
+        live = (
+            await session.execute(
+                select(TaskWakeRegistration.id)
+                .where(
+                    TaskWakeRegistration.task_id == task.id,
+                    TaskWakeRegistration.delivery_state.in_(
+                        [WakeDeliveryState.PENDING, WakeDeliveryState.FIRED]
+                    ),
+                )
+                .limit(1)
+            )
+        ).first()
+        if live is not None:
+            continue
+        touched = True
+        task.status = TaskStatus.FAILED
+        task.parked_at = None
+        # Clear park_reason too so a stranded task carries no stale "Parked …"
+        # marker on operator surfaces — the task is now FAILED, not parked.
+        task.park_reason = None
+        task.latest_status_message = (
+            "Parked task stranded with no live wake registration; failing"
+        )[:500]
+        ctx = dict(task.context or {})
+        ctx["failure_category"] = "park_wake_stranded"
+        ctx["failure_class"] = "park_wake_stranded"
+        task.context = ctx
+        with contextlib.suppress(Exception):
+            from app.jwt_revocation import emit_task_terminated_notify
+
+            emit_task_terminated_notify(session, str(task.id))
+        session.add(task)
+
+    if touched:
+        await session.commit()
+    return delivered
 
 
 # ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────

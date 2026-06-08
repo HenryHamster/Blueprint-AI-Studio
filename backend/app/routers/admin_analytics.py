@@ -672,6 +672,10 @@ _ACTIVE_STATUSES = {
     TaskStatus.PROVISIONING,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+    # PARKED is in-flight work waiting on an external wake — include it so a
+    # parked task linked to an open PR still surfaces on the in-flight widget
+    # rather than vanishing while it waits.
+    TaskStatus.PARKED,
 }
 
 

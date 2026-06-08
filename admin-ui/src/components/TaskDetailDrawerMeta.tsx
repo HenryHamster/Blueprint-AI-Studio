@@ -807,6 +807,16 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         </>
       )}
 
+      {(task.status === 'PARKED' || task.parked_at || task.park_reason) && (
+        <>
+          <SectionHeader>Parked</SectionHeader>
+          {task.park_reason && (
+            <DetailRow label="Reason"><span className="text-sm text-sky-200/90 break-words">{task.park_reason}</span></DetailRow>
+          )}
+          {task.parked_at && <DetailRow label="Parked at">{formatAbsolute(task.parked_at)}</DetailRow>}
+        </>
+      )}
+
       {task.description && <>
         <SectionHeader>Description</SectionHeader>
         <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">{task.description}</pre>

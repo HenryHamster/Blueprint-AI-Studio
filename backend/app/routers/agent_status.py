@@ -1087,6 +1087,64 @@ async def update_agent_status(
     if task.status == TaskStatus.EVALUATING:
         return {"status": "already_evaluating", "task_id": str(task.id)}
 
+    # Already-PARKED guard: if the task is already PARKED and the agent sends
+    # any non-PARKED status, reject it — the task is now owned by the
+    # wake-delivery worker and must not be mutated by a stale agent callback.
+    # If the agent re-sends PARKED (lost-response retry), fall through to the
+    # PARKED branch below; park_task handles the idempotent case.
+    if task.status == TaskStatus.PARKED and payload.status != TaskStatus.PARKED:
+        logger.info(
+            f"[AGENT STATUS] Task {task.id} is PARKED; ignoring stale "
+            f"agent status {payload.status!r} from vm {task.vm_instance_id}"
+        )
+        return {"status": "parked", "task_id": str(task.id)}
+
+    # PARKED: the agent is voluntarily parking this task on an external,
+    # non-agent wake source (e.g. a launched ComputeJob it no longer wants to
+    # poll-pin a fleet slot for). Release the VM/JWT/slot now and persist a
+    # durable wake registration; the leader-owned wake-delivery worker advances
+    # the task EXACTLY ONCE when the source fires (or the reaper ages it out at
+    # its deadline). Handled before the generic status/terminal processing so a
+    # park is never mistaken for a failure. Backward compatible: an agent that
+    # never sends a ``park_request`` can't reach this branch.
+    if payload.status == TaskStatus.PARKED:
+        if not payload.park_request:
+            raise HTTPException(
+                status_code=422, detail="PARKED status requires a park_request"
+            )
+        from app.task_lifecycle import park_task
+        from app.vm_lifecycle import _ensure_vm_deleted
+
+        pr = payload.park_request
+        deadline_at = (
+            _utcnow() + timedelta(seconds=pr.deadline_seconds)
+            if pr.deadline_seconds
+            else None
+        )
+        await park_task(
+            session,
+            task,
+            wake_source_kind=pr.wake_source_kind,
+            wake_source_ref=pr.wake_source_ref,
+            source_metadata=pr.source_metadata or {},
+            wake_action=pr.wake_action,
+            deadline_at=deadline_at,
+            reason=pr.reason or payload.logs,
+        )
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.PARKED},
+        )
+        await _ensure_vm_deleted(task.vm_instance_id, reason="task_parked")
+        logger.info(
+            f"[AGENT STATUS] Task {task.id} PARKED on {pr.wake_source_kind} "
+            f"(action={pr.wake_action}) — released slot/VM"
+        )
+        return {"status": "parked", "task_id": str(task.id)}
+
     # 2. Update task status
     task.status = payload.status
     if payload.provider or payload.auth_mode or payload.model or payload.execution_mode:
@@ -3548,9 +3606,9 @@ async def update_agent_status(
             # _sweep_post_commit_pending, so re-raising would only turn benign
             # cutover collateral into a 500 → Cloud Run ContainerError → instance
             # quarantine (prod 2026-06-03 07:38 cutover burst).
-            is_disconnect = bool(getattr(e, "connection_invalidated", False)) or isinstance(
-                e, InterfaceError
-            )
+            is_disconnect = bool(
+                getattr(e, "connection_invalidated", False)
+            ) or isinstance(e, InterfaceError)
             if is_timeout:
                 reason = "post_commit_timeout"
             elif is_locked:
@@ -3596,9 +3654,7 @@ async def update_agent_status(
             # 5xx → Cloud Run ContainerError for what is benign contention with a
             # peer post-commit driver, exactly the case the row-lock guard above
             # converts to a 429. So treat it like the final-commit case.
-            if (
-                is_final_commit or is_locked or is_disconnect
-            ) and _persist_err is None:
+            if (is_final_commit or is_locked or is_disconnect) and _persist_err is None:
                 if is_disconnect:
                     logger.warning(
                         "[PIPELINE] Post-commit hit a disconnection-class DB error "

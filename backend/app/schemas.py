@@ -110,6 +110,37 @@ class ReproduceVerdict(BaseModel):
         return v
 
 
+class TaskParkRequest(BaseModel):
+    """An agent's request to PARK a task waiting on an external, non-agent signal.
+
+    The agent declares *which* source it is waiting on (``wake_source_kind`` —
+    an open string, e.g. ``"compute_job_terminal"``, plus an optional
+    ``wake_source_ref`` such as a ComputeJob id), what to do when that source
+    fires (``wake_action`` — ``"resume"`` to re-queue the task, or ``"finalize"``
+    to drive it terminal), an optional ``deadline_seconds`` after which the
+    reaper ages the park-out rather than stranding it, and free-form
+    ``source_metadata`` the firing side / operators read. Mirrors ``BlockedNeed``'s
+    additive, ``extra="ignore"`` shape so older agents that never send a park
+    request behave identically.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    wake_source_kind: str = Field(..., min_length=1, max_length=64)
+    wake_source_ref: str | None = Field(None, max_length=255)
+    wake_action: str = Field("resume", max_length=20)
+    deadline_seconds: int | None = Field(None, ge=1, le=30 * 24 * 60 * 60)
+    reason: str | None = Field(None, max_length=2000)
+    source_metadata: Dict[str, Any] | None = None
+
+    @field_validator("wake_action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        allowed = {"resume", "finalize"}
+        if v not in allowed:
+            raise ValueError(f"wake_action must be one of {allowed}")
+        return v
+
+
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
@@ -192,6 +223,10 @@ class AgentStatusPayload(BaseModel):
     # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
     # behave identically to today (free-text waiting_on/reason only).
     blocked_need: BlockedNeed | None = None
+    # Optional request to PARK this task on an external wake source (released
+    # fleet slot + durable wake registration). Honored when ``status == PARKED``.
+    # Absent payloads behave identically to today — backward compatible.
+    park_request: TaskParkRequest | None = None
     # Optional durable reproduce-on-HEAD verdict for bug-report-/finding-derived
     # work. Set by the agent on a terminal status when it determined whether the
     # cited defect reproduces against HEAD. Persisted into

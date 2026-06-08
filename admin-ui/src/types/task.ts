@@ -1,6 +1,6 @@
 import type { TaskType } from '../taskCapabilities';
 
-export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
 
 export interface ResearchFinding {
@@ -95,6 +95,11 @@ export interface Task {
   blocked_reason?: string | null;
   blocked_at?: string | null;
   recheck_after?: string | null;
+  // Durable operator-visible metadata for the non-terminal PARKED state (backend
+  // alembic 0187 / models.py). Nullable — older payloads and any non-PARKED task
+  // carry null/undefined, so guard on presence before rendering.
+  parked_at?: string | null;
+  park_reason?: string | null;
   // R3-W2 (H1): heartbeat-hot fields promoted from Task.context to dedicated
   // columns in Round 2 (B2 / F). The frontend reads from the columns; the
   // legacy `task.context.last_metrics` mirror was retired and reading it

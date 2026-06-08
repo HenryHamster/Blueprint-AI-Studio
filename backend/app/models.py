@@ -126,9 +126,65 @@ class TaskStatus(str, Enum):
     # ``status`` is a plain VARCHAR column (not a Postgres ENUM type) and has no
     # CHECK constraint, so admitting this new value requires no DDL on the column.
     BLOCKED = "BLOCKED"
+    # PARKED is non-terminal work that is *intentionally* waiting on an external,
+    # non-agent signal (e.g. a ComputeJob reaching a terminal state). Unlike
+    # BLOCKED — which is a precondition that is *absent* and rechecked on a timer
+    # — a PARKED task has an explicit, durable wake registration
+    # (``TaskWakeRegistration``) naming the source it waits on, the action to take
+    # when that source fires (resume vs finalize), and a delivery/result state.
+    # Entering PARKED releases the agent VM, JWT, and fleet slot immediately (the
+    # supervising agent no longer pins a slot for the source's duration); a
+    # leader-owned wake-delivery worker later advances the task exactly once when
+    # the source fires, or the reaper ages it out at its deadline. It is
+    # deliberately distinct from BLOCKED (precondition-recheck) and from a
+    # childless EVALUATING parent (waiting on its own children) so dispatch,
+    # digests, and operators can reason about *why* a task is idle. ``status`` is
+    # a plain VARCHAR (no Postgres ENUM / CHECK constraint), so admitting this new
+    # value requires no DDL on the column.
+    PARKED = "PARKED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class WakeAction(str, Enum):
+    """What the wake-delivery worker does with a PARKED task when its source fires.
+
+    RESUME   — return the task to ``QUEUED`` so the orchestrator re-dispatches it
+               on a fresh VM (the common case: the agent parked mid-flight and
+               wants to continue once the external signal lands).
+    FINALIZE — drive the task straight to a terminal state via the normal
+               completion path (the source firing *is* the answer; no further
+               agent work is needed).
+
+    Stored as the enum *value* in a plain String column, mirroring ``TaskStatus``.
+    """
+
+    RESUME = "resume"
+    FINALIZE = "finalize"
+
+
+class WakeDeliveryState(str, Enum):
+    """Lifecycle of a single :class:`TaskWakeRegistration` delivery.
+
+    PENDING   — registered; the source has not fired yet. The task sits PARKED.
+    FIRED     — the source fired (``fired_at`` set); the registration is now
+                claimable by the leader-owned wake-delivery worker.
+    DELIVERED — the worker claimed the registration and advanced the PARKED task
+                exactly once (``delivered_at`` + ``result_state`` set).
+    EXPIRED   — the deadline passed before the source fired; the reaper aged the
+                registration (and its task) out rather than stranding it.
+    FAILED    — the worker claimed a fired registration but could not advance the
+                task (e.g. the task was no longer PARKED); recorded for operators.
+
+    Stored as the enum *value* in a plain String column, mirroring ``TaskStatus``.
+    """
+
+    PENDING = "PENDING"
+    FIRED = "FIRED"
+    DELIVERED = "DELIVERED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
 
 
 class ComputeJobStatus(str, Enum):
@@ -1077,6 +1133,20 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+
+    # Durable operator-visible metadata for the non-terminal ``PARKED`` state
+    # (alembic 0199). The authoritative wake state lives on ``TaskWakeRegistration``
+    # rows; these two denormalized columns answer "is this task parked and since
+    # when / why" without joining, and back a tight partial index for the
+    # reaper's strand sweep. Both nullable with no server default: existing rows
+    # read NULL (never PARKED), so the rollout is a pure additive no-op.
+    #   parked_at   — when the task entered PARKED (for age/strand metrics).
+    #   park_reason — short human-readable note shown on admin surfaces.
+    parked_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    park_reason: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     previous_error_fingerprint: str | None = Field(default=None)
     auto_remediation: bool = Field(
         default=False,
@@ -1157,11 +1227,11 @@ class Task(SQLModel, table=True):
             unique=True,
             postgresql_where=text(
                 "idempotency_key IS NOT NULL AND status IN "
-                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED')"
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED','PARKED')"
             ),
             sqlite_where=text(
                 "idempotency_key IS NOT NULL AND status IN "
-                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED')"
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED','PARKED')"
             ),
         ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
@@ -1261,6 +1331,18 @@ class Task(SQLModel, table=True):
             "recheck_after",
             postgresql_where=text("status = 'BLOCKED'"),
             sqlite_where=text("status = 'BLOCKED'"),
+        ),
+        # Partial index on parked_at so the reaper's PARKED-strand sweep
+        # (status = 'PARKED' ...) hits a tight index range scan instead of
+        # seq-scanning the whole table for the small parked set. Postgres-only
+        # via alembic 0199 CONCURRENTLY DDL; the metadata Index registers the
+        # name + column for test_model_indexes_covered_by_migrations. See the
+        # PARKED state and TaskWakeRegistration.
+        Index(
+            "ix_task_parked_at",
+            "parked_at",
+            postgresql_where=text("status = 'PARKED'"),
+            sqlite_where=text("status = 'PARKED'"),
         ),
         # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
         # finding M-S5). The Python layer's ``pack_under_budget`` already caps
@@ -1993,13 +2075,18 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
         # BLOCKED is terminal-for-now: entering it releases the VM and must
         # revoke the agent JWT (emit_task_terminated_notify), and the
         # BLOCKED->QUEUED unblock must fire the revive branch so peer instances
-        # evict the stale deny-list entry. Keep this in lockstep with the
-        # terminal set used by _on_status_set's callbacks below.
+        # evict the stale deny-list entry. PARKED is the same shape: entering it
+        # releases the agent VM/JWT/slot immediately (see park_task), so it must
+        # revoke the agent JWT exactly as BLOCKED does; the PARKED->QUEUED resume
+        # wake then fires the revive branch so peer instances evict the stale
+        # deny-list entry. Keep this in lockstep with the terminal set used by
+        # _on_status_set's callbacks below and with _AGENT_WS_TERMINAL_STATUSES.
         terminal = (
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
             TaskStatus.BLOCKED,
+            TaskStatus.PARKED,
         )
         for instance in session.dirty:
             if not isinstance(instance, Task):
@@ -2072,11 +2159,15 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
         # terminal-for-now: the VM is released and must stop, so revoke its JWT
         # exactly as for FAILED/CANCELLED. Recovery requeues the task to QUEUED,
         # which falls into the revive branch below and clears the deny-list entry.
+        # PARKED behaves identically — it releases the agent VM/JWT/slot the moment
+        # it parks, so the released agent's token must be revoked; the resume wake
+        # back to QUEUED hits the revive branch and clears the deny-list entry.
         if value in (
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
             TaskStatus.BLOCKED,
+            TaskStatus.PARKED,
         ):
             for cb in _on_task_terminal_callbacks:
                 try:
@@ -3886,5 +3977,127 @@ class MigrationReservation(SQLModel, table=True):
             "ix_migrationreservation_project_status",
             "project_id",
             "status",
+        ),
+    )
+
+
+class TaskWakeRegistration(SQLModel, table=True):
+    """A durable registration that a :class:`Task` is PARKED waiting on an
+    external, non-agent wake source, plus the delivery/result state of waking it.
+
+    This is the persistence backing the task park-and-wake primitive. When a task
+    parks, it releases its VM/JWT/fleet slot and writes one of these rows naming:
+
+    * ``wake_source_kind`` / ``wake_source_ref`` — *which* external source it
+      waits on (e.g. ``"compute_job_terminal"`` + the ComputeJob id). The kind is
+      an open string, not an enum, so a future source (e.g. a rate-limit clearing)
+      can register without a migration — only the consumer that fires it is new.
+    * ``source_metadata`` — free-form context the firing side and operators read.
+    * ``wake_action`` — RESUME (re-queue the task) vs FINALIZE (drive it terminal).
+    * ``deadline_at`` — when the reaper should age the registration out rather than
+      let it strand forever if the source never fires.
+    * ``delivery_state`` — PENDING → FIRED → DELIVERED / EXPIRED / FAILED.
+
+    Exactly-once is enforced at delivery: the leader-owned worker claims a FIRED
+    row ``FOR UPDATE SKIP LOCKED`` and flips it to DELIVERED in the same critical
+    section it advances the PARKED task, so neither a retry nor a concurrent
+    worker can advance the same parked task twice.
+
+    ``task_id`` is non-null and CASCADE-deletes with its task: unlike ComputeJob /
+    MigrationReservation (durable history that must outlive the task), a wake
+    registration is meaningless once its task is gone.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    task_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    project_id: uuid.UUID = Field(foreign_key="project.id")
+
+    # Source identity. ``wake_source_kind`` is an open categorical string (the
+    # first shipped value is "compute_job_terminal"); ``wake_source_ref`` is the
+    # specific instance id within that kind (e.g. the ComputeJob UUID).
+    wake_source_kind: str = Field(sa_column=Column(String(64), nullable=False))
+    wake_source_ref: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    source_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    wake_action: WakeAction = Field(
+        default=WakeAction.RESUME,
+        sa_column=Column(
+            String, nullable=False, server_default=WakeAction.RESUME.value
+        ),
+    )
+    delivery_state: WakeDeliveryState = Field(
+        default=WakeDeliveryState.PENDING,
+        sa_column=Column(
+            String, nullable=False, server_default=WakeDeliveryState.PENDING.value
+        ),
+    )
+
+    requested_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    # Earliest the reaper should EXPIRE this registration if the source has not
+    # fired. NULL means "no timeout" (wait indefinitely for the source).
+    deadline_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    fired_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    claimed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    delivered_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # How many times the worker has attempted delivery for this row (forensic).
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    # Terminal outcome of delivery: e.g. "resumed", "finalized", "expired",
+    # "task_not_parked". Short categorical for operator surfaces.
+    result_state: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+    result_detail: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Worker hot path: claim FIRED registrations and age out due PENDING ones.
+        # The sweep filters on delivery_state and orders/bounds by deadline_at, so
+        # a (delivery_state, deadline_at) composite keeps that scan tight to the
+        # small set of live registrations.
+        Index(
+            "ix_taskwakeregistration_state_deadline",
+            "delivery_state",
+            "deadline_at",
         ),
     )

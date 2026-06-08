@@ -188,6 +188,7 @@ _AGENT_INACTIVE_TASK_STATUSES = (
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
     TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
 )
 
 # Peer code-change and analysis task types that do real code/analysis work and

@@ -234,6 +234,7 @@ def _mark_reaper_progress() -> None:
     global _reaper_last_progress
     _reaper_last_progress = _utcnow()
 
+
 # Cycle-level circuit breaker. After N consecutive whole-cycle exceptions the
 # reaper enters HALTED state, stops cycling, and posts an ERROR alert. Resets
 # automatically on process restart (in-memory); tunable via runtime_config key
@@ -901,6 +902,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
+    sweep_deliver_task_wakes,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -928,16 +930,13 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     cutoff = now - timedelta(hours=starvation_hours)
 
     project_rows = (
-        (
-            await session.execute(
-                select(Project.id, Project.created_at).where(
-                    Project.autonomous_enabled.is_(True),
-                    Project.not_archived(),
-                )
+        await session.execute(
+            select(Project.id, Project.created_at).where(
+                Project.autonomous_enabled.is_(True),
+                Project.not_archived(),
             )
         )
-        .all()
-    )
+    ).all()
     created = 0
     for project_id, project_created_at in project_rows:
         # New projects have not had time to establish a cadence — skip until the
@@ -1207,19 +1206,14 @@ async def reaper_service():
                 vm_tool_use_lookup: dict[str, datetime] = {}
                 if candidate_vm_ids:
                     contact_rows = (
-                        (
-                            await session.execute(
-                                select(
-                                    VmContact.vm_instance_id,
-                                    VmContact.last_contact_at,
-                                    VmContact.last_tool_use_at,
-                                ).where(
-                                    VmContact.vm_instance_id.in_(candidate_vm_ids)
-                                )
-                            )
+                        await session.execute(
+                            select(
+                                VmContact.vm_instance_id,
+                                VmContact.last_contact_at,
+                                VmContact.last_tool_use_at,
+                            ).where(VmContact.vm_instance_id.in_(candidate_vm_ids))
                         )
-                        .all()
-                    )
+                    ).all()
                     vm_contact_lookup = {
                         vm_id: last_contact
                         for vm_id, last_contact, _last_tool in contact_rows
@@ -1604,12 +1598,22 @@ async def reaper_service():
                                 select(Task.id).where(
                                     Task.idempotency_key == task.idempotency_key,
                                     Task.id != task.id,
+                                    # Must mirror the ux_task_active_idempotency_key
+                                    # partial-index predicate EXACTLY (migration 0199:
+                                    # QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED/
+                                    # PARKED). A status the index counts but this guard
+                                    # omits lets a colliding requeue slip past → the
+                                    # unique-violation IntegrityError on commit that
+                                    # rolls back the WHOLE reaper batch — exactly what
+                                    # this pre-query exists to prevent.
                                     Task.status.in_(
                                         [
                                             TaskStatus.QUEUED,
                                             TaskStatus.PROVISIONING,
                                             TaskStatus.IN_PROGRESS,
                                             TaskStatus.EVALUATING,
+                                            TaskStatus.BLOCKED,
+                                            TaskStatus.PARKED,
                                         ]
                                     ),
                                 )
@@ -2036,8 +2040,8 @@ async def reaper_service():
                                 )
                                 io_gh_pr_state = _pr_data.get("state")
                                 io_gh_pr_merged = bool(_pr_data.get("merged"))
-                                io_gh_pr_base_branch = (
-                                    (_pr_data.get("base") or {}).get("ref")
+                                io_gh_pr_base_branch = (_pr_data.get("base") or {}).get(
+                                    "ref"
                                 )
                             except Exception as _gh_exc:  # noqa: BLE001
                                 # GH API unreachable: fall back to "open" — handing off
@@ -2419,9 +2423,7 @@ async def reaper_service():
                             task.vm_instance_id = None
                             task.last_heartbeat = None
                             if _terminal_rollup_merge:
-                                task.latest_status_message = (
-                                    f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
-                                )
+                                task.latest_status_message = f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
                             else:
                                 task.latest_status_message = (
                                     f"Reaped mid-run; PR #{_pr_num} merged into "
@@ -2622,7 +2624,10 @@ async def reaper_service():
                             await broadcast_to_project(
                                 str(task.project_id),
                                 "task_updated",
-                                {"task_id": str(task.id), "status": TaskStatus.EVALUATING},
+                                {
+                                    "task_id": str(task.id),
+                                    "status": TaskStatus.EVALUATING,
+                                },
                             )
                         elif can_retry:
                             # Check if this is a research/plan parent with work children —
@@ -3066,10 +3071,9 @@ async def reaper_service():
                         # represents the work, so the reap is moot — skip THIS row
                         # cleanly (no streak / quarantine) and let it re-qualify next
                         # cycle if it doesn't resolve. This is NOT a poison-pill crash.
-                        if (
-                            isinstance(_reap_exc, IntegrityError)
-                            and "ux_task_active_idempotency_key" in str(_reap_exc)
-                        ):
+                        if isinstance(
+                            _reap_exc, IntegrityError
+                        ) and "ux_task_active_idempotency_key" in str(_reap_exc):
                             logger.warning(
                                 "[REAPER] Orphan reap of %s hit "
                                 "ux_task_active_idempotency_key on commit (a peer "
@@ -3176,7 +3180,6 @@ async def reaper_service():
                     _orphan_commit_ok = True
 
                 if orphaned_tasks and _orphan_commit_ok:
-
                     # Re-fetch fresh task state by id before the post-commit loops.
                     # A per-task reap crash above triggers session.rollback() (2211),
                     # which expires EVERY orphaned_tasks ORM object (rollback expires
@@ -3201,7 +3204,9 @@ async def reaper_service():
                         _mark_reaper_progress()
                         try:
                             await _requeue_parent_task(parent, session)
-                        except Exception as e:  # per-attempt try in deferred-requeue loop
+                        except (
+                            Exception
+                        ) as e:  # per-attempt try in deferred-requeue loop
                             logger.error(
                                 f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
                                 exc_info=True,
@@ -3756,7 +3761,8 @@ async def reaper_service():
                 _mark_reaper_progress()
                 try:
                     await sweep_queued_age_alerts(
-                        session, now,
+                        session,
+                        now,
                         runtime_config=_runtime_config,
                         batch_size=_BATCH,
                     )
@@ -3774,7 +3780,8 @@ async def reaper_service():
                 _mark_reaper_progress()
                 try:
                     await sweep_stalled_strategic_cycles(
-                        session, now,
+                        session,
+                        now,
                         heartbeat_stale_cutoff_fn=_heartbeat_stale_cutoff,
                     )
                 except Exception as e:
@@ -3798,9 +3805,7 @@ async def reaper_service():
                 try:
                     await sweep_regression_scan(session)
                 except Exception as e:
-                    logger.error(
-                        f"[REAPER] Regression scan error: {e}", exc_info=True
-                    )
+                    logger.error(f"[REAPER] Regression scan error: {e}", exc_info=True)
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
@@ -3848,7 +3853,9 @@ async def reaper_service():
                             f"[REAPER] Step 11: retired {pool_retired} idle pool VM(s)"
                         )
                 except Exception as e:
-                    logger.error(f"[REAPER] Idle pool VM sweep error: {e}", exc_info=True)
+                    logger.error(
+                        f"[REAPER] Idle pool VM sweep error: {e}", exc_info=True
+                    )
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
@@ -3859,8 +3866,19 @@ async def reaper_service():
                 try:
                     await sweep_unblock_blocked_tasks(session, now)
                 except Exception as e:
+                    logger.error(f"[REAPER] Unblock sweep error: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12b: Deliver external task wakes — advance PARKED tasks
+                # whose registered wake source has fired (exactly once), expire
+                # timed-out registrations, and strand-guard orphaned parked tasks.
+                _mark_reaper_progress()
+                try:
+                    await sweep_deliver_task_wakes(session, now)
+                except Exception as e:
                     logger.error(
-                        f"[REAPER] Unblock sweep error: {e}", exc_info=True
+                        f"[REAPER] Task-wake delivery sweep error: {e}", exc_info=True
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // Mock the main agent runner so the handler's API + status helpers are stubbed,
 // while keeping the real strVal/sanitize implementations (we only override the
@@ -18,12 +18,7 @@ vi.mock('../index.js', async (importOriginal) => {
 // '../index.js' import to the mocked module. If '../index.js' is imported first,
 // the mock factory's importOriginal() eagerly loads the real index → handler
 // graph and caches a real-bound copy of this handler.
-import {
-  handleComputeExperiment,
-  classifyOutcome,
-  pollComputeJobUntilTerminal,
-  _setComputeExperimentSleepForTesting,
-} from './compute-experiment.js';
+import { handleComputeExperiment } from './compute-experiment.js';
 import { apiPost, apiGet, persistAndPostStatus } from '../index.js';
 import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -38,7 +33,7 @@ function jobResponse(fields: Record<string, unknown>): { data: Record<string, un
       task_id: 'task-1',
       backend: 'gcp',
       machine_type: 'e2-standard-8',
-      status: 'RUNNING',
+      status: 'QUEUED',
       accrued_cost_usd: 0.0,
       spend_cap_usd: 2.5,
       ...fields,
@@ -63,12 +58,6 @@ function lastCompletionPayload(): Record<string, unknown> {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // No real waiting between polls.
-  _setComputeExperimentSleepForTesting(() => Promise.resolve());
-});
-
-afterEach(() => {
-  _setComputeExperimentSleepForTesting(null);
 });
 
 // ── Registry wiring ──────────────────────────────────────────────────────────
@@ -88,89 +77,14 @@ describe('compute_experiment registration', () => {
   });
 });
 
-// ── classifyOutcome ──────────────────────────────────────────────────────────
-describe('classifyOutcome', () => {
-  it('SUCCESS → COMPLETED, intentional, not killed', () => {
-    expect(classifyOutcome('SUCCESS', 'SUCCEEDED')).toEqual({
-      taskStatus: 'COMPLETED', intentional: true, killedBy: null,
-    });
-  });
-
-  it('SPEND_CAP_EXCEEDED → COMPLETED, killed by budget (status FAILED is masked by outcome)', () => {
-    expect(classifyOutcome('SPEND_CAP_EXCEEDED', 'FAILED')).toEqual({
-      taskStatus: 'COMPLETED', intentional: true, killedBy: 'budget',
-    });
-  });
-
-  it('TIMED_OUT → COMPLETED, killed by deadline', () => {
-    expect(classifyOutcome('TIMED_OUT', 'TIMED_OUT')).toEqual({
-      taskStatus: 'COMPLETED', intentional: true, killedBy: 'deadline',
-    });
-  });
-
-  it('CANCELLED → COMPLETED, intentional', () => {
-    expect(classifyOutcome('CANCELLED', 'CANCELLED')).toEqual({
-      taskStatus: 'COMPLETED', intentional: true, killedBy: null,
-    });
-  });
-
-  it('FAILURE → FAILED, not intentional', () => {
-    expect(classifyOutcome('FAILURE', 'FAILED')).toEqual({
-      taskStatus: 'FAILED', intentional: false, killedBy: null,
-    });
-  });
-
-  it('falls back to status when outcome is empty (SUCCEEDED → COMPLETED)', () => {
-    expect(classifyOutcome('', 'SUCCEEDED').taskStatus).toBe('COMPLETED');
-  });
-
-  it('unknown terminal outcome → FAILED (never a silent success)', () => {
-    expect(classifyOutcome('WEIRD', 'WEIRD').taskStatus).toBe('FAILED');
-  });
-});
-
-// ── pollComputeJobUntilTerminal ──────────────────────────────────────────────
-describe('pollComputeJobUntilTerminal', () => {
-  it('polls until the job reaches a terminal state', async () => {
-    vi.mocked(apiGet)
-      .mockResolvedValueOnce(jobResponse({ status: 'STARTING' }))
-      .mockResolvedValueOnce(jobResponse({ status: 'RUNNING', accrued_cost_usd: 0.5 }))
-      .mockResolvedValueOnce(jobResponse({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.1 }));
-
-    const statusRef = { value: '' };
-    const result = await pollComputeJobUntilTerminal('job-123', null, statusRef, { pollIntervalMs: 1 });
-
-    expect(result.terminal).toBe(true);
-    expect(result.polls).toBe(3);
-    expect(vi.mocked(apiGet)).toHaveBeenCalledTimes(3);
-    expectCalledWith(apiGet, '/api/agent/compute-jobs/job-123');
-    expect(result.job?.outcome).toBe('SUCCESS');
-  });
-
-  it('stops with reason agent_deadline when the wait budget elapses before terminal', async () => {
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    const result = await pollComputeJobUntilTerminal('job-123', null, { value: '' }, {
-      pollIntervalMs: 1, maxWaitMs: 0,
-    });
-    expect(result.terminal).toBe(false);
-    expect(result.reason).toBe('agent_deadline');
-  });
-
-  it('gives up after repeated poll errors', async () => {
-    vi.mocked(apiGet).mockRejectedValue(new Error('network down'));
-    const result = await pollComputeJobUntilTerminal('job-123', null, { value: '' }, { pollIntervalMs: 1 });
-    expect(result.terminal).toBe(false);
-    expect(result.reason).toBe('poll_errors');
-  });
-});
-
-// ── handleComputeExperiment ──────────────────────────────────────────────────
+// ── handleComputeExperiment: launch → park ───────────────────────────────────
+// The agent no longer polls the job to terminal or builds the COMPUTE_RESULT
+// artifact — it launches the job and PARKS the task on a compute_job_terminal
+// wake. The backend monitor + wake worker finalize the task. So there is no
+// agent-side poll loop, no classifyOutcome, and no compute_monitor_failed mode.
 describe('handleComputeExperiment', () => {
-  it('launches the job, forwarding command/cap/deadline, then polls and completes on SUCCESS', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'STARTING' }));
-    vi.mocked(apiGet).mockResolvedValue(
-      jobResponse({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.23 }),
-    );
+  it('launches the job, then PARKS on the compute-job-terminal wake (no polling)', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'QUEUED' }));
 
     await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
 
@@ -182,60 +96,19 @@ describe('handleComputeExperiment', () => {
       machine_type: 'e2-standard-8',
     }));
 
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('COMPLETED');
-    expect(completion.artifact_type).toBe('COMPUTE_RESULT');
-    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
-    expect(result.outcome).toBe('SUCCESS');
-    expect(result.final_cost_usd).toBe(1.23);
-    expect(result.killed_by).toBeNull();
-    expect(result.intentional_terminal).toBe(true);
-    expect(result.experiment).toBe('perf-sweep-v1');
-    expect(result.job_id).toBe('job-123');
-  });
+    // The agent must NOT poll the job — that is the backend monitor's job now.
+    expect(vi.mocked(apiGet)).not.toHaveBeenCalled();
 
-  it('treats a budget kill as an intentional COMPLETED outcome, not a crash', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'FAILED', outcome: 'SPEND_CAP_EXCEEDED', final_cost_usd: 2.5,
-      terminal_reason: 'compute job terminated at spend cap',
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('COMPLETED');
-    expect(completion.failure_category).toBeUndefined();
-    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
-    expect(result.killed_by).toBe('budget');
-    expect(result.intentional_terminal).toBe(true);
-    expect(result.final_cost_usd).toBe(2.5);
-  });
-
-  it('treats a deadline kill as an intentional COMPLETED outcome', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'TIMED_OUT', outcome: 'TIMED_OUT', final_cost_usd: 0.9,
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('COMPLETED');
-    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
-    expect(result.killed_by).toBe('deadline');
-  });
-
-  it('fails the task on a genuine compute-command FAILURE', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({ status: 'FAILED', outcome: 'FAILURE' }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('FAILED');
-    expect(completion.failure_category).toBe('compute_job_failed');
-    expect(completion.artifact_type).toBe('COMPUTE_RESULT');
+    const park = lastCompletionPayload();
+    expect(park.status).toBe('PARKED');
+    const req = park.park_request as Record<string, unknown>;
+    expect(req.wake_source_kind).toBe('compute_job_terminal');
+    expect(req.wake_source_ref).toBe('job-123');
+    expect(req.wake_action).toBe('finalize');
+    // Park deadline outlasts the job's own deadline (600s) by the grace window.
+    expect(req.deadline_seconds).toBe(600 + 600);
+    expect((req.source_metadata as Record<string, unknown>).job_id).toBe('job-123');
+    expect((req.source_metadata as Record<string, unknown>).experiment).toBe('perf-sweep-v1');
   });
 
   it('fails fast WITHOUT launching when the spend cap is missing', async () => {
@@ -257,7 +130,7 @@ describe('handleComputeExperiment', () => {
     expect(lastCompletionPayload().status).toBe('FAILED');
   });
 
-  it('fails the task when the launch request throws', async () => {
+  it('fails the task (NOT parked) when the launch request throws', async () => {
     vi.mocked(apiPost).mockRejectedValue(new Error('422 unsupported_machine_type'));
     await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
 
@@ -265,96 +138,15 @@ describe('handleComputeExperiment', () => {
     const completion = lastCompletionPayload();
     expect(completion.status).toBe('FAILED');
     expect(completion.failure_category).toBe('compute_launch_failed');
+    expect(completion.status).not.toBe('PARKED');
   });
 
-  it('fails with compute_monitor_failed when the job never reaches a terminal state', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockRejectedValue(new Error('network down'));
-
+  it('fails the task (NOT parked) when the launch returns no job id', async () => {
+    vi.mocked(apiPost).mockResolvedValue({ data: { project_id: 'proj-1' } });
     await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
 
     const completion = lastCompletionPayload();
     expect(completion.status).toBe('FAILED');
-    expect(completion.failure_category).toBe('compute_monitor_failed');
-  });
-
-  it('forwards reported result metrics as top-level numeric keys in the COMPUTE_RESULT artifact', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'SUCCEEDED',
-      outcome: 'SUCCESS',
-      final_cost_usd: 1.0,
-      polling_metadata: {
-        result_metrics: { accuracy: 0.91, tokens_per_sec: 1234, ignored: 'nope' },
-      },
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const result = JSON.parse(lastCompletionPayload().logs as string) as Record<string, unknown>;
-    // Read by name at the top level — the contract the downstream gate relies on.
-    expect(result.accuracy).toBe(0.91);
-    expect(result.tokens_per_sec).toBe(1234);
-    // Non-numeric metric values are dropped.
-    expect(result.ignored).toBeUndefined();
-    // Existing job-level fields stay intact.
-    expect(result.final_cost_usd).toBe(1.0);
-    expect(result.outcome).toBe('SUCCESS');
-  });
-
-  it('forwards the durable artifact linkage (result_reference + artifact_id) and sets storage_uri', async () => {
-    const durableUri = 'gs://blueprint-agent-artifacts/compute-jobs/job-123/artifacts';
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'SUCCEEDED',
-      outcome: 'SUCCESS',
-      final_cost_usd: 1.0,
-      result_reference: durableUri,
-      artifact_id: 'artifact-xyz',
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const completion = lastCompletionPayload();
-    // The durable reference rides on the artifact's storage_uri so the
-    // task-completion/knowledge paths cite the stored result, not just the JSON.
-    expect(completion.storage_uri).toBe(durableUri);
-    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
-    expect(result.result_reference).toBe(durableUri);
-    expect(result.artifact_id).toBe('artifact-xyz');
-  });
-
-  it('omits storage_uri when the terminal job produced no durable artifact', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0,
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const completion = lastCompletionPayload();
-    expect(completion.storage_uri).toBeUndefined();
-    const result = JSON.parse(completion.logs as string) as Record<string, unknown>;
-    expect(result.result_reference).toBeNull();
-    expect(result.artifact_id).toBeNull();
-  });
-
-  it('does not let a metric colliding with a reserved key overwrite the job-level field', async () => {
-    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
-    vi.mocked(apiGet).mockResolvedValue(jobResponse({
-      status: 'SUCCEEDED',
-      outcome: 'SUCCESS',
-      final_cost_usd: 1.0,
-      polling_metadata: {
-        // 'final_cost_usd' collides with a reserved key; 'accuracy' does not.
-        result_metrics: { final_cost_usd: 999, accuracy: 0.5 },
-      },
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
-
-    const result = JSON.parse(lastCompletionPayload().logs as string) as Record<string, unknown>;
-    expect(result.final_cost_usd).toBe(1.0); // reserved field NOT overwritten
-    expect(result.accuracy).toBe(0.5);
+    expect(completion.failure_category).toBe('compute_launch_failed');
   });
 });
