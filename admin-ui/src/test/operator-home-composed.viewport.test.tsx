@@ -290,7 +290,13 @@ describe('operator home — composed viewport regression', () => {
               onBulkApprove={() => {}}
               onBulkRetry={() => {}}
             />
-            <DiagnosticsPanel diagnostics={diagnosticsData} onViewTask={() => {}} />
+            <DiagnosticsPanel
+              diagnostics={diagnosticsData}
+              onViewTask={() => {}}
+              handleRetry={() => {}}
+              handleCancel={() => {}}
+              setConfirmDialog={() => {}}
+            />
             {/* Home body panels — rendered beneath the chrome to cover the highest-traffic landing page */}
             <DashboardHome
               tasks={[]}

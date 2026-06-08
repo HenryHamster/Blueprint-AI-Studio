@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore } from 'lucide-react';
+import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore, Ban } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge, isProjectActive } from '../utils/projectStatus';
@@ -7,7 +7,7 @@ import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
-import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
+import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, cancelProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
 import type { Project } from '../types/project';
@@ -28,6 +28,9 @@ interface ProjectDashboardProps {
   /** Called after a project is successfully reset, so the parent can refetch
    *  the project + task lists (the project row survives; its tasks are wiped). */
   onProjectReset?: (projectId: string) => void;
+  /** Called after a project is successfully cancelled, so the parent can
+   *  refetch the project + task lists and surface CANCELLED immediately. */
+  onProjectCancelled?: (projectId: string) => void;
   /** Called after a project's pause state is successfully toggled, so the parent
    *  can refetch the project list and reflect the new paused flag. */
   onProjectPaused?: (projectId: string) => void;
@@ -127,7 +130,7 @@ function getMergeGateBadge(project: Project) {
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectCancelled, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -143,6 +146,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
   const [confirmingResetId, setConfirmingResetId] = useState<string | null>(null);
   const [resettingId, setResettingId] = useState<string | null>(null);
   const [resetError, setResetError] = useState<string | null>(null);
+  const [confirmingCancelId, setConfirmingCancelId] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   // Per-project pause/resume affordance state. Pause is reversible, so it is a
   // direct menu action (no destructive confirmation panel); only in-flight and
   // error state are tracked, keyed by project id.
@@ -166,6 +172,8 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
     setDeleteError(null);
     setConfirmingResetId(null);
     setResetError(null);
+    setConfirmingCancelId(null);
+    setCancelError(null);
     setPauseError(null);
     setConfirmingArchiveId(null);
     setArchiveError(null);
@@ -252,6 +260,21 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
       setResettingId(null);
     }
   };
+
+  const handleCancelProject = async (projectId: string) => {
+    setCancellingId(projectId);
+    setCancelError(null);
+    try {
+      await cancelProject(projectId);
+      closeProjectActions();
+      onProjectCancelled?.(projectId);
+    } catch (e) {
+      setCancelError(e instanceof Error ? e.message : 'Failed to cancel project');
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
   const handleTogglePaused = async (projectId: string, nextPaused: boolean) => {
     setPausingId(projectId);
     setPauseError(null);
@@ -502,6 +525,8 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                           setConfirmingId(null);
                           setDeleteError(null);
                           setPauseError(null);
+                          setConfirmingCancelId(null);
+                          setCancelError(null);
                         }}
                         className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
                         title="Project actions"
@@ -514,7 +539,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </div>
                 </div>
 
-                {menuOpenId === project.id && confirmingId !== project.id && confirmingResetId !== project.id && confirmingArchiveId !== project.id && (
+                {menuOpenId === project.id && confirmingId !== project.id && confirmingResetId !== project.id && confirmingArchiveId !== project.id && confirmingCancelId !== project.id && (
                   <div className="mb-2 rounded-lg border border-neutral-800 bg-neutral-900/80 p-1">
                     <button
                       onClick={(e) => { e.stopPropagation(); void handleTogglePaused(project.id, !project.paused); }}
@@ -551,6 +576,14 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     >
                       <RotateCcw className="w-3.5 h-3.5 shrink-0" />
                       Reset to clean
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setConfirmingCancelId(project.id); setCancelError(null); }}
+                      className="w-full flex items-center gap-2 min-h-[44px] px-2 rounded text-[11px] text-red-300 hover:bg-red-500/10 transition-colors text-left"
+                      title="Cancel project"
+                    >
+                      <Ban className="w-3.5 h-3.5 shrink-0" />
+                      Cancel project
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); setConfirmingId(project.id); setDeleteError(null); }}
@@ -638,6 +671,42 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                         disabled={resettingId === project.id}
                         className="flex-1 min-h-[44px] flex items-center justify-center rounded bg-neutral-800 text-neutral-300 hover:bg-neutral-700 text-[11px] font-semibold transition-colors disabled:opacity-50"
                         title="Cancel reset"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {confirmingCancelId === project.id && (
+                  <div className="mb-2 rounded-lg border border-red-500/30 bg-red-950/30 p-2" data-viewport-allow-truncation>
+                    <div className="flex items-start gap-1.5 mb-2">
+                      <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                      <p className="text-[11px] text-red-200 leading-snug">
+                        Cancel <span className="font-semibold">{project.name}</span>?
+                        This is terminal and will stop all active tasks, tear down their VMs, and keep the project record for audit/history.
+                      </p>
+                    </div>
+                    {cancelError && (
+                      <p className="text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words">
+                        {cancelError}
+                      </p>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); void handleCancelProject(project.id); }}
+                        disabled={cancellingId === project.id}
+                        className="flex-1 min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold transition-colors disabled:opacity-50"
+                        title="Confirm cancel"
+                      >
+                        <Ban className="w-3.5 h-3.5" />
+                        {cancellingId === project.id ? 'Cancelling…' : 'Cancel project'}
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); closeProjectActions(); }}
+                        disabled={cancellingId === project.id}
+                        className="flex-1 min-h-[44px] flex items-center justify-center rounded bg-neutral-800 text-neutral-300 hover:bg-neutral-700 text-[11px] font-semibold transition-colors disabled:opacity-50"
+                        title="Close cancel confirmation"
                       >
                         Cancel
                       </button>

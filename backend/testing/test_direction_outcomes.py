@@ -395,8 +395,6 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
     entry = project.directions[0]["research_history"][0]
     assert entry["prs_merged"] == 2
     assert entry["prs_rejected"] == 1
-    # conversion_rate = 2 merged / 4 tasks_created
-    assert entry["conversion_rate"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -454,7 +452,6 @@ async def test_generalized_success_gates_on_reproduce_verdict(db_session: AsyncS
     # Both merged PRs still count as shipped code (merge-rate metrics unchanged).
     assert entry["prs_merged"] == 2
     assert entry["verified_prs_merged"] == 2
-    assert entry["conversion_rate"] == 1.0
     # ...but only the reproduced defect is a proven-fix generalized success.
     assert entry["generalized_successes"] == 1
     code_merge = entry["outcome_kind_breakdown"]["code_merge"]
@@ -503,12 +500,11 @@ async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
     assert entry["prs_merged"] == 1
-    assert entry["conversion_rate"] == 0.5
 
 
 @pytest.mark.asyncio
 async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
-    """conversion_rate is None when tasks_created is 0."""
+    """verified_prs_merged is computed correctly even when tasks_created is 0."""
     direction_id = "d-zerodiv"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
@@ -538,7 +534,9 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    assert entry["conversion_rate"] is None
+    # Even with tasks_created=0, the merge still counts in verified_prs_merged.
+    assert entry["verified_prs_merged"] == 1
+    assert entry["tasks_created"] == 0
 
 
 def test_verified_merged_count_helper():
@@ -633,9 +631,8 @@ async def test_conversion_rate_excludes_degraded_unverified_merge(
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
     assert entry["prs_merged"] == 3
+    # Verification-aware: 2 (verified + benign) out of 3 created.
     assert entry["verified_prs_merged"] == 2
-    # Verification-aware: 2 (verified + benign) / 3 created, NOT 3/3.
-    assert entry["conversion_rate"] == round(2 / 3, 3)
 
 
 @pytest.mark.asyncio
@@ -702,7 +699,6 @@ async def test_verified_merged_excludes_declared_unsatisfied_acceptance(
     assert entry["prs_merged"] == 3
     # Only the no-key + satisfied merges are verified; the unsatisfied one drops.
     assert entry["verified_prs_merged"] == 2
-    assert entry["conversion_rate"] == round(2 / 3, 3)
 
 
 @pytest.mark.asyncio
@@ -791,7 +787,6 @@ async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
     assert entry["prs_merged"] == 5
     # Clean + undeclared merges survive; degraded and unsatisfied rows do not.
     assert entry["verified_prs_merged"] == 2
-    assert entry["conversion_rate"] == round(2 / 5, 3)
 
 
 def test_churn_metrics_excludes_degraded_unverified_merges():
@@ -4247,7 +4242,6 @@ async def test_generalized_health_non_code_portfolio(db_session: AsyncSession):
 
     # Existing merge metrics are intact and honestly zero (no PR-merging task).
     assert entry["prs_merged"] == 0
-    assert entry["conversion_rate"] == 0.0
     # Generalized signal: all three read-only successes counted.
     assert entry["generalized_successes"] == 3
     assert entry["generalized_health_rate"] == 1.0
@@ -4297,7 +4291,6 @@ async def test_generalized_health_code_only_unchanged(db_session: AsyncSession):
     entry = project.directions[0]["research_history"][0]
 
     assert entry["prs_merged"] == 1
-    assert entry["conversion_rate"] == 0.5
     # One code merge → one generalized success of kind code_merge.
     assert entry["generalized_successes"] == 1
     assert entry["outcome_kind_breakdown"]["code_merge"]["success"] == 1
@@ -4421,6 +4414,53 @@ async def test_verified_prs_merged_excludes_degraded(db_session: AsyncSession):
     assert entry["prs_merged"] == 3
     # Only verified + benign count as verified merges (degraded excluded).
     assert entry["verified_prs_merged"] == 2
+
+
+@pytest.mark.asyncio
+async def test_verified_write_merged_excludes_malformed_acceptance(
+    db_session: AsyncSession,
+):
+    """A malformed recorded verdict stays out of both verified slices.
+
+    This keeps acceptance_verified_write_merged from outrunning verified_prs_merged
+    and preserves the invariant guard for write merges with broken verdict shapes.
+    """
+    direction_id = "d-malformed-accept"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"kind": "named_test"},
+        },
+        title="malformed-acceptance",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 1
+    assert entry["verified_prs_merged"] == 0
+    assert entry["acceptance_verified_write_merged"] == 0
+    assert acceptance_metric_invariant_violations(entry) == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4568,13 +4608,14 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
     """The honest proven-by-evidence + declaration-coverage aggregates.
 
     Exercises the additive aggregation in ``_update_direction_research_outcomes``:
-    only a satisfied named_test merge (machine-checked, ``proven=True``) counts
-    toward ``acceptance_proven_merged``; an undeclared merge and a soft
-    observable_behavior merge (satisfied by a shipped diff only) are EXCLUDED
-    from proven, and ``acceptance_declaration_coverage`` counts declared vs
-    undeclared merged WRITE tasks. The existing ``verified_prs_merged`` /
-    ``conversion_rate`` values must stay unchanged (they still credit soft and
-    undeclared merges) — proven is strictly additive, not a redefinition.
+    only a machine-proven merge counts toward ``acceptance_proven_merged`` — either
+    a satisfied ``named_test`` (machine-checked) or a satisfied ``downstream_artifact``
+    that was consumed (recorded downstream-artifact consumption); an undeclared merge
+    and a soft ``observable_behavior`` merge (satisfied by a shipped diff only) are
+    EXCLUDED from proven. ``acceptance_declaration_coverage`` counts declared vs
+    undeclared merged WRITE tasks. The existing ``verified_prs_merged`` values must
+    stay unchanged (they still credit soft and undeclared merges) — proven is strictly
+    additive, not a redefinition.
     """
     direction_id = "d-proven"
     project = await _create_project(db_session, directions=[])
@@ -4614,7 +4655,7 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
         title="soft-behavior",
     )
     # (3) Proven merge: machine-checked named_test → declared=True, proven=True.
-    # The ONLY row that counts toward acceptance_proven_merged.
+    # One of two paths to proven; the other is a consumed downstream_artifact.
     await _create_child_task(
         db_session,
         research_task.id,
@@ -4678,14 +4719,13 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
     entry = project.directions[0]["research_history"][0]
 
     # Existing counts are UNCHANGED: all 5 merged; verified excludes only the
-    # unsatisfied named_test (4). conversion_rate stays verified/created.
+    # unsatisfied named_test (4).
     assert entry["prs_merged"] == 5
     assert entry["verified_prs_merged"] == 4
-    assert entry["conversion_rate"] == round(4 / 4, 3)
 
-    # New additive proven-by-evidence signal: only the WRITE named_test proven
-    # merge counts — undeclared, soft behavior, and unsatisfied are all excluded,
-    # and the non-WRITE review row is excluded despite its proven verdict.
+    # New additive proven-by-evidence signal: only WRITE proven merges count
+    # (named_test or consumed downstream_artifact) — undeclared, soft behavior,
+    # unsatisfied, and the non-WRITE review row are all excluded.
     assert entry["acceptance_proven_merged"] == 1
     # Declaration coverage over the 4 merged WRITE tasks: 3 declared
     # (behavior, proven named_test, unsatisfied named_test), 1 undeclared.

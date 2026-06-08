@@ -114,6 +114,10 @@ async def _resolve_terminal_parent_verdict(
             TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS,
             TaskStatus.EVALUATING,
+            # PARKED children are non-terminal — the wake worker will return them
+            # to QUEUED when their source fires; treat as active so a parent with
+            # only parked children is not prematurely resolved as failed/terminal.
+            TaskStatus.PARKED,
         )
         for c in children
     )
@@ -772,6 +776,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 TaskStatus.PROVISIONING,
                 TaskStatus.IN_PROGRESS,
                 TaskStatus.EVALUATING,
+                # PARKED children are non-terminal; keep the parent alive so the
+                # wake delivery can advance them rather than marking parent FAILED.
+                TaskStatus.PARKED,
             )
             for c in children
         )

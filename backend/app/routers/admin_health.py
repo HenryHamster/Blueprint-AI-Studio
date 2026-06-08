@@ -3,7 +3,7 @@
 import time
 import uuid
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -39,6 +39,7 @@ from app.shared_state import (
 )
 import app.shared_state as _shared_state
 from app.compute import get_zone_health_summary
+from app.fleet_utilization import get_fleet_utilization_snapshot
 from app.pipeline_health import compute_pipeline_health_summary
 from app.routers.admin_debug import _build_stuck_tasks
 
@@ -1241,6 +1242,58 @@ async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
         return snap
     except Exception:
         return {}
+
+
+def _derive_saturation(
+    util_avg: Optional[float],
+    util_now: Optional[float],
+) -> Optional[str]:
+    """Derive a saturation label from utilization ratios.
+
+    Thresholds (kept here — the only place — so backend tests can pin them):
+      util_avg < 0.70  → "healthy"   (clear headroom on the trailing average)
+      util_avg < 0.90  → "busy"      (elevated but not saturated)
+      util_avg >= 0.90 → "saturated" (fleet running near-full on the average)
+
+    When util_avg is None (no enabled accounts / no DB session), returns None
+    so callers can render an explicit "unknown" state instead of dividing by zero.
+    util_now is accepted for signature completeness but is not used in the
+    threshold decision — the trailing average is the chronic-headroom signal.
+    """
+    if util_avg is None:
+        return None
+    if util_avg < 0.70:
+        return "healthy"
+    if util_avg < 0.90:
+        return "busy"
+    return "saturated"
+
+
+@router.get("/fleet-utilization")
+async def get_fleet_utilization(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+    cache: DigestCache = Depends(get_digest_cache),
+) -> Dict[str, Any]:
+    """Snapshot of global fleet slot utilization for the operator dashboard.
+
+    Wraps ``get_fleet_utilization_snapshot`` in a TTL cache with in-flight
+    dedup so concurrent admin UI polls (every ~30s) do not re-run the bounded
+    DB scan per request. Cache key is system-wide; response does not vary per
+    user. Returns all snapshot fields plus a derived ``saturation`` label.
+    """
+    cache_key = ("fleet-utilization",)
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_fleet_utilization(session=session),
+    )
+
+
+async def _compute_fleet_utilization(*, session: AsyncSession) -> Dict[str, Any]:
+    """Compute the fleet-utilization payload (cached by caller)."""
+    snapshot = await get_fleet_utilization_snapshot(session)
+    saturation = _derive_saturation(snapshot.get("util_avg"), snapshot.get("util_now"))
+    return {**snapshot, "saturation": saturation}
 
 
 @router.get("/pr-behind-detector-stats")

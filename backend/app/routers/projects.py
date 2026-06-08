@@ -50,6 +50,9 @@ _AGENT_WS_TERMINAL_STATUSES = (
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
     TaskStatus.BLOCKED,
+    # PARKED releases the agent VM/JWT immediately (like BLOCKED), so the agent
+    # websocket should close — there is no live agent to relay to.
+    TaskStatus.PARKED,
 )
 
 
@@ -653,7 +656,10 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
         from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
 
-        if str(task.id) in _terminated_task_ids or task.status in _AGENT_WS_TERMINAL_STATUSES:
+        if (
+            str(task.id) in _terminated_task_ids
+            or task.status in _AGENT_WS_TERMINAL_STATUSES
+        ):
             _log_agent_auth_reject(
                 "ws_task_terminal",
                 path=path,
@@ -929,6 +935,10 @@ async def cancel_project(
                 TaskStatus.PROVISIONING,
                 TaskStatus.IN_PROGRESS,
                 TaskStatus.EVALUATING,
+                # PARKED tasks are non-terminal and must be torn down on project
+                # cancel rather than left waiting on a wake source that the
+                # cancelled project will never fire.
+                TaskStatus.PARKED,
             ]
         ),
     )
@@ -996,6 +1006,9 @@ async def get_project_status(
         TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
+        # PARKED is in-flight work waiting on an external wake source — surface
+        # it as active so operators see parked tasks rather than losing them.
+        TaskStatus.PARKED,
     ]
     tasks_stmt = (
         select(Task)

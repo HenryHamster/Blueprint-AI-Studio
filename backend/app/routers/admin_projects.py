@@ -709,6 +709,10 @@ async def delete_project_admin(
         TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
+        # PARKED is live work waiting on an external wake — count it as active so
+        # a non-force delete is refused while one exists, and a force delete
+        # cancels it (its wake registration cascade-deletes with the task).
+        TaskStatus.PARKED,
     ]
     # Bounded load: used for the existence check and per-task VM cleanup.
     # The bulk UPDATE below covers all matching rows regardless of this cap.
@@ -845,6 +849,9 @@ async def reset_project_admin(
         TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
+        # PARKED is live work waiting on an external wake — cancel it on reset so
+        # the wake worker can't later wake a task into a reset project.
+        TaskStatus.PARKED,
     ]
     # Bounded load for per-task VM cleanup; the bulk UPDATE below covers all
     # matching rows regardless of this cap.

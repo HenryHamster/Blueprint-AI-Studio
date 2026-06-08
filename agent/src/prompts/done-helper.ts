@@ -378,7 +378,8 @@ if [ -s "$CONSUMED_ARTIFACTS_FILE" ]; then
   if jq -e 'type == "array"' "$CONSUMED_ARTIFACTS_FILE" >/dev/null 2>&1; then
     CONSUMED_ARTIFACTS_JSON=$(jq '[.[] | select(type == "string" and length > 0)] | unique' "$CONSUMED_ARTIFACTS_FILE")
   else
-    echo "[done] /tmp/consumed_artifacts_${cfg.taskId}.json exists but is not a JSON array — skipping consumed_artifact_ids" >&2
+    echo "[done] /tmp/consumed_artifacts_${cfg.taskId}.json exists but is not a JSON array — reporting empty consumed_artifact_ids" >&2
+    CONSUMED_ARTIFACTS_JSON="[]"
   fi
 fi
 

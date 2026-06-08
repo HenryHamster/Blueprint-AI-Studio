@@ -26,7 +26,17 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 from app.migration_reservations import allocate_migration_reservation
-from app.models import Project, Task, TaskStatus, ArtifactType, Alert, AlertSeverity
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    ArtifactType,
+    Alert,
+    AlertSeverity,
+    TaskWakeRegistration,
+    WakeAction,
+    WakeDeliveryState,
+)
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
@@ -39,7 +49,12 @@ from app.task_lifecycle import (
     _record_parent_failure,
     _is_transient_scan_error,
     _resolve_fallback_verdict,
+    park_task,
+    fire_task_wakes,
+    deliver_wake,
 )
+from app.reaper_sweeps import sweep_deliver_task_wakes
+from app.time_utils import _utcnow
 from app.retry_prompt import (
     _extract_failing_tests,
     _extract_error_files,
@@ -88,7 +103,9 @@ async def tl_db(mocker):
     # Suppress broadcast calls
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     # Suppress failure alert creation (deferred import from app.main)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     async with _Session() as session:
         yield session, _Session
@@ -1220,7 +1237,9 @@ async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, 
     assert parent.status == TaskStatus.EVALUATING
     assert parent.context.get("_requeue_count") == 0
     assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
-    assert "blocked on upstream precondition" not in (parent.latest_status_message or "")
+    assert "blocked on upstream precondition" not in (
+        parent.latest_status_message or ""
+    )
     assert precondition_alert.await_count == 0
     precondition_alert.assert_not_awaited()
     alerts = (
@@ -1236,6 +1255,60 @@ async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, 
         .all()
     )
     assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_waits_when_child_is_parked(tl_db, mocker):
+    """A parent whose only non-terminal child is PARKED must not be resolved as
+    failed.  The shared terminal-verdict helper treats PARKED as active so the
+    parent stays EVALUATING until the wake delivery advances the parked child."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    # PARKED child — non-terminal, waiting on an external signal.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.PARKED,
+        parent_task_id=parent.id,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    # PARKED is active — the parent must not be marked FAILED or COMPLETED.
+    assert parent.status not in (TaskStatus.FAILED, TaskStatus.COMPLETED)
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_waits_when_completed_sibling_has_parked_sibling(
+    tl_db, mocker
+):
+    """A completed child alongside a PARKED sibling must not prematurely collapse
+    the parent.  has_active_children must return True for the PARKED child so the
+    parent remains in EVALUATING waiting for the wake delivery."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.PARKED,
+        parent_task_id=parent.id,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status not in (TaskStatus.FAILED, TaskStatus.COMPLETED)
 
 
 @pytest.mark.asyncio
@@ -1360,9 +1433,7 @@ async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
     failure_alert = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
-    record_failure = mocker.patch(
-        "app.task_lifecycle_requeue._record_parent_failure"
-    )
+    record_failure = mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
@@ -1397,16 +1468,12 @@ async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(
-    tl_db, mocker
-):
+async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(tl_db, mocker):
     """All non-genuine-cancel taxonomy classes together (cascade, superseded,
     pr_closed_non_rejection, cap_exhausted_after_approve, REASSIGNED, SCOPE_EMPTY)
     with nothing else → parent FAILED, no direction-health ding."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    record_failure = mocker.patch(
-        "app.task_lifecycle_requeue._record_parent_failure"
-    )
+    record_failure = mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
@@ -1416,7 +1483,10 @@ async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(
         context={"_requeue_count": 0},
     )
     non_genuine_specs = [
-        ({"_replaced_by_task_id": str(uuid.uuid4())}, "Parent requeued — replaced by retry"),
+        (
+            {"_replaced_by_task_id": str(uuid.uuid4())},
+            "Parent requeued — replaced by retry",
+        ),
         ({}, "Superseded by task abc123"),
         ({"failure_detail": "pr_closed_non_rejection"}, "PR closed without rejection"),
         ({"failure_detail": "cap_exhausted_after_approve"}, "Capped after approval"),
@@ -1438,7 +1508,9 @@ async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(
     assert result == 0
     await session.refresh(parent)
     assert parent.status == TaskStatus.FAILED
-    assert "All 6 subtask(s) superseded/cancelled" in (parent.latest_status_message or "")
+    assert "All 6 subtask(s) superseded/cancelled" in (
+        parent.latest_status_message or ""
+    )
     assert parent.context.get("failure_category") == "SCOPE_EMPTY"
     record_failure.assert_not_called()
 
@@ -1449,9 +1521,7 @@ async def test_requeue_limit_all_non_genuine_cancelled_terminates_failed(tl_db, 
     non-genuine cancel terminates FAILED (kept in lockstep with the
     all-children-terminal path) without a direction-health ding."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    record_failure = mocker.patch(
-        "app.task_lifecycle_requeue._record_parent_failure"
-    )
+    record_failure = mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
@@ -3085,9 +3155,7 @@ async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
     "task_type,expected_phase",
     [("design_doc_update", 1), ("strategic_review", 2)],
 )
-@pytest.mark.parametrize(
-    "status", [TaskStatus.FAILED, TaskStatus.CANCELLED]
-)
+@pytest.mark.parametrize("status", [TaskStatus.FAILED, TaskStatus.CANCELLED])
 async def test_process_post_commit_emits_cycle_completed_on_terminal_strategic(
     tl_db, mocker, task_type, expected_phase, status
 ):
@@ -3097,9 +3165,7 @@ async def test_process_post_commit_emits_cycle_completed_on_terminal_strategic(
     indicator (review iter-1 MAJOR, task_lifecycle.py:4006)."""
     session, factory = tl_db
     project = await _make_project(session)
-    task = await _make_task(
-        session, project.id, task_type=task_type, status=status
-    )
+    task = await _make_task(session, project.id, task_type=task_type, status=status)
     emit = AsyncMock()
     mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
 
@@ -3184,8 +3250,10 @@ async def test_process_post_commit_transient_handler_failure_requeues_after_roll
     # Re-fetch from a brand-new session to assert what actually persisted.
     async with factory() as verify_session:
         refetched = (
-            await verify_session.execute(select(Task).where(Task.id == task.id))
-        ).scalars().first()
+            (await verify_session.execute(select(Task).where(Task.id == task.id)))
+            .scalars()
+            .first()
+        )
         children = (
             (
                 await verify_session.execute(
@@ -3239,8 +3307,10 @@ async def test_process_post_commit_nontransient_handler_failure_fails_persisted(
 
     async with factory() as verify_session:
         refetched = (
-            await verify_session.execute(select(Task).where(Task.id == task.id))
-        ).scalars().first()
+            (await verify_session.execute(select(Task).where(Task.id == task.id)))
+            .scalars()
+            .first()
+        )
 
     assert refetched is not None
     assert refetched.status == TaskStatus.FAILED
@@ -3279,9 +3349,7 @@ def _poison_session_factory(project_id):
 
 
 @pytest.mark.asyncio
-async def test_process_post_commit_rollup_poison_recovers_and_completes(
-    tl_db, mocker
-):
+async def test_process_post_commit_rollup_poison_recovers_and_completes(tl_db, mocker):
     """Burst-2 regression (prod 2026-06-07 01:05): a lock-timeout inside the
     rollup trigger (_spawn_pipeline_task's spawn commit) left the post-commit
     session in pending-rollback; the rollup except block then read ``task.id``
@@ -3363,9 +3431,7 @@ async def test_process_post_commit_rollup_poison_recovers_and_completes(
 
 
 @pytest.mark.asyncio
-async def test_process_post_commit_handler_genuine_poison_still_requeues(
-    tl_db, mocker
-):
+async def test_process_post_commit_handler_genuine_poison_still_requeues(tl_db, mocker):
     """Burst-1 cascade class (prod 2026-06-07 00:56): a completion handler
     that dies with the transaction GENUINELY aborted (failed commit inside the
     handler) must still reach the transient-requeue recovery — rollback first,
@@ -3558,9 +3624,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         captured_spawn_kwargs.append(kwargs)
         return (None, False)
 
-    mocker.patch(
-        "app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn
-    )
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     # APPROVE-path merge cluster (only exercised when the verdict flips to
     # APPROVE on a verification-only + green-CI PR). Harmless for the
     # still-blocks scenarios, which take the REQUEST_CHANGES fix-spawn branch
@@ -3572,9 +3636,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
     )
     mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
-    mocker.patch(
-        "app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock
-    )
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -3626,9 +3688,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
             "details": [],
         }
 
-    mocker.patch(
-        "app.github.get_check_runs_cached", side_effect=_check_runs_router
-    )
+    mocker.patch("app.github.get_check_runs_cached", side_effect=_check_runs_router)
 
     session, factory = tl_db
     project = await _make_project(session)
@@ -4145,9 +4205,7 @@ def _patch_dual_head_collision(mocker):
     """Make the inline guard see a same-revision dual-head collision."""
     mocker.patch(
         "app.github.get_pr_files",
-        AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]
-        ),
+        AsyncMock(return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]),
     )
     mocker.patch(
         "app.github.get_pull_request_diff",
@@ -4329,9 +4387,7 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
         return_value=("tok", "owner", "repo"),
     )
     # Force the auto_approve_small gate open.
-    mocker.patch(
-        "app.direction_metrics._compute_acceptance_rate", return_value=0.9
-    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
         "app.task_lifecycle.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
@@ -4339,7 +4395,12 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     _patch_dual_head_collision(mocker)
     merge_mock = mocker.patch(
@@ -4411,7 +4472,12 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     merge_mock = mocker.patch(
         "app.task_lifecycle._merge_with_retry",
@@ -4486,7 +4552,12 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     merge_mock = mocker.patch(
         "app.task_lifecycle._merge_with_retry",
@@ -4539,9 +4610,10 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
     assert finalization["finalized_revision"] == "0152"
     finalization_mock.assert_awaited_once()
     assert finalization_mock.await_args.kwargs["promotion_target"] == "main"
-    assert "auto-finalized provisional alembic migration" in (
-        task.latest_status_message or ""
-    ).lower()
+    assert (
+        "auto-finalized provisional alembic migration"
+        in (task.latest_status_message or "").lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -4571,7 +4643,12 @@ async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -6192,9 +6269,7 @@ def _top_level_defs_in_file(path: str) -> dict:
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     found.setdefault(target.id, "assignment")
-        elif isinstance(node, ast.AnnAssign) and isinstance(
-            node.target, ast.Name
-        ):
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             found.setdefault(node.target.id, "assignment")
     return found
 
@@ -6524,17 +6599,19 @@ async def test_post_commit_failed_safeguard_releases_merge_gate(tl_db, mocker):
     # Re-fetch the orig from a fresh session to assert the gate was released.
     async with factory() as verify_session:
         refetched_orig = (
-            await verify_session.execute(select(Task).where(Task.id == orig.id))
-        ).scalars().first()
+            (await verify_session.execute(select(Task).where(Task.id == orig.id)))
+            .scalars()
+            .first()
+        )
 
     assert refetched_orig is not None
     assert refetched_orig.requires_approval is False, (
         "FAILED safeguard must release the merge gate, not strand it forever"
     )
     # EVALUATING orig is re-armed for the CI loop (ci_waiting handoff).
-    assert (
-        (refetched_orig.context or {}).get("review_loop", {}).get("ci_waiting") is True
-    )
+    assert (refetched_orig.context or {}).get("review_loop", {}).get(
+        "ci_waiting"
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -6609,9 +6686,7 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
             "scope": "small",
             "direction_id": "d-docs-1",
             "_pr_changed_files": ["docs/readme.md"],
-            "_pr_diff_summary": [
-                {"file": "docs/readme.md", "added": 5, "removed": 1}
-            ],
+            "_pr_diff_summary": [{"file": "docs/readme.md", "added": 5, "removed": 1}],
         },
     )
     # base_branch=main → not a staging branch → is_intermediate is False, so the
@@ -6671,9 +6746,7 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
         review_calls.append(ptype)
         return (None, False)
 
-    mocker.patch(
-        "app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn
-    )
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
 
     payload = AgentStatusPayload(
         task_id=task.id,
@@ -6731,7 +6804,7 @@ class TestResolveFallbackVerdict:
     def test_prose_discussing_approval_then_requesting_changes(self):
         text = (
             "We discussed whether to approve. Final call below.\n"
-            'VERDICT: REQUEST_CHANGES\n'
+            "VERDICT: REQUEST_CHANGES\n"
         )
         assert _resolve_fallback_verdict(text) == "REQUEST_CHANGES"
 
@@ -6759,9 +6832,7 @@ class TestResolveFallbackVerdict:
     # ---- structured REQUEST_CHANGES and precedence ---------------------------
 
     def test_quoted_request_changes(self):
-        assert (
-            _resolve_fallback_verdict('"REQUEST_CHANGES"') == "REQUEST_CHANGES"
-        )
+        assert _resolve_fallback_verdict('"REQUEST_CHANGES"') == "REQUEST_CHANGES"
 
     def test_standalone_request_changes_with_space(self):
         assert _resolve_fallback_verdict("REQUEST CHANGES") == "REQUEST_CHANGES"
@@ -6934,7 +7005,9 @@ async def test_grader_resume_security_audit_pass_spawns_from_dict_plan_output(
         .scalars()
         .all()
     )
-    assert len(children) == 1, "PASS grade must spawn the fix child from stored findings"
+    assert len(children) == 1, (
+        "PASS grade must spawn the fix child from stored findings"
+    )
     await session.refresh(source)
     assert source.status == TaskStatus.EVALUATING
     assert (source.context or {}).get("quality_grader", {}).get("passed") is True
@@ -6970,3 +7043,416 @@ async def test_grader_resume_security_audit_fail_spawns_nothing_and_fails(
     await session.refresh(source)
     assert source.status == TaskStatus.FAILED
     assert (source.context or {}).get("evaluation_gate", {}).get("passed") is False
+
+
+@pytest.mark.asyncio
+async def test_external_park_wake_delivery_is_exactly_once(tl_db):
+    """Park a task on an external wake source, fire it, then run the leader-owned
+    wake-delivery worker TWICE — the parked task must advance EXACTLY ONCE.
+
+    Exercises the full park-and-wake seam end to end against real production
+    code: ``park_task`` (release slot/VM + durable registration), the firing side
+    ``fire_task_wakes`` (PENDING -> FIRED), and the worker
+    ``sweep_deliver_task_wakes`` (claim FIRED rows -> ``deliver_wake`` advances
+    the task once). A second worker pass must be a no-op: the task stays QUEUED,
+    the registration stays DELIVERED, its ``delivered_at`` is unchanged, and it
+    was delivered exactly once (``attempt_count == 1``).
+    """
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    # --- Park the task on the compute-job-terminal source. -------------------
+    reg = await park_task(
+        session,
+        task,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref="job-abc",
+        source_metadata={"compute_job_id": "job-abc"},
+        wake_action=WakeAction.RESUME,
+        reason="waiting on compute job job-abc",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(reg)
+
+    # Parking releases the slot/VM and stamps operator-visible metadata, and is
+    # distinguishable from BLOCKED / EVALUATING by the PARKED status itself.
+    assert task.status == TaskStatus.PARKED
+    assert task.parked_at is not None
+    assert task.park_reason == "waiting on compute job job-abc"
+    assert task.vm_stopped_at is not None
+    assert reg.delivery_state == WakeDeliveryState.PENDING
+    assert reg.wake_action == WakeAction.RESUME
+
+    # --- Worker before the source fires: nothing to deliver. ----------------
+    delivered_pre = await sweep_deliver_task_wakes(session, _utcnow())
+    await session.refresh(task)
+    await session.refresh(reg)
+    assert delivered_pre == 0
+    assert task.status == TaskStatus.PARKED
+    assert reg.delivery_state == WakeDeliveryState.PENDING
+
+    # --- Source fires: PENDING -> FIRED. ------------------------------------
+    fired = await fire_task_wakes(
+        session,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref="job-abc",
+    )
+    await session.commit()
+    await session.refresh(reg)
+    assert fired == 1
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+    assert reg.fired_at is not None
+
+    # --- Worker pass #1: delivers exactly once. -----------------------------
+    delivered_1 = await sweep_deliver_task_wakes(session, _utcnow())
+    await session.refresh(task)
+    await session.refresh(reg)
+    assert delivered_1 == 1
+    assert task.status == TaskStatus.QUEUED  # RESUME re-queues for dispatch
+    assert task.parked_at is None
+    assert task.vm_instance_id is None
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.result_state == "resumed"
+    assert reg.attempt_count == 1
+    first_delivered_at = reg.delivered_at
+    assert first_delivered_at is not None
+
+    # --- Worker pass #2: strict no-op (exactly-once). -----------------------
+    delivered_2 = await sweep_deliver_task_wakes(session, _utcnow())
+    await session.refresh(task)
+    await session.refresh(reg)
+    assert delivered_2 == 0
+    assert task.status == TaskStatus.QUEUED  # NOT re-advanced
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at  # unchanged — delivered once
+    assert reg.attempt_count == 1  # the FIRED filter never re-selected it
+
+    # Exactly one delivered registration exists for the task.
+    delivered_rows = (
+        (
+            await session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.task_id == task.id,
+                    TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(delivered_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_delivery_commit_contract_is_truthful(tl_db, mocker):
+    """deliver_wake on a compute-FINALIZE registration uses the caller's single
+    commit to atomically cover the FIRED→DELIVERED flip, park-marker clearing, and
+    task finalization.  deliver_wake itself does NOT commit — the caller owns the
+    commit.  Repeated calls must return False without re-advancing the task.
+
+    The contract: for wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND with
+    wake_action == FINALIZE, deliver_wake mutates session state but does not commit.
+    The caller (sweep or test) commits exactly once after deliver_wake returns True,
+    making the DELIVERED state and task advance durable atomically.
+    """
+    from app.models import WakeAction, WakeDeliveryState, ComputeJob, ComputeJobStatus
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    # Create a real ComputeJob row so deliver_wake can resolve it (a missing or
+    # non-UUID wake_source_ref takes the "job_record_missing" early-exit path).
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(job)
+    await session.commit()
+
+    # Park the task on the compute-job-terminal wake source with FINALIZE action.
+    reg = await park_task(
+        session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        source_metadata={"compute_job_id": str(job.id)},
+        wake_action=WakeAction.FINALIZE,
+        reason="waiting on compute job",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(reg)
+
+    assert task.status == TaskStatus.PARKED
+    # park_task's catch-up path fires the registration immediately when the
+    # ComputeJob is already terminal at park time — no separate fire_task_wakes call.
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+    # Stub out the completion handler (owns_commit=False — pure mutation, no
+    # internal commit).  The caller's commit below is what makes state durable.
+    async def _fake_completion(task_arg, logs_arg, session_arg, *, owns_commit=True):
+        pass  # pure mutation; caller owns the commit
+
+    mocker.patch(
+        "app.task_completion._handle_compute_experiment_completion",
+        side_effect=_fake_completion,
+    )
+
+    # --- First deliver_wake call: mutates session but does NOT commit. ---------
+    result = await deliver_wake(session, reg, now=_utcnow())
+    assert result is True
+
+    # deliver_wake does not commit — state is not yet durable.  The caller
+    # (here: the test, mirroring the sweep) owns the single commit.
+    await session.commit()
+
+    # Verify durability: reload the registration from the DB in a fresh query.
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at is not None
+    assert reg.result_state == "finalized"
+
+    # Park markers cleared atomically with DELIVERED flip.
+    await session.refresh(task)
+    assert task.parked_at is None
+    assert task.park_reason is None
+
+    # --- Second deliver_wake call: strict no-op (idempotency). ----------------
+    first_delivered_at = reg.delivered_at
+    result2 = await deliver_wake(session, reg, now=_utcnow())
+    assert result2 is False
+
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_delivery_handler_failure_leaves_task_recoverable(
+    tl_db, mocker
+):
+    """When _handle_compute_experiment_completion raises after deliver_wake sets
+    FIRED→DELIVERED in memory, a rollback restores the registration to FIRED and
+    the task to PARKED with parked_at intact — the task is NOT permanently wedged.
+
+    This guards the critical atomicity invariant: because deliver_wake does NOT
+    pre-commit the DELIVERED flip, a handler failure rolls back everything and the
+    registration remains re-deliverable (or the poison handler can mark it FAILED,
+    leaving the task PARKED with parked_at set so the strand-guard can recover it).
+    """
+    from app.models import WakeAction, WakeDeliveryState, ComputeJob, ComputeJobStatus
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    # Create a real ComputeJob row so deliver_wake can resolve it (a missing or
+    # non-UUID wake_source_ref takes the "job_record_missing" early-exit path).
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(job)
+    await session.commit()
+
+    reg = await park_task(
+        session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        source_metadata={"compute_job_id": str(job.id)},
+        wake_action=WakeAction.FINALIZE,
+        reason="waiting on compute job",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(reg)
+
+    parked_at_before = task.parked_at
+    assert parked_at_before is not None
+    assert task.status == TaskStatus.PARKED
+    # park_task's catch-up path fires the registration immediately when the
+    # ComputeJob is already terminal at park time — no separate fire_task_wakes call.
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+    # Stub the completion handler to raise — simulating a finalization failure.
+    async def _raising_completion(task_arg, logs_arg, session_arg, *, owns_commit=True):
+        raise RuntimeError("simulated finalization failure")
+
+    mocker.patch(
+        "app.task_completion._handle_compute_experiment_completion",
+        side_effect=_raising_completion,
+    )
+
+    # deliver_wake must propagate the handler's exception (no silent swallow).
+    with pytest.raises(RuntimeError, match="simulated finalization failure"):
+        await deliver_wake(session, reg, now=_utcnow())
+
+    # Simulate what the sweep does on exception: rollback.
+    await session.rollback()
+
+    # After rollback the registration must still be FIRED (not DELIVERED) so the
+    # poison handler or a future sweep iteration can handle it.
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.FIRED, (
+        "registration must remain FIRED after rollback so the task stays recoverable"
+    )
+
+    # The task must still be PARKED with parked_at intact — NOT NULL — so the
+    # strand-guard can eventually recover it.
+    await session.refresh(task)
+    assert task.status == TaskStatus.PARKED, "task must remain PARKED after rollback"
+    assert task.parked_at is not None, (
+        "parked_at must NOT be NULL after rollback — a NULL parked_at with "
+        "DELIVERED registration permanently wedges the task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_park_task_catches_up_already_terminal_compute_job(tl_db):
+    """park_task creates a FIRED (not PENDING) registration when its compute job
+    is already terminal at park time, and stays PENDING when the job is active.
+
+    Covers the terminal-before-park catch-up path in park_task:
+    - A ComputeJob in a terminal status → registration born FIRED, fired_at set.
+    - A ComputeJob in a non-terminal status → registration stays PENDING.
+    - A non-compute-job wake source → registration stays PENDING (no catch-up).
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.models import ComputeJob, ComputeJobStatus
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+
+    # --- Terminal job: registration must be born FIRED. -----------------------
+    task_terminal = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    terminal_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task_terminal.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(terminal_job)
+    await session.commit()
+
+    reg_terminal = await park_task(
+        session,
+        task_terminal,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(terminal_job.id),
+        wake_action=WakeAction.FINALIZE,
+        reason="parked on terminal job",
+    )
+    await session.commit()
+    await session.refresh(reg_terminal)
+
+    assert reg_terminal.delivery_state == WakeDeliveryState.FIRED, (
+        "park_task must create FIRED registration for already-terminal compute job"
+    )
+    assert reg_terminal.fired_at is not None
+
+    # --- Non-terminal job: registration must stay PENDING. --------------------
+    task_active = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    active_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task_active.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo running",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+    )
+    session.add(active_job)
+    await session.commit()
+
+    reg_active = await park_task(
+        session,
+        task_active,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(active_job.id),
+        wake_action=WakeAction.FINALIZE,
+        reason="parked on active job",
+    )
+    await session.commit()
+    await session.refresh(reg_active)
+
+    assert reg_active.delivery_state == WakeDeliveryState.PENDING, (
+        "park_task must create PENDING registration for a non-terminal compute job"
+    )
+    assert reg_active.fired_at is None
+
+    # --- Non-compute-job wake: registration must stay PENDING. ----------------
+    task_other = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    reg_other = await park_task(
+        session,
+        task_other,
+        wake_source_kind="knowledge_document_landed",
+        wake_source_ref="doc-abc",
+        wake_action=WakeAction.RESUME,
+        reason="waiting on knowledge doc",
+    )
+    await session.commit()
+    await session.refresh(reg_other)
+
+    assert reg_other.delivery_state == WakeDeliveryState.PENDING, (
+        "park_task must not touch PENDING state for non-compute-job wake kinds"
+    )
+    assert reg_other.fired_at is None

@@ -4428,6 +4428,8 @@ class TestFailureClassificationInvariants:
             EXTERNAL_API,
             INFRA_CLASSES,
             NO_PROGRESS_TIMEOUT,
+            PARK_WAKE_STRANDED,
+            PARK_WAKE_TIMEOUT,
             PROVISION_FAILURE,
             RATE_LIMIT,
             REASSIGNED,
@@ -4448,6 +4450,11 @@ class TestFailureClassificationInvariants:
                 SCOPE_EMPTY,
                 REASSIGNED,
                 NO_PROGRESS_TIMEOUT,
+                # Park/wake orchestration outcomes are budget-exempt infra faults
+                # (the wake source never fired, or the registration was lost) —
+                # not code defects. See feat: surface park/wake health.
+                PARK_WAKE_TIMEOUT,
+                PARK_WAKE_STRANDED,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

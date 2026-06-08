@@ -895,3 +895,27 @@ describe('DetailsTab — Structural Gating', () => {
     expect(section?.textContent).toContain('from integration');
   });
 });
+
+describe('DetailsTab — Liveness signals', () => {
+  afterEach(() => cleanup());
+
+  it('shows the last tool use as a relative time and falls back when absent', () => {
+    const now = new Date('2026-06-08T12:00:00Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const task = makeTask({
+      last_tool_use_at: new Date(now - 5 * 60 * 1000).toISOString(),
+    });
+
+    render(<DetailsTab task={task} />);
+
+    expect(screen.getByText('Last tool use')).toBeInTheDocument();
+    expect(screen.getByText('5m ago')).toBeInTheDocument();
+
+    nowSpy.mockRestore();
+
+    cleanup();
+
+    render(<DetailsTab task={makeTask()} />);
+    expect(screen.getByText('No tool use recorded')).toBeInTheDocument();
+  });
+});

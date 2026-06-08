@@ -1130,6 +1130,11 @@ async def _check_and_trigger_rollup(
             # as active keeps the rollup waiting rather than rolling up an
             # incomplete subtree or miscounting it as a silent failure.
             TaskStatus.BLOCKED,
+            # A PARKED child is non-terminal work waiting on an external signal;
+            # the wake worker will return it to QUEUED when the source fires.
+            # Treat it as active so a completed sibling does not prematurely
+            # trigger a rollup that ignores the still-outstanding external job.
+            TaskStatus.PARKED,
         ):
             active_count += 1
             all_done = False

@@ -354,6 +354,16 @@ vi.mock('../api', () => ({
     total: 0,
     chains: [],
   })),
+  fetchFleetUtilization: vi.fn(async () => ({
+    active_now: 3,
+    nominal_capacity: 10,
+    usable_capacity: 8,
+    cooled_accounts: 0,
+    util_now: 0.375,
+    util_avg: 0.42,
+    window_hours: 1,
+    saturation: 'healthy' as const,
+  })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

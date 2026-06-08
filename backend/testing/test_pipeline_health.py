@@ -420,6 +420,8 @@ async def test_direction_stats_conversion_rate():
                         "prs_merged": 1,
                         "tasks_created": 4,
                         "prs_rejected": 3,
+                        "acceptance_proven_merged": 1,
+                        "acceptance_consumed_merged": 1,
                     },
                 ],
             }
@@ -457,6 +459,9 @@ async def test_direction_stats_conversion_rate():
     assert stats[0]["possibly_complete"] is True
     assert stats[0]["category"] == "structural"
     assert stats[0]["acceptance_rate"] == 0.25
+    assert stats[0]["verified_prs_merged"] == 1
+    assert stats[0]["proven_prs_merged"] == 1
+    assert stats[0]["consumed_prs_merged"] == 1
 
 
 @pytest.mark.asyncio
@@ -505,6 +510,8 @@ async def test_conversion_rate_excludes_degraded_unverified_merges():
     stats = result["direction_stats"]
     assert len(stats) == 1
     assert stats[0]["conversion_rate"] == 0.5
+    assert stats[0]["proven_prs_merged"] == 0
+    assert stats[0]["consumed_prs_merged"] == 0
     # Pipeline-level conversion is verification-aware too: 2 verified / 4 created.
     assert result["pipeline_conversion_rate"] == 0.5
 
@@ -1069,6 +1076,7 @@ async def test_return_structure_has_all_required_keys():
     assert set(result.keys()) == {
         "success_rate",
         "trend",
+        "park_wake_health",
         "failure_distribution",
         "failure_taxonomy",
         "failure_taxonomy_by_scope",

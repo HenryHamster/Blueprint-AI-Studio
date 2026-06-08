@@ -39,6 +39,25 @@ function renderRetryEta(retryAfter: string | undefined) {
   return <p className="text-xs text-amber-400">Auto-retry pending</p>;
 }
 
+export function TeardownForensicsPanel({ task }: { task: Task }) {
+  const forensics = task.context?.teardown_forensics;
+  if (!forensics?.serial_tail) return null;
+
+  return (
+    <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 mb-2">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold bg-orange-900/60 text-orange-300 border border-orange-800">
+          VM Teardown
+        </span>
+        <span className="text-xs text-neutral-400 truncate" title={forensics.reason}>{forensics.reason}</span>
+      </div>
+      <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-950 rounded p-2 max-h-64 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
+        {forensics.serial_tail}
+      </pre>
+    </div>
+  );
+}
+
 export function FailureDetailPanel({ task }: { task: Task }) {
   if (!(task.status === 'FAILED' && task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class])) {
     return null;

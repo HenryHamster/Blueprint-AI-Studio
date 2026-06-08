@@ -135,7 +135,9 @@ def _build_task_evaluation_summary(
         status=summary["status"],
         verdict=summary["verdict"],
         evidence=[TaskEvaluationSummaryItem(**item) for item in summary["evidence"]],
-        highlights=[TaskEvaluationSummaryItem(**item) for item in summary["highlights"]],
+        highlights=[
+            TaskEvaluationSummaryItem(**item) for item in summary["highlights"]
+        ],
     ).model_dump()
 
 
@@ -403,6 +405,10 @@ async def get_all_tasks(
             "blocked_reason": t.blocked_reason,
             "blocked_at": t.blocked_at.isoformat() if t.blocked_at else None,
             "recheck_after": t.recheck_after.isoformat() if t.recheck_after else None,
+            # Durable PARKED-state metadata (alembic 0199). Nullable for any
+            # non-PARKED or pre-migration task; the admin UI guards on presence.
+            "parked_at": t.parked_at.isoformat() if t.parked_at else None,
+            "park_reason": t.park_reason,
             "payloads": t.payloads,
             "context": {
                 k: v
@@ -1058,9 +1064,11 @@ async def get_task(
         "blocker_kind": task.blocker_kind,
         "blocked_reason": task.blocked_reason,
         "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
-        "recheck_after": task.recheck_after.isoformat()
-        if task.recheck_after
-        else None,
+        "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
+        # Durable PARKED-state metadata (alembic 0199). Nullable for any
+        # non-PARKED or pre-migration task; the admin UI guards on presence.
+        "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+        "park_reason": task.park_reason,
         "payloads": task.payloads,
         "context": {
             k: v
@@ -1280,19 +1288,27 @@ class CreateTaskPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_pr_metadata_required_for_pr_tasks(self) -> "CreateTaskPayload":
-        if self.task_type in (
-            TaskType.review,
-            TaskType.panel_review,
-            TaskType.fix,
-        ) and self.pr_number is None:
+        if (
+            self.task_type
+            in (
+                TaskType.review,
+                TaskType.panel_review,
+                TaskType.fix,
+            )
+            and self.pr_number is None
+        ):
             raise ValueError(
                 f"pr_number is required for task_type '{self.task_type.value}'"
             )
-        if self.task_type in (
-            TaskType.review,
-            TaskType.panel_review,
-            TaskType.fix,
-        ) and not self.branch:
+        if (
+            self.task_type
+            in (
+                TaskType.review,
+                TaskType.panel_review,
+                TaskType.fix,
+            )
+            and not self.branch
+        ):
             raise ValueError(
                 f"branch is required for task_type '{self.task_type.value}'"
             )
@@ -1405,11 +1421,16 @@ async def create_task_manually(
     if payload.hotfix:
         task_payload["hotfix"] = True
     # PR-based read-only/write review tasks need pr_number and branch
-    if payload.task_type in (
-        TaskType.review,
-        TaskType.panel_review,
-        TaskType.fix,
-    ) and payload.pr_number is not None and payload.branch is not None:
+    if (
+        payload.task_type
+        in (
+            TaskType.review,
+            TaskType.panel_review,
+            TaskType.fix,
+        )
+        and payload.pr_number is not None
+        and payload.branch is not None
+    ):
         task_payload["pr_number"] = payload.pr_number
         task_payload["branch"] = payload.branch
         if payload.task_type in (TaskType.review, TaskType.panel_review):
@@ -1454,7 +1475,10 @@ async def create_task_manually(
     # treating a partially grounded one as resolved. Best-effort: a missing
     # message or no extractable refs degrades silently (no injection).
     citation_task_context: dict | None = None
-    if payload.source_message_id is not None and payload.task_type == TaskType.investigate:
+    if (
+        payload.source_message_id is not None
+        and payload.task_type == TaskType.investigate
+    ):
         from app.source_ref_validation import (
             resolve_branch_verification_context,
             summarize_bug_report_citations,
@@ -1556,21 +1580,26 @@ async def create_task_manually(
     )
     if scoped_idempotency_key:
         existing = (
-            await session.execute(
-                select(Task).where(
-                    Task.idempotency_key == scoped_idempotency_key,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                            TaskStatus.BLOCKED,
-                        ]
-                    ),
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == scoped_idempotency_key,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                                TaskStatus.PARKED,
+                            ]
+                        ),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if existing:
             return {
                 "id": str(existing.id),
@@ -1603,21 +1632,26 @@ async def create_task_manually(
         await session.rollback()
         if scoped_idempotency_key and "ux_task_active_idempotency_key" in str(e):
             existing = (
-                await session.execute(
-                    select(Task).where(
-                        Task.idempotency_key == scoped_idempotency_key,
-                        Task.status.in_(
-                            [
-                                TaskStatus.QUEUED,
-                                TaskStatus.PROVISIONING,
-                                TaskStatus.IN_PROGRESS,
-                                TaskStatus.EVALUATING,
-                                TaskStatus.BLOCKED,
-                            ]
-                        ),
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.idempotency_key == scoped_idempotency_key,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                    TaskStatus.BLOCKED,
+                                    TaskStatus.PARKED,
+                                ]
+                            ),
+                        )
                     )
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             if existing:
                 return {
                     "id": str(existing.id),

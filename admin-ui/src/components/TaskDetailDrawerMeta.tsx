@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, ResolvedReferenceLink, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
-import { formatAbsolute, parseTimestamp } from '../utils/time';
+import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob } from '../api';
@@ -10,7 +10,7 @@ import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
-import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
+import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import {
@@ -693,6 +693,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           )}
         </span>
       </DetailRow>
+      <DetailRow label="Last tool use">
+        <span className="text-sm text-neutral-200" title={task.last_tool_use_at ? formatAbsolute(task.last_tool_use_at) : undefined}>
+          {task.last_tool_use_at ? timeAgo(task.last_tool_use_at) : 'No tool use recorded'}
+        </span>
+      </DetailRow>
       {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
       {task.api_call_summary != null && (() => {
         const s = task.api_call_summary;
@@ -804,6 +809,16 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
             const need = blocker?.need as Record<string, unknown> | undefined;
             return <BlockedNeedSection need={need} tasks={tasks} onNavigateToTask={onNavigateToTask} />;
           })()}
+        </>
+      )}
+
+      {(task.status === 'PARKED' || task.parked_at || task.park_reason) && (
+        <>
+          <SectionHeader>Parked</SectionHeader>
+          {task.park_reason && (
+            <DetailRow label="Reason"><span className="text-sm text-sky-200/90 break-words">{task.park_reason}</span></DetailRow>
+          )}
+          {task.parked_at && <DetailRow label="Parked at">{formatAbsolute(task.parked_at)}</DetailRow>}
         </>
       )}
 
@@ -1284,6 +1299,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           <>
             <SectionHeader>Context</SectionHeader>
             <FailureDetailPanel task={task} />
+            <TeardownForensicsPanel task={task} />
             <div>
               {/* reason: inline expand toggle; text-xs single-line height for raw context section */}
               <button

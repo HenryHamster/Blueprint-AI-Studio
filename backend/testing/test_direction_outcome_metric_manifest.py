@@ -128,3 +128,28 @@ def test_manifest_values_are_well_formed():
             f"{field}: manifest entry must declare EXACTLY ONE of "
             f"'consumer' or 'status' (got consumer={has_consumer}, status={has_status})"
         )
+
+
+def test_no_pending_unread_conversion_metric():
+    """conversion_rate must be retired, not pending.
+
+    A pending status signals an unresolved question about whether the stored
+    field should be the source of truth or be removed.  The field has been
+    retired — all conversion surfaces derive directly from the canonical count
+    fields (verified_prs_merged / tasks_created) and no production code reads
+    the stored entry copy.  This test locks in that decision so the manifest
+    cannot regress to pending.
+    """
+    meta = RESEARCH_HISTORY_METRIC_MANIFEST.get("conversion_rate")
+    assert meta is not None, (
+        "conversion_rate must remain in the manifest as a retired entry; "
+        "remove this test only if the field name changes"
+    )
+    assert meta.get("status") == "retired", (
+        f"conversion_rate manifest entry must be 'retired', got status={meta.get('status')!r}. "
+        "All conversion surfaces recompute from count fields — the stored copy is dead weight."
+    )
+    assert "consumer" not in meta, (
+        "conversion_rate must not claim an active consumer; "
+        "no production code reads entry['conversion_rate'] from research_history"
+    )

@@ -617,6 +617,12 @@ export function buildDirSummaryText(
   const body = directionsSummary.map((d, i) => {
     const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
     if (d.prs_merged) parts.push(`${fmtScalar(d.prs_merged)} merged`);
+    const proven = Number(d.proven_prs_merged ?? 0);
+    const consumed = Number(d.consumed_prs_merged ?? 0);
+    if (proven > 0 || consumed > 0) {
+      const consumedSuffix = consumed > 0 ? ` (${consumed} consumed downstream)` : '';
+      parts.push(`${proven} proven${consumedSuffix}`);
+    }
     if (d.tasks_failed) {
       const infraFailed = (d.tasks_failed_infra as number) || 0;
       parts.push(infraFailed > 0 ? `${fmtScalar(d.tasks_failed)} failed (${infraFailed} infra)` : `${fmtScalar(d.tasks_failed)} failed`);

@@ -3659,8 +3659,10 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
     finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
-    # Declare a prerequisite that does not exist in the project
-    finding["prerequisite"] = {"kind": "task", "ref": "nonexistent-task-id"}
+    # Declare an EXACT (finding-hash) prerequisite that does not resolve to any
+    # candidate this cycle — a valid-but-unresolved forward reference.
+    missing_ref = "00000000deadbeef"
+    finding["prerequisite"] = {"kind": "task", "ref": missing_ref}
 
     _patch_research_externals(mocker)
     mocker.patch(
@@ -3689,15 +3691,55 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
     # The unresolved prerequisite is persisted as the canonical machine-resolvable
     # need under context['blocker']['need'] for the blocked-resume sweep.
     need = get_blocker_metadata(child).get("need")
-    assert need == {"kind": "task", "ref": "nonexistent-task-id"}, (
+    assert need == {"kind": "task", "ref": missing_ref}, (
         "unresolved prerequisite must be carried as the blocked need"
     )
     # Still stamped on context for operator visibility, in addition to BLOCKED.
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
     assert any(
-        u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
+        u.get("kind") == "task" and u.get("ref") == missing_ref
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_title_like_task_prerequisite_dropped_not_blocking(db_session, mocker):
+    """A finding declaring a TITLE-LIKE kind=task prerequisite (free prose, not a
+    task id / finding hash) must NOT block the dependent: the malformed ref is
+    dropped at ingestion (normalize_prerequisite rejects it) so it never drives a
+    blocked need nor becomes durable stranded demand. The dependent spawns
+    normally — a named foundation belongs to kind=capability."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq04b")
+    finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": "Build the auth subsystem"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.status != TaskStatus.BLOCKED, (
+        "a title-like task prerequisite must NOT block the dependent"
+    )
+    assert get_blocker_needs(child) == [], (
+        "a dropped title-like task ref must not be carried as a blocked need"
+    )
 
 
 @_pytest.mark.asyncio
@@ -5313,6 +5355,40 @@ def test_off_registry_capability_ref_marked_advisory_not_rejected():
         context={"provides_capability": "payment-core"},
     )
     assert resolve_prerequisite_task(findings[0]["_prerequisite"], [other]) is None
+
+
+def test_annotate_drops_title_like_task_prereq_and_records_malformed_advisory():
+    """A title-like kind=task prerequisite is dropped (no _prerequisite) and a
+    retirable _malformed_prerequisite advisory is recorded so it never drives an
+    edge / blocked need, while an EXACT task ref and a capability ref are kept."""
+    findings = [
+        {"title": "title-like", "prerequisite": {"kind": "task", "ref": "Build the harness"}},
+        {"title": "exact-hash", "prerequisite": {"kind": "task", "ref": "deadbeefcafe0001"}},
+        {"title": "cap", "prerequisite": {"kind": "capability", "ref": "payment-core"}},
+        # A finding that previously carried a malformed advisory but now declares a
+        # valid prereq must have the stale advisory cleared.
+        {
+            "title": "now-valid",
+            "prerequisite": {"kind": "task", "ref": "feedfacefeedface"},
+            "_malformed_prerequisite": {"kind": "task", "ref": "old prose", "reason": "x"},
+        },
+    ]
+    _annotate_capability_declarations(findings, [])
+
+    # Title-like task ref: dropped, advisory recorded.
+    assert "_prerequisite" not in findings[0]
+    adv = findings[0]["_malformed_prerequisite"]
+    assert adv["kind"] == "task"
+    assert adv["ref"] == "Build the harness"
+    assert "capability" in adv["reason"]
+    # Exact / capability refs: carried through, no advisory.
+    assert findings[1]["_prerequisite"] == {"kind": "task", "ref": "deadbeefcafe0001"}
+    assert "_malformed_prerequisite" not in findings[1]
+    assert findings[2]["_prerequisite"] == {"kind": "capability", "ref": "payment-core"}
+    assert "_malformed_prerequisite" not in findings[2]
+    # Stale advisory cleared once a valid prereq is declared.
+    assert findings[3]["_prerequisite"] == {"kind": "task", "ref": "feedfacefeedface"}
+    assert "_malformed_prerequisite" not in findings[3]
 
 
 def test_annotate_capability_declarations_clears_stale_markers_and_skips_non_dicts():

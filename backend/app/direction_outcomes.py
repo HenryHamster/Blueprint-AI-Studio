@@ -29,13 +29,14 @@ from app.failure_classification import (
 )
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_counts_as_verified_context,
     acceptance_blocks_success,
     acceptance_is_consumed,
     acceptance_is_proven,
     acceptance_was_declared,
     classify_merged_acceptance,
 )
-from app.landed_signal import is_merged_completion, merge_verification_status
+from app.landed_signal import is_merged_completion
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
@@ -157,13 +158,15 @@ def proven_merged_count(entry: dict) -> int:
     """Machine-checked PROVEN merged-PR count for a research_history entry.
 
     The honest counterpart to :func:`verified_merged_count`: counts only merges
-    proven by machine-checked evidence (a satisfied ``named_test``), as recorded
-    in the additive ``acceptance_proven_merged`` field by
+    proven by machine-checked evidence — either a satisfied ``named_test`` that
+    ran green, or a satisfied ``downstream_artifact`` that was subsequently
+    consumed (recorded downstream-artifact consumption) — as recorded in the
+    additive ``acceptance_proven_merged`` field by
     ``_update_direction_research_outcomes``. Strictly distinct from — and never
-    larger than — ``verified_prs_merged``: a soft (behavior/artifact) or
-    undeclared merge counts as verified but NOT proven. Legacy entries written
-    before the field existed degrade to ``0`` (nothing is retroactively claimed
-    as proven), never to the raw merged count.
+    larger than — ``verified_prs_merged``: a soft (behavior or unconsumed
+    artifact) or undeclared merge counts as verified but NOT proven. Legacy
+    entries written before the field existed degrade to ``0`` (nothing is
+    retroactively claimed as proven), never to the raw merged count.
     """
     return int(entry.get("acceptance_proven_merged") or 0)
 
@@ -479,16 +482,17 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "verified_prs_merged": {
         "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
     },
-    # --- Acceptance aggregates: now wired to decision + digest consumers. ---
+    # --- Acceptance aggregates: now wired to decision + reader-facing consumers. ---
     # These expose proven-by-evidence and declaration-coverage truth distinct
-    # from "merely merged". As of 2026-06-07 they are folded into the lifetime
-    # rollups consumed by the digest and by strategic spawning's direction
-    # scoring (and summed in direction_metrics.py's aggregate).
+    # from "merely merged". Reader-facing surfaces show total proven merges and
+    # the downstream-artifact consumed subset in admin direction progress,
+    # direction portfolio summaries, strategic direction summaries, and
+    # project-context pipeline-health direction summaries.
     "acceptance_proven_merged": {
-        "consumer": "digest_direction_progress.py (lifetime proven rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_proven_merged)"
+        "consumer": "digest_direction_progress.py / strategic_spawning.py payloads rendered by admin direction summaries and strategic agent direction summaries"
     },
     "acceptance_consumed_merged": {
-        "consumer": "digest_direction_progress.py (lifetime consumed rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_consumed_merged)"
+        "consumer": "admin-ui DirectionProgressSection.tsx + DirectionPortfolioSection.tsx, agent strategic-sections.ts + project-context.ts (consumed subset beside proven merges)"
     },
     "acceptance_declared_merged": {
         "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
@@ -516,14 +520,15 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "preventive_context_tasks_failed": {
         "consumer": "routers/admin_digest.py (digest reporting)"
     },
-    # --- Conversion: stored copy is unread. ---
-    # Every conversion surface RECOMPUTES conversion from merged/created rather
-    # than reading this field (digest_direction_progress.py:466, pipeline_health,
-    # the UI/agent direction-level conversion_rate is the recomputed digest
-    # value, not this entry key). Pending: retire or make this the single source.
+    # --- Conversion: retired stored copy. ---
+    # Every conversion surface recomputes conversion from verified_prs_merged /
+    # tasks_created (digest_direction_progress.py:466, pipeline_health.py,
+    # strategic_analysis.py) rather than reading the stored entry field. The
+    # stored copy has been removed; all conversion semantics survive via the
+    # canonical count fields.
     "conversion_rate": {
-        "status": "pending",
-        "reason": "stored entry copy is never read; conversion surfaces recompute it (digest_direction_progress.py:466). Candidate for retirement or for becoming the single source",
+        "status": "retired",
+        "reason": "stored copy was never read; all conversion surfaces (digest_direction_progress.py:466, pipeline_health.py, strategic_analysis.py) recompute from verified_prs_merged / tasks_created",
         "date": "2026-06-07",
     },
     # --- Generalized (all-task-type) outcomes ---
@@ -816,38 +821,41 @@ async def _update_direction_research_outcomes(
     # counts should prefer this field over the raw prs_merged.
     #
     # The shared acceptance classifier keeps the direction window and release
-    # window in sync: the non-degraded buckets (proven + declared_unsatisfied +
-    # no_declaration) still count as verified, while degraded rows stay out.
+    # window in sync: the verified buckets (strict proven + satisfied_unproven
+    # + undeclared) still count as verified, while degraded, explicitly
+    # unsatisfied, and malformed rows stay out.
     aggregate_buckets = {
         "proven": 0,
-        "consumed": 0,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 0,
+        "undeclared": 0,
         "merged_unverified_degraded": 0,
-        "no_declaration": 0,
+        "malformed": 0,
     }
     for ct in _merged_rows:
         aggregate_buckets[classify_merged_acceptance(ct)] += 1
     entry["verified_prs_merged"] = (
         aggregate_buckets["proven"]
-        + aggregate_buckets["consumed"]
-        + aggregate_buckets["no_declaration"]
+        + aggregate_buckets["satisfied_unproven"]
+        + aggregate_buckets["undeclared"]
     )
     # Honest proven-by-evidence + declaration-coverage aggregates. These are
-    # STRICTLY ADDITIVE: they do not change verified_prs_merged, prs_merged, or
-    # conversion_rate above — they expose a separate, stronger truth distinct
-    # from "merely delivered". Restricted to merged WRITE tasks (the code-
-    # producing types that can carry an acceptance declaration) so read-only
-    # children never dilute the coverage denominator.
+    # STRICTLY ADDITIVE: they do not change verified_prs_merged or prs_merged —
+    # they expose a separate, stronger truth distinct from "merely delivered".
+    # Restricted to merged WRITE tasks (the code-producing types that can carry
+    # an acceptance declaration) so read-only children never dilute the coverage
+    # denominator.
     #
     #   * acceptance_verified_write_merged — verified merged WRITE tasks only.
     #     This is the write-only slice used by proof_weighted_merged so read-only
     #     merged work keeps full credit instead of being tier-weighted.
-    #   * acceptance_proven_merged — merges machine-checked PROVEN: a satisfied
-    #     named_test that ran green under a real merge-test verdict and exercises
-    #     a changed production seam (acceptance_is_proven). A soft
-    #     observable_behavior / downstream_artifact merge (satisfied by a shipped
-    #     diff only) and every undeclared merge are EXCLUDED — they prove nothing
-    #     about the specific claim.
+    #   * acceptance_proven_merged — merges machine-checked PROVEN
+    #     (acceptance_is_proven): either a satisfied named_test that ran green
+    #     under a real merge-test verdict, or a satisfied downstream_artifact
+    #     that was consumed (recorded downstream-artifact consumption). A soft
+    #     observable_behavior merge, an unconsumed downstream_artifact, and every
+    #     undeclared merge are EXCLUDED — they prove nothing about the specific
+    #     claim.
     #   * acceptance_declared_merged — merges that DECLARED any acceptance
     #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
     #     stamped). Undeclared / legacy merges are excluded.
@@ -863,10 +871,7 @@ async def _update_direction_research_outcomes(
     entry["acceptance_verified_write_merged"] = sum(
         1
         for ct in _merged_write_rows
-        if merge_verification_status(ct) != "unverified_degraded"
-        and not acceptance_blocks_success(
-            (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-        )
+        if acceptance_counts_as_verified_context(ct.context or {})
     )
     entry["acceptance_proven_merged"] = sum(
         1
@@ -929,16 +934,6 @@ async def _update_direction_research_outcomes(
         if is_merged_completion(ct)
         and (ct.context or {}).get("_pr_changed_files")
     ]
-    _tasks_created = entry.get("tasks_created", 0)
-    # Conversion is verification-aware: degraded-unverified merges (verification
-    # was expected but blocked by an environment/setup failure) are excluded so
-    # the rate agrees with the per-task outcome layer, which scores them neutral.
-    # Benign-unverified and verified merges still count (verified_merged_count).
-    entry["conversion_rate"] = (
-        round(verified_merged_count(entry) / _tasks_created, 3)
-        if _tasks_created > 0
-        else None
-    )
     # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
     # Uses evaluate_task_outcome to count successes across ALL task types (code
     # merges + research quality + audit findings + memo artifacts + verification

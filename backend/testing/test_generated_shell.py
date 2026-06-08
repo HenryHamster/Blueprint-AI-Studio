@@ -1691,3 +1691,96 @@ class TestPackerBackendDepsBake:
             assert sentinel in hcl, (
                 f"agent.pkr.hcl must emit {sentinel} after a successful deps bake."
             )
+
+
+class TestVmSelfDestructTtl:
+    """The VM self-destruct watchdog is a generous orphan-cost FAILSAFE, not a
+    per-task wall-clock cap.
+
+    Regression for the 2026-06-08 release_audit kill: the watchdog counts from
+    VM BOOT and was hardcoded ``TTL_SECONDS=3600`` (1h) in both the cold-VM and
+    warm-pool startup scripts. A release_audit (the longest task type — it audits
+    the full automain->main promotion diff) spent ~23min on a cold deps build
+    then ~28min auditing and got SIGTERM+poweroff'd at the 1h boot mark while
+    still heartbeating every 30s. The reaper's liveness timeouts (no-heartbeat
+    ~5min, no-progress ~8min) never fired because the task was healthy — the TTL
+    was the only wall-clock ceiling, and 1h was too tight for legitimate long
+    work. Default is now 4h (14400s); per-task enforcement stays with the
+    liveness reaper.
+    """
+
+    def test_default_ttl_is_four_hours_both_scripts(self):
+        """Both startup-script variants must default to the 4h failsafe, never
+        the old 1h literal that guillotined the release audit."""
+        for render, label in (
+            (_render_compute_startup_script, "cold-VM"),
+            (_render_pool_startup_script, "warm-pool"),
+        ):
+            script = render()
+            assert "TTL_SECONDS=14400" in script, (
+                f"{label} startup script must default to the 4h (14400s) "
+                f"self-destruct failsafe."
+            )
+            assert "TTL_SECONDS=3600" not in script, (
+                f"{label} startup script still carries the 1h (3600s) TTL that "
+                f"killed the release audit mid-run — must be the 4h failsafe."
+            )
+
+    def test_ttl_is_overridable(self):
+        """The watchdog ceiling is a parameter so ops/future long task types can
+        raise it without editing the bash template."""
+        script = build_agent_startup_script(
+            task_id="00000000-0000-0000-0000-000000000000",
+            secret_version_name="projects/test/secrets/agent/versions/1",
+            payload_uri_b64="Z3M6Ly9idWNrZXQvb2JqZWN0",
+            orchestrator_url="https://orch.test",
+            materialize_manifest_b64=compute._MATERIALIZE_MANIFEST_B64,
+            ttl_seconds=21600,
+        )
+        assert "TTL_SECONDS=21600" in script
+        assert "TTL_SECONDS=14400" not in script
+
+    def test_watchdog_structure_intact(self):
+        """Raising the value must not disturb the graceful-stop-then-poweroff
+        watchdog body (stop service, settle, poweroff)."""
+        script = _render_compute_startup_script()
+        # The watchdog still sleeps on the configured ceiling and powers off.
+        assert "sleep $TTL_SECONDS" in script
+        assert "systemctl stop blueprint-agent" in script
+        assert "poweroff" in script
+        # And the in-script wait-loop guard still compares against the same var.
+        assert "$TTL_SECONDS" in script
+
+    def test_compute_experiment_gets_24h_ceiling(self):
+        """compute_experiment (v7) legitimately runs many hours — it must
+        resolve to a 24h failsafe, not the 4h default that would kill it. Kept
+        bounded (not exempt): an orphaned compute VM is the costliest leak."""
+        from app.compute_startup_script import resolve_vm_ttl_seconds
+
+        assert resolve_vm_ttl_seconds("compute_experiment") == 86400
+
+    def test_default_and_unknown_types_get_4h(self):
+        """Every other task type — and an empty/None type — uses the 4h
+        default ceiling."""
+        from app.compute_startup_script import resolve_vm_ttl_seconds
+
+        assert resolve_vm_ttl_seconds("code_change") == 14400
+        assert resolve_vm_ttl_seconds("release_audit") == 14400
+        assert resolve_vm_ttl_seconds("") == 14400
+        assert resolve_vm_ttl_seconds(None) == 14400
+
+    def test_compute_experiment_cold_script_renders_24h(self):
+        """End-to-end: a cold VM rendered for compute_experiment carries the
+        24h ceiling in its actual self-destruct watchdog."""
+        from app.compute_startup_script import resolve_vm_ttl_seconds
+
+        script = build_agent_startup_script(
+            task_id="00000000-0000-0000-0000-000000000000",
+            secret_version_name="projects/test/secrets/agent/versions/1",
+            payload_uri_b64="Z3M6Ly9idWNrZXQvb2JqZWN0",
+            orchestrator_url="https://orch.test",
+            materialize_manifest_b64=compute._MATERIALIZE_MANIFEST_B64,
+            ttl_seconds=resolve_vm_ttl_seconds("compute_experiment"),
+        )
+        assert "TTL_SECONDS=86400" in script
+        assert "TTL_SECONDS=14400" not in script

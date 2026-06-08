@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
+import { apiFetch, fetchTask, fetchFleetUtilization, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -42,6 +42,7 @@ import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
 import { WarmReuseVsCostTrend } from './WarmReuseVsCostTrend';
 import { FailureClassPill } from './FailureClassPill';
 import { SystemHealthCard, type HealthOverviewResponse } from './SystemHealthCard';
+import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
 import { AnomalyThrottleBanner } from './AnomalyThrottleBanner';
 import { FailureTaxonomyBreakdown } from './FailureTaxonomyBreakdown';
 import { ReviewRejectionBreakdown } from './ReviewRejectionBreakdown';
@@ -124,6 +125,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
+  const [fleetUtilization, setFleetUtilization] = useState<FleetUtilizationResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -159,6 +161,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setDirectionSrBreakdown(null);
     setFingerprintAnalytics(null);
     setHealthOverview(null);
+    setFleetUtilization(null);
     setSparkData([]);
     sparkRef.current = [];
     setOpenPRsRefreshing(false);
@@ -203,6 +206,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const handleConfigureTargets = useCallback(() => {
     onConfigureTargets?.();
   }, [onConfigureTargets]);
+
+  const handleOpenDirections = selectedProjectId && onDirectionClick
+    ? () => onDirectionClick('')
+    : undefined;
 
   const handleToggleBlindSpotTheme = useCallback((theme: string) => {
     setExpandedBlindSpotThemes(prev => {
@@ -385,6 +392,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           if (requestId === dashboardRequestIdRef.current) setHealthOverview(null);
         }
       })(),
+      (async () => {
+        try {
+          const data = await fetchFleetUtilization();
+          if (requestId === dashboardRequestIdRef.current) setFleetUtilization(data);
+        } catch {
+          if (requestId === dashboardRequestIdRef.current) setFleetUtilization(null);
+        }
+      })(),
     );
 
     await Promise.allSettled(fetches);
@@ -520,7 +535,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       <AnomalyThrottleBanner digest={digest} onRestored={refetchDashboard} />
 
       {/* System Health — actionable issues with remediation hints */}
-      <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
+      <SystemHealthCard
+        data={healthOverview}
+        loading={loading}
+        tasks={tasks}
+        onViewTask={onViewTask}
+        onOpenDirections={handleOpenDirections}
+      />
+
+      {/* Fleet Capacity — global slot utilization and saturation */}
+      <FleetCapacityCard data={fleetUtilization} loading={loading} />
 
       {/* Viewport Debt */}
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}

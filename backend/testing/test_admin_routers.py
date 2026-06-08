@@ -8965,12 +8965,15 @@ class TestVersionLifecycleAcceptanceAggregate:
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         aggregate = {
-            "merged": 3,
+            "total": 3,
             "proven": 2,
+            "satisfied_unproven": 0,
             "declared_unsatisfied": 1,
+            "undeclared": 0,
             "merged_unverified_degraded": 0,
-            "no_declaration": 0,
+            "malformed": 0,
             "proven_rate": 0.667,
+            "satisfied_rate": 0.667,
         }
         version.last_qualification = {"status": "dry_run", "acceptance_aggregate": aggregate}
         db_session.add(version)
@@ -9050,12 +9053,15 @@ class TestVersionLifecycleAcceptanceAggregate:
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id)
         aggregate = {
-            "merged": 4,
+            "total": 4,
             "proven": 3,
+            "satisfied_unproven": 0,
             "declared_unsatisfied": 1,
+            "undeclared": 0,
             "merged_unverified_degraded": 0,
-            "no_declaration": 0,
+            "malformed": 0,
             "proven_rate": 0.75,
+            "satisfied_rate": 0.75,
         }
         verdict = QualificationVerdict(
             project_id=project.id,
@@ -12968,3 +12974,83 @@ async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_sessi
     assert block["task_type"] == "qa"
     categories = {c["category"] for c in block["categories"]}
     assert "test-coverage" in categories
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# fleet-utilization endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestFleetUtilizationEndpoint:
+    @pytest.mark.asyncio
+    async def test_fleet_utilization_returns_snapshot_for_admin(
+        self, client: AsyncClient, db_session
+    ):
+        """Authenticated admin GET of /api/admin/fleet-utilization returns 200
+        with utilization snapshot fields and a saturation state."""
+        resp = await client.get("/api/admin/fleet-utilization")
+        assert resp.status_code == 200
+        data = resp.json()
+        # All snapshot fields from get_fleet_utilization_snapshot must be present
+        for field in ("active_now", "nominal_capacity", "usable_capacity",
+                      "cooled_accounts", "util_now", "util_avg", "window_hours"):
+            assert field in data, f"missing field: {field}"
+        # Derived saturation field must be present (may be None when no accounts)
+        assert "saturation" in data
+        # saturation is either None or one of the three valid labels
+        if data["saturation"] is not None:
+            assert data["saturation"] in ("healthy", "busy", "saturated")
+
+    @pytest.mark.asyncio
+    async def test_fleet_utilization_requires_admin(self, override_get_session, db_session):
+        """Non-admin caller is rejected with 403."""
+        from fastapi import HTTPException
+
+        async def non_admin():
+            return {"user_id": "other", "email": "other@example.com", "role": "user"}
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[get_current_user] = non_admin
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/fleet-utilization")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(require_admin, None)
+
+
+class TestDeriveSaturation:
+    """Unit tests for the pure _derive_saturation helper."""
+
+    def test_healthy_when_util_avg_below_threshold(self):
+        from app.routers.admin_health import _derive_saturation
+
+        assert _derive_saturation(0.0, 0.0) == "healthy"
+        assert _derive_saturation(0.5, 0.5) == "healthy"
+        assert _derive_saturation(0.699, 0.9) == "healthy"
+
+    def test_busy_when_util_avg_in_middle_band(self):
+        from app.routers.admin_health import _derive_saturation
+
+        assert _derive_saturation(0.70, None) == "busy"
+        assert _derive_saturation(0.80, None) == "busy"
+        assert _derive_saturation(0.899, None) == "busy"
+
+    def test_saturated_when_util_avg_at_or_above_upper_threshold(self):
+        from app.routers.admin_health import _derive_saturation
+
+        assert _derive_saturation(0.90, None) == "saturated"
+        assert _derive_saturation(1.0, None) == "saturated"
+        assert _derive_saturation(1.5, None) == "saturated"
+
+    def test_none_when_util_avg_is_none(self):
+        from app.routers.admin_health import _derive_saturation
+
+        assert _derive_saturation(None, None) is None
+        assert _derive_saturation(None, 0.5) is None

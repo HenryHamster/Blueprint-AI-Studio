@@ -159,7 +159,7 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(label).toBeTruthy();
   });
 
-  test('terminal GPU job with result_metrics surfaces metric key-value pairs; CPU job shows none', async () => {
+  test('terminal GPU job with result_metrics surfaces metric key-value pairs', async () => {
     const gpuJob = makeJob({
       id: 'job-gpu',
       status: 'SUCCEEDED',
@@ -169,20 +169,44 @@ describe('ComputeJobsPanel render + kill', () => {
       accelerator_count: 1,
       polling_metadata: { result_metrics: { gpu_count: 1, driver_version: '525.0' } },
     });
-    const cpuJob = makeJob({
-      id: 'job-cpu',
-      task_title: 'cpu task',
-      status: 'SUCCEEDED',
-      outcome: 'SUCCESS',
-      final_cost_usd: 1.0,
-    });
-    fetchComputeJobs.mockResolvedValue([gpuJob, cpuJob]);
-    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    fetchComputeJobs.mockResolvedValue([gpuJob]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(await findByText((t) => t.includes('gpu_count:'))).toBeTruthy();
     expect(await findByText((t) => t.includes('driver_version:'))).toBeTruthy();
-    // CPU job row must not contain any metric labels
-    expect(queryByText((t) => t === 'cpu task' && t.includes('gpu_count:'))).toBeNull();
+  });
+
+  test('terminal CPU (no-accelerator) job with result_metrics shows those metrics', async () => {
+    const cpuJob = makeJob({
+      id: 'job-cpu',
+      task_title: 'cpu benchmark',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      accelerator_type: null,
+      polling_metadata: { result_metrics: { avg_latency_ms: 42.5, throughput_rps: 1000 } },
+    });
+    fetchComputeJobs.mockResolvedValue([cpuJob]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('cpu benchmark');
+    expect(await findByText((t) => t.includes('avg_latency_ms:'))).toBeTruthy();
+    expect(await findByText((t) => t.includes('throughput_rps:'))).toBeTruthy();
+  });
+
+  test('running job with result_metrics shows those metrics (not just terminal jobs)', async () => {
+    const runningJobWithMetrics = makeJob({
+      id: 'job-running',
+      task_title: 'live experiment',
+      status: 'RUNNING',
+      outcome: null,
+      accrued_cost_usd: 1.5,
+      polling_metadata: { result_metrics: { current_progress: 0.75, samples_collected: 300 } },
+    });
+    fetchComputeJobs.mockResolvedValue([runningJobWithMetrics]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('live experiment');
+    expect(await findByText((t) => t.includes('current_progress:'))).toBeTruthy();
+    expect(await findByText((t) => t.includes('samples_collected:'))).toBeTruthy();
   });
 
   test('renders nothing when there are no jobs', async () => {

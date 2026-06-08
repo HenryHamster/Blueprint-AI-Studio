@@ -94,6 +94,10 @@ _SR_INVESTIGATION_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+    # PARKED is a live, dedup-relevant state: a parked investigation is still
+    # open work, so the same-category dedup lookup must see it or a duplicate
+    # investigation could spawn while the parked one waits on its wake.
+    TaskStatus.PARKED,
 )
 _SR_INVESTIGATION_SPAWNED_BY = "operator_sr_investigation"
 

@@ -1,9 +1,9 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import ProblemModelViewer from './ProblemModelViewer';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
-import type { ProblemModel } from '../types';
+import type { ProblemModel, SelfReflectionEntry } from '../types';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -189,6 +189,96 @@ describe('ProblemModelViewer — viewport regression', () => {
                 notes: 'Implementation note explaining the current state and any limitations.',
               })),
             })}
+            {...defaultProps}
+          />
+        );
+      });
+    });
+  });
+
+  test('renders self-reflection entries with all fields', async () => {
+    const entries: SelfReflectionEntry[] = [
+      {
+        ts: '2026-06-07T12:00:00Z',
+        cycle_task_id: 'task-aabbccdd-1234-5678-abcd-ef0123456789',
+        what_was_hard: 'Determining the correct retry backoff parameters for the async job queue without access to production load data.',
+        missing_context: 'Historical p95 task latency and queue depth metrics from the last 30 days would have accelerated this analysis significantly.',
+        proposed_self_improvement: 'Add a persistent latency percentile summary to the directions response so the strategist can reference it without launching a separate research task.',
+      },
+      {
+        ts: '2026-06-06T09:30:00Z',
+        cycle_task_id: 'task-bbccddee-2345-6789-bcde-f01234567890',
+        what_was_hard: 'Understanding which frontend components were already covered by viewport tests vs. which needed new coverage.',
+        missing_context: 'A machine-readable test coverage map per component would reduce overhead on coverage-gap analysis.',
+        proposed_self_improvement: 'Emit a test-coverage index artifact after each CI run and surface it via the diagnostics endpoint.',
+      },
+    ];
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '800px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          selfReflectionLog={entries}
+          {...defaultProps}
+        />
+      );
+    });
+    // All three field labels should be present
+    expect(host.textContent).toContain('What was hard');
+    expect(host.textContent).toContain('Missing context');
+    expect(host.textContent).toContain('Proposed improvement');
+    // Entry content should render
+    expect(host.textContent).toContain('retry backoff parameters');
+    expect(host.textContent).toContain('p95 task latency');
+    expect(host.textContent).toContain('latency percentile summary');
+  });
+
+  test('self-reflection section is absent when selfReflectionLog is empty or omitted', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          {...defaultProps}
+        />
+      );
+    });
+    // Section heading should not appear when no entries provided
+    expect(host.textContent).not.toContain('Self-reflection');
+  });
+
+  test('self-reflection section renders without overflow at 375px', async () => {
+    const entries: SelfReflectionEntry[] = [
+      {
+        ts: '2026-06-07T12:00:00Z',
+        cycle_task_id: 'task-aabbccdd-1234-5678-abcd-ef0123456789',
+        what_was_hard: 'Determining the correct retry backoff parameters for the async job queue without access to production load data.',
+        missing_context: 'Historical p95 task latency and queue depth metrics from the last 30 days would have accelerated this analysis significantly.',
+        proposed_self_improvement: 'Add a persistent latency percentile summary to the directions response so the strategist can reference it without launching a separate research task.',
+      },
+    ];
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      host.style.height = '600px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProblemModelViewer
+            problemModel={makeProblemModel()}
+            selfReflectionLog={entries}
             {...defaultProps}
           />
         );

@@ -317,7 +317,12 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
           const cvr = typeof d.conversion_rate === 'number' || typeof d.conversion_rate === 'string'
             ? String(d.conversion_rate)
             : 'n/a';
-          return `d-${did} cvr ${cvr} (${String(d.cycles)} cycles${sat})`;
+          const proven = Number(d.proven_prs_merged ?? 0);
+          const consumed = Number(d.consumed_prs_merged ?? 0);
+          const proof = proven > 0 || consumed > 0
+            ? `, proof ${proven} proven${consumed > 0 ? ` (${consumed} consumed downstream)` : ''}`
+            : '';
+          return `d-${did} cvr ${cvr} (${String(d.cycles)} cycles${sat}${proof})`;
         })
         .join(', ');
       parts.push(`Direction ROI: ${dirStr}.`);

@@ -39,8 +39,9 @@ import uuid
 import operator
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
+from app.ci_resolution import is_degraded_unverified_reason
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
 from sqlalchemy.orm.attributes import flag_modified
@@ -113,6 +114,15 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # ``target_defect_reproduction``. Absence of the key means "no acceptance
 # verdict was recorded" and preserves prior bare-merge scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
+
+ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (
+    "proven",
+    "satisfied_unproven",
+    "declared_unsatisfied",
+    "undeclared",
+    "merged_unverified_degraded",
+    "malformed",
+)
 
 
 @dataclass(frozen=True)
@@ -427,19 +437,72 @@ def acceptance_was_declared(recorded: Any) -> bool:
 def acceptance_is_proven(recorded: Any) -> bool:
     """Whether a recorded verdict is machine-checked PROVEN, not merely delivered.
 
-    ``True`` only when a verdict was recorded AND it carries ``proven is True`` —
-    i.e. a satisfied ``named_test`` that ran green under a real merge-test verdict
-    and exercises a changed production seam. A satisfied
-    ``observable_behavior`` / ``downstream_artifact`` (soft / asserted by a
-    shipped diff only), every unsatisfied / fail-closed case, and all undeclared
-    or legacy rows return ``False``. This is the additive TRUE proven signal,
-    strictly distinct from ``verified_prs_merged`` (which still credits soft and
-    undeclared merges). Tolerant of legacy verdict dicts written before the
-    ``proven`` key existed — a missing key reads as ``False``, never proven.
+    ``True`` only when a verdict was recorded AND it carries ``proven is True``.
+    Two evidence paths produce ``proven=True``:
+
+    1. A satisfied ``named_test`` that ran green under a real merge-test verdict
+       and exercises a changed production seam (machine-checked proof).
+    2. A satisfied ``downstream_artifact`` that has been consumed — i.e.
+       ``record_artifact_consumptions_for_task`` ran and upgraded the verdict to
+       ``proven=True, consumed=True`` (recorded downstream-artifact consumption).
+       ``consumed`` is a strict subset: every consumed verdict is proven, but a
+       satisfied-but-unconsumed ``downstream_artifact`` is ``proven=False``.
+
+    A satisfied ``observable_behavior`` (soft / asserted by a shipped diff only),
+    every unsatisfied / fail-closed case, and all undeclared or legacy rows return
+    ``False``. This is the additive TRUE proven signal, strictly distinct from
+    ``verified_prs_merged`` (which still credits soft and undeclared merges).
+    Tolerant of legacy verdict dicts written before the ``proven`` key existed —
+    a missing key reads as ``False``, never proven.
     """
     if not isinstance(recorded, dict):
         return False
     return recorded.get("proven") is True
+
+
+def _context_merge_verification_status(context: Mapping[str, Any] | None) -> str:
+    """Return the merge-verification bucket derivable from a task context dict."""
+    review_loop = (context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return "verified"
+    reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
+    if not isinstance(reason, str) or not reason:
+        return "verified"
+    if is_degraded_unverified_reason(reason):
+        return "unverified_degraded"
+    return "unverified_benign"
+
+
+def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str:
+    """Classify one landed task context into the canonical acceptance buckets."""
+    if _context_merge_verification_status(context) == "unverified_degraded":
+        return "merged_unverified_degraded"
+    recorded = (context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    if not isinstance(recorded, dict):
+        return "undeclared"
+    if acceptance_blocks_success(recorded):
+        return "declared_unsatisfied"
+    if recorded.get("satisfied") is True:
+        if acceptance_is_proven(recorded):
+            return "proven"
+        return "satisfied_unproven"
+    return "malformed"
+
+
+def acceptance_counts_as_verified_context(
+    context: Mapping[str, Any] | None,
+) -> bool:
+    """Whether a landed task context still counts as verified merged work.
+
+    Verified merges include the strict proven, soft satisfied-unproven, and
+    undeclared buckets. Degraded, explicitly unsatisfied, and malformed rows do
+    not count.
+    """
+    return classify_merged_acceptance_context(context) in {
+        "proven",
+        "satisfied_unproven",
+        "undeclared",
+    }
 
 
 def acceptance_is_consumed(recorded: Any) -> bool:
@@ -492,9 +555,18 @@ def _authorized_consumed_artifact_ids(task: Task) -> set[uuid.UUID]:
 
 
 def _normalize_consumed_artifact_ids(
-    task: Task, consumed_artifact_ids: Iterable[uuid.UUID | str] | None
+    task: Task,
+    consumed_artifact_ids: Iterable[uuid.UUID | str] | None,
+    *,
+    modern_agent: bool = False,
 ) -> list[uuid.UUID]:
     if consumed_artifact_ids is None:
+        if modern_agent:
+            # Modern agent omitted the field entirely — treat as no consumption.
+            # Do NOT fall back to delivered prerequisites; an omission from a
+            # current-generation agent means the handler did not render artifact
+            # prerequisites and therefore cannot have consumed any.
+            return []
         raw = _fallback_consumed_artifact_ids(task)
     else:
         raw = list(consumed_artifact_ids)
@@ -518,6 +590,8 @@ async def record_artifact_consumptions_for_task(
     task: Task,
     session,
     consumed_artifact_ids: Iterable[uuid.UUID | str] | None = None,
+    *,
+    modern_agent: bool = False,
 ) -> list[ArtifactConsumption]:
     """Persist consumption rows and upgrade matching producer verdicts.
 
@@ -525,7 +599,7 @@ async def record_artifact_consumptions_for_task(
     verdicts are left untouched, and existing proven/consumed verdicts are never
     downgraded.
     """
-    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids)
+    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids, modern_agent=modern_agent)
     if not ids:
         return []
 
@@ -613,49 +687,41 @@ def classify_merged_acceptance(task: Task) -> str:
     """Classify one merged task into the release acceptance buckets.
 
     Buckets are deliberately additive and fail-safe:
-      * ``proven`` — non-degraded merge with satisfied declared acceptance;
+      * ``proven`` — non-degraded merge with strict machine-checked proof;
+      * ``satisfied_unproven`` — non-degraded merge with soft satisfied
+        declared acceptance;
       * ``declared_unsatisfied`` — non-degraded merge with declared evidence
         that failed;
+      * ``undeclared`` — non-degraded merge with no recorded declaration;
       * ``merged_unverified_degraded`` — merge whose verification was degraded;
-      * ``no_declaration`` — non-degraded merge with no recorded declaration.
+      * ``malformed`` — non-degraded recorded verdict dict with no conclusive
+        satisfied / unsatisfied value.
 
-    Undeclared / legacy rows stay neutral by falling into ``no_declaration``.
+    Undeclared / legacy rows stay neutral by falling into ``undeclared``.
     """
     if merge_verification_status(task) == "unverified_degraded":
         return "merged_unverified_degraded"
-    recorded = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-    if not isinstance(recorded, dict):
-        return "no_declaration"
-    if acceptance_blocks_success(recorded):
-        return "declared_unsatisfied"
-    if acceptance_is_consumed(recorded):
-        return "consumed"
-    return "proven"
+    return classify_merged_acceptance_context(task.context or {})
 
 
 def summarize_version_acceptance_aggregate(
     tasks: Iterable[Task],
 ) -> dict[str, Any]:
     """Summarize one version window's merged tasks into acceptance buckets."""
-    aggregate: dict[str, Any] = {
-        "merged": 0,
-        "proven": 0,
-        "consumed": 0,
-        "declared_unsatisfied": 0,
-        "merged_unverified_degraded": 0,
-        "no_declaration": 0,
-    }
+    aggregate: dict[str, Any] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
+    aggregate["total"] = 0
     for task in tasks:
         if task.status != TaskStatus.COMPLETED:
             continue
-        aggregate["merged"] += 1
-        bucket = classify_merged_acceptance(task)
-        aggregate[bucket] += 1
-        if bucket == "consumed":
-            aggregate["proven"] += 1
+        aggregate["total"] += 1
+        aggregate[classify_merged_acceptance(task)] += 1
     aggregate["proven_rate"] = (
-        round(aggregate["proven"] / aggregate["merged"], 3)
-        if aggregate["merged"] > 0
+        round(aggregate["proven"] / aggregate["total"], 3)
+        if aggregate["total"] > 0
         else None
+    )
+    satisfied = aggregate["proven"] + aggregate["satisfied_unproven"]
+    aggregate["satisfied_rate"] = (
+        round(satisfied / aggregate["total"], 3) if aggregate["total"] > 0 else None
     )
     return aggregate

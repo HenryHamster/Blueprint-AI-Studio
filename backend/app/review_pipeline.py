@@ -482,6 +482,11 @@ _PIPELINE_ACTIVE_STATUSES = (
     # producing duplicate re-spawns against an unchanged head (PR #8742) and
     # missed cross-type defers (PR #8746).
     TaskStatus.BLOCKED,
+    # PARKED holds its active-idempotency slot for the same reason: alembic 0199
+    # widened ux_task_active_idempotency_key to count PARKED. Treat it as live in
+    # dedup or a parked task is invisible while the index reserves its key,
+    # reproducing the exact duplicate-re-spawn bug BLOCKED was added to close.
+    TaskStatus.PARKED,
 )
 
 SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY = "scope_overflow_pr_signal_emitted"

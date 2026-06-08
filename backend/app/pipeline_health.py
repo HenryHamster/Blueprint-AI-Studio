@@ -21,7 +21,11 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import (
+    consumed_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.digest_direction_progress import pr_ineligible_created_in_entry
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
@@ -402,6 +406,8 @@ async def compute_pipeline_health_summary(
 
             prs_merged = 0
             verified_merged = 0
+            proven_merged = 0
+            consumed_merged = 0
             prs_rejected = 0
             tasks_created_total = 0
             pr_ineligible_total = 0
@@ -414,6 +420,8 @@ async def compute_pipeline_health_summary(
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
                         verified_merged += verified_merged_count(entry)
+                        proven_merged += proven_merged_count(entry)
+                        consumed_merged += consumed_merged_count(entry)
                         prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
                         pr_ineligible_total += pr_ineligible_created_in_entry(entry)
@@ -452,6 +460,9 @@ async def compute_pipeline_health_summary(
                     "possibly_complete": bool(d.get("possibly_complete", False)),
                     "category": d.get("category"),
                     "acceptance_rate": acceptance_rate,
+                    "verified_prs_merged": verified_merged,
+                    "proven_prs_merged": proven_merged,
+                    "consumed_prs_merged": consumed_merged,
                 }
             )
 
@@ -1107,9 +1118,23 @@ async def compute_pipeline_health_summary(
 
     from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
 
+    # Park/wake operational health (read-only) — PARKED population + wake-delivery
+    # backlog for the park-and-wake primitive. Degrades to None on any error so a
+    # transient query failure never sinks the whole health summary.
+    park_wake_health: Dict[str, Any] | None = None
+    try:
+        from app.digest_metrics import compute_park_wake_health
+
+        park_wake_health = await compute_park_wake_health(session, project_id)
+    except Exception:
+        logger.exception(
+            "[ANALYTICS] park_wake_health computation failed (non-critical)"
+        )
+
     return {
         "success_rate": success_rate,
         "trend": trend,
+        "park_wake_health": park_wake_health,
         "failure_distribution": failure_distribution,
         "failure_taxonomy": failure_taxonomy,
         "failure_taxonomy_by_scope": failure_taxonomy_by_scope,

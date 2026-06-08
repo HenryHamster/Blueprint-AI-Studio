@@ -50,6 +50,7 @@ import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
+import { PipelineRegressionsPanel } from './components/PipelineRegressionsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
@@ -765,6 +766,12 @@ export default function App() {
           void s.fetchProjects(true);
           void s.fetchTasks();
         }}
+        onProjectCancelled={() => {
+          // Cancel is terminal for the project and its active tasks. Refetch
+          // both views so the CANCELLED badge and task list update immediately.
+          void s.fetchProjects(true);
+          void s.fetchTasks();
+        }}
         onProjectPaused={() => {
           // Pause is a reversible flag on the project row; refetch so the
           // dashboard reflects the new paused state (pill + menu label).
@@ -839,7 +846,14 @@ export default function App() {
       <DiagnosticsPanel
         diagnostics={s.diagnostics}
         onViewTask={handleViewTask}
+        handleRetry={s.handleRetry}
+        handleCancel={s.handleCancel}
+        setConfirmDialog={s.setConfirmDialog}
       />
+
+      {s.userRole === 'admin' && s.selectedProjectId && (
+        <PipelineRegressionsPanel projectId={s.selectedProjectId} />
+      )}
 
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 

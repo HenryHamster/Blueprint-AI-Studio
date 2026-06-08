@@ -9,6 +9,7 @@ research_completion.py, strategic_completion.py).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -81,6 +82,9 @@ from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
+
+
+_COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -2000,7 +2004,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
 async def _persist_compute_experiment_knowledge_best_effort(
     task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
-) -> None:
+) -> bool:
     """Persist a compute_experiment's measured verdict as durable knowledge.
 
     Best-effort, additive, and self-contained: it runs only when the experiment
@@ -2012,7 +2016,7 @@ async def _persist_compute_experiment_knowledge_best_effort(
     """
     measurement = _extract_compute_measurement(logs)
     if measurement is None:
-        return  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
+        return True  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
     outcome, cost = measurement
     try:
         from app.knowledge_completion import persist_compute_experiment_knowledge
@@ -2032,10 +2036,123 @@ async def _persist_compute_experiment_knowledge_best_effort(
             task.id,
             exc_info=True,
         )
+        return False
+    return True
+
+
+async def _finalize_compute_experiment(
+    session: AsyncSession,
+    task: Task,
+    status: TaskStatus,
+    logs: str,
+    criterion: Optional[dict],
+    *,
+    owns_commit: bool,
+) -> None:
+    """Persist a compute_experiment's terminal mutation, committing only if owned.
+
+    The single seam every terminal branch of ``_handle_compute_experiment_completion``
+    funnels through so commit ownership is consistent:
+
+    * ``owns_commit=True`` (the direct post-commit dispatch path): commit the
+      task mutation, broadcast the status change, and persist durable knowledge —
+      today's behaviour, unchanged.
+    * ``owns_commit=False`` (the wake-delivery path): mutate only. The caller —
+      ``task_lifecycle.deliver_wake`` via ``reaper_sweeps.sweep_deliver_task_wakes``
+      — owns the single commit that covers BOTH the FIRED→DELIVERED flip and this
+      task advance, and runs ``run_compute_wake_post_commit`` for the broadcast +
+      knowledge AFTER it commits (so the KnowledgeDocument's own internal commit
+      cannot release the delivery row lock mid-batch).
+    """
+    session.add(task)
+    if not owns_commit:
+        return
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": status},
+    )
+    await _persist_compute_experiment_knowledge_best_effort(
+        task, logs, criterion, session
+    )
+
+
+async def run_compute_wake_post_commit(session: AsyncSession, registration) -> bool:
+    """Post-commit broadcast + durable knowledge for a wake-finalized compute task.
+
+    Invoked by ``reaper_sweeps.sweep_deliver_task_wakes`` AFTER it commits a
+    delivered ``compute_job_terminal`` registration. Mirrors the side effects the
+    direct completion path performs inside ``_finalize_compute_experiment`` with
+    ``owns_commit=True`` — but deferred until after the delivery commit so the
+    KnowledgeDocument persistence (which commits internally) can never release the
+    delivery row lock before its sibling registrations are processed.
+
+    Strictly best-effort and fully self-contained: a no-op for any non-compute
+    wake kind, and any failure is reported back as ``False`` so the sweep can
+    retry a delivered registration carrying the durable marker.
+    """
+    from app.compute_jobs import (
+        COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        build_compute_result_logs,
+    )
+    from app.models import ComputeJob
+
+    if registration.wake_source_kind != COMPUTE_JOB_TERMINAL_WAKE_KIND:
+        return True
+    try:
+        task = await session.get(Task, registration.task_id)
+        if task is None:
+            return False
+        marker = dict(registration.source_metadata or {})
+        marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
+        marker_meta["attempts"] = int(marker_meta.get("attempts", 0) or 0) + 1
+        marker_meta["updated_at"] = _utcnow().isoformat()
+        if "started_at" not in marker_meta:
+            marker_meta["started_at"] = marker_meta["updated_at"]
+        marker[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = marker_meta
+        registration.source_metadata = marker
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": task.status},
+        )
+        job = None
+        if registration.wake_source_ref:
+            with contextlib.suppress(ValueError, TypeError):
+                job = await session.get(
+                    ComputeJob, uuid.UUID(str(registration.wake_source_ref))
+                )
+        if job is None:
+            return False
+        logs = build_compute_result_logs(job)
+        criterion = (task.context or {}).get("compute_success_criterion")
+        persisted = await _persist_compute_experiment_knowledge_best_effort(
+            task, logs, criterion, session
+        )
+        if not persisted:
+            return False
+        marker = dict(registration.source_metadata or {})
+        marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+        registration.source_metadata = marker
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
+        await session.commit()
+        return True
+    except Exception:  # noqa: BLE001 — post-commit effects must never break the sweep
+        logger.warning(
+            "[COMPUTE] Post-commit wake side effects failed for task %s",
+            getattr(registration, "task_id", None),
+            exc_info=True,
+        )
+        return False
 
 
 async def _handle_compute_experiment_completion(
-    task: Task, logs: str, session: AsyncSession
+    task: Task, logs: str, session: AsyncSession, *, owns_commit: bool = True
 ):
     """Gate and persist a compute_experiment task's terminal job result.
 
@@ -2055,6 +2172,18 @@ async def _handle_compute_experiment_completion(
         they pass the gate and surface through the task as COMPLETED with the
         kill outcome recorded — they are intentional terminal outcomes, not
         crashes.
+
+    Commit ownership (``owns_commit``): every terminal branch funnels through
+    :func:`_finalize_compute_experiment`.
+
+      * ``owns_commit=True`` (default — the direct ``_process_post_commit``
+        dispatch path): commit the mutation, broadcast, and persist knowledge
+        here, as before.
+      * ``owns_commit=False`` (the wake-delivery path, called from
+        ``task_lifecycle.deliver_wake``): mutate only, no internal commit — the
+        caller's single commit covers both the wake FIRED→DELIVERED flip and this
+        task advance atomically, and runs ``run_compute_wake_post_commit`` for the
+        broadcast + knowledge AFTER it commits.
     """
     verdict = evaluate_terminal_output(task, logs)
 
@@ -2081,20 +2210,18 @@ async def _handle_compute_experiment_completion(
         measurement = _extract_compute_measurement(logs)
         if measurement is None:
             record_failed_gate(task, verdict)
-            session.add(task)
-            await session.commit()
-            await broadcast_to_project(
-                str(task.project_id),
-                "task_updated",
-                {"task_id": str(task.id), "status": TaskStatus.FAILED},
-            )
             logger.info(
                 "[COMPUTE] Prerequisite-mode task %s produced no measured verdict: %s",
                 task.id,
                 verdict.reason,
             )
-            await _persist_compute_experiment_knowledge_best_effort(
-                task, logs, criterion, session
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
             )
             return
 
@@ -2131,31 +2258,22 @@ async def _handle_compute_experiment_completion(
                 result_reference=result_reference,
             )
         task.status = TaskStatus.COMPLETED
-        session.add(task)
-        await session.commit()
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
-        )
         logger.info(
             "[COMPUTE] Prerequisite-mode task %s completed with measured verdict",
             task.id,
         )
-        await _persist_compute_experiment_knowledge_best_effort(
-            task, logs, criterion, session
+        await _finalize_compute_experiment(
+            session,
+            task,
+            TaskStatus.COMPLETED,
+            logs,
+            criterion,
+            owns_commit=owns_commit,
         )
         return
 
     if not verdict.passed:
         record_failed_gate(task, verdict)
-        session.add(task)
-        await session.commit()
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.FAILED},
-        )
         logger.info(
             "[COMPUTE] Task %s did not clear the metric gate: %s",
             task.id,
@@ -2165,8 +2283,13 @@ async def _handle_compute_experiment_completion(
         # measurement but missed its declared criterion still becomes durable,
         # queryable knowledge ("we tried X and it did NOT meet the bar"), so a
         # later cycle does not re-pose the question and re-spend.
-        await _persist_compute_experiment_knowledge_best_effort(
-            task, logs, criterion, session
+        await _finalize_compute_experiment(
+            session,
+            task,
+            TaskStatus.FAILED,
+            logs,
+            criterion,
+            owns_commit=owns_commit,
         )
         return
 
@@ -2214,21 +2337,19 @@ async def _handle_compute_experiment_completion(
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
     task.status = TaskStatus.COMPLETED
-    session.add(task)
-    await session.commit()
-    await broadcast_to_project(
-        str(task.project_id),
-        "task_updated",
-        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
-    )
     logger.info(
         "[COMPUTE] Task %s passed the metric gate and completed", task.id
     )
     # Persist the measured verdict as durable, queryable knowledge so future
     # research/strategist cycles can discover that this experiment already ran
     # and what it found, the same way web_research/design results survive.
-    await _persist_compute_experiment_knowledge_best_effort(
-        task, logs, criterion, session
+    await _finalize_compute_experiment(
+        session,
+        task,
+        TaskStatus.COMPLETED,
+        logs,
+        criterion,
+        owns_commit=owns_commit,
     )
 
 

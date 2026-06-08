@@ -707,6 +707,39 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('5 cycles');
     expect(result).toContain('3 merged');
     expect(result).toContain('1 failed');
+    expect(result).not.toContain('proven');
+    expect(result).not.toContain('consumed downstream');
+  });
+
+  it('renders proven merges with consumed downstream subset when present', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-proof',
+      text: 'close proof gap',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 4,
+      prs_merged: 5,
+      proven_prs_merged: 2,
+      consumed_prs_merged: 1,
+    }]);
+    expect(result).toContain('5 merged');
+    expect(result).toContain('2 proven (1 consumed downstream)');
+  });
+
+  it('omits zero-only proof fields from legacy summaries', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy-proof',
+      text: 'legacy direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      prs_merged: 2,
+      proven_prs_merged: 0,
+      consumed_prs_merged: 0,
+    }]);
+    expect(result).toContain('2 merged');
+    expect(result).not.toContain('0 proven');
+    expect(result).not.toContain('consumed downstream');
   });
 
   it('shows SATURATED flag when applicable', () => {

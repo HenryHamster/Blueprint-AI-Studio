@@ -94,6 +94,27 @@ _COMPUTE_JOB_PRELAUNCH_STATUSES = {
     ComputeJobStatus.STARTING,
 }
 
+# Wake-source kind for the task park-and-wake primitive. A compute_experiment
+# task parks on this kind with ``wake_source_ref=str(job.id)`` after launching
+# its budgeted job instead of poll-pinning its agent VM; the monitor fires the
+# wake EXACTLY ONCE when the job reaches a terminal state, and the leader-owned
+# wake-delivery worker finalizes the parked task through the compute_experiment
+# completion path. Mirrored by the agent handler and ``deliver_wake``.
+COMPUTE_JOB_TERMINAL_WAKE_KIND = "compute_job_terminal"
+
+# How each terminal ComputeJobOutcome maps to the (intentional, killed_by)
+# disposition the agent used to compute client-side. SUCCESS, the budget/deadline
+# kills, and CANCELLED are all INTENTIONAL terminal outcomes (the substrate did
+# its job); only a genuine command FAILURE — or an unknown outcome — is a
+# non-intentional failure.
+_COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] = {
+    ComputeJobOutcome.SUCCESS: (True, None),
+    ComputeJobOutcome.CANCELLED: (True, None),
+    ComputeJobOutcome.TIMED_OUT: (True, "deadline"),
+    ComputeJobOutcome.SPEND_CAP_EXCEEDED: (True, "budget"),
+    ComputeJobOutcome.FAILURE: (False, None),
+}
+
 
 def clamp_spend_cap_usd(raw_value: float) -> float:
     return max(
@@ -400,6 +421,17 @@ async def kill_compute_job(
     # An operator-killed job may still have written durable artifacts before
     # teardown — link them as a first-class result (best-effort, see helper).
     await _link_terminal_artifact(session, job)
+    # Fire the compute-job-terminal wake so any PARKED task waiting on this
+    # job wakes immediately rather than sitting until its park deadline.
+    # Mirrors the monitor path (see _process_single_compute_job).
+    if job.task_id is not None:
+        from app.task_lifecycle import fire_task_wakes
+
+        await fire_task_wakes(
+            session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job_id),
+        )
     await session.commit()
     await session.refresh(job)
     return job
@@ -499,7 +531,15 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
 
     for job in jobs:
         async with session_factory() as session:
-            live = await session.get(ComputeJob, job.id)
+            # Acquire the compute-job ROW lock (SELECT ... FOR UPDATE) for the
+            # whole finalize-and-fire critical section. This is the shared
+            # serialization point with the park registration's terminal recheck
+            # (task_lifecycle._maybe_fire_terminal_compute_wake): the monitor's
+            # terminal-fire and a parking task strictly serialize on this row, so
+            # a job that goes terminal before its task parks cannot lose the wake
+            # (terminal-before-park), and the park-before-terminal ordering stays
+            # idempotent. The lock is held until this session commits/rolls back.
+            live = await _lock_compute_job(session, job.id)
             if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
                 continue
             try:
@@ -510,6 +550,23 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
                 # the finalize commit (see _link_terminal_artifact).
                 if live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
                     await _link_terminal_artifact(session, live)
+                # If the job reached a terminal state this tick, fire the
+                # compute-job-terminal wake for the owning parked task in the
+                # SAME transaction as the finalization commit. Exactly-once: a
+                # later tick skips an already-terminal job (above), and
+                # fire_task_wakes only flips PENDING→FIRED — so duplicate monitor
+                # ticks can never double-fire or double-finalize.
+                if (
+                    live.task_id is not None
+                    and live.status in _COMPUTE_JOB_TERMINAL_STATUSES
+                ):
+                    from app.task_lifecycle import fire_task_wakes
+
+                    await fire_task_wakes(
+                        session,
+                        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                        wake_source_ref=str(live.id),
+                    )
                 await session.commit()
             except Exception as exc:
                 await session.rollback()
@@ -710,6 +767,93 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+
+
+def _coerce_metric_number(value: Any) -> float | int | None:
+    """Numeric coercion mirroring the agent's ``numOrNull`` for reported metrics.
+
+    Accepts finite ints/floats and numeric strings; rejects bools, NaN/inf, and
+    non-numeric values so a reported metric can only land as a real number.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, str) and value.strip():
+        try:
+            num = float(value)
+        except ValueError:
+            return None
+        return num if num == num and num not in (float("inf"), float("-inf")) else None
+    return None
+
+
+def build_compute_result_logs(job: ComputeJob) -> str:
+    """Serialize a terminal :class:`ComputeJob` into the COMPUTE_RESULT artifact.
+
+    This is the backend-side equivalent of the JSON artifact the agent's
+    compute-experiment handler used to emit after polling the job to terminal: a
+    JSON object carrying the terminal ``outcome`` plus
+    ``final_cost_usd``/``accrued_cost_usd`` (and any command-reported experiment
+    metrics flattened to top-level numeric keys) that
+    ``_handle_compute_experiment_completion`` gates and persists. Now that a
+    compute_experiment task PARKS on its job instead of poll-pinning a VM, the
+    leader-owned wake worker builds this artifact straight from the job row so the
+    parked task is finalized with the honest terminal outcome, final cost, and
+    result reference — no agent monitoring required. Keeps the artifact shape in
+    one place, in sync with the agent's ``RESERVED_RESULT_KEYS``.
+    """
+    meta = job.polling_metadata or {}
+    # status/outcome may surface as the str-enum member OR a bare string depending
+    # on how the row was loaded; normalize to the string value either way.
+    outcome = getattr(job.outcome, "value", job.outcome)
+    status_value = getattr(job.status, "value", job.status)
+    # Coerce the normalized string outcome to the enum so the lookup works
+    # whether the ORM loaded the column as a ComputeJobOutcome enum instance or
+    # as a raw string (e.g. "SPEND_CAP_EXCEEDED").
+    try:
+        outcome_enum = ComputeJobOutcome(outcome) if outcome is not None else None
+    except ValueError:
+        outcome_enum = None
+    intentional, killed_by = (
+        _COMPUTE_OUTCOME_DISPOSITION.get(outcome_enum, (False, None))
+        if outcome_enum is not None
+        else (False, None)
+    )
+    final_cost = job.final_cost_usd
+    if final_cost is None:
+        final_cost = job.accrued_cost_usd
+    result: dict[str, Any] = {
+        "job_id": str(job.id),
+        "backend": job.backend,
+        "machine_type": job.machine_type,
+        "status": status_value,
+        # Prefer the honest outcome; fall back to the terminal status so the
+        # downstream gate still sees a non-empty outcome on a legacy row.
+        "outcome": outcome or status_value,
+        "intentional_terminal": intentional,
+        "killed_by": killed_by,
+        "final_cost_usd": final_cost,
+        "accrued_cost_usd": job.accrued_cost_usd,
+        "spend_cap_usd": job.spend_cap_usd,
+        "terminal_reason": job.terminal_reason,
+        "result_reference": job.result_reference,
+    }
+    # Flatten command-reported result metrics to top-level numeric keys so the
+    # success-criterion gate can read them by name, exactly as the agent did. A
+    # reported metric whose name collides with a job-level key is skipped so it
+    # can never overwrite the reserved field.
+    reported = meta.get("result_metrics")
+    if isinstance(reported, dict):
+        for name, value in reported.items():
+            if name in result:
+                continue
+            num = _coerce_metric_number(value)
+            if num is not None:
+                result[name] = num
+    return json.dumps(result)
 
 
 async def _link_terminal_artifact(session, job: ComputeJob) -> None:

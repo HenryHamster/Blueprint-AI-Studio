@@ -293,12 +293,19 @@ async def run_infra_recovery_and_hold_maintenance(
                     await session.execute(
                         select(Task.idempotency_key).where(
                             Task.idempotency_key.in_(_cand_idem_keys),
+                            # Mirror the ux_task_active_idempotency_key partial-index
+                            # predicate EXACTLY (migration 0199 includes BLOCKED +
+                            # PARKED). A status the index counts but this guard omits
+                            # lets a colliding requeue trip the unique-violation
+                            # IntegrityError on commit → whole-batch rollback.
                             Task.status.in_(
                                 [
                                     TaskStatus.QUEUED,
                                     TaskStatus.PROVISIONING,
                                     TaskStatus.IN_PROGRESS,
                                     TaskStatus.EVALUATING,
+                                    TaskStatus.BLOCKED,
+                                    TaskStatus.PARKED,
                                 ]
                             ),
                         )

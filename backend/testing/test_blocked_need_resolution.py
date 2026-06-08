@@ -70,12 +70,70 @@ def test_task_need_resolves_by_finding_hash():
     assert resolve_blocked_need(blocked, need, [foundation]) is foundation
 
 
+def test_task_need_resolves_uppercase_finding_hash_and_uuid():
+    foundation = _task(context={"finding_hash": "deadbeefcafe0001"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "DEADBEEFCAFE0001"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+    uuid_foundation = _task()
+    uuid_need = {"kind": "task", "ref": str(uuid_foundation.id).upper()}
+    assert resolve_blocked_need(blocked, uuid_need, [uuid_foundation]) is uuid_foundation
+
+
 def test_task_need_unmatched_ref_returns_none():
-    # A ref that is neither any candidate's id nor its finding-hash matches
-    # nothing (no longer rejected as "malformed" — it is simply unmatched).
+    # A title-like ref ("not-a-known-ref") is not an exact task ref (UUID /
+    # finding hash), so the resolver short-circuits to None under the shared
+    # exact-task-ref policy — never a fuzzy match against the candidate's title.
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": "not-a-known-ref"}
     assert resolve_blocked_need(blocked, need, [_task()]) is None
+
+
+def test_task_need_title_like_ref_never_matches_titled_candidate():
+    # Even when a candidate's title equals the title-like task ref, a kind=task
+    # need must NOT fuzzy-match it: task resolution is by id / finding hash only.
+    candidate = _task(title="Build the auth subsystem")
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "Build the auth subsystem"}
+    assert resolve_blocked_need(blocked, need, [candidate]) is None
+
+
+# ── shared exact-task-ref policy ─────────────────────────────────────────────
+
+def test_is_exact_task_ref_accepts_uuid_and_finding_hash():
+    from app.task_blocked import is_exact_task_ref
+
+    assert is_exact_task_ref(str(uuid.uuid4())) is True
+    assert is_exact_task_ref("deadbeefcafe0001") is True  # 16-char finding hash
+    assert is_exact_task_ref("DEADBEEFCAFE0001") is True  # case-insensitive hex
+
+
+def test_is_exact_task_ref_rejects_title_like_and_malformed():
+    from app.task_blocked import is_exact_task_ref
+
+    assert is_exact_task_ref("Build the auth subsystem") is False
+    assert is_exact_task_ref("auth-subsystem") is False
+    assert is_exact_task_ref("abc123") is False  # too short
+    assert is_exact_task_ref("deadbeefcafe000") is False  # 15 chars, not a hash
+    assert is_exact_task_ref("") is False
+    assert is_exact_task_ref(None) is False
+    assert is_exact_task_ref(42) is False
+
+
+def test_is_foundation_demand_need_policy():
+    from app.task_blocked import is_foundation_demand_need
+
+    # Capability needs are foundation demand regardless of ref shape.
+    assert is_foundation_demand_need({"kind": "capability", "ref": "payment-core"}) is True
+    # Exact task refs are foundation demand; title-like task refs are NOT.
+    assert is_foundation_demand_need({"kind": "task", "ref": str(uuid.uuid4())}) is True
+    assert is_foundation_demand_need({"kind": "task", "ref": "deadbeefcafe0001"}) is True
+    assert is_foundation_demand_need({"kind": "task", "ref": "Build the harness"}) is False
+    # pr needs and malformed input are never foundation demand.
+    assert is_foundation_demand_need({"kind": "pr", "ref": "42"}) is False
+    assert is_foundation_demand_need({"kind": "capability", "ref": ""}) is False
+    assert is_foundation_demand_need(None) is False
 
 
 # ── kind='pr' ────────────────────────────────────────────────────────────────

@@ -1738,14 +1738,46 @@ describe('formatProjectContext', () => {
         trend: 'stable',
         failure_distribution: {},
         direction_stats: [
-          { direction_id: 'd-abcdef12345678', cycles: 5, possibly_saturated: false, conversion_rate: 0.42 },
+          {
+            direction_id: 'd-abcdef12345678',
+            cycles: 5,
+            possibly_saturated: false,
+            conversion_rate: 0.42,
+            proven_prs_merged: 2,
+            consumed_prs_merged: 1,
+          },
         ],
       },
     };
     const result = formatProjectContext(ctx, 'create');
     expect(result).toContain('cvr 0.42');
     expect(result).toContain('5 cycles');
+    expect(result).toContain('proof 2 proven (1 consumed downstream)');
     expect(result).not.toContain('merge rate');
+  });
+
+  it('omits zero-only pipeline direction proof split for legacy payloads', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.85,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [
+          {
+            direction_id: 'd-legacy12345678',
+            cycles: 2,
+            possibly_saturated: false,
+            conversion_rate: 0.5,
+            proven_prs_merged: 0,
+            consumed_prs_merged: 0,
+          },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('cvr 0.5');
+    expect(result).not.toContain('0 proven');
+    expect(result).not.toContain('consumed downstream');
   });
 
   it('includes scope-specific pipeline health stat when by_scope is provided', () => {

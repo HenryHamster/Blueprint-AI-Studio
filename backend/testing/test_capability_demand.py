@@ -222,6 +222,63 @@ async def test_collect_is_project_scoped(db_session):
 
 
 @pytest.mark.asyncio
+async def test_collect_excludes_title_like_task_ref_from_missing_foundation_demand(
+    db_session,
+):
+    """A BLOCKED dependent whose kind=task need carries a TITLE-LIKE ref (free
+    prose, not a task UUID / finding hash) must NOT surface as missing-foundation
+    demand: a title-like task ref names no machine-resolvable foundation, so it
+    can never be a creatable "missing task". An EXACT task ref (UUID) for an
+    absent foundation, and a capability need, DO surface — proving the collector
+    excludes only the malformed title-like task refs, not exact task demand."""
+    import uuid as _uuid
+
+    project = await _make_project(db_session)
+
+    # Title-like kind=task refs — the malformed case this policy rejects. These
+    # mimic legacy/hand-written rows that bypassed build_need's validation.
+    title_like_a = _blocked(
+        project.id,
+        {"kind": "task", "ref": "Build the seeded evaluation harness"},
+        direction_id="d-title-a",
+    )
+    title_like_b = _blocked(
+        project.id,
+        {"kind": "task", "ref": "auth-subsystem", "label": "Auth subsystem"},
+        direction_id="d-title-b",
+    )
+    # Control 1: an EXACT (UUID) task ref whose foundation is absent → real demand.
+    exact_task_ref = str(_uuid.uuid4())
+    exact_dep = _blocked(
+        project.id,
+        {"kind": "task", "ref": exact_task_ref, "label": "the foundation"},
+        direction_id="d-exact",
+    )
+    # Control 2: a capability need with no provider → real demand.
+    cap_dep = _blocked(
+        project.id,
+        {"kind": "capability", "ref": "payment-core"},
+        direction_id="d-cap",
+    )
+    db_session.add_all([title_like_a, title_like_b, exact_dep, cap_dep])
+    await db_session.commit()
+
+    result = await collect_missing_capability_demand(db_session, project.id)
+
+    # Only the exact task ref and the capability need are demand; neither
+    # title-like task ref appears under ANY identity.
+    assert result["total"] == 2
+    refs = {(e["kind"], e["ref"]) for e in result["demands"]}
+    assert ("task", exact_task_ref) in refs
+    assert ("capability", "payment-core") in refs
+    assert all(
+        e["ref"] not in ("Build the seeded evaluation harness", "auth-subsystem")
+        for e in result["demands"]
+    )
+    assert all(e["kind"] != "task" or e["ref"] == exact_task_ref for e in result["demands"])
+
+
+@pytest.mark.asyncio
 async def test_collect_folds_giveup_cancelled_within_lookback(db_session):
     """A give-up-CANCELLED dependent (missing-foundation retirement) within the
     lookback surfaces as already_cancelled demand and aggregates with a live

@@ -307,6 +307,66 @@ describe('writeDoneHelper — thinning categories gate', () => {
   });
 });
 
+// ── writeDoneHelper — consumed_artifact_ids reporting ─────────────────────────
+describe('writeDoneHelper — consumed_artifact_ids handling', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('emits consumed_artifact_ids: [] when consumed-artifacts file is malformed (not a JSON array)', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'consumed-test-1',
+      workBranch: 'blueprint/consumed-test-1',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // The malformed-file branch must set CONSUMED_ARTIFACTS_JSON to "[]"
+    // rather than leaving it empty (which would omit the field from the payload).
+    expect(doneScript).toContain('CONSUMED_ARTIFACTS_JSON="[]"');
+    // The error message should mention the empty report outcome
+    expect(doneScript).toContain('reporting empty consumed_artifact_ids');
+    // The valid-array branch must still filter and deduplicate
+    expect(doneScript).toContain('select(type == "string" and length > 0)');
+    // The payload construction must include the field when CONSUMED_ARTIFACTS_JSON is set
+    expect(doneScript).toContain('{consumed_artifact_ids: $consumed_artifacts}');
+  });
+
+  it('omits consumed_artifact_ids when consumed-artifacts file does not exist', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'consumed-test-2',
+      workBranch: 'blueprint/consumed-test-2',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // When file doesn't exist, CONSUMED_ARTIFACTS_JSON stays "" so the payload
+    // uses null (via ${CONSUMED_ARTIFACTS_JSON:-null}) and the field is omitted.
+    expect(doneScript).toContain('CONSUMED_ARTIFACTS_JSON=""');
+    expect(doneScript).toContain('${CONSUMED_ARTIFACTS_JSON:-null}');
+    // The conditional merge omits the field when consumed_artifacts is null/falsy
+    expect(doneScript).toContain('if $consumed_artifacts then {consumed_artifact_ids: $consumed_artifacts} else {} end');
+  });
+});
+
 // ── writeDoneHelper — --already-done (affirmative no-op completion) ────────────
 describe('writeDoneHelper — --already-done no-op completion', () => {
   let capturedScripts: Record<string, string> = {};

@@ -16,6 +16,8 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobOutcome,
+    ComputeJobStatus,
     DeploymentState,
     DeploymentStatus,
     KnowledgeDocument,
@@ -26,6 +28,8 @@ from app.models import (
     ProjectStatus,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
+    WakeDeliveryState,
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
@@ -8133,18 +8137,48 @@ def test_blocked_need_schema_parses_valid_and_rejects_malformed():
     # Absent need is fine — backward compatible.
     assert AgentStatusPayload(**base).blocked_need is None
 
-    # Valid need with each recognized kind.
-    for kind, ref in (("task", "t-abc"), ("pr", "7910"), ("capability", "auth")):
+    # Valid need with each recognized kind. kind=task requires an EXACT ref (a
+    # task UUID / finding hash), so the task case uses a real id.
+    foundation_id = str(uuid.uuid4())
+    for kind, ref in (("task", foundation_id), ("pr", "7910"), ("capability", "auth")):
         parsed = AgentStatusPayload(**base, blocked_need={"kind": kind, "ref": ref})
         assert parsed.blocked_need is not None
         assert parsed.blocked_need.kind == kind
         assert parsed.blocked_need.ref == ref
 
+    # A finding-hash task ref is also exact and accepted.
+    parsed_hash = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "deadbeefcafe0001"}
+    )
+    assert parsed_hash.blocked_need.ref == "deadbeefcafe0001"
+
+    parsed_upper = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "DEADBEEFCAFE0001"}
+    )
+    assert parsed_upper.blocked_need.ref == "deadbeefcafe0001"
+
+    parsed_uuid_upper = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": foundation_id.upper()}
+    )
+    assert parsed_uuid_upper.blocked_need.ref == foundation_id
+
     # Optional human label is accepted.
     with_label = AgentStatusPayload(
-        **base, blocked_need={"kind": "task", "ref": "t-x", "label": "the foundation"}
+        **base,
+        blocked_need={"kind": "task", "ref": foundation_id, "label": "the foundation"},
     )
     assert with_label.blocked_need.label == "the foundation"
+
+    # A title-like kind=task ref is NOT an exact task ref — it is gracefully
+    # DROPPED to None (identical to an absent need), so the BLOCKED status report
+    # still succeeds rather than 422-ing the whole request. Named foundations
+    # belong to kind=capability.
+    dropped = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "Build the auth subsystem"}
+    )
+    assert dropped.blocked_need is None
+    dropped2 = AgentStatusPayload(**base, blocked_need={"kind": "task", "ref": "t-x"})
+    assert dropped2.blocked_need is None
 
     # Malformed: unrecognized kind.
     with pytest.raises(ValidationError):
@@ -8191,12 +8225,15 @@ async def test_blocker_persists_structured_need_into_context(
 
     token = create_agent_token(str(task.id), "agent-vm-blocked-need")
     headers = {"x-agent-token": token}
+    foundation_ref = str(uuid.uuid4())
     payload = {
         "task_id": str(task.id),
         "status": "FAILED",
         "failure_category": "BLOCKED_PRECONDITION",
         "logs": "BLOCKER: waiting on the shared auth foundation",
-        "blocked_need": {"kind": "task", "ref": "t-foundation-1", "label": "auth"},
+        # kind=task requires an EXACT ref (UUID / finding hash) under the shared
+        # exact-task-ref policy.
+        "blocked_need": {"kind": "task", "ref": foundation_ref, "label": "auth"},
     }
     resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
@@ -8205,7 +8242,60 @@ async def test_blocker_persists_structured_need_into_context(
     await db_session.refresh(task)
     assert task.status == TaskStatus.BLOCKED
     need = ((task.context or {}).get("blocker") or {}).get("need")
-    assert need == {"kind": "task", "ref": "t-foundation-1", "label": "auth"}
+    assert need == {"kind": "task", "ref": foundation_ref, "label": "auth"}
+
+
+@pytest.mark.asyncio
+async def test_blocker_title_like_task_need_dropped_but_still_blocks(
+    client: AsyncClient, db_session, mocker
+):
+    """A BLOCKER carrying a title-like kind=task need still transitions the task
+    into BLOCKED, but the malformed need is dropped (not persisted) rather than
+    422-ing the status report — backward-compatible with an absent need."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Title-like need", user_id="test-user-title-like")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-title-like",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-title-like")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "BLOCKED_PRECONDITION",
+        "logs": "BLOCKER: waiting on the shared auth foundation",
+        "blocked_need": {"kind": "task", "ref": "Build the auth subsystem"},
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    # The malformed title-like task need was dropped — no machine-resolvable need.
+    blocker = (task.context or {}).get("blocker") or {}
+    assert blocker.get("need") is None
+    assert not blocker.get("needs")
 
 
 @pytest.mark.asyncio
@@ -11561,6 +11651,111 @@ async def test_agent_status_completed_downstream_artifact_stamps_and_delivers(
             "artifact_type": ArtifactType.SMOKETEST_RESULT.value,
             "source_task_id": str(task.id),
             "storage_uri": storage_uri,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_status_completed_downstream_artifact_delivers_dependent_beyond_scan_cap(
+    client: AsyncClient, db_session, mocker
+):
+    """A real dependent beyond the first page of irrelevant queued tasks still receives delivery."""
+    from app.artifact_prerequisites import (
+        ARTIFACT_PREREQUISITES_KEY,
+        _DEPENDENT_SCAN_CAP,
+    )
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Scan Cap Test",
+        user_id="test-user-downstream-scan-cap",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-scan-cap",
+        status=TaskStatus.IN_PROGRESS,
+        created_at=datetime.utcnow() - timedelta(minutes=10),
+    )
+    blocker = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "blocker"}],
+        vm_instance_id="agent-vm-downstream-scan-cap-blocker",
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(minutes=11),
+    )
+    db_session.add_all([producer, blocker])
+    await db_session.commit()
+    await db_session.refresh(producer)
+    await db_session.refresh(blocker)
+
+    for i in range(_DEPENDENT_SCAN_CAP + 1):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": f"irrelevant-{i}"}],
+                vm_instance_id=f"agent-vm-downstream-scan-cap-irrelevant-{i}",
+                status=TaskStatus.QUEUED,
+                depends_on=[str(blocker.id)],
+                created_at=datetime.utcnow() - timedelta(minutes=9, seconds=_DEPENDENT_SCAN_CAP + 1 - i),
+            )
+        )
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-scan-cap-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(producer.id)],
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(producer.id), "agent-vm-downstream-scan-cap")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(producer.id),
+        "status": "COMPLETED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(select(Artifact).where(Artifact.task_id == producer.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+
+    await db_session.refresh(dependent)
+    assert (dependent.context or {})[ARTIFACT_PREREQUISITES_KEY] == [
+        {
+            "artifact_id": str(artifacts[0].id),
+            "logical_key": "producer-output-bundle",
+            "artifact_type": ArtifactType.SMOKETEST_RESULT.value,
+            "source_task_id": str(producer.id),
         }
     ]
 
@@ -18795,3 +18990,349 @@ async def test_agent_artifact_download_url_generic_storage_failure_returns_503(
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_terminal_before_park_callback_finalizes_once(
+    client: AsyncClient, db_session, mocker
+):
+    """Regression: a compute job that reaches terminal BEFORE the agent POSTs PARKED
+    must still wake and finalize the task EXACTLY ONCE through the real HTTP endpoint.
+
+    Drives the terminal-before-park ordering through the /api/agent/status route:
+      1. Seed a compute_experiment task and a ComputeJob already in SUCCEEDED state.
+      2. POST the same PARKED payload shape that compute-experiment.ts sends.
+      3. park_task's register-then-recheck fires the registration immediately (PENDING->FIRED).
+      4. sweep_deliver_task_wakes finalizes the task COMPLETED with the honest
+         compute_result/final_cost_usd — never a park_wake_timeout.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Terminal Before Park Endpoint", user_id="test-user-park-1"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: terminal before park via endpoint",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Seed a ComputeJob already in terminal SUCCEEDED state with a known cost.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.42,
+        completed_at=datetime.utcnow() - timedelta(seconds=10),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # No wake registration exists yet — the monitor fired nothing (lost-wakeup window).
+    pre_regs = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert pre_regs == [], "no registration should exist before the task parks"
+
+    # POST the same PARKED payload shape sent by agent/src/handlers/compute-experiment.ts
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "PARKED",
+            "park_request": {
+                "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                "wake_source_ref": str(job.id),
+                "wake_action": "finalize",
+                "deadline_seconds": 3600,
+                "reason": f"Parked on compute job {job.id} terminal",
+                "source_metadata": {
+                    "job_id": str(job.id),
+                    "experiment": "test-experiment",
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "parked"
+    assert data["task_id"] == str(task.id)
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    # The register-then-recheck in park_task must fire the registration immediately
+    # because the job was already terminal — it must NOT be left PENDING to time out.
+    regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    assert len(regs) == 1, "exactly one registration must be created"
+    reg = regs[0]
+    assert reg.delivery_state == WakeDeliveryState.FIRED, (
+        "park-time terminal recheck must fire the registration for an already-terminal job"
+    )
+    assert reg.fired_at is not None
+    assert reg.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
+    assert reg.wake_source_ref == str(job.id)
+
+    # The leader sweep finalizes the parked task exactly once.
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert task.status == TaskStatus.COMPLETED
+    assert task.parked_at is None
+    assert (task.context or {}).get("failure_category") != "park_wake_timeout"
+    compute_result = (task.plan_output or {}).get("compute_result")
+    assert compute_result is not None
+    assert compute_result["outcome"] == "SUCCESS"
+    assert compute_result["final_cost_usd"] == pytest.approx(0.42)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.result_state == "finalized"
+    assert reg.attempt_count == 1
+
+    # Idempotency: a second sweep is a strict no-op.
+    first_delivered_at = reg.delivered_at
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
+
+    db_session.expire_all()
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at
+    assert reg.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent(
+    client: AsyncClient, db_session, mocker
+):
+    """A duplicate PARKED POST (lost-response retry) must be idempotent.
+
+    The second POST on an already-PARKED task must return {"status": "parked"},
+    not create a second registration row, and not mutate the task or the
+    existing registration.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Park Idempotent Endpoint", user_id="test-user-park-2"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-idem-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: idempotent park retry",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.10,
+        completed_at=datetime.utcnow() - timedelta(seconds=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    token = create_agent_token(str(task.id), vm_id)
+    park_payload = {
+        "task_id": str(task.id),
+        "status": "PARKED",
+        "park_request": {
+            "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            "wake_source_ref": str(job.id),
+            "wake_action": "finalize",
+            "deadline_seconds": 3600,
+            "reason": f"Parked on compute job {job.id} terminal",
+            "source_metadata": {"job_id": str(job.id), "experiment": "test"},
+        },
+    }
+
+    # First POST: parks the task and creates+fires the registration.
+    resp1 = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={"x-agent-token": token},
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    regs_after_first = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_first) == 1
+    first_reg_id = regs_after_first[0].id
+    first_reg_state = regs_after_first[0].delivery_state
+    first_parked_at = task.parked_at
+
+    # Second POST: duplicate retry — must be idempotent.
+    resp2 = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+
+    # Task remains PARKED, no mutation.
+    assert task.status == TaskStatus.PARKED
+    assert task.parked_at == first_parked_at
+
+    # Still exactly one registration — no duplicate created.
+    regs_after_second = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_second) == 1, "duplicate POST must not create a second registration"
+    assert regs_after_second[0].id == first_reg_id
+    assert regs_after_second[0].delivery_state == first_reg_state
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
+    client: AsyncClient, db_session, mocker
+):
+    """A stale non-PARKED callback after parking must be rejected as a no-op.
+
+    Once a task is PARKED the wake-delivery worker owns it. A stale COMPLETED or
+    FAILED callback from the same agent VM must return {"status": "parked"} and
+    leave the task PARKED with the registration count unchanged.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Park Stale Callback Endpoint", user_id="test-user-park-3"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-stale-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: stale callback after park",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.05,
+        completed_at=datetime.utcnow() - timedelta(seconds=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    token = create_agent_token(str(task.id), vm_id)
+
+    # First: park the task normally.
+    park_resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "PARKED",
+            "park_request": {
+                "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                "wake_source_ref": str(job.id),
+                "wake_action": "finalize",
+                "deadline_seconds": 3600,
+                "reason": f"Parked on compute job {job.id} terminal",
+                "source_metadata": {"job_id": str(job.id), "experiment": "test"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert park_resp.status_code == 200
+    assert park_resp.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    regs_after_park = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_park) == 1
+    reg_state_after_park = regs_after_park[0].delivery_state
+
+    # Now POST a stale COMPLETED callback on the already-PARKED task.
+    stale_resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "stale completion from agent that already parked",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert stale_resp.status_code == 200
+    data = stale_resp.json()
+    assert data["status"] == "parked", (
+        "stale non-PARKED callback on a PARKED task must return parked no-op response"
+    )
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+
+    # Task must remain PARKED — the stale callback must not advance it.
+    assert task.status == TaskStatus.PARKED
+
+    # Registration count and state must be unchanged.
+    regs_after_stale = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_stale) == 1, "stale callback must not create or remove registrations"
+    assert regs_after_stale[0].delivery_state == reg_state_after_park

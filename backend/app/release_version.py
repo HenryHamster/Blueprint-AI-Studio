@@ -27,7 +27,7 @@ Public API:
 
   compute_version_acceptance_aggregate(session, project_id, *, since)
       Classify merged-since tasks by acceptance-evidence outcome
-      (proven / declared_unsatisfied / undeclared / total).
+      using the canonical acceptance aggregate buckets.
 
   recent_closed_versions(session, project_id, limit=5)
       Return the most recently closed/promoted versions for a project,
@@ -56,8 +56,8 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import (
-    CODE_ACCEPTANCE_VERDICT_KEY,
-    acceptance_blocks_success,
+    ACCEPTANCE_AGGREGATE_BUCKETS,
+    classify_merged_acceptance_context,
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import Project, ReleaseVersion, Task, TaskStatus
@@ -260,23 +260,19 @@ async def count_merged_since(
     "Merged" is defined as ``task.status = COMPLETED`` AND the task carrying
     the canonical integration-landing signal at or after ``since``.
 
-    ``updated_at`` is used as a proxy for merge time because no dedicated
-    merged-at column exists on Task.  It is set via ``onupdate`` so it
-    reflects the last status transition, which for a newly-merged task is
-    the merge itself.
+    The stable terminal timestamp comes from the last status transition in
+    ``status_log`` when available, with ``created_at`` as the legacy fallback.
+    That keeps post-terminal writes (for example consumption-proof updates to
+    a merged producer task) from re-opening the version window.
     """
-    stmt = (
-        select(func.count())
-        .select_from(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.updated_at >= since,
-            landed_signal_predicate(session),
-        )
+    stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
     )
-    result = await session.execute(stmt)
-    return int(result.scalar() or 0)
+    rows = (await session.execute(stmt)).scalars().all()
+    return sum(1 for task in rows if _task_completed_at(task) >= since)
 
 
 async def compute_version_acceptance_aggregate(
@@ -288,62 +284,67 @@ async def compute_version_acceptance_aggregate(
     """Classify version-window merged tasks by acceptance-evidence outcome.
 
     Operates over the same merged-since window as :func:`count_merged_since`
-    (``COMPLETED`` tasks carrying the canonical landing signal with
-    ``updated_at >= since``).  For each landed task it reads the durable
-    per-task code-acceptance verdict
-    (:data:`app.acceptance_gate.CODE_ACCEPTANCE_VERDICT_KEY`, stamped at land
-    time) off ``Task.context`` and buckets it:
+    (``COMPLETED`` tasks carrying the canonical landing signal whose stable
+    terminal timestamp is at or after ``since``).  For each landed task it
+    reads the durable ``Task.context`` and delegates to
+    :func:`app.acceptance_gate.classify_merged_acceptance_context`, so the
+    version-window aggregate uses the same bucket vocabulary as the Task-object
+    classifier used by final qualification storage.
 
-      - ``proven`` — a verdict was recorded AND is explicitly satisfied
-        (declared acceptance evidence that passed).
-      - ``declared_unsatisfied`` — a verdict was recorded AND is explicitly
-        unsatisfied per :func:`app.acceptance_gate.acceptance_blocks_success`
-        (declared acceptance evidence that did NOT pass).
-      - ``undeclared`` — no verdict key present.  This is the common, legacy,
-        and "declared no acceptance evidence" case; counted for visibility but
-        it must NEVER be held against promotion readiness.
-
-    Returns ``{proven, declared_unsatisfied, undeclared, total}``.  A malformed
-    recorded verdict (a dict that is neither satisfied nor explicitly
-    unsatisfied) is fail-safe — counted as ``undeclared`` so it never lowers
-    readiness.
+    Returns the canonical six bucket counts plus ``total``.  A malformed
+    recorded verdict is surfaced as ``malformed`` for visibility, but readiness
+    treats it as advisory only.
     """
-    stmt = select(Task.context).where(
+    stmt = select(Task).where(
         Task.project_id == project_id,
         Task.status == TaskStatus.COMPLETED,
-        Task.updated_at >= since,
         landed_signal_predicate(session),
+        Task.updated_at >= since,
     )
-    rows = list((await session.execute(stmt)).scalars().all())
+    rows = [
+        task
+        for task in (await session.execute(stmt)).scalars().all()
+        if _task_completed_at(task) >= since
+    ]
 
-    proven = 0
-    declared_unsatisfied = 0
-    undeclared = 0
-    for ctx in rows:
-        recorded = (
-            ctx.get(CODE_ACCEPTANCE_VERDICT_KEY) if isinstance(ctx, dict) else None
-        )
-        if recorded is None:
-            undeclared += 1
-        elif acceptance_blocks_success(recorded):
-            declared_unsatisfied += 1
-        elif isinstance(recorded, dict) and recorded.get("satisfied") is True:
-            proven += 1
-        else:
-            # Malformed/indeterminate recorded verdict — fail safe.
-            undeclared += 1
+    aggregate: dict[str, int] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
+    for task in rows:
+        bucket = classify_merged_acceptance_context(task.context if isinstance(task.context, dict) else {})
+        aggregate[bucket] += 1
 
-    return {
-        "proven": proven,
-        "declared_unsatisfied": declared_unsatisfied,
-        "undeclared": undeclared,
-        "total": len(rows),
-    }
+    aggregate["total"] = len(rows)
+    return aggregate
+
+
+def _task_completed_at(task: Task) -> datetime:
+    """Return the stable terminal timestamp for a task.
+
+    Uses the last status-transition entry in ``status_log`` when available;
+    falls back to ``created_at`` for legacy rows with no durable completion
+    entry. Message-only writes append to ``status_log`` too, so the cutoff must
+    ignore those audit entries.
+    """
+
+    def _strip_tz(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+    for entry in reversed(task.status_log or []):
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("msg")
+        if not isinstance(msg, str) or not msg.startswith("Status changed: "):
+            continue
+        try:
+            return _strip_tz(datetime.fromisoformat(entry["t"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    completed_at = task.created_at
+    return _strip_tz(completed_at)
 
 
 # Non-terminal task statuses — work that is still "in flight" against a version.
 # Mirrors the active-status set used by the idempotency partial index in
-# models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED.
+# models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED/PARKED.
 # COMPLETED/FAILED/CANCELLED are terminal and excluded.
 _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.QUEUED,
@@ -351,6 +352,7 @@ _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
     TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
 )
 
 
@@ -362,8 +364,8 @@ async def count_in_flight_tasks(
 
     "In flight" means the task is in a non-terminal status
     (``QUEUED`` / ``PROVISIONING`` / ``IN_PROGRESS`` / ``EVALUATING`` /
-    ``BLOCKED``) — work that a version cut does NOT stop. Such tasks keep
-    running and land against the freshly-opened next version, so the
+    ``BLOCKED`` / ``PARKED``) — work that a version cut does NOT stop. Such
+    tasks keep running and land against the freshly-opened next version, so the
     version-cut confirmation surfaces this count to make that consequence
     explicit.
 

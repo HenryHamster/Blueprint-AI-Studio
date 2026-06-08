@@ -193,7 +193,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                   </ResolvedReferenceLink>
                 </div>
               )}
-              {!isComputeJobActive(job) && job.accelerator_type && (() => {
+              {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;
                 const entries = Object.entries(metrics);

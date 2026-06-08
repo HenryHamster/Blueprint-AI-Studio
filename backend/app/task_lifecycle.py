@@ -33,6 +33,9 @@ from app.models import (
     Alert,
     AlertSeverity,
     ProjectStatus,
+    TaskWakeRegistration,
+    WakeAction,
+    WakeDeliveryState,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import (
@@ -283,10 +286,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
         .scalars()
         .all()
     )
-    return any(
-        (t.first_payload).get("type") in STRATEGIC_TASK_TYPES
-        for t in active
-    )
+    return any((t.first_payload).get("type") in STRATEGIC_TASK_TYPES for t in active)
 
 
 async def _increment_research_spawn_count(
@@ -1201,23 +1201,21 @@ async def _process_post_commit(
                                 )
                                 if reservation is not None and branch and base_branch:
                                     try:
-                                        _finalization = (
-                                            await attempt_pr_migration_finalization(
-                                                gh_token,
-                                                owner,
-                                                repo,
-                                                pr_number=pr_number,
-                                                pr_branch=branch,
-                                                target_branch=base_branch,
-                                                promotion_target=(
-                                                    _shared_state.get_project_promotion_target(
-                                                        _project
-                                                    )
-                                                    if _project is not None
-                                                    else None
-                                                ),
-                                                project_id=str(task.project_id),
-                                            )
+                                        _finalization = await attempt_pr_migration_finalization(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            pr_number=pr_number,
+                                            pr_branch=branch,
+                                            target_branch=base_branch,
+                                            promotion_target=(
+                                                _shared_state.get_project_promotion_target(
+                                                    _project
+                                                )
+                                                if _project is not None
+                                                else None
+                                            ),
+                                            project_id=str(task.project_id),
                                         )
                                     except Exception as _mf_exc:  # noqa: BLE001
                                         logger.warning(
@@ -1269,7 +1267,10 @@ async def _process_post_commit(
                                 task.context = {
                                     **(task.context or {}),
                                     "review_loop": {
-                                        **((task.context or {}).get("review_loop") or {}),
+                                        **(
+                                            (task.context or {}).get("review_loop")
+                                            or {}
+                                        ),
                                         "ci_waiting": True,
                                         "review_approved": True,
                                         "ci_passed": True,
@@ -2061,9 +2062,7 @@ async def _process_post_commit(
                             "with no concrete code defect, while CI is "
                             "authoritatively green. Treated as APPROVE._"
                         )
-                        feedback = (
-                            f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
-                        )
+                        feedback = f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -2813,18 +2812,14 @@ async def _process_post_commit(
                                             _orig_is_custom_staged_rollup
                                             and _orig_project is not None
                                         ):
-                                            _orig_integration_branch = (
-                                                _shared_state.get_project_integration_branch(
-                                                    _orig_project
-                                                )
+                                            _orig_integration_branch = _shared_state.get_project_integration_branch(
+                                                _orig_project
                                             )
                                             _landed_on_integration = (
-                                                base_branch
-                                                == _orig_integration_branch
+                                                base_branch == _orig_integration_branch
                                             )
                                             _landed_on_promotion = (
-                                                base_branch
-                                                == _orig_promotion_target
+                                                base_branch == _orig_promotion_target
                                             )
                                             if (
                                                 not _landed_on_integration
@@ -2838,23 +2833,19 @@ async def _process_post_commit(
                                                     merged_base_branch=base_branch,
                                                     source="task_lifecycle.review_merge_success",
                                                 )
-                                            _record_pr_merged = (
-                                                _landed_on_integration
-                                            )
+                                            _record_pr_merged = _landed_on_integration
                                             _terminal_rollup_merge = (
                                                 _landed_on_integration
                                                 or _landed_on_promotion
                                             )
                                         else:
-                                            _record_pr_merged = await (
-                                                merged_pr_counts_as_integration_landing(
-                                                    orig,
-                                                    _orig_project,
-                                                    session,
-                                                    pr_number=pr_number,
-                                                    merged_base_branch=base_branch,
-                                                    source="task_lifecycle.review_merge_success",
-                                                )
+                                            _record_pr_merged = await merged_pr_counts_as_integration_landing(
+                                                orig,
+                                                _orig_project,
+                                                session,
+                                                pr_number=pr_number,
+                                                merged_base_branch=base_branch,
+                                                source="task_lifecycle.review_merge_success",
                                             )
                                         if _record_pr_merged:
                                             apply_merged_landed_signal(
@@ -3043,8 +3034,10 @@ async def _process_post_commit(
                                                 refresh_direction_outcomes_after_merge,
                                             )
 
-                                            await refresh_direction_outcomes_after_merge(
-                                                orig, session
+                                            await (
+                                                refresh_direction_outcomes_after_merge(
+                                                    orig, session
+                                                )
                                             )
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
@@ -3386,9 +3379,7 @@ async def _process_post_commit(
                                                 Task, uuid.UUID(original_task_id)
                                             )
                                             if _orig_rec is not None:
-                                                _rec_ctx = dict(
-                                                    _orig_rec.context or {}
-                                                )
+                                                _rec_ctx = dict(_orig_rec.context or {})
                                                 _rec_ctx[
                                                     "_post_merge_effects_deferred"
                                                 ] = {
@@ -3447,10 +3438,16 @@ async def _process_post_commit(
                                     # rest of _process_post_commit runs clean.
                                     with contextlib.suppress(Exception):
                                         _re_task = (
-                                            await session.execute(
-                                                select(Task).where(Task.id == task_id)
+                                            (
+                                                await session.execute(
+                                                    select(Task).where(
+                                                        Task.id == task_id
+                                                    )
+                                                )
                                             )
-                                        ).scalars().first()
+                                            .scalars()
+                                            .first()
+                                        )
                                         if _re_task is not None:
                                             task = _re_task
                                 except Exception as e:
@@ -3696,9 +3693,7 @@ async def _process_post_commit(
                                                 (_orig.first_payload or {}).get(
                                                     "hotfix"
                                                 )
-                                                or (_orig.context or {}).get(
-                                                    "hotfix"
-                                                )
+                                                or (_orig.context or {}).get("hotfix")
                                             ),
                                             non_merge_reason=(
                                                 "merged_pr_non_integration_branch"
@@ -4333,9 +4328,7 @@ async def _process_post_commit(
                     "design": _handle_design_completion,
                 }
                 _capability = get_task_capability(task_type)
-                _handler_name = (
-                    _capability.completion_handler if _capability else None
-                )
+                _handler_name = _capability.completion_handler if _capability else None
                 if _handler_name:
                     _handler = _completion_handlers[_handler_name]
                     _handler_logs = payload.logs or task.latest_status_message or ""
@@ -4643,6 +4636,13 @@ async def _process_post_commit(
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
         all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
         executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
+        # A PARKED task is live work waiting on an external wake; it released its
+        # VM on park (vm_instance_id=None) so it is invisible to
+        # ``executable_statuses``. Without this guard a finite project could
+        # converge COMPLETED/FAILED while a parked child is still waiting to be
+        # woken — an early-converge. Treat any live PARKED child as in-flight so
+        # the all-terminal guard below cannot trip while one exists.
+        has_parked_task = any(t.status == TaskStatus.PARKED for t in all_tasks)
         parent_tasks = [
             t
             for t in all_tasks
@@ -4650,6 +4650,9 @@ async def _process_post_commit(
             and t.status
             not in [
                 TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
+                # PARKED leaf is live work awaiting an external wake, not a
+                # parent/logical task — never force-fail it on project rollup.
+                TaskStatus.PARKED,
                 TaskStatus.COMPLETED,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
@@ -4699,7 +4702,7 @@ async def _process_post_commit(
             # would hang the project forever (previously these were FAILED rows
             # caught by the `any FAILED` branch); including it preserves the old
             # rollup, mapping a stuck BLOCKED child to a FAILED project outcome.
-            all_terminal = all(
+            all_terminal = not has_parked_task and all(
                 s
                 in (
                     TaskStatus.COMPLETED,
@@ -4953,3 +4956,471 @@ async def close_orphan_pr_if_any(
             f"cancelled task {task.id} (reason={reason})"
         )
     return ok
+
+
+# ---------------------------------------------------------------------------
+# Task park-and-wake primitive (alembic 0199 / TaskWakeRegistration).
+#
+# A task that is waiting on an external, non-agent signal parks via
+# :func:`park_task` — it releases its VM/JWT/fleet slot immediately and writes a
+# durable :class:`TaskWakeRegistration`. The external source later fires via
+# :func:`fire_task_wakes`, and the leader-owned wake-delivery worker
+# (``reaper_sweeps.sweep_deliver_task_wakes``) claims each FIRED registration
+# ``FOR UPDATE SKIP LOCKED`` and calls :func:`deliver_wake`, which advances the
+# PARKED task **exactly once**. Registrations that never fire are aged out by
+# :func:`expire_wake` at their deadline rather than stranding the task.
+#
+# These are the centralized, row-lock-aware helpers; the sweep is the only
+# scheduled caller of deliver/expire, but tests drive them directly.
+# ---------------------------------------------------------------------------
+
+# Statuses a live task may transition into PARKED from. Terminal states and
+# BLOCKED are excluded — a parked task is *running* work that chose to wait.
+_PARKABLE_STATUSES = frozenset(
+    {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    }
+)
+
+# Default age after which a PARKED task with no live (PENDING/FIRED) wake
+# registration is treated as orphaned and failed rather than stranded forever.
+_PARK_STRAND_SECONDS = 6 * 60 * 60
+
+
+async def _maybe_fire_terminal_compute_wake(
+    session,
+    registration: TaskWakeRegistration,
+    *,
+    now,
+) -> None:
+    """Close the terminal-before-park lost-wakeup race for compute-job wakes.
+
+    Register-then-recheck: after the PENDING ``compute_job_terminal`` registration
+    exists, acquire the SAME compute-job row lock the monitor takes on its
+    terminal-fire path (``compute_jobs.process_compute_jobs_once`` →
+    ``_lock_compute_job``) and check whether the job is ALREADY terminal. If it is,
+    fire the just-created registration immediately (PENDING → FIRED) so the leader
+    sweep finalizes it identically to a normally-fired wake.
+
+    Why this is race-free in BOTH orderings:
+
+    * terminal-before-park — the monitor finalized + fired under the row lock while
+      no registration existed (it fired nothing and will never revisit the terminal
+      job). This recheck runs AFTER the lock is free, sees the terminal job, and
+      fires the registration the monitor missed.
+    * park-before-terminal — the recheck sees a non-terminal job and leaves the
+      registration PENDING; the monitor later finalizes and fires it. If the two
+      race, the row lock serializes them: whichever writer holds the lock completes
+      before the other observes the job, so exactly one of them fires the row.
+
+    Idempotent: only a PENDING registration is fired (PENDING → FIRED); an
+    already-FIRED/DELIVERED registration is left untouched, so a delayed or retried
+    park can never double-fire.
+    """
+    from app.compute_jobs import (
+        COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        _COMPUTE_JOB_TERMINAL_STATUSES,
+        _lock_compute_job,
+    )
+
+    if registration.wake_source_kind != COMPUTE_JOB_TERMINAL_WAKE_KIND:
+        return
+    if registration.delivery_state != WakeDeliveryState.PENDING:
+        return
+    if not registration.wake_source_ref:
+        return
+    try:
+        job_id = uuid.UUID(str(registration.wake_source_ref))
+    except (ValueError, TypeError):
+        return
+
+    # SELECT ... FOR UPDATE on the compute job row — the shared serialization
+    # point with the monitor's terminal-fire path. autoflush persists the new
+    # PENDING registration before this read, keeping it consistent in-session.
+    job = await _lock_compute_job(session, job_id)
+    if job is None:
+        return
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        registration.delivery_state = WakeDeliveryState.FIRED
+        registration.fired_at = now
+        session.add(registration)
+        logger.info(
+            "[PARK] compute job %s already terminal at park time; fired "
+            "registration %s (terminal-before-park catch-up)",
+            job_id,
+            registration.id,
+        )
+
+
+async def park_task(
+    session,
+    task: Task,
+    *,
+    wake_source_kind: str,
+    wake_source_ref: str | None = None,
+    source_metadata: dict | None = None,
+    wake_action=WakeAction.RESUME,
+    deadline_at=None,
+    reason: str | None = None,
+    now=None,
+) -> TaskWakeRegistration:
+    """Transition ``task`` into PARKED and persist a durable wake registration.
+
+    Mirrors :func:`app.task_blocked.enter_blocked_state`: the caller owns the
+    task row lock (``SELECT ... FOR UPDATE``), the ``session.commit()``, and any
+    post-commit VM teardown (``_ensure_vm_deleted``). This helper does the
+    in-critical-section work that must be atomic with the status flip: releasing
+    the account/fleet slot exactly once, stamping operator-visible park metadata,
+    and adding the ``TaskWakeRegistration`` row. Returns the registration.
+
+    The fleet slot is released here (not deferred) so a parked task stops pinning
+    capacity the moment it parks — that is the whole point of the primitive.
+
+    Idempotent on retry: if the task is already PARKED and a live (PENDING or
+    FIRED) wake registration matching (task_id, kind, ref) already exists, that
+    registration is returned immediately without creating a duplicate.  This
+    covers the normal failure mode where the agent's first park POST response was
+    lost and it retries — the second call must not create a second registration.
+    """
+    from app.time_utils import _utcnow
+
+    now = now or _utcnow()
+
+    # Guard: only parkable statuses may transition into PARKED.
+    # If already PARKED, check for an existing live registration before
+    # creating another — idempotent retry support.
+    if task.status == TaskStatus.PARKED:
+        existing_reg = (
+            (
+                await session.execute(
+                    select(TaskWakeRegistration)
+                    .where(
+                        TaskWakeRegistration.task_id == task.id,
+                        TaskWakeRegistration.wake_source_kind
+                        == str(wake_source_kind)[:64],
+                        TaskWakeRegistration.wake_source_ref == (
+                            str(wake_source_ref)[:255] if wake_source_ref else None
+                        ),
+                        TaskWakeRegistration.delivery_state.in_(
+                            [WakeDeliveryState.PENDING, WakeDeliveryState.FIRED]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing_reg is not None:
+            # Delayed/retried park: re-run the terminal recheck so a job that went
+            # terminal AFTER the original park (but whose monitor fire found no
+            # registration, or whose registration is still PENDING) is caught here
+            # too. Idempotent — only fires a PENDING registration.
+            await _maybe_fire_terminal_compute_wake(session, existing_reg, now=now)
+            return existing_reg
+        # No live registration found (it was lost); fall through to create one.
+    elif task.status not in _PARKABLE_STATUSES:
+        raise ValueError(
+            f"task {task.id} cannot be parked from status {task.status!r} "
+            f"(parkable: {', '.join(s.value for s in _PARKABLE_STATUSES)})"
+        )
+
+    # Release the account/fleet slot exactly once (idempotent via the
+    # ``_slot_released`` marker, mirroring the BLOCKED path in agent_status).
+    try:
+        from app.max_plan_pool import (
+            get_task_llm_account_id,
+            release_max_plan_account,
+        )
+
+        acct_id = get_task_llm_account_id(task)
+        if acct_id and not (task.context or {}).get("_slot_released"):
+            await release_max_plan_account(acct_id)
+            task.context = {**(task.context or {}), "_slot_released": True}
+    except Exception:
+        logger.exception("[PARK] slot release failed for task %s", task.id)
+
+    task.status = TaskStatus.PARKED
+    task.parked_at = now
+    task.park_reason = (reason or f"waiting on {wake_source_kind}")[:2000]
+    task.vm_stopped_at = now
+
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=task.project_id,
+        wake_source_kind=str(wake_source_kind)[:64],
+        wake_source_ref=(str(wake_source_ref)[:255] if wake_source_ref else None),
+        source_metadata=dict(source_metadata or {}),
+        wake_action=WakeAction(wake_action),
+        delivery_state=WakeDeliveryState.PENDING,
+        requested_at=now,
+        deadline_at=deadline_at,
+    )
+    session.add(task)
+    session.add(reg)
+
+    # Register-then-recheck: now that the PENDING registration exists, close the
+    # terminal-before-park lost-wakeup race for the compute-job wake source. No-op
+    # for every other wake kind.
+    await _maybe_fire_terminal_compute_wake(session, reg, now=now)
+    return reg
+
+
+async def fire_task_wakes(
+    session,
+    *,
+    wake_source_kind: str,
+    wake_source_ref: str | None,
+    fired_at=None,
+    metadata_update: dict | None = None,
+) -> int:
+    """Mark every PENDING registration for ``(kind, ref)`` as FIRED. Idempotent.
+
+    Called by the external consumer when its source fires (e.g. a ComputeJob
+    reaching a terminal state). Rows are locked ``FOR UPDATE SKIP LOCKED`` so a
+    concurrent firing cannot double-fire the same registration. The leader-owned
+    worker delivers the FIRED rows on its next pass. Returns the count newly
+    fired. The caller commits.
+    """
+    from app.time_utils import _utcnow
+
+    fired_at = fired_at or _utcnow()
+    stmt = (
+        select(TaskWakeRegistration)
+        .where(
+            TaskWakeRegistration.wake_source_kind == str(wake_source_kind)[:64],
+            TaskWakeRegistration.wake_source_ref == wake_source_ref,
+            TaskWakeRegistration.delivery_state == WakeDeliveryState.PENDING,
+        )
+        .with_for_update(skip_locked=True)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    n = 0
+    for reg in rows:
+        reg.delivery_state = WakeDeliveryState.FIRED
+        reg.fired_at = fired_at
+        if metadata_update:
+            reg.source_metadata = {**(reg.source_metadata or {}), **metadata_update}
+        session.add(reg)
+        n += 1
+    return n
+
+
+async def deliver_wake(
+    session, registration: TaskWakeRegistration, *, now=None
+) -> bool:
+    """Advance the PARKED task behind a FIRED registration **exactly once**.
+
+    Exactly-once is enforced by the FIRED→DELIVERED flip happening atomically
+    with the task advance, under the registration row lock the worker already
+    holds (``FOR UPDATE SKIP LOCKED``). Any second call — a retry, or a racing
+    worker — sees ``delivery_state != FIRED`` (or the task no longer PARKED) and
+    returns ``False`` without touching the task. Returns ``True`` iff this call
+    advanced the task.
+
+    The caller (the sweep, or a test) owns the ``session.commit()`` for EVERY
+    branch — RESUME, generic FINALIZE, and the compute-job FINALIZE branch. None
+    of them commit internally, so the FIRED→DELIVERED flip and the task advance
+    commit together atomically under the caller's single commit. The compute
+    branch finalizes through ``_handle_compute_experiment_completion`` with
+    ``owns_commit=False`` (pure mutation, no internal commit); its post-commit
+    side effects (operator broadcast + durable knowledge persistence) are run by
+    the sweep AFTER it commits, via
+    ``task_completion.run_compute_wake_post_commit``.
+    """
+    from app.time_utils import _utcnow
+
+    now = now or _utcnow()
+    registration.attempt_count = (registration.attempt_count or 0) + 1
+
+    # Idempotency guard: only a FIRED registration is deliverable.
+    if registration.delivery_state != WakeDeliveryState.FIRED:
+        session.add(registration)
+        return False
+
+    task = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == registration.task_id).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if task is None or task.status != TaskStatus.PARKED:
+        # The task moved on (already woken by a sibling registration, cancelled,
+        # etc.). Record a truthful no-op outcome and do NOT advance anything.
+        registration.delivery_state = WakeDeliveryState.FAILED
+        registration.result_state = "task_not_parked"
+        registration.result_detail = (
+            f"task {registration.task_id} was "
+            f"{getattr(task, 'status', None)} not PARKED at delivery"
+        )[:2000]
+        registration.delivered_at = now
+        registration.claimed_at = registration.claimed_at or now
+        session.add(registration)
+        return False
+
+    action = WakeAction(registration.wake_action)
+
+    # Compute-job-terminal wake source: finalize the parked compute_experiment
+    # task through its REAL completion path so it lands with the honest terminal
+    # outcome, final cost, and result reference rather than a bare status flip.
+    # The FIRED→DELIVERED flip is recorded BEFORE the handler runs so it commits
+    # atomically with the task finalization the handler performs — preserving
+    # exactly-once delivery (a re-fired or re-claimed registration is no longer
+    # FIRED and returns False above). Critically the handler runs with
+    # ``owns_commit=False`` (pure mutation, no internal commit), so the caller's
+    # single commit covers BOTH the FIRED→DELIVERED flip and the task advance and
+    # a mid-batch commit can never release sibling delivery locks early.
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    if (
+        action == WakeAction.FINALIZE
+        and registration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
+    ):
+        from app.compute_jobs import build_compute_result_logs
+        from app.models import ComputeJob
+        from app.task_completion import _handle_compute_experiment_completion
+
+        job = None
+        if registration.wake_source_ref:
+            with contextlib.suppress(ValueError, TypeError):
+                job = await session.get(
+                    ComputeJob, uuid.UUID(registration.wake_source_ref)
+                )
+        registration.delivery_state = WakeDeliveryState.DELIVERED
+        registration.delivered_at = now
+        registration.claimed_at = registration.claimed_at or now
+        session.add(registration)
+        # Clear the park markers before the completion handler mutates the task so
+        # the finalized task carries no stale parked_at/park_reason (the completion
+        # path only manages status, not the park bookkeeping).
+        task.parked_at = None
+        task.park_reason = None
+        session.add(task)
+        if job is None:
+            # The ComputeJob row is missing (dangling ref, deleted row, or
+            # unparseable wake_source_ref). Stamp a distinct, truthful failure
+            # classification so operators and auto-remediation can distinguish
+            # this from a legitimate metric-gate miss.
+            registration.result_state = "job_record_missing"
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = (
+                "Compute wake finalized: job record missing at delivery"
+            )[:500]
+            ctx = dict(task.context or {})
+            ctx["failure_category"] = "compute_job_record_missing"
+            ctx["failure_class"] = "compute_job_record_missing"
+            task.context = ctx
+            flag_modified(task, "context")
+            with contextlib.suppress(Exception):
+                from app.jwt_revocation import emit_task_terminated_notify
+
+                emit_task_terminated_notify(session, str(task.id))
+            return True
+        registration.result_state = "finalized"
+        logs = build_compute_result_logs(job)
+        # _handle_compute_experiment_completion gates the artifact and sets the
+        # task to its honest terminal status (COMPLETED on pass, FAILED on a missed
+        # gate) and stamps the job result reference. With owns_commit=False it does
+        # NOT commit, broadcast, or persist knowledge — the caller (sweep) commits,
+        # then runs run_compute_wake_post_commit for the broadcast + knowledge.
+        await _handle_compute_experiment_completion(
+            task, logs, session, owns_commit=False
+        )
+        return True
+
+    if action == WakeAction.FINALIZE:
+        terminal = TaskStatus.COMPLETED
+        raw = (registration.source_metadata or {}).get("finalize_status")
+        if raw:
+            with contextlib.suppress(Exception):
+                candidate = TaskStatus(raw)
+                if candidate in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                ):
+                    terminal = candidate
+        task.status = terminal
+        task.parked_at = None
+        task.park_reason = None
+        task.latest_status_message = (
+            f"Woken by {registration.wake_source_kind}: finalized {terminal.value}"
+        )[:500]
+        with contextlib.suppress(Exception):
+            from app.jwt_revocation import emit_task_terminated_notify
+
+            emit_task_terminated_notify(session, str(task.id))
+        registration.result_state = "finalized"
+    else:  # RESUME — return the task to the dispatch queue on a fresh VM.
+        task.status = TaskStatus.QUEUED
+        task.parked_at = None
+        task.park_reason = None
+        task.vm_instance_id = None
+        # Clear the slot-released marker so re-dispatch acquires a fresh slot.
+        if (task.context or {}).get("_slot_released"):
+            ctx = dict(task.context or {})
+            ctx.pop("_slot_released", None)
+            task.context = ctx
+        task.latest_status_message = (
+            f"Woken by {registration.wake_source_kind}: re-queued for dispatch"
+        )[:500]
+        registration.result_state = "resumed"
+
+    registration.delivery_state = WakeDeliveryState.DELIVERED
+    registration.delivered_at = now
+    registration.claimed_at = registration.claimed_at or now
+    session.add(task)
+    session.add(registration)
+    return True
+
+
+async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) -> bool:
+    """Age out a PENDING registration whose deadline passed before it fired.
+
+    The PARKED task is failed with a truthful ``park_wake_timeout`` classification
+    rather than left to strand. Idempotent: a non-PENDING registration is a no-op.
+    Returns ``True`` iff this call expired the registration.
+    """
+    from app.time_utils import _utcnow
+
+    now = now or _utcnow()
+    if registration.delivery_state != WakeDeliveryState.PENDING:
+        return False
+
+    task = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == registration.task_id).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    registration.delivery_state = WakeDeliveryState.EXPIRED
+    registration.result_state = "expired"
+    registration.delivered_at = now
+    if task is not None and task.status == TaskStatus.PARKED:
+        task.status = TaskStatus.FAILED
+        task.parked_at = None
+        # Clear park_reason too so an expired task carries no stale "Parked …"
+        # marker on operator surfaces — the task is now FAILED, not parked.
+        task.park_reason = None
+        task.latest_status_message = (
+            f"Park wake on {registration.wake_source_kind} timed out at deadline"
+        )[:500]
+        ctx = dict(task.context or {})
+        ctx["failure_category"] = "park_wake_timeout"
+        ctx["failure_class"] = "park_wake_timeout"
+        task.context = ctx
+        with contextlib.suppress(Exception):
+            from app.jwt_revocation import emit_task_terminated_notify
+
+            emit_task_terminated_notify(session, str(task.id))
+        session.add(task)
+    session.add(registration)
+    return True

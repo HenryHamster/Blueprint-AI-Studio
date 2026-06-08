@@ -11831,18 +11831,25 @@ async def _seed_landed_acceptance_task(
     project_id,
     *,
     satisfied: bool | None,
+    proven: bool = True,
+    kind: str = "named_test",
 ):
     """Insert ONE landed (merged-on-integration) COMPLETED task for a project.
 
     ``satisfied`` controls the durable code-acceptance verdict stamped on
-    ``task.context``: ``True`` → proven, ``False`` → declared-but-unsatisfied,
-    ``None`` → no verdict key at all (the undeclared/legacy case).
+    ``task.context``: ``True`` with ``proven=True`` → strict proven, ``True``
+    with ``proven=False`` → satisfied_unproven, ``False`` →
+    declared-but-unsatisfied, ``None`` → no verdict key at all.
     """
     from app.time_utils import _utcnow
 
     ctx: dict = {"pr_merged": True, "landed_on_integration": True}
     if satisfied is not None:
-        ctx["code_acceptance_verdict"] = {"satisfied": satisfied, "kind": "named_test"}
+        ctx["code_acceptance_verdict"] = {
+            "satisfied": satisfied,
+            "proven": proven,
+            "kind": kind,
+        }
     task = Task(
         project_id=project_id,
         title="acceptance-landed-task",
@@ -11883,6 +11890,7 @@ async def test_readiness_declared_unsatisfied_raises_caveat_without_flipping_rea
     assert out["ready"] is True, out["reason"]
     # Additive signal reflects the unproven work.
     assert out["acceptance_declared_unsatisfied"] == 1
+    assert out["acceptance_satisfied_unproven"] == 0
     assert out["acceptance_unproven_present"] is True
     assert "acceptance_caveat" in out
     assert "not fully proven" in out["acceptance_caveat"]
@@ -11906,6 +11914,7 @@ async def test_readiness_undeclared_only_is_unaffected(db_session):
     assert out["ready"] is True, out["reason"]
     assert out["acceptance_undeclared"] == 2
     assert out["acceptance_declared_unsatisfied"] == 0
+    assert out["acceptance_satisfied_unproven"] == 0
     assert out["acceptance_unproven_present"] is False
     assert "acceptance_caveat" not in out
     assert "not fully proven" not in out["reason"]
@@ -11923,10 +11932,38 @@ async def test_readiness_proven_only_has_no_caveat(db_session):
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["acceptance_proven"] == 1
+    assert out["acceptance_satisfied_unproven"] == 0
     assert out["acceptance_declared_unsatisfied"] == 0
     assert out["acceptance_unproven_present"] is False
     assert "acceptance_caveat" not in out
     assert "not fully proven" not in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_satisfied_unproven_raises_caveat_without_flipping_ready(
+    db_session,
+):
+    """Soft satisfied evidence is advisory unproven work, not strict proof."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_clean_streak(db_session, project, version)
+    await _seed_landed_acceptance_task(
+        db_session,
+        project.id,
+        satisfied=True,
+        proven=False,
+        kind="observable_behavior",
+    )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is True, out["reason"]
+    assert out["acceptance_proven"] == 0
+    assert out["acceptance_satisfied_unproven"] == 1
+    assert out["acceptance_declared_unsatisfied"] == 0
+    assert out["acceptance_unproven_present"] is True
+    assert "satisfied-but-not-machine-proven" in out["acceptance_caveat"]
+    assert "satisfied-but-not-machine-proven" in out["reason"]
 
 
 @pytest.mark.asyncio
@@ -11940,8 +11977,11 @@ async def test_readiness_empty_history_carries_acceptance_keys(db_session):
 
     assert out["verdicts_evaluated"] == 0
     assert out["acceptance_proven"] == 0
+    assert out["acceptance_satisfied_unproven"] == 0
     assert out["acceptance_declared_unsatisfied"] == 0
     assert out["acceptance_undeclared"] == 0
+    assert out["acceptance_merged_unverified_degraded"] == 0
+    assert out["acceptance_malformed"] == 0
     assert out["acceptance_unproven_present"] is False
 
 
@@ -11965,6 +12005,7 @@ async def test_readiness_acceptance_aggregate_failure_degrades_safely(
 
     assert out["ready"] is True, out["reason"]
     assert out["acceptance_declared_unsatisfied"] == 0
+    assert out["acceptance_satisfied_unproven"] == 0
     assert out["acceptance_unproven_present"] is False
     assert "acceptance_caveat" not in out
 
@@ -12542,7 +12583,24 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
                 status=TaskStatus.COMPLETED,
                 context={
                     "pr_merged": True,
-                    "code_acceptance_verdict": {"satisfied": True},
+                    "code_acceptance_verdict": {
+                        "satisfied": True,
+                        "proven": True,
+                    },
+                },
+            ),
+            Task(
+                project_id=project.id,
+                title="soft-satisfied-merge",
+                payloads=[{"type": "create", "prompt": "x"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "pr_merged": True,
+                    "code_acceptance_verdict": {
+                        "satisfied": True,
+                        "proven": False,
+                        "kind": "observable_behavior",
+                    },
                 },
             ),
             Task(
@@ -12582,13 +12640,15 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
     await db_session.commit()
 
     expected = {
-        "merged": 4,
+        "total": 5,
         "proven": 1,
-        "consumed": 0,
+        "satisfied_unproven": 1,
         "declared_unsatisfied": 1,
         "merged_unverified_degraded": 1,
-        "no_declaration": 1,
-        "proven_rate": 0.25,
+        "undeclared": 1,
+        "malformed": 0,
+        "proven_rate": 0.2,
+        "satisfied_rate": 0.4,
     }
     assert result["status"] == "dry_run"
     assert version.last_qualification["acceptance_aggregate"] == expected
@@ -12664,16 +12724,97 @@ async def test_finalize_records_version_acceptance_aggregate_for_undeclared_wind
     await db_session.commit()
 
     expected = {
-        "merged": 2,
+        "total": 2,
         "proven": 0,
-        "consumed": 0,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 0,
         "merged_unverified_degraded": 0,
-        "no_declaration": 2,
+        "undeclared": 2,
+        "malformed": 0,
         "proven_rate": 0.0,
+        "satisfied_rate": 0.0,
     }
     assert result["status"] == "dry_run"
     assert version.last_qualification["acceptance_aggregate"] == expected
+
+
+@pytest.mark.asyncio
+async def test_finalize_records_version_acceptance_aggregate_ignores_post_terminal_updates(
+    db_session, mocker
+):
+    """A later non-terminal task write must not reopen the qualification window."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 1,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    window_opened_at = rq._utcnow()
+    old_completed_at = window_opened_at - timedelta(days=1)
+    post_terminal_message_at = window_opened_at + timedelta(days=1)
+
+    old_task = Task(
+        project_id=project.id,
+        title="old-merge",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=old_completed_at,
+        updated_at=old_completed_at,
+    )
+    db_session.add(old_task)
+    await db_session.commit()
+
+    with patch("app.models._utcnow", return_value=old_completed_at):
+        old_task.status = TaskStatus.COMPLETED
+        old_task.context = {"pr_merged": True}
+        await db_session.commit()
+
+    version.opened_at = window_opened_at
+    await db_session.commit()
+
+    with patch("app.models._utcnow", return_value=post_terminal_message_at):
+        old_task.latest_status_message = "Post-terminal context update"
+        await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    expected = {
+        "total": 0,
+        "proven": 0,
+        "satisfied_unproven": 0,
+        "declared_unsatisfied": 0,
+        "merged_unverified_degraded": 0,
+        "undeclared": 0,
+        "malformed": 0,
+        "proven_rate": None,
+        "satisfied_rate": None,
+    }
+    assert result["status"] == "dry_run"
+    assert version.last_qualification["acceptance_aggregate"] == expected
+
 
 @pytest.mark.asyncio
 async def test_connected_success_promotion_lifecycle_includes_goal_snapshot(
@@ -15634,23 +15775,29 @@ def test_format_verdict_for_api_includes_acceptance_aggregate():
         sub_scores={
             "audit": 0.95,
             "acceptance_aggregate": {
-                "merged": 4,
-                "proven": 4,
+                "total": 4,
+                "proven": 3,
+                "satisfied_unproven": 1,
                 "declared_unsatisfied": 0,
+                "undeclared": 0,
                 "merged_unverified_degraded": 0,
-                "no_declaration": 0,
-                "proven_rate": 1.0,
+                "malformed": 0,
+                "satisfied_rate": 1.0,
+                "proven_rate": 0.75,
             },
         },
     )
     out = rq.format_verdict_for_api(verdict)
     assert out["acceptance_aggregate"] == {
-        "merged": 4,
-        "proven": 4,
+        "total": 4,
+        "proven": 3,
+        "satisfied_unproven": 1,
         "declared_unsatisfied": 0,
+        "undeclared": 0,
         "merged_unverified_degraded": 0,
-        "no_declaration": 0,
-        "proven_rate": 1.0,
+        "malformed": 0,
+        "satisfied_rate": 1.0,
+        "proven_rate": 0.75,
     }
     # Raw evidence fields stay intact.
     assert out["candidate_sha"] == "agg123"
@@ -15715,7 +15862,9 @@ def test_get_latest_qualification_audit_findings_prefers_verdict_row():
 
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_all_verified(db_session):
-    """All landed tasks in the window pass the verified predicate — total == verified."""
+    """All landed tasks in the window have proven acceptance — total == verified."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
     project, version = await _make_project_and_version(db_session)
     for _ in range(2):
         task = Task(
@@ -15723,7 +15872,15 @@ async def test_acceptance_window_aggregate_all_verified(db_session):
             title="merged-task",
             payloads=[{"type": "create"}],
             status=TaskStatus.COMPLETED,
-            context={"pr_merged": True},
+            context={
+                "pr_merged": True,
+                CODE_ACCEPTANCE_VERDICT_KEY: {
+                    "satisfied": True,
+                    "proven": True,
+                    "kind": "named_test",
+                    "test_name": "test_feature",
+                },
+            },
         )
         db_session.add(task)
     await db_session.commit()
@@ -15746,7 +15903,15 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
         title="ok",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_ok",
+            },
+        },
     )
     task_blocked = Task(
         project_id=project.id,
@@ -15777,13 +15942,23 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
 async def test_acceptance_window_aggregate_degraded_excluded(db_session):
     """A task with unverified_degraded merge status is excluded from the verified
     count but still counted in the total."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
     project, version = await _make_project_and_version(db_session)
     task_ok = Task(
         project_id=project.id,
         title="ok",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_ok",
+            },
+        },
     )
     task_degraded = Task(
         project_id=project.id,
@@ -15807,8 +15982,12 @@ async def test_acceptance_window_aggregate_degraded_excluded(db_session):
 
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_legacy_no_verdict_counted(db_session):
-    """A legacy task with no code_acceptance_verdict key is counted as verified
-    (additive predicate — absence of the key is a free pass)."""
+    """A legacy task with no code_acceptance_verdict key is NOT counted as verified.
+
+    Undeclared (legacy) merges land in the ``undeclared`` bucket, which is
+    excluded from acceptance_window_verified — the metric only counts
+    explicitly declared and proven/satisfied acceptance evidence.
+    """
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     project, version = await _make_project_and_version(db_session)
@@ -15826,8 +16005,8 @@ async def test_acceptance_window_aggregate_legacy_no_verdict_counted(db_session)
 
     agg = await rq._compute_acceptance_window_aggregate(db_session, version)
     assert agg["acceptance_window_total"] == 1
-    assert agg["acceptance_window_verified"] == 1
-    assert agg["acceptance_window_fraction"] == pytest.approx(1.0)
+    assert agg["acceptance_window_verified"] == 0
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -15893,7 +16072,15 @@ async def test_acceptance_window_aggregate_ignores_post_terminal_updates(
 
     with patch("app.models._utcnow", return_value=fresh_completed_at):
         fresh_task.status = TaskStatus.COMPLETED
-        fresh_task.context = {"pr_merged": True}
+        fresh_task.context = {
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_fresh",
+            },
+        }
         await db_session.commit()
 
     agg = await rq._compute_acceptance_window_aggregate(db_session, version)
@@ -15903,17 +16090,117 @@ async def test_acceptance_window_aggregate_ignores_post_terminal_updates(
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_aggregate_excludes_malformed_verdict(
+    db_session,
+):
+    """A malformed recorded verdict is advisory only and does not count as verified."""
+    project, version = await _make_project_and_version(db_session)
+
+    malformed_task = Task(
+        project_id=project.id,
+        title="malformed-acceptance",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "code_acceptance_verdict": {"kind": "named_test"},
+        },
+    )
+    db_session.add(malformed_task)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    assert agg["acceptance_window_total"] == 1
+    assert agg["acceptance_window_verified"] == 0
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_metric_distinguishes_verified_merge_predicate_from_acceptance_proof(
+    db_session,
+):
+    """acceptance_window_verified counts only explicit proven/satisfied_unproven merges.
+
+    This test exercises the corrected predicate: a task with a proven
+    code_acceptance_verdict is counted as verified, while an identical task
+    with no verdict (undeclared) is counted in the total but NOT in the
+    verified count — demonstrating that the metric name honestly reflects
+    declared-and-verified acceptance proof, not a broad "was merged" signal.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Task with explicit proven acceptance — must count as verified.
+    task_proven = Task(
+        project_id=project.id,
+        title="proven-merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_feature_works",
+            },
+        },
+    )
+    # Task with satisfied-but-not-machine-proven verdict — also counts as verified.
+    task_satisfied_unproven = Task(
+        project_id=project.id,
+        title="satisfied-unproven-merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": False,
+                "kind": "named_test",
+                "test_name": "test_other_feature",
+            },
+        },
+    )
+    # Task with no verdict at all (undeclared / legacy) — must NOT count as verified.
+    task_undeclared = Task(
+        project_id=project.id,
+        title="undeclared-merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in (task_undeclared.context or {})
+
+    db_session.add(task_proven)
+    db_session.add(task_satisfied_unproven)
+    db_session.add(task_undeclared)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    # All three tasks are in the window.
+    assert agg["acceptance_window_total"] == 3
+    # Only the two explicitly declared tasks (proven + satisfied_unproven) count.
+    assert agg["acceptance_window_verified"] == 2
+    # Undeclared task is in total but not in verified — fraction is 2/3.
+    assert agg["acceptance_window_fraction"] == pytest.approx(2 / 3)
+
+
+@pytest.mark.asyncio
 async def test_finalize_records_acceptance_window_counts_in_verdict_sub_scores(
     db_session, mocker
 ):
     """_finalize_qualification persists acceptance_window_* keys in sub_scores.
 
-    Sets up two merged tasks in the version window — one undeclared (verified by
-    the additive predicate), one with an unsatisfied acceptance verdict (excluded
-    from the verified count) — then finalizes and asserts the three
-    acceptance_window_* keys appear alongside the existing composite keys in
-    version.last_qualification["sub_scores"]. This exercises real non-test
-    production code in _finalize_qualification and _compute_acceptance_window_aggregate.
+    Sets up two merged tasks in the version window — one with a proven
+    acceptance verdict (counted as verified), one with an unsatisfied
+    acceptance verdict (excluded from the verified count) — then finalizes
+    and asserts the three acceptance_window_* keys appear alongside the
+    existing composite keys in version.last_qualification["sub_scores"].
+    This exercises real non-test production code in _finalize_qualification
+    and _compute_acceptance_window_aggregate.
     """
     from app import shared_state
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
@@ -15942,13 +16229,21 @@ async def test_finalize_records_acceptance_window_counts_in_verdict_sub_scores(
         },
     )
 
-    # Task 1: undeclared verdict — counted as verified (additive, backward-compatible).
+    # Task 1: satisfied-and-proven verdict — counted as verified.
     task_verified = Task(
         project_id=project.id,
         title="verified-merge",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_verified",
+            },
+        },
     )
     # Task 2: unsatisfied acceptance verdict — counted in total but NOT in verified.
     task_blocked = Task(

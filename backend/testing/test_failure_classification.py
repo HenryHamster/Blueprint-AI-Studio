@@ -2449,3 +2449,67 @@ class TestBranchGoneClassification:
         # No debug/remediation task should spawn for a branch-gone race.
         t = _task(self._PROD_MSG, ctx={"failure_category": "CODE_ERROR"})
         assert should_trigger_code_defect_investigation(t) is False
+
+
+class TestParkWakeFailureClassRegistration:
+    """park_wake_timeout / park_wake_stranded are canonical recognized classes.
+
+    They are written by the reaper's wake-delivery sweep / expire path and must be
+    budget-exempt INFRA classes with infra taxonomy so failure distributions stop
+    presenting them as generic code-like residual fingerprints.
+    """
+
+    def test_constants_match_persisted_literals(self):
+        from app.failure_classification import (
+            PARK_WAKE_STRANDED,
+            PARK_WAKE_TIMEOUT,
+        )
+
+        # Values MUST equal the literals the expire/strand paths persist into
+        # task.context['failure_class'] so the persisted-verdict short-circuit
+        # returns them unchanged.
+        assert PARK_WAKE_TIMEOUT == "park_wake_timeout"
+        assert PARK_WAKE_STRANDED == "park_wake_stranded"
+
+    def test_recognized_and_budget_exempt(self):
+        from app.failure_classification import (
+            ALL_FAILURE_CLASSES,
+            INFRA_CLASSES,
+            PARK_WAKE_STRANDED,
+            PARK_WAKE_TIMEOUT,
+        )
+
+        for cls in (PARK_WAKE_TIMEOUT, PARK_WAKE_STRANDED):
+            assert cls in ALL_FAILURE_CLASSES
+            assert cls in INFRA_CLASSES  # budget-exempt: no retry burn / health ding
+
+    def test_classify_and_taxonomy(self):
+        from app.failure_classification import (
+            PARK_WAKE_STRANDED,
+            PARK_WAKE_TIMEOUT,
+            TAXONOMY_INFRA_RELATED,
+            classify_failure,
+            classify_failure_taxonomy,
+        )
+
+        for cls in (PARK_WAKE_TIMEOUT, PARK_WAKE_STRANDED):
+            task = _task(ctx={"failure_category": cls, "failure_class": cls})
+            assert classify_failure(task) == cls
+            assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
+
+    def test_normalize_agent_failure_category_canonicalizes(self):
+        from app.failure_classification import (
+            PARK_WAKE_STRANDED,
+            PARK_WAKE_TIMEOUT,
+            normalize_agent_failure_category,
+        )
+
+        task = _task()
+        assert (
+            normalize_agent_failure_category("park_wake_timeout", task)
+            == PARK_WAKE_TIMEOUT
+        )
+        assert (
+            normalize_agent_failure_category("park_wake_stranded", task)
+            == PARK_WAKE_STRANDED
+        )

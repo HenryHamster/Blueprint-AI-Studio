@@ -389,6 +389,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             <ProblemModelViewer
               projectId={selectedProjectId}
               problemModel={data.problemModel}
+              selfReflectionLog={data.selfReflectionLog}
               addToast={addToast}
               onUpdated={data.setProblemModel}
             />

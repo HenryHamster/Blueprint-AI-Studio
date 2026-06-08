@@ -4692,3 +4692,195 @@ def test_compute_format_compliance_metrics_by_type_trend():
     assert fix["format_compliance_rate"] is None
     assert fix["prev_format_compliance_rate"] == 1.0
     assert fix["trend"] is None
+
+
+# ── Park/wake operational health (feat: surface park/wake health) ────────────
+
+
+def test_park_wake_failure_classes_are_recognized():
+    """park_wake_timeout / park_wake_stranded are canonical recognized classes.
+
+    They must carry human labels, appear in the display tuple, be budget-exempt
+    INFRA classes, route to the infra taxonomy bucket, and be returned by the
+    classifier for a task stamped with them — so failure distributions stop
+    presenting them as generic code-like residual fingerprints.
+    """
+    from app.failure_classification import (
+        ALL_FAILURE_CLASSES,
+        INFRA_CLASSES,
+        PARK_WAKE_STRANDED,
+        PARK_WAKE_TIMEOUT,
+        TAXONOMY_INFRA_RELATED,
+        classify_failure,
+        classify_failure_taxonomy,
+    )
+
+    # Canonical string values match the literals the expire/strand paths write.
+    assert PARK_WAKE_TIMEOUT == "park_wake_timeout"
+    assert PARK_WAKE_STRANDED == "park_wake_stranded"
+
+    for cls in (PARK_WAKE_TIMEOUT, PARK_WAKE_STRANDED):
+        assert cls in ALL_FAILURE_CLASSES, f"{cls} missing from display tuple"
+        assert cls in INFRA_CLASSES, f"{cls} must be budget-exempt INFRA"
+        # Human label present (and not the bare class-name fallback).
+        assert cls in _FAILURE_CLASS_LABELS
+        assert _FAILURE_CLASS_LABELS[cls] != cls
+
+    # The classifier returns the recognized class for a stamped task, and the
+    # taxonomy routes it to the infra bucket (not code_defect / residual).
+    timed_out = make_task(
+        status=TaskStatus.FAILED,
+        latest_status_message="Park wake on compute_job_terminal timed out at deadline",
+        context={
+            "failure_category": PARK_WAKE_TIMEOUT,
+            "failure_class": PARK_WAKE_TIMEOUT,
+        },
+    )
+    stranded = make_task(
+        status=TaskStatus.FAILED,
+        latest_status_message="Parked task stranded with no live wake registration; failing",
+        context={
+            "failure_category": PARK_WAKE_STRANDED,
+            "failure_class": PARK_WAKE_STRANDED,
+        },
+    )
+    assert classify_failure(timed_out) == PARK_WAKE_TIMEOUT
+    assert classify_failure(stranded) == PARK_WAKE_STRANDED
+    assert classify_failure_taxonomy(timed_out) == TAXONOMY_INFRA_RELATED
+    assert classify_failure_taxonomy(stranded) == TAXONOMY_INFRA_RELATED
+
+
+@pytest.mark.asyncio
+async def test_park_wake_health_metrics_surface(db_session):
+    """Acceptance: the wake sweep's delivered/expired/stranded counts surface and
+    the read-only park/wake health metrics expose the PARKED population + FIRED
+    delivery backlog + stall signal; park_wake_* classify as recognized classes.
+
+    Exercises the production seam end-to-end:
+      * ``reaper_sweeps.sweep_deliver_task_wakes`` returns a ``WakeSweepResult``
+        carrying delivered / expired / stranded / delivery_failed breakdowns;
+      * ``digest_metrics.compute_park_wake_health`` surfaces parked count, oldest
+        ages, FIRED-but-undelivered backlog, and the delivery-stalled signal.
+    """
+    from app.digest_metrics import (
+        _PARK_WAKE_DELIVERY_STALL_SECONDS,
+        compute_park_wake_health,
+    )
+    from app.failure_classification import PARK_WAKE_STRANDED, PARK_WAKE_TIMEOUT
+    from app.models import (
+        TaskWakeRegistration,
+        WakeAction,
+        WakeDeliveryState,
+    )
+    from app.reaper_sweeps import (
+        WakeSweepResult,
+        reset_wake_delivery_stall_state,
+        sweep_deliver_task_wakes,
+    )
+    from app.task_lifecycle import _PARK_STRAND_SECONDS
+
+    reset_wake_delivery_stall_state()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Old enough that the read-only "delivery stalled" signal trips on the oldest
+    # FIRED registration, but still deliverable by the sweep.
+    fired_at = now - timedelta(seconds=_PARK_WAKE_DELIVERY_STALL_SECONDS + 60)
+
+    # (1) Deliverable: PARKED + FIRED RESUME registration → delivered.
+    deliver_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.PARKED,
+        title="park-deliver",
+        parked_at=now - timedelta(minutes=5),
+    )
+    # (2) Expirable: PARKED + PENDING registration past its deadline → expired.
+    expire_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.PARKED,
+        title="park-expire",
+        parked_at=now - timedelta(minutes=5),
+    )
+    # (3) Strandable: PARKED past the strand threshold with NO live registration.
+    strand_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.PARKED,
+        title="park-strand",
+        parked_at=now - timedelta(seconds=_PARK_STRAND_SECONDS + 3600),
+    )
+    db_session.add_all([deliver_task, expire_task, strand_task])
+    await db_session.commit()
+    for t in (deliver_task, expire_task, strand_task):
+        await db_session.refresh(t)
+
+    fired_reg = TaskWakeRegistration(
+        task_id=deliver_task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_action=WakeAction.RESUME,
+        delivery_state=WakeDeliveryState.FIRED,
+        fired_at=fired_at,
+    )
+    pending_reg = TaskWakeRegistration(
+        task_id=expire_task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_action=WakeAction.RESUME,
+        delivery_state=WakeDeliveryState.PENDING,
+        deadline_at=now - timedelta(minutes=1),
+    )
+    db_session.add_all([fired_reg, pending_reg])
+    await db_session.commit()
+
+    # --- Read-only health BEFORE the sweep: PARKED population + FIRED backlog. --
+    pre = await compute_park_wake_health(db_session, project_id=project.id)
+    assert pre["parked_task_count"] == 3
+    assert pre["oldest_parked_age_seconds"] >= _PARK_STRAND_SECONDS
+    assert pre["fired_undelivered_count"] == 1
+    assert pre["oldest_fired_age_seconds"] >= _PARK_WAKE_DELIVERY_STALL_SECONDS
+    # The oldest FIRED registration is past the stall threshold → stalled signal.
+    assert pre["delivery_stalled"] is True
+    assert (
+        pre["delivery_stall_threshold_seconds"] == _PARK_WAKE_DELIVERY_STALL_SECONDS
+    )
+
+    # --- Run the leader-owned wake-delivery sweep. ---------------------------
+    result = await sweep_deliver_task_wakes(db_session, now)
+
+    # Backward-compatible int contract preserved (== wakes delivered)...
+    assert isinstance(result, WakeSweepResult)
+    assert result == 1
+    # ...plus the per-pass breakdown now surfaces.
+    assert result.delivered == 1
+    assert result.expired == 1
+    assert result.stranded == 1
+    assert result.delivery_failed == 0
+    log_fields = result.as_log_fields()
+    assert log_fields["delivered"] == 1
+    assert log_fields["expired"] == 1
+    assert log_fields["stranded"] == 1
+
+    db_session.expire_all()
+    await db_session.refresh(deliver_task)
+    await db_session.refresh(expire_task)
+    await db_session.refresh(strand_task)
+
+    # The deliverable task resumed; the expirable + strandable tasks failed with
+    # the recognized, human-labelled park/wake classes (not residual code errors).
+    assert deliver_task.status == TaskStatus.QUEUED
+    assert expire_task.status == TaskStatus.FAILED
+    assert (expire_task.context or {}).get("failure_class") == PARK_WAKE_TIMEOUT
+    assert strand_task.status == TaskStatus.FAILED
+    assert (strand_task.context or {}).get("failure_class") == PARK_WAKE_STRANDED
+
+    # --- Read-only health AFTER the sweep: backlog drained, nothing parked. ---
+    post = await compute_park_wake_health(db_session, project_id=project.id)
+    assert post["parked_task_count"] == 0
+    assert post["oldest_parked_age_seconds"] is None
+    assert post["fired_undelivered_count"] == 0
+    assert post["oldest_fired_age_seconds"] is None
+    assert post["delivery_stalled"] is False

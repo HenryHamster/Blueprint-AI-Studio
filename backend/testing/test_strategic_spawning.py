@@ -892,14 +892,16 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
                 "status": "active",
                 "text": "Direction with a proof gap",
                 "priority": "medium",
-                # 4 verified merges, but only 1 PROVEN; 3 of 4 merged WRITE tasks
-                # declared forward acceptance evidence at plan time.
+                # 4 verified merges, but only 2 PROVEN; one of those proven
+                # merges is downstream-artifact consumed proof. 3 of 4 merged
+                # WRITE tasks declared forward acceptance evidence at plan time.
                 "research_history": [
                     {
                         "prs_merged": 4,
                         "prs_rejected": 0,
                         "verified_prs_merged": 4,
-                        "acceptance_proven_merged": 1,
+                        "acceptance_proven_merged": 2,
+                        "acceptance_consumed_merged": 1,
                         "acceptance_declared_merged": 3,
                         "acceptance_merged_write_total": 4,
                     }
@@ -932,9 +934,11 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
         s for s in payload["directions_summary"] if s["id"] == "d-proven01"
     )
     assert proven["verified_prs_merged"] == 4
-    assert proven["proven_prs_merged"] == 1
+    assert proven["proven_prs_merged"] == 2
+    assert proven["consumed_prs_merged"] == 1
     # Proven is the strict subset of verified for the same window.
     assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
+    assert proven["consumed_prs_merged"] <= proven["proven_prs_merged"]
     assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
 
     legacy = next(
@@ -942,6 +946,7 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     )
     # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
     assert legacy["proven_prs_merged"] == 0
+    assert legacy["consumed_prs_merged"] == 0
     assert legacy["acceptance_declaration_coverage"] is None
 
 

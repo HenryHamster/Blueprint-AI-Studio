@@ -8,7 +8,13 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
-from app.task_blocked import NEED_KINDS, NEED_LABEL_MAX_LEN, NEED_REF_MAX_LEN
+from app.task_blocked import (
+    NEED_KINDS,
+    NEED_LABEL_MAX_LEN,
+    NEED_REF_MAX_LEN,
+    canonicalize_exact_task_ref,
+    is_exact_task_ref,
+)
 
 
 class DeployPayload(BaseModel):
@@ -59,6 +65,20 @@ class BlockedNeed(BaseModel):
             raise ValueError(f"kind must be one of {NEED_KINDS}")
         return v
 
+    @field_validator("ref")
+    @classmethod
+    def _validate_and_normalize_ref(cls, v: str, info) -> str:
+        if not isinstance(v, str):
+            return v
+        ref = v.strip()
+        kind = info.data.get("kind") if isinstance(info.data, dict) else None
+        if kind == "task":
+            canonical = canonicalize_exact_task_ref(ref)
+            if canonical is None:
+                raise ValueError("task ref must be a real task UUID or finding hash")
+            return canonical
+        return ref
+
 
 class ReproduceVerdict(BaseModel):
     """Durable reproduce-on-HEAD verdict for bug-report-/finding-derived work.
@@ -87,6 +107,37 @@ class ReproduceVerdict(BaseModel):
         allowed = {"reproduced", "already_resolved", "indeterminate"}
         if v not in allowed:
             raise ValueError(f"status must be one of {allowed}")
+        return v
+
+
+class TaskParkRequest(BaseModel):
+    """An agent's request to PARK a task waiting on an external, non-agent signal.
+
+    The agent declares *which* source it is waiting on (``wake_source_kind`` —
+    an open string, e.g. ``"compute_job_terminal"``, plus an optional
+    ``wake_source_ref`` such as a ComputeJob id), what to do when that source
+    fires (``wake_action`` — ``"resume"`` to re-queue the task, or ``"finalize"``
+    to drive it terminal), an optional ``deadline_seconds`` after which the
+    reaper ages the park-out rather than stranding it, and free-form
+    ``source_metadata`` the firing side / operators read. Mirrors ``BlockedNeed``'s
+    additive, ``extra="ignore"`` shape so older agents that never send a park
+    request behave identically.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    wake_source_kind: str = Field(..., min_length=1, max_length=64)
+    wake_source_ref: str | None = Field(None, max_length=255)
+    wake_action: str = Field("resume", max_length=20)
+    deadline_seconds: int | None = Field(None, ge=1, le=30 * 24 * 60 * 60)
+    reason: str | None = Field(None, max_length=2000)
+    source_metadata: Dict[str, Any] | None = None
+
+    @field_validator("wake_action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        allowed = {"resume", "finalize"}
+        if v not in allowed:
+            raise ValueError(f"wake_action must be one of {allowed}")
         return v
 
 
@@ -172,12 +223,47 @@ class AgentStatusPayload(BaseModel):
     # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
     # behave identically to today (free-text waiting_on/reason only).
     blocked_need: BlockedNeed | None = None
+    # Optional request to PARK this task on an external wake source (released
+    # fleet slot + durable wake registration). Honored when ``status == PARKED``.
+    # Absent payloads behave identically to today — backward compatible.
+    park_request: TaskParkRequest | None = None
     # Optional durable reproduce-on-HEAD verdict for bug-report-/finding-derived
     # work. Set by the agent on a terminal status when it determined whether the
     # cited defect reproduces against HEAD. Persisted into
     # task.context["reproduce_verdict"]. Absent payloads behave identically to
     # today (older agents only send no_op_reason).
     reproduce_verdict: ReproduceVerdict | None = None
+
+    @field_validator("blocked_need", mode="before")
+    @classmethod
+    def _drop_title_like_task_need(cls, v: Any) -> Any:
+        """Graceful API-boundary enforcement of the exact-task-ref policy.
+
+        A ``kind=task`` blocked-need whose ``ref`` is a title-like string (not a
+        task UUID / finding hash, per
+        :func:`app.task_blocked.is_exact_task_ref`) names no machine-resolvable
+        foundation, so it must not be persisted as durable stranded demand.
+        Rather than 422 the entire status report — which would drop the BLOCKED
+        transition the agent is trying to record — drop ONLY the malformed need
+        to ``None`` (identical to an absent ``blocked_need``, backward-compatible).
+        Named foundations must be declared as ``kind=capability`` instead. Other
+        malformed needs (unknown kind, empty ref) still raise via ``BlockedNeed``.
+        """
+        if isinstance(v, dict):
+            kind = v.get("kind")
+            ref = v.get("ref")
+            # Only intercept a NON-EMPTY title-like task ref. Empty / missing /
+            # non-string refs fall through to BlockedNeed's field validation so
+            # they still raise (preserving the malformed-input contract).
+            if (
+                isinstance(kind, str)
+                and kind.strip().lower() == "task"
+                and isinstance(ref, str)
+                and ref.strip()
+                and not is_exact_task_ref(ref)
+            ):
+                return None
+        return v
 
 
 class UploadUrlRequest(BaseModel):

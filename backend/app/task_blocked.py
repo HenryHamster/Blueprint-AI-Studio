@@ -25,6 +25,8 @@ historical rows that terminated FAILED with that class remain comparable.
 
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -52,6 +54,85 @@ NEED_KINDS: tuple[str, ...] = ("task", "pr", "capability")
 NEED_REF_MAX_LEN = 200
 NEED_LABEL_MAX_LEN = 200
 
+# ── Shared exact-task-ref policy ─────────────────────────────────────────────
+# Single source of truth for the ``kind=task`` prerequisite contract, used by
+# research prerequisite normalization (``finding_deduplication``), agent
+# blocked-need schema/building (``schemas.BlockedNeed`` / :func:`build_need`),
+# blocked-need resolution (``blocked_need_resolution``), reaper give-up marking
+# (``reaper_sweeps``), and missing-foundation demand aggregation
+# (``capability_demand``). A ``task`` reference is EXACT — and therefore a
+# machine-resolvable foundation — ONLY when it is a real task UUID or a canonical
+# 16-char finding hash (the lowercase-hex prefix ``finding_deduplication.
+# finding_hash`` emits). A title-like string — free prose naming a desired
+# foundation — is NOT a task ref: it can never resolve to a real task, so it must
+# never become durable stranded "missing task" demand. Named foundations belong
+# to ``kind=capability`` (plus an explicit ``provides_capability`` marker on the
+# provider) instead.
+_FINDING_HASH_RE = re.compile(r"^[0-9a-fA-F]{16}$")
+
+
+def is_exact_task_ref(ref: object) -> bool:
+    """True iff ``ref`` is an exact, machine-resolvable task identifier.
+
+    Exact means a real task UUID or a canonical 16-char finding hash — never a
+    title-like free-prose string. This is the single predicate the whole
+    pipeline shares so a malformed ``kind=task`` ref is rejected identically at
+    ingestion, persistence, resolution, give-up marking, and demand aggregation.
+    """
+    if not isinstance(ref, str):
+        return False
+    text = ref.strip()
+    if not text:
+        return False
+    if _FINDING_HASH_RE.match(text):
+        return True
+    try:
+        uuid.UUID(text)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def canonicalize_exact_task_ref(ref: object) -> Optional[str]:
+    """Return the canonical lowercase form of an exact task ref, or None.
+
+    UUID refs are normalized via ``uuid.UUID`` so mixed-case spellings collapse
+    to the stored lowercase UUID string. 16-hex finding hashes are lowercased.
+    Non-exact refs return ``None``.
+    """
+    if not is_exact_task_ref(ref):
+        return None
+    text = str(ref).strip()
+    try:
+        return str(uuid.UUID(text))
+    except (ValueError, AttributeError, TypeError):
+        return text.lower()
+
+
+def is_foundation_demand_need(need: object) -> bool:
+    """True iff a ``{kind, ref}`` need names a commissionable missing foundation.
+
+    A foundation demand is a ``capability`` need (any non-empty ref — named
+    foundations are resolved by explicit provider capability markers) or an
+    EXACT ``task`` need (UUID / finding hash). A title-like ``task`` ref names no
+    resolvable foundation and is therefore NOT demand — it must never be folded
+    into missing-foundation aggregates or stamped as a missing-foundation
+    retirement. A ``pr`` need names an external ref and is never foundation
+    demand. Malformed input is ``False``.
+    """
+    if not isinstance(need, dict):
+        return False
+    kind = need.get("kind")
+    ref = need.get("ref")
+    if not isinstance(kind, str) or not isinstance(ref, str) or not ref.strip():
+        return False
+    kind = kind.strip().lower()
+    if kind == "capability":
+        return True
+    if kind == "task":
+        return is_exact_task_ref(ref)
+    return False
+
 
 def build_need(
     kind: str, ref: str, label: Optional[str] = None
@@ -60,13 +141,22 @@ def build_need(
 
     Returns ``None`` when ``kind`` is not a recognized NEED kind or ``ref`` is
     empty after trimming, so callers can pass through unvalidated input and only
-    persist a well-formed need. Length-bounds ``ref`` and ``label``.
+    persist a well-formed need. A ``kind=task`` ref that is not exact
+    (:func:`is_exact_task_ref` — i.e. a title-like string rather than a task
+    UUID / finding hash) is likewise rejected, so a malformed task prerequisite
+    is gracefully DROPPED rather than persisted as durable stranded demand;
+    callers fall back to the absent-need (free-text) behaviour. Length-bounds
+    ``ref`` and ``label``.
     """
     if kind not in NEED_KINDS:
         return None
     ref_text = (ref or "").strip()
     if not ref_text:
         return None
+    if kind == "task" and not is_exact_task_ref(ref_text):
+        return None
+    if kind == "task":
+        ref_text = canonicalize_exact_task_ref(ref_text) or ref_text
     need: Dict[str, Any] = {"kind": kind, "ref": ref_text[:NEED_REF_MAX_LEN]}
     if label:
         label_text = str(label).strip()

@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0198"
+EXPECTED_SCHEMA_REVISION = "0199"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1545,6 +1545,41 @@ async def prometheus_metrics(request: Request):
             "blueprint_reaper_last_cycle_age_seconds",
             "Seconds since last fully-successful reaper cycle (-1 if never completed)",
             _reaper_stats.get("last_cycle_age_seconds", -1),
+        )
+
+    # Park/wake operational health (fleet-wide, read-only). Surfaces the PARKED
+    # population and the wake-delivery backlog so a wedged delivery sweep is
+    # visible in metrics, not just logs. Small, indexed aggregates; guarded so a
+    # transient DB error degrades the scrape gracefully rather than failing it.
+    with contextlib.suppress(Exception):
+        from app.digest_metrics import compute_park_wake_health
+
+        async with AsyncSessionLocal() as _pw_session:
+            _pw = await compute_park_wake_health(_pw_session)
+        gauge(
+            "blueprint_tasks_parked",
+            "Number of tasks currently PARKED on an external wake source",
+            _pw.get("parked_task_count", 0),
+        )
+        gauge(
+            "blueprint_parked_task_oldest_age_seconds",
+            "Age of the oldest PARKED task in seconds (-1 if none)",
+            _pw.get("oldest_parked_age_seconds") or -1,
+        )
+        gauge(
+            "blueprint_wake_registrations_fired_undelivered",
+            "FIRED TaskWakeRegistrations the wake-delivery sweep has not yet delivered",
+            _pw.get("fired_undelivered_count", 0),
+        )
+        gauge(
+            "blueprint_wake_fired_oldest_age_seconds",
+            "Age of the oldest FIRED-but-undelivered wake registration in seconds (-1 if none)",
+            _pw.get("oldest_fired_age_seconds") or -1,
+        )
+        gauge(
+            "blueprint_wake_delivery_stalled",
+            "1 if a FIRED wake registration has gone undelivered past the stall threshold, 0 otherwise",
+            1 if _pw.get("delivery_stalled") else 0,
         )
 
     body = "\n".join(lines) + "\n"

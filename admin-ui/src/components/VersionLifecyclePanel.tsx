@@ -44,6 +44,52 @@ const QUAL_VERDICT_COLOR: Record<string, string> = {
   sha_error: 'text-red-400',
 };
 
+// Badge showing the real-world outcome of a promoted verdict: whether the
+// promotion that was gated actually served in production (serving_confirmed),
+// failed to deploy (deploy_failed), or has not yet resolved (awaiting).
+function PostPromotionOutcomeBadge({
+  outcome,
+  outcomeAt,
+}: {
+  outcome: string | null | undefined;
+  outcomeAt?: string | null;
+}) {
+  if (outcome === 'serving_confirmed') {
+    return (
+      <span
+        data-testid="post-promotion-outcome-badge"
+        data-outcome="serving_confirmed"
+        className="font-mono text-[9px] px-1 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+        title={outcomeAt ? `serving confirmed ${timeAgo(outcomeAt)}` : 'serving confirmed post-promotion'}
+      >
+        ✓ serving
+      </span>
+    );
+  }
+  if (outcome === 'deploy_failed') {
+    return (
+      <span
+        data-testid="post-promotion-outcome-badge"
+        data-outcome="deploy_failed"
+        className="font-mono text-[9px] px-1 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
+        title={outcomeAt ? `deploy failed ${timeAgo(outcomeAt)}` : 'deploy failed post-promotion'}
+      >
+        ⚠ deploy failed
+      </span>
+    );
+  }
+  return (
+    <span
+      data-testid="post-promotion-outcome-badge"
+      data-outcome="awaiting"
+      className="font-mono text-[9px] px-1 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
+      title="post-promotion outcome not yet recorded"
+    >
+      awaiting outcome
+    </span>
+  );
+}
+
 function QualSummary({ q }: { q: VersionQualification | null }) {
   if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
   const conf = `${Math.round(q.confidence * 100)}%`;
@@ -1194,6 +1240,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <QualSummary q={cv.last_qualification} />
+                  {cv.last_qualification.candidate_sha && (() => {
+                    const matchedVerdict = verdicts.find(v => v.candidate_sha === cv.last_qualification?.candidate_sha);
+                    return matchedVerdict?.terminal_status === 'promoted' ? (
+                      <PostPromotionOutcomeBadge outcome={matchedVerdict.post_promotion_outcome} outcomeAt={matchedVerdict.post_promotion_outcome_at} />
+                    ) : null;
+                  })()}
                   {cv.last_qualification.candidate_sha && (
                     <span
                       className="text-[10px] text-neutral-500 font-mono"
@@ -1383,23 +1435,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
-                    {v.post_promotion_outcome && (
-                      <span
-                        className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
-                          v.post_promotion_outcome === 'serving_confirmed'
-                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                            : v.post_promotion_outcome === 'deploy_failed'
-                              ? 'bg-red-500/10 border-red-500/40 text-red-400'
-                              : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                        }`}
-                        title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
-                      >
-                        {v.post_promotion_outcome === 'serving_confirmed'
-                          ? '✓ serving'
-                          : v.post_promotion_outcome === 'deploy_failed'
-                            ? '⚠ deploy failed'
-                            : 'unconfirmed'}
-                      </span>
+                    {v.terminal_status === 'promoted' && (
+                      <PostPromotionOutcomeBadge outcome={v.post_promotion_outcome} outcomeAt={v.post_promotion_outcome_at} />
                     )}
                     <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
                     {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}

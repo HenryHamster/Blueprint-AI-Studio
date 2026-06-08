@@ -5,7 +5,7 @@ import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import { usePoller } from './usePoller';
 import type { Direction } from '../components/DirectionsPanel';
-import type { ProblemModel, ProblemModelSizeHealth, RunningUpdateReconciliation } from '../types';
+import type { ProblemModel, ProblemModelSizeHealth, RunningUpdateReconciliation, SelfReflectionEntry } from '../types';
 
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
@@ -36,6 +36,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
   const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
     useState<RunningUpdateReconciliation | null>(null);
+  const [selfReflectionLog, setSelfReflectionLog] = useState<SelfReflectionEntry[]>([]);
   // The currently-open release version number, used to gate the "stage for next
   // version" affordance: staging requires an open version (the backend stamps
   // staged_for_version from it and 404s when none is open).
@@ -118,6 +119,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
       setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
+      setSelfReflectionLog(data.self_reflection_log ?? []);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
@@ -487,6 +489,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     runningUpdateAckAt,
     setRunningUpdateAckAt,
     runningUpdateReconciliation,
+    selfReflectionLog,
     openVersionNumber,
     error,
     setError,
