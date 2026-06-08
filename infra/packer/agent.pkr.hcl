@@ -132,6 +132,19 @@ build {
   # next shell provisioner can bake the expensive `deps` stage into the VM's
   # local docker store. The `deps` stage only COPYs requirements.txt, so these
   # two files are the entire context it needs — no full backend tree required.
+  #
+  # packer's file provisioner does NOT create the destination parent directory.
+  # This mkdir is MANDATORY: without it the first upload writes
+  # /tmp/backend-deps-ctx as a regular FILE (the Dockerfile's bytes), the second
+  # upload then fails ("Not a directory"), the reqhash degrades to
+  # sha256("")=e3b0c44298fc1c14, and `docker build` gets a file as its context —
+  # so no deps image is ever baked. Prod #8687 (2026-06-07) shipped without this
+  # mkdir and silently no-op'd fleet-wide: every agent VM missed the local fast
+  # path and paid the full ~20-min docker build on every ./check test gate.
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/backend-deps-ctx"]
+  }
+
   provisioner "file" {
     source      = "../../backend/Dockerfile"
     destination = "/tmp/backend-deps-ctx/Dockerfile"
@@ -144,6 +157,10 @@ build {
 
   provisioner "shell" {
     inline = [
+      # set -eu so any failed step aborts the bake (and the packer build) — the
+      # default inline shebang carries no -e, which is exactly how #8687's broken
+      # bake sailed through green. -u catches an unset REQHASH.
+      "set -eu",
       "# Bake the backend test image's `deps` stage (apt shellcheck + ~37 pip",
       "# packages) into the VM's local docker store, keyed by the SAME reqhash",
       "# scheme scripts/test-backend.sh + CI use:",
@@ -154,12 +171,25 @@ build {
       "# was pre-pulled above, so no base pull is needed here. The image persists",
       "# into booted instances via /var/lib/docker exactly like the postgres:15",
       "# and python:3.11-slim pre-pulls above (proven pattern).",
+      "#",
+      "# A bake that produces NO image must FAIL the packer build loudly, never",
+      "# ship green: #8687 (2026-06-07) silently no-op'd (missing context dir →",
+      "# empty reqhash → docker build on a non-dir context), and every agent VM",
+      "# then paid the full local docker build on every ./check test gate.",
+      "test -s /tmp/backend-deps-ctx/requirements.txt || { echo 'FATAL: requirements.txt missing/empty in bake context' >&2; exit 1; }",
+      "test -s /tmp/backend-deps-ctx/Dockerfile || { echo 'FATAL: Dockerfile missing/empty in bake context' >&2; exit 1; }",
       "REQHASH=$(cat /tmp/backend-deps-ctx/requirements.txt /tmp/backend-deps-ctx/Dockerfile | sha256sum | cut -c1-16)",
       "echo \"backend deps reqhash: $REQHASH\"",
-      "sudo docker build --target deps -t \"blueprint-backend-test-deps:$REQHASH\" /tmp/backend-deps-ctx && echo PACKER_BACKEND_DEPS_IMAGE_OK",
+      # Defense in depth: sha256 of empty input. Should be unreachable now that
+      # the context files are asserted above, but make the historical failure
+      # mode an explicit, named abort rather than a silent mis-tag.
+      "if [ \"$REQHASH\" = \"e3b0c44298fc1c14\" ]; then echo 'FATAL: reqhash is sha256(empty) — bake context did not materialize' >&2; exit 1; fi",
+      "sudo docker build --target deps -t \"blueprint-backend-test-deps:$REQHASH\" /tmp/backend-deps-ctx",
+      "echo PACKER_BACKEND_DEPS_IMAGE_OK",
       "# Verify the reqhash-tagged image is resolvable locally — the exact lookup",
       "# scripts/test-backend.sh's local fast path performs (docker image inspect).",
-      "sudo docker image inspect \"blueprint-backend-test-deps:$REQHASH\" >/dev/null && echo PACKER_BACKEND_DEPS_INSPECT_OK",
+      "sudo docker image inspect \"blueprint-backend-test-deps:$REQHASH\" >/dev/null || { echo 'FATAL: baked deps image not resolvable after build' >&2; exit 1; }",
+      "echo PACKER_BACKEND_DEPS_INSPECT_OK",
       "sudo rm -rf /tmp/backend-deps-ctx"
     ]
   }
