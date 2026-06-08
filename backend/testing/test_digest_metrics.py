@@ -4885,3 +4885,103 @@ async def test_park_wake_health_metrics_surface(db_session):
     assert post["fired_undelivered_count"] == 0
     assert post["oldest_fired_age_seconds"] is None
     assert post["delivery_stalled"] is False
+    # Additive new keys are always present (may be empty when no timeouts occurred).
+    assert "timeout_by_cause" in post
+    assert "timeout_cause_window_days" in post
+    assert post["timeout_cause_window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_park_wake_health_timeout_by_cause_breakdown(db_session):
+    """timeout_by_cause buckets recently-expired park_wake_timeout tasks by cause.
+
+    Inserts two failed tasks with different failure_detail values (and one with
+    provisioning-starved vs ran-out-of-time diagnostics) and asserts the cause
+    breakdown returned by compute_park_wake_health is correct.
+    """
+    from app.digest_metrics import compute_park_wake_health
+    from app.models import Task as TaskModel
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Wake-lost failure (delivery bug).
+    wake_lost_task = TaskModel(
+        project_id=project.id,
+        title="wake-lost timeout task",
+        status=TaskStatus.FAILED,
+        context={
+            "failure_class": "park_wake_timeout",
+            "failure_detail": "compute_job_terminal_wake_lost_after_job_completed",
+            "park_wake_timeout_diagnostics": {
+                "job_started_at": None,
+                "job_created_at": "2026-01-01T00:00:00",
+                "provisioning_seconds": 300.0,
+                "execution_seconds": None,
+                "job_terminal_by_deadline": True,
+            },
+        },
+    )
+    # Not-terminal / provisioning-starved (job_started_at is None).
+    provisioning_starved_task = TaskModel(
+        project_id=project.id,
+        title="provisioning-starved timeout task",
+        status=TaskStatus.FAILED,
+        context={
+            "failure_class": "park_wake_timeout",
+            "failure_detail": "compute_job_terminal_job_not_terminal_by_deadline",
+            "park_wake_timeout_diagnostics": {
+                "job_started_at": None,
+                "job_created_at": "2026-01-01T00:00:00",
+                "provisioning_seconds": 300.0,
+                "execution_seconds": None,
+                "job_terminal_by_deadline": False,
+            },
+        },
+    )
+    # Not-terminal / ran-out-of-time (job_started_at is set).
+    ran_out_task = TaskModel(
+        project_id=project.id,
+        title="ran-out-of-time timeout task",
+        status=TaskStatus.FAILED,
+        context={
+            "failure_class": "park_wake_timeout",
+            "failure_detail": "compute_job_terminal_job_not_terminal_by_deadline",
+            "park_wake_timeout_diagnostics": {
+                "job_started_at": "2026-01-01T00:05:00",
+                "job_created_at": "2026-01-01T00:00:00",
+                "provisioning_seconds": 300.0,
+                "execution_seconds": 900.0,
+                "job_terminal_by_deadline": False,
+            },
+        },
+    )
+    # A non-park_wake_timeout failed task — must NOT appear in timeout_by_cause.
+    other_failed = TaskModel(
+        project_id=project.id,
+        title="other failed task",
+        status=TaskStatus.FAILED,
+        context={"failure_class": "CODE_ERROR"},
+    )
+    db_session.add_all(
+        [wake_lost_task, provisioning_starved_task, ran_out_task, other_failed]
+    )
+    await db_session.commit()
+
+    result = await compute_park_wake_health(db_session, project_id=project.id)
+
+    by_cause = result["timeout_by_cause"]
+    assert by_cause.get("compute_job_terminal_wake_lost_after_job_completed", 0) == 1, (
+        f"expected 1 wake_lost; got {by_cause}"
+    )
+    assert by_cause.get("provisioning_starved", 0) == 1, (
+        f"expected 1 provisioning_starved; got {by_cause}"
+    )
+    assert by_cause.get("ran_out_of_time", 0) == 1, (
+        f"expected 1 ran_out_of_time; got {by_cause}"
+    )
+    # The non-park_wake_timeout task must not contribute to any cause bucket.
+    total = sum(by_cause.values())
+    assert total == 3, f"expected 3 total timeout tasks; got {total} in {by_cause}"

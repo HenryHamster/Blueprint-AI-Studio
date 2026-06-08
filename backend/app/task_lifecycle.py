@@ -5443,6 +5443,8 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
                     )
             deadline_at = registration.deadline_at
             job_completed_at = job.completed_at if job is not None else None
+            job_started_at = job.started_at if job is not None else None
+            job_created_at = job.created_at if job is not None else None
             job_status = getattr(job.status, "value", job.status) if job else None
             job_terminal_by_deadline = bool(
                 job is not None
@@ -5450,6 +5452,27 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
                 and deadline_at is not None
                 and job_completed_at <= deadline_at
             )
+            # Provisioning vs execution split: how much of the deadline was spent
+            # waiting for the job to start (provisioning) vs actually running.
+            # Clamped to 0 to guard against clock-skew or backdated test fixtures.
+            provisioning_seconds: float | None = None
+            execution_seconds: float | None = None
+            if job_created_at is not None and deadline_at is not None:
+                if job_started_at is not None:
+                    provisioning_seconds = max(
+                        0.0,
+                        round((job_started_at - job_created_at).total_seconds(), 1),
+                    )
+                    execution_seconds = max(
+                        0.0,
+                        round((deadline_at - job_started_at).total_seconds(), 1),
+                    )
+                else:
+                    # Job never reached running state — all budget went to provisioning.
+                    provisioning_seconds = max(
+                        0.0,
+                        round((deadline_at - job_created_at).total_seconds(), 1),
+                    )
             diagnostics = {
                 "wake_source_kind": registration.wake_source_kind,
                 "wake_source_ref": registration.wake_source_ref,
@@ -5464,10 +5487,14 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
                 ),
                 "deadline_at": deadline_at.isoformat() if deadline_at else None,
                 "job_status": job_status,
+                "job_created_at": job_created_at.isoformat() if job_created_at else None,
+                "job_started_at": job_started_at.isoformat() if job_started_at else None,
                 "job_completed_at": (
                     job_completed_at.isoformat() if job_completed_at else None
                 ),
                 "job_terminal_by_deadline": job_terminal_by_deadline,
+                "provisioning_seconds": provisioning_seconds,
+                "execution_seconds": execution_seconds,
             }
             if job_terminal_by_deadline:
                 failure_detail = "compute_job_terminal_wake_lost_after_job_completed"

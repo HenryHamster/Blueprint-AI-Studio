@@ -28,6 +28,13 @@ export const RATE_LIMIT_KIND_LABELS: Record<string, string> = {
   unknown: 'unknown',
 };
 
+/** Friendly labels for park_wake_timeout failure_detail values
+ *  (see backend/app/task_lifecycle.py expire_wake). */
+export const PARK_WAKE_FAILURE_DETAIL_LABELS: Record<string, string> = {
+  compute_job_terminal_wake_lost_after_job_completed: 'wake lost after job completed',
+  compute_job_terminal_job_not_terminal_by_deadline: 'job did not finish in time',
+};
+
 // RecentCompletion is the canonical digest type, hoisted to ../types/digest.
 // Re-exported here so existing importers (catchupRows, CatchUpPanel, tests)
 // keep resolving it from this module — single source of truth, no divergence.

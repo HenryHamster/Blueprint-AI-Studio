@@ -6024,6 +6024,11 @@ async def test_park_wake_timeout_disambiguates_compute_job_state(db_session):
     assert diagnostics["requested_at"] == reg.requested_at.isoformat()
     assert diagnostics["claimed_at"] is None
     assert diagnostics["fired_at"] is None
+    # Provisioning-vs-runtime enrichment: job never started, so execution_seconds is None.
+    assert "job_created_at" in diagnostics
+    assert diagnostics["job_started_at"] is None
+    assert diagnostics["provisioning_seconds"] is not None
+    assert diagnostics["execution_seconds"] is None
     assert "expired before the job reached terminal state" in (
         task.latest_status_message or ""
     )
@@ -6134,6 +6139,11 @@ async def test_park_wake_timeout_when_job_finished_but_wake_never_fired(db_sessi
     assert diagnostics["requested_at"] == reg.requested_at.isoformat()
     assert diagnostics["claimed_at"] is None
     assert diagnostics["fired_at"] is None
+    # Provisioning-vs-runtime enrichment fields are present (job_created_at always set).
+    assert "job_created_at" in diagnostics
+    assert "job_started_at" in diagnostics
+    assert "provisioning_seconds" in diagnostics
+    assert "execution_seconds" in diagnostics
     assert "wake never fired before the deadline" in (task.latest_status_message or "")
     assert reg.result_detail == task.latest_status_message
     assert reg.delivery_state == WakeDeliveryState.EXPIRED
@@ -6614,3 +6624,172 @@ async def test_kill_compute_job_gracefully_handles_peer_terminal(db_session, mon
     # The peer's outcome should be preserved (not overwritten by kill).
     assert job.outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED
     assert job.terminal_reason == "peer made terminal"
+
+
+@pytest.mark.asyncio
+async def test_park_wake_timeout_diagnostics_provisioning_vs_runtime_split(db_session):
+    """Acceptance: park_wake_timeout diagnostics carry the provisioning-vs-runtime split.
+
+    Two scenarios:
+    (A) Job never started running (started_at is None) — all budget went to provisioning.
+        Diagnostics: provisioning_seconds set, execution_seconds None.
+    (B) Job started running but did not complete in time.
+        Diagnostics: provisioning_seconds + execution_seconds both set.
+    """
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import park_task
+    from app.time_utils import _utcnow
+
+    project = Project(name="Provisioning Split Test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Use a future deadline first so park_task accepts it, then backdate after commit.
+    future_deadline = now + timedelta(hours=1)
+    # The "actual" past deadline used for diagnostics — must be after job created_at.
+    past_deadline = now - timedelta(minutes=5)
+
+    # --- Scenario A: job never started running (started_at is None) ---
+    task_a = Task(
+        project_id=project.id,
+        title="provisioning-starved task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    job_a = await compute_jobs.create_compute_job(
+        db_session,
+        task_a,
+        command="sleep 60",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Backdate job_a's created_at so it precedes the past_deadline.
+    job_a.created_at = past_deadline - timedelta(minutes=10)
+    await db_session.commit()
+
+    # Leave job_a.started_at as None — simulates provisioning starvation.
+    await park_task(
+        db_session,
+        task_a,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job_a.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=future_deadline,
+        reason="parked on slow job",
+    )
+    # Backdate the registration deadline so sweep expires it.
+    reg_a = (
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.task_id == task_a.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    reg_a.deadline_at = past_deadline
+    await db_session.commit()
+
+    # --- Scenario B: job started running but did not complete ---
+    task_b = Task(
+        project_id=project.id,
+        title="ran-out-of-time task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    job_b = await compute_jobs.create_compute_job(
+        db_session,
+        task_b,
+        command="sleep 600",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Backdate job_b's created_at so it precedes started_at and the past_deadline.
+    job_b_created_at = past_deadline - timedelta(minutes=10)
+    job_b.created_at = job_b_created_at
+    # Simulate the job reaching running state 2 minutes after creation.
+    started_at = job_b_created_at + timedelta(minutes=2)
+    job_b.started_at = started_at
+    await db_session.commit()
+
+    await park_task(
+        db_session,
+        task_b,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job_b.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=future_deadline,
+        reason="parked on slow job",
+    )
+    # Backdate the registration deadline.
+    reg_b = (
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.task_id == task_b.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    reg_b.deadline_at = past_deadline
+    await db_session.commit()
+
+    # Expire both tasks via the sweep.
+    delivered = await sweep_deliver_task_wakes(db_session, now)
+    assert delivered == 0, "no FIRED registrations to deliver"
+
+    db_session.expire_all()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # --- Verify Scenario A diagnostics ---
+    assert task_a.status == TaskStatus.FAILED
+    assert (task_a.context or {}).get("failure_class") == "park_wake_timeout"
+    assert (task_a.context or {}).get("failure_detail") == (
+        "compute_job_terminal_job_not_terminal_by_deadline"
+    )
+    diag_a = (task_a.context or {}).get("park_wake_timeout_diagnostics") or {}
+    assert diag_a["job_created_at"] is not None, "job_created_at must be recorded"
+    assert diag_a["job_started_at"] is None, "job never started — must be None"
+    assert diag_a["provisioning_seconds"] is not None, (
+        "provisioning_seconds must reflect full deadline when job never started"
+    )
+    assert diag_a["execution_seconds"] is None, (
+        "execution_seconds must be None when job never started"
+    )
+    assert diag_a["provisioning_seconds"] > 0
+
+    # --- Verify Scenario B diagnostics ---
+    assert task_b.status == TaskStatus.FAILED
+    assert (task_b.context or {}).get("failure_class") == "park_wake_timeout"
+    diag_b = (task_b.context or {}).get("park_wake_timeout_diagnostics") or {}
+    assert diag_b["job_created_at"] is not None
+    assert diag_b["job_started_at"] is not None, "job_started_at must reflect started_at"
+    assert diag_b["provisioning_seconds"] is not None, (
+        "provisioning_seconds must reflect time from creation to start"
+    )
+    assert diag_b["execution_seconds"] is not None, (
+        "execution_seconds must reflect time from start to deadline"
+    )
+    # job ran for (deadline - started_at); provisioning is (started_at - created_at).
+    # Both should be positive.
+    assert diag_b["provisioning_seconds"] > 0
+    assert diag_b["execution_seconds"] > 0

@@ -2072,6 +2072,45 @@ async def compute_park_wake_health(
         get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
     )
 
+    # Historical breakdown of park_wake_timeout outcomes by cause over the last 7 days.
+    # Buckets: wake_lost (delivery bug), provisioning_starved (job never reached
+    # running state), ran_out_of_time (job started but did not complete in time),
+    # unknown (no failure_detail on pre-enrichment failures).
+    _timeout_window_start = now - timedelta(days=7)
+    _timeout_task_filters = [
+        Task.status == TaskStatus.FAILED,
+        Task.updated_at >= _timeout_window_start,
+    ]
+    if project_id is not None:
+        _timeout_task_filters.append(Task.project_id == project_id)
+    _timeout_ctxs = (
+        await session.execute(
+            select(Task.context)
+            .where(*_timeout_task_filters)
+            .limit(500)
+        )
+    ).scalars().all()
+
+    timeout_by_cause: Dict[str, int] = {}
+    for _ctx in _timeout_ctxs:
+        if not isinstance(_ctx, dict):
+            continue
+        if _ctx.get("failure_class") != "park_wake_timeout":
+            continue
+        detail = _ctx.get("failure_detail") or "unknown"
+        if detail == "compute_job_terminal_job_not_terminal_by_deadline":
+            diag = _ctx.get("park_wake_timeout_diagnostics") or {}
+            if "job_started_at" not in diag:
+                # Pre-enrichment failure — sub-cause not recorded; group by detail.
+                cause = detail
+            elif diag.get("job_started_at") is None:
+                cause = "provisioning_starved"
+            else:
+                cause = "ran_out_of_time"
+        else:
+            cause = detail
+        timeout_by_cause[cause] = timeout_by_cause.get(cause, 0) + 1
+
     return {
         "parked_task_count": int(parked_task_count),
         "oldest_parked_age_seconds": _age_seconds(now, oldest_parked_at),
@@ -2080,6 +2119,8 @@ async def compute_park_wake_health(
         "delivery_stalled": delivery_stalled,
         "delivery_stall_threshold_seconds": _PARK_WAKE_DELIVERY_STALL_SECONDS,
         "stall_cycles": get_wake_delivery_stall_cycles(),
+        "timeout_by_cause": timeout_by_cause,
+        "timeout_cause_window_days": 7,
     }
 
 
