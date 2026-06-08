@@ -3847,6 +3847,103 @@ async def test_compute_wake_delivery_commit_is_durable_and_single(
         assert fresh_reg.attempt_count == 1
 
 
+@pytest.mark.asyncio
+async def test_park_task_waits_for_terminal_job_commit_before_catch_up(
+    db_session, monkeypatch
+):
+    """park_task must wait out an in-flight terminalization before catch-up.
+
+    If the monitor has already terminalized the compute job and fired wakes in an
+    uncommitted transaction, park_task should block on the compute-job row lock and
+    then create the registration as FIRED once that transaction commits.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.task_lifecycle import fire_task_wakes, park_task
+
+    project = Project(name="Race Fix Project", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: terminal race fix",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo terminal race",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    async with session_factory() as terminal_session:
+        locked_job = await terminal_session.get(ComputeJob, job.id, with_for_update=True)
+        assert locked_job is not None
+        locked_job.status = ComputeJobStatus.SUCCEEDED
+        locked_job.outcome = ComputeJobOutcome.SUCCESS
+        locked_job.completed_at = datetime.utcnow()
+        locked_job.final_cost_usd = 0.25
+        locked_job.accrued_cost_usd = 0.25
+        await terminal_session.flush()
+
+        fired = await fire_task_wakes(
+            terminal_session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+        )
+        assert fired == 0
+
+        started = asyncio.Event()
+
+        async def _park_after_commit():
+            async with session_factory() as park_session:
+                parked_task = await park_session.get(Task, task.id)
+                assert parked_task is not None
+                started.set()
+                reg = await park_task(
+                    park_session,
+                    parked_task,
+                    wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                    wake_source_ref=str(job.id),
+                    wake_action=WakeAction.FINALIZE,
+                    reason=f"waiting on compute job {job.id}",
+                )
+                await park_session.commit()
+                await park_session.refresh(reg)
+                return reg
+
+        parked = asyncio.create_task(_park_after_commit())
+        await started.wait()
+        await asyncio.sleep(0.05)
+        assert not parked.done()
+
+        await terminal_session.commit()
+        reg = await parked
+        reg_id = reg.id
+
+    await db_session.refresh(task)
+    reg = await db_session.get(TaskWakeRegistration, reg_id)
+    assert reg is not None
+    assert task.status == TaskStatus.PARKED
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+    assert reg.fired_at is not None
+
+
 def test_build_compute_result_logs_shape_metrics_and_disposition():
     """The backend COMPUTE_RESULT builder mirrors the agent artifact contract.
 

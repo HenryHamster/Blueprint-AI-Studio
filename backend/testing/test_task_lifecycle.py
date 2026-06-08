@@ -51,6 +51,7 @@ from app.task_lifecycle import (
     _resolve_fallback_verdict,
     park_task,
     fire_task_wakes,
+    deliver_wake,
 )
 from app.reaper_sweeps import sweep_deliver_task_wakes
 from app.time_utils import _utcnow
@@ -7148,3 +7149,297 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
         .all()
     )
     assert len(delivered_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_delivery_commit_contract_is_truthful(tl_db, mocker):
+    """deliver_wake on a compute-FINALIZE registration uses the caller's single
+    commit to atomically cover the FIRED→DELIVERED flip, park-marker clearing, and
+    task finalization.  deliver_wake itself does NOT commit — the caller owns the
+    commit.  Repeated calls must return False without re-advancing the task.
+
+    The contract: for wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND with
+    wake_action == FINALIZE, deliver_wake mutates session state but does not commit.
+    The caller (sweep or test) commits exactly once after deliver_wake returns True,
+    making the DELIVERED state and task advance durable atomically.
+    """
+    from app.models import WakeAction, WakeDeliveryState
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    # Park the task on the compute-job-terminal wake source with FINALIZE action.
+    reg = await park_task(
+        session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref="job-xyz",
+        source_metadata={"compute_job_id": "job-xyz"},
+        wake_action=WakeAction.FINALIZE,
+        reason="waiting on compute job job-xyz",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(reg)
+
+    assert task.status == TaskStatus.PARKED
+    assert reg.delivery_state == WakeDeliveryState.PENDING
+
+    # Fire the registration.
+    fired = await fire_task_wakes(
+        session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref="job-xyz",
+    )
+    await session.commit()
+    await session.refresh(reg)
+    assert fired == 1
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+    # Stub out the completion handler (owns_commit=False — pure mutation, no
+    # internal commit).  The caller's commit below is what makes state durable.
+    async def _fake_completion(task_arg, logs_arg, session_arg, *, owns_commit=True):
+        pass  # pure mutation; caller owns the commit
+
+    mocker.patch(
+        "app.task_completion._handle_compute_experiment_completion",
+        side_effect=_fake_completion,
+    )
+
+    # --- First deliver_wake call: mutates session but does NOT commit. ---------
+    result = await deliver_wake(session, reg, now=_utcnow())
+    assert result is True
+
+    # deliver_wake does not commit — state is not yet durable.  The caller
+    # (here: the test, mirroring the sweep) owns the single commit.
+    await session.commit()
+
+    # Verify durability: reload the registration from the DB in a fresh query.
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at is not None
+    assert reg.result_state == "finalized"
+
+    # Park markers cleared atomically with DELIVERED flip.
+    await session.refresh(task)
+    assert task.parked_at is None
+    assert task.park_reason is None
+
+    # --- Second deliver_wake call: strict no-op (idempotency). ----------------
+    first_delivered_at = reg.delivered_at
+    result2 = await deliver_wake(session, reg, now=_utcnow())
+    assert result2 is False
+
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_delivery_handler_failure_leaves_task_recoverable(
+    tl_db, mocker
+):
+    """When _handle_compute_experiment_completion raises after deliver_wake sets
+    FIRED→DELIVERED in memory, a rollback restores the registration to FIRED and
+    the task to PARKED with parked_at intact — the task is NOT permanently wedged.
+
+    This guards the critical atomicity invariant: because deliver_wake does NOT
+    pre-commit the DELIVERED flip, a handler failure rolls back everything and the
+    registration remains re-deliverable (or the poison handler can mark it FAILED,
+    leaving the task PARKED with parked_at set so the strand-guard can recover it).
+    """
+    from app.models import WakeAction, WakeDeliveryState
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    reg = await park_task(
+        session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref="job-abc",
+        source_metadata={"compute_job_id": "job-abc"},
+        wake_action=WakeAction.FINALIZE,
+        reason="waiting on compute job job-abc",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(reg)
+
+    parked_at_before = task.parked_at
+    assert parked_at_before is not None
+    assert task.status == TaskStatus.PARKED
+
+    # Fire the registration.
+    fired = await fire_task_wakes(
+        session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref="job-abc",
+    )
+    await session.commit()
+    await session.refresh(reg)
+    assert fired == 1
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+    # Stub the completion handler to raise — simulating a finalization failure.
+    async def _raising_completion(task_arg, logs_arg, session_arg, *, owns_commit=True):
+        raise RuntimeError("simulated finalization failure")
+
+    mocker.patch(
+        "app.task_completion._handle_compute_experiment_completion",
+        side_effect=_raising_completion,
+    )
+
+    # deliver_wake must propagate the handler's exception (no silent swallow).
+    with pytest.raises(RuntimeError, match="simulated finalization failure"):
+        await deliver_wake(session, reg, now=_utcnow())
+
+    # Simulate what the sweep does on exception: rollback.
+    await session.rollback()
+
+    # After rollback the registration must still be FIRED (not DELIVERED) so the
+    # poison handler or a future sweep iteration can handle it.
+    await session.refresh(reg)
+    assert reg.delivery_state == WakeDeliveryState.FIRED, (
+        "registration must remain FIRED after rollback so the task stays recoverable"
+    )
+
+    # The task must still be PARKED with parked_at intact — NOT NULL — so the
+    # strand-guard can eventually recover it.
+    await session.refresh(task)
+    assert task.status == TaskStatus.PARKED, "task must remain PARKED after rollback"
+    assert task.parked_at is not None, (
+        "parked_at must NOT be NULL after rollback — a NULL parked_at with "
+        "DELIVERED registration permanently wedges the task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_park_task_catches_up_already_terminal_compute_job(tl_db):
+    """park_task creates a FIRED (not PENDING) registration when its compute job
+    is already terminal at park time, and stays PENDING when the job is active.
+
+    Covers the terminal-before-park catch-up path in park_task:
+    - A ComputeJob in a terminal status → registration born FIRED, fired_at set.
+    - A ComputeJob in a non-terminal status → registration stays PENDING.
+    - A non-compute-job wake source → registration stays PENDING (no catch-up).
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.models import ComputeJob, ComputeJobStatus
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+
+    # --- Terminal job: registration must be born FIRED. -----------------------
+    task_terminal = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    terminal_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task_terminal.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(terminal_job)
+    await session.commit()
+
+    reg_terminal = await park_task(
+        session,
+        task_terminal,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(terminal_job.id),
+        wake_action=WakeAction.FINALIZE,
+        reason="parked on terminal job",
+    )
+    await session.commit()
+    await session.refresh(reg_terminal)
+
+    assert reg_terminal.delivery_state == WakeDeliveryState.FIRED, (
+        "park_task must create FIRED registration for already-terminal compute job"
+    )
+    assert reg_terminal.fired_at is not None
+
+    # --- Non-terminal job: registration must stay PENDING. --------------------
+    task_active = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    active_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task_active.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo running",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+    )
+    session.add(active_job)
+    await session.commit()
+
+    reg_active = await park_task(
+        session,
+        task_active,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(active_job.id),
+        wake_action=WakeAction.FINALIZE,
+        reason="parked on active job",
+    )
+    await session.commit()
+    await session.refresh(reg_active)
+
+    assert reg_active.delivery_state == WakeDeliveryState.PENDING, (
+        "park_task must create PENDING registration for a non-terminal compute job"
+    )
+    assert reg_active.fired_at is None
+
+    # --- Non-compute-job wake: registration must stay PENDING. ----------------
+    task_other = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    reg_other = await park_task(
+        session,
+        task_other,
+        wake_source_kind="knowledge_document_landed",
+        wake_source_ref="doc-abc",
+        wake_action=WakeAction.RESUME,
+        reason="waiting on knowledge doc",
+    )
+    await session.commit()
+    await session.refresh(reg_other)
+
+    assert reg_other.delivery_state == WakeDeliveryState.PENDING, (
+        "park_task must not touch PENDING state for non-compute-job wake kinds"
+    )
+    assert reg_other.fired_at is None
