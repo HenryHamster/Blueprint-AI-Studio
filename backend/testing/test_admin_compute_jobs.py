@@ -7,6 +7,7 @@ test seeds the role it exercises.
 """
 
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -129,3 +130,32 @@ async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_session):
+    """When a peer drives the job terminal during the lock-free RPC window,
+    kill_compute_job returns None. The router must re-fetch and return the
+    terminal job rather than blowing up with a 500."""
+    project = await _make_project(db_session, name="Peer Terminal")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job(db_session, project)
+
+    # Simulate the peer-terminal race: kill_compute_job returns None (peer won),
+    # but the job in DB is already CANCELLED.
+    job.status = ComputeJobStatus.CANCELLED
+    job.outcome = ComputeJobOutcome.CANCELLED
+    job.terminal_reason = "killed by peer"
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.routers.admin_compute_jobs.kill_compute_job",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["status"] == ComputeJobStatus.CANCELLED.value
+    assert body["outcome"] == ComputeJobOutcome.CANCELLED.value

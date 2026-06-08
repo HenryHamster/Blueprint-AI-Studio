@@ -389,42 +389,76 @@ async def kill_compute_job(
     job_id: uuid.UUID,
     project_id: uuid.UUID,
     killed_by: str | None = None,
-) -> ComputeJob:
+) -> ComputeJob | None:
     """Operator-initiated kill of an active compute job.
 
-    Locks the row, terminates the external compute via the backend, and drives
-    the job to the same terminal shape the monitor produces (CANCELLED status +
-    CANCELLED outcome) so the operator kill is distinguishable from a budget
+    Validates the job exists and is non-terminal (under lock), releases the lock,
+    terminates the external compute via the backend (lock-free RPC), then
+    re-acquires the lock to drive the job to terminal state. The job is driven to
+    the same terminal shape the monitor produces (CANCELLED status + CANCELLED
+    outcome) so the operator kill is distinguishable from a budget
     (SPEND_CAP_EXCEEDED) or deadline (TIMED_OUT) teardown by outcome, and from a
-    task-terminal cancel by the reason text. Rejects an already-terminal job.
+    task-terminal cancel by the reason text. A peer that drove the job terminal
+    during the lock-free window degrades gracefully to no-op. Rejects an
+    already-terminal job.
     """
     job = await _lock_compute_job(session, job_id)
     if job is None or job.project_id != project_id:
         raise ValueError("compute job not found")
     if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         raise ValueError("compute job is already terminal")
+    backend_name = job.backend
+    external_compute_id = job.external_compute_id
+    await session.commit()
 
     now = _utcnow()
-    backend = get_compute_backend(job.backend)
+    backend = get_compute_backend(backend_name)
     terminated = True
-    if job.external_compute_id:
+    if external_compute_id:
         terminated = await backend.terminate(job, reason="operator")
+
     by = f" ({killed_by})" if killed_by else ""
-    _finalize_terminal_job(
-        job,
+    return await _apply_operator_kill_result(
+        session,
+        job_id=job_id,
         status=ComputeJobStatus.CANCELLED,
         outcome=ComputeJobOutcome.CANCELLED,
         terminal_reason=f"killed by operator{by}",
         now=now,
         terminate_ok=terminated,
     )
-    # An operator-killed job may still have written durable artifacts before
-    # teardown — link them as a first-class result (best-effort, see helper).
-    await _link_terminal_artifact(session, job)
-    # Fire the compute-job-terminal wake so any PARKED task waiting on this
-    # job wakes immediately rather than sitting until its park deadline.
-    # Mirrors the monitor path (see _process_single_compute_job).
-    if job.task_id is not None:
+
+
+async def _apply_operator_kill_result(
+    session,
+    *,
+    job_id: uuid.UUID,
+    status: ComputeJobStatus,
+    outcome: ComputeJobOutcome,
+    terminal_reason: str,
+    now,
+    terminate_ok: bool = True,
+) -> ComputeJob | None:
+    """Apply operator-kill terminal state after lock-free backend RPC.
+
+    Re-acquires the job lock, re-checks the job is still non-terminal (gracefully
+    returns None if a peer made it terminal during the RPC), applies the terminal
+    state, links durable artifacts, and fires the compute-job-terminal wake.
+    Mirrors the pattern used by _apply_polled_compute_job_result in the monitor.
+    """
+    live = await _lock_compute_job(session, job_id)
+    if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        return None
+    _finalize_terminal_job(
+        live,
+        status=status,
+        outcome=outcome,
+        terminal_reason=terminal_reason,
+        now=now,
+        terminate_ok=terminate_ok,
+    )
+    await _link_terminal_artifact(session, live)
+    if live.task_id is not None:
         from app.task_lifecycle import fire_task_wakes
 
         await fire_task_wakes(
@@ -433,8 +467,8 @@ async def kill_compute_job(
             wake_source_ref=str(job_id),
         )
     await session.commit()
-    await session.refresh(job)
-    return job
+    await session.refresh(live)
+    return live
 
 
 async def list_compute_jobs(

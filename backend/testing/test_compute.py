@@ -5763,3 +5763,176 @@ async def test_kill_compute_job_fires_wake_for_parked_task(db_session, monkeypat
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
     assert reg.result_state == "finalized"
     assert reg.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_releases_row_lock_across_backend_rpc(
+    db_session, monkeypatch
+):
+    """Regression test: operator-kill must not hold the ComputeJob row lock
+    across the backend teardown RPC. The lock is released after validating the
+    job is non-terminal (pre-RPC), then re-acquired after the RPC to apply the
+    terminal state. This prevents stalling park-recheck paths that fire
+    compute-job-terminal wakes while the kill is in flight.
+
+    Proof: the ComputeJob row is acquirable from a separate session during the
+    kill's backend terminate RPC, and a concurrent peer-terminal during the
+    RPC produces exactly one terminal finalize, not two.
+    """
+    from app.database import AsyncSessionLocal
+
+    project = Project(name="Kill Job Releases Lock", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 100",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "lock-release-test-job"
+    db_session.add(job)
+    await db_session.commit()
+
+    lock_acquire_succeeded = False
+    rpc_in_flight = asyncio.Event()
+    rpc_can_proceed = asyncio.Event()
+
+    class _FakeBackend:
+        async def terminate(self, persisted_job, *, reason):
+            # Signal that RPC is in flight so the concurrent task can try to lock.
+            rpc_in_flight.set()
+            # Wait for the concurrent lock attempt to complete before proceeding.
+            await rpc_can_proceed.wait()
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: _FakeBackend()
+    )
+
+    async def try_acquire_lock_during_rpc():
+        nonlocal lock_acquire_succeeded
+        # Wait for the RPC to start.
+        await rpc_in_flight.wait()
+        # Try to acquire the lock in a separate session.
+        async with AsyncSessionLocal() as peer_session:
+            peer_job = await compute_jobs._lock_compute_job(peer_session, job.id)
+            lock_acquire_succeeded = peer_job is not None
+        # Signal that the lock attempt is complete so the RPC can proceed.
+        rpc_can_proceed.set()
+
+    # Run the lock-attempt task concurrently with the kill.
+    kill_task = asyncio.create_task(
+        compute_jobs.kill_compute_job(
+            db_session,
+            job_id=job.id,
+            project_id=project.id,
+            killed_by="operator@test.com",
+        )
+    )
+    lock_task = asyncio.create_task(try_acquire_lock_during_rpc())
+
+    await asyncio.gather(kill_task, lock_task)
+
+    assert lock_acquire_succeeded, (
+        "ComputeJob row lock must be released during backend RPC so concurrent "
+        "writers are not stalled (e.g., park-recheck wakes)"
+    )
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.CANCELLED
+    assert job.outcome == ComputeJobOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_gracefully_handles_peer_terminal(db_session, monkeypatch):
+    """Regression test: if a peer (monitor, deadline/budget teardown, or
+    task-terminal cancel) drives the job terminal during the kill's lock-free
+    backend RPC window, the kill must detect this on re-acquire and degrade to
+    no-op (return None) instead of double-finalizing.
+    """
+    from app.database import AsyncSessionLocal
+    from app.time_utils import _utcnow
+
+    project = Project(name="Kill Job Peer Terminal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 100",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "peer-terminal-test-job"
+    db_session.add(job)
+    await db_session.commit()
+
+    rpc_in_flight = asyncio.Event()
+    rpc_can_proceed = asyncio.Event()
+
+    class _FakeBackend:
+        async def terminate(self, persisted_job, *, reason):
+            # Signal that RPC is in flight.
+            rpc_in_flight.set()
+            # Wait for the peer to make it terminal.
+            await rpc_can_proceed.wait()
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: _FakeBackend()
+    )
+
+    async def peer_drive_terminal():
+        # Wait for the RPC to start.
+        await rpc_in_flight.wait()
+        # Drive the job terminal as a peer would (e.g., deadline/budget teardown).
+        async with AsyncSessionLocal() as peer_session:
+            peer_job = await compute_jobs._lock_compute_job(peer_session, job.id)
+            assert peer_job is not None
+            peer_job.status = ComputeJobStatus.FAILED
+            peer_job.outcome = ComputeJobOutcome.SPEND_CAP_EXCEEDED
+            peer_job.completed_at = _utcnow()
+            peer_job.terminal_reason = "peer made terminal"
+            await peer_session.commit()
+        # Signal that the peer is done so the RPC can proceed.
+        rpc_can_proceed.set()
+
+    # Run the peer-terminal task concurrently with the kill.
+    kill_task = asyncio.create_task(
+        compute_jobs.kill_compute_job(
+            db_session,
+            job_id=job.id,
+            project_id=project.id,
+            killed_by="operator@test.com",
+        )
+    )
+    peer_task = asyncio.create_task(peer_drive_terminal())
+
+    await asyncio.gather(kill_task, peer_task)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    # The peer's outcome should be preserved (not overwritten by kill).
+    assert job.outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    assert job.terminal_reason == "peer made terminal"
