@@ -183,6 +183,184 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
   });
 });
 
+describe('KnowledgeBrowser — pagination', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  const page1Doc = {
+    id: 'doc-page1',
+    title: 'First page document',
+    summary: 'Doc from first page.',
+    topic: null,
+    direction_id: null,
+    tags: [],
+    source_citations: [],
+    source_task_id: null,
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'web_research',
+    created_at: '2026-06-01T00:00:00Z',
+    updated_at: '2026-06-01T00:00:00Z',
+    forward_quality_verdict: null,
+  };
+
+  const page2Doc = {
+    id: 'doc-page2',
+    title: 'Second page document',
+    summary: 'Doc from second page.',
+    topic: null,
+    direction_id: null,
+    tags: [],
+    source_citations: [],
+    source_task_id: null,
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'web_research',
+    created_at: '2026-05-31T00:00:00Z',
+    updated_at: '2026-05-31T00:00:00Z',
+    forward_quality_verdict: null,
+  };
+
+  async function renderBrowser() {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    return host as HTMLDivElement;
+  }
+
+  test('shows load-more button when docs.length < total', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [page1Doc], total: 2, limit: 50, offset: 0 });
+
+    const container = await renderBrowser();
+    const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
+    expect(loadMore).toBeTruthy();
+  });
+
+  test('load-more appends second page to list', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments)
+      .mockResolvedValueOnce({ documents: [page1Doc], total: 2, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ documents: [page2Doc], total: 2, limit: 50, offset: 50 });
+
+    const container = await renderBrowser();
+
+    const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
+    expect(loadMore).toBeTruthy();
+    if (!loadMore) throw new Error('expected load more button');
+
+    await act(async () => { loadMore.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const text = container.textContent ?? '';
+    expect(text).toContain('First page document');
+    expect(text).toContain('Second page document');
+    // No load-more button when all docs shown
+    const loadMoreAfter = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Load more');
+    expect(loadMoreAfter).toBeFalsy();
+  });
+
+  test('header shows "showing N of TOTAL" when paginated', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [page1Doc], total: 5, limit: 50, offset: 0 });
+
+    const container = await renderBrowser();
+    const text = container.textContent ?? '';
+    expect(text).toContain('showing 1 of 5');
+  });
+
+  test('changing search filter resets to first page', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments)
+      .mockResolvedValueOnce({ documents: [page1Doc], total: 2, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ documents: [page2Doc], total: 2, limit: 50, offset: 50 })
+      .mockResolvedValue({ documents: [page1Doc], total: 1, limit: 50, offset: 0 });
+
+    const container = await renderBrowser();
+
+    // Load a second page
+    const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
+    if (!loadMore) throw new Error('expected load more button');
+    await act(async () => { loadMore.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    // Change the search input — should reset to offset 0
+    const searchInput = container.querySelector('input[type="text"]') as HTMLInputElement;
+    expect(searchInput).toBeTruthy();
+    await act(async () => {
+      // Simulate React's onChange via native input event (React 18 jsdom pattern)
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      nativeInputValueSetter?.call(searchInput, 'new query');
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    // The last call to fetchKnowledgeDocuments should have offset=0
+    const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]?.offset).toBe(0);
+  });
+
+  test('changing source-kind filter resets to first page', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments)
+      .mockResolvedValueOnce({ documents: [page1Doc], total: 2, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ documents: [page2Doc], total: 2, limit: 50, offset: 50 })
+      .mockResolvedValue({ documents: [page1Doc], total: 1, limit: 50, offset: 0 });
+
+    const container = await renderBrowser();
+
+    // Load a second page
+    const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
+    if (!loadMore) throw new Error('expected load more button');
+    await act(async () => { loadMore.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    // Click the 'Design' origin filter button — changes sourceKindFilter, should reset offset
+    const designButton = Array.from(container.querySelectorAll('button')).find(
+      b => b.textContent?.trim() === 'Design',
+    );
+    expect(designButton).toBeTruthy();
+    if (!designButton) throw new Error('expected Design filter button');
+    await act(async () => { designButton.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]?.offset).toBe(0);
+    expect(lastCall[1]?.source_kind).toBe('design');
+  });
+
+  test('no load-more button when all docs fit on one page', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [page1Doc], total: 1, limit: 50, offset: 0 });
+
+    const container = await renderBrowser();
+    const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Load more');
+    expect(loadMore).toBeFalsy();
+  });
+});
+
 describe('KnowledgeBrowser — compute_experiment source kind', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

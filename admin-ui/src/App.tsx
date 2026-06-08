@@ -765,6 +765,12 @@ export default function App() {
           void s.fetchProjects(true);
           void s.fetchTasks();
         }}
+        onProjectCancelled={() => {
+          // Cancel is terminal for the project and its active tasks. Refetch
+          // both views so the CANCELLED badge and task list update immediately.
+          void s.fetchProjects(true);
+          void s.fetchTasks();
+        }}
         onProjectPaused={() => {
           // Pause is a reversible flag on the project row; refetch so the
           // dashboard reflects the new paused state (pill + menu label).

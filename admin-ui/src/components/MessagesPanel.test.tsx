@@ -4066,3 +4066,157 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).not.toContain('Steer picked up');
   });
 });
+
+// ── Composer draft persistence tests ─────────────────────────────────────────
+
+describe('MessagesPanel composer draft persistence', () => {
+  beforeEach(() => { localStorage.clear(); });
+  afterEach(() => { localStorage.clear(); vi.clearAllMocks(); });
+
+  function renderDraftPanel(projectId = 'proj-draft') {
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    _mockMessagesFetch([]);
+    return render(
+      <MessagesPanel
+        selectedProjectId={projectId}
+        onClose={() => {}}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+  }
+
+  test('draft persists in localStorage after typing into the composer', async () => {
+    const { container } = renderDraftPanel();
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+
+    const { fireEvent: fe } = await import('@testing-library/react');
+    await act(async () => {
+      fe.change(textarea, { target: { value: 'draft text to persist' } });
+    });
+
+    const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
+    const stored = localStorage.getItem(draftKey);
+    expect(stored).not.toBeNull();
+    const parsed = JSON.parse(stored!);
+    expect(parsed.content).toBe('draft text to persist');
+    expect(typeof parsed.type).toBe('string');
+  });
+
+  test('draft is restored into the textarea when component remounts', async () => {
+    // Pre-seed a draft for the project
+    const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
+    localStorage.setItem(draftKey, JSON.stringify({ type: 'FEEDBACK', content: 'pre-existing draft' }));
+
+    const { container } = renderDraftPanel();
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    expect(textarea.value).toBe('pre-existing draft');
+  });
+
+  test('draft is cleared from localStorage after successful send', async () => {
+    // Make the POST succeed (and all other requests as well)
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (method === 'POST' && urlStr.includes('/api/admin/messages')) {
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-draft"
+        onClose={() => {}}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    // Type content via fireEvent so the React state is properly set and the draft is saved
+    const { fireEvent: fe2 } = await import('@testing-library/react');
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    await act(async () => {
+      fe2.change(textarea, { target: { value: 'about to send' } });
+    });
+
+    const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
+    await waitFor(() => expect(localStorage.getItem(draftKey)).not.toBeNull());
+
+    // Find the send button by its distinctive blue class and click it
+    const sendBtn = container.querySelector('button.bg-blue-600') as HTMLButtonElement;
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn.disabled).toBe(false);
+
+    await act(async () => {
+      sendBtn.click();
+    });
+
+    await waitFor(() => {
+      expect(localStorage.getItem(draftKey)).toBeNull();
+    });
+  });
+
+  test('draft is scoped per project — switching projects loads the new project draft', async () => {
+    // Seed separate drafts for two projects
+    localStorage.setItem(
+      'messages_composer_draft:test-user@example.com:proj-A',
+      JSON.stringify({ type: 'FEEDBACK', content: 'draft for project A' }),
+    );
+    localStorage.setItem(
+      'messages_composer_draft:test-user@example.com:proj-B',
+      JSON.stringify({ type: 'NOTE', content: 'draft for project B' }),
+    );
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-A');
+    _mockMessagesFetch([]);
+
+    const { container, rerender } = render(
+      <MessagesPanel
+        selectedProjectId="proj-A"
+        onClose={() => {}}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('draft for project A');
+
+    // Switch to project B
+    _suppressSinceLastVisit('test-user@example.com', 'proj-B');
+    _mockMessagesFetch([]);
+    const callsBefore = _messagesGetCalls().length;
+
+    await act(async () => {
+      rerender(
+        <MessagesPanel
+          selectedProjectId="proj-B"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThan(callsBefore));
+
+    expect(textarea.value).toBe('draft for project B');
+  });
+});

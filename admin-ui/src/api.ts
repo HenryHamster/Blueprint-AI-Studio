@@ -1736,6 +1736,26 @@ export async function resetProject(
   return res.json();
 }
 
+/**
+ * Owner-only project cancel. Marks the project terminal, cancels all active
+ * tasks, and tears down their VMs. Idempotent on the server: already-terminal
+ * projects return `ignored` rather than an error.
+ */
+export async function cancelProject(
+  projectId: string,
+): Promise<{ status: 'cancelled' | 'ignored'; message: string }> {
+  const res = await apiFetch(
+    `/api/projects/${encodeURIComponent(projectId)}/cancel`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to cancel project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to cancel project: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function setProjectPaused(
   projectId: string,
   paused: boolean,
@@ -2127,6 +2147,24 @@ export async function fetchKnowledgeDocument(
 /** Operator-steering strategic-refresh marker persisted on `project.vision._strategic_refresh`.
  *  Armed when operator steering wakes the strategist; cleared backend-side when the
  *  autonomous loop consumes it. Returned (inside `vision`) by GET /api/admin/projects/{id}. */
+export interface FleetUtilizationResponse {
+  active_now: number;
+  nominal_capacity: number | null;
+  usable_capacity: number | null;
+  cooled_accounts: number;
+  util_now: number | null;
+  util_avg: number | null;
+  window_hours: number;
+  /** Derived saturation label; null when no enabled accounts are configured. */
+  saturation: 'healthy' | 'busy' | 'saturated' | null;
+}
+
+export async function fetchFleetUtilization(): Promise<FleetUtilizationResponse> {
+  const res = await apiFetch('/api/admin/fleet-utilization');
+  if (!res.ok) throw new Error(`fleet-utilization fetch failed: ${res.status}`);
+  return res.json();
+}
+
 export interface StrategicRefreshMarker {
   requested_at?: string;
   reason?: string;

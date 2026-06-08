@@ -95,6 +95,31 @@ function saveMessagesPanelPrefs(userId: string | null | undefined, prefs: Messag
   try { localStorage.setItem(messagesPanelPrefsKey(userId), JSON.stringify(prefs)); } catch { /* ignore */ }
 }
 
+function composerDraftKey(userId?: string | null, projectId?: string | null): string {
+  return `messages_composer_draft:${userId || 'anonymous'}:${projectId || 'unknown'}`;
+}
+
+function loadComposerDraft(userId?: string | null, projectId?: string | null): { type: string; content: string } | null {
+  try {
+    const raw = localStorage.getItem(composerDraftKey(userId, projectId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { type?: unknown; content?: unknown };
+    if (typeof parsed.type !== 'string' || typeof parsed.content !== 'string') return null;
+    return { type: parsed.type, content: parsed.content };
+  } catch {
+    return null;
+  }
+}
+
+function saveComposerDraft(userId: string | null | undefined, projectId: string | null | undefined, draft: { type: string; content: string }): void {
+  if (!draft.content) return;
+  try { localStorage.setItem(composerDraftKey(userId, projectId), JSON.stringify(draft)); } catch { /* ignore */ }
+}
+
+function clearComposerDraft(userId: string | null | undefined, projectId: string | null | undefined): void {
+  try { localStorage.removeItem(composerDraftKey(userId, projectId)); } catch { /* ignore */ }
+}
+
 
 async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
   try {
@@ -120,9 +145,9 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
 export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
-  // Compose
-  const [newType, setNewType] = useState('FEEDBACK');
-  const [newContent, setNewContent] = useState('');
+  // Compose — initialized from the per-project draft (if any) so a reload restores it.
+  const [newType, setNewType] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.type ?? 'FEEDBACK');
+  const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
   const [submitting, setSubmitting] = useState(false);
   // Synchronous in-flight guard. `submitting` state updates asynchronously, so
   // two rapid keypresses (double-Enter) can both read the pre-update value and
@@ -331,6 +356,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
     setActiveViewId(DEFAULT_VIEW_ID);
     setOpenKebabId(null);
+    // Reload composer draft for the new project — drafts are scoped per-project
+    // so switching projects shows that project's in-progress draft, not another's.
+    const draft = loadComposerDraft(auth.currentUser?.email, selectedProjectId);
+    setNewContent(draft?.content ?? '');
+    setNewType(draft?.type ?? 'FEEDBACK');
     if (selectedProjectId) {
       // Prefer server saved views over localStorage — picks up views created on another device.
       fetchServerSavedViews(selectedProjectId).then(serverViews => {
@@ -805,6 +835,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // Sent cleanly — the next distinct message gets a fresh key.
       idempotencyKeyRef.current = null;
       setNewContent('');
+      clearComposerDraft(auth.currentUser?.email, selectedProjectId);
       setReplyTo(null);
       setLastArming(arming);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
@@ -1218,8 +1249,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
-        onChangeType={(value) => { setNewType(value); setLastArming(null); }}
-        onChangeContent={setNewContent}
+        onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
+        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: newType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
       />

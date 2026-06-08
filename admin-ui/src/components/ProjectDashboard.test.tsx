@@ -21,6 +21,7 @@ vi.mock('../api', async () => {
     })),
     deleteProject: vi.fn(async () => ({ message: 'deleted', active_tasks_cancelled: 0 })),
     resetProject: vi.fn(async () => ({ message: 'reset', active_tasks_cancelled: 0, tasks_deleted: 0 })),
+    cancelProject: vi.fn(async () => ({ status: 'cancelled', message: 'cancelled' })),
     setProjectPaused: vi.fn(async (_projectId: string, paused: boolean) => ({ paused })),
     archiveProject: vi.fn(async () => ({ message: 'archived', archived: true })),
     unarchiveProject: vi.fn(async () => ({ message: 'unarchived', archived: false })),
@@ -28,7 +29,7 @@ vi.mock('../api', async () => {
   };
 });
 
-import { deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects } from '../api';
+import { deleteProject, resetProject, cancelProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects } from '../api';
 
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
@@ -361,6 +362,7 @@ describe('ProjectDashboard', () => {
     expect(screen.getByTitle('Project actions')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('Project actions'));
     expect(screen.getByTitle('Delete project')).toBeInTheDocument();
+    expect(screen.getByTitle('Cancel project')).toBeInTheDocument();
   });
 
   it('confirmation step names the project and warns active work is cancelled', () => {
@@ -378,6 +380,24 @@ describe('ProjectDashboard', () => {
     expect(screen.getByTitle('Confirm delete')).toBeInTheDocument();
     expect(screen.getByText(/force-cancelled/)).toBeInTheDocument();
     // Name appears in the card header AND in the confirmation warning.
+    expect(screen.getAllByText('Platform').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('cancel confirmation warns it is terminal and tears down active task VMs', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', name: 'Platform' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Cancel project'));
+    expect(screen.getByTitle('Confirm cancel')).toBeInTheDocument();
+    expect(screen.getByText(/This is terminal/)).toBeInTheDocument();
+    expect(screen.getByText(/tear down their VMs/)).toBeInTheDocument();
     expect(screen.getAllByText('Platform').length).toBeGreaterThanOrEqual(2);
   });
 
@@ -422,6 +442,50 @@ describe('ProjectDashboard', () => {
 
     expect(await screen.findByText('Permission denied')).toBeInTheDocument();
     expect(onProjectDeleted).not.toHaveBeenCalled();
+  });
+
+  it('calls cancelProject and onProjectCancelled on success, including ignored responses', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectCancelled = vi.fn();
+    vi.mocked(cancelProject).mockResolvedValueOnce({ status: 'ignored', message: 'already terminal' });
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectCancelled={onProjectCancelled}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Cancel project'));
+    fireEvent.click(screen.getByTitle('Confirm cancel'));
+
+    await vi.waitFor(() => expect(onProjectCancelled).toHaveBeenCalledWith('proj-1'));
+    expect(cancelProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('surfaces a cancel error inline and does not call onProjectCancelled', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(cancelProject).mockRejectedValueOnce(new Error('Permission denied'));
+    const onProjectCancelled = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectCancelled={onProjectCancelled}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Cancel project'));
+    fireEvent.click(screen.getByTitle('Confirm cancel'));
+
+    expect(await screen.findByText('Permission denied')).toBeInTheDocument();
+    expect(onProjectCancelled).not.toHaveBeenCalled();
   });
 
   it('reset confirmation states what is wiped vs kept, and confirming calls resetProject', async () => {

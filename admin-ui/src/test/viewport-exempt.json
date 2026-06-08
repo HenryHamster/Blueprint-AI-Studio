@@ -35,6 +35,7 @@
     "DirectionsPanelHeader": "Tab/title header sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx which exercises it inline (overflow, text-truncation, touch-target at 375px).",
     "DirectionsAddForm": "Add-direction form sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx which exercises it inline.",
     "DirectionsQuickLinks": "Quick-links nav sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx which exercises it inline.",
-    "DirectionsList": "Directions list sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx (including the dense stress fixture) which exercises it inline."
+    "DirectionsList": "Directions list sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx (including the dense stress fixture) which exercises it inline.",
+    "FleetCapacityCard": "Fleet capacity stat card rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline."
   }
 }
