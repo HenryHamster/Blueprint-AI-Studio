@@ -367,13 +367,15 @@ async def test_digest_direction_progress_proven_prs_merged(
                 "text": "Direction with proven subset",
                 "status": "active",
                 "research_history": [
-                    # 3 verified merges this window, but only 1 PROVEN; 2 of 3
-                    # merged WRITE tasks declared forward acceptance evidence.
+                    # 3 verified merges this window, but only 2 PROVEN; one of
+                    # those proven merges is downstream-artifact consumed proof.
+                    # 2 of 3 merged WRITE tasks declared forward acceptance evidence.
                     {
                         "timestamp": recent_ts,
                         "prs_merged": 3,
                         "verified_prs_merged": 3,
-                        "acceptance_proven_merged": 1,
+                        "acceptance_proven_merged": 2,
+                        "acceptance_consumed_merged": 1,
                         "acceptance_declared_merged": 2,
                         "acceptance_merged_write_total": 3,
                     },
@@ -417,14 +419,17 @@ async def test_digest_direction_progress_proven_prs_merged(
     proven = by_id["dir-proven"]
     # proven is the strict subset of verified — always <= verified for the window.
     assert proven["verified_prs_merged"] == 3
-    assert proven["proven_prs_merged"] == 1
+    assert proven["proven_prs_merged"] == 2
+    assert proven["consumed_prs_merged"] == 1
     assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
+    assert proven["consumed_prs_merged"] <= proven["proven_prs_merged"]
     assert proven["acceptance_declaration_coverage"] == round(2 / 3, 3)
 
     legacy = by_id["dir-legacy"]
     # Legacy entries claim nothing proven and have no coverage denominator.
     assert legacy["verified_prs_merged"] == 2
     assert legacy["proven_prs_merged"] == 0
+    assert legacy["consumed_prs_merged"] == 0
     assert legacy["acceptance_declaration_coverage"] is None
 
 

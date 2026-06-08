@@ -27,10 +27,11 @@ _AUTONOMY_RETIREMENT_THRESHOLD = (
 
 # Proof-weighting tiers for the strategic-DECISION consumption layer. A merged
 # code change earns FULL credit only when it was machine-PROVEN (a satisfied
-# named_test); a merge that merely DECLARED forward evidence without proving it
-# earns partial credit; an UNDECLARED merge (no commitment to forward evidence —
-# the "merely delivered" proxy this direction is meant to stop crediting) earns
-# the least. All tiers are <= 1.0 so the proof-weighted count is STRICTLY <=
+# named_test, or a satisfied downstream_artifact proven by recorded consumption);
+# a merge that merely DECLARED forward evidence without proving it earns partial
+# credit; an UNDECLARED merge (no commitment to forward evidence — the "merely
+# delivered" proxy this direction is meant to stop crediting) earns the least.
+# All tiers are <= 1.0 so the proof-weighted count is STRICTLY <=
 # verified_merged_count and never inflates a direction's apparent output.
 _PROOF_WEIGHT_PROVEN = 1.0
 _PROOF_WEIGHT_DECLARED_UNPROVEN = 0.7
@@ -152,11 +153,12 @@ _HISTORY_AGG_DEFAULTS = {
     "total_verified_prs_merged": 0,
     # Acceptance-evidence lifetime aggregates — folded so directions past the
     # 10-cycle eviction window keep an honest proven/declared signal. Distinct
-    # from (and never larger than) total_verified_prs_merged: proven counts only
-    # machine-checked named-test proof, declared counts merges that committed to
-    # forward evidence at plan time, and merged_write_total is the coverage
-    # denominator (merged WRITE tasks) so lifetime coverage = declared /
-    # merged_write_total without lossy per-cycle fraction-averaging.
+    # from (and never larger than) total_verified_prs_merged: proven counts
+    # machine-checked named-test proof OR recorded downstream-artifact
+    # consumption; declared counts merges that committed to forward evidence at
+    # plan time; merged_write_total is the coverage denominator (merged WRITE
+    # tasks) so lifetime coverage = declared / merged_write_total without lossy
+    # per-cycle fraction-averaging.
     "total_acceptance_proven_merged": 0,
     "total_acceptance_consumed_merged": 0,
     "total_acceptance_declared_merged": 0,

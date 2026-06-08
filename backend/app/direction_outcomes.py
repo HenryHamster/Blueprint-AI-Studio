@@ -158,13 +158,15 @@ def proven_merged_count(entry: dict) -> int:
     """Machine-checked PROVEN merged-PR count for a research_history entry.
 
     The honest counterpart to :func:`verified_merged_count`: counts only merges
-    proven by machine-checked evidence (a satisfied ``named_test``), as recorded
-    in the additive ``acceptance_proven_merged`` field by
+    proven by machine-checked evidence — either a satisfied ``named_test`` that
+    ran green, or a satisfied ``downstream_artifact`` that was subsequently
+    consumed (recorded downstream-artifact consumption) — as recorded in the
+    additive ``acceptance_proven_merged`` field by
     ``_update_direction_research_outcomes``. Strictly distinct from — and never
-    larger than — ``verified_prs_merged``: a soft (behavior/artifact) or
-    undeclared merge counts as verified but NOT proven. Legacy entries written
-    before the field existed degrade to ``0`` (nothing is retroactively claimed
-    as proven), never to the raw merged count.
+    larger than — ``verified_prs_merged``: a soft (behavior or unconsumed
+    artifact) or undeclared merge counts as verified but NOT proven. Legacy
+    entries written before the field existed degrade to ``0`` (nothing is
+    retroactively claimed as proven), never to the raw merged count.
     """
     return int(entry.get("acceptance_proven_merged") or 0)
 
@@ -480,16 +482,17 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "verified_prs_merged": {
         "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
     },
-    # --- Acceptance aggregates: now wired to decision + digest consumers. ---
+    # --- Acceptance aggregates: now wired to decision + reader-facing consumers. ---
     # These expose proven-by-evidence and declaration-coverage truth distinct
-    # from "merely merged". As of 2026-06-07 they are folded into the lifetime
-    # rollups consumed by the digest and by strategic spawning's direction
-    # scoring (and summed in direction_metrics.py's aggregate).
+    # from "merely merged". Reader-facing surfaces show total proven merges and
+    # the downstream-artifact consumed subset in admin direction progress,
+    # direction portfolio summaries, strategic direction summaries, and
+    # project-context pipeline-health direction summaries.
     "acceptance_proven_merged": {
-        "consumer": "digest_direction_progress.py (lifetime proven rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_proven_merged)"
+        "consumer": "digest_direction_progress.py / strategic_spawning.py payloads rendered by admin direction summaries and strategic agent direction summaries"
     },
     "acceptance_consumed_merged": {
-        "consumer": "digest_direction_progress.py (lifetime consumed rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_consumed_merged)"
+        "consumer": "admin-ui DirectionProgressSection.tsx + DirectionPortfolioSection.tsx, agent strategic-sections.ts + project-context.ts (consumed subset beside proven merges)"
     },
     "acceptance_declared_merged": {
         "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
@@ -846,12 +849,13 @@ async def _update_direction_research_outcomes(
     #   * acceptance_verified_write_merged — verified merged WRITE tasks only.
     #     This is the write-only slice used by proof_weighted_merged so read-only
     #     merged work keeps full credit instead of being tier-weighted.
-    #   * acceptance_proven_merged — merges machine-checked PROVEN: a satisfied
-    #     named_test that ran green under a real merge-test verdict and exercises
-    #     a changed production seam (acceptance_is_proven). A soft
-    #     observable_behavior / downstream_artifact merge (satisfied by a shipped
-    #     diff only) and every undeclared merge are EXCLUDED — they prove nothing
-    #     about the specific claim.
+    #   * acceptance_proven_merged — merges machine-checked PROVEN
+    #     (acceptance_is_proven): either a satisfied named_test that ran green
+    #     under a real merge-test verdict, or a satisfied downstream_artifact
+    #     that was consumed (recorded downstream-artifact consumption). A soft
+    #     observable_behavior merge, an unconsumed downstream_artifact, and every
+    #     undeclared merge are EXCLUDED — they prove nothing about the specific
+    #     claim.
     #   * acceptance_declared_merged — merges that DECLARED any acceptance
     #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
     #     stamped). Undeclared / legacy merges are excluded.

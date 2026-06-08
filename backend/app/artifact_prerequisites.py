@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -68,50 +69,66 @@ async def deliver_artifact_to_dependents(
     to a dependent when it later launches.
     """
     task_id_str = str(task.id)
+    pointer = _artifact_pointer(artifact, task_id_str)
+    touched = 0
+    last_created_at = None
+    last_id = None
+    scan_failed = False
     try:
-        dependents = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        Task.status == TaskStatus.QUEUED,
-                        Task.project_id == task.project_id,
-                        Task.depends_on.isnot(None),
-                    )
-                    .order_by(Task.created_at)
-                    .limit(_DEPENDENT_SCAN_CAP)
+        while True:
+            query = (
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.QUEUED,
+                    Task.project_id == task.project_id,
+                    Task.depends_on.isnot(None),
                 )
+                .order_by(Task.created_at, Task.id)
+                .limit(_DEPENDENT_SCAN_CAP)
             )
-            .scalars()
-            .all()
-        )
+            if last_created_at is not None and last_id is not None:
+                query = query.where(
+                    or_(
+                        Task.created_at > last_created_at,
+                        and_(Task.created_at == last_created_at, Task.id > last_id),
+                    )
+                )
+            dependents = (await session.execute(query)).scalars().all()
+            if not dependents:
+                break
+
+            for dep in dependents:
+                if task_id_str not in (dep.depends_on or []):
+                    continue
+                ctx = dict(dep.context or {})
+                existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
+                prereqs = list(existing) if isinstance(existing, list) else []
+                if any(
+                    isinstance(p, dict) and p.get("artifact_id") == pointer["artifact_id"]
+                    for p in prereqs
+                ):
+                    continue
+                prereqs.append(pointer)
+                ctx[ARTIFACT_PREREQUISITES_KEY] = prereqs
+                dep.context = ctx
+                flag_modified(dep, "context")
+                session.add(dep)
+                touched += 1
+
+            last = dependents[-1]
+            if last.created_at is None or last.id is None:
+                break
+            last_created_at = last.created_at
+            last_id = last.id
+            if len(dependents) < _DEPENDENT_SCAN_CAP:
+                break
     except Exception:  # noqa: BLE001
+        scan_failed = True
         logger.warning(
             "[ARTIFACT] dependent scan failed for task %s; artifact not delivered",
             task.id,
             exc_info=True,
         )
-        return
-
-    pointer = _artifact_pointer(artifact, task_id_str)
-    touched = 0
-    for dep in dependents:
-        if task_id_str not in (dep.depends_on or []):
-            continue
-        ctx = dict(dep.context or {})
-        existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
-        prereqs = list(existing) if isinstance(existing, list) else []
-        if any(
-            isinstance(p, dict) and p.get("artifact_id") == pointer["artifact_id"]
-            for p in prereqs
-        ):
-            continue
-        prereqs.append(pointer)
-        ctx[ARTIFACT_PREREQUISITES_KEY] = prereqs
-        dep.context = ctx
-        flag_modified(dep, "context")
-        session.add(dep)
-        touched += 1
 
     if touched:
         if commit:
@@ -121,3 +138,5 @@ async def deliver_artifact_to_dependents(
             artifact.id,
             touched,
         )
+    elif scan_failed:
+        return

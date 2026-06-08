@@ -215,6 +215,52 @@ describe('DirectionPortfolioSection', () => {
     expect(screen.getByText('2 assisted')).toBeInTheDocument();
   });
 
+  it('shows proven merge and consumed downstream subset in header and cards', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[
+          makeDirection({ proven_prs_merged: 2, consumed_prs_merged: 1 }),
+          makeDirection({
+            direction_id: 'dir-2',
+            direction_text: 'Second proof direction',
+            prs_merged: 1,
+            proven_prs_merged: 1,
+            consumed_prs_merged: 0,
+          }),
+        ]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={3}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.getByText('3 proven')).toBeInTheDocument();
+    expect(screen.getAllByText('1 consumed')).toHaveLength(2);
+    expect(screen.getByText('2 proven')).toBeInTheDocument();
+  });
+
+  it('omits zero-only proof split for legacy portfolio payloads', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({ proven_prs_merged: 0, consumed_prs_merged: 0 })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.queryByText('0 proven')).not.toBeInTheDocument();
+    expect(screen.queryByText('0 consumed')).not.toBeInTheDocument();
+  });
+
   it('invokes onDirectionClick with the clicked direction id', async () => {
     const onDirectionClick = vi.fn();
     const user = userEvent.setup();

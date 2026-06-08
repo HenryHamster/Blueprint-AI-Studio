@@ -76,7 +76,7 @@ from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import RATE_LIMIT, classify_failure
 from app.acceptance_gate import (
-    acceptance_counts_as_verified_context,
+    classify_merged_acceptance_context,
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import (
@@ -1547,20 +1547,19 @@ async def _compute_acceptance_window_aggregate(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any]:
-    """Count merged tasks in this version's window that pass the verified predicate.
+    """Count merged tasks in this version's window with explicit verified acceptance.
 
     Queries all COMPLETED tasks with the landed-signal predicate that completed
     at or after ``version.opened_at`` (the version window lower bound), then
-    in-Python applies the same canonical bucket predicate used by
-    ``direction_outcomes.py`` for ``verified_prs_merged``: a merge is
-    acceptance-verified only when it lands in the proven, soft-satisfied, or
-    undeclared buckets. Degraded, explicitly unsatisfied, and malformed rows do
-    not count.
+    in-Python applies the canonical acceptance-bucket classifier: a merge is
+    acceptance-verified only when it lands in the ``proven`` or
+    ``satisfied_unproven`` buckets. Undeclared (legacy), degraded, explicitly
+    unsatisfied, and malformed rows do not count as verified.
 
     Returns:
       {
         "acceptance_window_total": int,    # all landed merges in the window
-        "acceptance_window_verified": int, # merges passing the verified predicate
+        "acceptance_window_verified": int, # merges with explicit declared-and-verified acceptance
         "acceptance_window_fraction": float | None,  # None when total == 0
       }
     """
@@ -1585,7 +1584,7 @@ async def _compute_acceptance_window_aggregate(
     verified = sum(
         1
         for task in rows
-        if acceptance_counts_as_verified_context(task.context or {})
+        if classify_merged_acceptance_context(task.context or {}) in {"proven", "satisfied_unproven"}
     )
     fraction = (verified / total) if total > 0 else None
     return {

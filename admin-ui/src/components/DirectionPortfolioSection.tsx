@@ -24,6 +24,8 @@ export interface DirectionProgress {
   cycles_in_window: number;
   tasks_created: number;
   prs_merged: number;
+  proven_prs_merged?: number | null;
+  consumed_prs_merged?: number | null;
   prs_rejected?: number | null;
   autonomous_prs_merged?: number | null;
   assisted_prs_merged?: number | null;
@@ -340,6 +342,12 @@ export function DirectionPortfolioSection({
     return { successes, terminal, rate };
   }, [directions]);
 
+  const proofSummary = useMemo(() => {
+    const proven = directions.reduce((sum, d) => sum + Math.max(0, Math.trunc(d.proven_prs_merged ?? 0)), 0);
+    const consumed = directions.reduce((sum, d) => sum + Math.max(0, Math.trunc(d.consumed_prs_merged ?? 0)), 0);
+    return proven > 0 || consumed > 0 ? { proven, consumed } : null;
+  }, [directions]);
+
   const taxonomyVisibleKeysByDir = useMemo(() => {
     const result = new Map<string, Array<typeof TAXONOMY_ORDER[number]>>();
     for (const d of directions) {
@@ -499,6 +507,22 @@ export function DirectionPortfolioSection({
             )}
             <span className="text-neutral-600">&middot;</span>
             <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
+            {proofSummary && (
+              <>
+                <span className="text-neutral-600">&middot;</span>
+                <span className="text-emerald-300" title="Machine-proven merged PRs">
+                  {proofSummary.proven} proven
+                </span>
+                {proofSummary.consumed > 0 && (
+                  <>
+                    <span className="text-neutral-600">·</span>
+                    <span className="text-sky-300" title="Downstream-artifact proof-by-consumption subset of proven merges">
+                      {proofSummary.consumed} consumed
+                    </span>
+                  </>
+                )}
+              </>
+            )}
             {generalizedSummary && (
               <>
                 <span className="text-neutral-600">&middot;</span>
@@ -554,6 +578,9 @@ export function DirectionPortfolioSection({
                 0,
                 Math.trunc(d.evicted_findings_count ?? d.history_aggregate?.evicted_findings ?? 0),
               );
+              const provenMerged = Math.max(0, Math.trunc(d.proven_prs_merged ?? 0));
+              const consumedMerged = Math.max(0, Math.trunc(d.consumed_prs_merged ?? 0));
+              const showProofSplit = provenMerged > 0 || consumedMerged > 0;
               const outcomeRows = summarizeOutcomeKinds(d.outcome_kind_breakdown);
               const showGeneralized = outcomeRows.some(r => r.kind !== 'code_merge');
               return (
@@ -574,6 +601,8 @@ export function DirectionPortfolioSection({
                     {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
                     {fas != null && <span className={fasColor} title={`First-attempt success rate${d.first_attempt_sample_size != null ? ` (n=${d.first_attempt_sample_size})` : ''}`}>{fas}% 1st</span>}
                     <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
+                    {showProofSplit && <span className="text-emerald-300" title="Machine-proven merged PRs">{provenMerged} proven</span>}
+                    {consumedMerged > 0 && <span className="text-sky-300" title="Downstream-artifact proof-by-consumption subset of proven merges">{consumedMerged} consumed</span>}
                     {d.product_ratio != null && (
                       <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
                     )}

@@ -3,9 +3,11 @@
 Covers the fail-closed numeric core shared with the compute success-criterion
 gate, and the code acceptance evaluation: no-declaration passes (and records
 nothing), a declared named_test that is present + verified + touches a changed
-seam passes and is recorded, and the three fail-closed cases (test missing,
-test-only diff / does-not-touch changed code, unverified merge). Pure in-memory
-Task objects, no DB — runs under ``bash scripts/test-backend.sh --standalone``.
+seam passes and is recorded (machine-checked proof), a consumed
+downstream_artifact is upgraded to proven by recorded consumption, and the
+fail-closed cases (test missing, test-only diff, unverified merge). Standalone
+in-memory tests run under ``bash scripts/test-backend.sh --standalone``; DB
+tests (consumed artifact upgrade) run under the full test harness.
 """
 
 import uuid
@@ -122,7 +124,8 @@ def test_named_test_present_verified_touches_seam_passes_and_records():
     assert verdict.declared is True
     assert verdict.satisfied is True
     assert verdict.kind == "named_test"
-    # A satisfied named_test is the ONLY machine-checked / proven kind.
+    # named_test is one of two proven kinds; a consumed downstream_artifact is
+    # the other (see test_consumed_downstream_artifact_upgrades_to_proven).
     assert verdict.proven is True
 
     recorded = record_code_acceptance_verdict(task)
@@ -437,6 +440,122 @@ async def test_explicit_consumed_artifact_ids_ignore_undelivered_ids(db_session)
 
 
 @pytest.mark.asyncio
+async def test_modern_omitted_consumed_artifact_ids_do_not_fallback(db_session):
+    """Modern agent omitting consumed_artifact_ids does NOT trigger legacy fallback."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    producer = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "release-promotion-record",
+        },
+        changed_files=["backend/app/release_promotion.py"],
+    )
+    producer.project_id = project.id
+    record_code_acceptance_verdict(producer)
+    db_session.add(producer)
+    await db_session.flush()
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="release-promotion-record",
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/release-promotion-record.json"
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+
+    consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
+    consumer.project_id = project.id
+    consumer.depends_on = [str(producer.id)]
+    consumer.context = {
+        ARTIFACT_PREREQUISITES_KEY: [
+            {
+                "artifact_id": str(artifact.id),
+                "logical_key": "release-promotion-record",
+                "source_task_id": str(producer.id),
+            }
+        ]
+    }
+    db_session.add(consumer)
+    await db_session.flush()
+
+    # modern_agent=True + None means "agent ran but omitted the field" — no fallback
+    rows = await record_artifact_consumptions_for_task(
+        consumer, db_session, None, modern_agent=True
+    )
+    assert rows == []
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+    # No consumption rows written; producer verdict is NOT upgraded to consumed
+    assert consumer.context.get("consumed_artifact_ids") is None
+    assert producer.context[CODE_ACCEPTANCE_VERDICT_KEY].get("consumed") is not True
+
+
+@pytest.mark.asyncio
+async def test_legacy_omitted_consumed_artifact_ids_falls_back(db_session):
+    """Legacy path (modern_agent=False, the default) still uses dependency fallback."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    producer = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "release-promotion-record",
+        },
+        changed_files=["backend/app/release_promotion.py"],
+    )
+    producer.project_id = project.id
+    record_code_acceptance_verdict(producer)
+    db_session.add(producer)
+    await db_session.flush()
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="release-promotion-record",
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/release-promotion-record.json"
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+
+    consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
+    consumer.project_id = project.id
+    consumer.depends_on = [str(producer.id)]
+    consumer.context = {
+        ARTIFACT_PREREQUISITES_KEY: [
+            {
+                "artifact_id": str(artifact.id),
+                "logical_key": "release-promotion-record",
+                "source_task_id": str(producer.id),
+            }
+        ]
+    }
+    db_session.add(consumer)
+    await db_session.flush()
+
+    # modern_agent=False (default) + None triggers legacy fallback from dependencies
+    rows = await record_artifact_consumptions_for_task(
+        consumer, db_session, None, modern_agent=False
+    )
+    assert len(rows) == 1
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+    # Legacy fallback DID record consumption
+    assert consumer.context.get("consumed_artifact_ids") == [str(artifact.id)]
+    assert producer.context[CODE_ACCEPTANCE_VERDICT_KEY].get("consumed") is True
+
+
+@pytest.mark.asyncio
 async def test_empty_explicit_consumed_artifact_ids_do_not_fallback(db_session):
     """An explicit empty report means no consumption, not legacy fallback."""
     project = make_project()
@@ -569,13 +688,16 @@ def test_malformed_recorded_verdict_buckets_as_malformed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# proven axis — only a satisfied named_test is machine-checked proven
+# proven axis — evaluate_code_acceptance: named_test is the only kind that
+# sets proven=True at evaluation time; downstream_artifact becomes proven later
+# via record_artifact_consumptions_for_task (see DB tests below)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_soft_kinds_are_satisfied_but_not_proven():
-    # A satisfied observable_behavior / downstream_artifact proves only that a
-    # diff shipped — it is satisfied but NOT machine-checked proven.
+    # A satisfied observable_behavior proves only that a diff shipped — it is
+    # satisfied but NOT proven.  A downstream_artifact is also not proven at
+    # evaluation time; it becomes proven only after downstream consumption.
     for kind, extra, changed in (
         (
             "observable_behavior",
@@ -648,9 +770,11 @@ def test_acceptance_was_declared_and_is_proven_contract():
 # A durable, non-gameable guard at the per-task verdict level that complements
 # the aggregate-level guard in test_direction_outcomes.py. Across every kind of
 # constructed task, it asserts the implication chain between the three truth axes
-# always holds, and that ONLY a verified, satisfied named_test exercising a
-# changed seam is ever proven — a soft, undeclared, test-only, or
-# degraded/unverified merge is never proven.
+# always holds, and that via evaluate_code_acceptance a verified, satisfied
+# named_test exercising a changed seam is the only static path to proven=True —
+# soft, undeclared, test-only, and degraded/unverified evaluations are not.
+# (downstream_artifact becomes proven via record_artifact_consumptions_for_task,
+# tested separately in the DB section.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -756,12 +880,12 @@ _VERDICT_MIX = [
 
 
 def test_verdict_axis_implication_invariant_over_mix():
-    """proven ⟹ satisfied ⟹ declared, and only a verified satisfied named_test
-    exercising a changed seam is proven — checked over a full mix of task kinds.
+    """proven ⟹ satisfied ⟹ declared — checked over a full mix of task kinds.
 
-    Drives the REAL gate (evaluate_code_acceptance) and the REAL recorded-verdict
-    predicates (acceptance_was_declared / acceptance_blocks_success /
-    acceptance_is_proven), never a reimplementation."""
+    Via evaluate_code_acceptance alone, only a verified satisfied named_test
+    exercising a changed seam is proven; downstream_artifact consumption is the
+    second proven path but requires record_artifact_consumptions_for_task (DB).
+    Drives the REAL gate and REAL predicates, never a reimplementation."""
     for label, kwargs, exp_declared, exp_satisfied, exp_proven in _VERDICT_MIX:
         task = _make_code_task(**kwargs)
         verdict = evaluate_code_acceptance(task)
@@ -836,8 +960,9 @@ def test_soft_undeclared_testonly_degraded_never_proven():
 
 def test_invariant_proven_implies_declared_and_satisfied():
     """Proven NEVER occurs without BOTH declared and satisfied."""
-    # The ONLY pathway to proven=True is a satisfied named_test with real
-    # verification and seam changes. All other shapes must be proven=False.
+    # Via evaluate_code_acceptance: named_test + verified + seam changes is the
+    # static proven path. Consumed downstream_artifact is the second proven path
+    # but requires record_artifact_consumptions_for_task (tested in DB section).
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",

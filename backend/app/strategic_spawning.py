@@ -3492,9 +3492,10 @@ async def _spawn_strategic_review(
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
         # Proven lifetime merge total — STRICTER than verified: only merges with
-        # machine-checked named-test proof (proven_merged_count), legacy entries
-        # degrade to 0. Always <= total_verified_merged for the same window, so a
-        # direction that shipped many merges but proved few is visibly distinct.
+        # machine-checked named-test proof OR recorded downstream-artifact
+        # consumption (proven_merged_count); legacy entries degrade to 0. Always
+        # <= total_verified_merged for the same window, so a direction that
+        # shipped many merges but proved few is visibly distinct.
         total_proven_merged = sum(
             proven_merged_count(h) for h in history
         ) + (agg.get("total_acceptance_proven_merged", 0) or 0)

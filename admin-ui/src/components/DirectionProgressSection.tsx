@@ -16,6 +16,8 @@ export interface DirectionProgress {
   cycles_in_window: number;
   tasks_created: number;
   prs_merged: number;
+  proven_prs_merged?: number | null;
+  consumed_prs_merged?: number | null;
   possibly_saturated: boolean;
   possibly_complete?: boolean;
   completion_criteria?: string | null;
@@ -59,6 +61,8 @@ export interface DirectionProgress {
   rejection_reasons?: { task_id?: string; title?: string; rejection_note?: string }[] | null;
   lifetime_cycles?: number;
   lifetime_prs_merged?: number;
+  lifetime_proven_prs_merged?: number | null;
+  lifetime_consumed_prs_merged?: number | null;
   lifetime_prs_rejected?: number;
   lifetime_tasks_failed?: number;
   lifetime_conversion_rate?: number | null;
@@ -158,6 +162,9 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
       </div>
       {sortedDirections.map(dp => {
         const isExpanded = expandedDirections.has(dp.direction_id);
+        const provenMerged = Math.max(0, Math.trunc(dp.proven_prs_merged ?? 0));
+        const consumedMerged = Math.max(0, Math.trunc(dp.consumed_prs_merged ?? 0));
+        const showProofSplit = provenMerged > 0 || consumedMerged > 0;
         return (
           <div key={dp.direction_id}>
             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
@@ -184,6 +191,16 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 {dp.prs_merged > 0 && (
                   <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
                     {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {showProofSplit && (
+                  <span className="text-[9px] bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Machine-proven merged PRs">
+                    {provenMerged} proven
+                  </span>
+                )}
+                {consumedMerged > 0 && (
+                  <span className="text-[9px] bg-sky-500/10 text-sky-300 border border-sky-500/20 px-1.5 py-0.5 rounded" title="Downstream-artifact proof-by-consumption subset of proven merges">
+                    {consumedMerged} consumed
                   </span>
                 )}
                 {typeof dp.prs_rejected === 'number' && dp.prs_rejected > 0 && (
@@ -425,15 +442,20 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 {(() => {
                   const cycles = dp.lifetime_cycles ?? 0;
                   const merged = dp.lifetime_prs_merged ?? 0;
+                  const lifetimeProven = Math.max(0, Math.trunc(dp.lifetime_proven_prs_merged ?? 0));
+                  const lifetimeConsumed = Math.max(0, Math.trunc(dp.lifetime_consumed_prs_merged ?? 0));
                   const failed = dp.lifetime_tasks_failed ?? 0;
                   const rejected = dp.lifetime_prs_rejected ?? 0;
-                  if (!cycles && !merged && !failed && !rejected) return null;
+                  if (!cycles && !merged && !lifetimeProven && !lifetimeConsumed && !failed && !rejected) return null;
                   const conv = typeof dp.lifetime_conversion_rate === 'number'
                     ? `${Math.round(dp.lifetime_conversion_rate * 100)}%`
                     : '—';
+                  const proofSuffix = (lifetimeProven > 0 || lifetimeConsumed > 0)
+                    ? ` · ${lifetimeProven} proven${lifetimeConsumed > 0 ? ` (${lifetimeConsumed} consumed)` : ''}`
+                    : '';
                   return (
                     <span className="text-[9px] text-neutral-500">
-                      Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged · {failed} failed · {conv} conversion
+                      Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged{proofSuffix} · {failed} failed · {conv} conversion
                     </span>
                   );
                 })()}

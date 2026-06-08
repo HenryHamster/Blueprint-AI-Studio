@@ -11652,6 +11652,111 @@ async def test_agent_status_completed_downstream_artifact_stamps_and_delivers(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_completed_downstream_artifact_delivers_dependent_beyond_scan_cap(
+    client: AsyncClient, db_session, mocker
+):
+    """A real dependent beyond the first page of irrelevant queued tasks still receives delivery."""
+    from app.artifact_prerequisites import (
+        ARTIFACT_PREREQUISITES_KEY,
+        _DEPENDENT_SCAN_CAP,
+    )
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Scan Cap Test",
+        user_id="test-user-downstream-scan-cap",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-scan-cap",
+        status=TaskStatus.IN_PROGRESS,
+        created_at=datetime.utcnow() - timedelta(minutes=10),
+    )
+    blocker = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "blocker"}],
+        vm_instance_id="agent-vm-downstream-scan-cap-blocker",
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(minutes=11),
+    )
+    db_session.add_all([producer, blocker])
+    await db_session.commit()
+    await db_session.refresh(producer)
+    await db_session.refresh(blocker)
+
+    for i in range(_DEPENDENT_SCAN_CAP + 1):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": f"irrelevant-{i}"}],
+                vm_instance_id=f"agent-vm-downstream-scan-cap-irrelevant-{i}",
+                status=TaskStatus.QUEUED,
+                depends_on=[str(blocker.id)],
+                created_at=datetime.utcnow() - timedelta(minutes=9, seconds=_DEPENDENT_SCAN_CAP + 1 - i),
+            )
+        )
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-scan-cap-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(producer.id)],
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(producer.id), "agent-vm-downstream-scan-cap")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(producer.id),
+        "status": "COMPLETED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(select(Artifact).where(Artifact.task_id == producer.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+
+    await db_session.refresh(dependent)
+    assert (dependent.context or {})[ARTIFACT_PREREQUISITES_KEY] == [
+        {
+            "artifact_id": str(artifacts[0].id),
+            "logical_key": "producer-output-bundle",
+            "artifact_type": ArtifactType.SMOKETEST_RESULT.value,
+            "source_task_id": str(producer.id),
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_status_malformed_pr_url_returns_400(
     client: AsyncClient, db_session, mocker
 ):

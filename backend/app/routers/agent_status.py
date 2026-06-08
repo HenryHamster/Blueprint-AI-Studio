@@ -1309,7 +1309,7 @@ async def update_agent_status(
 
     if payload.status == TaskStatus.COMPLETED:
         await record_artifact_consumptions_for_task(
-            task, session, payload.consumed_artifact_ids
+            task, session, payload.consumed_artifact_ids, modern_agent=True
         )
     session.add(task)
 

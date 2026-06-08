@@ -437,15 +437,23 @@ def acceptance_was_declared(recorded: Any) -> bool:
 def acceptance_is_proven(recorded: Any) -> bool:
     """Whether a recorded verdict is machine-checked PROVEN, not merely delivered.
 
-    ``True`` only when a verdict was recorded AND it carries ``proven is True`` —
-    i.e. a satisfied ``named_test`` that ran green under a real merge-test verdict
-    and exercises a changed production seam. A satisfied
-    ``observable_behavior`` / ``downstream_artifact`` (soft / asserted by a
-    shipped diff only), every unsatisfied / fail-closed case, and all undeclared
-    or legacy rows return ``False``. This is the additive TRUE proven signal,
-    strictly distinct from ``verified_prs_merged`` (which still credits soft and
-    undeclared merges). Tolerant of legacy verdict dicts written before the
-    ``proven`` key existed — a missing key reads as ``False``, never proven.
+    ``True`` only when a verdict was recorded AND it carries ``proven is True``.
+    Two evidence paths produce ``proven=True``:
+
+    1. A satisfied ``named_test`` that ran green under a real merge-test verdict
+       and exercises a changed production seam (machine-checked proof).
+    2. A satisfied ``downstream_artifact`` that has been consumed — i.e.
+       ``record_artifact_consumptions_for_task`` ran and upgraded the verdict to
+       ``proven=True, consumed=True`` (recorded downstream-artifact consumption).
+       ``consumed`` is a strict subset: every consumed verdict is proven, but a
+       satisfied-but-unconsumed ``downstream_artifact`` is ``proven=False``.
+
+    A satisfied ``observable_behavior`` (soft / asserted by a shipped diff only),
+    every unsatisfied / fail-closed case, and all undeclared or legacy rows return
+    ``False``. This is the additive TRUE proven signal, strictly distinct from
+    ``verified_prs_merged`` (which still credits soft and undeclared merges).
+    Tolerant of legacy verdict dicts written before the ``proven`` key existed —
+    a missing key reads as ``False``, never proven.
     """
     if not isinstance(recorded, dict):
         return False
@@ -547,9 +555,18 @@ def _authorized_consumed_artifact_ids(task: Task) -> set[uuid.UUID]:
 
 
 def _normalize_consumed_artifact_ids(
-    task: Task, consumed_artifact_ids: Iterable[uuid.UUID | str] | None
+    task: Task,
+    consumed_artifact_ids: Iterable[uuid.UUID | str] | None,
+    *,
+    modern_agent: bool = False,
 ) -> list[uuid.UUID]:
     if consumed_artifact_ids is None:
+        if modern_agent:
+            # Modern agent omitted the field entirely — treat as no consumption.
+            # Do NOT fall back to delivered prerequisites; an omission from a
+            # current-generation agent means the handler did not render artifact
+            # prerequisites and therefore cannot have consumed any.
+            return []
         raw = _fallback_consumed_artifact_ids(task)
     else:
         raw = list(consumed_artifact_ids)
@@ -573,6 +590,8 @@ async def record_artifact_consumptions_for_task(
     task: Task,
     session,
     consumed_artifact_ids: Iterable[uuid.UUID | str] | None = None,
+    *,
+    modern_agent: bool = False,
 ) -> list[ArtifactConsumption]:
     """Persist consumption rows and upgrade matching producer verdicts.
 
@@ -580,7 +599,7 @@ async def record_artifact_consumptions_for_task(
     verdicts are left untouched, and existing proven/consumed verdicts are never
     downgraded.
     """
-    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids)
+    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids, modern_agent=modern_agent)
     if not ids:
         return []
 

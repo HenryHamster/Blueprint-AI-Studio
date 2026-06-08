@@ -143,10 +143,11 @@ async def compute_direction_progress(
         # degraded-unverified) — drives conversion_rate so a merge that never
         # actually verified does not inflate the operator-read rate.
         verified_prs_merged = 0
-        # Proven (machine-checked named-test) merge count + declaration-coverage
-        # numerator/denominator — STRICTER than verified_prs_merged: proven counts
-        # only named-test proof, declared counts merges that committed to forward
-        # evidence at plan time, merged_write_total is the coverage denominator.
+        # Proven merge count + declaration-coverage numerator/denominator —
+        # STRICTER than verified_prs_merged: proven counts machine-checked
+        # named-test proof OR recorded downstream-artifact consumption; declared
+        # counts merges that committed to forward evidence at plan time;
+        # merged_write_total is the coverage denominator.
         proven_prs_merged = 0
         consumed_prs_merged = 0
         declared_prs_merged = 0

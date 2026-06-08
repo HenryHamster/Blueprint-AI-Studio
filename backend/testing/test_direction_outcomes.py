@@ -4608,12 +4608,14 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
     """The honest proven-by-evidence + declaration-coverage aggregates.
 
     Exercises the additive aggregation in ``_update_direction_research_outcomes``:
-    only a satisfied named_test merge (machine-checked, ``proven=True``) counts
-    toward ``acceptance_proven_merged``; an undeclared merge and a soft
-    observable_behavior merge (satisfied by a shipped diff only) are EXCLUDED
-    from proven, and ``acceptance_declaration_coverage`` counts declared vs
-    undeclared merged WRITE tasks. The existing ``verified_prs_merged`` values must stay unchanged
-    (they still credit soft and undeclared merges) — proven is strictly additive, not a redefinition.
+    only a machine-proven merge counts toward ``acceptance_proven_merged`` — either
+    a satisfied ``named_test`` (machine-checked) or a satisfied ``downstream_artifact``
+    that was consumed (recorded downstream-artifact consumption); an undeclared merge
+    and a soft ``observable_behavior`` merge (satisfied by a shipped diff only) are
+    EXCLUDED from proven. ``acceptance_declaration_coverage`` counts declared vs
+    undeclared merged WRITE tasks. The existing ``verified_prs_merged`` values must
+    stay unchanged (they still credit soft and undeclared merges) — proven is strictly
+    additive, not a redefinition.
     """
     direction_id = "d-proven"
     project = await _create_project(db_session, directions=[])
@@ -4653,7 +4655,7 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
         title="soft-behavior",
     )
     # (3) Proven merge: machine-checked named_test → declared=True, proven=True.
-    # The ONLY row that counts toward acceptance_proven_merged.
+    # One of two paths to proven; the other is a consumed downstream_artifact.
     await _create_child_task(
         db_session,
         research_task.id,
@@ -4721,9 +4723,9 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
     assert entry["prs_merged"] == 5
     assert entry["verified_prs_merged"] == 4
 
-    # New additive proven-by-evidence signal: only the WRITE named_test proven
-    # merge counts — undeclared, soft behavior, and unsatisfied are all excluded,
-    # and the non-WRITE review row is excluded despite its proven verdict.
+    # New additive proven-by-evidence signal: only WRITE proven merges count
+    # (named_test or consumed downstream_artifact) — undeclared, soft behavior,
+    # unsatisfied, and the non-WRITE review row are all excluded.
     assert entry["acceptance_proven_merged"] == 1
     # Declaration coverage over the 4 merged WRITE tasks: 3 declared
     # (behavior, proven named_test, unsatisfied named_test), 1 undeclared.

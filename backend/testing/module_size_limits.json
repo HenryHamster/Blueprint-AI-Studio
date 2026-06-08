@@ -52,7 +52,7 @@
     "direction_outcomes.py": 2350,
     "digest_metrics.py": 4400,
     "digest_remediation.py": 900,
-    "digest_direction_progress.py": 800,
+    "digest_direction_progress.py": 1050,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
     "release_qualifier.py": 3300,
