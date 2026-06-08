@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap, Ban } from 'lucide-react';
+import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap, Ban, RotateCcw, X } from 'lucide-react';
 import type { ProjectDiagnostics, StuckTask, FailingTaskTypes } from '../types/diagnostics';
 import { formatDurationSec } from '../utils/time';
 import { API_BASE_URL, authGet } from '../api';
@@ -16,9 +16,22 @@ const STUCK_REASON_LABELS: Record<StuckTask['stuck_reason'], string> = {
 interface DiagnosticsPanelProps {
   diagnostics: ProjectDiagnostics | null;
   onViewTask: (taskId: string) => void;
+  handleRetry: (taskId: string) => void;
+  handleCancel: (taskId: string) => void;
+  setConfirmDialog: (dialog: ConfirmDialogConfig | null) => void;
 }
 
-export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelProps) {
+interface ConfirmDialogConfig {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+}
+
+const RETRYABLE_STATUSES = new Set(['FAILED']);
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED']);
+
+export function DiagnosticsPanel({ diagnostics, onViewTask, handleRetry, handleCancel, setConfirmDialog }: DiagnosticsPanelProps) {
   const [collapsed, setCollapsed] = useState(() => {
     return localStorage.getItem('blueprint-admin:diagnosticsPanelCollapsed') === 'true';
   });
@@ -42,6 +55,9 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
   const cbFailures = diagnostics?.circuit_breaker.failure_count ?? 0;
   const zonesAvailable = diagnostics?.zone_health.available ?? 0;
   const exhaustedZones = diagnostics?.zone_health.exhausted ?? [];
+
+  const showRetry = (task: StuckTask) => RETRYABLE_STATUSES.has(task.status);
+  const showCancel = (task: StuckTask) => CANCELLABLE_STATUSES.has(task.status);
 
   return (
     <div className="mb-3 shrink-0">
@@ -108,6 +124,44 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
                         <span className="text-neutral-600 font-mono">
                           deps: {task.unresolvable_deps.map(d => d.slice(0, 8)).join(', ')}
                         </span>
+                      )}
+                      {(showRetry(task) || showCancel(task)) && (
+                        <div className="flex items-center gap-1.5 ml-auto">
+                          {showRetry(task) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRetry(task.task_id);
+                              }}
+                              className="inline-flex items-center gap-1 rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 min-h-[44px] md:min-h-auto text-[9px] font-semibold text-blue-400 hover:bg-blue-500/20 transition-colors"
+                              title={`Retry ${task.title}`}
+                            >
+                              <RotateCcw className="w-2.5 h-2.5" />
+                              Retry
+                            </button>
+                          )}
+                          {showCancel(task) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmDialog({
+                                  title: 'Cancel task?',
+                                  message: `This will cancel "${task.title}".`,
+                                  confirmLabel: 'Cancel task',
+                                  onConfirm: () => {
+                                    handleCancel(task.task_id);
+                                    setConfirmDialog(null);
+                                  },
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 rounded border border-red-500/20 bg-red-500/10 px-2 py-1 min-h-[44px] md:min-h-auto text-[9px] font-semibold text-red-400 hover:bg-red-500/20 transition-colors"
+                              title={`Cancel ${task.title}`}
+                            >
+                              <X className="w-2.5 h-2.5" />
+                              Cancel
+                            </button>
+                          )}
+                        </div>
                       )}
                     </div>
                     {task.remediation_hint && (

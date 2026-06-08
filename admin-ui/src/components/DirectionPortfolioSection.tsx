@@ -33,6 +33,7 @@ export interface DirectionProgress {
   auto_paused?: boolean;
   paused_reason?: string | null;
   needs_manual_intervention?: boolean;
+  retirement_eligible?: boolean;
   conversion_rate?: number | null;
   acceptance_rate?: number | null;
   first_attempt_success_rate?: number | null;
@@ -66,6 +67,9 @@ export interface DirectionProgress {
   outcome_kind_breakdown?: OutcomeKindBreakdown | null;
   lifetime_generalized_successes?: number | null;
   lifetime_generalized_health_rate?: number | null;
+  verified_prs_merged?: number | null;
+  acceptance_declaration_coverage?: number | null;
+  lifetime_acceptance_declaration_coverage?: number | null;
 }
 
 interface DirectionPortfolioSectionProps {
@@ -580,6 +584,8 @@ export function DirectionPortfolioSection({
               );
               const provenMerged = Math.max(0, Math.trunc(d.proven_prs_merged ?? 0));
               const consumedMerged = Math.max(0, Math.trunc(d.consumed_prs_merged ?? 0));
+              const verifiedMerged = typeof d.verified_prs_merged === 'number' ? Math.max(0, Math.trunc(d.verified_prs_merged)) : null;
+              const declCoverage = typeof d.acceptance_declaration_coverage === 'number' ? d.acceptance_declaration_coverage : null;
               const showProofSplit = provenMerged > 0 || consumedMerged > 0;
               const outcomeRows = summarizeOutcomeKinds(d.outcome_kind_breakdown);
               const showGeneralized = outcomeRows.some(r => r.kind !== 'code_merge');
@@ -594,6 +600,7 @@ export function DirectionPortfolioSection({
                     {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
                     {d.needs_manual_intervention && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">Needs Intervention</span>}
                     {d.auto_paused && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
+                    {d.retirement_eligible && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" title="Direction is eligible for retirement">Retirement Eligible</span>}
                   </div>
                   <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-neutral-500">
@@ -603,6 +610,15 @@ export function DirectionPortfolioSection({
                     <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
                     {showProofSplit && <span className="text-emerald-300" title="Machine-proven merged PRs">{provenMerged} proven</span>}
                     {consumedMerged > 0 && <span className="text-sky-300" title="Downstream-artifact proof-by-consumption subset of proven merges">{consumedMerged} consumed</span>}
+                    {verifiedMerged != null && verifiedMerged > 0 && <span className="text-teal-300" title="Verification-aware subset of merged PRs driving the conversion rate">{verifiedMerged} verified</span>}
+                    {declCoverage != null && (
+                      <span
+                        className={declCoverage >= 0.7 ? 'text-emerald-400' : declCoverage >= 0.4 ? 'text-amber-400' : 'text-red-400'}
+                        title="Fraction of merged write-PRs that committed acceptance evidence (acceptance-declaration coverage)"
+                      >
+                        {Math.round(declCoverage * 100)}% decl
+                      </span>
+                    )}
                     {d.product_ratio != null && (
                       <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
                     )}

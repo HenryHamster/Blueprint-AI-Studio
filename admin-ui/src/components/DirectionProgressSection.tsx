@@ -41,6 +41,7 @@ export interface DirectionProgress {
   auto_paused?: boolean;
   paused_reason?: string | null;
   needs_manual_intervention?: boolean;
+  retirement_eligible?: boolean;
   scope_breakdown?: Record<string, {
     created?: number;
     merged?: number;
@@ -98,6 +99,9 @@ export interface DirectionProgress {
   budget_exceeded?: boolean;
   format_compliance_rate?: number | null;
   self_repair_success_rate?: number | null;
+  verified_prs_merged?: number | null;
+  acceptance_declaration_coverage?: number | null;
+  lifetime_acceptance_declaration_coverage?: number | null;
 }
 
 type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_attempt_asc';
@@ -164,6 +168,8 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
         const isExpanded = expandedDirections.has(dp.direction_id);
         const provenMerged = Math.max(0, Math.trunc(dp.proven_prs_merged ?? 0));
         const consumedMerged = Math.max(0, Math.trunc(dp.consumed_prs_merged ?? 0));
+        const verifiedMerged = typeof dp.verified_prs_merged === 'number' ? Math.max(0, Math.trunc(dp.verified_prs_merged)) : null;
+        const declCoverage = typeof dp.acceptance_declaration_coverage === 'number' ? dp.acceptance_declaration_coverage : null;
         const showProofSplit = provenMerged > 0 || consumedMerged > 0;
         return (
           <div key={dp.direction_id}>
@@ -203,6 +209,19 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     {consumedMerged} consumed
                   </span>
                 )}
+                {verifiedMerged != null && verifiedMerged > 0 && (
+                  <span className="text-[9px] bg-teal-500/10 text-teal-300 border border-teal-500/20 px-1.5 py-0.5 rounded" title="Verification-aware subset of merged PRs driving the conversion rate">
+                    {verifiedMerged} verified
+                  </span>
+                )}
+                {declCoverage != null && (
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded border ${declCoverage >= 0.7 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : declCoverage >= 0.4 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
+                    title="Fraction of merged write-PRs that committed acceptance evidence (acceptance-declaration coverage)"
+                  >
+                    {Math.round(declCoverage * 100)}% decl
+                  </span>
+                )}
                 {typeof dp.prs_rejected === 'number' && dp.prs_rejected > 0 && (
                   <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded" title="PRs rejected">
                     {dp.prs_rejected} rejected
@@ -234,6 +253,11 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 {dp.possibly_complete && (
                   <span className="text-[9px] bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded" title={dp.completion_suggestion || "Direction may be complete"}>
                     possibly complete
+                  </span>
+                )}
+                {dp.retirement_eligible && (
+                  <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Direction is eligible for retirement">
+                    retirement eligible
                   </span>
                 )}
                 {dp.priority && (
@@ -453,9 +477,13 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   const proofSuffix = (lifetimeProven > 0 || lifetimeConsumed > 0)
                     ? ` · ${lifetimeProven} proven${lifetimeConsumed > 0 ? ` (${lifetimeConsumed} consumed)` : ''}`
                     : '';
+                  const lifetimeDeclCoverage = typeof dp.lifetime_acceptance_declaration_coverage === 'number' ? dp.lifetime_acceptance_declaration_coverage : null;
+                  const lifetimeDeclSuffix = lifetimeDeclCoverage != null
+                    ? ` · ${Math.round(lifetimeDeclCoverage * 100)}% decl (lifetime)`
+                    : '';
                   return (
                     <span className="text-[9px] text-neutral-500">
-                      Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged{proofSuffix} · {failed} failed · {conv} conversion
+                      Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged{proofSuffix} · {failed} failed · {conv} conversion{lifetimeDeclSuffix}
                     </span>
                   );
                 })()}

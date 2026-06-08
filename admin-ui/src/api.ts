@@ -445,6 +445,44 @@ export async function fetchOuterLoopChains(
   return res.json();
 }
 
+export interface PipelineRegression {
+  signal_name: string;
+  regression_class: string;
+  detected_at: string | null;
+  severity: string;
+  current_rate: number | null;
+  prior_rate: number | null;
+  resolved?: boolean;
+  resolved_at?: string | null;
+  details?: string | null;
+  spawned_task_id?: string | null;
+  spawned_task_status?: string | null;
+  spawned_task_title?: string | null;
+  [key: string]: unknown;
+}
+
+export interface PipelineRegressionsResponse {
+  project_id: string;
+  regressions: PipelineRegression[];
+  healthy: boolean;
+}
+
+export async function fetchPipelineRegressions(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<PipelineRegressionsResponse> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(
+    `/api/admin/pipeline-regressions?${params.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch pipeline regressions: ${res.status}`);
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: SrMissedTask[];
   total: number;

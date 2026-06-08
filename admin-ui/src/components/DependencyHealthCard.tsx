@@ -24,7 +24,9 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
   const cancels = data.unresumable_cancellations?.total ?? 0;
   const blocked = data.live_blocked?.total ?? 0;
   const resumed = data.resumes?.total ?? 0;
-  const anyFailure = parked > 0 || dupes > 0 || cancels > 0;
+  const giveUps = data.finding_structural_give_up?.total ?? 0;
+  const missingCap = data.missing_capability_demand?.total ?? 0;
+  const anyFailure = parked > 0 || dupes > 0 || cancels > 0 || giveUps > 0 || missingCap > 0;
 
   const toggle = (key: string) => setOpen((cur) => (cur === key ? null : key));
 
@@ -122,6 +124,53 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
             </li>
           ))}
         </ul>
+      )}
+
+      {row('giveups', 'Structural give-ups', giveUps)}
+      {open === 'giveups' && data.finding_structural_give_up && (
+        <div className="ml-4 mb-1 space-y-1 text-[10px] text-neutral-500">
+          {Object.entries(data.finding_structural_give_up.by_reason).map(([reason, n]) => (
+            <div key={reason}>
+              <span className="text-neutral-400">{reason}</span>: {n}
+            </div>
+          ))}
+          {data.finding_structural_give_up.findings.length > 0 && (
+            <ul className="mt-0.5 space-y-0.5">
+              {data.finding_structural_give_up.findings.map((f) => (
+                <li key={f.task_id} className="truncate">
+                  <span className="text-neutral-400">{f.title}</span>
+                  {f.reason ? ` — ${f.reason}` : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {row('missingcap', 'Stranded prerequisites', missingCap)}
+      {open === 'missingcap' && data.missing_capability_demand && (
+        <div className="ml-4 mb-1 space-y-1 text-[10px] text-neutral-500">
+          <div>
+            <span className="text-neutral-400">still blocked</span>: {data.missing_capability_demand.still_blocked}
+            {' · '}
+            <span className="text-neutral-400">already cancelled</span>: {data.missing_capability_demand.already_cancelled}
+          </div>
+          {Object.entries(data.missing_capability_demand.by_direction).map(([dir, n]) => (
+            <div key={dir}>
+              <span className="text-neutral-400">{dir}</span>: {n}
+            </div>
+          ))}
+          {data.missing_capability_demand.demands.length > 0 && (
+            <ul className="mt-0.5 space-y-0.5">
+              {data.missing_capability_demand.demands.map((d, i) => (
+                <li key={i} className="truncate">
+                  <span className="text-neutral-400">{d.label ?? d.ref ?? d.kind}</span>
+                  {` — ${d.dependent_count} dependent${d.dependent_count !== 1 ? 's' : ''}`}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </div>
   );

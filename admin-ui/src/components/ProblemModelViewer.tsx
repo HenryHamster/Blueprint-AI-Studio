@@ -11,11 +11,13 @@ import type {
   PendingConfirmation,
   ProblemModelPatch,
   Source,
+  SelfReflectionEntry,
 } from '../types';
 
 interface ProblemModelViewerProps {
   projectId: string;
   problemModel: ProblemModel;
+  selfReflectionLog?: SelfReflectionEntry[];
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onUpdated: (patched: ProblemModel) => void;
 }
@@ -221,9 +223,41 @@ function PendingConfirmationRow({ pending }: { pending: PendingConfirmation }) {
   );
 }
 
+function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
+  return (
+    <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/30 space-y-2">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[10px] text-neutral-500">{timeAgo(entry.ts)}</span>
+        {entry.cycle_task_id && (
+          <span className="text-[10px] font-mono text-neutral-600">{entry.cycle_task_id.slice(0, 8)}</span>
+        )}
+      </div>
+      {entry.what_was_hard && (
+        <div>
+          <h4 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">What was hard</h4>
+          <p className="text-xs text-neutral-300">{entry.what_was_hard}</p>
+        </div>
+      )}
+      {entry.missing_context && (
+        <div>
+          <h4 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">Missing context</h4>
+          <p className="text-xs text-neutral-300">{entry.missing_context}</p>
+        </div>
+      )}
+      {entry.proposed_self_improvement && (
+        <div>
+          <h4 className="text-[10px] font-semibold text-amber-600/80 uppercase tracking-wide mb-0.5">Proposed improvement</h4>
+          <p className="text-xs text-neutral-200">{entry.proposed_self_improvement}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ProblemModelViewer({
   projectId,
   problemModel,
+  selfReflectionLog = [],
   addToast,
   onUpdated,
 }: ProblemModelViewerProps) {
@@ -402,6 +436,18 @@ export default function ProblemModelViewer({
             <SectionHeader count={friction.length}>Friction</SectionHeader>
             <div className="space-y-2">
               {friction.map((f) => <FrictionRow key={f.id} friction={f} />)}
+            </div>
+          </section>
+        )}
+
+        {/* Self-reflection log */}
+        {selfReflectionLog.length > 0 && (
+          <section>
+            <SectionHeader count={selfReflectionLog.length}>Self-reflection</SectionHeader>
+            <div className="space-y-2">
+              {selfReflectionLog.map((entry, i) => (
+                <SelfReflectionCard key={entry.cycle_task_id ?? `sr-${i}`} entry={entry} />
+              ))}
             </div>
           </section>
         )}

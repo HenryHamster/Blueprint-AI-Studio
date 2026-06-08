@@ -39,3 +39,97 @@ describe('DirectionProgressSection proof split', () => {
     expect(screen.queryByText('0 consumed')).not.toBeInTheDocument();
   });
 });
+
+describe('DirectionProgressSection acceptance-evidence coverage', () => {
+  it('renders verified_prs_merged chip when value is positive', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ verified_prs_merged: 4 })]}
+      />,
+    );
+
+    expect(screen.getByText('4 verified')).toBeInTheDocument();
+  });
+
+  it('omits verified_prs_merged chip when value is zero', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ verified_prs_merged: 0 })]}
+      />,
+    );
+
+    expect(screen.queryByText('0 verified')).not.toBeInTheDocument();
+  });
+
+  it('omits verified_prs_merged chip when field is absent', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection()]}
+      />,
+    );
+
+    expect(screen.queryByText(/verified/)).not.toBeInTheDocument();
+  });
+
+  it('renders acceptance_declaration_coverage badge with percentage', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ acceptance_declaration_coverage: 0.72 })]}
+      />,
+    );
+
+    expect(screen.getByText('72% decl')).toBeInTheDocument();
+  });
+
+  it('omits acceptance_declaration_coverage badge when field is null', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ acceptance_declaration_coverage: null })]}
+      />,
+    );
+
+    expect(screen.queryByText(/% decl/)).not.toBeInTheDocument();
+  });
+
+  it('omits acceptance_declaration_coverage badge when field is absent', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection()]}
+      />,
+    );
+
+    expect(screen.queryByText(/% decl/)).not.toBeInTheDocument();
+  });
+});
+
+describe('DirectionProgressSection retirement eligible', () => {
+  it('renders retirement eligible badge when flag is true', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ retirement_eligible: true })]}
+      />,
+    );
+
+    expect(screen.getByText('retirement eligible')).toBeInTheDocument();
+  });
+
+  it('does not render retirement eligible badge when flag is false', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ retirement_eligible: false })]}
+      />,
+    );
+
+    expect(screen.queryByText('retirement eligible')).not.toBeInTheDocument();
+  });
+
+  it('does not render retirement eligible badge when flag is undefined', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ retirement_eligible: undefined })]}
+      />,
+    );
+
+    expect(screen.queryByText('retirement eligible')).not.toBeInTheDocument();
+  });
+});

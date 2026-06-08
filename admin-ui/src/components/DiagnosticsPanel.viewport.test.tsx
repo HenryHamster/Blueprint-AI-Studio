@@ -56,6 +56,12 @@ const populated: ProjectDiagnostics = {
   zone_health: { available: 1, exhausted: ['us-central1-a', 'us-central1-b'] },
 };
 
+const actionProps = {
+  handleRetry: vi.fn(),
+  handleCancel: vi.fn(),
+  setConfirmDialog: vi.fn(),
+};
+
 describe('DiagnosticsPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -82,7 +88,7 @@ describe('DiagnosticsPanel — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => {
-        r.render(<DiagnosticsPanel diagnostics={null} onViewTask={() => {}} />);
+        r.render(<DiagnosticsPanel diagnostics={null} onViewTask={() => {}} {...actionProps} />);
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     });
@@ -96,7 +102,7 @@ describe('DiagnosticsPanel — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => {
-        r.render(<DiagnosticsPanel diagnostics={populated} onViewTask={() => {}} />);
+        r.render(<DiagnosticsPanel diagnostics={populated} onViewTask={() => {}} {...actionProps} />);
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     }, { waitMs: 50 });

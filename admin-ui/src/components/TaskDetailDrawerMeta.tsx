@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, ResolvedReferenceLink, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
-import { formatAbsolute, parseTimestamp } from '../utils/time';
+import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob } from '../api';
@@ -691,6 +691,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           {task.last_heartbeat && (
             <span className="text-xs text-neutral-500">{formatAbsolute(task.last_heartbeat)}</span>
           )}
+        </span>
+      </DetailRow>
+      <DetailRow label="Last tool use">
+        <span className="text-sm text-neutral-200" title={task.last_tool_use_at ? formatAbsolute(task.last_tool_use_at) : undefined}>
+          {task.last_tool_use_at ? timeAgo(task.last_tool_use_at) : 'No tool use recorded'}
         </span>
       </DetailRow>
       {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
