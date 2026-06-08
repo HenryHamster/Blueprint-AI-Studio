@@ -1088,8 +1088,22 @@ async def test_local_backend_artifact_dir_survives_subprocess_exit():
     else:
         raise AssertionError("expected local terminal marker for completed subprocess")
 
+    # Wait for the subprocess to FULLY exit before asserting it's gone. The
+    # terminal marker is written by the wrapper a beat BEFORE the process is
+    # reaped, so a bare ``assert not _is_pid_running`` right after the marker
+    # poll races the OS reaping the pid and flakes (assert not True). Poll the
+    # actual exit condition with the same bounded budget — deterministic, not
+    # timing-dependent.
+    pid = result.metadata["pid"]
+    for _ in range(60):
+        if not compute_backends_module._is_pid_running(pid):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError(
+            f"subprocess pid {pid} still running 3s after its terminal marker"
+        )
     # Subprocess is gone; the artifact written to the contract dir is still on disk.
-    assert not compute_backends_module._is_pid_running(result.metadata["pid"])
     artifact_path = os.path.join(artifact_dir, "model.txt")
     with open(artifact_path, encoding="utf-8") as handle:
         assert handle.read().strip() == "checkpoint-bytes"
