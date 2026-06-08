@@ -1177,4 +1177,66 @@ describe('DetailsTab — Compute Experiment Contract', () => {
     expect(screen.getByText('llm')).toBeInTheDocument();
     expect(screen.getByText('compute experiment')).toBeInTheDocument();
   });
+
+  it('shows compute acceptance grade on the knowledge document section — acceptance grade', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-2',
+          title: 'Benchmark Results: GPU throughput',
+          summary: 'The model achieves 95% accuracy.',
+          citation_count: 3,
+          analysis_mode: 'llm',
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'acceptance',
+          compute_acceptance_reason: 'llm_artifact_cited',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    const badge = screen.getByText('Acceptance');
+    expect(badge).toBeInTheDocument();
+    expect(badge.closest('[title]')?.getAttribute('title')).toContain('LLM-grounded');
+  });
+
+  it('shows compute acceptance grade on the knowledge document section — measured-only grade', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-3',
+          title: 'Deterministic Benchmark Summary',
+          summary: 'Fallback analysis only.',
+          citation_count: 0,
+          analysis_mode: 'fallback',
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'measured_only',
+          compute_acceptance_reason: 'analysis_mode_not_llm',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    const badge = screen.getByText('Measured only');
+    expect(badge).toBeInTheDocument();
+    expect(badge.closest('[title]')?.getAttribute('title')).toContain('Deterministic fallback');
+  });
+
+  it('does not show acceptance grade badge for non-compute documents', () => {
+    const task = makeTask({
+      task_type: 'design',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-design-1',
+          title: 'Design Document',
+          source_kind: 'design',
+          compute_acceptance_grade: null,
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Knowledge Document')).toBeInTheDocument();
+    expect(screen.queryByText('Acceptance')).toBeNull();
+    expect(screen.queryByText('Measured only')).toBeNull();
+  });
 });
