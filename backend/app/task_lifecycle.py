@@ -49,7 +49,7 @@ from app.task_capabilities import (
     strategic_phase_for,
 )
 import app.shared_state as _shared_state
-from app.broadcast import broadcast_to_project  # noqa: F401 — re-exported for test patching
+from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
@@ -499,7 +499,7 @@ async def _process_post_commit(
     _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
     from app.time_utils import _utcnow
-    from app.broadcast import broadcast_to_project  # noqa: F811
+    from app.broadcast import broadcast_to_project
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
     from app.github import (
@@ -1217,7 +1217,7 @@ async def _process_post_commit(
                                             ),
                                             project_id=str(task.project_id),
                                         )
-                                    except Exception as _mf_exc:  # noqa: BLE001
+                                    except Exception as _mf_exc:
                                         logger.warning(
                                             "[PIPELINE] Migration finalization attempt "
                                             "failed for PR #%s: %s",
@@ -1227,7 +1227,7 @@ async def _process_post_commit(
                                         )
                                         _finalization = None
                                     if _finalization is not None:
-                                        from app.task_completion import (  # noqa: PLC0415
+                                        from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
 
@@ -1317,7 +1317,7 @@ async def _process_post_commit(
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
                             try:
-                                from app.task_completion import (  # noqa: PLC0415
+                                from app.task_completion import (
                                     _finalize_migration_reservation_after_merge,
                                 )
 
@@ -1326,7 +1326,7 @@ async def _process_post_commit(
                                     session,
                                     terminal_merge=not is_intermediate,
                                 )
-                            except Exception as _mr_exc:  # noqa: BLE001
+                            except Exception as _mr_exc:
                                 logger.warning(
                                     "[MIGRATION] Failed to finalize reservation for "
                                     "merged task %s: %r",
@@ -1360,7 +1360,7 @@ async def _process_post_commit(
                             if _record_pr_merged:
                                 await _mark_dependents_warm_claimable(task)
                                 try:
-                                    from app.reaper_sweeps import (  # noqa: PLC0415
+                                    from app.reaper_sweeps import (
                                         event_driven_unblock_dependents,
                                     )
 
@@ -2674,7 +2674,7 @@ async def _process_post_commit(
                                                 project_id=str(task.project_id),
                                             )
                                         )
-                                    except Exception as _mf_exc:  # noqa: BLE001
+                                    except Exception as _mf_exc:
                                         logger.warning(
                                             "[CI] Migration finalization attempt failed "
                                             "for PR #%s: %s",
@@ -2684,7 +2684,7 @@ async def _process_post_commit(
                                         )
                                         _finalization = None
                                     if _finalization is not None:
-                                        from app.task_completion import (  # noqa: PLC0415
+                                        from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
 
@@ -2865,7 +2865,7 @@ async def _process_post_commit(
                                                 ),
                                             )
                                         try:
-                                            from app.task_completion import (  # noqa: PLC0415
+                                            from app.task_completion import (
                                                 _finalize_migration_reservation_after_merge,
                                             )
 
@@ -2875,7 +2875,7 @@ async def _process_post_commit(
                                                 source_task=task,
                                                 terminal_merge=_terminal_rollup_merge,
                                             )
-                                        except Exception as _mr_exc:  # noqa: BLE001
+                                        except Exception as _mr_exc:
                                             logger.warning(
                                                 "[MIGRATION] Failed to finalize "
                                                 "reservation for merged task %s: %r",
@@ -3049,7 +3049,7 @@ async def _process_post_commit(
                                         if _record_pr_merged:
                                             await _mark_dependents_warm_claimable(orig)
                                             try:
-                                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                                from app.reaper_sweeps import (
                                                     event_driven_unblock_dependents,
                                                 )
 
@@ -3748,7 +3748,7 @@ async def _process_post_commit(
                             )
                         if _orig_to_refresh is not None:
                             try:
-                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                from app.reaper_sweeps import (
                                     event_driven_unblock_dependents,
                                 )
 
@@ -4521,7 +4521,7 @@ async def _process_post_commit(
             if task is None:
                 return {"status": "accepted"}
         try:
-            from app.task_completion import (  # noqa: PLC0415
+            from app.task_completion import (
                 _expire_migration_reservation_if_terminal,
             )
 
@@ -5428,18 +5428,85 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
     registration.result_state = "expired"
     registration.delivered_at = now
     if task is not None and task.status == TaskStatus.PARKED:
+        from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+        failure_detail = None
+        diagnostics = None
+        if registration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND:
+            from app.models import ComputeJob
+
+            job = None
+            if registration.wake_source_ref:
+                with contextlib.suppress(ValueError, TypeError):
+                    job = await session.get(
+                        ComputeJob, uuid.UUID(registration.wake_source_ref)
+                    )
+            deadline_at = registration.deadline_at
+            job_completed_at = job.completed_at if job is not None else None
+            job_status = getattr(job.status, "value", job.status) if job else None
+            job_terminal_by_deadline = bool(
+                job is not None
+                and job_completed_at is not None
+                and deadline_at is not None
+                and job_completed_at <= deadline_at
+            )
+            diagnostics = {
+                "wake_source_kind": registration.wake_source_kind,
+                "wake_source_ref": registration.wake_source_ref,
+                "requested_at": registration.requested_at.isoformat(),
+                "claimed_at": (
+                    registration.claimed_at.isoformat()
+                    if registration.claimed_at
+                    else None
+                ),
+                "fired_at": (
+                    registration.fired_at.isoformat() if registration.fired_at else None
+                ),
+                "deadline_at": deadline_at.isoformat() if deadline_at else None,
+                "job_status": job_status,
+                "job_completed_at": (
+                    job_completed_at.isoformat() if job_completed_at else None
+                ),
+                "job_terminal_by_deadline": job_terminal_by_deadline,
+            }
+            if job_terminal_by_deadline:
+                failure_detail = "compute_job_terminal_wake_lost_after_job_completed"
+                task.latest_status_message = (
+                    "Park wake on compute_job_terminal expired after the job "
+                    "completed, but the wake never fired before the deadline "
+                    f"(job_completed_at={diagnostics['job_completed_at']}, "
+                    f"deadline_at={diagnostics['deadline_at']}, "
+                    f"requested_at={diagnostics['requested_at']}, "
+                    f"fired_at={diagnostics['fired_at']})"
+                )[:500]
+            else:
+                failure_detail = "compute_job_terminal_job_not_terminal_by_deadline"
+                task.latest_status_message = (
+                    "Park wake on compute_job_terminal expired before the job "
+                    "reached terminal state "
+                    f"(job_status={diagnostics['job_status']}, "
+                    f"job_completed_at={diagnostics['job_completed_at']}, "
+                    f"deadline_at={diagnostics['deadline_at']}, "
+                    f"requested_at={diagnostics['requested_at']}, "
+                    f"fired_at={diagnostics['fired_at']})"
+                )[:500]
+        else:
+            task.latest_status_message = (
+                f"Park wake on {registration.wake_source_kind} timed out at deadline"
+            )[:500]
         task.status = TaskStatus.FAILED
         task.parked_at = None
         # Clear park_reason too so an expired task carries no stale "Parked …"
         # marker on operator surfaces — the task is now FAILED, not parked.
         task.park_reason = None
-        task.latest_status_message = (
-            f"Park wake on {registration.wake_source_kind} timed out at deadline"
-        )[:500]
         ctx = dict(task.context or {})
         ctx["failure_category"] = "park_wake_timeout"
         ctx["failure_class"] = "park_wake_timeout"
+        if failure_detail is not None:
+            ctx["failure_detail"] = failure_detail
+            ctx["park_wake_timeout_diagnostics"] = diagnostics
         task.context = ctx
+        registration.result_detail = task.latest_status_message
         with contextlib.suppress(Exception):
             from app.jwt_revocation import emit_task_terminated_notify
 

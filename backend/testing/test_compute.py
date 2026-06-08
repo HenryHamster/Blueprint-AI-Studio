@@ -5373,9 +5373,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
 
 
 @pytest.mark.asyncio
-async def test_sweep_expire_wake_fails_task_on_deadline_timeout(db_session):
+async def test_park_wake_timeout_disambiguates_compute_job_state(db_session):
     """Safety net: a PENDING registration whose deadline_at has passed causes the
-    PARKED task to go FAILED with failure_class/failure_category 'park_wake_timeout'.
+    PARKED task to go FAILED with failure_class/failure_category 'park_wake_timeout',
+    and the diagnostic payload distinguishes why the wake expired.
 
     Also verifies idempotency: a second sweep pass on a non-PENDING registration
     is a strict no-op (registration not re-expired, task status unchanged).
@@ -5448,6 +5449,21 @@ async def test_sweep_expire_wake_fails_task_on_deadline_timeout(db_session):
     assert (task.context or {}).get("failure_class") == "park_wake_timeout", (
         f"expected failure_class='park_wake_timeout', got {task.context!r}"
     )
+    assert (
+        task.context or {}
+    ).get("failure_detail") == "compute_job_terminal_job_not_terminal_by_deadline"
+    diagnostics = (task.context or {}).get("park_wake_timeout_diagnostics") or {}
+    assert diagnostics["job_terminal_by_deadline"] is False
+    assert diagnostics["job_status"] == ComputeJobStatus.QUEUED.value
+    assert diagnostics["job_completed_at"] is None
+    assert diagnostics["deadline_at"] == past_deadline.isoformat()
+    assert diagnostics["requested_at"] == reg.requested_at.isoformat()
+    assert diagnostics["claimed_at"] is None
+    assert diagnostics["fired_at"] is None
+    assert "expired before the job reached terminal state" in (
+        task.latest_status_message or ""
+    )
+    assert reg.result_detail == task.latest_status_message
     assert reg.delivery_state == WakeDeliveryState.EXPIRED
     assert reg.result_state == "expired"
 
@@ -5460,6 +5476,104 @@ async def test_sweep_expire_wake_fails_task_on_deadline_timeout(db_session):
     reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
     assert task.status == TaskStatus.FAILED
     assert reg.delivery_state == WakeDeliveryState.EXPIRED
+
+
+@pytest.mark.asyncio
+async def test_park_wake_timeout_when_job_finished_but_wake_never_fired(db_session):
+    """A terminal compute job that completed before the park deadline but never
+    fired its wake should expire with the alternate diagnostic branch.
+    """
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import park_task
+    from app.time_utils import _utcnow
+
+    project = Project(name="Expire Wake Terminal Job", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="expire-wake terminal job task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 60",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Park while job is still QUEUED so _maybe_fire_terminal_compute_wake leaves
+    # the registration PENDING — simulating the window before the monitor fires.
+    now = _utcnow()
+    future_deadline = now + timedelta(hours=1)
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=future_deadline,
+        reason="parked on job",
+    )
+    await db_session.commit()
+
+    # Simulate the lost-wake race: job completed before the (now-backdated) deadline,
+    # but the fire was never delivered. Backdate both the job completion and the
+    # registration deadline so the sweep sees an expired-but-terminal scenario.
+    completed_at = now - timedelta(minutes=10)
+    past_deadline = now - timedelta(minutes=5)
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.terminal_reason = "completed successfully"
+    job.completed_at = completed_at
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    # Backdate the deadline so Pass 2 (expire) triggers on this registration.
+    reg.deadline_at = past_deadline
+    await db_session.commit()
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.PARKED
+    assert reg.delivery_state == WakeDeliveryState.PENDING
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 0
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == "park_wake_timeout"
+    assert (task.context or {}).get("failure_class") == "park_wake_timeout"
+    assert (
+        task.context or {}
+    ).get("failure_detail") == "compute_job_terminal_wake_lost_after_job_completed"
+    diagnostics = (task.context or {}).get("park_wake_timeout_diagnostics") or {}
+    assert diagnostics["job_terminal_by_deadline"] is True
+    assert diagnostics["job_status"] == ComputeJobStatus.SUCCEEDED.value
+    assert diagnostics["job_completed_at"] == completed_at.isoformat()
+    assert diagnostics["deadline_at"] == past_deadline.isoformat()
+    assert diagnostics["requested_at"] == reg.requested_at.isoformat()
+    assert diagnostics["claimed_at"] is None
+    assert diagnostics["fired_at"] is None
+    assert "wake never fired before the deadline" in (task.latest_status_message or "")
+    assert reg.result_detail == task.latest_status_message
+    assert reg.delivery_state == WakeDeliveryState.EXPIRED
+    assert reg.result_state == "expired"
 
 
 @pytest.mark.asyncio
