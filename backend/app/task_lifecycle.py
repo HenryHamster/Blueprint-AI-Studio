@@ -4990,6 +4990,71 @@ _PARKABLE_STATUSES = frozenset(
 _PARK_STRAND_SECONDS = 6 * 60 * 60
 
 
+async def _maybe_fire_terminal_compute_wake(
+    session,
+    registration: TaskWakeRegistration,
+    *,
+    now,
+) -> None:
+    """Close the terminal-before-park lost-wakeup race for compute-job wakes.
+
+    Register-then-recheck: after the PENDING ``compute_job_terminal`` registration
+    exists, acquire the SAME compute-job row lock the monitor takes on its
+    terminal-fire path (``compute_jobs.process_compute_jobs_once`` →
+    ``_lock_compute_job``) and check whether the job is ALREADY terminal. If it is,
+    fire the just-created registration immediately (PENDING → FIRED) so the leader
+    sweep finalizes it identically to a normally-fired wake.
+
+    Why this is race-free in BOTH orderings:
+
+    * terminal-before-park — the monitor finalized + fired under the row lock while
+      no registration existed (it fired nothing and will never revisit the terminal
+      job). This recheck runs AFTER the lock is free, sees the terminal job, and
+      fires the registration the monitor missed.
+    * park-before-terminal — the recheck sees a non-terminal job and leaves the
+      registration PENDING; the monitor later finalizes and fires it. If the two
+      race, the row lock serializes them: whichever writer holds the lock completes
+      before the other observes the job, so exactly one of them fires the row.
+
+    Idempotent: only a PENDING registration is fired (PENDING → FIRED); an
+    already-FIRED/DELIVERED registration is left untouched, so a delayed or retried
+    park can never double-fire.
+    """
+    from app.compute_jobs import (
+        COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        _COMPUTE_JOB_TERMINAL_STATUSES,
+        _lock_compute_job,
+    )
+
+    if registration.wake_source_kind != COMPUTE_JOB_TERMINAL_WAKE_KIND:
+        return
+    if registration.delivery_state != WakeDeliveryState.PENDING:
+        return
+    if not registration.wake_source_ref:
+        return
+    try:
+        job_id = uuid.UUID(str(registration.wake_source_ref))
+    except (ValueError, TypeError):
+        return
+
+    # SELECT ... FOR UPDATE on the compute job row — the shared serialization
+    # point with the monitor's terminal-fire path. autoflush persists the new
+    # PENDING registration before this read, keeping it consistent in-session.
+    job = await _lock_compute_job(session, job_id)
+    if job is None:
+        return
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        registration.delivery_state = WakeDeliveryState.FIRED
+        registration.fired_at = now
+        session.add(registration)
+        logger.info(
+            "[PARK] compute job %s already terminal at park time; fired "
+            "registration %s (terminal-before-park catch-up)",
+            job_id,
+            registration.id,
+        )
+
+
 async def park_task(
     session,
     task: Task,
@@ -5049,6 +5114,11 @@ async def park_task(
             .first()
         )
         if existing_reg is not None:
+            # Delayed/retried park: re-run the terminal recheck so a job that went
+            # terminal AFTER the original park (but whose monitor fire found no
+            # registration, or whose registration is still PENDING) is caught here
+            # too. Idempotent — only fires a PENDING registration.
+            await _maybe_fire_terminal_compute_wake(session, existing_reg, now=now)
             return existing_reg
         # No live registration found (it was lost); fall through to create one.
     elif task.status not in _PARKABLE_STATUSES:
@@ -5090,6 +5160,11 @@ async def park_task(
     )
     session.add(task)
     session.add(reg)
+
+    # Register-then-recheck: now that the PENDING registration exists, close the
+    # terminal-before-park lost-wakeup race for the compute-job wake source. No-op
+    # for every other wake kind.
+    await _maybe_fire_terminal_compute_wake(session, reg, now=now)
     return reg
 
 
@@ -5145,7 +5220,15 @@ async def deliver_wake(
     returns ``False`` without touching the task. Returns ``True`` iff this call
     advanced the task.
 
-    The caller (the sweep, or a test) owns the ``session.commit()``.
+    The caller (the sweep, or a test) owns the ``session.commit()`` for EVERY
+    branch — RESUME, generic FINALIZE, and the compute-job FINALIZE branch. None
+    of them commit internally, so the FIRED→DELIVERED flip and the task advance
+    commit together atomically under the caller's single commit. The compute
+    branch finalizes through ``_handle_compute_experiment_completion`` with
+    ``owns_commit=False`` (pure mutation, no internal commit); its post-commit
+    side effects (operator broadcast + durable knowledge persistence) are run by
+    the sweep AFTER it commits, via
+    ``task_completion.run_compute_wake_post_commit``.
     """
     from app.time_utils import _utcnow
 
@@ -5188,7 +5271,10 @@ async def deliver_wake(
     # The FIRED→DELIVERED flip is recorded BEFORE the handler runs so it commits
     # atomically with the task finalization the handler performs — preserving
     # exactly-once delivery (a re-fired or re-claimed registration is no longer
-    # FIRED and returns False above).
+    # FIRED and returns False above). Critically the handler runs with
+    # ``owns_commit=False`` (pure mutation, no internal commit), so the caller's
+    # single commit covers BOTH the FIRED→DELIVERED flip and the task advance and
+    # a mid-batch commit can never release sibling delivery locks early.
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
 
     if (
@@ -5210,17 +5296,21 @@ async def deliver_wake(
         registration.claimed_at = registration.claimed_at or now
         registration.result_state = "finalized"
         session.add(registration)
-        # Clear the park markers before the completion handler commits so the
-        # finalized task carries no stale parked_at/park_reason (the completion
+        # Clear the park markers before the completion handler mutates the task so
+        # the finalized task carries no stale parked_at/park_reason (the completion
         # path only manages status, not the park bookkeeping).
         task.parked_at = None
         task.park_reason = None
         session.add(task)
         logs = build_compute_result_logs(job) if job is not None else "{}"
-        # _handle_compute_experiment_completion gates the artifact, sets the task
-        # to its honest terminal status (COMPLETED on pass, FAILED on a missed
-        # gate), stamps the job result reference, and COMMITS the session.
-        await _handle_compute_experiment_completion(task, logs, session)
+        # _handle_compute_experiment_completion gates the artifact and sets the
+        # task to its honest terminal status (COMPLETED on pass, FAILED on a missed
+        # gate) and stamps the job result reference. With owns_commit=False it does
+        # NOT commit, broadcast, or persist knowledge — the caller (sweep) commits,
+        # then runs run_compute_wake_post_commit for the broadcast + knowledge.
+        await _handle_compute_experiment_completion(
+            task, logs, session, owns_commit=False
+        )
         return True
 
     if action == WakeAction.FINALIZE:

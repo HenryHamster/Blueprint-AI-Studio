@@ -3126,7 +3126,7 @@ async def sweep_deliver_task_wakes(
     a sweep racing the external firing side) never double-process a registration:
 
     1. **Deliver** FIRED registrations — advance each PARKED task *exactly once*
-       via ``task_lifecycle.deliver_wake``.
+       via ``task_lifecycle.deliver_wake``, **one registration per transaction**.
     2. **Expire** PENDING registrations whose ``deadline_at`` passed before the
        source fired — age the task out (FAILED) rather than strand it.
     3. **Strand-guard** PARKED tasks older than the strand threshold that have no
@@ -3135,7 +3135,19 @@ async def sweep_deliver_task_wakes(
 
     Returns the number of tasks actually woken (pass 1 deliveries). Idempotent and
     safe to run every reaper cycle.
+
+    Pass 1 commits per-registration (not once per batch). ``deliver_wake`` is
+    caller-committed for EVERY branch — including the compute-job FINALIZE branch,
+    which used to commit internally — so the FIRED→DELIVERED flip and the task
+    advance commit together atomically, exactly once. Per-registration commits
+    guarantee that (a) one registration's failure can never roll back
+    already-delivered siblings, and (b) committing one delivery never releases the
+    ``FOR UPDATE`` lock of a registration not yet processed, because each delivery
+    is the only row locked in its own transaction. Compute finalizations also
+    commit internal KnowledgeDocument rows; their post-commit broadcast + knowledge
+    persistence run via ``run_compute_wake_post_commit`` AFTER the delivery commit.
     """
+    from app.task_completion import run_compute_wake_post_commit
     from app.task_lifecycle import (
         _PARK_STRAND_SECONDS,
         deliver_wake,
@@ -3145,24 +3157,62 @@ async def sweep_deliver_task_wakes(
     delivered = 0
     touched = False
 
-    # Pass 1: deliver fired registrations.
-    fired = (
-        (
-            await session.execute(
-                select(TaskWakeRegistration)
-                .where(TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED)
-                .order_by(TaskWakeRegistration.fired_at.asc().nullsfirst())
-                .limit(batch_size)
-                .with_for_update(skip_locked=True)
+    # Pass 1: deliver fired registrations, one registration per transaction. Each
+    # FIRED row is claimed (FOR UPDATE SKIP LOCKED, LIMIT 1), delivered, and
+    # committed in isolation so a commit never frees a sibling's lock and a single
+    # failure never rolls back already-delivered siblings.
+    for _ in range(batch_size):
+        reg = (
+            (
+                await session.execute(
+                    select(TaskWakeRegistration)
+                    .where(
+                        TaskWakeRegistration.delivery_state
+                        == WakeDeliveryState.FIRED
+                    )
+                    .order_by(TaskWakeRegistration.fired_at.asc().nullsfirst())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .all()
-    )
-    for reg in fired:
-        touched = True
-        if await deliver_wake(session, reg, now=now):
+        if reg is None:
+            break
+        reg_id = reg.id
+        try:
+            advanced = await deliver_wake(session, reg, now=now)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "[REAPER] Wake delivery failed for registration %s", reg_id
+            )
+            # A poison registration must not stall the whole pass (LIMIT-1 re-select
+            # would loop on it forever): re-fetch it fresh and mark it FAILED so the
+            # next iteration moves past it. Best-effort — never re-raises.
+            with contextlib.suppress(Exception):
+                poisoned = await session.get(TaskWakeRegistration, reg_id)
+                if (
+                    poisoned is not None
+                    and poisoned.delivery_state == WakeDeliveryState.FIRED
+                ):
+                    poisoned.delivery_state = WakeDeliveryState.FAILED
+                    poisoned.result_state = "delivery_error"
+                    poisoned.delivered_at = now
+                    session.add(poisoned)
+                    await session.commit()
+                else:
+                    await session.rollback()
+            continue
+        if advanced:
             delivered += 1
+            # Post-commit, best-effort: operator broadcast + durable knowledge for
+            # a wake-finalized compute experiment. Deferred until AFTER the delivery
+            # commit so the KnowledgeDocument's own internal commit cannot release
+            # the delivery row lock mid-pass. No-op for non-compute wake kinds.
+            await run_compute_wake_post_commit(session, reg)
 
     # Pass 2: expire due, never-fired registrations.
     due = (

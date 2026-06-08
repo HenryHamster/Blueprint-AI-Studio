@@ -3574,6 +3574,279 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     assert reg.attempt_count == 1
 
 
+@pytest.mark.asyncio
+async def test_compute_job_terminal_before_park_still_finalizes_once(
+    db_session, monkeypatch
+):
+    """Regression: a compute job that reaches terminal BEFORE the task parks must
+    still wake and finalize the task EXACTLY ONCE — never a ``park_wake_timeout``.
+
+    Forces the terminal-before-park ordering deterministically:
+      1. The monitor drives the job to terminal SUCCESS and fires the wake while
+         NO park registration exists yet (``fire_task_wakes`` finds nothing).
+      2. The task parks on the ALREADY-TERMINAL job. ``park_task``'s
+         register-then-recheck (``_maybe_fire_terminal_compute_wake``) takes the
+         shared compute-job row lock, sees the terminal job, and fires the
+         just-created registration (PENDING -> FIRED) so the leader sweep can
+         finalize it identically to a normally-fired wake.
+      3. The delivery sweep finalizes the parked task COMPLETED with the job's
+         honest outcome + cost — exactly once, not FAILED, not stranded.
+
+    Without the fix the registration would stay PENDING forever (the monitor
+    skips the already-terminal job), EXPIRE at the park deadline, and FAIL the
+    task with a misleading ``park_wake_timeout`` even though the job SUCCEEDED.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import park_task
+    from app.time_utils import _utcnow
+
+    project = Project(name="Compute Terminal Before Park", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: terminal before park",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    started_at = datetime.utcnow() - timedelta(seconds=30)
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "terminal-before-park-1"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="terminal-before-park-1",
+                started_at=started_at,
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.21, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=datetime.utcnow(),
+                message="completed",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # --- Drive the job to terminal with NO park registration present. --------
+    # Tick 1 launches (QUEUED->RUNNING), tick 2 observes terminal + fires the
+    # wake — but no registration exists, so fire_task_wakes flips nothing.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # The monitor fired nothing — no registration existed when the job finalized.
+    pre_regs = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert pre_regs == [], "no registration should exist before the task parks"
+
+    # --- NOW park on the already-terminal job (the lost-wakeup window). -------
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job.id}",
+    )
+    await db_session.commit()
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+    # The register-then-recheck caught the already-terminal job and fired the
+    # registration immediately — it must NOT be left PENDING to time out.
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert reg.delivery_state == WakeDeliveryState.FIRED, (
+        "park-time terminal recheck must fire the registration for an "
+        "already-terminal job"
+    )
+    assert reg.fired_at is not None
+
+    # --- The leader sweep finalizes the parked task exactly once. ------------
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.COMPLETED
+    assert task.parked_at is None
+    # Honest terminal outcome + cost carried through the real completion path —
+    # never a park_wake_timeout.
+    assert (task.context or {}).get("failure_category") != "park_wake_timeout"
+    compute_result = (task.plan_output or {}).get("compute_result")
+    assert compute_result is not None
+    assert compute_result["outcome"] == "SUCCESS"
+    assert compute_result["final_cost_usd"] == pytest.approx(0.21)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.result_state == "finalized"
+    assert reg.attempt_count == 1
+
+    # --- Idempotency: a second sweep is a strict no-op. ----------------------
+    first_delivered_at = reg.delivered_at
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.COMPLETED
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at  # unchanged — delivered once
+    assert reg.attempt_count == 1  # FIRED filter never re-selected it
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_delivery_commit_is_durable_and_single(
+    db_session, monkeypatch
+):
+    """BUG 2: the compute FINALIZE wake delivery commits ONCE, durably, and is a
+    strict no-op on re-delivery.
+
+    ``deliver_wake`` is now caller-committed for the compute branch too: the
+    FIRED->DELIVERED flip and the task advance commit together under the sweep's
+    single per-registration commit. This asserts the state change is DURABLE
+    (visible from a fresh session) and that a repeated sweep neither re-advances
+    the task nor re-increments ``attempt_count`` (the FIRED filter never
+    re-selects a DELIVERED row).
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import fire_task_wakes, park_task
+    from app.time_utils import _utcnow
+
+    project = Project(name="Compute Wake Commit Contract", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: commit contract",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Park BEFORE terminal (the normal ordering): the job is still QUEUED, so the
+    # park-time recheck leaves the registration PENDING.
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job.id}",
+    )
+    await db_session.commit()
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task.status == TaskStatus.PARKED
+    assert reg.delivery_state == WakeDeliveryState.PENDING
+
+    # Finalize the job and fire the wake (the firing side the monitor performs).
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.final_cost_usd = 0.34
+    job.accrued_cost_usd = 0.34
+    db_session.add(job)
+    await fire_task_wakes(
+        db_session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+    )
+    await db_session.commit()
+
+    # Deliver via the sweep (single per-registration commit owns the advance).
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    # Durability: the COMPLETED status + DELIVERED registration are visible from
+    # a brand-new session — the advance was actually committed, not just buffered.
+    fresh_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    async with fresh_factory() as fresh:
+        fresh_task = await fresh.get(Task, task.id)
+        fresh_reg = (
+            (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
+        )
+        assert fresh_task.status == TaskStatus.COMPLETED
+        assert fresh_reg.delivery_state == WakeDeliveryState.DELIVERED
+        assert fresh_reg.attempt_count == 1
+        durable_delivered_at = fresh_reg.delivered_at
+        assert durable_delivered_at is not None
+
+    # Re-delivery is a strict no-op: no second advance, delivered_at unchanged,
+    # attempt_count not re-incremented (the DELIVERED row is never re-selected).
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
+    async with fresh_factory() as fresh:
+        fresh_reg = (
+            (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
+        )
+        assert fresh_reg.delivery_state == WakeDeliveryState.DELIVERED
+        assert fresh_reg.delivered_at == durable_delivered_at
+        assert fresh_reg.attempt_count == 1
+
+
 def test_build_compute_result_logs_shape_metrics_and_disposition():
     """The backend COMPUTE_RESULT builder mirrors the agent artifact contract.
 

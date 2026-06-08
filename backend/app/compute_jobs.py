@@ -531,7 +531,15 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
 
     for job in jobs:
         async with session_factory() as session:
-            live = await session.get(ComputeJob, job.id)
+            # Acquire the compute-job ROW lock (SELECT ... FOR UPDATE) for the
+            # whole finalize-and-fire critical section. This is the shared
+            # serialization point with the park registration's terminal recheck
+            # (task_lifecycle._maybe_fire_terminal_compute_wake): the monitor's
+            # terminal-fire and a parking task strictly serialize on this row, so
+            # a job that goes terminal before its task parks cannot lose the wake
+            # (terminal-before-park), and the park-before-terminal ordering stays
+            # idempotent. The lock is held until this session commits/rolls back.
+            live = await _lock_compute_job(session, job.id)
             if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
                 continue
             try:
