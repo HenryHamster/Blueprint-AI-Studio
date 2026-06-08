@@ -5,8 +5,10 @@ import { ComputeJobsPanel } from './ComputeJobsPanel';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
+  computeJobRpcDiagnostic,
   fmtCountdown,
 } from './ComputeJobsPanel.utils';
+import type { ComputeRpcDiagnostic } from '../api';
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
@@ -47,7 +49,33 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
   };
 }
 
+function makeDiagnostic(overrides: Partial<ComputeRpcDiagnostic> = {}): ComputeRpcDiagnostic {
+  return {
+    operation: 'poll',
+    error_type: 'TimeoutError',
+    error_message: 'backend poll timed out after 30s',
+    started_at: new Date().toISOString(),
+    failed_at: new Date().toISOString(),
+    duration_ms: 30000,
+    attempt_count: 2,
+    job_status: 'RUNNING',
+    next_retry_at: new Date(Date.now() + 90_000).toISOString(),
+    retry_after_seconds: 90,
+    ...overrides,
+  };
+}
+
 describe('ComputeJobsPanel helpers', () => {
+  test('computeJobRpcDiagnostic reads field, falls back to polling_metadata, else null', () => {
+    const diag = makeDiagnostic();
+    expect(computeJobRpcDiagnostic(makeJob({ compute_rpc_diagnostic: diag }))).toEqual(diag);
+    expect(
+      computeJobRpcDiagnostic(makeJob({ polling_metadata: { compute_rpc_diagnostic: diag } })),
+    ).toEqual(diag);
+    expect(computeJobRpcDiagnostic(makeJob())).toBeNull();
+    expect(computeJobRpcDiagnostic(makeJob({ compute_rpc_diagnostic: null }))).toBeNull();
+  });
+
   test('isComputeJobActive covers pre-terminal statuses only', () => {
     for (const s of ['QUEUED', 'STARTING', 'RUNNING', 'POLLING'] as const) {
       expect(isComputeJobActive(makeJob({ status: s }))).toBe(true);
@@ -207,6 +235,83 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('live experiment');
     expect(await findByText((t) => t.includes('current_progress:'))).toBeTruthy();
     expect(await findByText((t) => t.includes('samples_collected:'))).toBeTruthy();
+  });
+
+  test('renders backend RPC diagnostic warning', async () => {
+    // Active RUNNING job with a diagnostic: warning shows operation, attempt,
+    // retry timing and error message, and the Kill control stays available.
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        compute_rpc_diagnostic: makeDiagnostic({
+          operation: 'terminate',
+          error_type: 'ConnectionError',
+          error_message: 'compute backend unreachable',
+          attempt_count: 3,
+          next_retry_at: null,
+          retry_after_seconds: 45,
+        }),
+      }),
+    ]);
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const warning = await findByTestId('compute-rpc-diagnostic');
+    expect(warning.textContent).toContain('terminate');
+    expect(warning.textContent).toContain('attempt 3');
+    expect(warning.textContent).toContain('retry after 45s');
+    expect(warning.textContent).toContain('compute backend unreachable');
+    // The warning does not replace the live controls.
+    expect(await findByText('Kill')).toBeTruthy();
+  });
+
+  test('terminal job with diagnostic shows warning distinct from terminal label and keeps result', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        final_cost_usd: 1.0,
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+        compute_rpc_diagnostic: makeDiagnostic({ operation: 'cost', job_status: 'FAILED' }),
+      }),
+    ]);
+    const { findByTestId, findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const warning = await findByTestId('compute-rpc-diagnostic');
+    expect(warning.textContent).toContain('cost');
+    // Terminal label still rendered, separate from the amber warning block.
+    await findByText('Failed');
+    expect(warning.textContent).not.toContain('Failed');
+    // Result link still present alongside the warning.
+    await findByRole('link', { name: /result\.json/i });
+  });
+
+  test('renders diagnostic from legacy polling_metadata fallback', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        polling_metadata: {
+          compute_rpc_diagnostic: makeDiagnostic({ operation: 'launch', error_message: 'quota exhausted' }),
+        },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const warning = await findByTestId('compute-rpc-diagnostic');
+    expect(warning.textContent).toContain('launch');
+    expect(warning.textContent).toContain('quota exhausted');
+  });
+
+  test('no diagnostic warning when the API omits the field', async () => {
+    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-rpc-diagnostic')).toBeNull();
+  });
+
+  test('kill failure surfaces the backend explanation, not a generic message', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    killComputeJob.mockRejectedValue(new Error('compute job already terminal: cannot kill'));
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const killBtn = await findByText('Kill');
+    await act(async () => { killBtn.click(); });
+    await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
+    await findByText('compute job already terminal: cannot kill');
   });
 
   test('renders nothing when there are no jobs', async () => {

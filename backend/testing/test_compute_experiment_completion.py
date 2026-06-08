@@ -1245,9 +1245,9 @@ async def test_compute_experiment_knowledge_falls_back_without_llm(
     doc = docs[0]
     assert doc.forward_quality_verdict["analysis_mode"] == "fallback"
     assert doc.forward_quality_verdict["outcome"] == "SUCCESS"
-    # Deterministic template: the only citation is the bare result_reference, and
-    # the body is the hardcoded verdict markdown.
-    assert doc.source_citations == [result_reference]
+    # Deterministic template: https:// result_reference is not a durable citation,
+    # so source_citations is empty. The body is the hardcoded verdict markdown.
+    assert doc.source_citations == []
     assert "Compute experiment verdict" in doc.body
 
 
@@ -1293,4 +1293,255 @@ async def test_compute_experiment_knowledge_falls_back_on_ungrounded_citation(
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"
-    assert docs[0].source_citations == [result_reference]
+    assert docs[0].source_citations == []
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_knowledge_requires_durable_citations(
+    db_session, _quiet_compute_io
+):
+    """Compute knowledge citations must be durable: transient https:// URLs are
+    excluded from source_citations; a gs:// result_reference backed by a real
+    Artifact row IS included.
+
+    Two cases exercised in one test (the acceptance-evidence gate for this PR):
+      1. https:// result_reference (signed URL) → source_citations == [] even when
+         the LLM path is disabled, because _is_durable_citation rejects http(s)://.
+      2. gs:// result_reference backed by a real Artifact → source_citations
+         contains the gs:// URI, confirming durable evidence is preserved.
+    """
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="DurableCitationTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _make_bare_task(name: str) -> Task:
+        return Task(
+            project_id=project.id,
+            title=f"compute_experiment: {name}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "compute_experiment", "experiment": name, "base_branch": "main"}],
+        )
+
+    # ── Case 1: https:// result_reference → no durable citation stored ───────
+    task_https = _make_bare_task("https-ref-experiment")
+    db_session.add(task_https)
+    await db_session.commit()
+    await db_session.refresh(task_https)
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc_https = await persist_compute_experiment_knowledge(
+            task_https,
+            outcome="SUCCESS",
+            cost=0.10,
+            criterion=None,
+            result_reference="https://signed.example.com/jobs/abc/result.json",
+            session=db_session,
+            logs=None,
+        )
+
+    assert doc_https is not None
+    assert doc_https.source_citations == [], (
+        "transient https:// result_reference must not be stored as a durable citation"
+    )
+
+    # ── Case 2: gs:// result_reference backed by real Artifact → citation kept ─
+    task_gs = _make_bare_task("gs-ref-experiment")
+    db_session.add(task_gs)
+    await db_session.commit()
+    await db_session.refresh(task_gs)
+
+    gs_uri = "gs://test-bucket/jobs/durable-job/result.json"
+    artifact = Artifact(
+        task_id=task_gs.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri=gs_uri,
+        logs=json.dumps({"artifact_uri": gs_uri, "file_count": 2}),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task_gs.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference=gs_uri,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps({"job_id": str(job.id), "outcome": "SUCCESS"})
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc_gs = await persist_compute_experiment_knowledge(
+            task_gs,
+            outcome="SUCCESS",
+            cost=0.15,
+            criterion=None,
+            result_reference=gs_uri,
+            session=db_session,
+            logs=logs_json,
+        )
+
+    assert doc_gs is not None
+    assert gs_uri in doc_gs.source_citations, (
+        "gs:// result_reference backed by a real Artifact must be preserved as "
+        "durable citation evidence"
+    )
+
+
+# ── Reentry upgrade: fallback → llm ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
+    db_session, mocker, _quiet_compute_io
+):
+    """A second persistence pass with a stronger LLM analysis upgrades the stored
+    fallback document in-place. Exactly ONE KnowledgeDocument row exists, its
+    content reflects the LLM analysis, and plan_output mirrors the upgraded values.
+
+    This is the acceptance-evidence test: production code in
+    _persist_compute_knowledge_document performs the upgrade (not a no-op).
+    """
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    # ── First pass: no ANTHROPIC_API_KEY → fallback document persisted ───────
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs_after_first = await _knowledge_docs_for(db_session, task)
+    assert len(docs_after_first) == 1
+    assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    fallback_body = docs_after_first[0].body
+    assert "Compute experiment verdict" in fallback_body
+
+    # ── Second pass: LLM available → document upgraded to llm in-place ───────
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, mock_create = _mock_anthropic_returning([artifact_uri, metric_ref])
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+
+    docs_after_second = await _knowledge_docs_for(db_session, task)
+    # Must be exactly ONE row — upgrade is in-place, not a new insert.
+    assert len(docs_after_second) == 1
+    doc = docs_after_second[0]
+
+    # Content reflects the LLM analysis, not the deterministic fallback.
+    verdict = doc.forward_quality_verdict
+    assert verdict["analysis_mode"] == "llm", (
+        "persisted doc must be upgraded from fallback to llm on reentry"
+    )
+    assert artifact_uri in doc.source_citations
+    assert metric_ref in doc.source_citations
+    assert "analysis" in doc.body.lower()
+    # The deterministic template body was replaced.
+    assert "Compute experiment verdict" not in doc.body
+
+    # plan_output mirrors the upgraded values.
+    assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
+    assert task.plan_output["knowledge_document"]["citation_count"] >= 2
+
+    # The LLM was actually invoked on the second pass.
+    mock_create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
+    db_session, mocker, _quiet_compute_io
+):
+    """A persistence pass with a weaker fallback does NOT overwrite an existing
+    stronger LLM document. The stored row keeps its llm values unchanged."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    # ── First pass: LLM available → llm document persisted ───────────────────
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs_after_first = await _knowledge_docs_for(db_session, task)
+    assert len(docs_after_first) == 1
+    assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "llm"
+    llm_body = docs_after_first[0].body
+
+    # ── Second pass: no API key → fallback path, must NOT downgrade ──────────
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs_after_second = await _knowledge_docs_for(db_session, task)
+    assert len(docs_after_second) == 1
+    doc = docs_after_second[0]
+
+    # The llm verdict and body must be preserved.
+    assert doc.forward_quality_verdict["analysis_mode"] == "llm", (
+        "llm document must not be downgraded to fallback on reentry"
+    )
+    assert doc.body == llm_body
+    assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_same_mode_retry_is_idempotent(
+    db_session, _quiet_compute_io
+):
+    """Two identical fallback persistence calls result in exactly ONE row with
+    no errors — idempotent retry is safe."""
+    task = await _make_compute_task(db_session)
+    logs = _result_artifact()
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"

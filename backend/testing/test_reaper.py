@@ -12086,6 +12086,95 @@ async def test_knowledge_completion_path_unblocks_waiter_end_to_end(
 
 
 @pytest.mark.asyncio
+async def test_knowledge_completion_unblocks_waiter_with_document_pointer(
+    reaper_db, mocker
+):
+    """A BLOCKED dependent task that lists the producer in its depends_on receives
+    a knowledge_prerequisites pointer AND transitions to QUEUED after
+    _deliver_knowledge_to_dependents fires.
+
+    This validates both halves of the fix:
+    1. The SQL filter Task.depends_on.contains([task_id_str]) correctly identifies
+       the BLOCKED waiter (not just QUEUED tasks).
+    2. event_driven_unblock_on_knowledge resumes the waiter with the pointer already
+       stamped so it launches with the produced knowledge.
+    """
+    from app.models import KnowledgeDocument
+    from app.knowledge_completion import (
+        _deliver_knowledge_to_dependents,
+        KNOWLEDGE_PREREQUISITES_KEY,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Producing task that just completed a web_research document.
+    producer = Task(
+        project_id=project.id,
+        title="producer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "deadbeef12345678"},
+        status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_kind="web_research",
+        title="pointer doc",
+        summary="pointer summary",
+        body="pointer body",
+        topic="pointer-topic",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    # BLOCKED waiter that explicitly depends on the producer and has a knowledge
+    # need satisfied by the producer's finding_hash.
+    waiter = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on knowledge from producer",
+        depends_on=[str(producer.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "deadbeef12345678",
+                "reason": "BLOCKER: waiting on knowledge from producer",
+                "need": {"kind": "task", "ref": "deadbeef12345678"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    await _deliver_knowledge_to_dependents(
+        producer, doc, {"title": "pointer doc", "summary": "pointer summary"}, reaper_db
+    )
+
+    await reaper_db.refresh(waiter)
+
+    # The pointer must be stamped on the waiter's context before resume.
+    prereqs = (waiter.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY, [])
+    assert any(
+        isinstance(p, dict) and p.get("doc_id") == str(doc.id) for p in prereqs
+    ), f"knowledge_prerequisites pointer missing; got {prereqs}"
+
+    # The event-driven unblock should have resumed the waiter.
+    assert waiter.status == TaskStatus.QUEUED
+    assert "blocker" not in (waiter.context or {})
+
+
+@pytest.mark.asyncio
 async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monkeypatch):
     """If the event-driven unblock raises, the knowledge-completion chokepoint
     swallows it — document delivery must never break the producing task."""

@@ -104,6 +104,36 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Kill RPC Failure")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job(db_session, project)
+    job.external_compute_id = "admin-kill-rpc-failure"
+    db_session.add(job)
+    await db_session.commit()
+
+    class FakeBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert reason == "operator"
+            raise RuntimeError("terminate backend unavailable")
+
+    with patch("app.compute_jobs.get_compute_backend", lambda _name: FakeBackend()):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["status"] == ComputeJobStatus.RUNNING.value
+    assert body["outcome"] is None
+    diagnostic = body["compute_rpc_diagnostic"]
+    assert diagnostic["operation"] == "terminate"
+    assert diagnostic["reason"] == "operator"
+    assert "terminate backend unavailable" in diagnostic["error_message"]
+    assert body["polling_metadata"]["compute_rpc_diagnostic"] == diagnostic
+
+
+@pytest.mark.asyncio
 async def test_kill_compute_job_viewer_forbidden(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Viewer Only")
     await _add_member(db_session, project.id, "viewer")

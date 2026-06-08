@@ -2007,6 +2007,23 @@ export async function fetchSrReviewerDisagreementTasks(
 
 // ── Compute jobs ────────────────────────────────────────────────────────────
 
+/** Bounded diagnostic recorded by the backend when a compute backend RPC
+ *  (launch / poll / cost / termination) fails in the monitor or kill path.
+ *  Mirrors `_build_compute_rpc_diagnostic` in backend/app/compute_jobs.py. */
+export interface ComputeRpcDiagnostic {
+  operation: string;
+  error_type: string;
+  error_message: string;
+  started_at: string | null;
+  failed_at: string | null;
+  duration_ms: number;
+  attempt_count: number;
+  job_status: string;
+  next_retry_at: string | null;
+  retry_after_seconds: number | null;
+  reason?: string | null;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -2030,6 +2047,9 @@ export interface ComputeJob {
   accelerator_type: string | null;
   accelerator_count: number | null;
   polling_metadata?: Record<string, unknown>;
+  // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
+  // (or once it resolves). Older responses may carry it under polling_metadata.
+  compute_rpc_diagnostic?: ComputeRpcDiagnostic | null;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;

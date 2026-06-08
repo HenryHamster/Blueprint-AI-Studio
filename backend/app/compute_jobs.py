@@ -68,6 +68,8 @@ MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
 COMPUTE_JOB_MONITOR_INTERVAL_SECONDS = float(
     os.getenv("COMPUTE_JOB_MONITOR_INTERVAL_SECONDS", "15")
 )
+_COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
+_COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
 _TASK_TERMINAL_STATUSES = {
     TaskStatus.COMPLETED,
@@ -415,7 +417,26 @@ async def kill_compute_job(
     backend = get_compute_backend(backend_name)
     terminated = True
     if external_compute_id:
-        terminated = await backend.terminate(job, reason="operator")
+        started_at = _utcnow()
+        try:
+            terminated = await backend.terminate(job, reason="operator")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] operator terminate failed for job=%s: %s",
+                job_id,
+                exc,
+            )
+            return await _persist_compute_rpc_failure(
+                session,
+                job_id=job_id,
+                operation="terminate",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="operator",
+            )
 
     by = f" ({killed_by})" if killed_by else ""
     return await _apply_operator_kill_result(
@@ -596,13 +617,34 @@ async def _process_single_compute_job(
         task is None or task.status in _TASK_TERMINAL_STATUSES
     ):
         terminated = True
+        terminate_diagnostic = None
         if job.external_compute_id:
-            terminated = await backend.terminate(job, reason="task_terminal")
+            started_at = _utcnow()
+            try:
+                terminated = await backend.terminate(job, reason="task_terminal")
+            except Exception as exc:
+                failed_at = _utcnow()
+                logger.exception(
+                    "[COMPUTE_JOB] task-terminal terminate failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+                terminated = False
+                terminate_diagnostic = _build_compute_rpc_diagnostic(
+                    job,
+                    operation="terminate",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="task_terminal",
+                )
         await _apply_task_terminal_cancellation(
             session_factory,
             job.id,
             now=now,
             terminate_ok=terminated,
+            compute_rpc_diagnostic=terminate_diagnostic,
         )
         return
 
@@ -612,7 +654,27 @@ async def _process_single_compute_job(
         )
         if reserved is None:
             return
-        result = await backend.launch(_build_launch_spec(reserved))
+        started_at = _utcnow()
+        try:
+            result = await backend.launch(_build_launch_spec(reserved))
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] launch failed for job=%s: %s",
+                job.id,
+                exc,
+            )
+            await _record_compute_rpc_failure(
+                session_factory,
+                job.id,
+                operation="launch",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=failed_at
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+            )
+            return
         await _apply_launch_result(
             session_factory,
             job.id,
@@ -624,13 +686,53 @@ async def _process_single_compute_job(
     # ── Running: poll STATUS first, then cost. A job that finished just before
     # this tick must be billed through finished_at, not through poll time, so
     # spend-cap decisions are never made from an inflated accrual. ──
-    status = await backend.poll_status(job)
+    started_at = _utcnow()
+    try:
+        status = await backend.poll_status(job)
+    except Exception as exc:
+        failed_at = _utcnow()
+        logger.exception(
+            "[COMPUTE_JOB] poll_status failed for job=%s: %s",
+            job.id,
+            exc,
+        )
+        await _record_compute_rpc_failure(
+            session_factory,
+            job.id,
+            operation="poll_status",
+            exc=exc,
+            started_at=started_at,
+            failed_at=failed_at,
+            next_retry_at=failed_at
+            + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+        )
+        return
     poll_attempt_count = (job.poll_attempt_count or 0) + 1
     next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
 
     if status.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         finished = status.finished_at or now
-        cost = await backend.poll_cost(job, as_of=finished)
+        started_at = _utcnow()
+        try:
+            cost = await backend.poll_cost(job, as_of=finished)
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] poll_cost failed for terminal job=%s: %s",
+                job.id,
+                exc,
+            )
+            await _record_compute_rpc_failure(
+                session_factory,
+                job.id,
+                operation="poll_cost",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=failed_at
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+            )
+            return
         accrued_cost_usd = max(
             float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
         )
@@ -657,11 +759,51 @@ async def _process_single_compute_job(
         return
 
     # Still running: accrue cost up to now, then enforce deadline/budget.
-    cost = await backend.poll_cost(job, as_of=now)
+    started_at = _utcnow()
+    try:
+        cost = await backend.poll_cost(job, as_of=now)
+    except Exception as exc:
+        failed_at = _utcnow()
+        logger.exception(
+            "[COMPUTE_JOB] poll_cost failed for running job=%s: %s",
+            job.id,
+            exc,
+        )
+        await _record_compute_rpc_failure(
+            session_factory,
+            job.id,
+            operation="poll_cost",
+            exc=exc,
+            started_at=started_at,
+            failed_at=failed_at,
+            next_retry_at=failed_at
+            + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+        )
+        return
     accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
 
     if job.wall_clock_deadline is not None and job.wall_clock_deadline <= now:
-        terminated = await backend.terminate(job, reason="deadline")
+        started_at = _utcnow()
+        terminate_diagnostic = None
+        try:
+            terminated = await backend.terminate(job, reason="deadline")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] deadline terminate failed for job=%s: %s",
+                job.id,
+                exc,
+            )
+            terminated = False
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="terminate",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="deadline",
+            )
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
@@ -674,11 +816,32 @@ async def _process_single_compute_job(
             outcome=ComputeJobOutcome.TIMED_OUT,
             terminal_reason="compute job terminated at deadline",
             terminate_ok=terminated,
+            compute_rpc_diagnostic=terminate_diagnostic,
         )
         return
 
     if job.spend_cap_usd is not None and accrued_cost_usd >= float(job.spend_cap_usd):
-        terminated = await backend.terminate(job, reason="budget")
+        started_at = _utcnow()
+        terminate_diagnostic = None
+        try:
+            terminated = await backend.terminate(job, reason="budget")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] budget terminate failed for job=%s: %s",
+                job.id,
+                exc,
+            )
+            terminated = False
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="terminate",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="budget",
+            )
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
@@ -691,6 +854,7 @@ async def _process_single_compute_job(
             outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
             terminal_reason="compute job terminated at spend cap",
             terminate_ok=terminated,
+            compute_rpc_diagnostic=terminate_diagnostic,
         )
         return
 
@@ -751,6 +915,7 @@ async def _apply_launch_result(
             extra["cost_rate_per_second"] = result.cost_rate_per_second
         extra["status_message"] = result.message or "compute job launched"
         _set_meta(live, **extra)
+        _clear_compute_rpc_diagnostic(live)
         await session.commit()
         return True
 
@@ -769,6 +934,7 @@ async def _apply_polled_compute_job_result(
     terminal_reason: str | None = None,
     exit_code: int | None = None,
     terminate_ok: bool = True,
+    compute_rpc_diagnostic: dict[str, Any] | None = None,
 ) -> bool:
     async with session_factory() as session:
         live = await _lock_compute_job(session, job_id)
@@ -786,6 +952,8 @@ async def _apply_polled_compute_job_result(
             _set_meta(live, result_metrics=dict(status.metrics))
         if status.command_log:
             _set_meta(live, command_log=dict(status.command_log))
+        if compute_rpc_diagnostic is None:
+            _clear_compute_rpc_diagnostic(live)
         if terminal_status is not None and outcome is not None:
             _finalize_terminal_job(
                 live,
@@ -796,6 +964,8 @@ async def _apply_polled_compute_job_result(
                 exit_code=exit_code,
                 terminate_ok=terminate_ok,
             )
+            if compute_rpc_diagnostic is not None:
+                _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
             await _link_terminal_artifact(session, live)
             if live.task_id is not None:
                 from app.task_lifecycle import fire_task_wakes
@@ -819,6 +989,7 @@ async def _apply_task_terminal_cancellation(
     *,
     now,
     terminate_ok: bool,
+    compute_rpc_diagnostic: dict[str, Any] | None = None,
 ) -> bool:
     async with session_factory() as session:
         live = await _lock_compute_job(session, job_id)
@@ -837,6 +1008,10 @@ async def _apply_task_terminal_cancellation(
             now=now,
             terminate_ok=terminate_ok,
         )
+        if compute_rpc_diagnostic is not None:
+            _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
+        else:
+            _clear_compute_rpc_diagnostic(live)
         await _link_terminal_artifact(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes
@@ -879,6 +1054,123 @@ def _set_meta(
         meta["status_message"] = status_message
     meta.update(extra)
     job.polling_metadata = meta
+
+
+def _clear_compute_rpc_diagnostic(job: ComputeJob) -> None:
+    meta = dict(job.polling_metadata or {})
+    if _COMPUTE_RPC_DIAGNOSTIC_KEY not in meta:
+        return
+    meta.pop(_COMPUTE_RPC_DIAGNOSTIC_KEY, None)
+    job.polling_metadata = meta
+
+
+def _bounded_rpc_string(value: Any, *, limit: int = _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated]"
+
+
+def _rpc_timestamp(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _build_compute_rpc_diagnostic(
+    job: ComputeJob,
+    *,
+    operation: str,
+    exc: Exception,
+    started_at: datetime,
+    failed_at: datetime,
+    next_retry_at: datetime | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    meta = job.polling_metadata or {}
+    previous = meta.get(_COMPUTE_RPC_DIAGNOSTIC_KEY)
+    prior_attempts = 0
+    if isinstance(previous, dict) and previous.get("operation") == operation:
+        try:
+            prior_attempts = int(previous.get("attempt_count") or 0)
+        except (TypeError, ValueError):
+            prior_attempts = 0
+    retry_after_seconds = None
+    if next_retry_at is not None:
+        retry_after_seconds = max(0.0, (next_retry_at - failed_at).total_seconds())
+    diagnostic: dict[str, Any] = {
+        "operation": _bounded_rpc_string(operation, limit=64),
+        "error_type": _bounded_rpc_string(type(exc).__name__, limit=200),
+        "error_message": _bounded_rpc_string(exc),
+        "started_at": _rpc_timestamp(started_at),
+        "failed_at": _rpc_timestamp(failed_at),
+        "duration_ms": max(
+            0,
+            int((failed_at - started_at).total_seconds() * 1000),
+        ),
+        "attempt_count": prior_attempts + 1,
+        "job_status": getattr(job.status, "value", job.status),
+        "next_retry_at": _rpc_timestamp(next_retry_at),
+        "retry_after_seconds": retry_after_seconds,
+    }
+    if reason is not None:
+        diagnostic["reason"] = _bounded_rpc_string(reason, limit=200)
+    return diagnostic
+
+
+async def _persist_compute_rpc_failure(
+    session,
+    *,
+    job_id: uuid.UUID,
+    operation: str,
+    exc: Exception,
+    started_at: datetime,
+    failed_at: datetime,
+    next_retry_at: datetime | None,
+    reason: str | None = None,
+) -> ComputeJob | None:
+    live = await _lock_compute_job(session, job_id)
+    if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        return None
+    diagnostic = _build_compute_rpc_diagnostic(
+        live,
+        operation=operation,
+        exc=exc,
+        started_at=started_at,
+        failed_at=failed_at,
+        next_retry_at=next_retry_at,
+        reason=reason,
+    )
+    _set_meta(live, compute_rpc_diagnostic=diagnostic)
+    live.last_polled_at = failed_at
+    live.next_poll_at = next_retry_at
+    live.updated_at = failed_at
+    session.add(live)
+    await session.commit()
+    await session.refresh(live)
+    return live
+
+
+async def _record_compute_rpc_failure(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    operation: str,
+    exc: Exception,
+    started_at: datetime,
+    failed_at: datetime,
+    next_retry_at: datetime | None,
+    reason: str | None = None,
+) -> ComputeJob | None:
+    async with session_factory() as session:
+        return await _persist_compute_rpc_failure(
+            session,
+            job_id=job_id,
+            operation=operation,
+            exc=exc,
+            started_at=started_at,
+            failed_at=failed_at,
+            next_retry_at=next_retry_at,
+            reason=reason,
+        )
 
 
 def _finalize_terminal_job(

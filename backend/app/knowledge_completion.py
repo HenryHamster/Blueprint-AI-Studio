@@ -142,6 +142,29 @@ def _is_usable_citation(value: Any) -> bool:
     return "/" in text
 
 
+def _is_durable_citation(value: Any) -> bool:
+    """True only for citations that are durably resolvable storage URIs or file refs.
+
+    Rejects bare ``http://``/``https://`` URLs — signed download URLs and bare
+    result URLs are transient; they cannot serve as durable acceptance evidence.
+    Accepts cloud-storage URIs (``gs://``, ``s3://``, ``az://``), ``file:`` URIs,
+    and path-like references (containing ``/``). Metric fragment references of
+    the form ``gs://...#metric:name=value`` are accepted because they are
+    anchored to a durable storage URI. Empty / non-string inputs are rejected.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in text
+
+
 def _usable_citations(obj: dict[str, Any]) -> list[str]:
     """Return the stripped, usable citation strings from a parsed document."""
     raw = obj.get("citations") or obj.get("source_citations") or []
@@ -548,7 +571,9 @@ async def _deliver_knowledge_to_dependents(
                 await session.execute(
                     select(Task)
                     .where(
-                        Task.status == TaskStatus.QUEUED,
+                        Task.status.in_(
+                            [TaskStatus.QUEUED, TaskStatus.BLOCKED]
+                        ),
                         Task.project_id == task.project_id,
                         Task.depends_on.isnot(None),
                     )
@@ -1027,7 +1052,7 @@ def _build_compute_experiment_document(
 
     citations = (
         [result_reference]
-        if result_reference and _is_usable_citation(result_reference)
+        if result_reference and _is_durable_citation(result_reference)
         else []
     )
 
@@ -1191,7 +1216,11 @@ async def _gather_compute_evidence(
 
     # Candidate citations the analysis is allowed to cite. Membership is enforced
     # after the LLM responds so the document can only cite real, durable evidence.
+    # real_evidence: durable storage URIs / metric refs the LLM MUST cite at least
+    # one of to pass the gate. supplementary: transient helpers (e.g. signed URLs)
+    # included in the prompt for LLM convenience but excluded from the gate check.
     real_evidence: list[str] = []
+    supplementary: list[str] = []
     seen: set[str] = set()
 
     def _add_real(value: str | None) -> None:
@@ -1199,17 +1228,23 @@ async def _gather_compute_evidence(
             seen.add(value)
             real_evidence.append(value)
 
+    def _add_supplementary(value: str | None) -> None:
+        if value and _is_usable_citation(value) and value not in seen:
+            seen.add(value)
+            supplementary.append(value)
+
     _add_real(artifact_uri)
     if storage_uri and storage_uri != artifact_uri:
         _add_real(storage_uri)
 
-    # Best-effort signed download URL for the artifact bundle — a directly usable
-    # http(s) pointer. Never blocks: any storage/credential error is swallowed.
+    # Signed download URLs are transient (they expire); include them in the LLM
+    # prompt as supplementary context but NOT in real_evidence so a signed URL
+    # alone cannot satisfy the durable-artifact citation gate.
     try:
         from app import storage as _storage
 
         signed = await _storage.generate_download_signed_url(artifact_uri)
-        _add_real(signed)
+        _add_supplementary(signed)
     except Exception:  # noqa: BLE001, S110 — signing is optional, nothing to log
         pass
 
@@ -1226,7 +1261,7 @@ async def _gather_compute_evidence(
     if not real_evidence:
         return None
 
-    citations = list(real_evidence)
+    citations = list(real_evidence) + supplementary
     if result_reference and _is_usable_citation(result_reference) and result_reference not in seen:
         citations.append(result_reference)
 
@@ -1468,6 +1503,23 @@ async def _analyze_compute_experiment_with_llm(
     }
 
 
+_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "llm": 1}
+
+
+def _incoming_mode_is_upgrade(existing_doc: KnowledgeDocument, incoming_mode: str) -> bool:
+    """True when ``incoming_mode`` is strictly stronger than the existing doc's mode.
+
+    Reads ``analysis_mode`` from the existing doc's ``forward_quality_verdict``
+    JSON, defaulting to ``"fallback"`` if absent. A strictly higher
+    ``_ANALYSIS_STRENGTH`` value is an upgrade; equal or lower is not.
+    """
+    existing_verdict = existing_doc.forward_quality_verdict or {}
+    existing_mode = str(existing_verdict.get("analysis_mode") or "fallback")
+    return _ANALYSIS_STRENGTH.get(incoming_mode, 0) > _ANALYSIS_STRENGTH.get(
+        existing_mode, 0
+    )
+
+
 async def _persist_compute_knowledge_document(
     task: Task,
     document: dict[str, Any],
@@ -1481,6 +1533,12 @@ async def _persist_compute_knowledge_document(
     on the verdict and the mirrored plan_output so consumers can tell which path
     produced the document. NEVER mutates ``task.status``,
     ``latest_status_message``, or ``plan_output['compute_result']``.
+
+    Idempotent on same-strength retries: a second call with the same (or weaker)
+    mode returns the existing row unchanged. An incoming ``mode`` that is strictly
+    STRONGER (e.g. ``"llm"`` over an existing ``"fallback"``) upgrades the stored
+    document's content and verdict in-place so the best available analysis always
+    wins, while a downgrade (``"fallback"`` over ``"llm"``) is a no-op.
     """
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
@@ -1540,21 +1598,38 @@ async def _persist_compute_knowledge_document(
         session.add(doc)
     else:
         doc = existing
+        if _incoming_mode_is_upgrade(existing, mode):
+            # Upgrade the stored document to the stronger analysis in-place.
+            # Never downgrades (fallback over llm is a no-op above).
+            doc.title = title
+            doc.summary = summary
+            doc.body = document["body"]
+            doc.topic = topic
+            doc.tags = tags
+            doc.source_citations = citations
+            doc.forward_quality_verdict = verdict_record
+            flag_modified(doc, "tags")
+            flag_modified(doc, "source_citations")
+            flag_modified(doc, "forward_quality_verdict")
+            session.add(doc)
 
     # Mirror a compact copy into plan_output for admin visibility WITHOUT
     # touching the compute_result the compute handler already wrote there.
+    # Always reflect the stored doc's actual (post-upgrade) values so the
+    # mirror is consistent with what was written to the database.
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
+    stored_verdict = doc.forward_quality_verdict or verdict_record
     plan_output["knowledge_document"] = {
         "id": str(doc.id),
-        "title": title,
-        "summary": summary,
-        "topic": topic,
-        "tags": tags,
+        "title": doc.title or title,
+        "summary": doc.summary or summary,
+        "topic": doc.topic if doc.topic is not None else topic,
+        "tags": doc.tags if doc.tags is not None else tags,
         "direction_id": direction_id,
-        "citation_count": len(citations),
+        "citation_count": len(doc.source_citations or citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
-        "analysis_mode": verdict_record.get("analysis_mode", mode),
+        "analysis_mode": stored_verdict.get("analysis_mode", mode),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -1666,6 +1741,13 @@ async def persist_compute_experiment_knowledge(
             )
             document = dict(document)
             document["_citation_grounding"] = grounding_stamp
+            # Strip citations that have no backing Artifact row: a storage URI with
+            # no resolved artifact is not durable evidence. When grounded == 0 the
+            # fallback citations are cleared so the document is not treated as
+            # acceptance-grade cited evidence. (_is_durable_citation already
+            # excluded transient http(s):// URLs; this removes unresolved gs:// etc.)
+            if grounding_stamp.get("grounded", 0) == 0 and document.get("citations"):
+                document["citations"] = []
         except Exception:  # noqa: BLE001 — grounding stamp must never break completion
             logger.warning(
                 "[COMPUTE] citation grounding stamp failed for task %s; "

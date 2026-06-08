@@ -3255,6 +3255,7 @@ async def sweep_deliver_task_wakes(
     from sqlalchemy import func
 
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.database import resolve_dialect_name
     from app.failure_classification import PARK_WAKE_STRANDED
     from app.task_completion import (
         _COMPUTE_WAKE_POST_COMMIT_META_KEY,
@@ -3276,16 +3277,25 @@ async def sweep_deliver_task_wakes(
     # post-commit marker before processing any new FIRED rows. This keeps the
     # wake side effects recoverable even after the delivery row itself has been
     # committed as DELIVERED.
+    #
+    # ``has_key`` uses the JSONB ``?`` operator (PostgreSQL only). On SQLite
+    # (standalone tests) the predicate is omitted; the Python loop guards below
+    # still filter correctly in that case.
+    _retry_where = [
+        TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
+        TaskWakeRegistration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND,
+    ]
+    if resolve_dialect_name(session) != "sqlite":
+        _retry_where.append(
+            TaskWakeRegistration.source_metadata.has_key(
+                _COMPUTE_WAKE_POST_COMMIT_META_KEY
+            )
+        )
     retry_rows = (
         (
             await session.execute(
                 select(TaskWakeRegistration)
-                .where(
-                    TaskWakeRegistration.delivery_state
-                    == WakeDeliveryState.DELIVERED,
-                    TaskWakeRegistration.wake_source_kind
-                    == COMPUTE_JOB_TERMINAL_WAKE_KIND,
-                )
+                .where(*_retry_where)
                 .order_by(TaskWakeRegistration.delivered_at.asc().nullsfirst())
                 .limit(batch_size)
                 .with_for_update(skip_locked=True)

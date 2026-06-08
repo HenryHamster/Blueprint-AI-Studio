@@ -667,9 +667,9 @@ async def test_compute_experiment_persist_sets_source_kind(
     assert doc is not None
     assert doc.source_kind == "compute_experiment"
     assert doc.direction_id == "d-xyz"
-    assert doc.source_citations == [
-        "https://storage.example.com/jobs/abc/result.json"
-    ]
+    # https:// result_reference is not a durable citation (_is_durable_citation
+    # rejects transient http(s):// URLs from the fallback document).
+    assert doc.source_citations == []
     assert "accuracy" in doc.body
 
 
@@ -742,6 +742,9 @@ async def test_compute_knowledge_unresolved_citation_is_flagged_ungrounded(
     assert grounding["file_citations"] == 1
     assert grounding["grounded"] == 0
     assert "gs://bucket/jobs/no-artifact/result.json" in grounding["unresolved"]
+    # An unresolved gs:// citation has no artifact backing — it is stripped from
+    # source_citations so the document is not treated as acceptance-grade evidence.
+    assert doc.source_citations == []
 
 
 @pytest.mark.asyncio
@@ -801,6 +804,8 @@ async def test_compute_fallback_stamps_grounding_when_artifact_resolves(
     assert grounding["file_citations"] == 1
     assert grounding["grounded"] == 1
     assert grounding["unresolved"] == []
+    # A resolved gs:// citation IS kept — durable evidence with artifact backing.
+    assert "gs://bucket/jobs/real-job/result.json" in doc.source_citations
 
 
 @pytest.mark.asyncio
