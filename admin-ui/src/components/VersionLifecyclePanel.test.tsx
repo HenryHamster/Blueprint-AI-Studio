@@ -4,6 +4,12 @@ import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import * as api from '../api';
 import type { VersionLifecycleResponse } from '../api';
 
+vi.mock('../firebase', () => ({
+  auth: { currentUser: null, onAuthStateChanged: () => () => {} },
+  signInWithGoogle: vi.fn(),
+  signOut: vi.fn(),
+  getIdToken: vi.fn().mockResolvedValue('test-token'),
+}));
 vi.mock('../api');
 
 // Mock window.confirm for cut version tests
@@ -23,6 +29,7 @@ function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.Cu
     merged_task_count: 0,
     qualification_state: null,
     last_qualification: null,
+    active_candidate_sha: null,
     latest_audit: null,
     audit_evidence_state: 'none',
     stale_audit: null,
@@ -49,6 +56,18 @@ function makeQualification(overrides: Partial<api.VersionQualification> = {}): a
     ci_resolution: null,
     blocker: null,
     finalized_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+function makePromotionInFlightState(
+  overrides: Partial<api.QualificationState> = {},
+): api.QualificationState {
+  return {
+    state: 'promotion_in_flight',
+    summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
+    promotion_pr_number: 4242,
+    promotion_pr_url: 'https://example/pr/4242',
     ...overrides,
   };
 }
@@ -777,12 +796,12 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               version_number: 6,
-              qualification_state: {
-                state: 'promotion_in_flight',
-                summary: 'Audit PASSED; a promotion PR is open and auto-merging.',
+              qualification_state: makePromotionInFlightState({
                 promotion_pr_number: 7357,
                 promotion_pr_url: 'https://example/pr/7357',
-              },
+                promotion_age_seconds: 7500,
+                promotion_timeout_seconds: 14400,
+              }),
             }),
             staged_directions: [],
           })}
@@ -794,14 +813,19 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
 
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #7357 open & auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+      );
       const consequences = screen.getByTestId('cut-consequences');
-      expect(consequences).toHaveTextContent('Promotion PR #7357 is open and auto-merging');
+      expect(consequences).toHaveTextContent(
+        'Promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+      );
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       await waitFor(() => {
         expect(window.confirm).toHaveBeenCalledWith(
-          expect.stringContaining('promotion PR #7357 is open and auto-merging')
+          expect.stringContaining('promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))')
         );
       });
       await waitFor(() => {
@@ -831,12 +855,13 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
     });
 
-    it('renders stale audit provenance as historical context only and says there is no current audit', () => {
+    it('renders stale audit provenance as historical context and contrasts the active candidate with the audited one', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'fed9876543210000' }),
+              active_candidate_sha: 'fed9876543210000',
               audit_evidence_state: 'stale',
               latest_audit: null,
               stale_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
@@ -849,10 +874,30 @@ describe('VersionLifecyclePanel', () => {
       );
       expect(screen.getByText('Historical Audit Context')).toBeInTheDocument();
       expect(screen.getByText(/no current audit for this candidate/i)).toBeInTheDocument();
-      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
       expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
       expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
+      // The historical-context block explicitly contrasts the active candidate
+      // SHA (awaiting a fresh audit) with the older audited candidate SHA.
+      const ctx = screen.getByTestId('historical-audit-context');
+      expect(within(ctx).getByText('@fed9876')).toBeInTheDocument();
+      expect(within(ctx).getByText('@abcdef1')).toBeInTheDocument();
+    });
+
+    it('shows the candidate SHA currently under evaluation on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              active_candidate_sha: 'abcdef1234567890',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('active-candidate-sha')).toHaveTextContent('@abcdef1');
     });
 
     it('does not display inherited findings when the current candidate has no audit evidence', () => {
@@ -908,6 +953,40 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it('does not contradict itself: a crashed audit child with a pending verdict shows the reconciled crash state, not "in flight / wait for the verdict"', () => {
+      // Backend reconciles a pending verdict whose audit child crashed
+      // (FAILED/CANCELLED, no report) into the audit_crashed qualification_state.
+      // The panel must render that reconciled top badge/summary in agreement with
+      // the audit-findings section's 'audit crashed — no report' cue — never the
+      // old 'qualifying / wait for the verdict' contradiction.
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ status: 'pending' }),
+              qualification_state: {
+                state: 'audit_crashed',
+                summary:
+                  'The qualification audit child CRASHED (terminal-failed with no report) while the verdict is still pending. The audit is DEAD — do NOT treat this as audit in flight.',
+              },
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'FAILED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // The audit-findings section reports the crash...
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+      // ...and the top qualification surface AGREES — no 'in flight / wait' copy.
+      expect(screen.queryByText(/wait for the verdict/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/audit is in flight/i)).not.toBeInTheDocument();
+      // The reconciled crash badge renders (red audit_crashed style).
+      expect(screen.getByText('audit crashed')).toBeInTheDocument();
     });
 
     it.each(['IN_PROGRESS', 'QUEUED', 'PROVISIONING', 'EVALUATING'])(
@@ -998,6 +1077,97 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByText(/^as of /)).toBeInTheDocument();
+    });
+
+    it('renders durable qualification evidence on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                migration_safety: 'block',
+                migration_safety_detail: 'open version needs a schema migration',
+                migration_apply_safety: 'warn',
+                migration_apply_safety_detail: 'apply path still diverges',
+                audit_findings: [{ severity: 'high', summary: 'unverified audit finding' }],
+                excluded_audit_findings: [{ severity: 'low', summary: 'stale noise' }],
+                test_erosion_detail: { deleted_test_files: 1 },
+                smoketest_detail: { passed: false, suite: 'release' },
+                promotion_pr_url: 'https://example.com/pr/open',
+                promotion_conflict: true,
+                promotion_error_detail: 'merge conflict',
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/migration block/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/apply warn/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('open version needs a schema migration')).toBeInTheDocument();
+      expect(within(evidence).getByTitle('apply path still diverges')).toBeInTheDocument();
+    });
+
+    it('renders durable qualification evidence in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v1',
+            release_version_id: 'rv1',
+            candidate_sha: 'deadbeef1234',
+            confidence: 0.95,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            audit_findings: [{ severity: 'high', summary: 'durable finding' }],
+            excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+            migration_safety: 'pass',
+            migration_safety_detail: 'schema migration verified',
+            migration_apply_safety: 'pass',
+            migration_apply_safety_detail: 'apply path verified',
+            test_erosion_detail: { deleted_test_files: 0 },
+            smoketest_detail: { passed: true },
+            audit_reconciliation: null,
+            promotion_pr_url: 'https://example.com/pr/123',
+            promotion_conflict: false,
+            promotion_error_detail: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'deploy_failed',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      const evidence = within(history).getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/migration pass/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/apply pass/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
+      expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
     });
   });
 
@@ -1099,12 +1269,7 @@ describe('VersionLifecyclePanel', () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
     });
 
-    const promotionInFlightState: api.QualificationState = {
-      state: 'promotion_in_flight',
-      summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
-      promotion_pr_number: 4242,
-      promotion_pr_url: 'https://example/pr/4242',
-    };
+    const promotionInFlightState = makePromotionInFlightState();
 
     it('disables Run Qualify and the phase flip while a promotion is in flight', () => {
       render(
@@ -1126,6 +1291,86 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
       // The note makes the locked state legible.
       expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent('#4242');
+    });
+
+    it('degrades cleanly to the PR-only lock copy when freshness timing is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: promotionInFlightState,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging — qualify & phase locked until it lands or is canceled'
+      );
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
+        'title',
+        'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying'
+      );
+    });
+
+    it('surfaces a nearing-timeout warning consistently across the status and lock copy', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makePromotionInFlightState({
+                promotion_age_seconds: 12600,
+                promotion_timeout_seconds: 14400,
+                promotion_nearing_timeout: true,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout)'
+      );
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — qualify & phase locked until it lands or is canceled'
+      );
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
+        'title',
+        'A promotion PR is open and auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — wait for it to land or cancel it before re-qualifying'
+      );
+    });
+
+    it('surfaces a past-timeout warning consistently across the status and lock copy', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makePromotionInFlightState({
+                promotion_age_seconds: 14700,
+                promotion_timeout_seconds: 14400,
+                promotion_past_timeout: true,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout)'
+      );
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
+        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout) — qualify & phase locked until it lands or is canceled'
+      );
     });
 
     it('leaves qualify + phase controls actionable when no promotion is in flight', () => {
@@ -1311,7 +1556,9 @@ describe('VersionLifecyclePanel', () => {
       expect(badge).toHaveTextContent('@abcdef1');
     });
 
-    it('renders an amber awaiting-confirmation badge while unconfirmed', () => {
+    it('renders an amber awaiting-confirmation badge with the remaining window while unconfirmed', () => {
+      // Deadline 10 minutes in the future — still inside the confirmation window.
+      const deadline = new Date(Date.now() + 10 * 60 * 1000).toISOString();
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
@@ -1322,6 +1569,7 @@ describe('VersionLifecyclePanel', () => {
                 serving_status: 'unconfirmed',
               },
               serving_status: 'unconfirmed',
+              deploy_confirm_deadline: deadline,
             }),
           })}
           loading={false}
@@ -1331,7 +1579,69 @@ describe('VersionLifecyclePanel', () => {
       );
       const badge = screen.getByTestId('serving-status-badge');
       expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'false');
       expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+      expect(badge).toHaveTextContent(/left in window/);
+      expect(badge.className).toContain('text-amber-400');
+    });
+
+    it('renders a red OVERDUE cue when the confirmation window has elapsed while still unconfirmed', () => {
+      // Deadline 15 minutes in the past — the resolving sweep is late/stuck.
+      const deadline = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Candidate was promoted (merged) but serving is NOT yet confirmed.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+              deploy_confirm_deadline: deadline,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'true');
+      expect(badge).toHaveTextContent(/OVERDUE/);
+      expect(badge).toHaveTextContent(/window elapsed/);
+      expect(badge.className).toContain('text-red-400');
+    });
+
+    it('shows the unconfirmed confirmation window in History rows for a recently-promoted version', () => {
+      const deadline = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 5,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'unconfirmed',
+                deploy_confirm_deadline: deadline,
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveAttribute('data-deploy-window-overdue', 'false');
+      expect(badge).toHaveTextContent(/left in window/);
     });
 
     it('renders a loud red failure badge with the reason — not a clean green promoted', () => {
@@ -1429,6 +1739,233 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('per-artifact serving evidence', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('drives the headline from the aggregate: backend revision serving but a required artifact pending renders awaiting-confirmation, NOT serving confirmed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Promoted but not every required artifact confirms serving yet.',
+                serving_status: 'serving_confirmed',
+              },
+              // Backend-only scalar says serving — the aggregate must override it.
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              aggregate_serving_status: 'unconfirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+      expect(badge).not.toHaveTextContent(/serving confirmed/);
+    });
+
+    it('aggregate deploy_failed names the failed artifact and reason in the breakdown', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'A required artifact failed to confirm serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              aggregate_serving_status: 'deploy_failed',
+              aggregate_deploy_failure_reason: 'frontend bundle 502 on canary',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'frontend bundle 502 on canary' },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent('frontend bundle 502 on canary');
+
+      const failedRow = screen
+        .getAllByTestId('artifact-evidence-row')
+        .find((r) => r.getAttribute('data-artifact-kind') === 'frontend_bundle');
+      expect(failedRow).toBeDefined();
+      expect(failedRow).toHaveAttribute('data-artifact-status', 'deploy_failed');
+      expect(failedRow).toHaveTextContent('frontend bundle 502 on canary');
+    });
+
+    it('renders one breakdown row per artifact with kind + status', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Awaiting multi-artifact confirmation.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+              aggregate_serving_status: 'unconfirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toHaveAttribute('data-artifact-kind', 'backend_revision');
+      expect(rows[0]).toHaveAttribute('data-artifact-status', 'serving_confirmed');
+      expect(rows[0]).toHaveTextContent('✓ serving');
+      expect(rows[1]).toHaveAttribute('data-artifact-kind', 'frontend_bundle');
+      expect(rows[1]).toHaveAttribute('data-artifact-status', 'unconfirmed');
+      expect(rows[1]).toHaveTextContent('pending');
+    });
+
+    it('recovery: aggregate serving_confirmed with every artifact confirmed renders green', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'All required artifacts now confirm serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              served_at: '2026-01-02T00:00:00Z',
+              aggregate_serving_status: 'serving_confirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                { artifact_kind: 'frontend_bundle', required: true, serving_status: 'serving_confirmed', served_identifier: 'bundle-42', served_at: '2026-01-02T00:05:00Z', reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(badge.className).toContain('text-emerald-400');
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows.every((r) => r.getAttribute('data-artifact-status') === 'serving_confirmed')).toBe(true);
+    });
+
+    it('backward compatible: a single backend artifact renders no breakdown list', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Single-artifact promotion confirmed serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              aggregate_serving_status: 'serving_confirmed',
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('serving-status-badge')).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(screen.queryByTestId('artifact-evidence-list')).not.toBeInTheDocument();
+    });
+
+    it('backward compatible: when the API omits the new fields, the scalar drives the badge unchanged', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Legacy scalar-only response.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(screen.queryByTestId('artifact-evidence-list')).not.toBeInTheDocument();
+    });
+
+    it('shows the per-artifact breakdown for a recent (history) version too', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 4,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'serving_confirmed',
+                aggregate_serving_status: 'deploy_failed',
+                aggregate_deploy_failure_reason: 'bundle never confirmed',
+                artifacts: [
+                  { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc1234', served_at: '2026-01-02T00:00:00Z', reason_code: null },
+                  { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'bundle never confirmed' },
+                ],
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      expect(rows).toHaveLength(2);
+      const failed = rows.find((r) => r.getAttribute('data-artifact-kind') === 'frontend_bundle');
+      expect(failed).toBeDefined();
+      expect(failed).toHaveAttribute('data-artifact-status', 'deploy_failed');
+      expect(failed).toHaveTextContent('bundle never confirmed');
+    });
+  });
+
   describe('clear deploy-failed lever', () => {
     beforeEach(() => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
@@ -1460,6 +1997,30 @@ describe('VersionLifecyclePanel', () => {
           userRole="admin"
         />
       );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('hides the clear control for aggregate-only deploy_failed state', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              serving_status: 'serving_confirmed',
+              aggregate_serving_status: 'deploy_failed',
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'required artifact failed',
+                serving_status: 'deploy_failed',
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
       expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
     });
 

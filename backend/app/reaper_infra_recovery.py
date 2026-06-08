@@ -7,6 +7,7 @@ _sweep_* functions below.
 
 import logging
 import uuid
+from datetime import datetime
 from datetime import timedelta
 
 from sqlalchemy.orm import load_only
@@ -573,6 +574,82 @@ async def run_infra_recovery_and_hold_maintenance(
     # (orchestrator skips tasks where retry_after > now).
     _heartbeat()
     try:
+        # Park-and-retarget expiry: a QUEUED task holding a warm VM must never
+        # keep that VM indefinitely. Once the bounded park window elapses,
+        # convert it back to the ordinary cold-requeue shape and tear the held
+        # VM down explicitly.
+        _queued_with_vm = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.vm_instance_id.is_not(None),
+                        # Filter to parked rows at SQL level so the LIMIT budget
+                        # is not consumed by ordinary cold-requeued QUEUED+vm tasks.
+                        # JSON path access compiles to ?-operator on PostgreSQL and
+                        # json_extract on SQLite — both return NULL when key is absent.
+                        Task.context["parked_for_retarget"].is_not(None),
+                    )
+                    .limit(_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        expired_parked = 0
+        expired_vm_ids: list[str] = []
+        for _qt in _queued_with_vm:
+            _ctx = dict(_qt.context or {})
+            if not _ctx.get("parked_for_retarget"):
+                continue
+            raw_deadline = _ctx.get("park_deadline")
+            park_deadline: datetime | None = None
+            if isinstance(raw_deadline, str):
+                try:
+                    park_deadline = datetime.fromisoformat(raw_deadline)
+                except ValueError:
+                    park_deadline = None
+            if park_deadline is not None and park_deadline > now:
+                continue
+            if park_deadline is None:
+                logger.warning(
+                    "[REAPER] Task %s has malformed park_deadline=%r; forcing cold requeue",
+                    _qt.id,
+                    raw_deadline,
+                )
+            old_vm_id = _qt.vm_instance_id
+            if old_vm_id:
+                expired_vm_ids.append(old_vm_id)
+            _qt.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+            _qt.last_heartbeat = None
+            _qt.started_at = None
+            _qt.retry_after_until = None
+            _qt.latest_status_message = (
+                "Park-and-retarget budget expired — cold requeueing"
+            )
+            _ctx.pop("parked_for_retarget", None)
+            _ctx.pop("park_deadline", None)
+            _ctx.pop("warm_target_vm_id", None)
+            _ctx.pop("warm_handoff_deadline", None)
+            _ctx.pop("warm_target_pr", None)
+            _ctx.pop("_retry_after_resets", None)
+            _qt.context = _ctx
+            session.add(_qt)
+            expired_parked += 1
+        if expired_parked:
+            await session.commit()
+            from app.vm_lifecycle import _ensure_vm_deleted
+
+            for old_vm_id in expired_vm_ids:
+                await _ensure_vm_deleted(
+                    old_vm_id, reason="park_retarget_budget_expired"
+                )
+            logger.info(
+                "[REAPER] Expired %d parked-for-retarget task(s) back to cold requeue",
+                expired_parked,
+            )
+
         # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
         # Audit R4-W2 (M2): filter ``retry_after_until IS NOT NULL``
         # at SQL — without this, the LIMIT _BATCH budget was wasted

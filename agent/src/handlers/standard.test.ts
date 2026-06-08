@@ -1215,6 +1215,44 @@ describe('acceptance evidence propagation', () => {
   });
 });
 
+describe('commissioned artifact prerequisite injection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('injects artifact prerequisites without pre-filling consumed ids', async () => {
+    const fs = (await import('fs')).default;
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {
+        artifact_prerequisites: [
+          {
+            artifact_id: 'artifact-1',
+            logical_key: 'release-promotion-record',
+            artifact_type: 'COMPUTE_RESULT',
+            source_task_id: 'producer-1',
+          },
+        ],
+      },
+      project_context: {},
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Use the artifact' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Commissioned Prerequisite Artifacts');
+    expect(prompt).toContain('artifact_id: artifact-1');
+    expect(prompt).toContain('only record artifact ids you truly consumed');
+    expect(prompt).toContain(`/tmp/consumed_artifacts_${TASK_ID}.json`);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalledWith(
+      `/tmp/consumed_artifacts_${TASK_ID}.json`,
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});
+
 // ── buildSmallScopeCallerNote (unchanged unit tests) ──────────────────────────
 describe('buildSmallScopeCallerNote', () => {
   it('returns empty string when no related files are provided', () => {

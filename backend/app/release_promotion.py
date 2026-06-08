@@ -39,6 +39,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.models import Project, QualificationVerdict
 from app.release_artifacts import (
+    AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
     get_or_create_release_deploy_artifact,
 )
@@ -266,6 +267,10 @@ async def _record_qualification_verdict(
         sub_scores = base_record.get("sub_scores") or {}
         if not isinstance(sub_scores, dict):
             sub_scores = {}
+        acceptance_aggregate = base_record.get("acceptance_aggregate")
+        if acceptance_aggregate is not None:
+            sub_scores = dict(sub_scores)
+            sub_scores["acceptance_aggregate"] = acceptance_aggregate
         # Embed CI resolution provenance in sub_scores.
         ci_resolution = base_record.get("ci_resolution")
         if isinstance(ci_resolution, dict):
@@ -1223,7 +1228,19 @@ async def promote(
             session, version, lock_released=True
         )
         if locked is not None and locked.status == "open":
+            # The live last_qualification here is the SPAWN-TIME "pending" record
+            # (written before the audit/composite children finished), so it has
+            # NO confidence / sub_scores / threshold.  Merge the finalize-time
+            # base_record (which carries the computed composite) in FIRST, then
+            # graft the promotion_pending sub-state on top.  Without this merge a
+            # later reconcile path — which records the promotion from
+            # base_record stripped of promotion_pending — would announce the
+            # promotion at "confidence 0.00" even though the candidate qualified
+            # at its real composite (the v6 prod regression).  base_record has no
+            # "status" key, so q's "pending" status is preserved.
             q = dict(locked.last_qualification or {})
+            q.update(base_record)
+            q["status"] = "pending"
             q["promotion_pending"] = {
                 "pr_number": pr_number,
                 "pr_url": pr_url,
@@ -1588,6 +1605,18 @@ async def _record_promotion_success(
             session,
             version,
             BACKEND_REVISION_ARTIFACT_KIND,
+            confirmation_deadline=version.deploy_confirm_deadline,
+        )
+        # Open the agent VM image serving window alongside the backend revision.
+        # The agent_image artifact is REQUIRED, so the aggregate serving status
+        # stays unconfirmed until BOTH the backend revision boots and the agent
+        # fleet is observed serving the promoted SHA (when the diff touched the
+        # bake paths) — a non-bake promotion's agent_image artifact confirms
+        # immediately so the aggregate tracks the backend revision alone.
+        await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            AGENT_IMAGE_ARTIFACT_KIND,
             confirmation_deadline=version.deploy_confirm_deadline,
         )
     session.add(version)

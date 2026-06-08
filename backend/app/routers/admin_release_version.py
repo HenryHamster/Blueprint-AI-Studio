@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field as _Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import load_only, selectinload
 from sqlmodel import select
 
 from app.database import get_session
@@ -22,6 +22,7 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
+from app.release_artifacts import summarize_release_artifacts
 from app import release_version as _release_version
 
 router = APIRouter()
@@ -95,7 +96,10 @@ async def get_retirement_critiques(
 
 def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     """Extract operator-facing fields from a last_qualification record."""
-    return {
+    from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
+
+    out = format_qualification_for_api(qual)
+    out.update({
         "status": qual.get("status"),
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
@@ -115,6 +119,66 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         # Audit reconciliation: model-reported vs findings-derived score delta
         # and excluded findings count (populated by _compute_audit_reconciliation).
         "audit_reconciliation": qual.get("audit_reconciliation"),
+    })
+    return out
+
+
+def _version_serving_summary(version: ReleaseVersion) -> tuple[dict[str, Any], list[dict]]:
+    aggregate, artifacts = summarize_release_artifacts(
+        version,
+        getattr(version, "deploy_artifacts", None),
+    )
+    return aggregate, artifacts
+
+
+def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
+    aggregate, artifacts = _version_serving_summary(version)
+    return {
+        "version_number": version.version_number,
+        "status": version.status,
+        "opened_at": version.opened_at.isoformat(),
+        "promoted_at": version.promoted_at.isoformat()
+        if version.promoted_at
+        else None,
+        "qualification_attempts": version.qualification_attempts,
+        "last_qualification": _format_qualification(version.last_qualification)
+        if version.last_qualification
+        else None,
+        # Post-promotion serving confirmation — disambiguates a merged
+        # promotion from one that actually shipped (additive fields).
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "deploy_confirm_deadline": version.deploy_confirm_deadline.isoformat()
+        if version.deploy_confirm_deadline
+        else None,
+        "aggregate_serving_status": aggregate["serving_status"],
+        "aggregate_deploy_failure_reason": aggregate["reason_code"],
+        "artifacts": artifacts,
+        "qualification_state": _release_version.summarize_qualification_state(
+            version.last_qualification,
+            version.serving_status,
+            version.deploy_failure_reason,
+            aggregate_serving_status=aggregate["serving_status"],
+            aggregate_deploy_failure_reason=aggregate["reason_code"],
+            artifact_evidence=artifacts,
+        ),
+        "abandoned_at": (
+            (version.last_qualification or {}).get("abandoned_at")
+            if version.status == "abandoned"
+            else None
+        ),
+        "abandoned_by": (
+            (version.last_qualification or {}).get("operator")
+            if version.status == "abandoned"
+            else None
+        ),
+        "abandon_reason": (
+            (version.last_qualification or {}).get("reason")
+            if version.status == "abandoned"
+            else None
+        ),
     }
 
 
@@ -156,6 +220,7 @@ async def get_version_lifecycle(
         (
             await session.execute(
                 select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
                 .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status == "open",
@@ -173,6 +238,12 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
+        aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
+        acceptance_aggregate = None
+        if isinstance(qual, dict):
+            acceptance_aggregate = qual.get("acceptance_aggregate")
+        if acceptance_aggregate is None:
+            acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
         # Verdict-staleness signal: how many tasks merged AT/AFTER the open
         # version's last qualification verdict was finalized. Each verdict is
         # evaluated against one candidate commit; merges landing after
@@ -193,9 +264,6 @@ async def get_version_lifecycle(
                 merged_since_verdict = await count_merged_since(
                     session, project_id, finalized_at_dt
                 )
-        qual_state = _release_version.summarize_qualification_state(
-            qual, open_row.serving_status, open_row.deploy_failure_reason
-        )
         # Surface the open version's audit findings/score so a verdict is
         # explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
@@ -206,6 +274,19 @@ async def get_version_lifecycle(
         # provenance and ``audit_evidence_state`` explains which case applies.
         audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
         latest_audit = audit_evidence["latest_audit"]
+        # Feed the version-scoped audit child into the qualification-state summary
+        # so a crashed audit (terminal-failed, no report) reconciles to
+        # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
+        # badge and the audit-findings section then agree by construction.
+        qual_state = _release_version.summarize_qualification_state(
+            qual,
+            open_row.serving_status,
+            open_row.deploy_failure_reason,
+            audit_child=latest_audit,
+            aggregate_serving_status=aggregate_serving["serving_status"],
+            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+            artifact_evidence=artifact_evidence,
+        )
 
         # Fetch live current_focus from the project's problem_model
         live_current_focus = None
@@ -229,6 +310,11 @@ async def get_version_lifecycle(
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # Version-window acceptance aggregate (proven-vs-merged) — additive
+            # and nullable, surfaced ALONGSIDE the raw ``merged_task_count`` (not
+            # replacing it). Computed/stored by the acceptance layer; ``None`` on
+            # legacy open versions that predate the aggregate.
+            "acceptance_aggregate": acceptance_aggregate,
             # Tasks merged AT/AFTER the last qualification verdict's finalized_at
             # (verdict-staleness signal). None when no verdict/finalized_at.
             "merged_since_verdict": merged_since_verdict,
@@ -238,6 +324,13 @@ async def get_version_lifecycle(
             "in_flight_task_count": in_flight_count,
             "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
+            # The candidate commit currently under evaluation for this open
+            # version, surfaced as a first-class field (not buried in
+            # last_qualification) so the UI can show what is being qualified and,
+            # when audit evidence is stale, contrast it against the historical
+            # audited candidate. Identical to the resolver's ``evaluated_sha``
+            # (``last_qualification['candidate_sha']``) — same single source.
+            "active_candidate_sha": qual.get("candidate_sha"),
             "latest_audit": latest_audit,
             # Provenance for version-scoped audit evidence (additive). When the
             # newest scoped audit was run against an OLDER candidate than the one
@@ -254,6 +347,9 @@ async def get_version_lifecycle(
             if open_row.served_at
             else None,
             "deploy_failure_reason": open_row.deploy_failure_reason,
+            "aggregate_serving_status": aggregate_serving["serving_status"],
+            "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
+            "artifacts": artifact_evidence,
             "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
             if open_row.deploy_confirm_deadline
             else None,
@@ -263,6 +359,7 @@ async def get_version_lifecycle(
         (
             await session.execute(
                 select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
                 .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status != "open",
@@ -280,41 +377,7 @@ async def get_version_lifecycle(
     return {
         "current_version": current_version_out,
         "recent_versions": [
-            {
-                "version_number": v.version_number,
-                "status": v.status,
-                "opened_at": v.opened_at.isoformat(),
-                "promoted_at": v.promoted_at.isoformat() if v.promoted_at else None,
-                "qualification_attempts": v.qualification_attempts,
-                "last_qualification": _format_qualification(v.last_qualification)
-                if v.last_qualification
-                else None,
-                # Post-promotion serving confirmation — disambiguates a merged
-                # promotion from one that actually shipped (additive fields).
-                "serving_status": v.serving_status,
-                "served_sha": v.served_sha,
-                "served_at": v.served_at.isoformat() if v.served_at else None,
-                "deploy_failure_reason": v.deploy_failure_reason,
-                "qualification_state": _release_version.summarize_qualification_state(
-                    v.last_qualification, v.serving_status, v.deploy_failure_reason
-                ),
-                "abandoned_at": (
-                    (v.last_qualification or {}).get("abandoned_at")
-                    if v.status == "abandoned"
-                    else None
-                ),
-                "abandoned_by": (
-                    (v.last_qualification or {}).get("operator")
-                    if v.status == "abandoned"
-                    else None
-                ),
-                "abandon_reason": (
-                    (v.last_qualification or {}).get("reason")
-                    if v.status == "abandoned"
-                    else None
-                ),
-            }
-            for v in history_rows
+            _serialize_version_history_entry(version) for version in history_rows
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         # Per-project live-promotion enablement. ``promotion_enabled_effective``
@@ -415,6 +478,7 @@ async def set_version_phase(
             if pr_url:
                 detail += f" {pr_url}"
             detail += ")"
+        detail += _release_version.format_promotion_freshness(_qual_state)
         raise HTTPException(status_code=409, detail=detail)
 
     operator_id = current_user.get("email") or current_user["user_id"]
@@ -551,6 +615,7 @@ async def cut_version(
             if exc.promotion_pr_url:
                 detail += f" {exc.promotion_pr_url}"
             detail += ")"
+        detail += _release_version.format_promotion_freshness(exc.promotion_freshness)
         raise HTTPException(status_code=409, detail=detail) from exc
     if abandoned is None or new_version is None:
         raise HTTPException(

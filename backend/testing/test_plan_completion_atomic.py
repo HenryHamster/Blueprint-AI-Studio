@@ -18,6 +18,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import select
 
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+)
 from app.models import Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
@@ -462,7 +466,9 @@ async def test_dependent_on_skipped_producer_fails_plan(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES))
+@pytest.mark.parametrize(
+    "knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES - {"compute_experiment"})
+)
 async def test_knowledge_prereq_subtype_spawns_as_itself(
     db_session, mocker, _quiet_mocks, knowledge_type
 ):
@@ -529,6 +535,88 @@ async def test_knowledge_prereq_subtype_spawns_as_itself(
 
 
 @pytest.mark.asyncio
+async def test_compute_experiment_prereq_spawns_launch_payload_and_dependency(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan may spawn a compute_experiment prerequisite as a non-PR producer.
+
+    The child payload must carry the authored launch contract, omit the create
+    prompt suffix, and stamp prerequisite mode so completion treats the success
+    criterion as advisory while downstream dependents still wait on its task ID.
+    """
+    from app.shared_state import runtime_config
+
+    runtime_config["agent_prompt_suffixes"] = {"create": "IMPLEMENTATION SUFFIX"}
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Measure the baseline",
+                    "prompt": "benchmark the current implementation",
+                    "type": "compute_experiment",
+                    "command": "python bench.py --mode baseline",
+                    "spend_cap_usd": 3.5,
+                    "deadline_seconds": 900,
+                    "success_criterion": {
+                        "metric": "accuracy",
+                        "operator": ">=",
+                        "threshold": 0.9,
+                    },
+                    "machine_type": "n2-standard-4",
+                    "experiment": "baseline-accuracy",
+                    "benchmark": "suite-v1",
+                    "metric": "accuracy",
+                    "cwd": "backend",
+                    "env": {"BENCHMARK_MODE": "baseline"},
+                    "accelerator": "T4",
+                    "provisioning_model": "spot",
+                },
+                {
+                    "title": "Implement against the measurement",
+                    "prompt": "use the measured result",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_title = {c.title: c for c in children}
+    producer = by_title["Measure the baseline"]
+    dependent = by_title["Implement against the measurement"]
+
+    payload = producer.first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload["command"] == "python bench.py --mode baseline"
+    assert payload["spend_cap_usd"] == pytest.approx(3.5)
+    assert payload["deadline_seconds"] == 900
+    assert payload["success_criterion"]["metric"] == "accuracy"
+    assert payload["machine_type"] == "n2-standard-4"
+    assert payload["experiment"] == "baseline-accuracy"
+    assert payload["benchmark"] == "suite-v1"
+    assert payload["metric"] == "accuracy"
+    assert payload["cwd"] == "backend"
+    assert payload["env"] == {"BENCHMARK_MODE": "baseline"}
+    assert payload["accelerator"] == "T4"
+    assert payload["provisioning_model"] == "spot"
+    assert "prompt_suffix" not in payload
+    assert "prompt" not in payload
+    assert (producer.context or {})[
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY
+    ] == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+    assert dependent.depends_on == [str(producer.id)]
+
+
+@pytest.mark.asyncio
 async def test_implementation_child_can_depend_on_knowledge_prereq(
     db_session, mocker, _quiet_mocks
 ):
@@ -581,6 +669,49 @@ async def test_implementation_child_can_depend_on_knowledge_prereq(
         f"Dependent create should depend on the knowledge producer, "
         f"got {dependent.depends_on!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_invalid_compute_prereq_contract_fails_when_kept_subtask_depends_on_it(
+    db_session, mocker, _quiet_mocks
+):
+    """An invalid compute prerequisite is skipped, and dependents fail cleanly."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Broken measurement",
+                    "prompt": "measure first",
+                    "type": "compute_experiment",
+                    "command": "   ",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                },
+                {
+                    "title": "Implement using the measurement",
+                    "prompt": "use its result",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.FAILED
+    msg = task.latest_status_message or ""
+    assert "unsatisfiable dependency" in msg.lower()
+    assert "invalid compute_experiment launch contract" in msg
+    assert "missing or empty command" in msg
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert children == []
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1250,274 @@ async def test_plan_subtask_absent_acceptance_evidence_is_noop(
         .all()
     )
     assert len(children) == 1
+    assert "acceptance_evidence" not in (children[0].context or {})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence forward-carry through decomposition (PARENT → child)
+# When the plan agent does not re-declare per-subtask evidence, the parent
+# finding's declared acceptance evidence must still survive one hop onto the
+# child/children that deliver the declared seam.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _setup_plan_task_with_evidence(
+    db_session,
+    mocker,
+    *,
+    payload_evidence=None,
+    context_evidence=None,
+):
+    """Build a plan task that carries the parent finding's declared acceptance
+    evidence on the payload and/or context channel, as research_completion does
+    when it routes a finding through the plan (decomposition) agent."""
+    project = make_project(name="ParentEvidenceTest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = {"type": "plan", "prompt": "do things", "base_branch": "main"}
+    if payload_evidence is not None:
+        payload["acceptance_evidence"] = payload_evidence
+
+    task = make_task(
+        project_id=project.id,
+        title="Plan: carry evidence",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[payload],
+        context=(
+            {"acceptance_evidence": context_evidence}
+            if context_evidence is not None
+            else {}
+        ),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=task,
+    )
+    return task
+
+
+async def _children_of(db_session, task):
+    return (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_acceptance_evidence_survives_decomposition(
+    db_session, mocker, _quiet_mocks
+):
+    """The parent finding's declared payload acceptance_evidence lands on a child
+    that delivers the seam and did not self-declare.
+
+    This is the core decomposition-hop guarantee: a finding that carefully
+    declares 'prove this with test T' must not lose T when the plan agent omits
+    a per-subtask declaration. The child whose related_files reference the
+    declared test path inherits the parent's evidence onto its payload.
+    """
+    parent_evidence = {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_seam.py",
+        "test_id": "test_seam_end_to_end",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: deliver the seam",
+                    "prompt": "implement the seam end-to-end",
+                    "scope": "small",
+                    "type": "create",
+                    "related_files": ["backend/testing/test_seam.py"],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(
+        db_session, mocker, payload_evidence=parent_evidence
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    child_ev = children[0].first_payload.get("acceptance_evidence")
+    assert child_ev is not None, (
+        "parent acceptance_evidence must survive decomposition onto the "
+        "delivering child's payload"
+    )
+    assert child_ev["kind"] == "named_test"
+    assert child_ev["test_path"] == "backend/testing/test_seam.py"
+    assert child_ev["test_id"] == "test_seam_end_to_end"
+
+
+@pytest.mark.asyncio
+async def test_parent_context_acceptance_evidence_survives_decomposition(
+    db_session, mocker, _quiet_mocks
+):
+    """The parent's context-channel PlanAcceptanceEvidence carries onto the
+    delivering child's context when the subtask does not self-declare."""
+    context_evidence = {
+        "kind": "test",
+        "descriptor": "seam test exercises the new path end-to-end",
+        "selector": "backend/testing/test_seam.py::test_seam",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: deliver the seam",
+                    "prompt": "implement it",
+                    "scope": "small",
+                    "type": "create",
+                    "related_files": ["backend/testing/test_seam.py"],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(
+        db_session, mocker, context_evidence=context_evidence
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert children[0].context.get("acceptance_evidence") == context_evidence
+
+
+@pytest.mark.asyncio
+async def test_subtask_own_acceptance_evidence_not_overwritten_by_parent(
+    db_session, mocker, _quiet_mocks
+):
+    """A subtask that declares its OWN evidence keeps it — the parent's declared
+    evidence never overwrites a self-declared subtask."""
+    parent_evidence = {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_parent.py",
+        "test_id": "test_parent_seam",
+    }
+    own_evidence = {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_child.py",
+        "test_id": "test_child_seam",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: self-declares",
+                    "prompt": "implement it",
+                    "scope": "small",
+                    "type": "create",
+                    "related_files": ["backend/testing/test_parent.py"],
+                    "acceptance_evidence": own_evidence,
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(
+        db_session, mocker, payload_evidence=parent_evidence
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    child_ev = children[0].first_payload.get("acceptance_evidence")
+    assert child_ev["test_path"] == "backend/testing/test_child.py", (
+        "subtask's own evidence must win over the parent's declaration"
+    )
+    assert child_ev["test_id"] == "test_child_seam"
+
+
+@pytest.mark.asyncio
+async def test_parent_evidence_lands_on_terminal_child_when_no_seam_match(
+    db_session, mocker, _quiet_mocks
+):
+    """When no subtask references the declared seam path, the parent's evidence
+    lands on the terminal (integrating) child only — not every child.
+
+    Subtask B depends on A; neither references the declared test path, so the
+    path-match policy finds nothing and falls back to the terminal sink (B).
+    """
+    parent_evidence = {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_unreferenced.py",
+        "test_id": "test_integration",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Step A",
+                    "prompt": "build the foundation",
+                    "scope": "small",
+                    "type": "create",
+                },
+                {
+                    "title": "Step B",
+                    "prompt": "integrate on the foundation",
+                    "scope": "small",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(
+        db_session, mocker, payload_evidence=parent_evidence
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 2
+    by_title = {c.title: c for c in children}
+    # Foundation (source) does NOT inherit.
+    assert "acceptance_evidence" not in by_title["Step A"].first_payload, (
+        "non-terminal child must not inherit the parent's evidence"
+    )
+    # Terminal/integrating child (sink) inherits.
+    child_ev = by_title["Step B"].first_payload.get("acceptance_evidence")
+    assert child_ev is not None, "terminal child must inherit the parent's evidence"
+    assert child_ev["test_path"] == "backend/testing/test_unreferenced.py"
+
+
+@pytest.mark.asyncio
+async def test_parent_declares_nothing_children_unchanged(
+    db_session, mocker, _quiet_mocks
+):
+    """A parent plan task with no declared evidence leaves children untouched —
+    nothing is synthesized (preserves today's no-synthesis behavior)."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: no evidence anywhere",
+                    "prompt": "implement it",
+                    "scope": "small",
+                    "type": "create",
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(db_session, mocker)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert "acceptance_evidence" not in children[0].first_payload
     assert "acceptance_evidence" not in (children[0].context or {})
 
 

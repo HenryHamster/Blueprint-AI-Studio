@@ -148,10 +148,31 @@ async def gcp_cleanup_service():
                 # active here or it would be deleted out from under the monitor.
                 from app.compute_jobs import active_compute_job_vm_ids
 
+                # Parked tasks are QUEUED (not PROVISIONING/IN_PROGRESS) but still
+                # hold a live VM during the park-and-retarget cooldown window.
+                # Without this exemption the orphan sweep would delete the held VM
+                # within 5 minutes — well inside the up-to-1800s park budget.
+                _parked_rows = (
+                    await session.execute(
+                        select(Task.vm_instance_id, Task.context).where(
+                            Task.status == TaskStatus.QUEUED,
+                            Task.vm_instance_id.is_not(None),
+                        )
+                    )
+                ).all()
+                parked_vm_ids = {
+                    vid
+                    for vid, ctx in _parked_rows
+                    if vid
+                    and isinstance(ctx, dict)
+                    and ctx.get("parked_for_retarget")
+                }
+
                 active_vm_ids = list(
                     set(active_vm_ids)
                     | await pool_vm_cleanup_exemptions(session)
                     | await active_compute_job_vm_ids(session)
+                    | parked_vm_ids
                 )
 
                 # Run cleanup with a hard timeout. 270s, not 120: deleting a

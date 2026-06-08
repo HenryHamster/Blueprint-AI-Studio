@@ -155,8 +155,10 @@ def _parse_established_entry(entry_text: str) -> dict:
     source_refs: list = []
     status: str = "established"
 
-    # Extract status tag: (proposed), (merged), (stale), (failed: category)
-    status_m = re.search(r"\((proposed|merged|stale|failed:[^)]*)\)", entry_text)
+    # Extract status tag: (proposed), (merged), (unproven), (stale), (failed: category)
+    status_m = re.search(
+        r"\((proposed|merged|unproven|stale|failed:[^)]*)\)", entry_text
+    )
     if status_m:
         status = status_m.group(1).strip()
 
@@ -165,7 +167,9 @@ def _parse_established_entry(entry_text: str) -> dict:
     if scope_m:
         title = scope_m.group(1).strip()
     else:
-        paren_m = re.search(r"\s*\((?:proposed|merged|stale|failed)", entry_text)
+        paren_m = re.search(
+            r"\s*\((?:proposed|merged|unproven|stale|failed)", entry_text
+        )
         if paren_m:
             title = entry_text[: paren_m.start()].strip()
 
@@ -191,10 +195,12 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
     """Retag '(proposed)' entries from prior outcomes.
 
     Matches the title prefix of each established entry against prior cycles'
-    finding_titles and failed_task_details / no_op_task_details so agents can
-    see which findings actually shipped ('(merged)'), failed
-    ('(failed: CATEGORY)'), or no-op'd as already-resolved / non-reproducing on
-    HEAD ('(stale)'). failed/merged take precedence over stale.
+    finding_titles and failed_task_details / no_op_task_details /
+    unproven_merge_details so agents can see which findings actually shipped
+    ('(merged)'), shipped but with unsatisfied declared evidence ('(unproven)'),
+    failed ('(failed: CATEGORY)'), or no-op'd as already-resolved /
+    non-reproducing on HEAD ('(stale)'). Precedence is
+    failed > unproven > merged > stale.
     """
     if not prior_history:
         return established
@@ -217,6 +223,21 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
             for n in no_op
             if n.get("title")
         }
+        # Delivered-but-unproven merges: the finding's child task merged, but its
+        # DECLARED acceptance evidence was UNSATISFIED, so the per-task scorer
+        # downgraded it to neutral. Tagged '(unproven)' so the research agent
+        # re-targets a finding that was shipped-but-not-proven instead of treating
+        # it as resolved. A missing key (legacy history) reads as an empty list.
+        # Precedence is failed > unproven > merged > stale: a finding that ALSO
+        # genuinely shipped a verified merge keeps its '(merged)' tag (handled
+        # below), but a per-finding unproven merge is never masked by a sibling's
+        # verified merge in the same cycle.
+        unproven = entry.get("unproven_merge_details") or []
+        unproven_map = {
+            (u.get("title") or "").strip()
+            for u in unproven
+            if u.get("title")
+        }
         prs_merged = entry.get("prs_merged", 0) or 0
         # 'settled' tracks whether every created task reached a terminal state
         # (merged-or-failed) and must keep counting RAW merges — a merged-but-
@@ -237,6 +258,11 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
             if tn in failed_map:
                 cat = failed_map[tn] or "unknown"
                 outcomes[tn] = f"failed: {cat}"
+            elif tn in unproven_map:
+                # Delivered-but-unproven merge: shipped, but declared evidence did
+                # not hold. Ranks above the cycle-level 'merged' tag so a sibling
+                # finding's verified merge cannot mask this finding's unproven one.
+                outcomes[tn] = "unproven"
             elif settled and verified_merged > 0:
                 outcomes[tn] = "merged"
             elif tn in no_op_map:

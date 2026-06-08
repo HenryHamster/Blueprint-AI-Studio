@@ -17,7 +17,11 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import (
+    declared_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
 from app.knowledge_query import build_knowledge_index
 from app.models import (
@@ -30,9 +34,17 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.release_artifacts import (
+    summarize_release_artifacts,
+    summarize_required_artifact_gap,
+)
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
+)
+from app.capability_registry import (
+    registry_capability_names,
+    registry_capability_vocabulary,
 )
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.problem_model import compute_model_size_signal, parse_problem_model
@@ -60,6 +72,38 @@ from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
+
+
+def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    aggregate, artifacts = summarize_release_artifacts(
+        version,
+        getattr(version, "deploy_artifacts", None),
+    )
+    return aggregate, artifacts
+
+
+def _strategic_recent_version_entry(version) -> dict[str, Any]:
+    from app.release_version import summarize_qualification_state as _summarize
+
+    aggregate, artifacts = _version_serving_summary(version)
+    return {
+        "version_number": version.version_number,
+        "status": version.status,
+        "phase": version.phase,
+        "last_qualification": version.last_qualification,
+        "qualification_state": _summarize(
+            version.last_qualification,
+            version.serving_status,
+            version.deploy_failure_reason,
+            aggregate_serving_status=aggregate["serving_status"],
+            aggregate_deploy_failure_reason=aggregate["reason_code"],
+            artifact_evidence=artifacts,
+        ),
+        "serving_status": aggregate["serving_status"],
+        "served_sha": (version.served_sha or "")[:12] or None,
+        "deploy_failure_reason": aggregate["reason_code"],
+        "artifacts": artifacts,
+    }
 
 
 def _build_parallelism_hint(
@@ -1729,42 +1773,51 @@ _MEMO_CITATIONS_KEEP = 5
 _MEMO_EXCERPT_MAX_CHARS = 400
 
 
+_MEMO_HEAVY_FIELDS = ("citations", "final_metrics")
+_MEMO_VERBOSE_FIELDS = ("rationale", "reasoning")
+
+
+def _strip_heavy_fields(m: dict) -> dict:
+    """Return a copy of the memo entry without the heaviest optional fields."""
+    return {k: v for k, v in m.items() if k not in _MEMO_HEAVY_FIELDS}
+
+
+def _strip_verbose_fields(m: dict) -> dict:
+    """Return a copy without heavy AND verbose optional fields."""
+    drop = set(_MEMO_HEAVY_FIELDS) | set(_MEMO_VERBOSE_FIELDS)
+    return {k: v for k, v in m.items() if k not in drop}
+
+
+def _cap_excerpt(m: dict) -> dict:
+    result = dict(m)
+    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[:_MEMO_EXCERPT_MAX_CHARS]
+    return result
+
+
 def _summarize_memo_citations(memos: list) -> list:
     """Trim memo citations for inclusion in strategic-agent payloads.
 
-    Keeps the most recent N memos (by task_id) and caps excerpt length
-    so the digest survives under budget pressure rather than vanishing
-    entirely. The strategic reviewer can cite memos by task_id; shorter
-    excerpts still preserve citability.
+    Field-level trimming order (applied before entry-count capping):
+      1. Drop ``citations`` and ``final_metrics`` (largest optional fields).
+      2. Drop ``rationale`` and ``reasoning`` (verbose text fields; compact
+         ``*_excerpt`` variants are preserved).
+      3. Cap ``summary_excerpt`` to ``_MEMO_EXCERPT_MAX_CHARS``.
+    Then cap entry count to ``_MEMO_CITATIONS_KEEP`` (newest-first).
+
+    This ensures over-budget payloads degrade to a compact citable digest
+    rather than dropping the whole feed. ``task_id`` is always preserved.
     """
     if not isinstance(memos, list):
         return memos
-    if len(memos) <= _MEMO_CITATIONS_KEEP:
-        # No trimming needed for list size, but still cap excerpts
-        return [
-            {
-                **m,
-                "summary_excerpt": (m.get("summary_excerpt") or "")[
-                    :_MEMO_EXCERPT_MAX_CHARS
-                ]
-                if isinstance(m, dict)
-                else m,
-            }
-            for m in memos
-        ]
-    # Cap to most recent memos and trim excerpts
-    trimmed = memos[:_MEMO_CITATIONS_KEEP]
-    return [
-        {
-            **m,
-            "summary_excerpt": (m.get("summary_excerpt") or "")[
-                :_MEMO_EXCERPT_MAX_CHARS
-            ]
-            if isinstance(m, dict)
-            else m,
-        }
-        for m in trimmed
-    ]
+    result = []
+    for m in memos:
+        if not isinstance(m, dict):
+            result.append(m)
+            continue
+        entry = _strip_verbose_fields(m)
+        entry = _cap_excerpt(entry)
+        result.append(entry)
+    return result[:_MEMO_CITATIONS_KEEP]
 
 
 # ── Open-message inbox (the strategist's authoritative feed) ──────────────────
@@ -2108,6 +2161,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # under budget rather than trimming. Actionable: the strategist can open a
     # foundation direction or record an explicit retirement.
     "missing_capability_demand": {"priority": "medium"},
+    # Shared capability vocabulary (canonical registry name + status) the strategist
+    # draws prerequisite / provides_capability refs from. Small and bounded; medium
+    # priority so it survives typical pressure but degrades before load-bearing state.
+    "available_capabilities": {"priority": "medium"},
 }
 
 
@@ -2152,6 +2209,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
     # whole under budget; full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
+    "available_capabilities": {"priority": "medium"},
 }
 
 
@@ -3204,9 +3263,13 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Read-only, fail-open, additive: included only when demand is non-empty.
     _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
     _missing_demand_present = bool(_missing_demand.get("demands"))
+    _dd_registry_names = registry_capability_names(project.problem_model)
     _missing_demand_hint = (
-        missing_demand_prompt_hint(_missing_demand) if _missing_demand_present else None
+        missing_demand_prompt_hint(_missing_demand, registry_names=_dd_registry_names)
+        if _missing_demand_present
+        else None
     )
+    _dd_available_capabilities = registry_capability_vocabulary(project.problem_model)
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
@@ -3226,6 +3289,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 else {}
             ),
             **({"prompt_suffix": _missing_demand_hint} if _missing_demand_hint else {}),
+            **(
+                {"available_capabilities": _dd_available_capabilities}
+                if _dd_available_capabilities
+                else {}
+            ),
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
                 **verification_kwargs,
@@ -3423,6 +3491,29 @@ async def _spawn_strategic_review(
         ) + (
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
+        # Proven lifetime merge total — STRICTER than verified: only merges with
+        # machine-checked named-test proof (proven_merged_count), legacy entries
+        # degrade to 0. Always <= total_verified_merged for the same window, so a
+        # direction that shipped many merges but proved few is visibly distinct.
+        total_proven_merged = sum(
+            proven_merged_count(h) for h in history
+        ) + (agg.get("total_acceptance_proven_merged", 0) or 0)
+        total_consumed_merged = sum(
+            h.get("acceptance_consumed_merged", 0) for h in history
+        ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+        # Declaration coverage = declared / merged-write, recomputed from summed
+        # counts (not averaged per-cycle fractions) so it survives eviction.
+        total_declared_merged = sum(
+            declared_merged_count(h) for h in history
+        ) + (agg.get("total_acceptance_declared_merged", 0) or 0)
+        total_merged_write = sum(
+            h.get("acceptance_merged_write_total", 0) for h in history
+        ) + (agg.get("total_acceptance_merged_write_total", 0) or 0)
+        acceptance_declaration_coverage = (
+            round(total_declared_merged / total_merged_write, 3)
+            if total_merged_write > 0
+            else None
+        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -3481,6 +3572,13 @@ async def _spawn_strategic_review(
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
             "verified_prs_merged": total_verified_merged,
+            # Proven count + declaration coverage: the honest, machine-checked
+            # subset of verified merges (proven <= verified) plus how much merged
+            # code even committed to forward evidence. Lets the strategist
+            # prioritize closing the proof gap, not just delivery.
+            "proven_prs_merged": total_proven_merged,
+            "consumed_prs_merged": total_consumed_merged,
+            "acceptance_declaration_coverage": acceptance_declaration_coverage,
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
@@ -3799,11 +3897,14 @@ async def _spawn_strategic_review(
                 current_open_version,
                 ensure_initial_release_version,
                 recent_closed_versions,
-                summarize_qualification_state,
                 to_phase_block,
             )
 
-            _open_version = await current_open_version(session, project.id)
+            _open_version = await current_open_version(
+                session,
+                project.id,
+                include_artifacts=True,
+            )
             if _open_version is None:
                 # No open version: bootstrap v1.  Resolve the integration-branch
                 # HEAD SHA so the qualifier's diff is meaningful; fall back to
@@ -3843,11 +3944,39 @@ async def _spawn_strategic_review(
                     promotion_target=_promotion_target,
                 )
             if _open_version is not None:
+                _open_aggregate, _open_artifacts = _version_serving_summary(
+                    _open_version
+                )
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
                 )
+                # Resolve the open version's audit child so a crashed audit
+                # (terminal-failed, no report) reconciles the qualification_state
+                # to ``audit_crashed`` instead of telling the strategic agent to
+                # wait on a dead audit (it would otherwise burn a cycle). Same
+                # version-scoped evidence the operator panel reads. Best-effort.
+                _audit_child = None
+                try:
+                    from app.release_qualifier_audit import (
+                        resolve_lifecycle_audit_evidence,
+                    )
+
+                    _audit_evidence = await resolve_lifecycle_audit_evidence(
+                        session, _open_version
+                    )
+                    _audit_child = _audit_evidence["latest_audit"]
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] audit-child resolution failed; continuing"
+                    )
                 _version_phase_block = {
-                    **to_phase_block(_open_version),
+                    **to_phase_block(
+                        _open_version,
+                        audit_child=_audit_child,
+                        aggregate_serving_status=_open_aggregate["serving_status"],
+                        aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
+                        artifact_evidence=_open_artifacts,
+                    ),
                     "tasks_merged_this_version": _tasks_merged,
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
@@ -3866,27 +3995,17 @@ async def _spawn_strategic_review(
                 )
             try:
                 _closed = await recent_closed_versions(
-                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                    session,
+                    project.id,
+                    limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                    include_artifacts=True,
                 )
                 if _closed:
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        {
-                            "version_number": v.version_number,
-                            "status": v.status,
-                            "phase": v.phase,
-                            "last_qualification": v.last_qualification,
-                            "qualification_state": summarize_qualification_state(
-                                v.last_qualification,
-                                v.serving_status,
-                                v.deploy_failure_reason,
-                            ),
-                            "serving_status": v.serving_status,
-                            "served_sha": (v.served_sha or "")[:12] or None,
-                            "deploy_failure_reason": v.deploy_failure_reason,
-                        }
-                        for v in _closed
+                        _strategic_recent_version_entry(version)
+                        for version in _closed
                     ]
             except Exception:
                 logger.exception(
@@ -3907,7 +4026,7 @@ async def _spawn_strategic_review(
     _deployment_state_block: dict | None = None
     if _integration_branch != _promotion_target:
         try:
-            from app.models import DeploymentState
+            from app.models import DeploymentState, DeploymentStatus
             from app.release_version import (
                 recent_closed_versions as _recent_closed_for_deploy,
             )
@@ -3920,7 +4039,10 @@ async def _spawn_strategic_review(
             _promoted_v = None
             try:
                 for _cv in await _recent_closed_for_deploy(
-                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                    session,
+                    project.id,
+                    limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                    include_artifacts=True,
                 ):
                     if _cv.status == "promoted":
                         _promoted_v = _cv
@@ -3936,6 +4058,14 @@ async def _spawn_strategic_review(
             _deployed_sha: str | None = None
             _deployed_revision: str | None = None
             _deploy_status: str | None = None
+            # Rollback provenance — only meaningful for the self-repo's own
+            # DeploymentState. Surfaced so the strategist sees WHY the pipeline
+            # rolled back (which SHA, how many consecutive rollbacks, the
+            # reason) and can prioritize stabilization rather than spawn more
+            # risky feature work right after a rollback / halt.
+            _rolled_back_from_sha: str | None = None
+            _rollback_count: int = 0
+            _rollback_reason: str | None = None
             if getattr(project, "is_self_repo", False):
                 try:
                     _ds = await session.get(DeploymentState, 1)
@@ -3943,16 +4073,30 @@ async def _spawn_strategic_review(
                         _deployed_sha = _ds.current_sha or None
                         _deployed_revision = _ds.current_revision or None
                         _deploy_status = _ds.status
+                        _rolled_back_from_sha = _ds.rolled_back_from_sha or None
+                        _rollback_count = _ds.rollback_count or 0
+                        _rollback_reason = _ds.rollback_reason or None
                 except Exception:
                     logger.exception(
                         "[STRATEGIC] DeploymentState read failed; continuing"
                     )
-            # Real serving SHA only — NEVER a promoted_sha stand-in.  A version's
-            # served_sha is set solely once deploy_health confirms the promotion
-            # is actually serving (serving_status="serving_confirmed"); an
-            # unconfirmed or deploy_failed promotion reports null here, so the
-            # strategist never reads a merged-but-unshipped SHA as "deployed".
-            if not _deployed_sha and _promoted_v is not None:
+            _promoted_aggregate: dict[str, Any] | None = None
+            _promoted_artifacts: list[dict[str, Any]] = []
+            _promoted_gap: str | None = None
+            if _promoted_v is not None:
+                _promoted_aggregate, _promoted_artifacts = _version_serving_summary(
+                    _promoted_v
+                )
+                _promoted_gap = summarize_required_artifact_gap(_promoted_artifacts)
+            # Real serving SHA only — NEVER a promoted_sha stand-in. Fall back to
+            # the promoted version's served_sha only once aggregate required-artifact
+            # truth says that promotion actually shipped.
+            if (
+                not _deployed_sha
+                and _promoted_v is not None
+                and _promoted_aggregate is not None
+                and _promoted_aggregate["serving_status"] == "serving_confirmed"
+            ):
                 _deployed_sha = _promoted_v.served_sha
             _undeployed_dirs = (
                 (recent_interventions or {}).get("undeployed_directions") or []
@@ -3972,6 +4116,12 @@ async def _spawn_strategic_review(
                 "deployed_sha": (_deployed_sha or "")[:12] or None,
                 "deployed_revision": _deployed_revision,
                 "deploy_status": _deploy_status,
+                # Rollback provenance (self-repo only; None/0 otherwise) — the
+                # same truth operators already see in the deploy panel.
+                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12]
+                or None,
+                "rollback_count": _rollback_count,
+                "rollback_reason": _rollback_reason,
                 "promoted_version": (
                     _promoted_v.version_number if _promoted_v else None
                 ),
@@ -3984,11 +4134,17 @@ async def _spawn_strategic_review(
                 # the strategist see whether "promoted" actually shipped vs is
                 # still unconfirmed or failed to deploy.
                 "promoted_serving_status": (
-                    _promoted_v.serving_status if _promoted_v else None
+                    _promoted_aggregate["serving_status"]
+                    if _promoted_aggregate
+                    else None
                 ),
                 "promoted_deploy_failure_reason": (
-                    _promoted_v.deploy_failure_reason if _promoted_v else None
+                    _promoted_aggregate["reason_code"]
+                    if _promoted_aggregate
+                    else None
                 ),
+                "promoted_artifacts": _promoted_artifacts,
+                "promoted_artifact_gap": _promoted_gap,
                 "open_version": (
                     _open_version.version_number if _open_version else None
                 ),
@@ -4029,6 +4185,62 @@ async def _spawn_strategic_review(
                     f"{prompt_suffix}\n{_deploy_line}"
                     if prompt_suffix
                     else _deploy_line
+                )
+            # Stabilization directive — symmetric to the deploy_failed /
+            # unconfirmed recovery directives, but driven by the orchestrator's
+            # OWN deploy status (self-repo only). When the pipeline has
+            # ROLLED_BACK (reverted to last-known-good) or HALTED (repeated
+            # rollbacks → manual-intervention needed), stabilization is the
+            # priority for the cycle: scrutinize the rolled-back-from change
+            # rather than spawn more risky feature work, and (for HALTED)
+            # recognize the repeated-rollback halt. Best-effort and naturally
+            # scoped to self-repo since _deploy_status is only read there.
+            if _deploy_status in (
+                DeploymentStatus.ROLLED_BACK,
+                DeploymentStatus.HALTED,
+            ):
+                _from_txt = (
+                    f" The rolled-back-from SHA is "
+                    f"{(_rolled_back_from_sha or '')[:12]}."
+                    if _rolled_back_from_sha
+                    else ""
+                )
+                _reason_txt = (
+                    f" Rollback reason: {_rollback_reason}."
+                    if _rollback_reason
+                    else ""
+                )
+                _count_txt = (
+                    f" Consecutive rollbacks: {_rollback_count}."
+                    if _rollback_count
+                    else ""
+                )
+                if _deploy_status == DeploymentStatus.HALTED:
+                    _stabilize_directive = (
+                        f"Deployment HALTED (see `deployment_state.deploy_status` "
+                        f"= 'HALTED') — the pipeline has rolled back repeatedly and "
+                        f"now needs manual intervention.{_count_txt}{_from_txt}"
+                        f"{_reason_txt} Treat STABILIZATION as the TOP priority for "
+                        f"this cycle: scrutinize the rolled-back-from change and the "
+                        f"repeated-rollback cause, do NOT advance focus or spawn more "
+                        f"risky feature work as if the milestone shipped. Recognize "
+                        f"this is a repeated-rollback halt, not a one-off."
+                    )
+                else:
+                    _stabilize_directive = (
+                        f"Deployment ROLLED BACK (see "
+                        f"`deployment_state.deploy_status` = 'ROLLED_BACK') — the "
+                        f"orchestrator reverted its own live deploy to the last "
+                        f"known good.{_count_txt}{_from_txt}{_reason_txt} Treat "
+                        f"STABILIZATION as the priority for this cycle: scrutinize "
+                        f"the rolled-back-from change rather than spawn more risky "
+                        f"feature work, and do NOT advance focus as if the milestone "
+                        f"shipped."
+                    )
+                prompt_suffix = (
+                    f"{prompt_suffix}\n{_stabilize_directive}"
+                    if prompt_suffix
+                    else _stabilize_directive
                 )
         except Exception:
             logger.exception(
@@ -4188,11 +4400,15 @@ async def _spawn_strategic_review(
         _verdict_txt = ""
         _prior_serving_status: str | None = None
         _prior_deploy_reason: str | None = None
+        _prior_artifact_gap: str | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
             for _v in await _rcv(
-                session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                session,
+                project.id,
+                limit=_VERSION_PHASE_RECENT_VERSIONS_CAP,
+                include_artifacts=True,
             ):
                 if _v.version_number == _prior_n and _v.status == "promoted":
                     if _v.promoted_at is not None:
@@ -4200,8 +4416,12 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
-                    _prior_serving_status = _v.serving_status
-                    _prior_deploy_reason = _v.deploy_failure_reason
+                    _prior_aggregate, _prior_artifacts = _version_serving_summary(_v)
+                    _prior_serving_status = _prior_aggregate["serving_status"]
+                    _prior_deploy_reason = _prior_aggregate["reason_code"]
+                    _prior_artifact_gap = summarize_required_artifact_gap(
+                        _prior_artifacts
+                    )
                     break
         except Exception:
             logger.exception(
@@ -4215,6 +4435,11 @@ async def _spawn_strategic_review(
             _reason_txt = (
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
+            _artifact_txt = (
+                f" Evidence: {_prior_artifact_gap}."
+                if _prior_artifact_gap
+                else ""
+            )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
                 f"{_target}{_promoted_when} but its deploy DID NOT confirm "
@@ -4226,8 +4451,14 @@ async def _spawn_strategic_review(
                 f"Your TOP priority this cycle is recovering the failed deploy "
                 f"(roll forward a fix / investigate why the promoted SHA never "
                 f"served); only after it is serving should you move focus on."
+                f"{_artifact_txt}"
             )
         elif _prior_serving_status == "unconfirmed":
+            _artifact_txt = (
+                f" Evidence: {_prior_artifact_gap}."
+                if _prior_artifact_gap
+                else ""
+            )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
                 f"(merged) to {_target}{_promoted_when}{_verdict_txt}, but its "
@@ -4238,7 +4469,7 @@ async def _spawn_strategic_review(
                 f"resolve it to serving_confirmed or deploy_failed shortly. You "
                 f"may begin setting v{_cur_n}'s mission, but do not declare "
                 f"v{_prior_n} live until serving is confirmed, and do NOT "
-                f"re-promote/re-qualify v{_prior_n}."
+                f"re-promote/re-qualify v{_prior_n}.{_artifact_txt}"
             )
         else:
             _post_promote_hint = (
@@ -4288,7 +4519,7 @@ async def _spawn_strategic_review(
             from app.release_version import recent_closed_versions as _rcv
 
             for _v in await _rcv(
-                session, project.id, limit=1
+                session, project.id, limit=1, include_artifacts=True
             ):
                 if _v.status == "promoted":
                     _latest_promoted_version = _v
@@ -4297,10 +4528,29 @@ async def _spawn_strategic_review(
             logger.exception(
                 "[STRATEGIC] failed-deploy directive: latest promoted lookup failed; continuing"
             )
-        if _latest_promoted_version is not None and _latest_promoted_version.serving_status == "deploy_failed":
+        if _latest_promoted_version is not None:
+            _latest_promoted_aggregate, _latest_promoted_artifacts = (
+                _version_serving_summary(_latest_promoted_version)
+            )
+            _latest_artifact_gap = summarize_required_artifact_gap(
+                _latest_promoted_artifacts
+            )
+        else:
+            _latest_promoted_aggregate = None
+            _latest_artifact_gap = None
+        if (
+            _latest_promoted_version is not None
+            and _latest_promoted_aggregate is not None
+            and _latest_promoted_aggregate["serving_status"] == "deploy_failed"
+        ):
             _reason_txt = (
-                f" (reason={_latest_promoted_version.deploy_failure_reason})"
-                if _latest_promoted_version.deploy_failure_reason
+                f" (reason={_latest_promoted_aggregate['reason_code']})"
+                if _latest_promoted_aggregate["reason_code"]
+                else ""
+            )
+            _artifact_txt = (
+                f" Evidence: {_latest_artifact_gap}."
+                if _latest_artifact_gap
                 else ""
             )
             _failed_deploy_directive = (
@@ -4314,7 +4564,7 @@ async def _spawn_strategic_review(
                 f"THIS deploy is confirmed serving — recovering the SAME promoted SHA "
                 f"(a slow or boot-crashed deploy that later comes up healthy) resolves "
                 f"it automatically; you do NOT need to cut and promote a subsequent "
-                f"version for it to clear."
+                f"version for it to clear.{_artifact_txt}"
             )
             prompt_suffix = (
                 f"{prompt_suffix}\n{_failed_deploy_directive}"
@@ -4719,8 +4969,12 @@ async def _spawn_strategic_review(
     # the advisory hint is appended to the cycle prompt_suffix.
     _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
     _missing_demand_present = bool(_missing_demand.get("demands"))
+    _sr_registry_names = registry_capability_names(project.problem_model)
+    _sr_available_capabilities = registry_capability_vocabulary(project.problem_model)
     if _missing_demand_present:
-        _missing_demand_hint = missing_demand_prompt_hint(_missing_demand)
+        _missing_demand_hint = missing_demand_prompt_hint(
+            _missing_demand, registry_names=_sr_registry_names
+        )
         if _missing_demand_hint:
             prompt_suffix = (
                 f"{prompt_suffix}\n{_missing_demand_hint}"
@@ -4889,6 +5143,11 @@ async def _spawn_strategic_review(
             **(
                 {"missing_capability_demand": _missing_demand}
                 if _missing_demand_present
+                else {}
+            ),
+            **(
+                {"available_capabilities": _sr_available_capabilities}
+                if _sr_available_capabilities
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

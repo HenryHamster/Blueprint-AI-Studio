@@ -102,6 +102,12 @@ describe('ConversionRateCard', () => {
     render(<ConversionRateCard rate={0.1} loading={false} />);
     expect(screen.getByText('10%')).toHaveClass('text-red-400');
   });
+
+  it('labels the denominator as PR-eligible tasks, not all tasks', () => {
+    render(<ConversionRateCard rate={0.6} loading={false} />);
+    expect(screen.getByText('PRs merged / PR-eligible tasks created')).toBeInTheDocument();
+    expect(screen.queryByText('PRs merged / tasks created')).toBeNull();
+  });
 });
 
 describe('AcceptanceRateCard', () => {

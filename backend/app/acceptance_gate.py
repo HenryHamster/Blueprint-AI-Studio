@@ -35,12 +35,23 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import uuid
 import operator
+import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+from app.landed_signal import merge_verification_status
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
+
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.artifact_prerequisites import downstream_artifact_logical_key
+from app.models import Artifact
+from app.models import ArtifactConsumption
 from app.models import Task
+from app.models import TaskStatus
 from app.payload_schemas import (
     AcceptanceEvidence,
     _looks_like_test_file,
@@ -114,12 +125,24 @@ class AcceptanceGateVerdict:
     answers whether the declared evidence is genuinely present/exercised to the
     extent checkable at completion; a False ``satisfied`` is the honest
     fail-closed outcome.
+
+    ``proven`` is a STRICTER axis than ``satisfied``: it is True only when the
+    claim was machine-checked — a satisfied ``named_test`` (the test is in the
+    diff, ran green under a real merge-test verdict, and exercises a changed
+    production seam). A satisfied ``observable_behavior`` / ``downstream_artifact``
+    is ``satisfied=True`` but ``proven=False`` (it proves only that a diff
+    shipped, not that the specific claim holds), and every fail-closed /
+    unsatisfied / undeclared case is ``proven=False``. ``satisfied`` semantics
+    and every downstream consumer of it are unchanged; ``proven`` is purely
+    additive so callers can distinguish machine-checked proof from
+    merely-delivered work.
     """
 
     declared: bool
     satisfied: bool
     kind: str | None
     reason: str
+    proven: bool = False
 
 
 def _changed_files(task: Task) -> list[str]:
@@ -219,6 +242,81 @@ def _evaluate_named_test(
         f"named_test {declared_path!r} was added/modified, ran green under a "
         f"verified merge, and exercises a changed production seam "
         f"({len(seam_files)} non-test file(s))",
+        proven=True,
+    )
+
+
+def _artifact_tokens(artifact_id: str) -> list[str]:
+    """Substantive lowercase tokens of an ``artifact_id``, split on non-alphanums.
+
+    ``release-deploy-artifact-registry`` → ``["release", "deploy", "registry"]``.
+    Single-character and generic structural tokens (``artifact``) carry no
+    grounding signal — a changed path almost always contains them — so they are
+    dropped, leaving only tokens that meaningfully tie the declaration to a file.
+    """
+    raw = [t for t in re.split(r"[^a-z0-9]+", artifact_id.lower()) if t]
+    generic = {"artifact", "artifacts"}
+    return [t for t in raw if len(t) > 1 and t not in generic]
+
+
+def _artifact_grounded(artifact_id: str, changed: list[str]) -> bool:
+    """Whether a changed-file path reflects the declared ``artifact_id``.
+
+    Grounds the declaration in what actually shipped: at least one substantive
+    token of the artifact_id must appear as a token within a changed-file path
+    (path split on non-alphanumerics, so ``release_promotion.py`` yields
+    ``release``/``promotion``/``py``). Mirrors ``_paths_match``'s tolerance for
+    differing path/slug conventions without requiring an exact basename match.
+    """
+    tokens = _artifact_tokens(artifact_id)
+    if not tokens:
+        return False
+    for path in changed:
+        path_tokens = {t for t in re.split(r"[^a-z0-9]+", path.lower()) if t}
+        if any(t in path_tokens for t in tokens):
+            return True
+    return False
+
+
+def _evaluate_downstream_artifact(
+    evidence: AcceptanceEvidence, changed: list[str]
+) -> AcceptanceGateVerdict:
+    """Grounded gate for a ``downstream_artifact`` acceptance declaration.
+
+    Unlike ``observable_behavior`` (which only requires a non-empty diff), a
+    ``downstream_artifact`` names a concrete ``artifact_id`` a later task
+    consumes. Satisfied only when that declared artifact_id is reflected in the
+    shipped changed files (a substantive token of the slug appears in a changed
+    path) — so a meaningful-sounding artifact_id paired with a completely
+    unrelated diff fails closed. An empty diff shipped nothing to ground against
+    and also fails closed. Satisfied but never machine-checked (``proven=False``):
+    a path-token match shows the artifact was plausibly delivered, not that a
+    downstream consumer actually exercised it.
+    """
+    if not changed:
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            "declared downstream_artifact acceptance evidence but the task "
+            "shipped no changed files to deliver it",
+        )
+    artifact_id = (evidence.artifact_id or "").strip()
+    if not _artifact_grounded(artifact_id, changed):
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared downstream_artifact {artifact_id!r} is not reflected in "
+            f"any of the {len(changed)} shipped changed file(s) — the diff does "
+            "not deliver the named artifact",
+        )
+    return AcceptanceGateVerdict(
+        True,
+        True,
+        evidence.kind,
+        f"downstream_artifact {artifact_id!r} is reflected in the shipped "
+        "changed files",
     )
 
 
@@ -243,13 +341,16 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     if evidence.kind == "named_test":
         return _evaluate_named_test(evidence, changed, verified)
 
-    # observable_behavior / downstream_artifact carry no machine-checkable
-    # assertion the backend can independently re-run at completion. To the extent
-    # checkable, require that the task actually shipped a real diff (a non-empty
-    # changed-file set) — a declared behavior/artifact with an empty diff shipped
-    # nothing to exercise, so it fails closed. The declaration's substance
-    # (non-trivial description / artifact_id) is already enforced at validation.
-    if evidence.kind in ("observable_behavior", "downstream_artifact"):
+    if evidence.kind == "downstream_artifact":
+        return _evaluate_downstream_artifact(evidence, changed)
+
+    # observable_behavior carries no machine-checkable assertion the backend can
+    # independently re-run at completion. To the extent checkable, require that
+    # the task actually shipped a real diff (a non-empty changed-file set) — a
+    # declared behavior with an empty diff shipped nothing to exercise, so it
+    # fails closed. The declaration's substance (non-trivial description) is
+    # already enforced at validation.
+    if evidence.kind == "observable_behavior":
         if not changed:
             return AcceptanceGateVerdict(
                 True,
@@ -277,10 +378,10 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
 
     No-op (returns ``None``, writes nothing) when the task declared no acceptance
     evidence, so undeclared/legacy tasks keep their context untouched and their
-    scoring unchanged. Otherwise records ``{satisfied, kind, reason}`` under
-    :data:`CODE_ACCEPTANCE_VERDICT_KEY` so later scoring
-    (:func:`acceptance_blocks_success`) can consume it. The caller is responsible
-    for committing.
+    scoring unchanged. Otherwise records ``{satisfied, proven, kind, reason}``
+    under :data:`CODE_ACCEPTANCE_VERDICT_KEY` so later scoring
+    (:func:`acceptance_blocks_success`, :func:`acceptance_is_proven`) can consume
+    it. The caller is responsible for committing.
     """
     verdict = evaluate_code_acceptance(task)
     if not verdict.declared:
@@ -288,6 +389,7 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
     ctx = dict(task.context or {})
     ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
         "satisfied": verdict.satisfied,
+        "proven": verdict.proven,
         "kind": verdict.kind,
         "reason": verdict.reason,
     }
@@ -307,3 +409,253 @@ def acceptance_blocks_success(recorded: Any) -> bool:
     if not isinstance(recorded, dict):
         return False
     return recorded.get("satisfied") is False
+
+
+def acceptance_was_declared(recorded: Any) -> bool:
+    """Whether a task DECLARED acceptance evidence (any kind) at plan time.
+
+    ``True`` exactly when a verdict dict was recorded — the verdict is stamped
+    only for tasks that declared evidence (see
+    :func:`record_code_acceptance_verdict`, which no-ops on the undeclared case),
+    so the presence of the key is itself the declaration signal. Undeclared and
+    legacy rows (no key, ``None``, or any non-dict) return ``False``. Feeds the
+    additive declaration-coverage aggregate without touching any existing count.
+    """
+    return isinstance(recorded, dict)
+
+
+def acceptance_is_proven(recorded: Any) -> bool:
+    """Whether a recorded verdict is machine-checked PROVEN, not merely delivered.
+
+    ``True`` only when a verdict was recorded AND it carries ``proven is True`` —
+    i.e. a satisfied ``named_test`` that ran green under a real merge-test verdict
+    and exercises a changed production seam. A satisfied
+    ``observable_behavior`` / ``downstream_artifact`` (soft / asserted by a
+    shipped diff only), every unsatisfied / fail-closed case, and all undeclared
+    or legacy rows return ``False``. This is the additive TRUE proven signal,
+    strictly distinct from ``verified_prs_merged`` (which still credits soft and
+    undeclared merges). Tolerant of legacy verdict dicts written before the
+    ``proven`` key existed — a missing key reads as ``False``, never proven.
+    """
+    if not isinstance(recorded, dict):
+        return False
+    return recorded.get("proven") is True
+
+
+def acceptance_is_consumed(recorded: Any) -> bool:
+    """Whether a downstream_artifact verdict has been proven by consumption."""
+    if not isinstance(recorded, dict):
+        return False
+    return recorded.get("consumed") is True
+
+
+def _fallback_consumed_artifact_ids(task: Task) -> list[uuid.UUID]:
+    """Delivered artifact prerequisites from direct dependencies for old agents."""
+    depends_on = {str(dep) for dep in (task.depends_on or []) if dep}
+    if not depends_on:
+        return []
+    raw = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    if not isinstance(raw, list):
+        return []
+    ids: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_task_id") or "") not in depends_on:
+            continue
+        try:
+            artifact_id = uuid.UUID(str(item.get("artifact_id") or ""))
+        except (TypeError, ValueError):
+            continue
+        if artifact_id not in seen:
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+    return ids
+
+
+def _authorized_consumed_artifact_ids(task: Task) -> set[uuid.UUID]:
+    """Artifact ids explicitly delivered to this task and therefore reportable."""
+    delivered = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    if not isinstance(delivered, list):
+        return set()
+    allowed: set[uuid.UUID] = set()
+    for item in delivered:
+        if not isinstance(item, dict):
+            continue
+        try:
+            artifact_id = uuid.UUID(str(item.get("artifact_id") or ""))
+        except (TypeError, ValueError):
+            continue
+        allowed.add(artifact_id)
+    return allowed
+
+
+def _normalize_consumed_artifact_ids(
+    task: Task, consumed_artifact_ids: Iterable[uuid.UUID | str] | None
+) -> list[uuid.UUID]:
+    if consumed_artifact_ids is None:
+        raw = _fallback_consumed_artifact_ids(task)
+    else:
+        raw = list(consumed_artifact_ids)
+    allowed = _authorized_consumed_artifact_ids(task) if consumed_artifact_ids is not None else set()
+    ids: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for value in raw:
+        try:
+            artifact_id = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+        if consumed_artifact_ids is not None and artifact_id not in allowed:
+            continue
+        if artifact_id not in seen:
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+    return ids
+
+
+async def record_artifact_consumptions_for_task(
+    task: Task,
+    session,
+    consumed_artifact_ids: Iterable[uuid.UUID | str] | None = None,
+) -> list[ArtifactConsumption]:
+    """Persist consumption rows and upgrade matching producer verdicts.
+
+    Idempotent and additive: duplicate reports no-op, missing/legacy producer
+    verdicts are left untouched, and existing proven/consumed verdicts are never
+    downgraded.
+    """
+    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids)
+    if not ids:
+        return []
+
+    artifacts = (
+        (await session.execute(select(Artifact).where(Artifact.id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    artifacts_by_id = {artifact.id: artifact for artifact in artifacts}
+    recorded: list[ArtifactConsumption] = []
+    recorded_id_strings: list[str] = []
+
+    for artifact_id in ids:
+        artifact = artifacts_by_id.get(artifact_id)
+        if artifact is None:
+            continue
+        producer = await session.get(Task, artifact.task_id)
+        if producer is None or producer.project_id != task.project_id:
+            continue
+        existing = (
+            (
+                await session.execute(
+                    select(ArtifactConsumption).where(
+                        ArtifactConsumption.consumer_task_id == task.id,
+                        ArtifactConsumption.artifact_id == artifact.id,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is None:
+            existing = ArtifactConsumption(
+                artifact_id=artifact.id,
+                consumer_task_id=task.id,
+                producer_task_id=artifact.task_id,
+                logical_key=artifact.logical_key,
+            )
+            session.add(existing)
+            await session.flush()
+        recorded.append(existing)
+        recorded_id_strings.append(str(artifact.id))
+
+        declared_key = downstream_artifact_logical_key(producer)
+        if (
+            not declared_key
+            or artifact.logical_key != declared_key
+        ):
+            continue
+        producer_ctx = dict(producer.context or {})
+        verdict = producer_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not (
+            isinstance(verdict, dict)
+            and verdict.get("kind") == "downstream_artifact"
+            and verdict.get("satisfied") is True
+        ):
+            continue
+        upgraded = dict(verdict)
+        if upgraded.get("proven") is not True or upgraded.get("consumed") is not True:
+            upgraded["proven"] = True
+            upgraded["consumed"] = True
+            upgraded["consumed_by_task_id"] = str(task.id)
+            upgraded["consumed_artifact_id"] = str(artifact.id)
+            producer_ctx[CODE_ACCEPTANCE_VERDICT_KEY] = upgraded
+            producer.context = producer_ctx
+            flag_modified(producer, "context")
+            session.add(producer)
+
+    if recorded_id_strings:
+        ctx = dict(task.context or {})
+        prior = ctx.get("consumed_artifact_ids")
+        merged = [str(v) for v in prior] if isinstance(prior, list) else []
+        for artifact_id in recorded_id_strings:
+            if artifact_id not in merged:
+                merged.append(artifact_id)
+        ctx["consumed_artifact_ids"] = merged
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+    return recorded
+
+
+def classify_merged_acceptance(task: Task) -> str:
+    """Classify one merged task into the release acceptance buckets.
+
+    Buckets are deliberately additive and fail-safe:
+      * ``proven`` — non-degraded merge with satisfied declared acceptance;
+      * ``declared_unsatisfied`` — non-degraded merge with declared evidence
+        that failed;
+      * ``merged_unverified_degraded`` — merge whose verification was degraded;
+      * ``no_declaration`` — non-degraded merge with no recorded declaration.
+
+    Undeclared / legacy rows stay neutral by falling into ``no_declaration``.
+    """
+    if merge_verification_status(task) == "unverified_degraded":
+        return "merged_unverified_degraded"
+    recorded = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    if not isinstance(recorded, dict):
+        return "no_declaration"
+    if acceptance_blocks_success(recorded):
+        return "declared_unsatisfied"
+    if acceptance_is_consumed(recorded):
+        return "consumed"
+    return "proven"
+
+
+def summarize_version_acceptance_aggregate(
+    tasks: Iterable[Task],
+) -> dict[str, Any]:
+    """Summarize one version window's merged tasks into acceptance buckets."""
+    aggregate: dict[str, Any] = {
+        "merged": 0,
+        "proven": 0,
+        "consumed": 0,
+        "declared_unsatisfied": 0,
+        "merged_unverified_degraded": 0,
+        "no_declaration": 0,
+    }
+    for task in tasks:
+        if task.status != TaskStatus.COMPLETED:
+            continue
+        aggregate["merged"] += 1
+        bucket = classify_merged_acceptance(task)
+        aggregate[bucket] += 1
+        if bucket == "consumed":
+            aggregate["proven"] += 1
+    aggregate["proven_rate"] = (
+        round(aggregate["proven"] / aggregate["merged"], 3)
+        if aggregate["merged"] > 0
+        else None
+    )
+    return aggregate

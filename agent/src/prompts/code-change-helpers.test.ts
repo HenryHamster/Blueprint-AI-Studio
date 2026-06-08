@@ -29,6 +29,7 @@ vi.mock('fs', () => ({
 import {
   detectLinterKind,
   buildScopedLintOneliner,
+  sanitizeCiFailureSelectors,
 } from './code-change-helpers.js';
 
 describe('writeCodeChangeHelpers — self-review fallback', () => {
@@ -962,5 +963,84 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     expect(payload).not.toHaveProperty('blocked_need');
     expect(payload?.logs).toBe('BLOCKER: just a reason');
     expect(payload?.failure_category).toBe('BLOCKED_PRECONDITION');
+  });
+});
+
+// ── sanitizeCiFailureSelectors ───────────────────────────────────────────────
+// The ci_failure closed-loop gate interpolates these node-ids into the
+// generated ./check bash AND passes them to scripts/test-backend.sh. The
+// sanitizer is the injection-safety boundary (shell-safe pytest node-ids only)
+// AND the path normalizer (the harness runs pytest from the backend root, so
+// node-ids are backend-relative). Anything malformed is dropped (graceful
+// degradation) — never a hard block on a weird selector.
+describe('sanitizeCiFailureSelectors', () => {
+  it('accepts well-formed pytest node-ids (with and without ::nodeid)', () => {
+    expect(sanitizeCiFailureSelectors([
+      'testing/test_strategic_spawning.py::test_x',
+      'testing/test_release_qualifier.py',
+    ])).toEqual([
+      'testing/test_strategic_spawning.py::test_x',
+      'testing/test_release_qualifier.py',
+    ]);
+  });
+
+  it('strips a leading backend/ prefix (harness runs pytest from backend root)', () => {
+    expect(sanitizeCiFailureSelectors(['backend/testing/test_models.py::test_create']))
+      .toEqual(['testing/test_models.py::test_create']);
+  });
+
+  it('normalizes Windows backslashes to forward slashes', () => {
+    expect(sanitizeCiFailureSelectors(['testing\\test_win.py::test_z']))
+      .toEqual(['testing/test_win.py::test_z']);
+  });
+
+  it('preserves parametrized node-ids ([param] ids)', () => {
+    expect(sanitizeCiFailureSelectors(['testing/test_a.py::test_b[case-1]']))
+      .toEqual(['testing/test_a.py::test_b[case-1]']);
+  });
+
+  it('dedups (after backend/ stripping) and preserves first-seen order', () => {
+    expect(sanitizeCiFailureSelectors([
+      'testing/test_dup.py::t',
+      'backend/testing/test_dup.py::t',
+      'testing/test_other.py::t',
+    ])).toEqual(['testing/test_dup.py::t', 'testing/test_other.py::t']);
+  });
+
+  it('drops shell-unsafe selectors (injection-safety boundary)', () => {
+    expect(sanitizeCiFailureSelectors([
+      'testing/test_ok.py::test_good',
+      'evil; rm -rf /',
+      'testing/test_x.py::test_y && echo pwned',
+      'testing/test_x.py::test_y | cat',
+      "testing/test_x.py::test_'quote",
+      'testing/test_x.py::test_$(whoami)',
+      '$(rm -rf /)',
+    ])).toEqual(['testing/test_ok.py::test_good']);
+  });
+
+  it('drops non-testing/ paths (only the backend test tree is in scope)', () => {
+    expect(sanitizeCiFailureSelectors([
+      'app/main.py::test_not_in_testing',
+      'src/foo.test.ts',
+      'testing/test_real.py::test_ok',
+    ])).toEqual(['testing/test_real.py::test_ok']);
+  });
+
+  it('returns [] for undefined / empty / all-blank input', () => {
+    expect(sanitizeCiFailureSelectors(undefined)).toEqual([]);
+    expect(sanitizeCiFailureSelectors([])).toEqual([]);
+    expect(sanitizeCiFailureSelectors(['', '   ', '\t'])).toEqual([]);
+  });
+
+  it('skips non-string entries defensively', () => {
+    // Callers are typed string[], but a malformed payload could carry holes.
+    expect(sanitizeCiFailureSelectors([
+      // @ts-expect-error intentional malformed entry
+      null,
+      'testing/test_ok.py::test_good',
+      // @ts-expect-error intentional malformed entry
+      42,
+    ])).toEqual(['testing/test_ok.py::test_good']);
   });
 });

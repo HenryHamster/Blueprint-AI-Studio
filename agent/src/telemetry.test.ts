@@ -8,11 +8,18 @@ import {
   recordLlmTokens,
   getLlmTelemetry,
   resetLlmTelemetry,
+  recordFormatMiss,
+  recordFormatRepairAttempt,
+  recordFormatRepairSuccess,
+  getFormatComplianceTelemetry,
+  resetFormatComplianceTelemetry,
   estimateTokensFromChars,
 } from './telemetry.js';
+import { extractJsonObjectDetailed } from './json-extract.js';
 
 beforeEach(() => {
   resetLlmTelemetry();
+  resetFormatComplianceTelemetry();
   setCurrentPromptFingerprint(null);
 });
 
@@ -75,6 +82,87 @@ describe('LLM telemetry', () => {
     recordLlmTokens(500, 250);
     resetLlmTelemetry();
     expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0 });
+  });
+});
+
+describe('format-compliance telemetry', () => {
+  it('starts at zero', () => {
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: {},
+      format_error_total: 0,
+      format_repair_attempts: 0,
+      format_repair_successes: 0,
+    });
+  });
+
+  it('records a malformed-then-repaired sequence driven by real extraction verdicts', () => {
+    // Initial FINAL output: schema keys present but the JSON object is truncated
+    // (unbalanced) — the extraction layer is the GROUND TRUTH for the reason.
+    const malformed = '{"summary": "did the thing", "reasoning": "because"';
+    const firstVerdict = extractJsonObjectDetailed(malformed, 'summary', 'reasoning');
+    expect(firstVerdict.ok).toBe(false);
+    if (firstVerdict.ok) throw new Error('expected miss');
+    expect(firstVerdict.reason).toBe('unbalanced_json');
+
+    // Memo-handler self-repair path: record the verdict's reason, the attempt,
+    // then re-extract the repaired output and record success.
+    recordFormatMiss(firstVerdict.reason);
+    recordFormatRepairAttempt();
+
+    const repaired = '{"summary": "did the thing", "reasoning": "because", "citations": [], "tags": []}';
+    const retryVerdict = extractJsonObjectDetailed(repaired, 'summary', 'reasoning');
+    expect(retryVerdict.ok).toBe(true);
+    recordFormatRepairSuccess();
+
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: { unbalanced_json: 1 },
+      format_error_total: 1,
+      format_repair_attempts: 1,
+      format_repair_successes: 1,
+    });
+  });
+
+  it('buckets distinct reason classes separately and totals format errors', () => {
+    recordFormatMiss('missing_required_key');
+    recordFormatMiss('unbalanced_json');
+    recordFormatMiss('unbalanced_json');
+    recordFormatMiss('malformed_json');
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: {
+        missing_required_key: 1,
+        unbalanced_json: 2,
+        malformed_json: 1,
+      },
+      format_error_total: 4,
+      format_repair_attempts: 0,
+      format_repair_successes: 0,
+    });
+  });
+
+  it('snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatMiss('no_json_start');
+    const snap = getFormatComplianceTelemetry();
+    snap.format_miss_by_reason.no_json_start = 999;
+    snap.format_error_total = 999;
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: { no_json_start: 1 },
+      format_error_total: 1,
+      format_repair_attempts: 0,
+      format_repair_successes: 0,
+    });
+  });
+
+  it('reset clears all format-compliance counters', () => {
+    recordFormatMiss('unbalanced_json');
+    recordFormatRepairAttempt();
+    recordFormatRepairSuccess();
+    resetFormatComplianceTelemetry();
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: {},
+      format_error_total: 0,
+      format_repair_attempts: 0,
+      format_repair_successes: 0,
+    });
   });
 });
 

@@ -18,7 +18,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import strategic_cycle
-from app.direction_metrics import _compute_direction_quality_score
+from app.direction_metrics import (
+    _agg_proof_weighted_merged,
+    _compute_direction_quality_score,
+    proof_weighted_merged,
+)
 from app.direction_outcomes import verified_merged_count
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -696,6 +700,44 @@ def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
     }
 
 
+_SNAPSHOT_MAX_RECENT_CYCLES = 3
+_SNAPSHOT_FIELD_MAX = 300
+
+
+def _build_retirement_snapshot(direction: dict, rationale: str) -> Dict[str, Any]:
+    """Build a compact snapshot of a retired direction for memo context.
+
+    Reads success_evidence and retirement_condition from direction["context"]
+    (read-only — never writes back). Handles absent context dict gracefully.
+    Bounds string lengths and recent history size to keep payloads small.
+    """
+    ctx = direction.get("context") or {}
+    success_evidence = (ctx.get("success_evidence") or "")[:_SNAPSHOT_FIELD_MAX]
+    retirement_condition = (ctx.get("retirement_condition") or "")[:_SNAPSHOT_FIELD_MAX]
+    direction_text = (direction.get("text") or "")[:_SNAPSHOT_FIELD_MAX]
+
+    history = direction.get("research_history") or []
+    recent = history[-_SNAPSHOT_MAX_RECENT_CYCLES:] if history else []
+    recent_history_summary = [
+        {
+            "cycles": h.get("cycles", 1),
+            "prs_merged": h.get("prs_merged", 0),
+            "tasks_completed": h.get("tasks_completed", 0),
+            "tasks_failed": h.get("tasks_failed", 0),
+        }
+        for h in recent
+    ]
+
+    return {
+        "direction_text": direction_text,
+        "success_evidence": success_evidence,
+        "retirement_condition": retirement_condition,
+        "rationale": rationale[:_SNAPSHOT_FIELD_MAX],
+        "recent_history_summary": recent_history_summary,
+        "retirement_metrics": _build_retirement_metrics(direction),
+    }
+
+
 def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
@@ -723,6 +765,25 @@ def _collect_retirement_metrics(
         if d is not None:
             result[did] = _build_retirement_metrics(d)
     return result
+
+
+def _snapshot_has_substantive_context(snapshot: dict) -> bool:
+    """Return True when the snapshot carries enough context to synthesize a meaningful memo.
+
+    retirement_metrics is checked for non-zero activity (final_prs_merged or
+    final_cycles_active) because _build_retirement_metrics always returns a dict.
+    """
+    metrics = snapshot.get("retirement_metrics") or {}
+    metrics_substantive = bool(
+        metrics.get("final_prs_merged") or metrics.get("final_cycles_active")
+    )
+    return bool(
+        snapshot.get("direction_text")
+        or snapshot.get("success_evidence")
+        or snapshot.get("retirement_condition")
+        or metrics_substantive
+        or snapshot.get("recent_history_summary")
+    )
 
 
 async def _spawn_retirement_memos(
@@ -778,46 +839,114 @@ async def _spawn_retirement_memos(
         direction_text = (direction.get("text") or "") if direction else ""
         rationale = rationales.get(did) or ""
         topic = direction_text[:120] or f"Direction {did}"
+        snapshot = _build_retirement_snapshot(direction or {}, rationale)
+        snapshot["source_task_id"] = str(task.id)
+        success_evidence = snapshot.get("success_evidence") or ""
+        retirement_condition = snapshot.get("retirement_condition") or ""
         memo_payload = validate_internal_payload(
             {
                 "type": "memo",
                 "topic": f"Direction retired: {topic}",
                 "reasoning_kind": "direction_retirement",
                 "direction_id": did,
+                "source_finding": snapshot,
                 **({"retirement_rationale": rationale} if rationale else {}),
             },
             "strategic_completion:memo:direction_retirement",
         )
+        context: Dict[str, Any] = {
+            "memo_reasoning_kind": "direction_retirement",
+            "memo_source_direction_id": did,
+            "memo_source_task_id": str(task.id),
+            **({"retirement_rationale": rationale} if rationale else {}),
+            **({"success_evidence": success_evidence} if success_evidence else {}),
+            **({"retirement_condition": retirement_condition} if retirement_condition else {}),
+        }
         memo_task = Task(
             project_id=project.id,
             title=f"Memo: direction retired — {topic[:100]}",
             description="Reasoning memo for retired direction",
             parent_task_id=task.id,
             payloads=[memo_payload],
-            context={
-                "memo_reasoning_kind": "direction_retirement",
-                "memo_source_direction_id": did,
-                "memo_source_task_id": str(task.id),
-                **({"retirement_rationale": rationale} if rationale else {}),
-            },
+            context=context,
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(memo_task)
-        # Synthesize the memo artifact at spawn time when rationale is available
-        # so the task is immediately COMPLETED and citable without provisioning a VM.
+        # Synthesize the memo artifact at spawn time when source_finding is
+        # available — works for both rationale-present and rationale-absent paths.
+        # The source_finding snapshot carries all decision context so synthesis
+        # is substantive even on auto-retirement paths with no rationale note.
         synthesized = False
         if rationale:
-            parts = [f"Retirement rationale: {rationale}"]
+            parts = []
             if direction_text:
-                parts.insert(0, f"Direction: {direction_text}")
+                parts.append(f"Direction: {direction_text}")
+            parts.append(f"Retirement rationale: {rationale}")
+            if success_evidence:
+                parts.append(f"Success evidence: {success_evidence}")
+            if retirement_condition:
+                parts.append(f"Retirement condition: {retirement_condition}")
+            metrics = snapshot.get("retirement_metrics") or {}
+            if metrics:
+                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                parts.append(f"Final metrics: {metrics_str}")
+            history = snapshot.get("recent_history_summary") or []
+            if history:
+                history_lines = [
+                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                    for i, h in enumerate(history)
+                ]
+                parts.append("Recent history:\n" + "\n".join(history_lines))
+            tags = ["direction-retirement"]
+            if success_evidence:
+                tags.append("success-evidence")
+            if retirement_condition:
+                tags.append("retirement-condition")
+            citations = [f"direction:{did}", f"task:{task.id}"]
             synth_memo = {
                 "summary": rationale[:200],
                 "reasoning": "\n\n".join(parts),
-                "citations": [f"direction:{did}", f"task:{task.id}"],
-                "tags": ["direction-retirement"],
+                "citations": citations,
+                "tags": tags,
+            }
+            _apply_synthesized_memo(memo_task, synth_memo, session)
+            synthesized = True
+        elif _snapshot_has_substantive_context(snapshot):
+            parts = []
+            if direction_text:
+                parts.append(f"Direction: {direction_text}")
+            if success_evidence:
+                parts.append(f"Success evidence: {success_evidence}")
+            if retirement_condition:
+                parts.append(f"Retirement condition: {retirement_condition}")
+            metrics = snapshot.get("retirement_metrics") or {}
+            if metrics:
+                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                parts.append(f"Final metrics: {metrics_str}")
+            history = snapshot.get("recent_history_summary") or []
+            if history:
+                history_lines = [
+                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                    for i, h in enumerate(history)
+                ]
+                parts.append("Recent history:\n" + "\n".join(history_lines))
+            tags = ["direction-retirement"]
+            if success_evidence:
+                tags.append("success-evidence")
+            if retirement_condition:
+                tags.append("retirement-condition")
+            citations = [f"direction:{did}", f"task:{task.id}"]
+            summary = direction_text[:200] or f"Direction {did} retired"
+            synth_memo = {
+                "summary": summary,
+                "reasoning": "\n\n".join(parts),
+                "citations": citations,
+                "tags": tags,
             }
             _apply_synthesized_memo(memo_task, synth_memo, session)
             synthesized = True
@@ -919,6 +1048,12 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     # count (and so count as non-merge finished work) to match the per-task
     # outcome layer. Benign-unverified and verified merges still count.
     merged = sum(verified_merged_count(e) for e in window)
+    # Proof-weighted merge volume drives the RATE gate so a direction whose merges
+    # are mostly undeclared/unproven (the "merely delivered" proxy) reads as a lower
+    # merge rate than one shipping proven work, and trips the churn guardrail where
+    # the proven direction does not. The displayed ``merged`` count stays the integer
+    # verified total. Legacy/read-only cycles degrade to the verified value.
+    proof_merged = sum(proof_weighted_merged(e) for e in window)
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -933,7 +1068,7 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
         0, (tasks_complete - no_pr_completions) + code_failed - merged
     )
     total_finished = merged + non_merge_finished
-    merge_rate = merged / total_finished if total_finished > 0 else 0.0
+    merge_rate = proof_merged / total_finished if total_finished > 0 else 0.0
     return {
         "window_cycles": len(window),
         "merged": merged,
@@ -985,7 +1120,14 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     total_finished = lifetime_merged + lifetime_non_merge_finished
     if total_finished == 0:
         return None
-    lifetime_merge_rate = lifetime_merged / total_finished
+    # Proof-weighted lifetime merge volume drives the RATE gate (same rationale as
+    # _compute_churn_metrics): undeclared/unproven lifetime merges count for less, so
+    # a slow-burn direction shipping only unprovable work trips the backstop where a
+    # proven one does not. Displayed lifetime_merged stays the integer verified total.
+    proof_lifetime_merged = sum(
+        proof_weighted_merged(e) for e in history
+    ) + _agg_proof_weighted_merged(agg)
+    lifetime_merge_rate = proof_lifetime_merged / total_finished
     return {
         "lifetime_merged": lifetime_merged,
         "lifetime_non_merge_finished": lifetime_non_merge_finished,
@@ -1024,6 +1166,36 @@ def _direction_still_productive(direction: dict) -> bool:
     )
     consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
     return consecutive < skip_max
+
+
+def _recent_merges_mostly_unproven(direction: dict) -> bool:
+    """True when a direction's recent VERIFIED merges are essentially all
+    undeclared/unproven — the "merely delivered" proxy.
+
+    Used to STRIP the still-productive pause shield (Rules 2/5/6) from a direction
+    that keeps shipping merges no acceptance evidence backs, so a pile of
+    unprovable merges no longer out-protects a direction shipping proven work.
+    A proven (or even merely declared) direction keeps its shield: the proof-
+    weighted fraction stays at or above ``direction_proof_shield_min_fraction``.
+
+    Fail-safe: returns False when the rolling window has NO acceptance-aware merges
+    (legacy / read-only / research directions), so their shield is untouched and
+    behavior is unchanged for pre-acceptance data.
+    """
+    history = direction.get("research_history") or []
+    window_cycles = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    if window_cycles <= 0:
+        return False
+    window = history[-window_cycles:]
+    acc = [e for e in window if "acceptance_merged_write_total" in e]
+    verified = sum(verified_merged_count(e) for e in acc)
+    if verified <= 0:
+        return False
+    weighted = sum(proof_weighted_merged(e) for e in acc)
+    threshold = float(
+        _runtime_config.get("direction_proof_shield_min_fraction", 0.6) or 0.6
+    )
+    return (weighted / verified) < threshold
 
 
 def _already_built_signature(direction: dict) -> dict | None:
@@ -1098,8 +1270,13 @@ def _check_direction_health(direction: dict) -> str | None:
     # direction that is still demonstrably productive must not be pause-retired by a
     # zero-merge / churn / lifetime-burn signal. Code-failure rules (3, 4) below are
     # deliberately left UNGATED — a crashing direction pauses no matter how productive
-    # its last cycle looked.
-    still_productive = _direction_still_productive(direction)
+    # its last cycle looked. The shield is also FORFEIT when the direction's recent
+    # merges are essentially all undeclared/unproven (_recent_merges_mostly_unproven):
+    # "productive" must mean proven work, not a pile of merely-delivered merges, so
+    # such a direction no longer out-protects one shipping proven work.
+    still_productive = _direction_still_productive(
+        direction
+    ) and not _recent_merges_mostly_unproven(direction)
 
     if not in_grace:
         # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task

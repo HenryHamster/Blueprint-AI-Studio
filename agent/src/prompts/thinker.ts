@@ -3,6 +3,9 @@ import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode, persistAndPostStatus } from '../index.js';
 import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { extractJsonObjectDetailed } from '../json-extract.js';
+import { repairStructuredOutput } from '../handlers/structured-output-repair.js';
+import type { RepairStructuredOutputResult } from '../handlers/structured-output-repair.js';
 
 export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'): string {
   const blocks: string[] = [];
@@ -107,6 +110,13 @@ export interface ThinkerPromptParams {
   versionPhaseSection: string;
   memoCitationsSection: string;
   efficiencySnapshotSection: string;
+  /**
+   * Shared capability vocabulary section (canonical registry names + statuses)
+   * plus the uniform provides_capability / prerequisite declaration guidance.
+   * Built from the strategic payload's `available_capabilities` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  availableCapabilitiesSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -173,7 +183,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -375,6 +385,55 @@ export async function runThinkerWithGate(
     return { ok: false };
   }
 
+  let problemModelParseable = false;
+  try {
+    const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
+    if (problemModelProbe.ok) {
+      problemModelParseable = true;
+      try {
+        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+      }
+    }
+  } catch {
+    problemModelParseable = false;
+  }
+
+  let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
+  if (!problemModelParseable) {
+    problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['intent'],
+      first: {
+        exitCode: thinkerResult.exitCode,
+        allOutput: thinkerResult.allOutput,
+        lastResultText: thinkerResult.lastResultText,
+      },
+      reopenPrompt: [
+        'Your strategic run completed cleanly, but the required problem_model JSON was not parseable.',
+        'Output ONLY the problem_model JSON object now - no markdown, no explanation, no code fences.',
+        `Write the JSON for ${problemModelPath}.`,
+        'Schema reminder:',
+        '{"intent":{"purpose":"...","current_focus":"..."},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
+      ].join('\n'),
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing strategic problem-model JSON...',
+    });
+    if (problemModelRepair.value !== null) {
+      try {
+        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelRepair.value, null, 2)}\n`);
+        sendLog(ws, `[INFO] Recovered strategic problem-model JSON via bounded repair and wrote ${problemModelPath}\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Recovered strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+      }
+    }
+  }
+
   if (!filesPresent()) {
     const missing: string[] = [];
     if (!fs.existsSync(problemModelPath)) missing.push(problemModelPath);
@@ -391,7 +450,7 @@ export async function runThinkerWithGate(
     // verbatim in the prompt so the retry has real content to extract from. Use
     // allOutput's tail (not lastResultText) because the Section-1 problem_model
     // JSON is usually emitted before the final summary text.
-    const priorOutput = thinkerResult.allOutput.slice(-80_000);
+    const priorOutput = (problemModelRepair?.retry?.allOutput || thinkerResult.allOutput).slice(-80_000);
     const retryPrompt = [
       'Your previous strategic analysis completed but the required handoff files',
       'were not written to disk. IMPORTANT: this is a FRESH session — you do NOT',

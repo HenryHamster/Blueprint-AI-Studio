@@ -25,14 +25,18 @@ consumer over-claims on a thin sample.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import release_version
 from app.models import QualificationVerdict, ReleaseVersion
 from app.shared_state import resolve_project_promotion_enabled
+
+logger = logging.getLogger(__name__)
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -102,6 +106,90 @@ def _readiness_caveat(validated: dict[str, Any]) -> str:
             f"measured precision"
         )
     return _READINESS_GROUND_TRUTH_CAVEAT
+
+
+# Zero-count acceptance aggregate — the fail-safe value used both for the
+# no-open-version path and whenever the aggregate query degrades. With zero
+# declared-unsatisfied tasks the readiness signal is unaffected (additive,
+# never a hard block).
+_EMPTY_ACCEPTANCE_AGGREGATE: dict[str, int] = {
+    "proven": 0,
+    "declared_unsatisfied": 0,
+    "undeclared": 0,
+    "total": 0,
+}
+
+
+async def _compute_acceptance_aggregate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, int]:
+    """Resolve the open version's acceptance aggregate, fail-safe.
+
+    Returns the per-version acceptance bucket counts
+    (``proven`` / ``declared_unsatisfied`` / ``undeclared`` / ``total``) over
+    the open version's window, or all-zeros when there is no open version or the
+    query fails.  Never raises — any failure degrades to zero-counts so a
+    transient aggregate error can never lower or hard-block readiness.
+    """
+    try:
+        version = await release_version.current_open_version(session, project_id)
+        if version is None or version.opened_at is None:
+            return dict(_EMPTY_ACCEPTANCE_AGGREGATE)
+        agg = await release_version.compute_version_acceptance_aggregate(
+            session, project_id, since=version.opened_at
+        )
+        return {
+            "proven": int(agg.get("proven", 0)),
+            "declared_unsatisfied": int(agg.get("declared_unsatisfied", 0)),
+            "undeclared": int(agg.get("undeclared", 0)),
+            "total": int(agg.get("total", 0)),
+        }
+    except Exception:  # noqa: BLE001 — defensive: any failure must not block readiness
+        logger.warning(
+            "[RELEASE_READINESS] acceptance aggregate failed for project %s; "
+            "degrading to zero-counts (readiness unaffected)",
+            project_id,
+            exc_info=True,
+        )
+        return dict(_EMPTY_ACCEPTANCE_AGGREGATE)
+
+
+def _acceptance_keys(aggregate: dict[str, int]) -> dict[str, Any]:
+    """Additive readiness keys derived from an acceptance aggregate.
+
+    Strictly fail-safe: only ``declared_unsatisfied`` (a recorded acceptance
+    verdict that did NOT pass) ever contributes a signal. Undeclared / legacy /
+    satisfied tasks never count against readiness. The keys are advisory — they
+    augment the readiness dict but never flip ``ready`` (mirroring how
+    ``validated_precision`` augments, never replaces, the self-approval signal).
+    """
+    declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
+    return {
+        "acceptance_proven": int(aggregate.get("proven", 0)),
+        "acceptance_declared_unsatisfied": declared_unsatisfied,
+        "acceptance_undeclared": int(aggregate.get("undeclared", 0)),
+        "acceptance_unproven_present": declared_unsatisfied > 0,
+    }
+
+
+def _acceptance_caveat(aggregate: dict[str, int]) -> str | None:
+    """Advisory caveat when the open version contains declared-but-unproven work.
+
+    Returns ``None`` unless one or more merged tasks recorded a declared
+    acceptance verdict that did NOT pass — in that case the version is "merely
+    delivered" for those tasks, not proven, and operators/strategist should see
+    it. Never returned for undeclared-only or satisfied-only windows.
+    """
+    declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
+    if declared_unsatisfied <= 0:
+        return None
+    return (
+        f"acceptance not fully proven — {declared_unsatisfied} merged task(s) "
+        f"in this version declared acceptance evidence that did NOT pass "
+        f"(advisory: the version contains claimed-but-unproven work; does not "
+        f"hard-block promotion)"
+    )
 
 
 async def _compute_validated_precision(
@@ -183,7 +271,27 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
+        # Durable per-attempt evidence fields mirror the immutable verdict row
+        # so the current open version keeps the same evidence trail even after
+        # later re-qualifications overwrite mutable state.
+        "migration_safety": qual.get("migration_safety"),
+        "migration_safety_detail": qual.get("migration_safety_detail"),
+        "migration_apply_safety": qual.get("migration_apply_safety"),
+        "migration_apply_safety_detail": qual.get("migration_apply_safety_detail"),
+        "audit_findings": qual.get("audit_findings"),
+        "excluded_audit_findings": qual.get("excluded_audit_findings"),
+        "test_erosion_detail": qual.get("test_erosion_detail"),
+        "smoketest_detail": qual.get("smoketest_detail"),
+        "audit_reconciliation": qual.get("audit_reconciliation"),
+        "promotion_pr_url": qual.get("promotion_pr_url"),
+        "promotion_conflict": qual.get("promotion_conflict"),
+        "promotion_error_detail": qual.get("promotion_error_detail"),
     }
+
+
+def _sub(verdict: QualificationVerdict, key: str) -> Any:
+    """Safely read a key from verdict.sub_scores; returns None for legacy rows."""
+    return (verdict.sub_scores or {}).get(key)
 
 
 def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
@@ -197,6 +305,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     evidence keys are additive and may be ``None`` on legacy rows that predate
     the evidence columns.
     """
+    acceptance_aggregate = None
+    sub_scores = verdict.sub_scores or {}
+    if isinstance(sub_scores, dict):
+        acceptance_aggregate = sub_scores.get("acceptance_aggregate")
+    if acceptance_aggregate is None:
+        acceptance_aggregate = getattr(verdict, "acceptance_aggregate", None)
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -239,6 +353,18 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
+        # --- Acceptance-window signal (additive; None on legacy rows without aggregate) -
+        # Surfaces the proven-vs-delivered distinction: how many landed merges in the
+        # qualification window have verified acceptance evidence vs. raw delivered count.
+        "acceptance_window_total": _sub(verdict, "acceptance_window_total"),
+        "acceptance_window_verified": _sub(verdict, "acceptance_window_verified"),
+        "acceptance_window_fraction": _sub(verdict, "acceptance_window_fraction"),
+        # Version-window acceptance aggregate (proven-vs-merged) recorded for this
+        # verdict's evaluated candidate — additive and nullable. Computed/stored
+        # by the acceptance layer; surfaced here so each verdict row carries the
+        # proven claim state next to the raw merged counts. ``None`` on legacy
+        # rows that predate the aggregate.
+        "acceptance_aggregate": acceptance_aggregate,
     }
 
 
@@ -358,6 +484,9 @@ async def compute_promotion_readiness(
     verdicts = list((await session.execute(stmt)).scalars().all())
 
     validated = await _compute_validated_precision(session, project_id)
+    acceptance = await _compute_acceptance_aggregate(session, project_id)
+    acceptance_keys = _acceptance_keys(acceptance)
+    acceptance_caveat = _acceptance_caveat(acceptance)
 
     evaluated = len(verdicts)
     if evaluated == 0:
@@ -367,6 +496,9 @@ async def compute_promotion_readiness(
             consecutive_infra_errors=consecutive_infra_errors,
             validated=validated,
         )
+        out.update(acceptance_keys)
+        if acceptance_caveat:
+            out["acceptance_caveat"] = acceptance_caveat
         if infra_failure_count:
             out["reason"] = (
                 "recent qualifications have been infrastructure failures, not quality findings"
@@ -438,7 +570,15 @@ async def compute_promotion_readiness(
     else:
         reason = "; ".join(reasons)
 
-    return _annotate_regime({
+    # Acceptance signal is additive and advisory: when the open version contains
+    # merged tasks whose DECLARED acceptance evidence did not pass, surface a
+    # caveat on the reason so operators/strategist see the version is not fully
+    # proven. It never flips ``ready`` (mirrors validated_precision: augment,
+    # never replace) and undeclared/legacy work never contributes.
+    if acceptance_caveat:
+        reason = f"{reason} NOTE: {acceptance_caveat}"
+
+    out = {
         "ready": ready,
         "reason": reason,
         "verdicts_evaluated": evaluated,
@@ -463,4 +603,8 @@ async def compute_promotion_readiness(
         "deploy_failed_count": validated["deploy_failed_count"],
         "ground_truth_validated": validated["ground_truth_validated"],
         "caveat": _readiness_caveat(validated),
-    }, promotion_enabled)
+    }
+    out.update(acceptance_keys)
+    if acceptance_caveat:
+        out["acceptance_caveat"] = acceptance_caveat
+    return _annotate_regime(out, promotion_enabled)

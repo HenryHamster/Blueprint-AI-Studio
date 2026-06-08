@@ -892,9 +892,11 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
+    sweep_recover_stranded_transient_blockers,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
+    sweep_migration_slot_contention,
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
@@ -2789,6 +2791,32 @@ async def reaper_service():
                                             "[REAPER] Failed to inject retry guidance for task %s",
                                             task.id,
                                         )
+                                # Escalate effort one tier for a pure wall-clock
+                                # execution timeout so the retry gets a larger
+                                # budget (and a stronger model where effort drives
+                                # model selection) instead of repeating the same
+                                # doomed budget. Gated to the execution_timeout
+                                # subtype only — oom/crash/heartbeat-loss/rate-limit
+                                # never escalate. Persisted on reaper_ctx["effort"]
+                                # (Layer-1 routing wins) before task.context is set.
+                                try:
+                                    from app.failure_classification import (
+                                        escalated_effort_for_execution_timeout,
+                                    )
+
+                                    _escalated_effort = (
+                                        escalated_effort_for_execution_timeout(task)
+                                    )
+                                    if _escalated_effort:
+                                        reaper_ctx["_effort_escalated_from"] = (
+                                            reaper_ctx.get("effort")
+                                        )
+                                        reaper_ctx["effort"] = _escalated_effort
+                                except Exception:
+                                    logger.exception(
+                                        "[REAPER] Failed to escalate effort for task %s",
+                                        task.id,
+                                    )
                                 if is_provision_failure and (task.context or {}).get(
                                     "_infra_wait"
                                 ):
@@ -3837,6 +3865,20 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 12b: Recovery — un-strand transient blockers previously
+                # hard-parked at the +10y sentinel so they self-heal when the
+                # overlapping in-flight task merges.
+                _mark_reaper_progress()
+                try:
+                    await sweep_recover_stranded_transient_blockers(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Transient-blocker recovery sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 13: Staged-direction auto-activation backstop — self-heal
                 # any staged direction whose target version already promoted/opened
                 # in case the promotion-path activation hook failed once.
@@ -3876,6 +3918,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Merge-gate degradation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Migration-serialization-slot contention alerting — surface a
+                # prolonged per-project migration slot hold that is parking
+                # schema-touching tasks (invisible to the throughput-only
+                # migration-health summary and the escalated-only parked-blocker
+                # signal). Alerting only — never influences serialization.
+                _mark_reaper_progress()
+                try:
+                    await sweep_migration_slot_contention(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Migration-slot-contention sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

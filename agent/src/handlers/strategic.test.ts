@@ -94,6 +94,11 @@ vi.mock('./research-plan.js', () => ({
     _c: unknown,
     authoritativeActiveTotal?: number,
   ) => `PORTFOLIO(auth=${authoritativeActiveTotal})`,
+  // Echo the rendered capability count so wiring tests can assert the handler
+  // threads payload.available_capabilities through to the vocabulary section.
+  buildAvailableCapabilitiesSection: (caps: Array<Record<string, unknown>> | undefined) =>
+    Array.isArray(caps) && caps.length ? `AVAILABLE_CAPS(${caps.length})` : '',
+  CAPABILITY_DECLARATION_DOC: 'CAP_DECL_DOC',
 }));
 
 vi.mock('./strategic-sections.js', () => ({
@@ -331,6 +336,34 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toContain('one atomic op');
     // Steers AWAY from the old create-then-stage sequence for new ideas.
     expect(executorPrompt).toContain('Do NOT create-then-stage');
+  });
+
+  it('treats problem_model reconstruction as the last resort after bounded repair', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-last-resort',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
 });
 
@@ -630,5 +663,33 @@ describe('handleStrategic prompt_suffix wiring', () => {
       'task-2', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
     );
     expect(capturedThinkerPrompt).toBe('BASE_THINKER_PROMPT');
+  });
+
+  it('threads available_capabilities into the thinker availableCapabilitiesSection param', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-3',
+      {
+        project_name: 'Blueprint',
+        available_capabilities: [
+          { name: 'seeded-eval-harness', status: 'working' },
+          { name: 'payment-core', status: 'planned' },
+        ],
+      },
+      {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+    const section = capturedThinkerParams?.availableCapabilitiesSection as string;
+    // The vocabulary section renders (mock echoes the count) and carries the
+    // uniform provides_capability / prerequisite declaration doc.
+    expect(section).toContain('AVAILABLE_CAPS(2)');
+    expect(section).toContain('CAP_DECL_DOC');
+  });
+
+  it('passes an empty availableCapabilitiesSection when no capabilities are supplied', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-4', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+    expect(capturedThinkerParams?.availableCapabilitiesSection).toBe('');
   });
 });

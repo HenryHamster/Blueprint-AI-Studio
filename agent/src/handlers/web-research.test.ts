@@ -27,6 +27,16 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -46,6 +56,7 @@ import { handleWebResearch, groundWebCitations } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 const TASK_ID = 'task-web-research-1';
 const WS = null;
@@ -286,6 +297,51 @@ describe('handleWebResearch', () => {
     expect(parsed.title).toBe(VALID_DOCUMENT.title);
   });
 
+  it('recovers knowledge document via bounded re-ask on clean-exit parse failure', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // First run: clean exit but unparseable output.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Research complete but forgot to emit JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Repair run: good document JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: JSON.stringify(VALID_DOCUMENT),
+      lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts COMPLETED even when repair fails to recover the knowledge document', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Both runs return unparseable output on clean exit.
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Still COMPLETED — web-research handler is lenient even on parse failure.
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
   it('marks the task FAILED when the inner session exits non-zero', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({
@@ -326,6 +382,79 @@ function fakeFetch(map: (url: string, method: string) => { status: number } | Er
 
 const CONTROL_OK = (url: string): { status: number } | null =>
   url.includes('www.google.com') || url.includes('example.com') ? { status: 200 } : null;
+
+// ── Bounded self-repair on a clean-exit-but-unparseable first response ────────
+describe('handleWebResearch — bounded self-repair on format miss', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(apiGet).mockResolvedValue({ documents: [] });
+    // Reachable control + citation probes so grounding never hits the network.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 } as Response));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('makes exactly one focused re-ask when exitCode=0 but no document extracts, and COMPLETES with the recovered document', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'I searched but never emitted the JSON document.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
+    expect((parsed as Record<string, unknown>)._citation_grounding).toBeDefined();
+    expect(payload.artifact_type).toBeUndefined();
+  });
+
+  it('does NOT record repair success when the re-ask is also unparseable; falls back to raw output', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: 'no json', lastResultText: 'raw fallback',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+  });
+
+  it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1, allOutput: 'boom', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    expect(lastPostedPayload().status).toBe('FAILED');
+  });
+});
 
 describe('groundWebCitations', () => {
   it('stamps all reachable URLs as grounded with an empty unresolved list', async () => {

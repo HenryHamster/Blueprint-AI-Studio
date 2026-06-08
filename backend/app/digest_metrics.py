@@ -82,13 +82,19 @@ from app.failure_classification import (
     REASSIGNED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
+    TIMEOUT_CASCADE,
+    TIMEOUT_EXECUTION,
+    TIMEOUT_HEARTBEAT_LOST,
+    TIMEOUT_ITERATION_LIMIT,
+    TIMEOUT_OOM,
+    TIMEOUT_PROCESS_CRASH,
+    TIMEOUT_UNKNOWN,
     VIEWPORT_REGRESSION,
 )
 
 logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
-_MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD = timedelta(hours=2)
 
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
@@ -221,6 +227,140 @@ def _compute_first_attempt_breakdowns(
         "trend": trend,
         "first_attempt_by_review_category": first_attempt_by_review_category,
     }
+
+
+def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
+    """Roll a list of tasks' ``format_compliance_summary`` into one count+rate block.
+
+    Tasks whose ``format_compliance_summary`` is NULL/missing or not a dict are
+    skipped (fail-safe neutral — older agents leave it NULL). ``format_error_total``
+    is the extraction layer's count of unparseable FINAL outputs (a "format miss");
+    a task is *well-formed* when that count is zero. Self-repair counts are the
+    focused re-ask attempts after a miss and how many of them parsed.
+    """
+    measured = 0
+    well_formed = 0
+    error_total = 0
+    repair_attempts = 0
+    repair_successes = 0
+    for t in tasks:
+        summary = getattr(t, "format_compliance_summary", None)
+        if not isinstance(summary, dict):
+            continue
+        measured += 1
+        e = int(summary.get("format_error_total") or 0)
+        a = int(summary.get("format_repair_attempts") or 0)
+        s = int(summary.get("format_repair_successes") or 0)
+        error_total += e
+        repair_attempts += a
+        repair_successes += s
+        if e == 0:
+            well_formed += 1
+    return {
+        "tasks_measured": measured,
+        "well_formed_tasks": well_formed,
+        # Per-case well-formed rate (Aider's percent_cases_well_formed): the
+        # share of measured tasks that produced no unparseable final output.
+        "format_compliance_rate": round(well_formed / measured, 3)
+        if measured
+        else None,
+        "format_error_total": error_total,
+        "repair_attempts": repair_attempts,
+        "repair_successes": repair_successes,
+        # Share of self-repair re-asks that produced a parseable output. None
+        # (not 0) when no repair was ever attempted — an empty denominator.
+        "self_repair_success_rate": round(repair_successes / repair_attempts, 3)
+        if repair_attempts
+        else None,
+    }
+
+
+def _format_compliance_trend(curr_rate: float | None, prev_rate: float | None) -> str | None:
+    """Compute improving/declining/stable trend using ±0.05 threshold (mirrors _compute_first_attempt_breakdowns)."""
+    if curr_rate is None or prev_rate is None:
+        return None
+    delta = curr_rate - prev_rate
+    if delta > 0.05:
+        return "improving"
+    if delta < -0.05:
+        return "declining"
+    return "stable"
+
+
+def compute_format_compliance_metrics(
+    terminal_tasks: List[Task],
+    prev_terminal_tasks: List[Task] | None = None,
+) -> Dict[str, Any]:
+    """Windowed structured-output format-compliance + self-repair-success measure.
+
+    Pure function — no database calls. Aggregates the per-task
+    ``format_compliance_summary`` JSONB (written by the ``/heartbeat`` endpoint
+    from the agent's structured-output extraction-layer telemetry) into a
+    windowed pipeline measure, overall and grouped by task type. The caller
+    passes a pre-windowed terminal-task list, mirroring
+    ``_compute_first_attempt_breakdowns`` / ``compute_failure_grouping``.
+
+    The measure reports two rates that Aider's edit leaderboard treats as
+    SEPARATE axes from task success (knowledge doc 5c6a2b4c — "evaluate format
+    adherence and task success as separate axes"; percent_cases_well_formed):
+      * ``format_compliance_rate`` — share of measured tasks whose structured
+        output was well-formed (``format_error_total == 0``), i.e. no unparseable
+        final output was observed.
+      * ``self_repair_success_rate`` — share of self-repair attempts that then
+        produced a parseable output (Σ successes / Σ attempts) (knowledge doc
+        6f14116c — format-error self-correction).
+
+    The counts come straight from the extraction layer's own parse verdict
+    (ground truth), so neither rate is gameable by the agent's self-report.
+    Tasks with a NULL/missing ``format_compliance_summary`` are not counted.
+
+    When ``prev_terminal_tasks`` is supplied (the immediately prior window),
+    each block gains ``trend`` (improving / declining / stable / None),
+    ``prev_format_compliance_rate``, and ``prev_self_repair_success_rate``
+    alongside the existing snapshot keys, mirroring the before/after shape of
+    ``_compute_first_attempt_breakdowns``.
+
+    Returns ``{"overall": <block>, "by_type": {<task type>: <block>}}`` where
+    each block is the dict produced by ``_accumulate_format_compliance``.
+    """
+    overall = _accumulate_format_compliance(terminal_tasks)
+    by_type_groups: Dict[str, list] = {}
+    for t in terminal_tasks:
+        if not isinstance(getattr(t, "format_compliance_summary", None), dict):
+            continue
+        task_type = (t.first_payload or {}).get("type", "create")
+        by_type_groups.setdefault(task_type, []).append(t)
+    by_type = {
+        task_type: _accumulate_format_compliance(tasks)
+        for task_type, tasks in by_type_groups.items()
+    }
+
+    if prev_terminal_tasks is not None:
+        prev_overall = _accumulate_format_compliance(prev_terminal_tasks)
+        overall["prev_format_compliance_rate"] = prev_overall["format_compliance_rate"]
+        overall["prev_self_repair_success_rate"] = prev_overall["self_repair_success_rate"]
+        overall["trend"] = _format_compliance_trend(
+            overall["format_compliance_rate"], prev_overall["format_compliance_rate"]
+        )
+
+        prev_by_type_groups: Dict[str, list] = {}
+        for t in prev_terminal_tasks:
+            if not isinstance(getattr(t, "format_compliance_summary", None), dict):
+                continue
+            task_type = (t.first_payload or {}).get("type", "create")
+            prev_by_type_groups.setdefault(task_type, []).append(t)
+
+        for task_type in set(by_type) | set(prev_by_type_groups):
+            curr_block = by_type.get(task_type) or _accumulate_format_compliance([])
+            prev_block = _accumulate_format_compliance(prev_by_type_groups.get(task_type) or [])
+            curr_block["prev_format_compliance_rate"] = prev_block["format_compliance_rate"]
+            curr_block["prev_self_repair_success_rate"] = prev_block["self_repair_success_rate"]
+            curr_block["trend"] = _format_compliance_trend(
+                curr_block["format_compliance_rate"], prev_block["format_compliance_rate"]
+            )
+            by_type[task_type] = curr_block
+
+    return {"overall": overall, "by_type": by_type}
 
 
 def _compute_first_review_approval_breakdowns(
@@ -2163,6 +2303,7 @@ def compute_migration_health(
     *,
     error_log_map: Dict[str, Any],
     active_tasks: List[Task] | None = None,
+    migration_slot_contention: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Summarize migration-task throughput and migration-error incidence.
 
@@ -2189,38 +2330,6 @@ def compute_migration_health(
             for f in payload_files
         )
 
-    def _is_migration_producing(t: Task) -> bool:
-        if _task_type(t) == "migrate":
-            return True
-        ctx = t.context or {}
-        files = ctx.get("related_files") or []
-        if isinstance(files, list) and any(
-            isinstance(f, str)
-            and (
-                f.startswith("backend/alembic/versions/")
-                or f == "backend/app/models.py"
-                or f.endswith("/backend/app/models.py")
-            )
-            for f in files
-        ):
-            return True
-        payload_files = (t.first_payload or {}).get("related_files") or []
-        return isinstance(payload_files, list) and any(
-            isinstance(f, str)
-            and (
-                f.startswith("backend/alembic/versions/")
-                or f == "backend/app/models.py"
-                or f.endswith("/backend/app/models.py")
-            )
-            for f in payload_files
-        )
-
-    def _task_age_seconds(t: Task, *, field: str) -> int | None:
-        ts = getattr(t, field, None)
-        if ts is None:
-            return None
-        return max(0, int((_utcnow() - ts).total_seconds()))
-
     _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
@@ -2235,70 +2344,35 @@ def compute_migration_health(
         if _task_type(t) != "migrate" and _touched_migration(t)
     )
 
-    active_migration_tasks = [
-        t for t in (active_tasks or []) if _is_migration_producing(t)
-    ]
-    migration_slot_holder = min(
-        (
-            t
-            for t in active_migration_tasks
-            if t.status == TaskStatus.IN_PROGRESS
-        ),
-        key=lambda t: (
-            t.started_at or t.created_at or _utcnow(),
-            str(t.id),
-        ),
-        default=None,
-    )
-    holder_hold_seconds = (
-        _task_age_seconds(migration_slot_holder, field="started_at")
-        if migration_slot_holder is not None
-        else None
-    )
-    if holder_hold_seconds is None and migration_slot_holder is not None:
-        holder_hold_seconds = _task_age_seconds(
-            migration_slot_holder, field="created_at"
+    contention_summary = migration_slot_contention
+    if contention_summary is None:
+        from app.orchestrator_filters import _is_migration_task  # noqa: PLC0415
+
+        active_migration_tasks = [
+            t for t in (active_tasks or []) if _is_migration_task(t)
+        ]
+        contention_summary = compute_migration_slot_contention_summary(
+            [t for t in active_migration_tasks if t.status == TaskStatus.IN_PROGRESS],
+            [
+                t
+                for t in active_migration_tasks
+                if t.status in (TaskStatus.QUEUED, TaskStatus.BLOCKED)
+            ],
         )
-    serializing_waiters = [
-        t
-        for t in active_migration_tasks
-        if t.status == TaskStatus.QUEUED
-        and (t.latest_status_message or "").startswith(
-            "Waiting: serializing migration"
-        )
-    ]
-    longest_wait = min(
-        serializing_waiters,
-        key=lambda t: (
-            t.updated_at or t.created_at or t.started_at or _utcnow(),
-            str(t.id),
-        ),
-        default=None,
-    )
-    longest_wait_seconds = (
-        _task_age_seconds(longest_wait, field="updated_at")
-        if longest_wait is not None
-        else None
-    )
-    if longest_wait_seconds is None and longest_wait is not None:
-        longest_wait_seconds = _task_age_seconds(longest_wait, field="created_at")
-    deferred_count = len(serializing_waiters)
-    if migration_slot_holder is None and deferred_count == 0:
+
+    deferred_count = int(contention_summary.get("waiting_count") or 0)
+    if not contention_summary.get("slot_held") and deferred_count == 0:
         contention_status = "idle"
         contention_severity = "info"
     elif deferred_count == 0:
         contention_status = "held"
         contention_severity = "info"
+    elif contention_summary.get("threshold_exceeded"):
+        contention_status = "elevated"
+        contention_severity = "critical"
     else:
-        hold_threshold_seconds = int(
-            _MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD.total_seconds()
-        )
-        if holder_hold_seconds is not None and holder_hold_seconds >= hold_threshold_seconds:
-            contention_status = "elevated"
-            contention_severity = "critical"
-        else:
-            contention_status = "contention"
-            contention_severity = "warning"
+        contention_status = "contention"
+        contention_severity = "warning"
 
     return {
         "current_schema_revision": EXPECTED_SCHEMA_REVISION,
@@ -2311,28 +2385,262 @@ def compute_migration_health(
             "status": contention_status,
             "severity": contention_severity,
             "holder": {
-                "task_id": str(migration_slot_holder.id),
-                "title": migration_slot_holder.title,
-                "started_at": migration_slot_holder.started_at.isoformat()
-                if migration_slot_holder.started_at
-                else None,
-                "hold_seconds": holder_hold_seconds,
+                "task_id": contention_summary.get("holder_task_id"),
+                "title": contention_summary.get("holder_title"),
+                "started_at": contention_summary.get("holder_started_at"),
+                "hold_seconds": contention_summary.get("holder_held_seconds"),
             }
-            if migration_slot_holder is not None
+            if contention_summary.get("holder_task_id") is not None
             else None,
             "deferred_count": deferred_count,
             "longest_wait": {
-                "task_id": str(longest_wait.id),
-                "title": longest_wait.title,
-                "waiting_since": longest_wait.updated_at.isoformat()
-                if longest_wait.updated_at
-                else None,
-                "wait_seconds": longest_wait_seconds,
+                "task_id": contention_summary.get("longest_wait_task_id"),
+                "title": contention_summary.get("longest_wait_title"),
+                "waiting_since": contention_summary.get("longest_wait_since"),
+                "wait_seconds": contention_summary.get("longest_wait_seconds"),
             }
-            if longest_wait is not None
+            if contention_summary.get("longest_wait_task_id") is not None
             else None,
         },
     }
+
+
+# ── Migration-serialization slot contention (read-only observability) ────────
+#
+# A migration-producing task (``migrate`` type, or one touching
+# ``backend/app/models.py`` / ``backend/alembic/versions/``) that is IN_PROGRESS
+# holds the per-project migration-serialization slot; while it is held, sibling
+# schema-touching tasks defer to QUEUED/BLOCKED ("Waiting: serializing migration
+# …"). The existing ``compute_migration_health`` summary reports migration
+# throughput and error counts but NOT this contention, and the parked-blocker
+# signal counts ONLY BLOCKED tasks past escalation — migration-deferred siblings
+# are QUEUED, so neither metric sees a multi-hour hold parking the schema queue
+# (the recent incident: one holder held the slot ~2h and parked 5+ tasks before a
+# human noticed). This pair surfaces it: per project, the current holder and how
+# long it has held, how many migration-producing tasks are deferred waiting, and
+# the longest current wait. Read-only — it never changes serialization behavior.
+
+# A slot held at least this long WHILE tasks are waiting marks the per-project
+# entry ``threshold_exceeded`` (the loud self-surfacing signal the UI highlights
+# and the reaper alert sweep can escalate on). One hour: well below the ~2h
+# incident, well above a normal migration author+test run.
+_MIGRATION_SLOT_HOLD_ALERT_SECONDS = 3600
+# Defensive cap on the surfaced per-project list so a large fleet never bloats
+# the digest payload.
+_MIGRATION_SLOT_PROJECT_LIST_LIMIT = 100
+
+
+def _migration_slot_hold_seconds(holder: "Task", now: "datetime") -> "float | None":
+    """Seconds the holder has been IN_PROGRESS (its slot-hold age).
+
+    Anchored on ``started_at`` (stamped at dispatch) and falling back to
+    ``created_at`` so a holder that somehow lacks ``started_at`` still yields a
+    non-null age. ``None`` only when neither timestamp is present.
+    """
+    anchor = getattr(holder, "started_at", None) or getattr(holder, "created_at", None)
+    if anchor is None:
+        return None
+    return max(0.0, (now - anchor).total_seconds())
+
+
+def compute_migration_slot_contention_summary(
+    holders: List["Task"],
+    waiters: List["Task"],
+) -> Dict[str, Any]:
+    """Reduce migration-slot holders and waiters into a contention summary.
+
+    Pure function — no database calls; duration math only. ``holders`` are the
+    IN_PROGRESS migration-producing tasks; ``waiters`` are the QUEUED/BLOCKED
+    migration-producing tasks deferred on the slot. Both are grouped by project.
+
+    For each project the representative holder is the LONGEST-held IN_PROGRESS
+    migration task (the likeliest bottleneck — under the reservation scheme more
+    than one may be in flight, so ``holder_count`` is reported alongside). A
+    waiter's wait age is derived from ``updated_at`` (which advances when the task
+    is re-stamped with its "Waiting: serializing migration …" deferral status).
+    ``threshold_exceeded`` fires only when the slot is held, the hold age reaches
+    ``_MIGRATION_SLOT_HOLD_ALERT_SECONDS``, AND at least one task is waiting — so a
+    long solo migration with no waiters never raises the loud signal.
+
+    Returns a flat AGGREGATE view (max hold age / total waiters / max wait across
+    the scoped projects, plus the representative holder) and a per-project
+    ``projects`` list for fleet-wide consumers (e.g. the reaper alert sweep).
+    Non-zero exactly when migration tasks are actually deferred on the slot.
+    """
+    now = _utcnow()
+
+    def _proj(t: "Task") -> "str | None":
+        pid = getattr(t, "project_id", None)
+        return str(pid) if pid is not None else None
+
+    holders_by_project: Dict[Any, List["Task"]] = defaultdict(list)
+    for t in holders:
+        holders_by_project[_proj(t)].append(t)
+    waiters_by_project: Dict[Any, List["Task"]] = defaultdict(list)
+    for t in waiters:
+        waiters_by_project[_proj(t)].append(t)
+
+    projects: List[Dict[str, Any]] = []
+    for pkey in set(holders_by_project) | set(waiters_by_project):
+        p_holders = holders_by_project.get(pkey, [])
+        p_waiters = waiters_by_project.get(pkey, [])
+
+        holder = None
+        holder_held_seconds: "float | None" = None
+        for h in p_holders:
+            held = _migration_slot_hold_seconds(h, now)
+            if holder is None or (
+                held is not None
+                and (holder_held_seconds is None or held > holder_held_seconds)
+            ):
+                holder = h
+                holder_held_seconds = held
+
+        wait_ages = [
+            max(0.0, (now - w.updated_at).total_seconds())
+            for w in p_waiters
+            if getattr(w, "updated_at", None) is not None
+        ]
+        longest_wait_seconds = max(wait_ages) if wait_ages else None
+        longest_waiter = max(
+            (w for w in p_waiters if getattr(w, "updated_at", None) is not None),
+            key=lambda w: max(0.0, (now - w.updated_at).total_seconds()),
+            default=None,
+        )
+
+        slot_held = holder is not None
+        waiting_count = len(p_waiters)
+        threshold_exceeded = bool(
+            slot_held
+            and waiting_count > 0
+            and holder_held_seconds is not None
+            and holder_held_seconds >= _MIGRATION_SLOT_HOLD_ALERT_SECONDS
+        )
+
+        projects.append(
+            {
+                "project_id": pkey,
+                "slot_held": slot_held,
+                "holder_task_id": str(holder.id) if holder is not None else None,
+                "holder_title": (holder.title or str(holder.id)[:8])
+                if holder is not None
+                else None,
+                "holder_started_at": holder.started_at.isoformat()
+                if holder is not None and holder.started_at is not None
+                else None,
+                "holder_held_seconds": round(holder_held_seconds)
+                if holder_held_seconds is not None
+                else None,
+                "holder_count": len(p_holders),
+                "waiting_count": waiting_count,
+                "longest_wait_task_id": str(longest_waiter.id)
+                if longest_waiter is not None
+                else None,
+                "longest_wait_title": longest_waiter.title
+                if longest_waiter is not None
+                else None,
+                "longest_wait_since": longest_waiter.updated_at.isoformat()
+                if longest_waiter is not None and longest_waiter.updated_at is not None
+                else None,
+                "longest_wait_seconds": round(longest_wait_seconds)
+                if longest_wait_seconds is not None
+                else None,
+                "threshold_exceeded": threshold_exceeded,
+            }
+        )
+
+    # Newest-incident-first: most-contended projects (threshold breaches, then
+    # longest holds) lead the capped list.
+    projects.sort(
+        key=lambda p: (
+            p["threshold_exceeded"],
+            p["holder_held_seconds"] or 0,
+            p["waiting_count"],
+        ),
+        reverse=True,
+    )
+    projects = projects[:_MIGRATION_SLOT_PROJECT_LIST_LIMIT]
+
+    # Aggregate roll-up — the representative (longest-held) holder across scope.
+    rep = projects[0] if projects else None
+    aggregate_longest_wait = max(
+        (p for p in projects if p.get("longest_wait_task_id") is not None),
+        key=lambda p: p["longest_wait_seconds"] or 0,
+        default=None,
+    )
+    return {
+        "slot_held": any(p["slot_held"] for p in projects),
+        "holder_task_id": rep["holder_task_id"] if rep else None,
+        "holder_title": rep["holder_title"] if rep else None,
+        "holder_project_id": rep["project_id"] if rep else None,
+        "holder_started_at": rep["holder_started_at"] if rep else None,
+        "holder_held_seconds": max(
+            (p["holder_held_seconds"] or 0 for p in projects), default=0
+        )
+        if projects
+        else None,
+        "waiting_count": sum(p["waiting_count"] for p in projects),
+        "longest_wait_task_id": aggregate_longest_wait["longest_wait_task_id"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_title": aggregate_longest_wait["longest_wait_title"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_since": aggregate_longest_wait["longest_wait_since"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_seconds": max(
+            (p["longest_wait_seconds"] or 0 for p in projects), default=0
+        )
+        if projects
+        else None,
+        "threshold_exceeded": any(p["threshold_exceeded"] for p in projects),
+        "projects": projects,
+    }
+
+
+async def compute_migration_slot_contention(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Surface migration-serialization-slot contention (read-only observability).
+
+    Runs two small self-contained queries — IN_PROGRESS tasks (potential slot
+    holders) and QUEUED/BLOCKED tasks (potential waiters) — filters each to the
+    migration-producing subset via the canonical
+    :func:`orchestrator_filters._is_migration_task` detector, and delegates the
+    grouping/duration math to :func:`compute_migration_slot_contention_summary`.
+    Never mutates state. Scoped to ``project_id`` when provided, else fleet-wide.
+
+    ``_is_migration_task`` is deferred-imported to keep
+    ``app.orchestrator_filters`` off this module's import path at load time (its
+    own imports are leaf: migration_path, models, shared_state, time_utils,
+    task_capabilities).
+    """
+    from app.orchestrator_filters import _is_migration_task  # noqa: PLC0415
+
+    holder_filters = [Task.status == TaskStatus.IN_PROGRESS]
+    if project_id is not None:
+        holder_filters.append(Task.project_id == project_id)
+    in_progress = (
+        (await session.execute(select(Task).where(*holder_filters).limit(1000)))
+        .scalars()
+        .all()
+    )
+
+    waiter_filters = [Task.status.in_([TaskStatus.QUEUED, TaskStatus.BLOCKED])]
+    if project_id is not None:
+        waiter_filters.append(Task.project_id == project_id)
+    waiting = (
+        (await session.execute(select(Task).where(*waiter_filters).limit(2000)))
+        .scalars()
+        .all()
+    )
+
+    return compute_migration_slot_contention_summary(
+        [t for t in in_progress if _is_migration_task(t)],
+        [t for t in waiting if _is_migration_task(t)],
+    )
 
 
 def compute_digest_trend_history(
@@ -2717,6 +3025,282 @@ def compute_churn_direction(buckets: List[Dict[str, Any]]) -> str:
     return "flat"
 
 
+# ---------------------------------------------------------------------------
+# Durable, windowed AGENT_TIMEOUT-rate measure (direction d-46468a41).
+#
+# The equipping lane needs a VALIDATED pipeline measure to cite a real
+# before/after delta on. AGENT_TIMEOUT is the most-flagged failure class, so the
+# headline measure is its windowed RATE, decomposed by the seven persisted
+# subtypes. The dominant subtype routes the operator failure-guidance line to a
+# known OSS countermeasure (oom -> memory/footprint; execution_timeout ->
+# long-command/tool budgets a la SWE-agent; heartbeat_lost/process_crash ->
+# liveness/checkpoint a la OpenHands; iteration_limit -> scope/condensation a la
+# Aider).
+#
+# GROUND-TRUTH RULE: this measure reads ONLY persisted per-task ground truth —
+# ``ctx['failure_category']`` (the numerator class) and ``ctx['timeout_subtype']``
+# (the subtype) — both stamped at terminal-FAILED time by
+# ``failure_classification.persist_failure_category``. It NEVER calls
+# ``classify_timeout_subtype`` / ``classify_failure`` (which DERIVE from
+# log/status text), so the rate is stable against later status-message rewrites
+# and is not gameable by re-derivation.
+# ---------------------------------------------------------------------------
+
+# The seven persisted AGENT_TIMEOUT subtypes, in a fixed order so every emitted
+# rate block carries all seven keys (zero-filled) and the manifest can enumerate
+# them deterministically.
+TIMEOUT_SUBTYPES: tuple[str, ...] = (
+    TIMEOUT_HEARTBEAT_LOST,
+    TIMEOUT_OOM,
+    TIMEOUT_EXECUTION,
+    TIMEOUT_CASCADE,
+    TIMEOUT_ITERATION_LIMIT,
+    TIMEOUT_PROCESS_CRASH,
+    TIMEOUT_UNKNOWN,
+)
+
+# Window for the rate measure — same length as the efficiency axes so the daily
+# snapshot it folds into reads apples-to-apples with the other axes.
+_TIMEOUT_RATE_WINDOW_DAYS = 7
+
+# Confident-dominance gate for the operator guidance line: a subtype is reported
+# as the dominant cause only when it covers >=2 timeouts AND >=60% of them, and
+# is not the catch-all "unknown" bucket. Mirrors the long-standing narrative gate
+# in :func:`_compute_dominant_timeout_subtype` so switching the narrative to
+# persisted ground truth does not change WHEN advice is refined, only its source.
+_TIMEOUT_DOMINANT_MIN_COUNT = 2
+_TIMEOUT_DOMINANT_MIN_SHARE = 0.6
+
+
+def _persisted_timeout_subtype(task: Task) -> str | None:
+    """Return a task's persisted timeout subtype, or None if it is not a timeout.
+
+    Reads ONLY the durable ground truth ``ctx['failure_category']`` /
+    ``ctx['timeout_subtype']`` — never re-derives from logs. A task whose
+    persisted ``failure_category`` is not AGENT_TIMEOUT returns None; an
+    AGENT_TIMEOUT task with no recorded subtype collapses to ``unknown`` (the
+    same fallback the writer uses), so it is still counted in the numerator.
+    """
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        return None
+    if ctx.get("failure_category") != AGENT_TIMEOUT:
+        return None
+    subtype = ctx.get("timeout_subtype") or TIMEOUT_UNKNOWN
+    return subtype if subtype in TIMEOUT_SUBTYPES else TIMEOUT_UNKNOWN
+
+
+def _dominant_persisted_timeout(
+    tasks: List[Task],
+) -> tuple[str | None, float | None, int]:
+    """Return ``(dominant_subtype, dominant_share, timeout_count)`` from ground truth.
+
+    ``dominant_subtype`` is the most common persisted subtype among the timeout
+    tasks (None when there are no timeouts); ``dominant_share`` is its fraction of
+    all timeouts. No confidence gate is applied here — that is the consumer's job
+    (see :func:`confident_dominant_timeout_subtype`).
+    """
+    counts: Dict[str, int] = {}
+    total = 0
+    for t in tasks:
+        subtype = _persisted_timeout_subtype(t)
+        if subtype is None:
+            continue
+        total += 1
+        counts[subtype] = counts.get(subtype, 0) + 1
+    if not counts:
+        return None, None, 0
+    dominant, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+    return dominant, round(dominant_count / total, 4), total
+
+
+def confident_dominant_timeout_subtype(tasks: List[Task]) -> str | None:
+    """Persisted dominant timeout subtype, gated for the operator guidance line.
+
+    Returns the subtype only when it covers >=2 timeouts AND >=60% of them and is
+    not ``unknown`` — otherwise None (no confident single cause to route advice
+    to). Reads persisted ground truth via :func:`_persisted_timeout_subtype`, so
+    the digest AGENT_TIMEOUT guidance is driven by the same durable signal the
+    snapshot measure persists, not by log re-derivation.
+    """
+    dominant, share, count = _dominant_persisted_timeout(tasks)
+    if dominant is None or share is None:
+        return None
+    dominant_count = round(share * count)
+    if (
+        dominant_count >= _TIMEOUT_DOMINANT_MIN_COUNT
+        and share >= _TIMEOUT_DOMINANT_MIN_SHARE
+        and dominant != TIMEOUT_UNKNOWN
+    ):
+        return dominant
+    return None
+
+
+def compute_timeout_rate(
+    tasks: List[Task], *, window_days: int = _TIMEOUT_RATE_WINDOW_DAYS
+) -> Dict[str, Any]:
+    """Windowed AGENT_TIMEOUT rate, decomposed by persisted subtype.
+
+    DENOMINATOR — ``execution_reached``: terminal tasks in the window that
+    actually reached execution, i.e. carry a ``started_at`` timestamp. This makes
+    the rate a fraction over tasks that COULD have timed out (a task that never
+    started cannot time out), so it is comparable over time and not inflated or
+    deflated by queued/never-dispatched volume. Callers pass the already-windowed
+    terminal task set (e.g. efficiency_snapshot._load_recent_tasks); ``tasks`` is
+    not re-filtered by time here.
+
+    NUMERATOR — ``timeout_count``: tasks whose persisted
+    ``ctx['failure_category']`` is AGENT_TIMEOUT. Read from durable ground truth
+    only — never re-derived from logs.
+
+    Returns a block with the overall rate, a per-subtype ``{count, rate}`` map
+    covering all seven subtypes (rate over the SAME execution-reached denominator,
+    so the per-subtype rates sum to the overall rate), and the dominant subtype +
+    its share among timeouts. ``overall_rate`` / per-subtype ``rate`` are None
+    only when the denominator is 0 (no tasks reached execution — rate undefined,
+    distinct from a real 0.0). ``window_days`` is echoed for provenance.
+    """
+    denominator = sum(1 for t in tasks if getattr(t, "started_at", None) is not None)
+    subtype_counts: Dict[str, int] = {s: 0 for s in TIMEOUT_SUBTYPES}
+    timeout_count = 0
+    for t in tasks:
+        subtype = _persisted_timeout_subtype(t)
+        if subtype is None:
+            continue
+        timeout_count += 1
+        subtype_counts[subtype] += 1
+
+    def _rate(n: int) -> float | None:
+        if denominator <= 0:
+            return None
+        return round(n / denominator, 4)
+
+    dominant, dominant_share, _ = _dominant_persisted_timeout(tasks)
+
+    return {
+        "window_days": window_days,
+        "denominator": denominator,
+        "denominator_definition": (
+            "terminal tasks in the window that reached execution (started_at "
+            "present); a task that never started cannot time out"
+        ),
+        "timeout_count": timeout_count,
+        "overall_rate": _rate(timeout_count),
+        "by_subtype": {
+            subtype: {"count": subtype_counts[subtype], "rate": _rate(subtype_counts[subtype])}
+            for subtype in TIMEOUT_SUBTYPES
+        },
+        "dominant_subtype": dominant,
+        "dominant_share": dominant_share,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metric-governance manifest for the AGENT_TIMEOUT-rate measure.
+#
+# Mirrors RESEARCH_HISTORY_METRIC_MANIFEST in direction_outcomes.py: every field
+# the measure emits declares EITHER a named ground-truth source + named consumer,
+# OR a dated pending/retired reason. The guard test
+# ``backend/testing/test_timeout_rate_metric_manifest.py`` AST-extracts the dict
+# keys ``compute_timeout_rate`` actually returns and asserts they all appear here
+# (and that no manifest "consumer" key has stopped being emitted), so the measure
+# cannot silently rot — a new emitted field cannot land without declaring who
+# reads it and where its ground truth comes from.
+#
+# ``ground_truth`` names the durable source each field is computed from (so the
+# manifest documents that the measure reads persisted per-task truth, not logs).
+# The per-subtype rates live under the ``by_subtype`` key, which is declared once
+# here (its inner shape is fixed: one ``{count, rate}`` entry per TIMEOUT_SUBTYPES
+# member).
+# ---------------------------------------------------------------------------
+TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
+    "window_days": {
+        "ground_truth": "constant _TIMEOUT_RATE_WINDOW_DAYS (provenance, not measured)",
+        "consumer": "efficiency_snapshot.read_baseline_with_drift (agent_timeout_rate block provenance)",
+    },
+    "denominator": {
+        "ground_truth": "Task.started_at presence over the windowed terminal task set",
+        "consumer": "efficiency-axes response (agent_timeout_rate.current denominator), strategic layer",
+    },
+    "denominator_definition": {
+        "ground_truth": "static documentation string (no measured input)",
+        "consumer": "efficiency-axes response (operator-facing denominator definition)",
+    },
+    "timeout_count": {
+        "ground_truth": "persisted ctx['failure_category'] == AGENT_TIMEOUT",
+        "consumer": "efficiency-axes response (agent_timeout_rate numerator)",
+    },
+    "overall_rate": {
+        "ground_truth": "timeout_count / execution-reached denominator (both persisted ground truth)",
+        "consumer": "digest narrative AGENT_TIMEOUT before/after sentence (admin_digest.py), efficiency-axes agent_timeout_rate.overall drift",
+    },
+    "by_subtype": {
+        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-reached denominator",
+        "consumer": "efficiency-axes agent_timeout_rate.by_subtype drift (per-subtype current-vs-baseline)",
+    },
+    "dominant_subtype": {
+        "ground_truth": "most common persisted ctx['timeout_subtype'] among window timeouts",
+        "consumer": "digest narrative AGENT_TIMEOUT guidance line via confident_dominant_timeout_subtype (admin_digest.py / compute_narrative_summary)",
+    },
+    "dominant_share": {
+        "ground_truth": "dominant subtype count / timeout_count (persisted ground truth)",
+        "consumer": "efficiency-axes agent_timeout_rate.dominant_share (operator + strategic context)",
+    },
+}
+
+
+def _format_timeout_rate_drift(drift: Dict[str, Any] | None) -> str | None:
+    """Render the AGENT_TIMEOUT-rate before/after sentence from the overall block.
+
+    ``drift`` is the ``{current, baseline, drift_pct}`` overall block from the
+    persisted measure (efficiency_snapshot.read_baseline_with_drift). Returns a
+    sentence like ``"Agent-timeout rate 8%, down from a baseline of 12%."`` when
+    both current and baseline are present, or None when there is nothing durable
+    to report yet (no snapshot/baseline). Rates are stored as fractions (0..1)
+    and rendered as whole-number percentages.
+    """
+    if not isinstance(drift, dict):
+        return None
+    current = drift.get("current")
+    baseline = drift.get("baseline")
+    if not isinstance(current, (int, float)) or not isinstance(baseline, (int, float)):
+        return None
+    cur_pct = round(current * 100)
+    base_pct = round(baseline * 100)
+    if cur_pct < base_pct:
+        direction = "down"
+    elif cur_pct > base_pct:
+        direction = "up"
+    else:
+        direction = "unchanged"
+    if direction == "unchanged":
+        return f"Agent-timeout rate {cur_pct}%, unchanged from baseline."
+    return (
+        f"Agent-timeout rate {cur_pct}%, {direction} from a baseline of {base_pct}%."
+    )
+
+
+def _compute_dominant_timeout_subtype(timeout_tasks: List[Dict[str, Any]]) -> str | None:
+    """Compute the dominant timeout subtype from a list of timeout failure entries.
+
+    Returns the subtype string if one clearly dominates (present in >=2 tasks and
+    >= 60% of timeout tasks), else None.
+    """
+    if not timeout_tasks:
+        return None
+    subtype_counts: Dict[str, int] = {}
+    for task_entry in timeout_tasks:
+        subtype = task_entry.get("timeout_subtype") or "unknown"
+        subtype_counts[subtype] = subtype_counts.get(subtype, 0) + 1
+    if not subtype_counts:
+        return None
+    dominant_subtype, dominant_count = max(subtype_counts.items(), key=lambda kv: kv[1])
+    total = len(timeout_tasks)
+    if dominant_count >= 2 and dominant_count / total >= 0.6:
+        return dominant_subtype if dominant_subtype != "unknown" else None
+    return None
+
+
 def compute_narrative_summary(
     *,
     hours: int,
@@ -2740,8 +3324,17 @@ def compute_narrative_summary(
     failed_tasks: List[Task],
     outer_loop_convergence_summary: Dict[str, Any] | None = None,
     outer_loop_convergence_trend: Dict[str, Any] | None = None,
+    timeout_rate_drift: Dict[str, Any] | None = None,
 ) -> str:
-    """Build the human-readable digest narrative from precomputed metrics."""
+    """Build the human-readable digest narrative from precomputed metrics.
+
+    ``timeout_rate_drift`` is the durable AGENT_TIMEOUT-rate overall block
+    (``{current, baseline, drift_pct}``) read off the efficiency snapshot via
+    ``read_baseline_with_drift``. When the dominant failure class is
+    AGENT_TIMEOUT and this block carries a current+baseline, a before/after
+    sentence is appended reporting the rate's drift from baseline so the operator
+    sees whether the measure moved, not just the in-window count.
+    """
     from app.failure_classification import (
         classify_failure as _classify_failure,
         classify_failure_taxonomy as _classify_taxonomy,
@@ -2787,6 +3380,24 @@ def compute_narrative_summary(
                 "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
                 "SCOPE_OVERFLOW": f"Most failures ({cnt}/{failed_count}) exceeded scope budget (touched more files than scope allows) — consider task decomposition or scope escalation.",
             }
+            if cls == "AGENT_TIMEOUT":
+                # Drive the refined guidance line from PERSISTED ground truth
+                # (ctx['failure_category'] / ctx['timeout_subtype']) via the same
+                # durable signal the snapshot measure persists — not from the
+                # log-derived subtype on the failure-grouping entries.
+                _timeout_subtype = confident_dominant_timeout_subtype(failed_tasks)
+                if _timeout_subtype:
+                    _timeout_msgs = {
+                        "oom": f"Most failures ({cnt}/{failed_count}) are out-of-memory timeouts — check task memory usage and consider memory/footprint optimization.",
+                        "heartbeat_lost": f"Most failures ({cnt}/{failed_count}) are heartbeat-timeout errors — may indicate hangs or liveness issues.",
+                        "process_crash": f"Most failures ({cnt}/{failed_count}) are process crashes — may indicate hangs or liveness issues.",
+                        "execution_timeout": f"Most failures ({cnt}/{failed_count}) are execution timeouts — tasks may need complexity reduction or scope adjustment.",
+                        "iteration_limit": f"Most failures ({cnt}/{failed_count}) hit iteration limits — tasks may need complexity reduction or scope adjustment.",
+                        "cascade_cancellation": f"Most failures ({cnt}/{failed_count}) are cascade cancellations — check upstream dependencies and parent task status.",
+                    }
+                    _refined_msg = _timeout_msgs.get(_timeout_subtype)
+                    if _refined_msg:
+                        _root_cause_msgs["AGENT_TIMEOUT"] = _refined_msg
             if cls == "CODE_ERROR":
                 _ce_tax: Dict[str, int] = {}
                 for _t in failed_tasks:
@@ -2808,6 +3419,14 @@ def compute_narrative_summary(
                         if _refined:
                             _root_cause_msgs["CODE_ERROR"] = _refined
             dominant_msg = _root_cause_msgs.get(cls)
+            # Before/after sentence: when agent-timeouts dominate, report the
+            # durable AGENT_TIMEOUT-rate measure's current-vs-baseline drift so
+            # the operator sees whether the validated pipeline measure actually
+            # moved, not just the in-window absolute count.
+            if cls == "AGENT_TIMEOUT" and dominant_msg:
+                _drift_sentence = _format_timeout_rate_drift(timeout_rate_drift)
+                if _drift_sentence:
+                    dominant_msg = f"{dominant_msg} {_drift_sentence}"
         if dominant_msg:
             narrative_parts.append(dominant_msg)
         else:

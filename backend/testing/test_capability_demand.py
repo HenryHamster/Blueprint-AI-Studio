@@ -71,6 +71,21 @@ def test_unresolved_empty_when_active_candidate_provides_capability():
     assert out == []
 
 
+def test_unresolved_floor_marker_does_not_mask_missing_human_capability():
+    """The namespaced floor marker must not satisfy a real capability ref."""
+    need = {"kind": "capability", "ref": "auth-subsystem"}
+    task = _blocked(None, need)
+    provider = make_task(
+        project_id=task.project_id,
+        status=TaskStatus.IN_PROGRESS,
+        title="Build auth subsystem foundation",
+        context={},
+    )
+
+    out = unresolved_capability_needs(task, active=[provider], completed=[])
+    assert out == [need]
+
+
 def test_unresolved_excluded_by_shipped_completed_foundation():
     """A capability satisfied by a SHIPPED (pr_merged) COMPLETED foundation is not demand."""
     need = {"kind": "capability", "ref": "auth-subsystem"}
@@ -371,6 +386,71 @@ def test_prompt_hint_names_top_demands_and_frames_decision():
     # Frames both options without prescribing one.
     assert "create" in hint.lower()
     assert "retir" in hint.lower()
+
+
+def test_prompt_hint_prefers_canonical_registry_name():
+    """When a capability demand corresponds to a registry capability, the hint
+    names it by its CANONICAL registry name so producers/consumers converge."""
+    demand = {
+        "total": 1,
+        "demands": [
+            {
+                "kind": "capability",
+                # Free-prose consumer ref that normalizes onto the registry name.
+                "ref": "Seeded Eval Harness",
+                "label": "Seeded evaluation harness (win rate + 95% CI)",
+                "dependent_count": 2,
+                "still_blocked": 2,
+                "already_cancelled": 0,
+            }
+        ],
+    }
+    hint = missing_demand_prompt_hint(
+        demand, registry_names=["seeded-eval-harness", "payment-core"]
+    )
+    assert hint is not None
+    # The canonical registry name is shown ...
+    assert "seeded-eval-harness" in hint
+    # ... NOT the consumer's free-prose label.
+    assert "Seeded evaluation harness (win rate + 95% CI)" not in hint
+
+
+def test_prompt_hint_keeps_label_when_ref_is_off_registry():
+    """A demand whose ref is NOT a registry capability keeps label-preferred text."""
+    demand = {
+        "total": 1,
+        "demands": [
+            {
+                "kind": "capability",
+                "ref": "mystery-cap",
+                "label": "Mystery subsystem",
+                "dependent_count": 1,
+                "still_blocked": 1,
+                "already_cancelled": 0,
+            }
+        ],
+    }
+    hint = missing_demand_prompt_hint(demand, registry_names=["seeded-eval-harness"])
+    assert hint is not None
+    assert "Mystery subsystem" in hint
+
+
+def test_prompt_hint_without_registry_names_is_unchanged():
+    """Omitting registry_names preserves today's label-preferred behavior exactly."""
+    demand = {
+        "total": 1,
+        "demands": [
+            {
+                "kind": "capability",
+                "ref": "seeded-eval-harness",
+                "label": "Seeded eval harness",
+                "dependent_count": 1,
+                "still_blocked": 1,
+                "already_cancelled": 0,
+            }
+        ],
+    }
+    assert "Seeded eval harness" in missing_demand_prompt_hint(demand)
 
 
 def test_prompt_hint_truncates_and_notes_overflow():

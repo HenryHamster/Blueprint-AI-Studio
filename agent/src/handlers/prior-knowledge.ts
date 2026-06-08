@@ -64,6 +64,27 @@ export interface PrereqKnowledgeDoc {
   body: string;
 }
 
+export interface PrerequisiteArtifactPointer {
+  artifact_id: string;
+  logical_key?: string;
+  artifact_type?: string;
+  source_task_id?: string;
+  storage_uri?: string;
+}
+
+export async function fetchArtifactDownloadUrl(artifactId: string): Promise<string | null> {
+  const id = (artifactId || '').trim();
+  if (!id) return null;
+  try {
+    const path = `/api/agent/artifacts/download-url?artifact_id=${encodeURIComponent(id)}`;
+    const d = await apiGet(path) as Record<string, unknown> | null;
+    if (!d || typeof d !== 'object') return null;
+    return strVal(d.url) || null;
+  } catch {
+    return null;
+  }
+}
+
 // Resolve a single knowledge document (including its markdown body) by id via the
 // agent's authenticated backend client. Fail-soft by contract: any error, timeout,
 // 404, or malformed response returns null so a resolution miss never breaks the
@@ -118,6 +139,32 @@ export function buildPrerequisiteKnowledgeSection(
 The following knowledge was produced SPECIFICALLY to inform this task: a plan commissioned this research/design as a prerequisite and made this task depend on it. Treat it as authoritative input — build directly ON it rather than re-deriving or re-researching from scratch, and cite the relevant document id(s) where your work uses or extends it.
 
 ${blocks.join('\n\n')}
+
+`;
+}
+
+export function buildPrerequisiteArtifactSection(
+  pointers: PrerequisiteArtifactPointer[],
+  signedUrls: Map<string, string>,
+  taskId: string,
+): string {
+  if (pointers.length === 0) return '';
+  const entries = pointers
+    .filter((p) => (p.artifact_id || '').trim())
+    .map((p) => {
+      const id = p.artifact_id.trim();
+      const label = (p.logical_key || p.artifact_type || 'artifact').trim();
+      const url = signedUrls.get(id);
+      const source = p.source_task_id ? ` from task ${p.source_task_id}` : '';
+      const link = url ? `\n  signed_download_url: ${url}` : '';
+      return `- ${label} [artifact_id: ${id}]${source}${link}`;
+    });
+  if (entries.length === 0) return '';
+  const consumedFile = `/tmp/consumed_artifacts_${taskId}.json`;
+  return `## Commissioned Prerequisite Artifacts
+The following artifacts were produced SPECIFICALLY for this task by direct dependencies. Use the signed URL when present, cite the artifact_id(s) your work actually relies on, and only record artifact ids you truly consumed. When you finish: write ${consumedFile} as a JSON array of the artifact_id strings you actually consumed (e.g. ["id1","id2"]). If you used none, write an empty array [] to that file — do NOT omit the file, because omitting triggers a legacy fallback that over-credits all delivered artifacts as consumed.
+
+${entries.join('\n')}
 
 `;
 }

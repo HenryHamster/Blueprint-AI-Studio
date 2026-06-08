@@ -20,10 +20,34 @@ fixture.
 """
 
 from app.branch_resolution import (
+    EFFORT_ORDER,
+    escalate_effort,
     get_project_integration_branch,
     get_project_promotion_target,
     is_single_branch_project,
 )
+
+
+class TestEscalateEffort:
+    """Effort-tier escalation used to give a wall-clock-timed-out retry a bigger
+    budget (and a stronger model where effort drives model selection)."""
+
+    def test_order_is_low_to_max(self):
+        assert EFFORT_ORDER == ("low", "medium", "high", "max")
+
+    def test_steps_one_tier_up(self):
+        assert escalate_effort("low") == "medium"
+        assert escalate_effort("medium") == "high"
+        assert escalate_effort("high") == "max"
+
+    def test_caps_at_max(self):
+        # Already at the top tier — never overflow past it.
+        assert escalate_effort("max") is None
+
+    def test_unknown_or_missing_returns_none(self):
+        assert escalate_effort("bogus") is None
+        assert escalate_effort("") is None
+        assert escalate_effort(None) is None
 
 
 class _FakeProject:

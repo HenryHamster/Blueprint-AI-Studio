@@ -2304,6 +2304,71 @@ class TestComputeDirectionQualityScore:
             d_recent_good
         ) > _compute_direction_quality_score(d_recent_bad)
 
+    def test_quality_score_treats_unverified_merge_as_wasted(self):
+        """Unverified merge (verified_prs_merged=0) counts as wasted cycle.
+
+        A cycle with tasks_created > 0 but zero verified merges (though raw
+        prs_merged > 0) is scored as a wasted cycle. The quality score should
+        be equal to a cycle that merged nothing, and strictly lower than the
+        same cycle with verified merges.
+        """
+        # Cycle with unverified merge: tasks_created > 0, prs_merged > 0, verified_prs_merged = 0
+        unverified_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 0,  # unverified/degraded merge
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Same cycle but with zero raw merges (truly wasted)
+        no_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 0,
+                    "verified_prs_merged": 0,
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Same cycle but with verified merge
+        verified_merge = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,  # verified merge
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                }
+            ]
+        }
+        # Unverified merge should be equal to no merge
+        assert _compute_direction_quality_score(unverified_merge) == pytest.approx(
+            _compute_direction_quality_score(no_merge)
+        )
+        # Verified merge should score higher than unverified
+        assert _compute_direction_quality_score(
+            verified_merge
+        ) > _compute_direction_quality_score(unverified_merge)
+
     def test_direction_sort_respects_quality_tiebreak(self):
         """Two directions with equal productivity: higher-quality sorts first."""
         from app.failure_classification import (
@@ -9201,3 +9266,455 @@ async def test_remove_direction_emits_strategic_updated(client: AsyncClient, moc
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1
     assert events[0][2] == {"kind": "directions"}
+
+
+@pytest.mark.asyncio
+async def test_update_direction_round_trips_success_evidence_and_retirement_condition(
+    db_session, mocker
+):
+    """update_direction via /api/agent/strategic persists success_evidence and
+    retirement_condition onto direction context and the values round-trip back."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    direction_id = "d-rt-se-rc"
+    project = Project(
+        name="P-rt-se-rc",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Original direction text",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "old evidence",
+                    "retirement_condition": "old retirement",
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "update_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": direction_id,
+                        "changes": {
+                            "success_evidence": "updated observable outcome",
+                            "retirement_condition": "updated measurable retirement condition",
+                        },
+                        "rationale": "Reframed acceptance criteria",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["direction_id"] == direction_id
+
+        await db_session.refresh(project)
+        directions = project.directions or []
+        direction = next((d for d in directions if d.get("id") == direction_id), None)
+        assert direction is not None, "direction not found after update"
+        ctx = direction.get("context") or {}
+        assert ctx.get("success_evidence") == "updated observable outcome"
+        assert ctx.get("retirement_condition") == "updated measurable retirement condition"
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+# ---------------------------------------------------------------------------
+# conflicts_with round-trip tests via agent strategic API
+# ---------------------------------------------------------------------------
+
+
+async def _setup_strategic_fixtures(db_session, directions_list, project_name):
+    """Create project + task, return (project, task, task_id)."""
+    project = Project(
+        name=project_name,
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=directions_list,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task, str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_persists_conflicts_with(db_session, mocker):
+    """create_direction with conflicts_with persists onto the new direction.
+
+    Round-trip: create d-cw-first, then create d-cw-second with conflicts_with=[d-cw-first].
+    After the second create the stored direction should carry conflicts_with.
+    """
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project, task, task_id = await _setup_strategic_fixtures(
+        db_session,
+        [
+            {
+                "id": "d-cw-first",
+                "text": "First direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "ev1",
+                    "retirement_condition": "rc1",
+                },
+            }
+        ],
+        "P-cw-create",
+    )
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "Second direction that conflicts with first",
+                        "priority": "medium",
+                        "success_evidence": "no parallel run with first",
+                        "retirement_condition": "first direction retired",
+                        "conflicts_with": ["d-cw-first"],
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        new_id = body["direction_id"]
+
+        await db_session.refresh(project)
+        directions = project.directions or []
+        new_dir = next((d for d in directions if d.get("id") == new_id), None)
+        assert new_dir is not None, "new direction not found"
+        assert new_dir.get("conflicts_with") == ["d-cw-first"]
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_create_direction_conflicts_with_unknown_id_returns_400(
+    db_session, mocker
+):
+    """create_direction with an unknown ID in conflicts_with returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project, task, task_id = await _setup_strategic_fixtures(
+        db_session, [], "P-cw-create-bad"
+    )
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "Direction with bad conflicts_with",
+                        "priority": "medium",
+                        "success_evidence": "ev",
+                        "retirement_condition": "rc",
+                        "conflicts_with": ["d-nonexistent"],
+                    },
+                },
+            )
+        assert resp.status_code == 400, resp.text
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_update_direction_sets_conflicts_with(db_session, mocker):
+    """update_direction with changes.conflicts_with persists onto the direction."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project, task, task_id = await _setup_strategic_fixtures(
+        db_session,
+        [
+            {
+                "id": "d-upd-a",
+                "text": "Direction A",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "ev", "retirement_condition": "rc"},
+            },
+            {
+                "id": "d-upd-b",
+                "text": "Direction B",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "ev", "retirement_condition": "rc"},
+            },
+        ],
+        "P-cw-update",
+    )
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "update_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": "d-upd-a",
+                        "changes": {"conflicts_with": ["d-upd-b"]},
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "ok"
+
+        await db_session.refresh(project)
+        dir_a = next(
+            (d for d in (project.directions or []) if d.get("id") == "d-upd-a"), None
+        )
+        assert dir_a is not None
+        assert dir_a.get("conflicts_with") == ["d-upd-b"]
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_update_direction_clears_conflicts_with(db_session, mocker):
+    """update_direction with changes.conflicts_with=null removes the key."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project, task, task_id = await _setup_strategic_fixtures(
+        db_session,
+        [
+            {
+                "id": "d-clr-a",
+                "text": "Direction A",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "conflicts_with": ["d-clr-b"],
+                "context": {"success_evidence": "ev", "retirement_condition": "rc"},
+            },
+            {
+                "id": "d-clr-b",
+                "text": "Direction B",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "ev", "retirement_condition": "rc"},
+            },
+        ],
+        "P-cw-clear",
+    )
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "update_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": "d-clr-a",
+                        "changes": {"conflicts_with": None},
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        dir_a = next(
+            (d for d in (project.directions or []) if d.get("id") == "d-clr-a"), None
+        )
+        assert dir_a is not None
+        assert "conflicts_with" not in dir_a
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_update_direction_conflicts_with_unknown_id_returns_400(
+    db_session, mocker
+):
+    """update_direction with an unknown ID in changes.conflicts_with returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project, task, task_id = await _setup_strategic_fixtures(
+        db_session,
+        [
+            {
+                "id": "d-bad-upd",
+                "text": "A direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "ev", "retirement_condition": "rc"},
+            }
+        ],
+        "P-cw-update-bad",
+    )
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "update_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": "d-bad-upd",
+                        "changes": {"conflicts_with": ["d-does-not-exist"]},
+                    },
+                },
+            )
+        assert resp.status_code == 400, resp.text
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)

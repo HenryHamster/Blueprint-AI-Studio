@@ -9,6 +9,7 @@ from httpx import AsyncClient
 
 from app.efficiency_snapshot import (
     ALL_AXES,
+    AXIS_CONSUMERS,
     AXIS_COST_PER_MERGED_PR,
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
@@ -3088,3 +3089,189 @@ async def test_unpriced_alert_ignores_tokenless_and_unattributed(db_session, moc
     fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
     assert fired is None
     assert await _unpriced_alerts(db_session, project.id) == []
+
+
+def _make_timeout_task(project_id, subtype: str):
+    """A terminal FAILED task with persisted AGENT_TIMEOUT ground truth + started_at."""
+    from app.failure_classification import AGENT_TIMEOUT
+
+    now = _utcnow()
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        started_at=now - timedelta(minutes=10),
+        updated_at=now,
+        context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": subtype},
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_timeout_rate_persisted_and_drifted(db_session):
+    """The AGENT_TIMEOUT-rate measure is folded into the snapshot and drifts vs baseline."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First window: 2 oom timeouts among 4 execution-reached tasks -> 0.5 overall.
+    db_session.add(_make_timeout_task(project.id, "oom"))
+    db_session.add(_make_timeout_task(project.id, "oom"))
+    started = _make_efficient_task(project.id)
+    started.started_at = _utcnow() - timedelta(minutes=10)
+    db_session.add(started)
+    started2 = _make_efficient_task(project.id)
+    started2.started_at = _utcnow() - timedelta(minutes=10)
+    db_session.add(started2)
+    await db_session.commit()
+
+    # First snapshot seeds the immutable baseline.
+    snap = await write_snapshot(db_session, project.id)
+    block = snap["agent_timeout_rate"]
+    assert block["denominator"] == 4
+    assert block["timeout_count"] == 2
+    assert block["overall_rate"] == 0.5
+    assert block["dominant_subtype"] == "oom"
+    assert block["by_subtype"]["oom"]["rate"] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    atr = drift["agent_timeout_rate"]
+    # Baseline == current on the seeding snapshot: zero drift.
+    assert atr["overall"]["current"] == 0.5
+    assert atr["overall"]["baseline"] == 0.5
+    assert atr["overall"]["drift_pct"] == 0.0
+    assert atr["dominant_subtype"] == "oom"
+    assert atr["by_subtype"]["oom"]["current"] == 0.5
+    assert atr["denominator_definition"]
+
+
+@pytest.mark.asyncio
+async def test_agent_timeout_rate_backfilled_into_preexisting_baseline(db_session):
+    """A baseline that predates the measure gets agent_timeout_rate backfilled.
+
+    agent_timeout_rate is a nested block, not a member of ALL_AXES, so the
+    ALL_AXES-only re-seed loop never reaches it. Without an explicit backfill,
+    any project whose efficiency_baseline was seeded before this measure -- the
+    live, daily-snapshotted Blueprint project among them -- keeps a permanent
+    baseline with no agent_timeout_rate, so read_baseline_with_drift yields
+    baseline=None / drift_pct=None and the digest before/after sentence never
+    appears. This asserts the next snapshot grafts the block into the immutable
+    baseline.
+    """
+    # Pre-existing baseline lacks agent_timeout_rate entirely (predates measure).
+    project = make_project(
+        design_doc={
+            "efficiency_baseline": {
+                "baseline": {"captured_at": "2020-01-01T00:00:00+00:00"},
+                "snapshots": [],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 1 oom timeout among 2 execution-reached tasks -> 0.5 overall.
+    db_session.add(_make_timeout_task(project.id, "oom"))
+    started = _make_efficient_task(project.id)
+    started.started_at = _utcnow() - timedelta(minutes=10)
+    db_session.add(started)
+    await db_session.commit()
+
+    # The else-branch (baseline already seeded) must still backfill the block.
+    snap = await write_snapshot(db_session, project.id)
+    assert snap["agent_timeout_rate"]["overall_rate"] == 0.5
+
+    # write_snapshot mutates the project under project_lock but leaves the commit
+    # to its caller (the snapshot service). Commit here so the subsequent refresh
+    # reloads the persisted baseline rather than discarding the pending write.
+    await db_session.commit()
+    await db_session.refresh(project)
+    baseline = project.design_doc["efficiency_baseline"]["baseline"]
+    assert baseline.get("agent_timeout_rate") is not None
+    assert baseline["agent_timeout_rate"]["overall_rate"] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    atr = drift["agent_timeout_rate"]
+    assert atr["overall"]["baseline"] == 0.5
+    assert atr["overall"]["drift_pct"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_efficiency_axes_endpoint_exposes_timeout_rate(
+    client: AsyncClient, db_session
+):
+    """The efficiency-axes endpoint surfaces the agent_timeout_rate block."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(_make_timeout_task(project.id, "execution_timeout"))
+    started = _make_efficient_task(project.id)
+    started.started_at = _utcnow() - timedelta(minutes=10)
+    db_session.add(started)
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/efficiency-axes")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "agent_timeout_rate" in body
+    atr = body["agent_timeout_rate"]
+    assert atr["timeout_count"] == 1
+    assert atr["denominator"] == 2
+    assert atr["overall"]["current"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Standalone-smoke-compatible invariant tests (no DB session required)
+# ---------------------------------------------------------------------------
+
+
+def test_all_axes_have_named_consumer_or_retired_record():
+    """Every ALL_AXES member has an entry in AXIS_CONSUMERS with a non-empty
+    consumer, pending, or retired disposition, and every entry claiming an
+    active consumer is still a member of ALL_AXES (no stale records).
+
+    This test runs under --standalone --no-postgres (no DB session needed).
+    It is the distributed invariant guard: adding a new drift-alertable axis
+    without a named consumer or retired-with-record annotation MUST fail CI.
+    """
+    all_axes_set = set(ALL_AXES)
+    manifest_keys = set(AXIS_CONSUMERS)
+
+    # (a) Every ALL_AXES member must appear in AXIS_CONSUMERS.
+    missing = all_axes_set - manifest_keys
+    assert not missing, (
+        f"ALL_AXES members missing from AXIS_CONSUMERS: {sorted(missing)}. "
+        "Add an entry with a 'consumer', 'pending', or 'retired'+'date' disposition."
+    )
+
+    # (b) Every manifest entry must have at least one valid disposition key.
+    for axis_key, entry in AXIS_CONSUMERS.items():
+        has_consumer = bool(entry.get("consumer"))
+        has_pending = "pending" in entry
+        has_retired = "retired" in entry and "date" in entry
+        assert has_consumer or has_pending or has_retired, (
+            f"AXIS_CONSUMERS['{axis_key}'] has no valid disposition. "
+            "Provide 'consumer', 'pending', or both 'retired' and 'date'."
+        )
+
+    # (c) Every manifest key claiming an active consumer must still be in ALL_AXES
+    # (prevents stale consumer records from outliving their axis).
+    stale = {
+        k for k, v in AXIS_CONSUMERS.items() if v.get("consumer") and k not in all_axes_set
+    }
+    assert not stale, (
+        f"AXIS_CONSUMERS entries claiming active consumers for axes no longer in ALL_AXES: "
+        f"{sorted(stale)}. Remove or update the manifest entry."
+    )
+
+
+def test_axis_llm_cost_constant_value():
+    """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
+    assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"

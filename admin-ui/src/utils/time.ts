@@ -110,6 +110,26 @@ export function secondsUntil(v: string | number): number {
   return Math.max(0, Math.floor((parseTimestamp(v).getTime() - Date.now()) / 1000));
 }
 
+/**
+ * Render-time state of a bounded confirmation/deadline window.
+ *
+ * Computes remaining-vs-elapsed against `now` at call time so the surface is
+ * honest at view time, not at fetch time. `overdue` is true once now is at or
+ * past the deadline; `text` is a human label ("5m left in window" /
+ * "window elapsed 3m ago"). Wrapping `Date.now()` here (rather than in the
+ * component body) keeps the impure clock read out of render.
+ */
+export function deployWindowStatus(deadline: string | number): { overdue: boolean; text: string } {
+  const remainingMs = parseTimestamp(deadline).getTime() - Date.now();
+  const overdue = remainingMs <= 0;
+  return {
+    overdue,
+    text: overdue
+      ? `window elapsed ${formatDurationMs(-remainingMs)} ago`
+      : `${formatDurationMs(remainingMs)} left in window`,
+  };
+}
+
 /** "10m 30s" since signal first crossed threshold to case opening. */
 export function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
   if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';

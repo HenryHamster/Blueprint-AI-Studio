@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -140,6 +140,12 @@ beforeEach(() => {
 function mockJwtWithExp(expUnixSec: number): string {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
   const payload = Buffer.from(JSON.stringify({ exp: expUnixSec, sub: 'test-task' })).toString('base64url');
+  return `${header}.${payload}.fakesig`;
+}
+
+function mockJwtWithVmInstanceId(vmInstanceId: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ sub: 'test-task', vm_instance_id: vmInstanceId })).toString('base64url');
   return `${header}.${payload}.fakesig`;
 }
 
@@ -2821,6 +2827,158 @@ describe('persistAndPostStatus telemetry enrichment', () => {
       (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { handler_duration_secs?: number };
     expect(body.handler_duration_secs).toBeUndefined();
+  });
+});
+
+describe('park directives and warm continuation', () => {
+  const originalTaskId = process.env.TASK_ID;
+  const originalVmInstanceId = process.env.VM_INSTANCE_ID;
+  const originalAgentToken = process.env.AGENT_SECRET_TOKEN;
+  const originalLiveAgentToken = getAgentHeaders()['X-Agent-Token'];
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalVmInstanceId !== undefined) process.env.VM_INSTANCE_ID = originalVmInstanceId;
+    else delete process.env.VM_INSTANCE_ID;
+    if (originalAgentToken !== undefined) process.env.AGENT_SECRET_TOKEN = originalAgentToken;
+    else delete process.env.AGENT_SECRET_TOKEN;
+    _setAgentTokenForTesting(originalLiveAgentToken);
+    _consumePendingParkDirectiveForTesting('task-park');
+  });
+
+  it('records a park directive from /api/agent/status', async () => {
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        action: 'park',
+        retry_after_until: '2030-01-01T00:00:10Z',
+        park_deadline: '2030-01-01T00:00:30Z',
+      }),
+      text: () => Promise.resolve(''),
+      headers: { get: () => null },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await persistAndPostStatus('task-park', {
+      task_id: 'task-park',
+      status: 'FAILED',
+      failure_category: 'rate_limited',
+    });
+
+    expect(result).toMatchObject({
+      action: 'park',
+      retry_after_until: '2030-01-01T00:00:10Z',
+      park_deadline: '2030-01-01T00:00:30Z',
+    });
+    expect(_consumePendingParkDirectiveForTesting('task-park')).toEqual({
+      action: 'park',
+      retryAfterUntil: '2030-01-01T00:00:10Z',
+      parkDeadline: '2030-01-01T00:00:30Z',
+    });
+  });
+
+  it('uses the park deadline as the poll timeout and exits cleanly when it expires', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2030-01-01T00:00:00Z'));
+    process.env.TASK_ID = 'task-park';
+    process.env.VM_INSTANCE_ID = 'vm-park-1';
+
+    let observedTimeoutMs: number | undefined;
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-park',
+      priorPrNumber: 17,
+      baseBranch: 'main',
+      parkDirective: {
+        action: 'park',
+        retryAfterUntil: '2030-01-01T00:00:05Z',
+        parkDeadline: '2030-01-01T00:00:15Z',
+      },
+    }, {
+      pollForNextRole: opts => {
+        observedTimeoutMs = opts.timeoutMs;
+        return Promise.resolve({ action: 'exit', reason: 'poll_timeout' });
+      },
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: allowJwtFallback => (allowJwtFallback ? 'vm-park-1' : process.env.VM_INSTANCE_ID || null),
+    });
+
+    expect(result).toEqual({ action: 'exit' });
+    expect(observedTimeoutMs).toBe(15_000);
+    expect(process.env.TASK_ID).toBe('');
+  });
+
+  it('falls back to the task JWT vm id and re-targets after reclaim', async () => {
+    process.env.TASK_ID = 'task-park';
+    delete process.env.VM_INSTANCE_ID;
+    _setAgentTokenForTesting(mockJwtWithVmInstanceId('vm-from-jwt'));
+
+    const callOrder: string[] = [];
+    const resetForNextRole = vi.fn().mockImplementation(() => {
+      callOrder.push('reset');
+      return Promise.resolve();
+    });
+    const activateClaimedRole = vi.fn().mockImplementation((claim: { taskId?: string; agentToken?: string }) => {
+      callOrder.push('activate');
+      if (claim.agentToken) _setAgentTokenForTesting(claim.agentToken);
+      if (claim.taskId) process.env.TASK_ID = claim.taskId;
+    });
+    const materializeClaimCredentialState = vi.fn().mockImplementation(() => {
+      callOrder.push('materialize');
+    });
+    const performWarmRetarget = vi.fn().mockImplementation((_manifest: unknown, opts: { taskId?: string }) => {
+      callOrder.push(`retarget:${opts.taskId}`);
+      return Promise.resolve();
+    });
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-park',
+      priorPrNumber: 9,
+      baseBranch: 'main',
+      parkDirective: {
+        action: 'park',
+        retryAfterUntil: '2030-01-01T00:00:05Z',
+        parkDeadline: '2030-01-01T00:00:15Z',
+      },
+    }, {
+      pollForNextRole: opts => {
+        callOrder.push(`poll:${opts.vmInstanceId}`);
+        return Promise.resolve({
+          action: 'claim',
+          taskId: 'task-next',
+          agentToken: 'rotated-jwt',
+          secretManifest: {
+            env: { PROVIDER: 'anthropic' },
+            files: [{ path: '/tmp/provider.json', content: '{}', mode: '0600' }],
+          },
+        });
+      },
+      resetForNextRole,
+      activateClaimedRole,
+      materializeClaimCredentialState,
+      performWarmRetarget,
+      resolveVmInstanceId: allowJwtFallback => (allowJwtFallback ? 'vm-from-jwt' : null),
+    });
+
+    expect(result).toEqual({ action: 'exit' });
+    expect(callOrder).toEqual([
+      'poll:vm-from-jwt',
+      'activate',
+      'reset',
+      'materialize',
+      'retarget:task-next',
+    ]);
+    expect(performWarmRetarget).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { PROVIDER: 'anthropic' } }),
+      { rotatedJwt: 'rotated-jwt', taskId: 'task-next' },
+    );
+    expect(process.env.TASK_ID).toBe('task-next');
   });
 });
 

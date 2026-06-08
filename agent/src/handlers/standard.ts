@@ -22,9 +22,12 @@ import {
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import {
   fetchKnowledgeDocumentById,
+  fetchArtifactDownloadUrl,
   buildPrerequisiteKnowledgeSection,
+  buildPrerequisiteArtifactSection,
   type PrerequisiteKnowledgePointer,
   type PrereqKnowledgeDoc,
+  type PrerequisiteArtifactPointer,
 } from './prior-knowledge.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
@@ -561,7 +564,31 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqKnowledge] Injected ${resolved.size}/${prereqPointers.length} commissioned knowledge document(s).\n`);
   }
 
-  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + finalPrompt;
+  let prerequisiteArtifactSection = '';
+  const rawArtifactPrereqs = ctx.artifact_prerequisites;
+  const artifactPointers: PrerequisiteArtifactPointer[] = Array.isArray(rawArtifactPrereqs)
+    ? (rawArtifactPrereqs as unknown[])
+        .filter((p): p is Record<string, unknown> => !!p && typeof p === 'object')
+        .map((p) => ({
+          artifact_id: strVal(p.artifact_id),
+          logical_key: strVal(p.logical_key),
+          artifact_type: strVal(p.artifact_type),
+          source_task_id: strVal(p.source_task_id),
+          storage_uri: strVal(p.storage_uri),
+        }))
+        .filter((p) => p.artifact_id)
+    : [];
+  if (artifactPointers.length > 0) {
+    const signedUrls = new Map<string, string>();
+    for (const p of artifactPointers) {
+      const url = await fetchArtifactDownloadUrl(p.artifact_id);
+      if (url) signedUrls.set(p.artifact_id, url);
+    }
+    prerequisiteArtifactSection = buildPrerequisiteArtifactSection(artifactPointers, signedUrls, taskId);
+    sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedUrls.size} signed URL(s).\n`);
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });

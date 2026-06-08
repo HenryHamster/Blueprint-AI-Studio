@@ -1,6 +1,15 @@
 import { strVal, relativeTimeFromIso } from '../prompt.js';
 import { formatProjectContext } from './project-context.js';
 
+// Task types whose output ships through the CI-green + reviewer-sign-off
+// code-review merge gate, mirroring backend CODE_REVIEW_GATED_TASK_TYPES
+// (task_capabilities.py — the registry-derived set of capabilities with
+// evaluation == "code-ci-review"). The two learning signals below
+// (self-review calibration + first-review rejection patterns) are only
+// meaningful for reviewed code work, so both render for exactly these types.
+// Cannot import the Python frozenset cross-language; kept as a mirrored literal.
+const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
+
 type SRCatchRateSource = {
   categories?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
   by_task_type?: Record<string, Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>>;
@@ -340,7 +349,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         (taskContext?.related_files as string[] | undefined) ||
         [];
       prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
-      if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
+      if (REVIEW_GATED_TASK_TYPES.includes(taskType)) {
         prefix += formatSelfReviewCalibrationSection(
           (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||
           (projectCtx.sr_catch_rate_trends as SRCatchRateSource | undefined),
@@ -350,7 +359,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
     // Per-type rejection patterns ship as an object (not an array), so they
     // render independently of the hasData array check above.
-    if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
+    if (REVIEW_GATED_TASK_TYPES.includes(taskType)) {
       prefix += formatRejectionPatternsSection(
         projectCtx.rejection_patterns as RejectionPatternsSource | undefined,
         taskType,

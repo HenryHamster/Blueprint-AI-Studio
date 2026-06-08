@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { User } from 'firebase/auth';
-import type { DeployState, OrchestratorHealth, ProviderApisHealth } from '../types/settings';
+import type { DeployState, OrchestratorHealth, ProviderApisHealth, FailedRollbackInfo } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from './usePoller';
@@ -101,6 +101,20 @@ export function useDeploymentState(
   const rollbackInFlight = useRef(false);
   const [isRollingBack, setIsRollingBack] = useState(false);
 
+  // Durable, standing failed-rollback affordance. The error toast fired below
+  // auto-dismisses after a few seconds, after which the deploy surface would
+  // otherwise look indistinguishable from a successful rollback (false success
+  // by absence). This state outlives the toast so the operator always sees that
+  // the last rollback failed and traffic still serves the bad revision. It is
+  // cleared on the operator's next resolving action (a successful rollback, a
+  // mark-stable, or any deploy-state status change away from the at-failure
+  // status — see the useEffect below).
+  const [failedRollback, setFailedRollback] = useState<FailedRollbackInfo | null>(null);
+  // The deploy-state status captured at the moment of the failed rollback. Used
+  // to auto-clear the affordance once a poll observes the status move away from
+  // it (the situation has been resolved some other way).
+  const statusAtFailure = useRef<string | null>(null);
+
   const handleRollback = async () => {
     if (rollbackInFlight.current) return;
     rollbackInFlight.current = true;
@@ -125,9 +139,20 @@ export function useDeploymentState(
         const servingSha = data.serving_sha?.slice(0, 8) ?? 'current revision';
         const detail = data.gcloud_error ? ` (${data.gcloud_error})` : '';
         addToast(`Rollback failed — traffic still serves ${servingSha}; retry${detail}`, 'error');
+        // Promote the ephemeral toast into standing state so the affordance
+        // survives past the toast's auto-dismiss. Capture the current deploy
+        // status so the auto-clear effect can detect a later status change.
+        setFailedRollback({
+          serving_sha: data.serving_sha ?? null,
+          gcloud_error: data.gcloud_error ?? null,
+        });
+        statusAtFailure.current = deployState?.status ?? null;
         fetchDeployState();
         return;
       }
+      // A real traffic shift happened — clear any prior failed-rollback signal.
+      setFailedRollback(null);
+      statusAtFailure.current = null;
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
     } catch {
@@ -144,6 +169,10 @@ export function useDeploymentState(
         method: 'POST', headers: await authHeaders(),
       });
       if (!res.ok) throw new Error(res.statusText);
+      // Marking stable is one of the operator's resolving actions — drop the
+      // standing failed-rollback affordance.
+      setFailedRollback(null);
+      statusAtFailure.current = null;
       addToast('Deploy marked stable', 'success');
       fetchDeployState();
     } catch {
@@ -174,6 +203,18 @@ export function useDeploymentState(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
   usePoller(() => { fetchDeployState(true); }, { intervalMs: 60_000, enabled: !!user, leading: false, deps: [user] });
+
+  // Auto-clear the failed-rollback affordance once the deploy-state status
+  // moves away from what it was when the rollback failed. A successful retry,
+  // an auto-rollback, or an external state change all resolve the situation, so
+  // the standing signal must not linger as a false alarm.
+  useEffect(() => {
+    if (!failedRollback) return;
+    if (deployState && deployState.status !== statusAtFailure.current) {
+      setFailedRollback(null);
+      statusAtFailure.current = null;
+    }
+  }, [deployState, failedRollback]);
 
   // --- Zone Health ---
   const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);
@@ -258,6 +299,7 @@ export function useDeploymentState(
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, isRollingBack, handleMarkStable, handleRepairState,
+    failedRollback,
     zoneHealth,
     orchestratorHealth,
     detailedHealth,

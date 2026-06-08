@@ -4705,6 +4705,7 @@ async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.60,
+                    "current_reviewer_finding_count": 15,
                     "current_human_count": 15,
                     "rate_history": [0.62, 0.60],
                     "trend": "decreasing",
@@ -4749,6 +4750,7 @@ async def test_evaluate_sr_catch_rate_targets_suppressed_on_low_findings(db_sess
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.50,
+                    "current_reviewer_finding_count": 4,
                     "current_human_count": 4,  # below _SR_CATCH_RATE_MIN_FINDINGS=10
                     "rate_history": [0.52, 0.50],
                     "trend": "decreasing",

@@ -22,13 +22,22 @@ from sqlalchemy import func
 from sqlmodel import select
 
 from app.compute_backends import (
+    LOCAL_BACKEND_NAME,
     ComputeLaunchSpec,
+    collect_terminal_artifact_reference,
     default_compute_backend_name,
     get_compute_backend,
     validate_backend_name,
 )
+from app.artifact_prerequisites import (
+    deliver_artifact_to_dependents,
+    downstream_artifact_logical_key,
+    stamp_artifact_logical_key,
+)
 from app.database import AsyncSessionLocal
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -36,7 +45,11 @@ from app.models import (
     TaskStatus,
 )
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_vm_rate_per_second, is_supported_machine_type
+from app.vm_cost_rates import (
+    get_compute_rate_per_second,
+    resolve_compute_machine_type,
+    validate_compute_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,51 +121,78 @@ async def create_compute_job(
     task: Task,
     *,
     command: str,
-    machine_type: str,
+    machine_type: str | None = None,
     spend_cap_usd: float,
     deadline_seconds: int,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     backend_name: str | None = None,
     provisioning_model: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
-    if not is_supported_machine_type(machine_type):
-        raise ValueError(f"unsupported machine_type: {machine_type}")
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=accelerator,
+        machine_type=machine_type,
+    )
+    # Single gate for CPU and GPU shapes: a GPU machine type is accepted ONLY when
+    # paired with a supported single-GPU accelerator (rejects A100/over-quota,
+    # count != 1, unknown accelerators, and GPU/machine-family mismatch); a CPU
+    # request still requires an explicitly priced e2 machine type, unchanged.
+    accel_spec, reject_reason = validate_compute_request(
+        accelerator, resolved_machine_type, accelerator_count
+    )
+    if reject_reason is not None:
+        raise ValueError(reject_reason)
 
     normalized_backend = backend_name or default_compute_backend_name()
     # Validate BEFORE persisting: an unknown / mode-incompatible backend would
     # otherwise wedge the row in QUEUED forever (monitor raises every pass).
     validate_backend_name(normalized_backend)
+    # A GPU can never be provisioned by the local-subprocess backend — reject
+    # loudly at create time rather than silently running the command CPU-only.
+    if accel_spec is not None and normalized_backend == LOCAL_BACKEND_NAME:
+        raise ValueError(
+            "GPU compute jobs are unavailable on the local-subprocess backend"
+        )
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
     capped_deadline = clamp_deadline_seconds(deadline_seconds)
+    # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
+    # cost rate, and provisioning path all resolve the same supported shape.
+    persisted_accelerator = accel_spec.name if accel_spec is not None else None
+    persisted_accelerator_count = accelerator_count if accel_spec is not None else None
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
-        machine_type=machine_type,
+        machine_type=resolved_machine_type,
         spend_cap_usd=capped_spend,
         deadline_seconds=capped_deadline,
         cwd=cwd,
         env=env,
         backend_name=normalized_backend,
         provisioning_model=normalized_provisioning,
+        accelerator=persisted_accelerator,
+        accelerator_count=persisted_accelerator_count,
     )
     locked_task = await _lock_task_for_compute_job(session, task.id)
     if locked_task is None:
         raise ValueError("task not found")
     if locked_task.status in _TASK_TERMINAL_STATUSES:
         raise ValueError("cannot launch a compute job for a terminal task")
-    existing = await _get_active_compute_job_for_task(
-        session, task_id=locked_task.id
-    )
+    existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
         if _launch_request_matches(existing, launch_request_fingerprint):
             return existing
         raise ValueError("task already has an active compute job")
     deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
-    rate = get_vm_rate_per_second(
-        machine_type=machine_type,
+    # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
+    # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
+    rate = get_compute_rate_per_second(
+        machine_type=resolved_machine_type,
+        accelerator=persisted_accelerator,
+        count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
     )
     job = ComputeJob(
@@ -160,7 +200,9 @@ async def create_compute_job(
         project_id=locked_task.project_id,
         backend=normalized_backend,
         status=ComputeJobStatus.QUEUED,
-        machine_type=machine_type,
+        machine_type=resolved_machine_type,
+        accelerator_type=persisted_accelerator,
+        accelerator_count=persisted_accelerator_count,
         spend_cap_usd=capped_spend,
         accrued_cost_usd=0.0,
         wall_clock_deadline=deadline_at,
@@ -217,8 +259,12 @@ def _build_launch_request_fingerprint(
     env: dict[str, str] | None,
     backend_name: str,
     provisioning_model: str,
+    accelerator: str | None = None,
+    accelerator_count: int | None = None,
 ) -> str:
     payload = {
+        "accelerator": accelerator,
+        "accelerator_count": accelerator_count,
         "backend": backend_name,
         "command": command,
         "cwd": cwd,
@@ -259,14 +305,48 @@ async def stamp_compute_job_result_reference(
     job_id: uuid.UUID,
     result_reference: str | None,
 ) -> ComputeJob | None:
-    """Persist a terminal result reference on the matching compute-job row."""
+    """Persist a terminal result reference on the matching compute-job row.
+
+    When the producer declared downstream_artifact acceptance evidence, the
+    reference is also represented as a first-class COMPUTE_RESULT Artifact so
+    queued dependents can receive the declared logical artifact pointer.
+    """
     reference = (result_reference or "").strip()
     if not reference:
         return None
     job = await get_compute_job_for_task(session, job_id=job_id, task_id=task_id)
     if job is None:
         return None
+    task = await session.get(Task, task_id)
+    logical_key = downstream_artifact_logical_key(task)
     job.result_reference = reference
+    artifact = None
+    if job.artifact_id is not None:
+        artifact = await session.get(Artifact, job.artifact_id)
+        if artifact is not None and logical_key:
+            artifact.logical_key = logical_key
+            if not artifact.storage_uri:
+                artifact.storage_uri = reference
+            session.add(artifact)
+    elif logical_key:
+        artifact = Artifact(
+            task_id=task_id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri=reference,
+            logical_key=logical_key,
+            logs=json.dumps(
+                {
+                    "compute_job_id": str(job.id),
+                    "result_reference": reference,
+                },
+                sort_keys=True,
+            ),
+        )
+        session.add(artifact)
+        await session.flush()
+        job.artifact_id = artifact.id
+    if task is not None and artifact is not None:
+        await deliver_artifact_to_dependents(task, artifact, session)
     job.updated_at = _utcnow()
     session.add(job)
     return job
@@ -317,6 +397,9 @@ async def kill_compute_job(
         now=now,
         terminate_ok=terminated,
     )
+    # An operator-killed job may still have written durable artifacts before
+    # teardown — link them as a first-class result (best-effort, see helper).
+    await _link_terminal_artifact(session, job)
     await session.commit()
     await session.refresh(job)
     return job
@@ -341,7 +424,10 @@ async def list_compute_jobs(
             ComputeJob.project_id == project_id,
             (
                 ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | (ComputeJob.completed_at.is_not(None) & (ComputeJob.completed_at >= cutoff))
+                | (
+                    ComputeJob.completed_at.is_not(None)
+                    & (ComputeJob.completed_at >= cutoff)
+                )
             ),
         )
         .order_by(ComputeJob.created_at.desc())
@@ -418,6 +504,12 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
                 continue
             try:
                 await _process_single_compute_job(session, live)
+                # On any terminal transition (success, failure, deadline, budget,
+                # task-terminal cancel) link the durable artifact location as a
+                # first-class result before committing. Best-effort: never blocks
+                # the finalize commit (see _link_terminal_artifact).
+                if live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+                    await _link_terminal_artifact(session, live)
                 await session.commit()
             except Exception as exc:
                 await session.rollback()
@@ -469,13 +561,17 @@ async def _process_single_compute_job(session, job: ComputeJob) -> None:
     if status.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         finished = status.finished_at or now
         cost = await backend.poll_cost(job, as_of=finished)
-        job.accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
+        job.accrued_cost_usd = max(
+            float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
+        )
         # Persist any command-reported result metrics under a dedicated
         # polling_metadata key. polling_metadata already serializes to the agent
         # via serialize_compute_job_response, so the metrics reach the handler
         # without a migration. Absent metrics (None) leave the key unwritten.
         if status.metrics:
             _set_meta(job, result_metrics=dict(status.metrics))
+        if status.command_log:
+            _set_meta(job, command_log=dict(status.command_log))
         outcome = (
             ComputeJobOutcome.SUCCESS
             if status.status == ComputeJobStatus.SUCCEEDED
@@ -571,6 +667,8 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         cwd=meta.get("cwd"),
         env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
+        accelerator=job.accelerator_type,
+        accelerator_count=int(job.accelerator_count or 1),
     )
 
 
@@ -578,7 +676,9 @@ def _meta_message(job: ComputeJob) -> str | None:
     return (job.polling_metadata or {}).get("status_message")
 
 
-def _set_meta(job: ComputeJob, *, status_message: str | None = None, **extra: Any) -> None:
+def _set_meta(
+    job: ComputeJob, *, status_message: str | None = None, **extra: Any
+) -> None:
     meta = dict(job.polling_metadata or {})
     if status_message is not None:
         meta["status_message"] = status_message
@@ -610,3 +710,67 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+
+
+async def _link_terminal_artifact(session, job: ComputeJob) -> None:
+    """Turn a terminal job's durable artifact location into a first-class result.
+
+    When a terminal compute job produced durable, non-metric output (checkpoints,
+    plots, logs) that survived VM teardown, create one ``Artifact`` row for that
+    stored result and stamp ``ComputeJob.artifact_id`` + ``ComputeJob.result_reference``
+    to point at it — reusing the existing artifact/compute-job columns rather than
+    a parallel persistence channel. The agent's terminal COMPUTE_RESULT payload
+    then forwards the durable reference it reads back off the row.
+
+    Best-effort and idempotent:
+      * skips a job with no owning task or one already linked (re-entry safe);
+      * only a location with at least one durable object becomes an Artifact —
+        an empty artifact directory degrades to 'no artifact';
+      * the Artifact INSERT runs inside a SAVEPOINT so a failure (e.g. the owning
+        task was concurrently deleted) rolls back ONLY the linkage, never the
+        job's terminal completion, and is logged rather than raised.
+    """
+    if job.task_id is None or job.artifact_id is not None:
+        return
+    reference = await collect_terminal_artifact_reference(job)
+    if reference is None:
+        return
+    task = await session.get(Task, job.task_id)
+    try:
+        async with session.begin_nested():
+            artifact_logs = {
+                "compute_job_id": str(job.id),
+                "backend": reference.backend,
+                "artifact_uri": reference.uri,
+                "file_count": reference.file_count,
+                "outcome": (
+                    job.outcome.value if job.outcome is not None else None
+                ),
+                "final_cost_usd": job.final_cost_usd,
+            }
+            command_log = (job.polling_metadata or {}).get("command_log")
+            if command_log is not None:
+                artifact_logs["command_log"] = command_log
+            artifact = Artifact(
+                task_id=job.task_id,
+                artifact_type=ArtifactType.COMPUTE_RESULT,
+                storage_uri=reference.uri,
+                logs=json.dumps(artifact_logs, sort_keys=True),
+            )
+            stamp_artifact_logical_key(artifact, task)
+            session.add(artifact)
+            await session.flush()  # assign artifact.id before stamping the job
+        # SAVEPOINT released cleanly — safe to point the job at the durable result.
+        job.artifact_id = artifact.id
+        job.result_reference = reference.uri
+        job.updated_at = _utcnow()
+        session.add(job)
+        if task is not None:
+            await deliver_artifact_to_dependents(task, artifact, session)
+    except Exception:
+        logger.warning(
+            "[COMPUTE_JOB] durable-artifact linkage failed for job=%s; "
+            "completing without an artifact link",
+            job.id,
+            exc_info=True,
+        )

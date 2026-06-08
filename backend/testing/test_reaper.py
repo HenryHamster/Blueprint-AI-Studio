@@ -24,6 +24,7 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select as _select
 
+from app.capability_registry import derive_provider_marker
 from app.models import (
     Alert,
     AlertSeverity,
@@ -384,6 +385,57 @@ async def _run_reaper_once():
         pass
 
 
+@pytest.mark.asyncio
+async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mocker):
+    """An expired queued park must tear the held VM down and restore the cold
+    requeue shape so a warm VM cannot leak indefinitely."""
+    from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+
+    project = await _make_project(reaper_db)
+    old_vm_id = "agent-vm-park-expired"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=old_vm_id,
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        context={
+            "parked_for_retarget": True,
+            "park_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "warm_target_vm_id": old_vm_id,
+            "warm_handoff_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "warm_target_pr": "4242",
+            "blacklisted_accounts": ["acct-failed"],
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+
+    now = datetime.utcnow()
+    await run_infra_recovery_and_hold_maintenance(reaper_db, now)
+
+    await reaper_db.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != old_vm_id
+    assert task.retry_after_until is None
+    assert task.latest_status_message == "Park-and-retarget budget expired — cold requeueing"
+    assert "parked_for_retarget" not in ctx
+    assert "park_deadline" not in ctx
+    assert "warm_target_vm_id" not in ctx
+    assert "warm_handoff_deadline" not in ctx
+    assert "warm_target_pr" not in ctx
+    assert ctx.get("blacklisted_accounts") == ["acct-failed"]
+    delete_vm.assert_awaited_once_with(
+        old_vm_id, reason="park_retarget_budget_expired"
+    )
+
+
 # ── _copy_analysis_artifacts_to_previous (pure helper) ────────────────────
 
 
@@ -535,6 +587,66 @@ async def test_in_progress_heartbeat_timeout_reaped(
     # Reaper retries (attempt_count < class budget), so status flips to QUEUED.
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_timeout_retry_escalates_effort(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A pure wall-clock execution-timeout requeue escalates effort one tier so
+    the retry gets a larger budget, while an OOM requeue leaves effort
+    unchanged. This is the acceptance evidence for the escalation feature."""
+    project = await _make_project(reaper_db)
+
+    # Execution timeout: AGENT_TIMEOUT + execution_timeout subtype → escalate.
+    exec_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-exec-timeout",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        latest_status_message="execution timed out after 3600s",
+        context={
+            "failure_class": "AGENT_TIMEOUT",
+            "timeout_subtype": "execution_timeout",
+            "effort": "medium",
+        },
+    )
+    # OOM: AGENT_TIMEOUT + oom subtype → must NOT escalate.
+    oom_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-oom",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        latest_status_message="exit code 137 out of memory",
+        context={
+            "failure_class": "AGENT_TIMEOUT",
+            "timeout_subtype": "oom",
+            "effort": "medium",
+        },
+    )
+    reaper_db.add(exec_task)
+    reaper_db.add(oom_task)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(exec_task)
+    await reaper_db.refresh(oom_task)
+
+    # Both requeued in place (attempt_count < class budget).
+    assert exec_task.status == TaskStatus.QUEUED
+    assert oom_task.status == TaskStatus.QUEUED
+
+    # Execution-timeout retry escalated medium → high, with a breadcrumb.
+    assert exec_task.context["effort"] == "high"
+    assert exec_task.context["_effort_escalated_from"] == "medium"
+
+    # OOM retry left effort unchanged and recorded no escalation.
+    assert oom_task.context["effort"] == "medium"
+    assert "_effort_escalated_from" not in oom_task.context
 
 
 @pytest.mark.asyncio
@@ -7655,6 +7767,72 @@ async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resumes_when_need_satisfied_by_knowledge_document(
+    reaper_db, mocker
+):
+    """Incident shape (2026-06-07): a blocked dependent's kind='task' need whose ref
+    is a finding_hash is satisfied by a durable KnowledgeDocument even when the
+    originating task is CANCELLED — the dependent must resume (QUEUED), never be
+    routed to the dead-foundation-cancel path."""
+    from app.models import KnowledgeDocument
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Source task: CANCELLED (non-death — scope-empty so it is excluded from
+    # the dead-foundation path), but its finding_hash IS the need's ref.
+    source_task = Task(
+        project_id=project.id, title="source", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "bfb447f23b6d44f6", "failure_category": "SCOPE_EMPTY"},
+        status_log=[],
+    )
+    reaper_db.add(source_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(source_task)
+    # A KnowledgeDocument was written by that source task — durable substance.
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind="web_research",
+        title="Better runs blueprint",
+        summary="Analysis of better-run patterns.",
+        body="Full analysis body here.",
+        topic="better-runs-blueprint",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    # Blocked dependent: kind='task' need referencing the source task's finding_hash.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs the research finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "bfb447f23b6d44f6",
+                "reason": "BLOCKER: needs the research finding",
+                "need": {"kind": "task", "ref": "bfb447f23b6d44f6"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    # Resumed via knowledge-document satisfaction — not cancelled.
+    assert t.status == TaskStatus.QUEUED
+    # No edge wired (knowledge satisfaction has no live foundation).
+    assert not (t.depends_on or [])
+    # Blocker metadata cleared.
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_treat_ghost_merge_as_completed_foundation(
     reaper_db, mocker
 ):
@@ -8158,6 +8336,67 @@ async def test_unblock_sweep_resolves_capability_marker_need_into_dep_edge(
                 "waiting_on": "schema-models",
                 "reason": "BLOCKER: needs the schema models",
                 "need": {"kind": "capability", "ref": "schema-models"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resolves_floor_stamped_capability_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A non-research task's persisted floor marker resolves a blocked need.
+
+    The insert listener must stamp the derived namespaced provider marker into
+    context so future exact-match consumers can depend on any task type without
+    per-path wiring.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id,
+        title="build schema models foundation",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "plan"}],
+        context={},
+        status_log=[],
+    )
+    floor_marker = derive_provider_marker(foundation)
+    assert floor_marker is not None
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    assert floor_marker in (
+        [foundation.context["provides_capability"]]
+        if isinstance(foundation.context.get("provides_capability"), str)
+        else foundation.context.get("provides_capability", [])
+    )
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the exact foundation task",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": floor_marker,
+                "reason": "BLOCKER: needs the exact foundation task",
+                "need": {"kind": "capability", "ref": floor_marker},
             }
         },
         recheck_after=now - timedelta(minutes=1),
@@ -9239,6 +9478,120 @@ async def test_unblock_sweep_escalates_dead_dependency(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_requeues_completed_measured_negative_compute_prereq(
+    reaper_db, mocker
+):
+    """A measured-negative compute prerequisite is still eligible once completed."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id,
+        title="measure baseline",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+        context={
+            "compute_success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.42,
+                "met": False,
+                "measurable": True,
+            }
+        },
+        status_log=[],
+        plan_output={
+            "compute_result": {
+                "outcome": "SUCCESS",
+                "final_cost_usd": 0.37,
+                "criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                    "value": 0.42,
+                    "met": False,
+                    "measurable": True,
+                },
+            }
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        depends_on=[str(dep.id)],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_escalated") is None
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_escalates_broken_compute_prereq(reaper_db, mocker):
+    """A broken compute prerequisite still cascade-blocks its dependent."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id,
+        title="measure baseline",
+        description="x",
+        status=TaskStatus.FAILED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+        context={"evaluation_gate": {"passed": False, "strategy": "metric"}},
+        status_log=[],
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        depends_on=[str(dep.id)],
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_deadline_escalation(reaper_db, mocker):
     """A blocker older than the escalation deadline gets one ERROR alert, stays parked."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
@@ -9293,9 +9646,13 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
     project = await _make_project(reaper_db)
     now = _utcnow()
 
-    # (a) Past-deadline conflict blocker → escalates terminally and parks.
+    # (a) Past-deadline upstream-dependency blocker → escalates terminally and parks
+    # at the far-future horizon.  Use a non-transient blocker_kind (upstream_dependency)
+    # so it gets _BLOCKED_ESCALATED_PARK rather than the bounded cadence that
+    # transient blockers (file_conflict, pending_rollup) now use.
     escalated = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
         recheck_after=now - timedelta(minutes=1),
     )
@@ -9359,8 +9716,13 @@ async def test_unblock_sweep_evicts_legacy_escalated_none_recheck(reaper_db, moc
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
+    # Use a non-transient blocker_kind: transient ones (file_conflict, pending_rollup)
+    # now re-evaluate and requeue when their conflict has cleared; the eviction
+    # behavior (stay BLOCKED, push recheck_after forward) applies only to durable
+    # non-transient escalated blockers with no machine-resolvable need.
     t = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         context={"_blocked_escalated": True},
         recheck_after=None,  # legacy: escalated rows used to be left NULL
     )
@@ -9503,8 +9865,11 @@ async def test_parked_blocker_stays_parked_when_need_unsatisfiable(
         now=now,
     )
     # (b) No structured need at all — must keep the far-future park.
+    # Use a non-transient blocker_kind: transient blockers (file_conflict,
+    # pending_rollup) now re-evaluate when due instead of hard-parking at +10y.
     needless = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         context={"_blocked_escalated": True, "blocker": {"source": "agent"}},
         recheck_after=now - timedelta(minutes=1),
     )
@@ -11049,3 +11414,611 @@ async def test_merge_gate_degradation_sweep_ignores_tiny_sample(reaper_db, mocke
 
     created = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
     assert created == 0
+
+
+# ── sweep_migration_slot_contention (per-project alert) ──────────────────────
+
+
+def _mk_migration_inprogress(project_id, *, started_delta, title="mig-holder"):
+    from app.time_utils import _utcnow
+    return Task(
+        project_id=project_id,
+        title=title,
+        description="m",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="t",
+        requires_approval=False,
+        payloads=[{"type": "migrate"}],
+        context={},
+        status_log=[],
+        started_at=_utcnow() - started_delta,
+    )
+
+
+def _mk_migration_waiter(project_id, *, status=TaskStatus.QUEUED, updated_delta=None):
+    from app.time_utils import _utcnow
+    kwargs = {}
+    if updated_delta is not None:
+        kwargs["updated_at"] = _utcnow() - updated_delta
+    return Task(
+        project_id=project_id,
+        title="mig-waiter",
+        description="w",
+        status=status,
+        created_by="t",
+        requires_approval=False,
+        payloads=[{"type": "migrate"}],
+        context={},
+        status_log=[],
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_alerts_past_threshold(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-unit", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(hours=2))
+    waiter = _mk_migration_waiter(project.id, updated_delta=timedelta(minutes=45))
+    reaper_db.add_all([holder, waiter])
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 1
+
+    from app.alert_dispatch import _MIGRATION_SLOT_CONTENTION_ALERT_TITLE
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.title == _MIGRATION_SLOT_CONTENTION_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].project_id == project.id
+    assert alerts[0].task_id == holder.id
+    assert "parked waiting" in alerts[0].message
+
+    # Dedups on the stable title — a second sweep raises no new alert.
+    again = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert again == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_silent_below_threshold(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-fresh", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Fresh holder (5m) with a waiter — contended but under the 1h threshold.
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(minutes=5))
+    waiter = _mk_migration_waiter(project.id, updated_delta=timedelta(minutes=3))
+    reaper_db.add_all([holder, waiter])
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_silent_with_no_waiters(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-solo", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Long-held solo migration, nobody parked -> not a contention event.
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(hours=4))
+    reaper_db.add(holder)
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 0
+
+
+# ── event_driven_unblock_dependents ──────────────────────────────────────────
+
+from app.reaper_sweeps import event_driven_unblock_dependents  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_landing_event_resumes_blocked_dependent_immediately(reaper_db, mocker):
+    """A BLOCKED dependent whose capability need is satisfied by a just-landed
+    foundation is immediately resumed to QUEUED by event_driven_unblock_dependents
+    — without waiting for the next periodic sweep."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation: COMPLETED and carries the merge-unblock signal.
+    foundation = Task(
+        project_id=project.id,
+        title="build auth layer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "auth-layer"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    # Dependent: BLOCKED waiting on the capability "auth-layer".
+    # recheck_after is in the future — the periodic sweep would NOT pick this up.
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),  # not yet due for the sweep
+    )
+
+    # The periodic sweep would NOT pick this up (recheck_after is in the future).
+    # The event-driven path must resume it immediately.
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 1
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.QUEUED
+    assert "blocker" not in (dependent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_skips_without_merge_signal(reaper_db, mocker):
+    """If the foundation is COMPLETED but has NO merge-unblock signal, the
+    event-driven path returns 0 and leaves the dependent BLOCKED."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation: COMPLETED but NO pr_merged signal.
+    foundation = Task(
+        project_id=project.id,
+        title="incomplete foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "auth-layer"},  # no pr_merged
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_no_match_leaves_dependent_blocked(reaper_db, mocker):
+    """A foundation that does NOT provide the needed capability leaves the
+    dependent BLOCKED (no false-positive resume)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Foundation provides a DIFFERENT capability.
+    foundation = Task(
+        project_id=project.id,
+        title="unrelated foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "database-schema"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "reason": "BLOCKER: needs auth layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
+    """An exception inside the disposition logic is swallowed; the function
+    returns 0 rather than propagating the error (fail-open guarantee)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    foundation = Task(
+        project_id=project.id,
+        title="error-prone foundation",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "some-cap"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+
+    await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs some-cap",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "some-cap",
+                "reason": "BLOCKER: needs some-cap",
+                "need": {"kind": "capability", "ref": "some-cap"},
+            }
+        },
+        recheck_after=now + timedelta(hours=1),
+    )
+
+    # Inject a failure into _classify_blocker_needs to simulate an unexpected error.
+    import app.reaper_sweeps as _rs_mod
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("simulated classification error")
+
+    monkeypatch.setattr(_rs_mod, "_classify_blocker_needs", _raise)
+
+    # Must not raise; must return 0.
+    result = await event_driven_unblock_dependents(foundation, reaper_db)
+    assert result == 0
+
+
+# ── Fix: file_conflict blockers must not hard-park or survive requeue ──────────
+#
+# Regression tests for the three-part fix:
+#   Fix 1: clear_blocker_metadata clears _blocked_escalated / _precondition_escalated_key
+#   Fix 2: transient blockers (file_conflict) never hard-park at +10y;
+#           need-less parked transient blockers re-evaluate and requeue when cleared
+#   Fix 3: recovery sweep resets already-parked transient blockers to bounded re-eval
+
+from app.reaper_sweeps import (  # noqa: E402
+    sweep_recover_stranded_transient_blockers,
+    _BLOCKED_PARKED_REEVAL_INTERVAL,
+    _TRANSIENT_BLOCKER_PARK_SENTINEL,
+)
+# _BLOCKED_ESCALATED_PARK already imported in the Step-12 import block above.
+
+
+# ── Fix 1: clear_blocker_metadata wipes escalation markers ────────────────────
+
+
+def test_clear_blocker_metadata_clears_escalation_markers():
+    """clear_blocker_metadata must wipe _blocked_escalated and _precondition_escalated_key
+    so a requeued task never immediately re-parks on its next block episode."""
+    from app.task_blocked import clear_blocker_metadata
+    from testing.factories import make_task
+
+    t = make_task(
+        status=TaskStatus.BLOCKED,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=_utcnow(),
+        recheck_after=_utcnow() + timedelta(days=3650),
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+            "_blocked_escalated": True,
+            "_precondition_escalated_key": "file conflict on a.py",
+        },
+    )
+
+    clear_blocker_metadata(t)
+
+    ctx = t.context or {}
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "blocker" not in ctx
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert t.recheck_after is None
+    assert t.blocker_kind is None
+
+
+@pytest.mark.asyncio
+async def test_file_conflict_requeue_does_not_re_park(reaper_db, mocker):
+    """The key regression: a file_conflict blocker whose context carries
+    _blocked_escalated=True is requeued by the operator → on the next reblock
+    and sweep cycle the task must NOT immediately re-park at +10y.
+
+    Concrete shape: task has _blocked_escalated=True (operator requeued it),
+    becomes BLOCKED again (conflict still live when it runs), and the sweep
+    is called.  With the fix, the sweep rechecks state and requeues (clear)
+    instead of re-parking at the +10y sentinel."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Simulate a file_conflict blocker that was re-blocked AFTER a requeue:
+    # the requeue cleared the escalation markers (Fix 1), but here we test
+    # the sweep path directly — task has _blocked_escalated=True and is due.
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=7),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+            "_blocked_first_at": {
+                "key": "file conflict on a.py",
+                "at": (now - timedelta(hours=7)).isoformat(),
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    # Transient blocker with _blocked_escalated=True should be requeued
+    # (conflict clears since there are no in-flight tasks holding it),
+    # NOT re-parked at +10y.
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Must NOT have a far-future recheck_after (the +10y sentinel).
+    far_future = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    assert t.recheck_after is None or t.recheck_after < far_future
+
+
+@pytest.mark.asyncio
+async def test_file_conflict_escalation_uses_bounded_recheck_not_10y(
+    reaper_db, mocker
+):
+    """When a file_conflict blocker crosses the 6h escalation deadline, it must be
+    parked at _BLOCKED_PARKED_REEVAL_INTERVAL (bounded) not _BLOCKED_ESCALATED_PARK
+    (+10y), so it self-heals when the overlapping in-flight task merges."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_blocked_escalation_alert",
+        new_callable=AsyncMock,
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # A file_conflict blocker past the 6h escalation deadline, not yet escalated.
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=7),  # 7h > 6h threshold
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_first_at": {
+                "key": "file conflict on a.py",
+                "at": (now - timedelta(hours=7)).isoformat(),
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    # Escalation fires; task stays BLOCKED.
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+    # recheck_after must be bounded (PARKED_REEVAL_INTERVAL) NOT the +10y sentinel.
+    assert t.recheck_after is not None
+    far_future = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    assert t.recheck_after < far_future
+    # Specifically within a few minutes of _BLOCKED_PARKED_REEVAL_INTERVAL from now.
+    expected_max = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=5)
+    assert t.recheck_after <= expected_max
+
+
+@pytest.mark.asyncio
+async def test_parked_file_conflict_re_evaluates_on_next_cycle(reaper_db, mocker):
+    """A file_conflict blocker with _blocked_escalated=True and a due
+    recheck_after re-evaluates its precondition state instead of re-parking at
+    +10y.  When the conflict has cleared (no in-flight tasks holding it), the
+    task is requeued and the escalated marker is cleared."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    ctx = t.context or {}
+    # Escalation marker cleared on the unblock transition.
+    assert "_blocked_escalated" not in ctx
+
+
+# ── Fix 3: recovery sweep un-strands hard-parked transient blockers ────────────
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_resets_hard_parked_file_conflict(reaper_db, mocker):
+    """The recovery sweep finds a file_conflict blocker hard-parked at +10y and
+    resets its recheck_after to the bounded re-eval cadence so it self-heals."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        # Hard-parked at the +10y sentinel.
+        recheck_after=now + timedelta(days=3650),
+    )
+
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+
+    assert recovered == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED  # still BLOCKED
+    # recheck_after reset to bounded re-eval (within 2× PARKED_REEVAL_INTERVAL).
+    assert t.recheck_after is not None
+    far_future = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    assert t.recheck_after < far_future
+    expected_max = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=5)
+    assert t.recheck_after <= expected_max
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_ignores_non_transient_blockers(reaper_db, mocker):
+    """The recovery sweep must not touch hard-parked blockers that are NOT
+    transient kinds (e.g. upstream_dependency) — those stay for the operator."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    far = now + timedelta(days=3650)
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="Waiting: upstream dependency",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={"blocker": {"source": "agent"}, "_blocked_escalated": True},
+        recheck_after=far,
+    )
+
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+
+    assert recovered == 0
+    await reaper_db.refresh(t)
+    # recheck_after must be unchanged.
+    assert t.recheck_after is not None
+    assert abs((t.recheck_after - far).total_seconds()) < 5
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_then_unblock_sweep_requeues(reaper_db, mocker):
+    """End-to-end: recovery sweep resets a hard-parked transient blocker,
+    then the unblock sweep requeues it when the conflict has cleared."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        recheck_after=now + timedelta(days=3650),
+    )
+
+    # Step 1: recovery sweep moves the row back into the due window
+    # (recheck_after → now + _BLOCKED_PARKED_REEVAL_INTERVAL).
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+    assert recovered == 1
+
+    # Step 2: unblock sweep re-evaluates when the reset recheck_after is due.
+    # Advance "now" past the new recheck_after so the row is due.
+    future_now = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=1)
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, future_now)
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED

@@ -14,7 +14,6 @@ import logging
 import os
 import time
 import uuid
-import asyncio
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, Any
@@ -41,6 +40,8 @@ from app.models import (
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
 from app.auth import get_current_user
+from app.admin_helpers import _get_user_project, _get_user_task
+from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_settings import router as admin_settings_router
@@ -85,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0156"
+EXPECTED_SCHEMA_REVISION = "0198"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1203,33 +1204,113 @@ async def get_viewport_failure_screenshot_download_url(
     panel can display screenshots from the stable per-project/component/width
     path without a per-task DB lookup. The component is sanitized with the same
     rule the upload endpoint applies so the two paths always agree.
+
+    Signing is delegated to the shared ``app.storage`` helper so this route and
+    the general artifact-download resolver share one bucket-allowlisting +
+    V4-signing implementation instead of duplicating it.
     """
-    import datetime as _dt
     import re as _re
 
-    from google.cloud import storage as _gcs
-
-    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
 
     safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
     object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
-
-    def _generate() -> str:
-        blob = (
-            _gcs.Client(project=GCP_PROJECT_ID)
-            .bucket(ARTIFACT_BUCKET_NAME)
-            .blob(object_name)
-        )
-        return blob.generate_signed_url(
-            version="v4", expiration=_dt.timedelta(hours=1), method="GET"
-        )
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:
-        url = await asyncio.to_thread(_generate)
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
+        # Reconstructed path failed validation — a client/config error, not an
+        # outage. Surface as 400 without echoing the object path back.
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid screenshot reference")
     except Exception as exc:
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+    return {"url": url}
+
+
+@app.get(
+    "/api/admin/artifacts/download-url",
+    response_model=ArtifactDownloadResponse,
+)
+async def resolve_artifact_download_url(
+    storage_uri: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve a project-owned ``gs://`` artifact reference into a signed GET URL.
+
+    Operators reach this for any storage-backed output — a compute job
+    ``result_reference``, a task artifact ``storage_uri``, a compute-job durable
+    artifact reference, or a knowledge citation — instead of being limited to
+    raw http(s) links. It fails closed:
+
+    * malformed / non-``gs://`` / out-of-bucket references -> 400, no URL leaked;
+    * a reference whose owning task is in a different project than ``project_id``
+      (or a project the caller can't access) -> 404, treated as not-found so
+      cross-project probing learns nothing;
+    * references not bound to a resolvable task or compute job -> 404;
+    * a storage-layer failure while signing -> 503.
+
+    ``project_id`` is the project the operator is viewing; membership in it is
+    enforced before any object is signed.
+    """
+    from app.storage import (
+        compute_job_id_for_artifact_uri,
+        StorageUriError,
+        generate_download_signed_url,
+        parse_artifact_uri,
+        task_id_for_artifact_uri,
+    )
+
+    # 1. Scheme + bucket allowlist. Reject malformed/out-of-bucket before any
+    # DB or storage work so nothing about the object is observable.
+    try:
+        parse_artifact_uri(storage_uri)
+    except StorageUriError as exc:
+        logger.info("[ARTIFACT] rejected download reference: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")
+
+    # 2. Bind the reference to its owning task or compute job, then authorize
+    # the caller for that project's membership. A reference that doesn't resolve
+    # to something the caller may access is indistinguishable from "not found".
+    owning_task_id = task_id_for_artifact_uri(storage_uri)
+    if owning_task_id is not None:
+        task = await _get_user_task(owning_task_id, current_user["user_id"], session)
+        if task.project_id != project_id:
+            # Reference belongs to a different project than the one the operator
+            # is viewing — reject as not-found rather than confirming it exists.
+            raise HTTPException(status_code=404, detail="Artifact not found")
+    else:
+        owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
+        if owning_compute_job_id is None:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        from app.models import ComputeJob  # noqa: PLC0415
+
+        job = await session.get(ComputeJob, owning_compute_job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        await _get_user_project(job.project_id, current_user["user_id"], session)
+        if job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # 3. Sign. Validation already passed, so any failure here is a storage
+    # outage, not a bad reference.
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError:
+        # Defensive: should be unreachable since step 1 validated the URI.
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")
+    except Exception as exc:
+        logger.warning("[ARTIFACT] signing failed for task %s: %s", owning_task_id, exc)
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
     return {"url": url}
 

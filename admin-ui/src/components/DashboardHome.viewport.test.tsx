@@ -200,6 +200,7 @@ vi.mock('../api', () => ({
   fetchTask: vi.fn(async () => ({})),
   fetchTaskSerialConsole: vi.fn(async () => ({ available: false })),
   fetchAutonomyDebug: vi.fn(async () => ({})),
+  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/artifacts/test.json'),
   fetchRetirementCritiques: vi.fn(async () => ({ critiques: [] })),
   fetchResearchActionability: vi.fn(async () => ({
     cycles: [],

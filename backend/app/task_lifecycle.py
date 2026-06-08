@@ -1358,6 +1358,20 @@ async def _process_post_commit(
                             # as warm-claimable for this task's teardown-defer VM.
                             if _record_pr_merged:
                                 await _mark_dependents_warm_claimable(task)
+                                try:
+                                    from app.reaper_sweeps import (  # noqa: PLC0415
+                                        event_driven_unblock_dependents,
+                                    )
+
+                                    await event_driven_unblock_dependents(
+                                        task, session
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "[PIPELINE] event_driven_unblock_dependents "
+                                        "failed for task %s",
+                                        task.id,
+                                    )
                             logger.info(
                                 f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)"
                             )
@@ -3041,6 +3055,20 @@ async def _process_post_commit(
                                         # warm-claimable (see cluster 1 parity).
                                         if _record_pr_merged:
                                             await _mark_dependents_warm_claimable(orig)
+                                            try:
+                                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                                    event_driven_unblock_dependents,
+                                                )
+
+                                                await event_driven_unblock_dependents(
+                                                    orig, session
+                                                )
+                                            except Exception:
+                                                logger.exception(
+                                                    "[PIPELINE] event_driven_unblock_dependents "
+                                                    "failed for task %s",
+                                                    orig.id,
+                                                )
                                         # Spawn a smoketest after rollup merges to the
                                         # promotion target. After Phase 1 (automain/LTS),
                                         # normal rollups target `automain`; only promotion
@@ -3723,6 +3751,21 @@ async def _process_post_commit(
                             await refresh_direction_outcomes_after_merge(
                                 _orig_to_refresh, session
                             )
+                        if _orig_to_refresh is not None:
+                            try:
+                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                    event_driven_unblock_dependents,
+                                )
+
+                                await event_driven_unblock_dependents(
+                                    _orig_to_refresh, session
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[PIPELINE] event_driven_unblock_dependents "
+                                    "failed for task %s",
+                                    _orig_to_refresh.id,
+                                )
                         if original_task_id:
                             try:  # noqa: SIM105
                                 await broadcast_to_project(

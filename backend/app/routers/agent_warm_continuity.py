@@ -23,6 +23,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -377,6 +378,8 @@ async def _resolve_retarget(
             model=selection.model,
             execution_mode=selection.execution_mode,
         )
+        if ctx.get("parked_for_retarget"):
+            new_ctx["park_retarget_claim_blocked"] = True
         return None, new_ctx, None
 
     # The account slot is now ACQUIRED (select_max_plan_account pre-incremented
@@ -582,6 +585,15 @@ async def _finalize_warm_claim(
                 session, task, vm_instance_id, vm_boot, ctx, task_type
             )
             retargeted = True
+            if ctx.pop("park_retarget_claim_blocked", False):
+                await session.rollback()
+                logger.info(
+                    "[NEXT-ROLE] Parked retarget claim for task %s on vm %s "
+                    "deferred: no alternate account is claimable yet",
+                    task.id,
+                    vm_instance_id,
+                )
+                return Response(status_code=204)
 
         # Baseline boot-account attribution. The VM's LLM credentials are frozen
         # into its boot secret manifest, so a backlog/chain claim that bypasses
@@ -604,6 +616,11 @@ async def _finalize_warm_claim(
                 model=boot_account.get("model"),
             )
 
+        # Park-and-retarget is a transient QUEUED-state marker only. Once this
+        # warm claim lands the task is active again, so clear the bounded-park
+        # bookkeeping before committing the IN_PROGRESS transition.
+        ctx.pop("parked_for_retarget", None)
+        ctx.pop("park_deadline", None)
         existing_timing = dict(ctx.get("_timing") or {})
         existing_timing.setdefault("warm_start", True)
         existing_timing["warm_claim_origin"] = origin
@@ -697,6 +714,7 @@ async def next_role(
     from app.warm_backlog_reuse import record_chain_poll as _record_chain_poll
 
     _record_chain_poll()
+    now = _utcnow()
 
     # Race guard: refuse warm-claim on a VM that was just scheduled for
     # orchestrator-initiated deletion. With fire_and_forget_vm_delete
@@ -761,6 +779,10 @@ async def next_role(
             Task.status == TaskStatus.QUEUED,
             Project.paused.is_(False),
             Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id,
+            or_(
+                Task.retry_after_until.is_(None),
+                Task.retry_after_until <= now,
+            ),
         ]
         if use_jsonb_has_key:
             pool_filters.insert(2, Task.context.has_key("warm_target_vm_id"))
@@ -878,6 +900,8 @@ async def next_role(
 
                 record_pool_claim_failure("finalize_error")
                 raise
+            if isinstance(result, Response):
+                return result
             if secret_manifest is not None:
                 # Transient credential re-target grant; the agent re-materializes
                 # it BEFORE running the role. Not persisted anywhere.
@@ -929,6 +953,12 @@ async def next_role(
         if use_jsonb_has_key:
             warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
         warm_vm_filters.append(
+            or_(
+                Task.retry_after_until.is_(None),
+                Task.retry_after_until <= now,
+            )
+        )
+        warm_vm_filters.append(
             Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
         )
         stmt = (
@@ -972,6 +1002,8 @@ async def next_role(
                 record_chain_claimed as _record_chain_claimed,
             )
 
+            if isinstance(result, Response):
+                return result
             _record_chain_claimed()
             logger.info(
                 f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
@@ -1068,6 +1100,8 @@ async def next_role(
                     except Exception:
                         _shared_state.record_backlog_reuse_failure("finalize_error")
                         raise
+                    if isinstance(result, Response):
+                        return result
                     _record_warm_claim_succeeded()
                     logger.info(
                         f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "

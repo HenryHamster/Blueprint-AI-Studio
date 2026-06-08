@@ -90,6 +90,48 @@ export interface CodeChangeHelperConfig {
    *  Blueprint admin-ui/agent/backend blocks (the self-repo fallback used
    *  only when no build_config is present). */
   buildConfig?: BuildConfig;
+  /** Exact pytest node-id selectors that CI reported failing, for a
+   *  ci_failure fix task. When set, the generated ./check verifies these
+   *  selectors pass LOCALLY (targeted `scripts/test-backend.sh` run — never
+   *  the full suite, which OOMs the agent VM) and FAILS the gate if any
+   *  still fails. Since ./pr open gates on ./check, this closes the
+   *  fix→verify→push loop: the push is blocked until the CI-failing tests
+   *  pass locally. Empty/undefined for non-ci_failure tasks (unchanged
+   *  behavior). Selectors that fail shell-safety validation are dropped. */
+  ciFailureSelectors?: string[];
+}
+
+// A pytest node-id we are willing to interpolate into the generated ./check
+// bash as a single-quoted literal AND pass to `scripts/test-backend.sh`. We
+// accept the conventional `testing/...py` path (optionally `backend/`-prefixed,
+// stripped below) with an optional `::nodeid` tail. The character class is a
+// conservative allowlist (alnum + `_./-` for the path, plus `:[]` and a few
+// param-id chars for the node-id) that rejects every shell metacharacter, so
+// emitting these as single-quoted bash literals is injection-safe (CLAUDE.md
+// on generating one language from another). Anything that doesn't match is
+// dropped (graceful degradation) rather than blocking the gate on a weird
+// selector — but a well-formed failing selector still blocks the push.
+const PYTEST_SELECTOR_RE = /^(?:backend\/)?testing\/[A-Za-z0-9_./-]+\.py(?:::[A-Za-z0-9_.:[\]-]+)?$/;
+
+/** Normalize + filter ci_failure selectors for the `scripts/test-backend.sh`
+ *  invocation in the generated ./check. The harness runs pytest from inside
+ *  the backend image (CWD `/app` = backend root), so node-ids are
+ *  backend-relative: strip a leading `backend/`. Drops any selector that
+ *  fails the shell-safety allowlist, dedups, and preserves order. */
+export function sanitizeCiFailureSelectors(selectors: string[] | undefined): string[] {
+  if (!selectors || selectors.length === 0) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of selectors) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim().replace(/\\/g, '/');
+    if (!PYTEST_SELECTOR_RE.test(trimmed)) continue;
+    const rel = trimmed.startsWith('backend/') ? trimmed.slice('backend/'.length) : trimmed;
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    out.push(rel);
+  }
+  return out;
 }
 
 /** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */

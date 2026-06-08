@@ -25,6 +25,10 @@ Public API:
   count_merged_since(session, project_id, since)
       Count tasks whose PR was merged after ``since`` for a project.
 
+  compute_version_acceptance_aggregate(session, project_id, *, since)
+      Classify merged-since tasks by acceptance-evidence outcome
+      (proven / declared_unsatisfied / undeclared / total).
+
   recent_closed_versions(session, project_id, limit=5)
       Return the most recently closed/promoted versions for a project,
       newest first.  Used by the operator version-lifecycle panel.
@@ -43,21 +47,31 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
 from app.landed_signal import landed_signal_predicate
 from app.models import Project, ReleaseVersion, Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
 _VALID_PHASES = frozenset({"build", "stabilize"})
 _PHASE_REASONING_MAX = 500
+
+# Fraction of the promotion auto-timeout cap past which an in-flight promotion is
+# flagged as ``promotion_nearing_timeout`` (so operators/strategist get a warning
+# before the reconciliation sweep force-reverts it to stabilize).
+_PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 
 # Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
 # which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
@@ -71,10 +85,15 @@ class VersionCutBlockedByPromotion(RuntimeError):
         self,
         promotion_pr_number: int | None = None,
         promotion_pr_url: str | None = None,
+        promotion_freshness: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__("promotion PR is open and auto-merging")
         self.promotion_pr_number = promotion_pr_number
         self.promotion_pr_url = promotion_pr_url
+        # Additive freshness context (age / auto-timeout) so the version-cut 409
+        # can surface elapsed age and near/past-timeout state. ``None`` when the
+        # promotion_pending record had no usable ``enabled_at``.
+        self.promotion_freshness = dict(promotion_freshness) if promotion_freshness else None
 
 
 async def open_version(
@@ -132,6 +151,8 @@ async def open_version(
 async def current_open_version(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    include_artifacts: bool = False,
 ) -> ReleaseVersion | None:
     """Return the current open ``ReleaseVersion`` for ``project_id``, or None.
 
@@ -148,6 +169,8 @@ async def current_open_version(
         .order_by(ReleaseVersion.opened_at.desc())
         .limit(2)
     )
+    if include_artifacts:
+        stmt = stmt.options(selectinload(ReleaseVersion.deploy_artifacts))
     rows = list((await session.execute(stmt)).scalars().all())
     if not rows:
         return None
@@ -256,6 +279,68 @@ async def count_merged_since(
     return int(result.scalar() or 0)
 
 
+async def compute_version_acceptance_aggregate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    since: datetime,
+) -> dict[str, int]:
+    """Classify version-window merged tasks by acceptance-evidence outcome.
+
+    Operates over the same merged-since window as :func:`count_merged_since`
+    (``COMPLETED`` tasks carrying the canonical landing signal with
+    ``updated_at >= since``).  For each landed task it reads the durable
+    per-task code-acceptance verdict
+    (:data:`app.acceptance_gate.CODE_ACCEPTANCE_VERDICT_KEY`, stamped at land
+    time) off ``Task.context`` and buckets it:
+
+      - ``proven`` — a verdict was recorded AND is explicitly satisfied
+        (declared acceptance evidence that passed).
+      - ``declared_unsatisfied`` — a verdict was recorded AND is explicitly
+        unsatisfied per :func:`app.acceptance_gate.acceptance_blocks_success`
+        (declared acceptance evidence that did NOT pass).
+      - ``undeclared`` — no verdict key present.  This is the common, legacy,
+        and "declared no acceptance evidence" case; counted for visibility but
+        it must NEVER be held against promotion readiness.
+
+    Returns ``{proven, declared_unsatisfied, undeclared, total}``.  A malformed
+    recorded verdict (a dict that is neither satisfied nor explicitly
+    unsatisfied) is fail-safe — counted as ``undeclared`` so it never lowers
+    readiness.
+    """
+    stmt = select(Task.context).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        Task.updated_at >= since,
+        landed_signal_predicate(session),
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    proven = 0
+    declared_unsatisfied = 0
+    undeclared = 0
+    for ctx in rows:
+        recorded = (
+            ctx.get(CODE_ACCEPTANCE_VERDICT_KEY) if isinstance(ctx, dict) else None
+        )
+        if recorded is None:
+            undeclared += 1
+        elif acceptance_blocks_success(recorded):
+            declared_unsatisfied += 1
+        elif isinstance(recorded, dict) and recorded.get("satisfied") is True:
+            proven += 1
+        else:
+            # Malformed/indeterminate recorded verdict — fail safe.
+            undeclared += 1
+
+    return {
+        "proven": proven,
+        "declared_unsatisfied": declared_unsatisfied,
+        "undeclared": undeclared,
+        "total": len(rows),
+    }
+
+
 # Non-terminal task statuses — work that is still "in flight" against a version.
 # Mirrors the active-status set used by the idempotency partial index in
 # models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED.
@@ -301,6 +386,8 @@ async def recent_closed_versions(
     session: AsyncSession,
     project_id: uuid.UUID,
     limit: int = 5,
+    *,
+    include_artifacts: bool = False,
 ) -> list[ReleaseVersion]:
     """Return the most recently closed (non-open) ``ReleaseVersion`` rows.
 
@@ -318,13 +405,139 @@ async def recent_closed_versions(
         .order_by(ReleaseVersion.opened_at.desc())
         .limit(limit)
     )
+    if include_artifacts:
+        stmt = stmt.options(selectinload(ReleaseVersion.deploy_artifacts))
     return list((await session.execute(stmt)).scalars().all())
+
+
+_PROMOTION_FRESHNESS_KEYS = (
+    "promotion_enabled_at",
+    "promotion_age_seconds",
+    "promotion_timeout_seconds",
+    "promotion_timeout_at",
+    "promotion_past_timeout",
+    "promotion_nearing_timeout",
+)
+
+
+def _humanize_seconds(seconds: float) -> str:
+    """Render a duration as a compact ``Xh Ym`` / ``Xh`` / ``Ym`` string."""
+    total = int(max(0, seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, _ = divmod(rem, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
+    """Derive additive age / auto-timeout context for an in-flight promotion.
+
+    Reads ``promotion_pending.enabled_at`` (the moment auto-merge was armed) and
+    the SAME configurable cap the reconciliation sweep uses to force-fail a
+    stranded ``promotion_pending`` (``_promotion_pending_timeout_seconds``), so
+    every consumer of the shared qualification summary agrees by construction on
+    elapsed age and whether the promotion is nearing or past the auto-timeout.
+
+    Returns ``{}`` (today's timeless behavior) when ``enabled_at`` is missing or
+    unparseable — callers fall back to the PR-number-only summary rather than
+    erroring.
+    """
+    enabled_at_raw = promo.get("enabled_at")
+    if not isinstance(enabled_at_raw, str) or not enabled_at_raw:
+        return {}
+    try:
+        enabled_at = _coerce_naive_utc(datetime.fromisoformat(enabled_at_raw))
+    except (ValueError, TypeError):
+        return {}
+    # Lazy import: release_reconciliation imports release_version at module load,
+    # so a top-level import here would form a cycle.
+    from app.release_reconciliation import _promotion_pending_timeout_seconds
+
+    cap_seconds = _promotion_pending_timeout_seconds()
+    age_seconds = max(0.0, (_utcnow() - enabled_at).total_seconds())
+    past_timeout = age_seconds >= cap_seconds
+    nearing_timeout = (not past_timeout) and age_seconds >= (
+        cap_seconds * _PROMOTION_NEARING_TIMEOUT_FRACTION
+    )
+    return {
+        "promotion_enabled_at": enabled_at.isoformat(),
+        "promotion_age_seconds": age_seconds,
+        "promotion_timeout_seconds": cap_seconds,
+        "promotion_timeout_at": (enabled_at + timedelta(seconds=cap_seconds)).isoformat(),
+        "promotion_past_timeout": past_timeout,
+        "promotion_nearing_timeout": nearing_timeout,
+    }
+
+
+def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
+    """Return a short operator-facing age / auto-timeout suffix for 409 details.
+
+    Reads the additive freshness keys carried on the shared qualification
+    summary (or the version-cut exception). Returns ``""`` when no freshness is
+    available (missing/invalid ``enabled_at``) so messages fall back unchanged.
+    """
+    if not state:
+        return ""
+    age = state.get("promotion_age_seconds")
+    if age is None:
+        return ""
+    phrase = f"in flight ~{_humanize_seconds(age)}"
+    if state.get("promotion_past_timeout"):
+        phrase += ", past auto-timeout"
+    elif state.get("promotion_nearing_timeout"):
+        phrase += ", nearing auto-timeout"
+    return f" — {phrase}"
+
+
+# Audit-child task statuses that are NOT a crash when no report is present.
+# Mirrors the frontend ``classifyAuditNoReport`` (VersionLifecyclePanel.tsx) so
+# the operator panel's top badge and its audit-findings section agree by
+# construction:
+#   - non-terminal (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) → still running
+#   - BLOCKED → waiting on a precondition, distinct from a crash
+#   - COMPLETED with no report → finished-but-empty anomaly, not a crash
+# FAILED / CANCELLED / any other (unknown) terminal status with no report is a
+# genuine crash.
+_AUDIT_NONCRASH_STATUSES = frozenset(
+    {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "BLOCKED", "COMPLETED"}
+)
+
+
+def _audit_child_crashed(audit_child: dict[str, Any] | None) -> bool:
+    """Return True when the audit child reached a terminal-failed state with no report.
+
+    ``audit_child`` is the version-scoped audit-evidence envelope (the
+    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence`` /
+    ``get_latest_release_audit_report``), carrying ``task_status`` and ``report``.
+    ``None`` (no current audit child resolved) → not a crash, so callers that
+    pass no signal preserve the prior ``qualifying`` behavior. Pure/sync — no I/O.
+    """
+    if not isinstance(audit_child, dict):
+        return False
+    if audit_child.get("report"):
+        # The audit produced a report — by construction not a crashed-no-report.
+        return False
+    status = str(audit_child.get("task_status") or "").strip().upper()
+    if not status:
+        # No status signal — do not assert a crash.
+        return False
+    # FAILED / CANCELLED / unknown terminal status, with no report → crashed;
+    # everything in the noncrash set (running / blocked / completed-empty) is not.
+    return status not in _AUDIT_NONCRASH_STATUSES
 
 
 def summarize_qualification_state(
     last_qualification: dict[str, Any] | None,
     serving_status: str | None = None,
     deploy_failure_reason: str | None = None,
+    *,
+    audit_child: dict[str, Any] | None = None,
+    aggregate_serving_status: str | None = None,
+    aggregate_deploy_failure_reason: str | None = None,
+    artifact_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Disambiguate the overloaded ``last_qualification.status`` for the agent.
 
@@ -343,9 +556,22 @@ def summarize_qualification_state(
     explicit sub-state from the raw verdict — pure data, no I/O.
 
     Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
-    ``promotion_in_flight`` | ``promotion_failed`` | ``not_promoted`` |
-    ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
+    ``audit_crashed`` | ``promotion_in_flight`` | ``promotion_failed`` |
+    ``not_promoted`` | ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
     ``promotion_deploy_failed``), or ``None`` when unqualified (no verdict yet).
+
+    Audit-crash reconciliation: when ``status == "pending"`` with no
+    ``promotion_pending`` sub-key, the bare result was always ``qualifying``
+    ("audit in flight, wait"). But the audit child can crash (terminal-failed,
+    no report) while the verdict is still pending — and the operator panel's
+    audit-findings section already reads that crashed status, so the two
+    surfaces contradicted each other. When the optional ``audit_child`` envelope
+    (the version-scoped ``latest_audit`` dict carrying ``task_status``/``report``)
+    shows a crash, return ``audit_crashed`` instead of ``qualifying`` so neither
+    the panel badge nor the strategic payload tells the reader to wait for a dead
+    audit. A still-running smoketest child does NOT mask an already-crashed audit
+    child. ``audit_child=None`` preserves the prior behavior for callers without
+    the signal.
 
     Post-promotion serving disambiguation: when ``status == "promoted"`` the
     optional ``serving_status`` (with ``deploy_failure_reason``) splits the bare
@@ -362,17 +588,45 @@ def summarize_qualification_state(
         promo = lq.get("promotion_pending")
         if isinstance(promo, dict):
             armed = promo.get("auto_merge_enabled")
+            summary = (
+                "Audit PASSED; a promotion PR is open and auto-merge is "
+                f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                "auditing' — the audit already cleared. Watch the promotion "
+                "PR's CI: if it goes red the version bounces back to "
+                "stabilize and needs a fresh qualify on a synced candidate."
+            )
+            freshness = _promotion_in_flight_freshness(promo)
+            if freshness:
+                age_str = _humanize_seconds(freshness["promotion_age_seconds"])
+                cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
+                summary += f" In flight ~{age_str} (auto-timeout cap {cap_str})."
+                if freshness["promotion_past_timeout"]:
+                    summary += (
+                        " It has PASSED the auto-timeout — the reconciliation "
+                        "sweep will force-fail it back to stabilize."
+                    )
+                elif freshness["promotion_nearing_timeout"]:
+                    summary += (
+                        " It is NEARING the auto-timeout that reverts it to "
+                        "stabilize."
+                    )
             return {
                 "state": "promotion_in_flight",
-                "summary": (
-                    "Audit PASSED; a promotion PR is open and auto-merge is "
-                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
-                    "auditing' — the audit already cleared. Watch the promotion "
-                    "PR's CI: if it goes red the version bounces back to "
-                    "stabilize and needs a fresh qualify on a synced candidate."
-                ),
+                "summary": summary,
                 "promotion_pr_number": promo.get("pr_number"),
                 "promotion_pr_url": promo.get("pr_url"),
+                **freshness,
+            }
+        if _audit_child_crashed(audit_child):
+            return {
+                "state": "audit_crashed",
+                "summary": (
+                    "The qualification audit child CRASHED (terminal-failed with "
+                    "no report) while the verdict is still pending. The audit is "
+                    "DEAD — do NOT treat this as 'audit in flight' and do NOT wait "
+                    "for a verdict from it; it will never produce one. Re-run the "
+                    "qualifier on a fresh candidate to get a new audit."
+                ),
             }
         return {
             "state": "qualifying",
@@ -421,7 +675,18 @@ def summarize_qualification_state(
             ),
         }
     if status == "promoted":
-        if serving_status == "serving_confirmed":
+        effective_serving_status = (
+            aggregate_serving_status
+            if artifact_evidence is not None
+            else serving_status
+        )
+        effective_failure_reason = (
+            aggregate_deploy_failure_reason
+            if artifact_evidence is not None
+            else deploy_failure_reason
+        )
+        artifact_fields = {"artifacts": artifact_evidence} if artifact_evidence else {}
+        if effective_serving_status == "serving_confirmed":
             return {
                 "state": "promoted",
                 "serving_status": "serving_confirmed",
@@ -429,23 +694,29 @@ def summarize_qualification_state(
                     "Candidate was promoted AND its deploy is CONFIRMED serving "
                     "in production — the version actually shipped."
                 ),
+                **artifact_fields,
             }
-        if serving_status == "deploy_failed":
+        if effective_serving_status == "deploy_failed":
             return {
                 "state": "promotion_deploy_failed",
                 "serving_status": "deploy_failed",
-                "deploy_failure_reason": deploy_failure_reason,
+                "deploy_failure_reason": effective_failure_reason,
                 "summary": (
                     "Candidate merged to the promotion target but its deploy "
                     "NEVER confirmed serving"
-                    + (f" ({deploy_failure_reason})" if deploy_failure_reason else "")
+                    + (
+                        f" ({effective_failure_reason})"
+                        if effective_failure_reason
+                        else ""
+                    )
                     + ". This promotion did NOT ship — the deployed code is not "
                     "live. Treat the version as NOT shipped: investigate the "
                     "deploy / roll forward a fix rather than advancing as if it "
                     "succeeded."
                 ),
+                **artifact_fields,
             }
-        if serving_status == "unconfirmed":
+        if effective_serving_status == "unconfirmed":
             return {
                 "state": "promoted_unconfirmed",
                 "serving_status": "unconfirmed",
@@ -455,10 +726,12 @@ def summarize_qualification_state(
                     "window. Do not treat it as live-confirmed yet; the sweep "
                     "resolves it to serving_confirmed or deploy_failed."
                 ),
+                **artifact_fields,
             }
         return {
             "state": "promoted",
             "summary": "Candidate was promoted — the version was cut.",
+            **artifact_fields,
         }
     if status == "deferred_unsynced":
         return {
@@ -474,13 +747,41 @@ def summarize_qualification_state(
     return {"state": status, "summary": f"Qualification status: {status}."}
 
 
-def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
+def to_phase_block(
+    version: ReleaseVersion,
+    audit_child: dict[str, Any] | None = None,
+    *,
+    aggregate_serving_status: str | None = None,
+    aggregate_deploy_failure_reason: str | None = None,
+    artifact_evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Return a compact dict for embedding in the strategic agent's payload.
 
     Shape matches the ``version_phase`` block described in Phase 2 of the
     design doc (strategic_spawning.py ``_STRATEGIC_REVIEW_SCHEMA``).
+
+    ``audit_child`` (optional, defaults to ``None`` to preserve existing
+    callers/tests) is the version-scoped audit-evidence envelope. When the
+    strategic caller resolves the open version's audit child, threading it here
+    lets ``qualification_state`` reflect an ``audit_crashed`` reconciliation
+    instead of a misleading ``qualifying`` while the audit is dead.
     """
-    return {
+    effective_serving_status = (
+        aggregate_serving_status
+        if artifact_evidence is not None
+        else version.serving_status
+    )
+    effective_failure_reason = (
+        aggregate_deploy_failure_reason
+        if artifact_evidence is not None
+        else version.deploy_failure_reason
+    )
+    acceptance_aggregate = None
+    if isinstance(version.last_qualification, dict):
+        acceptance_aggregate = version.last_qualification.get("acceptance_aggregate")
+    if acceptance_aggregate is None:
+        acceptance_aggregate = getattr(version, "acceptance_aggregate", None)
+    block = {
         "version_number": version.version_number,
         "phase": version.phase,
         "goal": version.goal,
@@ -493,12 +794,26 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
             version.last_qualification,
             version.serving_status,
             version.deploy_failure_reason,
+            audit_child=audit_child,
+            aggregate_serving_status=aggregate_serving_status,
+            aggregate_deploy_failure_reason=aggregate_deploy_failure_reason,
+            artifact_evidence=artifact_evidence,
         ),
-        "serving_status": version.serving_status,
+        "serving_status": effective_serving_status,
         "served_sha": version.served_sha,
         "served_at": version.served_at.isoformat() if version.served_at else None,
-        "deploy_failure_reason": version.deploy_failure_reason,
+        "deploy_failure_reason": effective_failure_reason,
+        # Version-window acceptance aggregate (proven-vs-merged) — additive and
+        # nullable. The aggregate itself is computed/stored by the acceptance
+        # layer; this read model only passes it through so the strategist reads
+        # the proven claim state ALONGSIDE the raw merged count
+        # (``tasks_merged_this_version``, added by the caller). ``None`` on legacy
+        # rows that predate the aggregate, keeping the payload backward-compatible.
+        "acceptance_aggregate": acceptance_aggregate,
     }
+    if artifact_evidence is not None:
+        block["artifacts"] = artifact_evidence
+    return block
 
 
 def set_version_phase(
@@ -766,6 +1081,7 @@ async def abandon_current_version(
         raise VersionCutBlockedByPromotion(
             qual_state.get("promotion_pr_number"),
             qual_state.get("promotion_pr_url"),
+            promotion_freshness=qual_state,
         )
 
     project = await session.get(Project, project_id)

@@ -64,6 +64,16 @@ vi.mock('../build-config.js', () => ({
   resolveBuildConfig: vi.fn().mockReturnValue(undefined),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 // Mock the code-change module so handleMigrate tests can assert on what was
 // passed to runCodeChangeTask without exercising the marker-detection branches.
 vi.mock('./code-change.js', () => ({
@@ -132,6 +142,7 @@ import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -199,6 +210,24 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(jsonBlock);
+  });
+
+  it('repairs clean-exit unparseable output once and stores the repaired findings array', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const repaired = [{ area: 'api', severity: 'medium', title: 'Unbounded list' }];
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'plain text', lastResultText: 'no json' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('PERF_REPORT');
+    expect(call.logs).toBe(JSON.stringify(repaired));
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
 
   it('sets status COMPLETED and artifact_type PERF_REPORT on exitCode 0', async () => {
@@ -464,11 +493,41 @@ describe('handleInvestigate — report reading and status mapping', () => {
     // this and treat it as "not found" rather than letting it propagate as a fatal error.
     const malformedJson = '{"root_cause": undefined, "recommended_fix": "fix it"}';
     vi.mocked(readHandlerOutput).mockReturnValue(null);
-    vi.mocked(runClaudeCode).mockResolvedValue({
-      exitCode: 0,
-      allOutput: '',
-      lastResultText: malformedJson,
-    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: malformedJson,
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: malformedJson,
+      });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
+  it('falls through to parse_failed when allOutput has malformed JSON with required keys', async () => {
+    const malformedJson = 'Investigation complete.\n{"root_cause": undefined, "recommended_fix": "fix it"}\nDone.';
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: malformedJson,
+        lastResultText: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: malformedJson,
+        lastResultText: '',
+      });
 
     await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
@@ -477,20 +536,39 @@ describe('handleInvestigate — report reading and status mapping', () => {
     expect(call.failure_category).toBe('parse_failed');
   });
 
-  it('falls through to parse_failed when allOutput has malformed JSON with required keys', async () => {
-    const malformedJson = 'Investigation complete.\n{"root_cause": undefined, "recommended_fix": "fix it"}\nDone.';
+  it('recovers clean-exit unparseable investigation output via bounded re-ask instead of failing', async () => {
+    const recovered = {
+      summary: 'Auth token not invalidated',
+      root_cause: 'Missing invalidation call in logout handler',
+      affected_files: [{ path: 'backend/app/auth.py', issue: 'no invalidation' }],
+      recommended_fix: 'Call invalidate() in logout()',
+      severity: 'high',
+      confidence: 'medium',
+    };
     vi.mocked(readHandlerOutput).mockReturnValue(null);
-    vi.mocked(runClaudeCode).mockResolvedValue({
-      exitCode: 0,
-      allOutput: malformedJson,
-      lastResultText: '',
-    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'investigation complete but prose only',
+        lastResultText: 'no json object here',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(recovered),
+      });
 
     await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.failure_category).toBe('parse_failed');
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.failure_category).toBeUndefined();
+    expect(call.logs).toBe(JSON.stringify(recovered));
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('Return ONLY the JSON object');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
 
   it('sets status FAILED and artifact_type ERROR_LOG on non-zero exitCode with result', async () => {
@@ -539,6 +617,68 @@ describe('handleInvestigate — report reading and status mapping', () => {
         GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
       ),
     ).rejects.toThrow(/No prompt found/);
+  });
+});
+
+// ── handleInvestigate — bounded self-repair on a clean-exit-but-unparseable run ─
+describe('handleInvestigate — bounded self-repair on format miss', () => {
+  const RECOVERED = {
+    summary: 'Token not invalidated on logout',
+    root_cause: 'logout handler never calls invalidate()',
+    affected_files: [{ path: 'backend/app/auth.py', issue: 'no invalidation' }],
+    recommended_fix: 'Call invalidate() in the logout handler',
+    severity: 'high',
+    confidence: 'high',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('makes exactly one focused re-ask when exitCode=0 but no report parses, and COMPLETES with the recovered report', async () => {
+    // First call: clean exit, narrative but no JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I read auth.py but never emitted the JSON.', lastResultText: '' });
+    // Second call (repair): valid investigation report in lastResultText.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(RECOVERED) });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(RECOVERED));
+  });
+
+  it('does NOT record repair success and posts FAILED/parse_failed when the re-ask is also unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'still no json', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+  });
+
+  it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crash', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
   });
 });
 

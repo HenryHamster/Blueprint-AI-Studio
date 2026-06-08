@@ -744,6 +744,41 @@ function decodeJwtSub(token: string): string | null {
   }
 }
 
+function decodeJwtVmInstanceId(token: string): string | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    const payload = JSON.parse(json) as { vm_instance_id?: unknown };
+    return typeof payload.vm_instance_id === 'string' ? payload.vm_instance_id : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseParkDirective(result: unknown): ParkDirective | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const body = result as Record<string, unknown>;
+  if (body.action !== 'park') return null;
+  const retryAfterUntil = typeof body.retry_after_until === 'string' ? body.retry_after_until : '';
+  const parkDeadline = typeof body.park_deadline === 'string' ? body.park_deadline : '';
+  if (!retryAfterUntil || !parkDeadline) return null;
+  return { action: 'park', retryAfterUntil, parkDeadline };
+}
+
+const pendingParkDirectivesByTask = new Map<string, ParkDirective>();
+
+function consumePendingParkDirective(taskId: string): ParkDirective | null {
+  const directive = pendingParkDirectivesByTask.get(taskId) ?? null;
+  pendingParkDirectivesByTask.delete(taskId);
+  return directive;
+}
+
+export function _consumePendingParkDirectiveForTesting(taskId: string): ParkDirective | null {
+  return consumePendingParkDirective(taskId);
+}
+
 function createPersistedStaleResultEnvelope(
   payload: Record<string, unknown>,
   agentToken = AGENT_TOKEN,
@@ -916,6 +951,8 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   const enrichedPayload = enrichStatusPayload(taskId, statusPayload);
   writeStaleResultFile(resultPath, createPersistedStaleResultEnvelope(enrichedPayload));
   const result = await apiPost('/api/agent/status', enrichedPayload);
+  const parkDirective = parseParkDirective(result);
+  if (parkDirective) pendingParkDirectivesByTask.set(taskId, parkDirective);
   try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
   clearPendingStatusFlags(taskId);
   return result;
@@ -1130,6 +1167,12 @@ export interface PollResult {
   // credentials and re-exec so the frozen provider constants are re-read on
   // the correct account. Absent (same-account claim) → JWT-only rotation.
   secretManifest?: SecretManifest;
+}
+
+export interface ParkDirective {
+  action: 'park';
+  retryAfterUntil: string;
+  parkDeadline: string;
 }
 
 export interface PollForNextRoleOptions {
@@ -1735,6 +1778,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   resetCheckSynthesizerState();
   // Per-task LLM call/token telemetry (efficiency direction d-91d8dede).
   resetLlmTelemetry();
+  // Per-task structured-output format-compliance telemetry (equipping d-46468a41).
+  resetFormatComplianceTelemetry();
   // Structured provider-run error report. enrichStatusPayload already guards
   // attachment by task_id, but clear between roles anyway so a warm role can
   // never observe the prior role's run report through the getter.
@@ -1807,6 +1852,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
+        ...getFormatComplianceTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
@@ -1862,6 +1908,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...(agentSourceSha ? { agent_source_sha: agentSourceSha } : {}),
         ...getLlmTelemetry(),
+        ...getFormatComplianceTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
@@ -1892,6 +1939,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               tool_trace: retryToolTrace,
               ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
               ...getLlmTelemetry(),
+              ...getFormatComplianceTelemetry(),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
             traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
@@ -1980,6 +2028,7 @@ export function sendHeartbeatSync(
       status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
       metrics,
       ...getLlmTelemetry(),
+      ...getFormatComplianceTelemetry(),
       ...(extras || {}),
     });
     execFileSync('curl', [
@@ -2594,6 +2643,11 @@ import {
   recordLlmTokens,
   getLlmTelemetry,
   resetLlmTelemetry,
+  recordFormatMiss,
+  recordFormatRepairAttempt,
+  recordFormatRepairSuccess,
+  getFormatComplianceTelemetry,
+  resetFormatComplianceTelemetry,
   estimateTokensFromChars,
 } from './telemetry.js';
 export {
@@ -2605,6 +2659,11 @@ export {
   recordLlmTokens,
   getLlmTelemetry,
   resetLlmTelemetry,
+  recordFormatMiss,
+  recordFormatRepairAttempt,
+  recordFormatRepairSuccess,
+  getFormatComplianceTelemetry,
+  resetFormatComplianceTelemetry,
   estimateTokensFromChars,
 };
 
@@ -2983,129 +3042,16 @@ export async function main() {
       lastPrNumber = claimResult.prNumber;
       lastBaseBranch = claimResult.baseBranch;
 
-      // After a successful role completion, poll for a warm next role. This
-      // single unconditional poll loop serves BOTH warm-VM mechanisms: the
-      // PR-chain pin (warm_continuity) and same-project backlog reuse
-      // (warm_backlog_reuse, efficiency direction d-91d8dede). The agent is
-      // agnostic to which is enabled — the backend decides what /next-role
-      // returns (chain pin, backlog claim, exit, or 204). So no agent change
-      // is needed for backlog reuse: the VM already stays alive and polls here
-      // regardless of whether a chain follow-on is pinned. process.env.
-      // VM_INSTANCE_ID is set by the orchestrator startup script and is what
-      // the backend keys warm pinning on; local dev / tests where it's absent
-      // skip the loop and exit normally.
-      const vmInstanceId = process.env.VM_INSTANCE_ID;
-      if (!vmInstanceId) break;
-
-      // Clear TASK_ID for the duration of the warm-poll. While poll is
-      // running, the prior task is already in EVALUATING server-side, so
-      // any SIGTERM hitting the agent process (e.g. orchestrator decided
-      // to delete the VM because there's no follow-up work) would
-      // otherwise fire _crashReport and overwrite the prior task's
-      // latest_status_message with "[FATAL:SIGTERM] VM shutting down" —
-      // healthy work that's just sitting in EVALUATING gets mislabeled as
-      // a fatal failure and downstream classify_failure tags it
-      // AGENT_TIMEOUT. With TASK_ID empty, _crashReport's `if (taskId)`
-      // gate skips the heartbeat. The 'claim' branch below restores
-      // TASK_ID to the new task before any code that could crash.
-      //
-      // BUT clearing TASK_ID also stripped crash context from *genuine*
-      // crashes (uncaughtException / unhandledRejection) during the poll gap —
-      // they reported with no task id and were silently lost. _crashReportTaskId
-      // is deliberately NOT cleared here (it still points at the warm-pinned
-      // task) and _inWarmPollWindow lets _crashReport label a poll-gap crash
-      // distinctly (so a real crash is still reported without overwriting the
-      // prior task's healthy EVALUATING status the way a benign SIGTERM would).
-      process.env.TASK_ID = '';
-      _inWarmPollWindow = true;
-
-      let pollResult: PollResult;
-      try {
-        pollResult = await pollForNextRole({
-          vmInstanceId,
-          priorTaskId: lastTaskId,
-          priorPrNumber: lastPrNumber,
-          apiBase: ORCHESTRATOR_URL,
-          agentJwt: AGENT_TOKEN,
-        });
-      } catch (pollErr) {
-        // Defensive — pollForNextRole has its own internal try/catch, but
-        // if a programmer error escapes it we don't want to crash the
-        // VM. Treat as exit and let the orchestrator cold-provision next.
-        log(`pollForNextRole threw: ${String(pollErr)} — exiting`);
-        break;
-      }
-      if (pollResult.action === 'exit') {
-        log(`pollForNextRole returned exit (reason=${pollResult.reason ?? 'unspecified'})`);
-        break;
-      }
-      // claim — rotate the agent token, reset, then re-enter the loop.
-      log(`Warm-claimed next role: task ${pollResult.taskId ?? ''}`);
-      // The backend mints a fresh JWT scoped to the new task as part of
-      // the next-role response. Rotate AGENT_TOKEN immediately so the
-      // upcoming runRoleOnce → /api/agent/claim idempotent-replay (and
-      // every subsequent task-scoped call) authenticates against the new
-      // task. Without rotation the prior task's terminal JWT is rejected
-      // by verify_agent_token outside the idempotent-path allowlist.
-      activateClaimedRole(pollResult, 'reset_failed: warm-claim');
-      try {
-        await resetForNextRole({
-          workspace: WORKSPACE,
-          priorTaskId: lastTaskId,
-          baseBranch: lastBaseBranch ?? undefined,
-        });
-      } catch (resetErr) {
-        const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
-        log(`resetForNextRole failed: ${resetMsg}`);
-        // Surface as a typed failure so the outer catch / global crash
-        // handler tags this as reset_failed and the orchestrator knows
-        // to cold-provision rather than retry warm.
-        const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
-        err.failureCategory = 'reset_failed';
-        throw err;
-      }
-      materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
-      // Reset succeeded — flip the warm-handoff flag so handlers'
-      // prepareWorkspaceForRole reuses the workspace (preserving caches)
-      // instead of wiping + re-cloning.
-      process.env.BLUEPRINT_WARM_HANDOFF = '1';
-      // Reset ALL per-role module-level mutable state in one place so a reused
-      // warm VM cannot leak state from the prior task into this one (cancel
-      // signal, phase-0 telemetry, tool-trace, prompt fingerprint, ./check
-      // synthesizer counters, LLM call/token totals). warmStart:true marks this
-      // as a warm role; the next runRoleOnce sets roleClaimTimestamp after a
-      // successful re-claim. See resetPerRoleModuleState for the field list.
-      resetPerRoleModuleState({ warmStart: true });
-
-      // Account-divergent warm claim: the backend resolved this task to an LLM
-      // account different from the VM's frozen boot account and shipped its
-      // secret manifest. A JWT-only rotation cannot adopt the new provider
-      // material (the constants are frozen at import), so re-materialize the new
-      // credentials and re-exec. In production performWarmRetarget never returns
-      // (systemd restarts us); same-account claims (no secretManifest) fall
-      // straight through to the loop and re-enter on JWT-only rotation, exactly
-      // as before.
-      if (pollResult.secretManifest) {
-        log('Warm claim is account-divergent — re-materializing provider creds + re-exec');
-        try {
-          await performWarmRetarget(pollResult.secretManifest, {
-            rotatedJwt: AGENT_TOKEN,
-            taskId: pollResult.taskId ?? '',
-          });
-        } catch (rtErr) {
-          const rtMsg = rtErr instanceof Error ? rtErr.message : String(rtErr);
-          log(`warm re-target failed: ${rtMsg}`);
-          // Surface as reset_failed so the orchestrator cold-provisions a fresh
-          // VM rather than letting the role run on the prior account's creds.
-          const err = new Error(`reset_failed: warm re-target failed: ${rtMsg}`) as Error & { failureCategory?: FailureCategory };
-          err.failureCategory = 'reset_failed';
-          throw err;
-        }
-        // Unreachable in production (the restart SIGTERMs us). If reexec was a
-        // no-op (e.g. test injection), break rather than risk running the role
-        // on stale credentials.
-        break;
-      }
+      // After a successful role completion, poll for a warm next role. The
+      // backend decides whether this is an ordinary warm claim or a PARK
+      // directive that extends the warm-poll window for a rate-limited task.
+      const warmContinuation = await continueWarmContinuation({
+        priorTaskId: lastTaskId,
+        priorPrNumber: lastPrNumber,
+        baseBranch: lastBaseBranch,
+        parkDirective: claimResult.parkDirective,
+      });
+      if (warmContinuation.action === 'exit') break;
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —
@@ -3131,6 +3077,7 @@ interface RunRoleOnceOptions {
 interface RunRoleOnceResult {
   taskId: string;
   prNumber: number | null;
+  parkDirective: ParkDirective | null;
   /**
    * The base branch of the just-completed task. Threaded through to the
    * role-loop so resetForNextRole's optional fetch+rebase step (step 5) can
@@ -3138,6 +3085,115 @@ interface RunRoleOnceResult {
    * was dead code in production.
    */
   baseBranch: string | null;
+}
+
+interface WarmContinuationDeps {
+  pollForNextRole: typeof pollForNextRole;
+  resetForNextRole: typeof resetForNextRole;
+  activateClaimedRole: typeof activateClaimedRole;
+  materializeClaimCredentialState: typeof materializeClaimCredentialState;
+  performWarmRetarget: typeof performWarmRetarget;
+  resolveVmInstanceId: (allowJwtFallback: boolean) => string | null;
+}
+
+const warmContinuationDeps: WarmContinuationDeps = {
+  pollForNextRole,
+  resetForNextRole,
+  activateClaimedRole,
+  materializeClaimCredentialState,
+  performWarmRetarget,
+  resolveVmInstanceId: (allowJwtFallback: boolean) => {
+    const vmInstanceId = process.env.VM_INSTANCE_ID;
+    if (vmInstanceId) return vmInstanceId;
+    return allowJwtFallback ? decodeJwtVmInstanceId(AGENT_TOKEN) : null;
+  },
+};
+
+function parkPollTimeoutMs(parkDirective: ParkDirective): number {
+  const deadlineMs = Date.parse(parkDirective.parkDeadline);
+  return Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs - Date.now()) : 0;
+}
+
+export async function continueWarmContinuation(
+  opts: {
+    priorTaskId: string;
+    priorPrNumber: number | null;
+    baseBranch: string | null;
+    parkDirective?: ParkDirective | null;
+  },
+  deps: WarmContinuationDeps = warmContinuationDeps,
+): Promise<{ action: 'continue' | 'exit' }> {
+  const vmInstanceId = deps.resolveVmInstanceId(!!opts.parkDirective);
+  if (!vmInstanceId) {
+    return { action: 'exit' };
+  }
+
+  // Clear TASK_ID for the poll window so a benign SIGTERM during park does
+  // not overwrite the prior task with a false shutdown report.
+  process.env.TASK_ID = '';
+  _inWarmPollWindow = true;
+
+  let pollResult: PollResult;
+  try {
+    pollResult = await deps.pollForNextRole({
+      vmInstanceId,
+      priorTaskId: opts.priorTaskId,
+      priorPrNumber: opts.priorPrNumber,
+      apiBase: ORCHESTRATOR_URL,
+      agentJwt: AGENT_TOKEN,
+      ...(opts.parkDirective ? { timeoutMs: parkPollTimeoutMs(opts.parkDirective) } : {}),
+    });
+  } catch (pollErr) {
+    // Defensive — pollForNextRole has its own internal try/catch, but if a
+    // programmer error escapes it we don't want to crash the VM. Treat as exit
+    // and let the orchestrator cold-provision the next one.
+    log(`pollForNextRole threw: ${String(pollErr)} — exiting`);
+    return { action: 'exit' };
+  }
+
+  if (pollResult.action === 'exit') {
+    log(`pollForNextRole returned exit (reason=${pollResult.reason ?? 'unspecified'})`);
+    return { action: 'exit' };
+  }
+
+  // claim — rotate the agent token, reset, then re-enter the loop.
+  log(`Warm-claimed next role: task ${pollResult.taskId ?? ''}`);
+  deps.activateClaimedRole(pollResult, 'reset_failed: warm-claim');
+  try {
+    await deps.resetForNextRole({
+      workspace: WORKSPACE,
+      priorTaskId: opts.priorTaskId,
+      baseBranch: opts.baseBranch ?? undefined,
+    });
+  } catch (resetErr) {
+    const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
+    log(`resetForNextRole failed: ${resetMsg}`);
+    const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
+    err.failureCategory = 'reset_failed';
+    throw err;
+  }
+  deps.materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
+  process.env.BLUEPRINT_WARM_HANDOFF = '1';
+  resetPerRoleModuleState({ warmStart: true });
+
+  if (pollResult.secretManifest) {
+    log('Warm claim is account-divergent — re-materializing provider creds + re-exec');
+    try {
+      await deps.performWarmRetarget(pollResult.secretManifest, {
+        rotatedJwt: AGENT_TOKEN,
+        taskId: pollResult.taskId ?? '',
+      });
+    } catch (rtErr) {
+      const rtMsg = rtErr instanceof Error ? rtErr.message : String(rtErr);
+      log(`warm re-target failed: ${rtMsg}`);
+      const err = new Error(`reset_failed: warm re-target failed: ${rtMsg}`) as Error & { failureCategory?: FailureCategory };
+      err.failureCategory = 'reset_failed';
+      throw err;
+    }
+    return { action: 'exit' };
+  }
+
+  return { action: 'continue' };
 }
 
 async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult> {
@@ -3244,6 +3300,15 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     }
     const handler = resolution.handler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+    const parkedAfterSuccess = consumePendingParkDirective(taskId);
+    if (parkedAfterSuccess) {
+      return {
+        taskId,
+        prNumber,
+        baseBranch: baseBranchForReset,
+        parkDirective: parkedAfterSuccess,
+      };
+    }
     // Phase 0 telemetry: t_handler_complete. Captured only on the success
     // path so failures don't pollute the completion-duration histogram.
     // enrichStatusPayload picks this up on the very next status post and
@@ -3321,6 +3386,15 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
         if (attempt < 2) await new Promise(r => setTimeout(r, 10_000 * (attempt + 1)));
       }
     }
+    const parkedAfterFailure = consumePendingParkDirective(taskId);
+    if (parkedAfterFailure) {
+      return {
+        taskId,
+        prNumber,
+        baseBranch: baseBranchForReset,
+        parkDirective: parkedAfterFailure,
+      };
+    }
     // Re-throw so the role loop terminates — failures don't get warm
     // continuity; the orchestrator cold-provisions for the next role.
     throw error;
@@ -3335,7 +3409,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     }
   }
 
-  return { taskId, prNumber, baseBranch: baseBranchForReset };
+  return { taskId, prNumber, baseBranch: baseBranchForReset, parkDirective: null };
 }
 
 // Global crash handlers — report errors via heartbeat before dying.

@@ -1048,11 +1048,14 @@ async def test_system_maturity_unique_constraint_project_system(db_session):
 # AcceptanceEvidence — the general plan-time declaration contract
 # ---------------------------------------------------------------------------
 
-# The 7 code/PR-producing task types that carry the optional acceptance_evidence
-# field. Each entry maps the task type to the minimal extra fields needed to
+# The code/PR-producing task types that carry the optional acceptance_evidence
+# field (including ``plan``, which forward-carries a finding's declared evidence
+# through decomposition). Each entry maps the task type to the minimal extra
+# fields needed to
 # satisfy its own required-field schema (so we can build a complete payload).
 _ACCEPTANCE_TYPES: dict[str, dict] = {
     "create": {"prompt": "do the thing"},
+    "plan": {"prompt": "plan the thing"},
     "fix": {"prompt": "fix it", "pr_number": 7, "branch": "fix/x"},
     "refactor": {"prompt": "refactor it"},
     "qa": {},

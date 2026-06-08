@@ -10,6 +10,7 @@ from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
     ALL_TASK_TYPES,
     agent_capability_slice,
+    CODE_REVIEW_GATED_TASK_TYPES,
     COMPLETION_HANDLER_BY_TASK_TYPE,
     COMPUTE_JOB_LAUNCH_TASK_TYPES,
     EVALUATION_STRATEGY_BY_TASK_TYPE,
@@ -212,6 +213,33 @@ def test_code_pr_types_keep_code_ci_review_gate():
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
 
+def test_code_review_gated_task_types_derived_from_registry():
+    """CODE_REVIEW_GATED_TASK_TYPES is exactly the code-ci-review capabilities.
+
+    This locks the membership of the launch-context learning-signal gate (the
+    per-type rejection patterns + self-review calibration injected by
+    routers/agent.py): every reviewed-code type — including qa/docs/deps — is in,
+    and read-only / knowledge types stay out. Derived, not a parallel literal."""
+    assert CODE_REVIEW_GATED_TASK_TYPES == {
+        "create",
+        "fix",
+        "refactor",
+        "migrate",
+        "qa",
+        "deps",
+        "docs",
+    }
+    derived = frozenset(
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.evaluation == "code-ci-review"
+    )
+    assert CODE_REVIEW_GATED_TASK_TYPES == derived
+    # Read-only / knowledge types are never gated in.
+    for t in ("research", "plan", "review", "memo", "security_audit"):
+        assert t not in CODE_REVIEW_GATED_TASK_TYPES
+
+
 def test_every_capability_declares_a_valid_run_shape():
     """The additive `run_shape` field is present on every capability with a value
     from the closed run-shape vocabulary, and the derived map covers every type.
@@ -358,17 +386,22 @@ def test_plan_subtask_types_derived_from_registry():
 def test_plan_knowledge_subtask_types_derived_from_registry():
     """PLAN_KNOWLEDGE_SUBTASK_TYPES is the single source of truth for the
     plan-decomposition KNOWLEDGE-prerequisite child allowlist. It must be
-    registry-derived from ``plan_knowledge_prereq_eligible``, equal exactly
-    {web_research, design}, be DISJOINT from PLAN_SUBTASK_TYPES (knowledge
-    prereqs are NOT PR-producing implementation subtypes), and neither type may
-    appear in WRITE_TASK_TYPES or PRODUCT_TASK_TYPES."""
+    registry-derived from ``plan_knowledge_prereq_eligible``, include the
+    durable non-PR prerequisite producers {web_research, design,
+    compute_experiment}, be DISJOINT from PLAN_SUBTASK_TYPES (knowledge
+    prereqs are NOT PR-producing implementation subtypes), and none of the
+    types may appear in WRITE_TASK_TYPES or PRODUCT_TASK_TYPES."""
     expected = {
         cap.id.value
         for cap in TASK_CAPABILITIES
         if cap.plan_knowledge_prereq_eligible
     }
     assert frozenset(expected) == PLAN_KNOWLEDGE_SUBTASK_TYPES
-    assert PLAN_KNOWLEDGE_SUBTASK_TYPES == {"web_research", "design"}
+    assert PLAN_KNOWLEDGE_SUBTASK_TYPES == {
+        "compute_experiment",
+        "design",
+        "web_research",
+    }
     assert PLAN_KNOWLEDGE_SUBTASK_TYPES.issubset(ALL_TASK_TYPES)
     # Disjoint from the PR-producing implementation allowlist — knowledge
     # prereqs must NOT be classified as PR-producing subtypes.

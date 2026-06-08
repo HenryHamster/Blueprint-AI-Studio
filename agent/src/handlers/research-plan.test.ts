@@ -50,6 +50,16 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
   return {
@@ -74,6 +84,7 @@ import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -94,6 +105,8 @@ import {
   buildEfficiencySnapshotSection,
   buildEmptyRepoGuidance,
   buildCapabilityVerificationSection,
+  buildAvailableCapabilitiesSection,
+  CAPABILITY_DECLARATION_DOC,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -1155,6 +1168,54 @@ describe('buildCapabilityVerificationSection', () => {
   });
 });
 
+describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
+  it('returns empty string when the field is absent or empty', () => {
+    expect(buildAvailableCapabilitiesSection(undefined)).toBe('');
+    expect(buildAvailableCapabilitiesSection([])).toBe('');
+  });
+
+  it('renders canonical names with statuses and the draw-from-registry framing', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working' },
+      { name: 'seeded-eval-harness', status: 'planned' },
+    ]);
+    // Header + the load-bearing "shared vocabulary" / draw-from-list framing.
+    expect(section).toContain('AVAILABLE CAPABILITIES');
+    expect(section).toContain('shared vocabulary');
+    expect(section).toMatch(/DRAW THE NAME FROM THIS LIST/);
+    // Canonical names and their statuses both render.
+    expect(section).toContain('`payment-core`');
+    expect(section).toContain('(working)');
+    expect(section).toContain('`seeded-eval-harness`');
+    expect(section).toContain('(planned)');
+    // The matcher is framed as exact, never fuzzy.
+    expect(section).toContain('EXACT');
+  });
+
+  it('renders a name without status when status is omitted, and skips blank entries', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'auth-core' },
+      { name: '' },
+      { status: 'working' } as Record<string, unknown>,
+    ]);
+    expect(section).toContain('`auth-core`');
+    // No status parens for the status-less entry on its own line.
+    expect(section).toMatch(/- `auth-core`\n/);
+  });
+});
+
+describe('CAPABILITY_DECLARATION_DOC (uniform across task types)', () => {
+  it('documents both the provides_capability stamp and the prerequisite ref drawn from the registry', () => {
+    expect(CAPABILITY_DECLARATION_DOC).toContain('provides_capability');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('prerequisite');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('AVAILABLE CAPABILITIES');
+    // Applies to every task type, not research special-casing.
+    expect(CAPABILITY_DECLARATION_DOC).toContain('every other task type');
+    // Off-registry refs are accepted (advisory), never rejected.
+    expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
+  });
+});
+
 describe('buildVersionPhaseSection', () => {
   it('returns empty string when versionPhase is undefined', () => {
     expect(buildVersionPhaseSection(undefined)).toBe('');
@@ -1828,6 +1889,94 @@ describe('buildMemoCitationsSection', () => {
     expect(result).toMatch(/authentic|genuinely informs/i);
     expect(result).toMatch(/performative.*not|valuable citations.*strengthen/i);
   });
+
+  it('renders reasoning_kind and direction_id when present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-ret-1',
+        summary_excerpt: 'Direction retired.',
+        reasoning_kind: 'direction_retirement',
+        direction_id: 'dir-abc123',
+      },
+    ]);
+    expect(result).toContain('task_id: memo-ret-1');
+    expect(result).toContain('kind: direction_retirement');
+    expect(result).toContain('direction: dir-abc123');
+  });
+
+  it('omits reasoning_kind and direction_id meta parts when absent (legacy shape)', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-legacy', summary_excerpt: 'Legacy memo.' },
+    ]);
+    expect(result).toContain('M0 (task_id: memo-legacy): Legacy memo.');
+    expect(result).not.toContain('kind:');
+    expect(result).not.toContain('direction:');
+  });
+
+  it('renders tags when present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-tags',
+        summary_excerpt: 'Tagged memo.',
+        tags: ['retirement', 'acceptance'],
+      },
+    ]);
+    expect(result).toContain('tags: retirement, acceptance');
+  });
+
+  it('renders success_evidence and retirement_condition as indented lines', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-ev',
+        summary_excerpt: 'Evidence memo.',
+        success_evidence: 'All tests passed.',
+        retirement_condition: 'KPIs met for 2 cycles.',
+      },
+    ]);
+    expect(result).toContain('success_evidence: All tests passed.');
+    expect(result).toContain('retirement_condition: KPIs met for 2 cycles.');
+  });
+
+  it('handles enriched entry with all new fields present', () => {
+    const result = buildMemoCitationsSection([
+      {
+        task_id: 'memo-full',
+        summary_excerpt: 'Full enriched memo.',
+        reasoning_kind: 'direction_retirement',
+        direction_id: 'dir-xyz',
+        tags: ['retirement'],
+        citation_refs: 'direction:dir-xyz, task:memo-src',
+        success_evidence: 'Evidence here.',
+        retirement_condition: 'Condition here.',
+        final_metrics_excerpt: 'final_prs_merged=12, final_cycles_active=4',
+        rationale_excerpt: 'Retired after acceptance criteria were met.',
+        reasoning_excerpt: 'Direction: full scope shipped.\n\nRetirement rationale: done.',
+      },
+    ]);
+    expect(result).toContain('M0');
+    expect(result).toContain('task_id: memo-full');
+    expect(result).toContain('kind: direction_retirement');
+    expect(result).toContain('direction: dir-xyz');
+    expect(result).toContain('tags: retirement');
+    expect(result).toContain('citation_refs: direction:dir-xyz, task:memo-src');
+    expect(result).toContain('success_evidence: Evidence here.');
+    expect(result).toContain('retirement_condition: Condition here.');
+    expect(result).toContain('final_metrics: final_prs_merged=12, final_cycles_active=4');
+    expect(result).toContain('rationale: Retired after acceptance criteria were met.');
+    expect(result).toContain('reasoning: Direction: full scope shipped.');
+    expect(result).toContain('Full enriched memo.');
+  });
+
+  it('skips malformed entries (non-object) gracefully', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-valid', summary_excerpt: 'Valid.' },
+      'not-an-object',
+      null,
+      { task_id: 'memo-also-valid', summary_excerpt: 'Also valid.' },
+    ]);
+    expect(result).toContain('M0 (task_id: memo-valid): Valid.');
+    expect(result).toContain('M3 (task_id: memo-also-valid): Also valid.');
+  });
 });
 
 describe('resolveMemoHandles', () => {
@@ -2136,6 +2285,38 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('"type"');
   });
 
+  // ── handlePlan compute_experiment empirical-prerequisite documentation ────────
+  // The plan prompt must advertise the new measurement-prerequisite subtype so a
+  // plan can express "measure this first, then act on the verdict": the
+  // type="compute_experiment" subtask, its launch-contract fields, and the
+  // measured-negative-vs-broken consumption semantics that decide whether a
+  // depends_on dependent still runs.
+  it('handlePlan prompt documents the compute_experiment prerequisite subtype', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('type="compute_experiment"');
+  });
+
+  it('handlePlan prompt lists the compute_experiment launch-contract fields', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"command"');
+    expect(p).toContain('"spend_cap_usd"');
+    expect(p).toContain('"deadline_seconds"');
+    expect(p).toContain('"success_criterion"');
+  });
+
+  it('handlePlan prompt explains measured-negative-is-consumable vs broken-cancels semantics', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // A measured negative is still usable evidence — the dependent still runs.
+    expect(p).toMatch(/MEASURED NEGATIVE/);
+    // A broken run with no usable verdict cancels the dependent follow-on.
+    expect(p).toMatch(/BROKEN run/);
+    // The verdict is consumed via depends_on_indices.
+    expect(p).toContain('depends_on_indices');
+  });
+
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
   // Regression: the plan prompt previously told the agent that any subtask
   // touching backend/app/models.py (or adding tables/columns) must spawn a
@@ -2265,6 +2446,57 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('deadline_seconds');
     // Optional machine-checkable success criterion.
     expect(p).toContain('success_criterion');
+  });
+
+  // ── shared capability vocabulary (research + plan, uniform) ──────────────────
+  // Both research and plan must render the AVAILABLE CAPABILITIES vocabulary from
+  // the new payload field and document provides_capability / prerequisite as
+  // drawn from the registry — a capability framework ALL task types share.
+  const VOCAB_PAYLOAD = {
+    base_branch: 'main',
+    prompt: 'analyze the codebase',
+    available_capabilities: [
+      { name: 'seeded-eval-harness', status: 'working' },
+      { name: 'payment-core', status: 'planned' },
+    ],
+  };
+
+  it('handlePlan renders the AVAILABLE CAPABILITIES vocabulary from the payload field', async () => {
+    await handlePlan(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('AVAILABLE CAPABILITIES');
+    expect(p).toContain('`seeded-eval-harness`');
+    expect(p).toContain('shared vocabulary');
+  });
+
+  it('handlePlan documents provides_capability AND prerequisite drawn from the registry on plan subtasks', async () => {
+    await handlePlan(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The plan subtask schema now carries both fields (today it emitted only depends_on_indices).
+    expect(p).toContain('"provides_capability"');
+    expect(p).toContain('"prerequisite"');
+    // And documents drawing the name from the vocabulary, plan-side (not research-only).
+    expect(p).toContain('DRAW THE NAME from the AVAILABLE CAPABILITIES');
+    expect(p).toContain('every other task type');
+  });
+
+  it('handleResearch renders the AVAILABLE CAPABILITIES vocabulary and draws finding declarations from it', async () => {
+    await handleResearch(FP_TASK_ID, VOCAB_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('AVAILABLE CAPABILITIES');
+    expect(p).toContain('`payment-core`');
+    // provides_capability / prerequisite docs reference the vocabulary.
+    expect(p).toContain('provides_capability');
+    expect(p).toContain('DRAW THE NAME from the AVAILABLE CAPABILITIES');
+  });
+
+  it('omits the rendered vocabulary section when the payload has no capabilities (back-compat)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The rendered list section (with its "shared vocabulary" header framing) is
+    // absent — the field-doc rules may still REFERENCE the vocabulary, but no
+    // capability list is injected when none were supplied.
+    expect(p).not.toContain('# AVAILABLE CAPABILITIES (shared vocabulary)');
   });
 });
 
@@ -2558,6 +2790,135 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
   });
 });
 
+// ── handleStrategic — bounded self-repair on a legacy-strategic-JSON format miss ─
+//
+// The strategic completion path consumes buildStrategicCompletionLogs (a pure
+// function in research-plan.ts). When the executor emits the legacy inline
+// markers (direction_operations AND (problem_model OR vision)) but the JSON
+// fails to extract on a clean exit, the handler now issues exactly ONE bounded
+// re-ask before falling through. A command-based run with no inline JSON (no
+// warning) is NOT re-asked — preserved by the existing buildStrategicCompletionLogs
+// gate tests above.
+describe('handleStrategic — bounded self-repair on legacy strategic JSON format miss', () => {
+  const SR_TASK_ID = 'sr-strategic-001';
+  const SR_TASK = { title: 'Strategic cycle', description: 'strategic', context: {}, project_context: {} };
+  const SR_PAYLOAD = { base_branch: 'main', research_mode: 'strategic', prompt: 'run the cycle' };
+
+  // Thinker mock must return parseable problem-model JSON with "intent" so that
+  // repairStructuredOutput in runThinkerWithGate is NOT triggered (otherwise it
+  // makes an extra runClaudeCode call that shifts the mock sequence).
+  const THINKER_OUTPUT = '{"intent":{"purpose":"test","current_focus":"test"}}';
+
+  // Executor output that satisfies the three required-call post-checks AND carries
+  // the legacy inline markers in prose (so buildStrategicCompletionLogs sets a
+  // warning) but contains no parseable JSON object.
+  const EXECUTOR_MARKERS_NO_JSON =
+    './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
+    'I prepared the "problem_model" and "direction_operations" but never emitted the JSON object.';
+  const REPAIRED_STRATEGIC_JSON = '{"problem_model":{"revision":1},"direction_operations":[]}';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+    // Thinker gate needs both handoff files present; returning true everywhere
+    // also makes the legacy /tmp/strategic_output read attempt fire (it then
+    // yields null via the readHandlerOutput mock, so the completion-logs path runs).
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
+  });
+
+  function lastPostedStatus(): Record<string, unknown> {
+    const calls = vi.mocked(persistAndPostStatus).mock.calls;
+    return calls[calls.length - 1][1];
+  }
+
+  it('re-asks exactly once and COMPLETES with the recovered inline strategic JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: REPAIRED_STRATEGIC_JSON, lastResultText: REPAIRED_STRATEGIC_JSON });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    // thinker + executor + exactly one bounded re-ask = 3 invocations.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const posted = lastPostedStatus();
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
+    expect(parsed.problem_model.revision).toBe(1);
+  });
+
+  it('does NOT record repair success when the re-ask still yields no inline JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'fallback summary' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still no parseable json here', lastResultText: '' });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    // Still COMPLETED (clean exit) with the fallback logs.
+    expect(lastPostedStatus().status).toBe('COMPLETED');
+  });
+
+  it('counts repair success when the retry delivers JSON only in lastResultText (JSON-stream provider)', async () => {
+    // Simulate a JSON-stream provider: allOutput is the raw stream with escaped JSON,
+    // lastResultText is the clean final answer with the parseable JSON.
+    const STREAM_RAW = './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
+      '{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"problem_model\\":{\\"revision\\":2},\\"direction_operations\\":[]}"}}';
+    // allOutput has the keys only as escaped substrings; lastResultText has the literal keys.
+    const CLEAN_JSON = '{"problem_model":{"revision":2},"direction_operations":[]}';
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: STREAM_RAW, lastResultText: CLEAN_JSON });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+    const posted = lastPostedStatus();
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
+    expect(parsed.problem_model.revision).toBe(2);
+  });
+
+  it('does NOT re-ask a command-based run that emits no inline strategic JSON (no warning gate)', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 40.',
+        lastResultText: 'Commands ran successfully.',
+      });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Only thinker + executor — no re-ask, no format telemetry.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    expect(lastPostedStatus().status).toBe('COMPLETED');
+  });
+});
+
 // ── handlePlan greenfield bootstrap-from-goal mode ───────────────────────────
 // On an empty / near-empty repo the plan prompt must gain an explicit greenfield
 // branch that decomposes "build the foundation for the goal" and overrides the
@@ -2666,5 +3027,66 @@ describe('handlePlan / handleResearch prompt determinism', () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt1).toBe(prompt2);
+  });
+});
+
+// ── handlePlan structured-output self-repair ──────────────────────────────────
+describe('handlePlan structured-output self-repair', () => {
+  const TASK_ID = 'plan-repair-001';
+  const GH_TOKEN = 'gh-token';
+  const OWNER = 'owner';
+  const REPO = 'repo';
+  const WS = null;
+  const STATUS_REF = () => ({ value: '' });
+  const TASK = { title: 'Plan task', description: 'Decompose the feature', context: {}, project_context: {} };
+  const PAYLOAD = { base_branch: 'main', prompt: 'decompose the new feature' };
+
+  const VALID_PLAN = JSON.stringify({
+    subtasks: [
+      { title: 'Add feature', prompt: 'Implement the feature.', type: 'create', scope: 'medium', related_files: ['agent/src/index.ts'], depends_on_indices: [] },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('triggers repair when plan file absent and subtasks extraction fails on clean exit', async () => {
+    // First run: clean exit but no parseable subtasks JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'I analyzed the codebase extensively.', lastResultText: '',
+    });
+    // Repair run: valid plan JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_PLAN, lastResultText: VALID_PLAN,
+    });
+
+    await handlePlan(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('COMPLETED');
+    const logs = JSON.parse(payload.logs as string) as { subtasks: unknown[] };
+    expect(Array.isArray(logs.subtasks)).toBe(true);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts COMPLETED even when plan repair fails to recover subtasks', async () => {
+    // Both runs return unparseable output on clean exit.
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    });
+
+    await handlePlan(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Still COMPLETED — plan handler is lenient even when repair fails.
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('COMPLETED');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
 });

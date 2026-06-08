@@ -9,7 +9,11 @@ from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import (
+    consumed_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.failure_classification import (
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
@@ -21,6 +25,122 @@ _AUTONOMY_RETIREMENT_THRESHOLD = (
     10  # autonomous merges required for retirement eligibility
 )
 
+# Proof-weighting tiers for the strategic-DECISION consumption layer. A merged
+# code change earns FULL credit only when it was machine-PROVEN (a satisfied
+# named_test); a merge that merely DECLARED forward evidence without proving it
+# earns partial credit; an UNDECLARED merge (no commitment to forward evidence —
+# the "merely delivered" proxy this direction is meant to stop crediting) earns
+# the least. All tiers are <= 1.0 so the proof-weighted count is STRICTLY <=
+# verified_merged_count and never inflates a direction's apparent output.
+_PROOF_WEIGHT_PROVEN = 1.0
+_PROOF_WEIGHT_DECLARED_UNPROVEN = 0.7
+_PROOF_WEIGHT_UNDECLARED = 0.4
+
+def _weight_merged(
+    verified: int, merged_write: int, proven: int, declared: int
+) -> float:
+    """Proof-weight a verified-merge universe by declaration/proof tiers.
+
+    Partitions the ``verified`` merges into three nested tiers — PROVEN (machine-
+    checked), DECLARED-but-unproven, and UNDECLARED — and applies the
+    ``_PROOF_WEIGHT_*`` multipliers. The result is STRICTLY ``<= verified`` (every
+    tier weight is <= 1.0) so proof-weighting can only ever DISCOUNT, never inflate,
+    a direction's apparent merged output.
+
+    Fail-safe: when ``merged_write <= 0`` (a read-only / research cycle with no
+    merged write task — declaration coverage is undefined) or ``verified <= 0``,
+    the full verified count is returned unweighted so such cycles degrade to
+    today's behavior rather than being retro-penalized to a discounted value.
+    """
+    if merged_write <= 0 or verified <= 0:
+        return float(verified)
+    proven = min(max(0, proven), verified)
+    declared_unproven = max(0, min(max(0, declared), verified) - proven)
+    undeclared = max(0, verified - proven - declared_unproven)
+    return (
+        proven * _PROOF_WEIGHT_PROVEN
+        + declared_unproven * _PROOF_WEIGHT_DECLARED_UNPROVEN
+        + undeclared * _PROOF_WEIGHT_UNDECLARED
+    )
+
+
+def proof_weighted_merged(entry: dict) -> float:
+    """Proof/declaration-weighted merged count for one research_history entry.
+
+    The strategic-DECISION counterpart to :func:`verified_merged_count`: it credits
+    a machine-PROVEN merge fully, a declared-but-unproven merge partially, and an
+    UNDECLARED merge least (see ``_PROOF_WEIGHT_*``). Always ``<=
+    verified_merged_count(entry)`` so it can only discount the "merely delivered"
+    proxy, never inflate it.
+
+    Fail-safe over legacy data: an entry written before the acceptance contract has
+    no ``acceptance_merged_write_total`` key, so the proof state is unknown and the
+    raw verified count is returned unchanged (the same legacy gate the acceptance-
+    metric invariant guard uses). Read-only / research cycles (zero merged write
+    tasks) keep full credit, because only the verified WRITE slice is proof-weighted.
+    """
+    verified = verified_merged_count(entry)
+    if "acceptance_merged_write_total" not in entry:
+        return float(verified)
+    if "acceptance_verified_write_merged" not in entry:
+        return _weight_merged(
+            verified,
+            int(entry.get("acceptance_merged_write_total") or 0),
+            proven_merged_count(entry),
+            int(entry.get("acceptance_declared_merged") or 0),
+        )
+    verified_write = int(entry.get("acceptance_verified_write_merged") or 0)
+    read_only_verified = max(0, verified - verified_write)
+    return _weight_merged(
+        verified_write,
+        int(entry.get("acceptance_merged_write_total") or 0),
+        proven_merged_count(entry),
+        int(entry.get("acceptance_declared_merged") or 0),
+    ) + read_only_verified
+
+
+def _agg_proof_weighted_merged(agg: dict) -> float:
+    """Proof/declaration-weighted lifetime merged count from a history_aggregate.
+
+    Mirrors :func:`proof_weighted_merged` over the evicted-cycle aggregate. Merges
+    folded from cycles that PREDATE the acceptance contract are tracked separately
+    (they never recorded ``acceptance_*`` totals), so they keep FULL credit here —
+    only the acceptance-aware portion of lifetime verified merges is proof-weighted.
+    This guarantees legacy merges are never retro-penalized when their cycle ages
+    out of research_history, and the result stays ``<= total_verified_prs_merged``.
+    """
+    total_verified = int(
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    )
+    if "total_acceptance_merged_write_total" not in agg:
+        return float(total_verified)
+    acc_verified = int(agg.get("total_acceptance_verified_merged") or 0)
+    if "total_acceptance_verified_write_merged" not in agg:
+        # Legacy aggregate: no write/read-only split was persisted yet.
+        legacy_verified = max(0, total_verified - acc_verified)
+        weighted_acc = _weight_merged(
+            acc_verified,
+            int(agg.get("total_acceptance_merged_write_total") or 0),
+            int(agg.get("total_acceptance_proven_merged") or 0),
+            int(agg.get("total_acceptance_declared_merged") or 0),
+        )
+        return legacy_verified + weighted_acc
+    acc_verified_write = int(agg.get("total_acceptance_verified_write_merged") or 0)
+    # Pre-contract verified merges keep full credit; within the acceptance-aware
+    # slice, read-only verified merges also keep full credit and only the verified
+    # WRITE slice is proof-weighted. Clamp so stale/partial aggregates cannot go
+    # negative.
+    legacy_verified = max(0, total_verified - acc_verified)
+    read_only_verified = max(0, acc_verified - acc_verified_write)
+    weighted_write = _weight_merged(
+        acc_verified_write,
+        int(agg.get("total_acceptance_merged_write_total") or 0),
+        int(agg.get("total_acceptance_proven_merged") or 0),
+        int(agg.get("total_acceptance_declared_merged") or 0),
+    )
+    return legacy_verified + read_only_verified + weighted_write
+
+
 _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
@@ -30,6 +150,17 @@ _HISTORY_AGG_DEFAULTS = {
     # _compute_lifetime_burn_metrics reads this so a degraded merge does not
     # suppress lifetime non-merge burn even after its cycle is evicted.
     "total_verified_prs_merged": 0,
+    # Acceptance-evidence lifetime aggregates — folded so directions past the
+    # 10-cycle eviction window keep an honest proven/declared signal. Distinct
+    # from (and never larger than) total_verified_prs_merged: proven counts only
+    # machine-checked named-test proof, declared counts merges that committed to
+    # forward evidence at plan time, and merged_write_total is the coverage
+    # denominator (merged WRITE tasks) so lifetime coverage = declared /
+    # merged_write_total without lossy per-cycle fraction-averaging.
+    "total_acceptance_proven_merged": 0,
+    "total_acceptance_consumed_merged": 0,
+    "total_acceptance_declared_merged": 0,
+    "total_acceptance_merged_write_total": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
     "total_tasks_failed_infra": 0,
@@ -47,6 +178,20 @@ _HISTORY_AGG_DEFAULTS = {
     "total_operator_actions": 0,
     "total_generalized_successes": 0,
     "total_generalized_terminal_outcomes": 0,
+    # Acceptance proof/declaration aggregate for the proof-weighting slice —
+    # lifetime survival past research_history eviction. Only the acceptance-aware
+    # slice is rolled up (entries that recorded an ``acceptance_merged_write_total``);
+    # pre-contract merges are excluded so they keep full credit in
+    # _agg_proof_weighted_merged and are never retro-penalized.
+    #   * total_acceptance_verified_merged — verified merges from acceptance-aware
+    #     cycles (the universe _agg_proof_weighted_merged partitions and weights).
+    #   * total_acceptance_verified_write_merged — the verified WRITE slice within
+    #     that acceptance-aware universe; this is the part that gets proof-weighted.
+    # total_acceptance_proven_merged / total_acceptance_declared_merged /
+    # total_acceptance_merged_write_total are folded above (shared with the
+    # established acceptance-coverage consumers) and reused here.
+    "total_acceptance_verified_merged": 0,
+    "total_acceptance_verified_write_merged": 0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -329,6 +474,19 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_verified_prs_merged"] += ev.get(
             "verified_prs_merged", ev.get("prs_merged", 0)
         )
+        # Acceptance-evidence aggregates — legacy-0 fallback: pre-aggregate
+        # entries claim nothing proven/declared and contribute no denominator,
+        # matching proven_merged_count / declared_merged_count semantics.
+        agg["total_acceptance_proven_merged"] += ev.get(
+            "acceptance_proven_merged", 0
+        )
+        agg["total_acceptance_consumed_merged"] += consumed_merged_count(ev)
+        agg["total_acceptance_declared_merged"] += ev.get(
+            "acceptance_declared_merged", 0
+        )
+        agg["total_acceptance_merged_write_total"] += ev.get(
+            "acceptance_merged_write_total", 0
+        )
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
         agg["total_tasks_failed_infra"] += ev.get("tasks_failed_infra", 0)
@@ -342,6 +500,20 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         )
         agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
         agg["total_operator_actions"] += ev.get("operator_action_count", 0)
+        # Proof-weighting slice — the verified-merge universe restricted to
+        # acceptance-aware evicted cycles (those that recorded the merged-write
+        # denominator). Pre-contract entries lack the key and contribute nothing
+        # here, so their verified merges stay outside the proof-weighted slice and
+        # keep full credit. proven / declared / merged_write_total are folded above
+        # (shared with the established acceptance-coverage consumers); the
+        # acceptance-aware verified slice is split into write vs read-only so only
+        # the WRITE subset is proof-weighted.
+        if "acceptance_merged_write_total" in ev:
+            agg["total_acceptance_verified_merged"] += verified_merged_count(ev)
+            agg["total_acceptance_verified_write_merged"] += ev.get(
+                "acceptance_verified_write_merged",
+                0,
+            )
         agg["total_generalized_successes"] += _entry_generalized_successes(ev)
         agg["total_generalized_terminal_outcomes"] += (
             _entry_generalized_terminal_outcomes(ev)
@@ -444,11 +616,14 @@ def _compute_difficulty_index(d: dict) -> float:
     total_tasks = sum(e.get("tasks_created", 0) for e in history) + (
         agg.get("total_tasks_created") or 0
     )
-    # Tasks-per-merge counts VERIFIED merges: a degraded/unverified merge did not
-    # actually ship, so it must not make a direction look easier than it is.
-    # Legacy fallback handled by verified_merged_count / the aggregate .get chain.
-    total_merged = sum(verified_merged_count(e) for e in history) + (
-        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    # Tasks-per-merge counts PROOF-WEIGHTED merges: a degraded/unverified merge did
+    # not ship (excluded by verified_merged_count), and an undeclared/unproven merge
+    # is the "merely delivered" proxy this direction must stop crediting — so a
+    # direction shipping piles of undeclared merges reads as HARDER (more tasks per
+    # proven merge) than one shipping proven work. Legacy/read-only cycles degrade
+    # to the verified count inside proof_weighted_merged / _agg_proof_weighted_merged.
+    total_merged = sum(proof_weighted_merged(e) for e in history) + (
+        _agg_proof_weighted_merged(agg)
     )
     if total_merged <= 0:
         return 1.0
@@ -466,12 +641,13 @@ def _compute_productivity_score(d: dict) -> float:
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    # Both the lifetime and recent merge totals count VERIFIED merges only: a
-    # degraded/unverified merge never actually shipped and must not inflate a
-    # direction's productivity. Legacy fallback handled by verified_merged_count /
-    # the aggregate .get chain.
-    total_merged = sum(verified_merged_count(e) for e in history) + (
-        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    # Both the lifetime and recent merge totals are PROOF-WEIGHTED: a degraded merge
+    # never shipped (excluded by verified_merged_count), and an undeclared/unproven
+    # merge — the "merely delivered" proxy — contributes only partial productivity so
+    # a direction shipping undeclared work does not read as productive as one shipping
+    # proven work. Legacy/read-only cycles degrade to the verified count.
+    total_merged = sum(proof_weighted_merged(e) for e in history) + (
+        _agg_proof_weighted_merged(agg)
     )
     total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (
         agg.get("total_prs_rejected") or 0
@@ -485,7 +661,7 @@ def _compute_productivity_score(d: dict) -> float:
     recent = history[-3:]
     if not recent:
         return lifetime_rate
-    recent_merged = sum(verified_merged_count(e) for e in recent)
+    recent_merged = sum(proof_weighted_merged(e) for e in recent)
     recent_rejected = sum(e.get("prs_rejected", 0) for e in recent)
     recent_rate = (recent_merged - 0.5 * recent_rejected) / len(recent)
     return (recent_rate * 3 + lifetime_rate) / 4
@@ -529,10 +705,9 @@ def _compute_direction_quality_score(d: dict) -> float:
         )
 
         tasks_created = entry.get("tasks_created", 0) or 0
-        prs_merged = entry.get("prs_merged", 0) or 0
         if tasks_created > 0:
             active_w += w
-            if prs_merged == 0:
+            if verified_merged_count(entry) == 0:
                 wasted_w += w
 
     if (actionable_w + structural_w) > 0:
@@ -547,7 +722,23 @@ def _compute_direction_quality_score(d: dict) -> float:
     else:
         scope_signal = 0.5
 
-    score = (taxonomy_health + productivity_signal + scope_signal) / 3.0
+    components = [taxonomy_health, productivity_signal, scope_signal]
+
+    # (d) proof signal — what share of recent VERIFIED merges were actually proven
+    # (or at least declared) versus the "merely delivered" undeclared proxy. Added
+    # ONLY when the window contains acceptance-aware cycles that produced verified
+    # merges (the same legacy gate proof_weighted_merged uses), so legacy/read-only
+    # directions keep the original 3-component score unchanged. proof_signal ranges
+    # over [_PROOF_WEIGHT_UNDECLARED, 1.0]: an all-proven direction reads as fully
+    # healthy here while an all-undeclared one is pulled down — so a pile of
+    # unprovable merges no longer scores the same as proven work.
+    acc_recent = [e for e in recent if "acceptance_merged_write_total" in e]
+    recent_verified = sum(verified_merged_count(e) for e in acc_recent)
+    if acc_recent and recent_verified > 0:
+        recent_weighted = sum(proof_weighted_merged(e) for e in acc_recent)
+        components.append(max(0.0, min(1.0, recent_weighted / recent_verified)))
+
+    score = sum(components) / len(components)
     return max(0.0, min(1.0, score))
 
 

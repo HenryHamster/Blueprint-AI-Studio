@@ -8,6 +8,9 @@ import pytest
 from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
+    Artifact,
+    ArtifactConsumption,
+    ArtifactType,
     ComputeJob,
     ComputeJobStatus,
     MaxPlanAccount,
@@ -375,3 +378,83 @@ def test_get_task_total_vm_cost_or_none_banked_zero_with_no_provisioning_is_none
     task = _make_task()
     task.vm_runtime_cost_banked_db = 0.0
     assert get_task_total_vm_cost_usd_or_none(task) is None
+
+
+def test_artifact_consumption_schema_contract():
+    """Verify ArtifactConsumption table structure and Artifact.logical_key column.
+
+    Checks:
+    - Artifact.logical_key column exists, is nullable, and is indexed
+    - ArtifactConsumption table name is "artifactconsumption"
+    - All required columns exist with correct nullability
+    - artifact_id FK uses SET NULL on delete (durable history)
+    - consumer_task_id FK uses SET NULL on delete (durable history)
+    - producer_task_id FK uses SET NULL on delete (durable history)
+    - Unique constraint exists on (consumer_task_id, artifact_id)
+    - Legacy Artifact rows are not affected (logical_key defaults to None)
+    """
+    # --- Artifact.logical_key presence and nullability ---
+    artifact_table = Artifact.__table__
+    assert "logical_key" in artifact_table.c, "Artifact must have logical_key column"
+    lk_col = artifact_table.c["logical_key"]
+    assert lk_col.nullable, (
+        "Artifact.logical_key must be nullable (legacy rows stay NULL)"
+    )
+    lk_index_names = {idx.name for idx in artifact_table.indexes}
+    assert "ix_artifact_logical_key" in lk_index_names, (
+        "Artifact.logical_key must have an index ix_artifact_logical_key"
+    )
+
+    # --- Legacy-null behaviour via Python default ---
+    legacy_artifact = Artifact(
+        task_id=uuid.uuid4(),
+        artifact_type=ArtifactType.GIT_COMMIT,
+    )
+    assert legacy_artifact.logical_key is None, (
+        "Legacy Artifact rows must default logical_key to None"
+    )
+
+    # --- ArtifactConsumption table name ---
+    ac_table = ArtifactConsumption.__table__
+    assert ac_table.name == "artifactconsumption"
+
+    # --- Required columns exist ---
+    required_columns = {
+        "id",
+        "artifact_id",
+        "consumer_task_id",
+        "producer_task_id",
+        "logical_key",
+        "created_at",
+    }
+    actual_columns = set(ac_table.c.keys())
+    assert required_columns <= actual_columns, (
+        f"Missing columns: {required_columns - actual_columns}"
+    )
+
+    # --- Nullability: producer_task_id and logical_key are nullable ---
+    assert ac_table.c.producer_task_id.nullable, "producer_task_id must be nullable"
+    assert ac_table.c.logical_key.nullable, "logical_key must be nullable"
+
+    # --- FK ondelete=SET NULL for all three FK columns ---
+    for col_name in ("artifact_id", "consumer_task_id", "producer_task_id"):
+        col = ac_table.c[col_name]
+        assert col.foreign_keys, f"{col_name} must have a foreign key"
+        fk = next(iter(col.foreign_keys))
+        assert fk.ondelete == "SET NULL", (
+            f"{col_name} FK must use ON DELETE SET NULL (got {fk.ondelete!r})"
+        )
+
+    # --- Unique constraint on (consumer_task_id, artifact_id) ---
+    unique_constraint_names = {
+        c.name for c in ac_table.constraints if hasattr(c, "columns")
+    }
+    assert "uq_artifactconsumption_consumer_artifact" in unique_constraint_names, (
+        "ArtifactConsumption must have unique constraint uq_artifactconsumption_consumer_artifact"
+    )
+
+    # --- Indexes ---
+    ac_index_names = {idx.name for idx in ac_table.indexes}
+    assert "ix_artifactconsumption_artifact_id" in ac_index_names
+    assert "ix_artifactconsumption_consumer_task_id" in ac_index_names
+    assert "ix_artifactconsumption_producer_task_id" in ac_index_names

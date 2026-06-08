@@ -27,8 +27,9 @@ from app.github import (
     submit_pr_review,
     update_commit_status,
 )
-from app.models import Artifact, ArtifactType
+from app.models import Artifact, ArtifactType, Task
 from app.routers.agent import verify_agent_token
+from app.task_pr_linkage import parse_pr_number_from_url, persist_task_pr_linkage
 from app.schemas import (
     GitHubCommitStatusRequest,
     GitHubCreateBranchRequest,
@@ -339,6 +340,18 @@ async def agent_github_create_pr(
             task_id=req.task_id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url
         )
         session.add(artifact)
+        # Persist PR linkage onto the task row, not just the artifact. Standalone
+        # (parentless) tasks otherwise lose pr_number/branch entirely — they live
+        # only in the artifact, so GET /api/admin/tasks returns null/null. The
+        # leading payload is the canonical home the admin UI + branch_resolution
+        # already read from.
+        task = await session.get(Task, req.task_id)
+        if task is not None:
+            persist_task_pr_linkage(
+                task,
+                pr_number=parse_pr_number_from_url(pr_url),
+                branch=req.head,
+            )
         await session.commit()
         logger.info(f"[PR] Saved PR artifact for task {req.task_id}: {pr_url}")
 

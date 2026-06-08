@@ -92,6 +92,8 @@ export interface DirectionProgress {
   cost_budget_usd?: number | null;
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
+  format_compliance_rate?: number | null;
+  self_repair_success_rate?: number | null;
 }
 
 type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_attempt_asc';
@@ -473,6 +475,27 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     </span>
                   );
                 })()}
+                {(typeof dp.format_compliance_rate === 'number' || typeof dp.self_repair_success_rate === 'number') && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">output quality:</span>
+                    {typeof dp.format_compliance_rate === 'number' && (
+                      <span
+                        className={`text-[9px] px-1.5 py-0.5 rounded border ${dp.format_compliance_rate >= 0.9 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : dp.format_compliance_rate >= 0.7 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
+                        title="Share of tasks that produced well-formed structured output (no parse errors)"
+                      >
+                        {Math.round(dp.format_compliance_rate * 100)}% fmt
+                      </span>
+                    )}
+                    {typeof dp.self_repair_success_rate === 'number' && (
+                      <span
+                        className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
+                        title="Share of self-repair re-asks that produced parseable output"
+                      >
+                        {Math.round(dp.self_repair_success_rate * 100)}% repair
+                      </span>
+                    )}
+                  </div>
+                )}
                 {dp.prompt_quality_hint && (
                   <span className="text-[10px] text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
                     Prompt quality: {dp.prompt_quality_hint}

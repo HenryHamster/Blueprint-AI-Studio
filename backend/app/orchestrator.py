@@ -2807,6 +2807,14 @@ async def orchestrator_worker():
                     # machinery but is gated on the warm-pool flag/breaker, not
                     # warm-continuity, and releases its leased PoolVm row on clear.
                     _is_pool_pin = bool(_warm_ctx.get("warm_pool_pin"))
+                    # A parked-for-retarget task holds the parked VM id in
+                    # vm_instance_id (agent_status stamps it there so the reaper
+                    # can tear it down if the park budget expires). When the
+                    # orchestrator gives up on the warm pin it must reset
+                    # vm_instance_id just like pool pins do, so the cold
+                    # fall-through mints a FRESH id instead of re-creating a GCP
+                    # instance with a stale parked-VM name (name-collision hazard).
+                    _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
                     if _warm_target_vm_id:
                         _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                         _warm_expired = False
@@ -2850,6 +2858,11 @@ async def orchestrator_worker():
                             continue
 
                         # (a), (c), or (d): clear warm fields and fall through.
+                        _park_keys = (
+                            {"parked_for_retarget", "park_deadline"}
+                            if _is_parked_retarget
+                            else set()
+                        )
                         _new_ctx = {
                             k: v
                             for k, v in _warm_ctx.items()
@@ -2859,6 +2872,7 @@ async def orchestrator_worker():
                                 "warm_target_pr",
                                 "warm_handoff_deadline",
                                 "warm_pool_pin",
+                                *_park_keys,
                             )
                         }
                         task.context = _new_ctx
@@ -2887,6 +2901,15 @@ async def orchestrator_worker():
                             # just scheduled for teardown (name collision racing the
                             # reaper's delete). Chain pins leave vm_instance_id None
                             # so they are unaffected; only pool pins set it.
+                            task.vm_instance_id = None
+                        elif _is_parked_retarget:
+                            # Park-and-retarget stamped the held VM id onto
+                            # vm_instance_id (agent_status.py) so the reaper can
+                            # track it. When the warm pin is given up (VM
+                            # unresponsive, deadline expired, or circuit-breaker
+                            # suppressed), reset vm_instance_id so the cold
+                            # fall-through below mints a FRESH id — otherwise the
+                            # stale parked-VM name races the reaper's delete on GCP.
                             task.vm_instance_id = None
                         # Phase 2e observability: track clear-out rate so we
                         # can detect warm-VM instability. Sustained >5/hour

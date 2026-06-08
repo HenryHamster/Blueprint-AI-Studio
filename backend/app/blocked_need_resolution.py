@@ -332,6 +332,36 @@ def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool
     return False
 
 
+def knowledge_substance_satisfies_need(
+    need: Dict[str, Any],
+    substance_index,
+) -> bool:
+    """True iff a durable KnowledgeDocument already holds the substance of this need.
+
+    Only fires for ``kind=='task'`` needs — the incident failure class (a finding-hash
+    or task-id ref whose originating task is CANCELLED). Matching is conservative and
+    exact: the need's ref must equal a record's ``finding_hash`` OR a record's
+    ``topic`` (no fuzzy/substring/keyword heuristics), so independent work is never
+    falsely satisfied. ``substance_index`` is a pre-fetched list of
+    ``KnowledgeSubstance`` records (or any objects with ``.finding_hash`` and
+    ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``.
+    """
+    if not isinstance(need, dict):
+        return False
+    if need.get("kind") != "task":
+        return False
+    ref = need.get("ref")
+    if not ref:
+        return False
+    ref = str(ref).strip()
+    for record in substance_index:
+        if record.finding_hash and record.finding_hash == ref:
+            return True
+        if record.topic and record.topic == ref:
+            return True
+    return False
+
+
 def resolve_blocked_need(
     task: Task, need: Dict[str, Any], candidates: List[Task]
 ) -> Optional[Task]:

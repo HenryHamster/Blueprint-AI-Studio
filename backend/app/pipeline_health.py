@@ -106,7 +106,7 @@ async def _evaluate_sr_catch_rate_targets(
             continue
         # Gate on finding count (true denominator) not task count to avoid spurious
         # alerts when the window clears the task-count bar but rests on a handful of findings.
-        current_human_count = cat_data.get("current_human_count") or 0
+        current_human_count = cat_data.get("current_reviewer_finding_count") or cat_data.get("current_human_count") or 0
         if current_human_count < _SR_CATCH_RATE_MIN_FINDINGS:
             continue
         rate_history = cat_data.get("rate_history") or []

@@ -181,7 +181,7 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
         const pct = Math.round(pcr * 100);
         const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
         return (
-          <span className={tone} title="PRs merged / tasks created">
+          <span className={tone} title="PRs merged / PR-eligible tasks created (excludes research/audit/memo/investigate)">
             {pct}% conv
           </span>
         );

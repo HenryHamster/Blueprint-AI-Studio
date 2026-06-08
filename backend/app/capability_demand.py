@@ -37,6 +37,7 @@ from app.blocked_need_resolution import (
     completed_foundation_for_need,
     resolve_blocked_need,
 )
+from app.capability_registry import normalize_capability_name
 from app.database import resolve_dialect_name
 from app.finding_deduplication import normalize_prerequisite
 from app.landed_signal import has_merge_unblock_signal
@@ -97,6 +98,7 @@ def unresolved_capability_needs(
     active: List[Task],
     completed: List[Task],
     failed_parent_ids: Optional[set] = None,
+    substance_index=None,
 ) -> List[Dict[str, Any]]:
     """Return a BLOCKED task's UNRESOLVED foundation/capability needs.
 
@@ -109,16 +111,25 @@ def unresolved_capability_needs(
         (:func:`blocked_need_resolution.resolve_blocked_need` returns ``None``), AND
       * no already-shipped COMPLETED foundation satisfies it
         (:func:`blocked_need_resolution.completed_foundation_for_need` returns
-        ``None``).
+        ``None``), AND
+      * no durable KnowledgeDocument already holds its substance
+        (:func:`blocked_need_resolution.knowledge_substance_satisfies_need` returns
+        ``False`` when ``substance_index`` is provided).
 
     A foundation that is absent, dead, or completed-but-unshipped (ghost merge /
     unmerged) matches NEITHER set, so it is reported. A need a real foundation
-    provides — in flight or shipped — is dropped. ``pr`` needs are skipped (they
-    name an external ref, not a foundation this system commissions). ``active`` /
-    ``completed`` are pre-fetched same-project candidate sets;
-    ``failed_parent_ids`` is the stranded-parent set used to reject ghost merges
-    (mirrors ``reaper_sweeps._classify_blocker_needs``).
+    provides — in flight or shipped — is dropped. A need whose substance persists as
+    a durable KnowledgeDocument is also dropped: the work is done, even if the
+    originating task is CANCELLED. ``pr`` needs are skipped (they name an external
+    ref, not a foundation this system commissions). ``active`` / ``completed`` are
+    pre-fetched same-project candidate sets; ``failed_parent_ids`` is the
+    stranded-parent set used to reject ghost merges; ``substance_index`` is the
+    project's knowledge-substance index from
+    :func:`knowledge_query.fetch_knowledge_substance_index` (pass ``None`` or omit
+    to skip the knowledge check).
     """
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+
     unresolved: List[Dict[str, Any]] = []
     for need in get_blocker_needs(task):
         if _demand_identity(need) is None:
@@ -128,6 +139,10 @@ def unresolved_capability_needs(
         if (
             completed_foundation_for_need(task, need, completed, failed_parent_ids)
             is not None
+        ):
+            continue
+        if substance_index is not None and knowledge_substance_satisfies_need(
+            need, substance_index
         ):
             continue
         unresolved.append(need)
@@ -276,6 +291,11 @@ async def collect_missing_capability_demand(
     failed_parent_ids = {c.id for c in dead}
     failed_parent_ids |= {c.id for c in completed if not has_merge_unblock_signal(c)}
 
+    # Knowledge-substance index: a need whose substance is already captured in a
+    # durable KnowledgeDocument is not missing-foundation demand — the work is done.
+    from app.knowledge_query import fetch_knowledge_substance_index
+    substance_index = await fetch_knowledge_substance_index(session, project_id)
+
     entries: Dict[tuple, Dict[str, Any]] = {}
 
     # (a) Live BLOCKED dependents.
@@ -311,6 +331,7 @@ async def collect_missing_capability_demand(
             active=active,
             completed=completed,
             failed_parent_ids=failed_parent_ids,
+            substance_index=substance_index,
         ):
             identity = _demand_identity(need)
             if identity is None:
@@ -401,7 +422,10 @@ async def fetch_missing_demand_for_spawn(
         return {"total": 0, "demands": []}
 
 
-def missing_demand_prompt_hint(demand: Optional[Dict[str, Any]]) -> Optional[str]:
+def missing_demand_prompt_hint(
+    demand: Optional[Dict[str, Any]],
+    registry_names: Optional[List[str]] = None,
+) -> Optional[str]:
     """Build an advisory prompt suffix describing missing-foundation demand.
 
     Returns ``None`` when there is no demand so callers omit the hint (and the
@@ -410,16 +434,30 @@ def missing_demand_prompt_hint(demand: Optional[Dict[str, Any]]) -> Optional[str
     OR record an explicit retirement of the stranded dependents — without
     prescribing either. The top :data:`_HINT_ENTRY_LIMIT` demands are named inline;
     the full bounded list rides along in the ``missing_capability_demand`` field.
+
+    ``registry_names`` is the optional strategist-curated capability vocabulary
+    (canonical kebab-case names from ``problem_model.capabilities``). When a
+    capability demand ref corresponds to a registry capability (its normalized
+    form matches a registry name), the CANONICAL registry name is shown instead of
+    the consumer's free-prose label, so producers and consumers converge on one
+    string over time. Omitted/None leaves today's label-preferred behavior.
     """
     if not demand:
         return None
     demands = demand.get("demands") or []
     if not demands:
         return None
+    registry_set = {n for n in (registry_names or []) if isinstance(n, str)}
     lines: List[str] = []
     for entry in demands[:_HINT_ENTRY_LIMIT]:
         ref = entry.get("label") or entry.get("ref") or "(unnamed)"
         kind = entry.get("kind") or "capability"
+        # Vocabulary convergence: when this capability demand maps onto a curated
+        # registry capability, name it by its canonical registry name.
+        if kind == "capability" and registry_set:
+            _canonical = normalize_capability_name(entry.get("ref"))
+            if _canonical and _canonical in registry_set:
+                ref = _canonical
         dependent_count = entry.get("dependent_count", 0)
         still_blocked = entry.get("still_blocked", 0)
         already_cancelled = entry.get("already_cancelled", 0)

@@ -3,6 +3,7 @@ import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
 import type { BuildConfig, MergeGateRuntime, MergeVerificationVerdict } from './types/project';
+import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -202,6 +203,38 @@ export async function fetchTask(taskId: string): Promise<import('./components/Ta
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}`);
   if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);
   return res.json();
+}
+
+export interface ArtifactDownloadUrlResponse {
+  url: string;
+}
+
+export async function resolveArtifactDownloadUrl(
+  projectId: string,
+  storageUri: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    storage_uri: storageUri,
+  });
+  const res = await apiFetch(
+    `/api/admin/artifacts/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve artifact download URL: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve artifact download URL: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ArtifactDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Artifact download resolver returned an empty URL');
+  }
+  return data.url;
 }
 
 export async function fetchTaskSerialConsole(taskId: string): Promise<import('./types/task').SerialConsoleResponse> {
@@ -924,6 +957,13 @@ export interface EfficiencyAxesResponse {
   // Synthesized warm-pool payoff verdict (see PoolPayoffVerdict). Optional so
   // older backends that omit it degrade silently.
   pool_payoff_verdict?: PoolPayoffVerdict;
+  // Per-origin warm-start breakdown (pool vs chain-continuity vs backlog-reuse)
+  // + the pool-origin share, from the latest snapshot. Backend emits it at the
+  // top level of the efficiency-axes response; surfaces render it beside the
+  // contaminated aggregate vm_reuse_rate so the aggregate is never the sole
+  // reuse number read. Optional/nullable — older backends omit it, and the
+  // backend returns null when there were no warm starts to attribute.
+  warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -1056,6 +1096,7 @@ export interface VersionQualification {
   sub_scores: VersionQualificationSubScores | null;
   ci_resolution: CiResolution | null;
   blocker: string | null;
+  started_at?: string | null;
   finalized_at: string | null;
   // The candidate commit this qualification was evaluated against. Used to detect
   // when the latest audit's findings were computed against a different commit.
@@ -1069,6 +1110,30 @@ export interface VersionQualification {
   audit_reconciliation?: AuditReconciliation | null;
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
+}
+
+/** Per-artifact serving evidence for a release version. One entry per registered
+ *  deploy artifact (e.g. the backend Cloud Run revision, plus any other required
+ *  artifact). serving_status is one of 'unconfirmed' | 'serving_confirmed' |
+ *  'deploy_failed' | null (null = no serving expectation, e.g. a never-promoted
+ *  version). reason_code carries the failure/pending detail. */
+export interface ReleaseArtifactEvidence {
+  artifact_kind: string;
+  required: boolean;
+  serving_status?: string | null;
+  served_identifier?: string | null;
+  served_at?: string | null;
+  reason_code?: string | null;
 }
 
 export interface QualificationState {
@@ -1076,6 +1141,14 @@ export interface QualificationState {
   summary: string;
   promotion_pr_number?: number | null;
   promotion_pr_url?: string | null;
+  // Additive promotion freshness context for the shared "promotion in flight"
+  // state. When absent, callers must fall back to the timeless PR-only copy.
+  promotion_enabled_at?: string | null;
+  promotion_age_seconds?: number | null;
+  promotion_timeout_seconds?: number | null;
+  promotion_timeout_at?: string | null;
+  promotion_past_timeout?: boolean | null;
+  promotion_nearing_timeout?: boolean | null;
   error?: string | null;
   blocker?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:
@@ -1109,6 +1182,11 @@ export interface CurrentVersion {
   in_flight_task_count?: number;
   qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
+  // The candidate commit currently under evaluation for this open version
+  // (mirror of last_qualification.candidate_sha / the resolver's evaluated SHA).
+  // Surfaced so the UI can show what is being qualified and, when audit evidence
+  // is stale, contrast it against the historical audited candidate.
+  active_candidate_sha?: string | null;
   latest_audit?: LatestAudit | null;
   // Version-scoped audit evidence for the open candidate. `latest_audit` is
   // current only when audit_evidence_state='current'; `stale_audit` carries
@@ -1124,6 +1202,20 @@ export interface CurrentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Aggregate required-artifact serving truth (additive). The headline
+  // 'is it actually shipped' decision derives from this, NOT the backend-only
+  // scalar: 'serving_confirmed' only when every required artifact confirms,
+  // 'deploy_failed' when any required artifact failed, 'unconfirmed' while any
+  // required artifact is still pending. `artifacts` is the per-artifact evidence
+  // list (one entry per registered deploy artifact). Both may be absent when the
+  // API has no artifact registry — fall back to the scalar fields above.
+  aggregate_serving_status?: string | null;
+  aggregate_deploy_failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
+  // Post-promotion deploy-confirmation window deadline (ISO string). The sweep
+  // resolves serving_status to confirmed/failed when this elapses; the panel
+  // computes remaining/overdue at render time.
+  deploy_confirm_deadline?: string | null;
 }
 
 export interface RecentVersion {
@@ -1142,6 +1234,14 @@ export interface RecentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // Aggregate required-artifact serving truth (additive) — see CurrentVersion.
+  aggregate_serving_status?: string | null;
+  aggregate_deploy_failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
+  // Post-promotion deploy-confirmation window deadline (ISO string) — see
+  // CurrentVersion. Present on the recently-promoted history row whose
+  // serving_status is still 'unconfirmed'.
+  deploy_confirm_deadline?: string | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1382,6 +1482,15 @@ export interface QualificationVerdictRecord {
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
   audit_missing_reason: string | null;
+  audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  audit_reconciliation?: AuditReconciliation | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;
   terminal_status: string | null;
@@ -1393,6 +1502,9 @@ export interface QualificationVerdictRecord {
   // 'serving_confirmed' | 'deploy_failed' | 'unconfirmed' (null until recorded).
   post_promotion_outcome?: string | null;
   post_promotion_outcome_at?: string | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
 }
 
 export interface QualificationVerdictsInfraContext {
@@ -1857,6 +1969,9 @@ export interface ComputeJob {
   accrued_cost_usd: number | null;
   final_cost_usd: number | null;
   result_reference: string | null;
+  accelerator_type: string | null;
+  accelerator_count: number | null;
+  polling_metadata?: Record<string, unknown>;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;
@@ -1940,6 +2055,15 @@ export interface KnowledgeForwardQualityVerdict {
   [key: string]: unknown;
 }
 
+export interface KnowledgeCitationRecord {
+  ref?: string | null;
+  url?: string | null;
+  title?: string | null;
+  excerpt?: string | null;
+}
+
+export type KnowledgeCitation = string | KnowledgeCitationRecord;
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -1948,7 +2072,7 @@ export interface KnowledgeDocument {
   /** Strategic direction key (e.g. `d-1a2b3c4d`) that motivated the producing task, or null. */
   direction_id: string | null;
   tags: string[];
-  source_citations: unknown[];
+  source_citations: KnowledgeCitation[];
   source_task_id: string | null;
   authoring_branch?: string | null;
   head_sha?: string | null;

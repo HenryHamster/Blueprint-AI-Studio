@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import type { JSX } from 'react';
 import {
   clearDeployFailed,
   cutVersion,
@@ -14,13 +15,14 @@ import {
   type CurrentVersion,
   type LatestAudit,
   type QualificationVerdictRecord,
+  type ReleaseArtifactEvidence,
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
   type PromotionReadiness,
   type QualificationState,
 } from '../api';
-import { timeAgo } from '../utils/time';
+import { timeAgo, formatDurationSec, deployWindowStatus } from '../utils/time';
 
 // Generate a client idempotency key for a version cut. Prefers the native UUID
 // generator and falls back to a timestamp+random token for older runtimes (and
@@ -137,6 +139,10 @@ function classifyAuditNoReport(taskStatus: string | null | undefined): AuditNoRe
 }
 const QUAL_STATE_STYLE: Record<string, string> = {
   qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // The audit child crashed (terminal-failed, no report) while the verdict is
+  // still pending — loud red, NOT the amber 'qualifying' look. Keeps the top
+  // badge in agreement with the audit-findings section's 'audit crashed' cue.
+  audit_crashed: 'bg-red-500/10 border-red-500/30 text-red-400',
   promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
@@ -150,6 +156,44 @@ const QUAL_STATE_STYLE: Record<string, string> = {
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
 
+type PromotionFreshnessContext = {
+  detailText: string;
+  toneClassName: string;
+};
+
+function finiteSeconds(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Math.max(0, value);
+}
+
+function formatPromotionFreshnessContext(
+  state: QualificationState | null | undefined,
+): PromotionFreshnessContext | null {
+  const ageSeconds = finiteSeconds(state?.promotion_age_seconds);
+  if (ageSeconds == null) return null;
+  const timeoutSeconds = finiteSeconds(state?.promotion_timeout_seconds);
+  let detailText = `in flight ~${formatDurationSec(ageSeconds)}`;
+  if (timeoutSeconds != null && timeoutSeconds > 0) {
+    detailText += ` (auto-timeout cap ${formatDurationSec(timeoutSeconds)})`;
+  }
+  if (state?.promotion_past_timeout) {
+    return {
+      detailText: `${detailText}, past auto-timeout`,
+      toneClassName: 'text-red-400',
+    };
+  }
+  if (state?.promotion_nearing_timeout) {
+    return {
+      detailText: `${detailText}, nearing auto-timeout`,
+      toneClassName: 'text-amber-400',
+    };
+  }
+  return {
+    detailText,
+    toneClassName: 'text-emerald-300',
+  };
+}
+
 // Distinct, operator-readable serving-confirmation badge for a promoted version.
 // Green = confirmed live; amber = still awaiting deploy confirmation; red = a
 // deploy that failed to stabilize (with the failure reason). Renders nothing
@@ -159,11 +203,13 @@ function ServingStatusBadge({
   servedSha,
   servedAt,
   deployFailureReason,
+  deployConfirmDeadline,
 }: {
   servingStatus?: string | null;
   servedSha?: string | null;
   servedAt?: string | null;
   deployFailureReason?: string | null;
+  deployConfirmDeadline?: string | null;
 }) {
   if (!servingStatus) return null;
   if (servingStatus === 'serving_confirmed') {
@@ -196,18 +242,90 @@ function ServingStatusBadge({
     );
   }
   if (servingStatus === 'unconfirmed') {
+    // Compute the confirmation-window state at render time so the panel is
+    // honest at view time, not at fetch time. When `now` is past the deadline
+    // while serving is still unconfirmed, the resolving sweep is late/stuck and
+    // the deploy should be investigated — render a distinct overdue cue.
+    let windowText: string | null = null;
+    let overdue = false;
+    if (deployConfirmDeadline) {
+      const status = deployWindowStatus(deployConfirmDeadline);
+      overdue = status.overdue;
+      windowText = status.text;
+    }
     return (
       <span
         data-testid="serving-status-badge"
         data-serving-status="unconfirmed"
-        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
-        title="Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window."
+        data-deploy-window-overdue={deployConfirmDeadline ? String(overdue) : undefined}
+        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+          overdue
+            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+        }`}
+        title={
+          overdue
+            ? 'Promoted (merged) but serving is still not confirmed and the deploy confirmation window has elapsed — the resolving sweep is late or stuck; investigate the deploy.'
+            : 'Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window.'
+        }
       >
-        … awaiting deploy confirmation
+        {overdue ? '⚠ awaiting deploy confirmation — OVERDUE' : '… awaiting deploy confirmation'}
+        {windowText && (
+          <span className={`font-normal ${overdue ? 'text-red-300' : 'text-amber-500/90'}`}>{windowText}</span>
+        )}
       </span>
     );
   }
   return null;
+}
+
+// Per-artifact serving label/colour for the evidence breakdown. The backend
+// emits serving_status as serving_confirmed | deploy_failed | unconfirmed | null;
+// a confirmed artifact that follows a prior failure reads as 'recovered'.
+const ARTIFACT_STATUS_STYLE: Record<string, { cls: string; label: string }> = {
+  serving_confirmed: { cls: 'text-emerald-400', label: '✓ serving' },
+  deploy_failed: { cls: 'text-red-400', label: '⚠ failed' },
+  unconfirmed: { cls: 'text-amber-400', label: '… pending' },
+};
+
+// Per-artifact serving evidence so an operator can see WHICH registered deploy
+// artifact is pending/failed/recovered behind the aggregate headline. Renders
+// nothing for the legacy single-artifact case (or when the API omits the list),
+// so a backend-only response looks exactly as it did before this breakdown.
+function ArtifactEvidenceList({ artifacts }: { artifacts?: ReleaseArtifactEvidence[] | null }) {
+  if (!artifacts || artifacts.length <= 1) return null;
+  return (
+    <div
+      data-testid="artifact-evidence-list"
+      className="flex flex-col gap-0.5 pl-2 border-l border-neutral-700/50"
+    >
+      {artifacts.map((a) => {
+        const style =
+          ARTIFACT_STATUS_STYLE[a.serving_status ?? ''] ??
+          { cls: 'text-neutral-500', label: a.serving_status ?? 'n/a' };
+        return (
+          <div
+            key={a.artifact_kind}
+            data-testid="artifact-evidence-row"
+            data-artifact-kind={a.artifact_kind}
+            data-artifact-status={a.serving_status ?? 'none'}
+            className="flex flex-wrap items-center gap-1.5 text-[9px]"
+          >
+            <span className="font-mono text-neutral-400">{a.artifact_kind}</span>
+            {a.required && <span className="text-neutral-600 uppercase tracking-wide">required</span>}
+            <span className={`font-semibold ${style.cls}`}>{style.label}</span>
+            {a.served_identifier && (
+              <span className="font-mono text-neutral-500 truncate max-w-[160px]">{a.served_identifier}</span>
+            )}
+            {a.served_at && <span className="text-neutral-600">{timeAgo(a.served_at)}</span>}
+            {a.reason_code && (
+              <span className="text-red-300/80 truncate max-w-[180px]" title={a.reason_code}>{a.reason_code}</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // Provenance for scoped audit evidence. Shows which commit the audit ran
@@ -273,14 +391,43 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   );
 }
 
-function HistoricalAuditContext({ audit }: { audit: LatestAudit }) {
+// Stale-audit view: the newest scoped audit ran against an older candidate than
+// the one now under evaluation. When the active candidate SHA is known, contrast
+// it explicitly against the audited commit so an operator can see exactly which
+// commit is waiting for a fresh audit and which one the stale findings describe.
+function HistoricalAuditContext({
+  audit,
+  activeCandidateSha,
+}: {
+  audit: LatestAudit;
+  activeCandidateSha?: string | null;
+}) {
+  const auditedShort = audit.candidate_sha ? `@${audit.candidate_sha.slice(0, 7)}` : null;
   return (
-    <div className="space-y-0.5">
+    <div data-testid="historical-audit-context" className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
       <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
         no current audit for this candidate
       </span>
-      <AuditProvenance audit={audit} />
+      {activeCandidateSha ? (
+        <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+          <span className="text-neutral-400">active</span>
+          <span className="font-mono text-neutral-300" title={activeCandidateSha}>
+            @{activeCandidateSha.slice(0, 7)}
+          </span>
+          <span className="text-neutral-600">waiting for a fresh audit · audited</span>
+          {auditedShort && (
+            <span className="font-mono text-neutral-500" title={audit.candidate_sha ?? undefined}>
+              {auditedShort}
+            </span>
+          )}
+          {audit.created_at && (
+            <span className="text-neutral-600">ran {timeAgo(audit.created_at)}</span>
+          )}
+        </div>
+      ) : (
+        <AuditProvenance audit={audit} />
+      )}
     </div>
   );
 }
@@ -310,6 +457,144 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
           {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
         </span>
       )}
+    </div>
+  );
+}
+
+type DurableQualificationEvidence = {
+  audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
+};
+
+function formatCompactDetail(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    const text = JSON.stringify(value);
+    return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidence }) {
+  const findings = q.audit_findings ?? [];
+  const excludedFindings = q.excluded_audit_findings ?? [];
+  const chips: JSX.Element[] = [];
+
+  if (q.migration_safety || q.migration_safety_detail) {
+    chips.push(
+      <span
+        key="migration-safety"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={q.migration_safety_detail ?? undefined}
+      >
+        migration {q.migration_safety ?? 'unknown'}
+      </span>,
+    );
+  }
+  if (q.migration_apply_safety || q.migration_apply_safety_detail) {
+    chips.push(
+      <span
+        key="migration-apply-safety"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={q.migration_apply_safety_detail ?? undefined}
+      >
+        apply {q.migration_apply_safety ?? 'unknown'}
+      </span>,
+    );
+  }
+  if (findings.length > 0) {
+    chips.push(
+      <span
+        key="audit-findings"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-sky-500/10 text-sky-300 border-sky-500/20"
+        title={findings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
+      >
+        {findings.length} audit finding{findings.length !== 1 ? 's' : ''}
+      </span>,
+    );
+  }
+  if (excludedFindings.length > 0) {
+    chips.push(
+      <span
+        key="excluded-audit-findings"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        title={excludedFindings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
+      >
+        {excludedFindings.length} excluded finding{excludedFindings.length !== 1 ? 's' : ''}
+      </span>,
+    );
+  }
+  if (q.test_erosion_detail) {
+    chips.push(
+      <span
+        key="test-erosion-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={formatCompactDetail(q.test_erosion_detail)}
+      >
+        erosion {formatCompactDetail(q.test_erosion_detail)}
+      </span>,
+    );
+  }
+  if (q.smoketest_detail) {
+    chips.push(
+      <span
+        key="smoketest-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={formatCompactDetail(q.smoketest_detail)}
+      >
+        smoke {formatCompactDetail(q.smoketest_detail)}
+      </span>,
+    );
+  }
+  if (q.promotion_pr_url) {
+    chips.push(
+      <span
+        key="promotion-pr-url"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        title={q.promotion_pr_url}
+      >
+        promotion PR
+      </span>,
+    );
+  }
+  if (q.promotion_conflict) {
+    chips.push(
+      <span
+        key="promotion-conflict"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        title={q.promotion_error_detail ?? 'promotion conflict'}
+      >
+        promotion conflict
+      </span>,
+    );
+  } else if (q.promotion_error_detail) {
+    chips.push(
+      <span
+        key="promotion-error-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        title={q.promotion_error_detail}
+      >
+        {q.promotion_error_detail}
+      </span>,
+    );
+  }
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div data-testid="durable-qualification-evidence" className="flex flex-wrap gap-1.5 pt-0.5">
+      {chips}
     </div>
   );
 }
@@ -425,6 +710,7 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
   const activating = stagedActivatedByCut(staged, cv.version_number);
   const inFlight = cv.in_flight_task_count ?? 0;
   const qualState: QualificationState | null = cv.qualification_state ?? null;
+  const promotionFreshness = formatPromotionFreshnessContext(qualState);
   return (
     <div
       data-testid="cut-consequences"
@@ -454,8 +740,9 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
           : 'No tasks are currently in flight.'}
       </p>
       {qualState?.state === 'promotion_in_flight' && (
-        <p className="text-emerald-300">
-          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging — this cut will be rejected until it lands or is canceled.
+        <p className={promotionFreshness?.toneClassName ?? 'text-emerald-300'}>
+          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging
+          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — this cut will be rejected until it lands or is canceled.
         </p>
       )}
     </div>
@@ -504,12 +791,19 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // the controls here so the panel presents the same truth, consistent with how
   // the cut lever already surfaces this state.
   const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  const promotionFreshness = formatPromotionFreshnessContext(cv?.qualification_state);
+  const promotionLockContext = promotionFreshness ? ` (${promotionFreshness.detailText})` : '';
   const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
   // Admin-only lever: a promoted version latched to deploy_failed (current open
   // version after promotion, or a recent promoted one) can be cleared once the
   // deploy is verified or attested live. The backend endpoint is project-scoped
   // and targets the latest promoted deploy_failed version.
   const isAdmin = userRole === 'admin';
+  // The clear lever is backed by a project-scoped endpoint that still targets
+  // the latest promoted version latched to the scalar serving_status field.
+  // Keep this predicate on that same backend-owned latch; aggregate-only
+  // required-artifact failures still surface in the badges/breakdown, but the
+  // clear endpoint cannot currently recover them directly.
   const hasDeployFailed = cv?.serving_status === 'deploy_failed'
     || recent.some(v => v.serving_status === 'deploy_failed');
 
@@ -612,6 +906,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
     const qualState: QualificationState | null = cv.qualification_state ?? null;
+    const cutPromotionFreshness = formatPromotionFreshnessContext(qualState);
     const consequences = [
       activating.length > 0
         ? `${activating.length} staged direction${activating.length !== 1 ? 's' : ''} will start now`
@@ -620,7 +915,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
         : null,
       qualState?.state === 'promotion_in_flight'
-        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging`
+        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''}`
         : null,
     ].filter(Boolean);
     const msg = consequences.length
@@ -768,6 +1063,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+              {cv.active_candidate_sha && (
+                <span
+                  data-testid="active-candidate-sha"
+                  className="text-[10px] text-neutral-500 font-mono"
+                  title={`candidate under evaluation: ${cv.active_candidate_sha}`}
+                >
+                  candidate @{cv.active_candidate_sha.slice(0, 7)}
+                </span>
+              )}
             </div>
             {editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
@@ -867,13 +1171,23 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
-                    servingStatus={cv.serving_status ?? cv.qualification_state.serving_status}
+                    servingStatus={cv.aggregate_serving_status ?? cv.serving_status ?? cv.qualification_state.serving_status}
                     servedSha={cv.served_sha}
                     servedAt={cv.served_at}
-                    deployFailureReason={cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    deployFailureReason={cv.aggregate_deploy_failure_reason ?? cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
                 </div>
+                {cv.qualification_state.state === 'promotion_in_flight' && promotionFreshness && (
+                  <p
+                    data-testid="promotion-in-flight-freshness"
+                    className={`text-[10px] ${promotionFreshness.toneClassName}`}
+                  >
+                    Promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging ({promotionFreshness.detailText})
+                  </p>
+                )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
+                <ArtifactEvidenceList artifacts={cv.artifacts} />
               </div>
             )}
             {cv.last_qualification && (
@@ -936,6 +1250,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.last_qualification.audit_reconciliation && (
                   <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
                 )}
+                <DurableQualificationEvidenceRow q={cv.last_qualification} />
               </div>
             )}
             {auditEvidenceState === 'current' && cv.latest_audit && (
@@ -945,7 +1260,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             )}
             {auditEvidenceState === 'stale' && cv.stale_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <HistoricalAuditContext audit={cv.stale_audit} />
+                <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
             {projectId && (
@@ -954,7 +1269,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={() => handleSetPhase('stabilize')}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
@@ -963,7 +1278,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={() => handleSetPhase('build')}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
@@ -973,15 +1288,18 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <button
                     onClick={handleQualify}
                     disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying' : undefined}
+                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before re-qualifying` : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
                 )}
                 {promotionInFlight && (
-                  <span data-testid="promotion-in-flight-note" className="text-[10px] text-emerald-300 italic">
-                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging — qualify & phase locked until it lands or is canceled
+                  <span
+                    data-testid="promotion-in-flight-note"
+                    className={`text-[10px] italic ${promotionFreshness?.toneClassName ?? 'text-emerald-300'}`}
+                  >
+                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging{promotionLockContext} — qualify & phase locked until it lands or is canceled
                   </span>
                 )}
                 {cuttingVersion ? (
@@ -1057,33 +1375,36 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
             <div className="space-y-1">
               {verdicts.slice(0, 8).map(v => (
-                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
-                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
-                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
-                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
-                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
-                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
-                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
-                  {v.post_promotion_outcome && (
-                    <span
-                      className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
-                        v.post_promotion_outcome === 'serving_confirmed'
-                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                <div key={v.id} className="space-y-0.5 pl-2 border-l-2 border-neutral-700/40">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                    <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
+                    <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
+                    {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                    {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
+                    {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                    {v.post_promotion_outcome && (
+                      <span
+                        className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
+                          v.post_promotion_outcome === 'serving_confirmed'
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                            : v.post_promotion_outcome === 'deploy_failed'
+                              ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                              : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                        }`}
+                        title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
+                      >
+                        {v.post_promotion_outcome === 'serving_confirmed'
+                          ? '✓ serving'
                           : v.post_promotion_outcome === 'deploy_failed'
-                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
-                            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                      }`}
-                      title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
-                    >
-                      {v.post_promotion_outcome === 'serving_confirmed'
-                        ? '✓ serving'
-                        : v.post_promotion_outcome === 'deploy_failed'
-                          ? '⚠ deploy failed'
-                          : 'unconfirmed'}
-                    </span>
-                  )}
-                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
-                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                            ? '⚠ deploy failed'
+                            : 'unconfirmed'}
+                      </span>
+                    )}
+                    <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
+                    {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                  </div>
+                  <DurableQualificationEvidenceRow q={v} />
                 </div>
               ))}
             </div>
@@ -1094,23 +1415,27 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-0.5">
               {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
-                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
-                  <span className="text-neutral-500">{v.status}</span>
-                  <ServingStatusBadge
-                    servingStatus={v.serving_status ?? v.qualification_state?.serving_status}
-                    servedSha={v.served_sha}
-                    servedAt={v.served_at}
-                    deployFailureReason={v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
-                  />
-                  <QualSummary q={v.last_qualification} />
-                  {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
-                    <span className="text-neutral-400">
-                      cut by {v.abandoned_by ?? 'unknown'}
-                      {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
-                      {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
-                    </span>
-                  )}
+                <div key={v.version_number} className="space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                    <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                    <span className="text-neutral-500">{v.status}</span>
+                    <ServingStatusBadge
+                      servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
+                      servedSha={v.served_sha}
+                      servedAt={v.served_at}
+                      deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                      deployConfirmDeadline={v.deploy_confirm_deadline}
+                    />
+                    <QualSummary q={v.last_qualification} />
+                    {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                      <span className="text-neutral-400">
+                        cut by {v.abandoned_by ?? 'unknown'}
+                        {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                        {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <ArtifactEvidenceList artifacts={v.artifacts} />
                 </div>
               ))}
             </div>

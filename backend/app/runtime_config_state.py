@@ -459,6 +459,14 @@ runtime_config: Dict = {
     # admin UI response stays under Cloud Run's 32 MB body limit and analytics
     # endpoints don't OOM loading a week of rows.
     "auto_archive_enabled": True,
+    # Effort-escalation-on-execution-timeout kill-switch. When True (default),
+    # a task requeued purely because its wall-clock execution budget ran out
+    # (the AGENT_TIMEOUT "execution_timeout" subtype — NOT oom/crash/heartbeat
+    # loss) has its per-attempt effort tier bumped one step before the retry, so
+    # the retry gets a larger wall-clock budget (and a stronger model where
+    # effort drives model selection) instead of repeating the same doomed
+    # budget. False restores the prior same-effort retry behavior fleet-wide.
+    "effort_escalation_on_execution_timeout_enabled": True,
     # Auto-debug spawn kill-switch (#8528): gates should_auto_debug in
     # agent_status.py. False stops Debug:/Fix: replacement spawns fleet-wide —
     # the storm brake for usage-exhaustion nights where debug children burn
@@ -616,6 +624,15 @@ runtime_config: Dict = {
     # Defaults to FALSE — the whole capability ships dark, so this leaves
     # eligibility and the claim response byte-for-byte unchanged until enabled.
     "warm_retarget_enabled": False,
+    # Rate-limit tail optimization: when enabled, a RATE_LIMIT / provider-quota
+    # requeue may keep its warm VM alive and re-claim the same task on an
+    # alternate account instead of tearing the VM down immediately. Ships dark
+    # until the agent-side park loop also lands.
+    "park_and_retarget_enabled": False,
+    # Bounded hold window for the park-and-retarget path. Must stay below the
+    # stale retry_after sweep's far-future guard, so the default is conservative
+    # and admin validation clamps the operator override.
+    "park_and_retarget_budget_seconds": 600,
     # Warm-backlog claim scan / teardown window. The scan limit keeps each
     # /next-role poll cheap; the defer window gives the agent time to claim
     # a backlog task before the idle VM is torn down.
@@ -1035,6 +1052,22 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_retarget_enabled",
                         bool(config_json["warm_retarget_enabled"]),
+                    )
+                if "park_and_retarget_enabled" in config_json:
+                    _set(
+                        "park_and_retarget_enabled",
+                        bool(config_json["park_and_retarget_enabled"]),
+                    )
+                if "park_and_retarget_budget_seconds" in config_json:
+                    try:
+                        raw_budget = int(
+                            config_json["park_and_retarget_budget_seconds"]
+                        )
+                    except (TypeError, ValueError):
+                        raw_budget = 600
+                    _set(
+                        "park_and_retarget_budget_seconds",
+                        max(30, min(1800, raw_budget)),
                     )
                 if "usage_headroom_gate_enabled" in config_json:
                     _set(

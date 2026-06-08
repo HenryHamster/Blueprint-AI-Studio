@@ -979,6 +979,60 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     await gcp_cleanup_service()
 
 
+@pytest.mark.asyncio
+async def test_gcp_cleanup_does_not_reap_parked_task_vm(gcp_db, mocker):
+    """A QUEUED task holding a VM for park-and-retarget must NOT appear in the
+    orphan-deletion set — gcp_cleanup_service should exempt it from cleanup."""
+    project = await _make_project(gcp_db)
+
+    # Parked task: QUEUED + parked_for_retarget context + live VM
+    parked_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-parked-1",
+        context={
+            "parked_for_retarget": True,
+            "park_deadline": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
+        },
+    )
+    gcp_db.add(parked_task)
+
+    # Normal QUEUED task (no vm, no park context) — should not be exempted
+    plain_queued = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=None,
+    )
+    gcp_db.add(plain_queued)
+
+    # Active IN_PROGRESS task — must always be exempted
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1")
+
+    await gcp_db.commit()
+
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+    )
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-parked-1" in called_vm_ids, (
+        "Parked VM must be exempted from orphan cleanup"
+    )
+    assert "agent-vm-active-1" in called_vm_ids
+    assert None not in called_vm_ids
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _check_daily_cost_ceiling (agent_status.py)
 # ══════════════════════════════════════════════════════════════════════════════

@@ -75,6 +75,7 @@ vi.mock('../api', () => ({
   fetchSrCatchRateHealth: vi.fn(async () => MOCK_HEALTH_HEALTHY),
   API_BASE_URL: 'http://localhost:8000',
   authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/artifacts/test.json'),
 }));
 
 describe('SrMissedRetrospectivesPanel — viewport regression', () => {

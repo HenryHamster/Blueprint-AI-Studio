@@ -313,7 +313,13 @@ class RefactorPayload(_AcceptanceEvidenceMixin, _PromptRequired):
     pass
 
 
-class PlanPayload(_PromptRequired):
+class PlanPayload(_AcceptanceEvidenceMixin, _PromptRequired):
+    # A plan task carries the parent finding's declared acceptance evidence so
+    # the requirement survives the parent→child decomposition hop. Typed slot
+    # (instead of relying on BasePayload's extra='allow' pass-through) so the
+    # forward-carried declaration is validated the same as on a code task, and
+    # _handle_plan_completion can read it via read_acceptance_evidence. Optional
+    # + exclude_none means a plan with no declaration round-trips identically.
     pass
 
 
@@ -428,12 +434,21 @@ class StrategicReviewPayload(_SystemPopulated):
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
     # Current LTS version/phase context. Keys: version_number, phase,
-    # phase_changed_at, tasks_merged_this_version, last_qualification.
+    # phase_changed_at, tasks_merged_this_version, last_qualification,
+    # acceptance_aggregate (additive proven-vs-merged version-window aggregate,
+    # carried alongside the raw tasks_merged_this_version count; nullable on
+    # legacy rows). Stays ``dict[str, Any] | None`` with extra='allow', so the
+    # additive key needs no validation change.
     version_phase: dict[str, Any] | None = None
     # Citable memo summaries (terminal reasoning artifacts spawned from dropped
     # research findings) for this cycle window. Optional + default-None so
-    # existing consumers and tests are unaffected. Each entry:
-    # {task_id, summary_excerpt}. The reviewer prompt can cite memos by task_id.
+    # existing consumers and tests are unaffected. Each entry contains at
+    # minimum {task_id, summary_excerpt}; enriched entries also carry optional
+    # fields: reasoning_kind, direction_id, tags, citations, success_evidence,
+    # retirement_condition, final_metrics, rationale. The reviewer prompt can
+    # cite memos by task_id. Summarizer trims heavy fields (citations,
+    # final_metrics, rationale) before capping entry count to keep the feed
+    # small but citable under budget pressure.
     memo_citations: list[dict[str, Any]] | None = None
     # Per-axis efficiency snapshot with drift vs baseline. Keys: axes (dict of
     # axis_name → {current, baseline, drift_pct, history_tail}),
@@ -650,6 +665,10 @@ class ComputeExperimentPayload(_SystemPopulated):
     env: dict[str, str] | None = None
     backend_name: str | None = None
     provisioning_model: str | None = None
+    # Optional single-GPU accelerator (canonical short name "T4"/"L4"/"V100").
+    # Absent ⇒ a CPU job, unchanged. When set it must be paired with a matching
+    # GPU machine_type; the backend rejects A100/over-quota and mismatches loudly.
+    accelerator: str | None = None
     # Benchmark/evaluation metadata — informational; echoed back into the result
     # artifact so operators can correlate a job with the experiment that ran it.
     experiment: str | None = None

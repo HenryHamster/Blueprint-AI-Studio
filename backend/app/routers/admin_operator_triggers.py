@@ -298,6 +298,7 @@ async def trigger_qualify(
             if pr_url:
                 detail += f" {pr_url}"
             detail += ")"
+        detail += release_version.format_promotion_freshness(result)
         raise HTTPException(status_code=409, detail=detail)
     return result
 

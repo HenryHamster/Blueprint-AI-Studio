@@ -13,8 +13,11 @@ from unittest.mock import AsyncMock
 from sqlmodel import select as sql_select
 
 from app.alert_dispatch import (
+    _MIGRATION_SLOT_CONTENTION_ALERT_TITLE,
     _UNVERIFIED_REASON_LABELS,
+    _fmt_duration_seconds,
     _maybe_create_blocked_escalation_alert,
+    _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
     _maybe_create_unverified_merge_alert,
 )
@@ -408,3 +411,96 @@ async def test_merge_gate_degradation_alert_dedups_on_stable_title(db_session, m
     assert second == 0  # deduped on stable title
     alerts = await _degradation_alerts(db_session, project.id)
     assert len(alerts) == 1
+
+
+# ── migration-slot-contention alert ──────────────────────────────────────────
+
+
+async def _slot_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title == _MIGRATION_SLOT_CONTENTION_ALERT_TITLE,
+        Alert.dismissed_at.is_(None),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+def test_fmt_duration_seconds():
+    assert _fmt_duration_seconds(None) == "n/a"
+    assert _fmt_duration_seconds(30) == "30s"
+    assert _fmt_duration_seconds(90) == "1m"
+    assert _fmt_duration_seconds(3600) == "1h"
+    assert _fmt_duration_seconds(2 * 3600 + 5 * 60) == "2h 5m"
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_alert_creates_and_embeds_numbers(
+    db_session, mocker
+):
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    holder = make_task(project_id=project.id)
+    db_session.add(holder)
+    await db_session.commit()
+
+    created = await _maybe_create_migration_slot_contention_alert(
+        db_session,
+        project.id,
+        holder_task_id=str(holder.id),
+        held_seconds=2 * 3600,
+        waiting_count=5,
+        longest_wait_seconds=45 * 60,
+    )
+    await db_session.commit()
+    assert created == 1
+    bcast.assert_awaited()
+
+    alerts = await _slot_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.task_id == holder.id
+    assert alert.severity == AlertSeverity.WARNING
+    # Drifting numbers live in the message (not the title) so dedup survives them.
+    assert "2h" in alert.message
+    assert "5 schema-touching task" in alert.message
+    assert "45m" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_alert_dedups_on_stable_title(
+    db_session, mocker
+):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await _maybe_create_migration_slot_contention_alert(
+        db_session,
+        project.id,
+        holder_task_id=None,
+        held_seconds=2 * 3600,
+        waiting_count=3,
+        longest_wait_seconds=10 * 60,
+    )
+    await db_session.commit()
+    assert first == 1
+
+    # Drifting numbers must not defeat dedup — same stable title.
+    second = await _maybe_create_migration_slot_contention_alert(
+        db_session,
+        project.id,
+        holder_task_id=None,
+        held_seconds=3 * 3600,
+        waiting_count=7,
+        longest_wait_seconds=90 * 60,
+    )
+    await db_session.commit()
+    assert second == 0
+    assert len(await _slot_alerts(db_session, project.id)) == 1

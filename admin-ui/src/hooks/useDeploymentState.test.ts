@@ -405,6 +405,117 @@ describe('useDeploymentState', () => {
     );
   });
 
+  // --- Durable failed-rollback affordance ---
+  //
+  // The error toast fired on a failed traffic shift auto-dismisses after a few
+  // seconds (Toasts.tsx). The hook promotes that ephemeral signal into standing
+  // `failedRollback` state so the deploy surface can render a durable affordance
+  // that outlives the toast and clears on the operator's next resolving action.
+
+  // These tests mirror the existing handler-test style (await the async handler
+  // directly; the floating re-fetch triggers a state update outside act, which
+  // React warns about — suppressed via console.error = vi.fn() in beforeEach).
+  // We deliberately do NOT wrap handlers in act(): act() forces React to re-flush
+  // until the tree is stable, and combined with a deploy-state mock that returns
+  // a fresh object every poll it spins into a "Maximum update depth" loop in this
+  // hook's multi-poller setup — a test-harness artifact, not a code defect.
+
+  it('sets failedRollback from a 200 rollback_failed body and keeps it past the toast window', async () => {
+    stubAllEndpoints({ '/api/admin/deploy-state': { status: 'STABLE' } });
+    const { result } = renderHook(() =>
+      useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }),
+    );
+    await waitFor(() => expect(result.current.deployState?.status).toBe('STABLE'));
+
+    // Rollback whose Cloud Run traffic shift fails: HTTP 200 rollback_failed.
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        status: 'rollback_failed',
+        serving_sha: 'sha123bad000000',
+        gcloud_error: 'traffic shift rejected',
+      }),
+    });
+    await result.current.handleRollback();
+
+    // Standing state reconstructed from the response — decoupled from the toast.
+    await waitFor(() => {
+      expect(result.current.failedRollback).toEqual({
+        serving_sha: 'sha123bad000000',
+        gcloud_error: 'traffic shift rejected',
+      });
+    });
+
+    // The toast auto-dismisses after 4000ms (Toasts.tsx); the affordance must
+    // outlive it. The hook holds it as state with no self-clearing timer, so it
+    // is still present well past that window.
+    await new Promise((r) => setTimeout(r, 4100));
+    expect(result.current.failedRollback?.serving_sha).toBe('sha123bad000000');
+  }, 10_000);
+
+  it('clears failedRollback on a subsequent successful rollback', async () => {
+    stubAllEndpoints({ '/api/admin/deploy-state': { status: 'STABLE' } });
+    const { result } = renderHook(() =>
+      useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }),
+    );
+    await waitFor(() => expect(result.current.deployState?.status).toBe('STABLE'));
+
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ status: 'rollback_failed', serving_sha: 'sha123bad000000' }),
+    });
+    await result.current.handleRollback();
+    await waitFor(() => expect(result.current.failedRollback?.serving_sha).toBe('sha123bad000000'));
+
+    // A real traffic shift (status='rolled_back') resolves the situation.
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ status: 'rolled_back', from_sha: 'sha123bad000000', to_sha: 'sha999good00000' }),
+    });
+    await result.current.handleRollback();
+    await waitFor(() => expect(result.current.failedRollback).toBeNull());
+  });
+
+  it('clears failedRollback when the operator marks the deploy stable', async () => {
+    stubAllEndpoints({ '/api/admin/deploy-state': { status: 'STABLE' } });
+    const { result } = renderHook(() =>
+      useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }),
+    );
+    await waitFor(() => expect(result.current.deployState?.status).toBe('STABLE'));
+
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ status: 'rollback_failed', serving_sha: 'sha123bad000000' }),
+    });
+    await result.current.handleRollback();
+    await waitFor(() => expect(result.current.failedRollback).not.toBeNull());
+
+    await result.current.handleMarkStable();
+    await waitFor(() => expect(result.current.failedRollback).toBeNull());
+  });
+
+  it('auto-clears failedRollback when deploy-state status moves away from the at-failure status', async () => {
+    stubAllEndpoints({ '/api/admin/deploy-state': { status: 'STABLE' } });
+    const { result } = renderHook(() =>
+      useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }),
+    );
+    await waitFor(() => expect(result.current.deployState?.status).toBe('STABLE'));
+
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ status: 'rollback_failed', serving_sha: 'sha123bad000000' }),
+    });
+    await result.current.handleRollback();
+    await waitFor(() => expect(result.current.failedRollback).not.toBeNull());
+
+    // An external/operator change moves the deploy status; the next refetch
+    // observes it and the standing affordance auto-clears (no false alarm).
+    stubAllEndpoints({ '/api/admin/deploy-state': { status: 'PAUSED' } });
+    await result.current.handlePausePipeline();
+    await waitFor(() => expect(result.current.deployState?.status).toBe('PAUSED'));
+    await waitFor(() => expect(result.current.failedRollback).toBeNull());
+  });
+
   it('handleMarkStable posts to mark-stable endpoint and shows success toast', async () => {
     const addToast = vi.fn();
     const { result } = renderHook(() =>

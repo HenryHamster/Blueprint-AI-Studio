@@ -66,6 +66,11 @@ _global_quota_state: dict = {}
 # region -> same shape.
 _region_quota_state: dict[str, dict] = {}
 
+# GPU-specific quota cooldown state — isolated from the CPU fleet so a GPU
+# quota event never blocks CPU agent-VM provisioning.
+_gpu_global_quota_state: dict = {}
+_gpu_region_quota_state: dict[str, dict] = {}
+
 
 def _zone_region(zone: str) -> str:
     """``us-central1-f`` → ``us-central1``."""
@@ -230,9 +235,62 @@ def _clear_quota_cooldowns_after_success(zone: str) -> None:
     _region_quota_state.pop(_zone_region(zone), None)
 
 
+def _record_gpu_global_quota_exhaustion(err_str: str) -> int:
+    """Arm/extend the GPU project-level quota backoff. Same logic as
+    ``_record_global_quota_exhaustion`` but isolated to the GPU lane so a
+    GPUS_ALL_REGIONS event never arms the CPU fleet's global cooldown."""
+    with _zone_state_lock():
+        now = datetime.now(timezone.utc)
+        state = _gpu_global_quota_state
+        last_event = state.get("last_event")
+        within_debounce = (
+            last_event is not None
+            and (now - last_event).total_seconds() < GLOBAL_QUOTA_COOLDOWN_SECONDS
+        )
+        consecutive = state.get("consecutive", 0)
+        if not within_debounce:
+            consecutive += 1
+        cooldown_secs = _quota_backoff_seconds(consecutive, GLOBAL_QUOTA_COOLDOWN_SECONDS)
+        state["last_event"] = now
+        state["consecutive"] = consecutive
+        state["last_error"] = err_str[:300]
+        state["cooldown_expires_at"] = now + timedelta(seconds=cooldown_secs)
+    return cooldown_secs
+
+
+def _record_gpu_region_quota_exhaustion(region: str, err_str: str) -> int:
+    """Arm/extend a GPU REGION-level quota backoff. Isolated to the GPU lane."""
+    with _zone_state_lock():
+        now = datetime.now(timezone.utc)
+        state = _gpu_region_quota_state.setdefault(region, {})
+        last_event = state.get("last_event")
+        within_debounce = (
+            last_event is not None
+            and (now - last_event).total_seconds() < REGION_QUOTA_COOLDOWN_SECONDS
+        )
+        consecutive = state.get("consecutive", 0)
+        if not within_debounce:
+            consecutive += 1
+        cooldown_secs = _quota_backoff_seconds(consecutive, REGION_QUOTA_COOLDOWN_SECONDS)
+        state["last_event"] = now
+        state["consecutive"] = consecutive
+        state["last_error"] = err_str[:300]
+        state["cooldown_expires_at"] = now + timedelta(seconds=cooldown_secs)
+    return cooldown_secs
+
+
+def _clear_gpu_quota_cooldowns_after_success(zone: str) -> None:
+    """Clear GPU quota cooldowns after a successful GPU provision. Caller must
+    hold ``compute._zone_lock``."""
+    if _gpu_global_quota_state:
+        _gpu_global_quota_state.clear()
+    _gpu_region_quota_state.pop(_zone_region(zone), None)
+
+
 def get_quota_cooldowns() -> dict:
     """Snapshot of active project-global / per-region quota cooldowns
-    (for health endpoints and operator tooling)."""
+    (for health endpoints and operator tooling). GPU quota state is additive
+    under separate keys so callers that ignore them remain unaffected."""
     now = datetime.now(timezone.utc)
     with _zone_state_lock():
         global_cd = _global_quota_state.get("cooldown_expires_at")
@@ -242,7 +300,18 @@ def get_quota_cooldowns() -> dict:
             for region, state in _region_quota_state.items()
             if state.get("cooldown_expires_at") and now < state["cooldown_expires_at"]
         }
+        gpu_global_cd = _gpu_global_quota_state.get("cooldown_expires_at")
+        gpu_global_until = (
+            gpu_global_cd.isoformat() if gpu_global_cd and now < gpu_global_cd else None
+        )
+        gpu_regions = {
+            region: state["cooldown_expires_at"].isoformat()
+            for region, state in _gpu_region_quota_state.items()
+            if state.get("cooldown_expires_at") and now < state["cooldown_expires_at"]
+        }
     return {
         "global_quota_cooldown_until": global_until,
         "region_quota_cooldowns": regions,
+        "gpu_global_quota_cooldown_until": gpu_global_until,
+        "gpu_region_quota_cooldowns": gpu_regions,
     }

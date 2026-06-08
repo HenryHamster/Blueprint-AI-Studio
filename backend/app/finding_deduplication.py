@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
+from app.capability_registry import compose_capability_markers
 from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
@@ -157,21 +158,11 @@ def normalize_prerequisite(raw: object) -> Optional[dict]:
 def _task_capability_markers(task: Task) -> set[str]:
     """Return the explicit capability markers a task advertises in its context.
 
-    Looks only at the explicit ``provides_capability`` / ``capability`` context
-    keys (string or list-of-strings). No inference from title/files — a task
-    only "provides" a capability if it says so.
+    Reads the shared capability-marker composition helper so every task exposes
+    its explicit ``provides_capability`` / ``capability`` markers PLUS the
+    namespaced derived floor marker. No title/file inference is added here.
     """
-    ctx = _task_context(task)
-    markers: set[str] = set()
-    for key in ("provides_capability", "capability"):
-        val = ctx.get(key)
-        if isinstance(val, str) and val.strip():
-            markers.add(val.strip().lower())
-        elif isinstance(val, (list, tuple, set)):
-            for v in val:
-                if isinstance(v, str) and v.strip():
-                    markers.add(v.strip().lower())
-    return markers
+    return compose_capability_markers(task)
 
 
 def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:

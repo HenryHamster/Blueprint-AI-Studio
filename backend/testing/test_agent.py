@@ -189,7 +189,9 @@ async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, db_session):
+async def test_agent_claim_includes_task_capability_slice(
+    client: AsyncClient, db_session
+):
     project = Project(name="Agent Claim Capability Test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
@@ -288,7 +290,9 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 async def test_agent_claim_includes_compute_experiment_capability_slice(
     client: AsyncClient, db_session
 ):
-    project = Project(name="Agent Claim Compute Capability Test", user_id="test-user-123")
+    project = Project(
+        name="Agent Claim Compute Capability Test", user_id="test-user-123"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -307,7 +311,9 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
 
     assert resp.status_code == 200
     data = resp.json()
-    expected = {entry["id"]: entry for entry in task_type_catalog()}["compute_experiment"]
+    expected = {entry["id"]: entry for entry in task_type_catalog()}[
+        "compute_experiment"
+    ]
     assert data["task_capability"] == expected
 
 
@@ -420,7 +426,9 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
-async def test_agent_compute_job_launch_creates_pending_row(client: AsyncClient, db_session):
+async def test_agent_compute_job_launch_creates_pending_row(
+    client: AsyncClient, db_session
+):
     import app.compute_jobs as compute_jobs_module
 
     project = Project(name="Agent Compute Launch", user_id="test-user-123")
@@ -620,9 +628,7 @@ async def test_completed_teardown_defer_is_provider_aware_noop_single_provider(
     import app.shared_state as _ss
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    mock_teardown = mocker.patch(
-        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
-    )
+    mock_teardown = mocker.patch("app.vm_lifecycle.schedule_deferred_backlog_teardown")
     mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
     monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
 
@@ -674,9 +680,7 @@ async def test_completed_teardown_proceeds_when_backlog_provider_mismatch(
     import app.shared_state as _ss
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    mock_teardown = mocker.patch(
-        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
-    )
+    mock_teardown = mocker.patch("app.vm_lifecycle.schedule_deferred_backlog_teardown")
     mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
     monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
 
@@ -934,9 +938,7 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
         "task_id": str(task.id),
         "tool_trace": [{"t": older, "tool": "Read", "input_preview": "x"}],
     }
-    resp2 = await client.post(
-        "/api/agent/heartbeat", json=payload_old, headers=headers
-    )
+    resp2 = await client.post("/api/agent/heartbeat", json=payload_old, headers=headers)
     assert resp2.status_code == 200
     contact2 = await db_session.get(VmContact, vm_id)
     assert contact2.last_tool_use_at >= recorded
@@ -1543,7 +1545,9 @@ async def test_agent_claim_project_metadata_empty_build_config(
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_surfaces_approval_gate_config(client: AsyncClient, db_session):
+async def test_agent_claim_surfaces_approval_gate_config(
+    client: AsyncClient, db_session
+):
     """A project's approval_gate_config is surfaced in project_metadata so the
     agent's fresh-reviewer can derive per-project sensitive paths."""
     project = Project(
@@ -3197,9 +3201,7 @@ async def _claim_with_playbook_provenance(
     await db_session.commit()
 
     token = create_agent_token(str(claim_task.id), "agent-vm-div-reader")
-    resp = await client.post(
-        "/api/agent/claim", headers={"x-agent-token": token}
-    )
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200, resp.text
     playbook = resp.json().get("playbook") or {}
     return playbook, str(claim_task.id)
@@ -3478,9 +3480,7 @@ async def test_design_doc_get_reconciles_absent_capability_entry(
 
     import app.source_ref_validation as srv
 
-    monkeypatch.setattr(
-        srv, "_path_exists_at_head", AsyncMock(return_value=False)
-    )
+    monkeypatch.setattr(srv, "_path_exists_at_head", AsyncMock(return_value=False))
     monkeypatch.setattr(
         "app.routers.admin_agent_ops.ground_design_doc_value",
         partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
@@ -4157,9 +4157,7 @@ async def test_playbook_set_rejects_when_nothing_evictable(
     # Patch _playbook_size_bytes to always report > 30KB cap, and
     # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
     with (
-        patch(
-            "app.routers.admin_agent_ops._playbook_size_bytes", return_value=32_000
-        ),
+        patch("app.routers.admin_agent_ops._playbook_size_bytes", return_value=32_000),
         patch(
             "app.routers.admin_agent_ops._maybe_archive_for_capacity",
             side_effect=lambda doc, est=0: doc,
@@ -6941,6 +6939,56 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_self_review_catch_rate_for_qa(
+    client: AsyncClient, db_session
+):
+    """qa ships reviewed test code, so it receives the SR catch-rate calibration
+    just like create/fix — the gate keys on CODE_REVIEW_GATED_TASK_TYPES."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "test-coverage": {"miss_rate": 0.35, "weighted_miss_rate": 0.40},
+            },
+            "by_task_type": {
+                "qa": {"test-coverage": {"miss_rate": 0.45}},
+            },
+        },
+    }
+    project = Project(
+        name="SR QA Calibration Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "qa", "prompt": "Add tests"}],
+        vm_instance_id="agent-vm-sr-qa-calib",
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sr-qa-calib")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    sr = project_ctx.get("self_review_catch_rate")
+    assert sr is not None, (
+        f"expected self_review_catch_rate in project_context for qa, got {list(project_ctx.keys())}"
+    )
+    assert "test-coverage" in sr["categories"]
+    assert sr["for_task_type"]["test-coverage"]["miss_rate"] == 0.45
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     client: AsyncClient, db_session
 ):
@@ -7941,6 +7989,61 @@ async def test_reassigned_lands_cancelled_no_retry_no_alert(
 
 
 @pytest.mark.asyncio
+async def test_execution_timeout_retry_escalates_effort(
+    client: AsyncClient, db_session, mocker
+):
+    """An agent-reported pure wall-clock execution timeout ("execution timed
+    out") requeues with its effort tier bumped one step (medium → high), so the
+    retry gets a larger budget. An OOM failure requeues with effort unchanged."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Effort Escalation", user_id="test-user-escalate")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _post_failure(vm_suffix: str, logs: str) -> Task:
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "build x"}],
+            vm_instance_id=f"agent-vm-{vm_suffix}",
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            context={"effort": "medium"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-{vm_suffix}")
+        payload = {"task_id": str(task.id), "status": "FAILED", "logs": logs}
+        resp = await client.post(
+            "/api/agent/status", json=payload, headers={"x-agent-token": token}
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        return task
+
+    exec_task = await _post_failure("exec-timeout", "execution timed out after 3600s")
+    oom_task = await _post_failure("oom", "exit code 137 out of memory")
+
+    # Both AGENT_TIMEOUT failures requeue rather than terminal-fail.
+    assert exec_task.status == TaskStatus.QUEUED
+    assert oom_task.status == TaskStatus.QUEUED
+
+    # Execution timeout escalates effort one tier; OOM leaves it unchanged.
+    assert exec_task.context["effort"] == "high"
+    assert exec_task.context["_effort_escalated_from"] == "medium"
+    assert oom_task.context["effort"] == "medium"
+    assert "_effort_escalated_from" not in oom_task.context
+
+
+@pytest.mark.asyncio
 async def test_blocker_lands_blocked_no_retry_no_alert(
     client: AsyncClient, db_session, mocker
 ):
@@ -8272,9 +8375,7 @@ async def test_post_commit_disconnect_on_retry_returns_pending_not_500(
     pc = mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=mocker.AsyncMock,
-        side_effect=InterfaceError(
-            "SELECT 1", {}, Exception("connection is closed")
-        ),
+        side_effect=InterfaceError("SELECT 1", {}, Exception("connection is closed")),
     )
 
     project = Project(name="PostCommit Disc Test", user_id="test-user-pc-disc")
@@ -8330,9 +8431,7 @@ async def test_post_commit_disconnect_inline_returns_pending_not_500(
     pc = mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=mocker.AsyncMock,
-        side_effect=InterfaceError(
-            "SELECT 1", {}, Exception("connection is closed")
-        ),
+        side_effect=InterfaceError("SELECT 1", {}, Exception("connection is closed")),
     )
 
     project = Project(name="PostCommit Disc Inline", user_id="test-user-pc-disc2")
@@ -8808,7 +8907,9 @@ async def test_failed_pool_served_task_feeds_pool_breaker(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
         # Stamp the warm-claim origin exactly as the pool dispatch path does.
-        context={"_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}},
+        context={
+            "_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}
+        },
     )
     db_session.add(task)
     await db_session.commit()
@@ -8863,7 +8964,9 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+        new=AsyncMock(
+            return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}
+        ),
     )
 
     project = Project(
@@ -8910,9 +9013,7 @@ async def test_failed_with_merged_pr_marks_completed(
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -8946,7 +9047,9 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+        new=AsyncMock(
+            return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}
+        ),
     )
 
     project = Project(
@@ -8961,9 +9064,7 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
 
     task = Task(
         project_id=project.id,
-        payloads=[
-            {"type": "create", "prompt": "do work", "base_branch": "automain"}
-        ],
+        payloads=[{"type": "create", "prompt": "do work", "base_branch": "automain"}],
         vm_instance_id="agent-vm-merged-promotion-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -8995,9 +9096,7 @@ async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is None
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -10018,7 +10117,9 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "migrate", "prompt": "add Alembic migration for PoolVm registry"}],
+        payloads=[
+            {"type": "migrate", "prompt": "add Alembic migration for PoolVm registry"}
+        ],
         vm_instance_id="agent-vm-already-done-1",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -10058,10 +10159,10 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
     from sqlalchemy import select as _select
 
     artifacts = (
-        await db_session.execute(
-            _select(Artifact).where(Artifact.task_id == task.id)
-        )
-    ).scalars().all()
+        (await db_session.execute(_select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
     assert all(a.artifact_type != ArtifactType.PULL_REQUEST for a in artifacts)
 
 
@@ -10540,6 +10641,235 @@ async def test_agent_create_pr_returns_cached_when_open(
     assert resp.status_code == 200
     assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/7"
     mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_create_pr_persists_pr_linkage_on_task(
+    client: AsyncClient, db_session, mocker
+):
+    """Opening a PR via the github proxy must persist pr_number/branch onto the
+    task's leading payload, not just the saved artifact. Regression for task
+    67cedea6: standalone tasks lost their PR linkage to an artifact-only save."""
+    project = Project(name="PR Linkage Persist", user_id="test-user-linkage")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-linkage",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.routers.agent_github.create_pull_request",
+        new=AsyncMock(
+            return_value={
+                "html_url": "https://github.com/foo/bar/pull/8618",
+                "number": 8618,
+            }
+        ),
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-linkage")
+    resp = await client.post(
+        "/api/agent/github/pull-requests",
+        json={
+            "task_id": str(task.id),
+            "owner": "foo",
+            "repo": "bar",
+            "title": "feat: thing",
+            "head": "blueprint/task-67cedea6",
+            "base": "main",
+            "body": "body",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.first_payload.get("pr_number") == 8618
+    assert task.first_payload.get("branch") == "blueprint/task-67cedea6"
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_cites_pr_and_review(
+    client: AsyncClient, db_session, mocker
+):
+    """A standalone (parentless) task that completes with a PR linkage gets a
+    terminal status message citing the PR number and the review task that owns
+    the merge, instead of a generic heartbeat remnant."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Standalone PR Completion",
+        user_id="test-user-standalone",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "do thing", "pr_number": 8618},
+        ],
+        vm_instance_id="agent-vm-standalone",
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="heartbeat: still working",
+    )
+    db_session.add(task)
+    # The review task spawned by the auto-review webhook for the same PR.
+    review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 8618, "branch": "b"}],
+        status=TaskStatus.QUEUED,
+        created_by="SYSTEM_AUTO_REVIEW",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(review_task)
+
+    token = create_agent_token(str(task.id), "agent-vm-standalone")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    expected = f"PR #8618 opened — review {str(review_task.id)[:8]} owns merge"
+    assert task.latest_status_message == expected
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_review_pending_when_no_review(
+    client: AsyncClient, db_session, mocker
+):
+    """When no review task exists yet for the PR, the terminal message still
+    cites the PR but marks the review as pending."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Standalone PR Pending",
+        user_id="test-user-pending",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x", "pr_number": 999}],
+        vm_instance_id="agent-vm-pending",
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="heartbeat remnant",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pending")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.latest_status_message == "PR #999 opened — review pending"
+
+
+@pytest.mark.asyncio
+async def test_review_task_completion_message_not_clobbered(
+    client: AsyncClient, db_session, mocker
+):
+    """A parentless review task (pr_number is an INPUT, not a PR it opened) must
+    NOT get the 'PR opened — review owns merge' message."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Review Not Clobbered",
+        user_id="test-user-review-clobber",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 8618, "branch": "b"}],
+        vm_instance_id="agent-vm-review-clobber",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="SYSTEM_AUTO_REVIEW",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-review-clobber")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "review posted: APPROVE",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert "owns merge" not in (task.latest_status_message or "")
+
+
+def test_pr_linkage_helpers():
+    """Unit coverage for the PR-linkage helpers (no DB)."""
+    from app.task_pr_linkage import (
+        parse_pr_number_from_url,
+        persist_task_pr_linkage,
+        standalone_pr_completion_message,
+    )
+
+    assert parse_pr_number_from_url("https://github.com/o/r/pull/8618") == 8618
+    assert parse_pr_number_from_url("https://github.com/o/r/pull/8618/") == 8618
+    assert parse_pr_number_from_url(None) is None
+    assert parse_pr_number_from_url("https://github.com/o/r/issues/3") is None
+
+    t = Task(project_id=uuid.uuid4(), payloads=[{"type": "create"}])
+    assert persist_task_pr_linkage(t, pr_number=7, branch="feat/x") is True
+    assert t.first_payload["pr_number"] == 7
+    assert t.first_payload["branch"] == "feat/x"
+    # Idempotent: re-applying the same values is a no-op.
+    assert persist_task_pr_linkage(t, pr_number=7, branch="feat/x") is False
+    # Empty payloads list seeds a leading payload.
+    t2 = Task(project_id=uuid.uuid4(), payloads=[])
+    assert persist_task_pr_linkage(t2, pr_number=3) is True
+    assert t2.first_payload["pr_number"] == 3
+
+    rid = uuid.UUID("c7bf6da8-0000-0000-0000-000000000000")
+    assert (
+        standalone_pr_completion_message(8618, rid)
+        == "PR #8618 opened — review c7bf6da8 owns merge"
+    )
+    assert (
+        standalone_pr_completion_message(8618, None)
+        == "PR #8618 opened — review pending"
+    )
 
 
 @pytest.mark.asyncio
@@ -11147,6 +11477,95 @@ async def test_agent_status_pr_artifact_stores_enriched_context(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_completed_downstream_artifact_stamps_and_delivers(
+    client: AsyncClient, db_session, mocker
+):
+    """COMPLETED non-PR artifacts with downstream_artifact evidence stamp the slug
+    and deliver a prerequisite pointer to queued dependents."""
+    from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Success Test",
+        user_id="test-user-downstream-success",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-success",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(task.id), "agent-vm-downstream-success")
+    headers = {"x-agent-token": token}
+    storage_uri = "gs://blueprint-agent-artifacts/tasks/downstream-output.json"
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "storage_uri": storage_uri,
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.logical_key == "producer-output-bundle"
+    assert artifact.storage_uri == storage_uri
+
+    await db_session.refresh(dependent)
+    assert (dependent.context or {})[ARTIFACT_PREREQUISITES_KEY] == [
+        {
+            "artifact_id": str(artifact.id),
+            "logical_key": "producer-output-bundle",
+            "artifact_type": ArtifactType.SMOKETEST_RESULT.value,
+            "source_task_id": str(task.id),
+            "storage_uri": storage_uri,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_status_malformed_pr_url_returns_400(
     client: AsyncClient, db_session, mocker
 ):
@@ -11209,6 +11628,85 @@ async def test_agent_status_malformed_pr_url_returns_400(
     payload["pr_url"] = valid_pr_url
     resp2 = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstream_artifact(
+    client: AsyncClient, db_session, mocker
+):
+    """FAILED non-PR diagnostic artifacts stay unstamped and are not delivered as
+    downstream prerequisites."""
+    from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Failure Test",
+        user_id="test-user-downstream-failed",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-failed",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-failed-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(task.id), "agent-vm-downstream-failed")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Task failed.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.logical_key is None
+
+    await db_session.refresh(dependent)
+    assert ARTIFACT_PREREQUISITES_KEY not in (dependent.context or {})
 
 
 @pytest.mark.asyncio
@@ -11859,18 +12357,25 @@ async def test_smoketest_passing_does_not_spawn_plan_task(
 
 
 @pytest.mark.asyncio
-async def test_smoketest_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+async def test_smoketest_result_plan_output_is_dict(
+    client: AsyncClient, db_session, mocker
+):
     """SMOKETEST_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
+
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-dict")
     token = create_agent_token(str(task.id), "agent-vm-smoke-dict")
     resp = await client.post(
         "/api/agent/status",
-        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "SMOKETEST_RESULT",
-              "logs": _json.dumps({"passed": True, "tests": [], "suites": {}})},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "SMOKETEST_RESULT",
+            "logs": _json.dumps({"passed": True, "tests": [], "suites": {}}),
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
@@ -12150,27 +12655,38 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(
 
 
 @pytest.mark.asyncio
-async def test_debug_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+async def test_debug_result_plan_output_is_dict(
+    client: AsyncClient, db_session, mocker
+):
     """DEBUG_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
+
     project = Project(name="Debug Dict", user_id="test-user-debug-dict2")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    task = Task(project_id=project.id, title="Debug: dict test",
-                payloads=[{"type": "debug", "base_branch": "main"}],
-                vm_instance_id="agent-vm-debug-dict2", status=TaskStatus.IN_PROGRESS)
+    task = Task(
+        project_id=project.id,
+        title="Debug: dict test",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-dict2",
+        status=TaskStatus.IN_PROGRESS,
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
     token = create_agent_token(str(task.id), "agent-vm-debug-dict2")
     resp = await client.post(
         "/api/agent/status",
-        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "DEBUG_RESULT",
-              "logs": _json.dumps({"confidence": "low", "root_cause": "test"})},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "DEBUG_RESULT",
+            "logs": _json.dumps({"confidence": "low", "root_cause": "test"}),
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
@@ -12298,10 +12814,7 @@ async def test_agent_claim_injects_strategic_intent(client: AsyncClient, db_sess
     intent = resp.json().get("strategic_intent")
     assert intent is not None
     assert intent["purpose"] == "Build an autonomous coding studio."
-    assert (
-        intent["current_focus"]
-        == "Thread operator steering into tactical prompts."
-    )
+    assert intent["current_focus"] == "Thread operator steering into tactical prompts."
 
 
 @pytest.mark.asyncio
@@ -12800,6 +13313,134 @@ async def test_next_role_claims_warm_pinned_queued_task(
     assert (pinned_task.context or {}).get("_timing", {}).get(
         "prior_role_vm_id"
     ) == "agent-vm-warm-claim"
+
+
+@pytest.mark.asyncio
+async def test_next_role_respects_retry_after_for_warm_pinned_task(
+    client: AsyncClient, db_session
+):
+    """Warm-claim must not bypass retry_after_until on a parked/pinned task."""
+    project = Project(name="Next-Role Retry-After", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 5555}],
+        vm_instance_id="agent-vm-retry-after",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 5555}],
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() + timedelta(minutes=5),
+        context={
+            "warm_target_vm_id": "agent-vm-retry-after",
+            "warm_target_pr": "5555",
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-retry-after")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-retry-after",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 5555,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED
+    assert pinned_task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_next_role_defers_parked_task_when_retarget_has_no_account(
+    client: AsyncClient, db_session, mocker
+):
+    """A parked task must stay queued when retarget can't resolve an account."""
+    from types import SimpleNamespace
+    from app.shared_state import runtime_config as _runtime_config
+
+    project = Project(name="Next-Role Parked Retarget", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 6666}],
+        vm_instance_id="agent-vm-parked-retarget",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 6666}],
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        context={
+            "warm_target_vm_id": "agent-vm-parked-retarget",
+            "warm_target_pr": "6666",
+            "parked_for_retarget": True,
+            "park_deadline": (datetime.utcnow() + timedelta(minutes=5)).isoformat(),
+            "blacklisted_accounts": ["acct-failed"],
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    mocker.patch(
+        "app.max_plan_pool.select_llm_runtime_for_task",
+        return_value=SimpleNamespace(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-sonnet-4-6",
+            quality_tier=None,
+            account=None,
+            settings=None,
+            execution_mode=None,
+        ),
+    )
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "warm_retarget_enabled": True,
+            "warm_continuity_enabled": True,
+        },
+        clear=False,
+    )
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-parked-retarget")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-parked-retarget",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 6666,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED
+    assert pinned_task.vm_instance_id is None
+    ctx = pinned_task.context or {}
+    assert ctx.get("parked_for_retarget") is True
+    assert ctx.get("blacklisted_accounts") == ["acct-failed"]
 
 
 @pytest.mark.asyncio
@@ -15066,6 +15707,79 @@ async def test_heartbeat_omits_api_call_summary_when_fields_absent(
 
     await db_session.refresh(task)
     assert task.api_call_summary is None
+    # Sibling format-compliance column is likewise untouched.
+    assert task.format_compliance_summary is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_format_compliance_summary(
+    client: AsyncClient, db_session
+):
+    """Heartbeat persists structured-output format-compliance telemetry into
+    Task.format_compliance_summary (sibling to api_call_summary), last-write-wins."""
+    project = Project(name="Format Compliance Summary", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-fmt-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.format_compliance_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-fmt-summary")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 2, "missing_required_key": 1},
+            "format_error_total": 3,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_miss_by_reason"] == {
+        "unbalanced_json": 2,
+        "missing_required_key": 1,
+    }
+    assert summary["format_error_total"] == 3
+    assert summary["format_repair_attempts"] == 2
+    assert summary["format_repair_successes"] == 1
+    assert "last_updated_at" in summary
+
+    # Subsequent heartbeat with higher cumulative counts overwrites (last-write-wins).
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 4},
+            "format_error_total": 4,
+            "format_repair_attempts": 3,
+            "format_repair_successes": 3,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.format_compliance_summary["format_miss_by_reason"] == {
+        "unbalanced_json": 4
+    }
+    assert task.format_compliance_summary["format_error_total"] == 4
+    assert task.format_compliance_summary["format_repair_successes"] == 3
+    # LLM telemetry column stays NULL when only format fields are sent.
+    assert task.api_call_summary is None
 
 
 # ===========================================================================
@@ -15879,7 +16593,9 @@ async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(db_session, m
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Hotfix-Plan", user_id="hotfix-user")
@@ -15952,7 +16668,9 @@ async def test_non_hotfix_plan_subtasks_do_not_carry_hotfix(db_session, mocker):
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Normal-Plan", user_id="hotfix-user")
@@ -16346,6 +17064,277 @@ async def test_generic_failure_with_rate_limited_account_requeues_free(
     assert task.attempt_count == 0, (
         f"attempt_count must stay 0 on free RATE_LIMIT requeue, got {task.attempt_count}"
     )
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_parks_and_retains_vm_when_alternate_account_eligible(
+    client: AsyncClient, db_session, mocker
+):
+    """Flagged park-and-retarget keeps the warm VM when another same-pool
+    account is already eligible, preserving the free RATE_LIMIT requeue
+    semantics while blacklisting the failed account."""
+    from app.time_utils import _utcnow
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000park"
+    alternate_account_id = "aaaaaaaa-0001-4000-a000-00000000alt1"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-park",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {
+            "claude-sonnet-4-6": {"at": _utcnow() - timedelta(minutes=5), "hits": 1}
+        },
+    }
+    alternate = {
+        "id": alternate_account_id,
+        "user_id": "u-park",
+        "name": "alternate-account",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-alt",
+        "disabled_models": {},
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed, alternate_account_id: alternate})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-park": [failed, alternate]})
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Park And Retarget", user_id="u-park")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test park path"}],
+        vm_instance_id="agent-vm-park-me",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-park-me")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "claude_code_failed",
+            "logs": "Process exited with code 1",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "accepted"
+    assert body["action"] == "park"
+    assert body["retry_after_until"]
+    assert body["park_deadline"]
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id == "agent-vm-park-me"
+    assert task.attempt_count == 0
+    assert task.latest_status_message == (
+        "Rate Limited — parked on warm VM for alternate-account retarget"
+    )
+    assert ctx.get("parked_for_retarget") is True
+    assert ctx.get("warm_target_vm_id") == "agent-vm-park-me"
+    assert ctx.get("warm_handoff_deadline") == ctx.get("park_deadline")
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    assert task.retry_after_until is not None
+    delete_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_falls_back_to_cold_requeue_when_park_unavailable(
+    client: AsyncClient, db_session, mocker
+):
+    """When the park feature is dark or no alternate account is eligible,
+    the RATE_LIMIT path keeps the legacy cold requeue behaviour."""
+    from app.time_utils import _utcnow
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000cold"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-cold",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {
+            "claude-sonnet-4-6": {"at": _utcnow() - timedelta(minutes=5), "hits": 1}
+        },
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-cold": [failed]})
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Cold Requeue Fallback", user_id="u-cold")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test cold fallback"}],
+        vm_instance_id="agent-vm-cold-fallback",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-fallback")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "claude_code_failed",
+            "logs": "Process exited with code 1",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "accepted"}
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != "agent-vm-cold-fallback"
+    assert task.attempt_count == 0
+    assert ctx.get("parked_for_retarget") is None
+    assert ctx.get("warm_target_vm_id") is None
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    delete_vm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_external_api_provider_quota_cold_requeue_keeps_blacklist(
+    client: AsyncClient, db_session, mocker
+):
+    """EXTERNAL_API provider-quota fallback must keep the failed-account blacklist."""
+    from app.failure_classification import FailureClassification
+    from app.shared_state import runtime_config as _runtime_config
+    import app.max_plan_pool as pool_mod
+
+    failed_account_id = "aaaaaaaa-0001-4000-a000-00000000quota"
+    failed = {
+        "id": failed_account_id,
+        "user_id": "u-quota",
+        "name": "failed-account",
+        "enabled": True,
+        "active_tasks": 1,
+        "oauth_token": "sk-ant-failed",
+        "disabled_models": {},
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed})
+    mocker.patch.object(pool_mod, "_max_plan_pools", {"u-quota": [failed]})
+    mocker.patch(
+        "app.failure_classification.classify_failure_with_confidence",
+        return_value=FailureClassification("EXTERNAL_API", 1.0),
+    )
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
+    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "park_and_retarget_enabled": True,
+            "park_and_retarget_budget_seconds": 600,
+            "warm_continuity_enabled": True,
+            "warm_retarget_enabled": True,
+        },
+        clear=False,
+    )
+
+    project = Project(name="Quota Fallback", user_id="u-quota")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test quota fallback"}],
+        vm_instance_id="agent-vm-quota-fallback",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": failed_account_id,
+            "llm_model": "claude-sonnet-4-6",
+            "external_api_subtype": "provider_quota",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-quota-fallback")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "external_api",
+            "logs": "quota exceeded: provider cooldown",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "accepted"}
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id != "agent-vm-quota-fallback"
+    assert failed_account_id in (ctx.get("blacklisted_accounts") or [])
+    delete_vm.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -17526,3 +18515,283 @@ async def test_heartbeat_image_persist_skipped_when_pool_disabled(
     await db_session.refresh(member)
     assert member.agent_image_name is None
     assert member.agent_image_build_ts is None
+
+
+# ---------------------------------------------------------------------------
+# /api/agent/artifacts/download-url — authorization and storage-failure tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_delivered_artifact_returns_url(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact delivered in task.context.artifact_prerequisites returns a signed URL."""
+    project = Project(name="ArtDL Auth Project", user_id="user-artdl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/some-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    fake_url = "https://storage.googleapis.com/bucket/signed?sig=abc"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_undelivered_artifact_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact id NOT in task.context.artifact_prerequisites returns 404."""
+    project = Project(name="ArtDL Undelivered Project", user_id="user-artdl-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-2",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/other-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Consumer has no artifact_prerequisites at all
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-2",
+        context={},
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-2")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_cross_project_artifact_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact from a different project is rejected with 404 even if id is delivered."""
+    project_a = Project(name="ArtDL Project A", user_id="user-artdl-003")
+    project_b = Project(name="ArtDL Project B", user_id="user-artdl-004")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    # Producer is in project_b
+    producer_b = Task(
+        project_id=project_b.id,
+        payloads=[{"type": "create", "prompt": "producer b"}],
+        vm_instance_id="vm-artdl-producer-b",
+    )
+    db_session.add(producer_b)
+    await db_session.commit()
+    await db_session.refresh(producer_b)
+
+    artifact_b = Artifact(
+        task_id=producer_b.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/cross-project-output.json",
+    )
+    db_session.add(artifact_b)
+    await db_session.commit()
+    await db_session.refresh(artifact_b)
+
+    # Consumer is in project_a but has the cross-project artifact id in prerequisites
+    consumer_a = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create", "prompt": "consumer a"}],
+        vm_instance_id="vm-artdl-consumer-a",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact_b.id), "logical_key": "cross-project"}
+            ]
+        },
+    )
+    db_session.add(consumer_a)
+    await db_session.commit()
+    await db_session.refresh(consumer_a)
+
+    token = create_agent_token(str(consumer_a.id), "vm-artdl-consumer-a")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact_b.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_storage_uri_error_returns_400(
+    client: AsyncClient, db_session, mocker
+):
+    """A malformed storage_uri on the artifact surfaces as 400."""
+    from app.storage import StorageUriError
+
+    project = Project(name="ArtDL StorageErr Project", user_id="user-artdl-005")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-err",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/bad-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-err",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=StorageUriError("malformed uri")),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-err")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_generic_storage_failure_returns_503(
+    client: AsyncClient, db_session, mocker
+):
+    """A generic GCS failure surfaces as 503, not an unhandled 500."""
+    project = Project(name="ArtDL GCS Failure Project", user_id="user-artdl-006")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-gcs",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/gcs-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-gcs",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("gcs unavailable")),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-gcs")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 503

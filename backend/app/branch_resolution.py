@@ -40,6 +40,30 @@ def scope_to_effort(scope: str | None) -> str:
     return _SCOPE_EFFORT_MAP.get(scope or "", "medium")
 
 
+# Canonical ordering of effort tiers, lowest to highest. A task's effort tier
+# determines its wall-clock budget (and, where the model is chosen per effort,
+# its model). Used by escalate_effort to step a timed-out task up one tier on
+# retry so the retry gets a larger budget instead of repeating a doomed one.
+EFFORT_ORDER = ("low", "medium", "high", "max")
+
+
+def escalate_effort(effort: str | None) -> str | None:
+    """Return the next-higher effort tier, or None if already at/above the cap.
+
+    Steps one tier up the canonical EFFORT_ORDER (low -> medium -> high -> max).
+    Returns None when ``effort`` is already the top tier ("max"), or is unknown /
+    missing — in both cases the caller leaves the effort unchanged and retries as
+    before. Pure and side-effect-free.
+    """
+    try:
+        idx = EFFORT_ORDER.index(effort)
+    except ValueError:
+        return None
+    if idx + 1 >= len(EFFORT_ORDER):
+        return None
+    return EFFORT_ORDER[idx + 1]
+
+
 # Maps a task type to its branch prefix. Must stay in sync with the agent's
 # branch derivation (agent/src/index.ts, handlers/specialized.ts). When an
 # orchestrator path needs to address an agent-pushed branch (review/fix spawn,

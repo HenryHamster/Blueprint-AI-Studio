@@ -15,13 +15,17 @@ one claim-finalize routine.
 
 import logging
 import uuid
-from collections import deque
+from collections import Counter, deque
 from datetime import timedelta
 
 from sqlalchemy import or_, select
 
 from app.models import Project, Task, TaskStatus
-from app.orchestrator_filters import _prod_files
+from app.orchestrator_filters import (
+    HOTSPOT_FILE_THRESHOLD,
+    _prod_files,
+    file_conflict_defers,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import READ_ONLY_TASK_TYPES
 from app.time_utils import _utcnow
@@ -217,31 +221,35 @@ def _grace_poll_interval_secs() -> int:
     )
 
 
-async def _project_in_progress_files(session, project_id) -> set[str]:
-    """Production files currently being modified by IN_PROGRESS tasks in a project.
+async def _project_in_progress_files(
+    session, project_id
+) -> list[tuple[frozenset, uuid.UUID | None]]:
+    """Per-task production-file sets for IN_PROGRESS write tasks in a project.
 
-    Mirrors the orchestrator's ``filter_file_conflicts`` isolation guarantee:
-    a warm backlog claim must never run a task that overlaps files an
-    IN_PROGRESS task is already editing, or the two diverge and collide at
-    merge time. Test files are additive and excluded (same as the filter).
+    Returns a list of (files, parent_task_id) tuples, one per IN_PROGRESS
+    write task. The richer per-task attribution enables the cross-parent
+    hotspot exemption in _eligible_backlog_ids — callers that need only the
+    flat file set can union the first elements.
+
+    Read-only IN_PROGRESS tasks (reviews, plans, etc.) push no diff and are
+    excluded, mirroring filter_file_conflicts' isolation guarantee.
     """
     rows = (
         await session.execute(
-            select(Task.context, Task.payloads).where(
+            select(Task.context, Task.payloads, Task.parent_task_id).where(
                 Task.project_id == project_id,
                 Task.status == TaskStatus.IN_PROGRESS,
             )
         )
     ).all()
-    files: set[str] = set()
-    for ctx, payloads in rows:
-        # Read-only IN_PROGRESS tasks (e.g. a review that inherited the PR's full
-        # related_files) push no diff, so they can't collide — never let them
-        # claim files. Matches the cold path's exemption in filter_file_conflicts.
+    result: list[tuple[frozenset, uuid.UUID | None]] = []
+    for ctx, payloads, parent_task_id in rows:
         if _is_read_only_payloads(payloads):
             continue
-        files |= _prod_files((ctx or {}).get("related_files", []))
-    return files
+        files = _prod_files((ctx or {}).get("related_files", []))
+        if files:
+            result.append((frozenset(files), parent_task_id))
+    return result
 
 
 async def _eligible_backlog_ids(
@@ -249,7 +257,7 @@ async def _eligible_backlog_ids(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: set[str] | None = None,
+    in_progress_files: "list[tuple[frozenset, uuid.UUID | None]] | None" = None,
     vm_boot: dict | None = None,
 ) -> list[uuid.UUID]:
     """QUEUED task ids in *project_id* an idle VM may claim, priority-ordered.
@@ -301,6 +309,7 @@ async def _eligible_backlog_ids(
                 Task.account_id,
                 Task.model,
                 Task.payloads,
+                Task.parent_task_id,
             )
             .join(Project, Task.project_id == Project.id)
             .where(
@@ -335,13 +344,29 @@ async def _eligible_backlog_ids(
     if in_progress_files is None:
         in_progress_files = await _project_in_progress_files(session, project_id)
 
+    # Compute hotspot files from the union of QUEUED candidates + IN_PROGRESS tasks.
+    # Files referenced by HOTSPOT_FILE_THRESHOLD+ tasks are exempt from cross-parent
+    # deferral (see file_conflict_defers). Count occurrences per task (not per file
+    # in the flat union) so a file in 3 separate tasks scores 3.
+    ip_file_set: set[str] = set()
+    file_counts: Counter = Counter()
+    for ip_files, _ in in_progress_files:
+        for f in ip_files:
+            file_counts[f] += 1
+        ip_file_set.update(ip_files)
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, _ in rows:
+        if not _is_read_only_payloads(payloads):
+            for f in _prod_files((ctx or {}).get("related_files", [])):
+                file_counts[f] += 1
+    hotspot_files = frozenset(f for f, n in file_counts.items() if n >= HOTSPOT_FILE_THRESHOLD)
+
     eligible: list[uuid.UUID] = []
     skipped_depends_on = 0
     skipped_pinned_vm = 0
     skipped_file_conflict = 0
     skipped_provider_mismatch = 0
 
-    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads in rows:
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, t_parent_id in rows:
         ctx = ctx or {}
         # Dependency-bearing tasks are claimable warm ONLY once the
         # orchestrator's authoritative dep resolution has marked them ready
@@ -372,9 +397,25 @@ async def _eligible_backlog_ids(
         # on ANY single-file overlap with no read-only carve-out at all).
         if in_progress_files and not _is_read_only_payloads(payloads):
             cfiles = _prod_files(ctx.get("related_files", []))
-            if cfiles & in_progress_files:
-                skipped_file_conflict += 1
-                continue
+            if cfiles & ip_file_set:
+                # Check cross-parent hotspot exemption (mirrors filter_file_conflicts).
+                overlapping_ip_files: set[str] = set()
+                overlapping_ip_parents: set = set()
+                for ip_files, ip_parent in in_progress_files:
+                    if cfiles & ip_files:
+                        overlapping_ip_files.update(ip_files)
+                        overlapping_ip_parents.add(ip_parent)
+                scope = ctx.get("scope", "small")
+                if file_conflict_defers(
+                    cfiles,
+                    overlapping_ip_files,
+                    scope=scope,
+                    cand_parent=t_parent_id,
+                    blocker_parents=overlapping_ip_parents,
+                    hotspot_files=hotspot_files,
+                ):
+                    skipped_file_conflict += 1
+                    continue
         eligible.append(task_id)
 
     # Per-poll funnel aggregation: each reason fires AT MOST ONCE per scan,
@@ -414,7 +455,7 @@ async def has_eligible_backlog_task(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: set[str] | None = None,
+    in_progress_files: "list[tuple[frozenset, uuid.UUID | None]] | None" = None,
     vm_boot: dict | None = None,
 ) -> bool:
     """True iff *project_id* has at least one backlog task this VM could claim.
@@ -443,7 +484,7 @@ async def select_backlog_reuse_candidate(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: set[str] | None = None,
+    in_progress_files: "list[tuple[frozenset, uuid.UUID | None]] | None" = None,
     vm_boot: dict | None = None,
 ) -> Task | None:
     """Atomically lock the next claimable backlog task for an idle VM, or None.

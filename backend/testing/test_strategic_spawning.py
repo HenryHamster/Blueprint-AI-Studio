@@ -877,6 +877,75 @@ async def test_gap_id_absent_when_not_set(db_session):
 
 
 @pytest.mark.asyncio
+async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_session):
+    """The per-direction strategic stat surfaces proven_prs_merged (the
+    machine-checked subset of verified merges) and acceptance_declaration_coverage
+    (declared / merged-write) alongside verified_prs_merged. Proven is STRICTER
+    than verified — it must be <= verified for the same window — so a direction
+    that shipped many merges but proved few is visibly distinguished. A legacy
+    entry that predates the acceptance aggregates degrades proven to 0 and
+    coverage to None, exactly like the verified fallback."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-proven01",
+                "status": "active",
+                "text": "Direction with a proof gap",
+                "priority": "medium",
+                # 4 verified merges, but only 1 PROVEN; 3 of 4 merged WRITE tasks
+                # declared forward acceptance evidence at plan time.
+                "research_history": [
+                    {
+                        "prs_merged": 4,
+                        "prs_rejected": 0,
+                        "verified_prs_merged": 4,
+                        "acceptance_proven_merged": 1,
+                        "acceptance_declared_merged": 3,
+                        "acceptance_merged_write_total": 4,
+                    }
+                ],
+            },
+            {
+                "id": "d-legacy01",
+                "status": "active",
+                "text": "Direction with a legacy entry",
+                "priority": "medium",
+                # Predates the acceptance aggregates — no acceptance_* fields.
+                "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    proven = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-proven01"
+    )
+    assert proven["verified_prs_merged"] == 4
+    assert proven["proven_prs_merged"] == 1
+    # Proven is the strict subset of verified for the same window.
+    assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
+    assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
+
+    legacy = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-legacy01"
+    )
+    # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
+    assert legacy["proven_prs_merged"] == 0
+    assert legacy["acceptance_declaration_coverage"] is None
+
+
+@pytest.mark.asyncio
 async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
     db_session,
 ):
@@ -4736,6 +4805,34 @@ async def _ensure_releaseversion_table(session):
     await session.commit()
 
 
+def test_summarize_version_phase_preserves_acceptance_aggregate():
+    """The budget-trim summarizer keeps the additive acceptance_aggregate
+    top-level key (and the raw merged count) intact under trim pressure."""
+    from app.strategic_spawning import _summarize_version_phase
+
+    block = {
+        "version_number": 4,
+        "phase": "stabilize",
+        "tasks_merged_this_version": 6,
+        "acceptance_aggregate": {"merged": 6, "proven": 4, "proven_rate": 0.6667},
+        "promotion_readiness": {
+            "ready": True,
+            "thresholds": {"min_verdicts": 5},
+            "confidence": {"mean": 0.9, "stdev": 0.02, "min": 0.8, "max": 0.95},
+        },
+    }
+    out = _summarize_version_phase(block)
+    # The aggregate and raw merged count survive the trim verbatim.
+    assert out["acceptance_aggregate"] == {
+        "merged": 6,
+        "proven": 4,
+        "proven_rate": 0.6667,
+    }
+    assert out["tasks_merged_this_version"] == 6
+    # The trim still drops verbose thresholds from promotion_readiness.
+    assert "thresholds" not in out["promotion_readiness"]
+
+
 @pytest.mark.asyncio
 async def test_version_phase_includes_promotion_readiness(
     db_session, mocker, _lts_split_active
@@ -4882,6 +4979,111 @@ async def test_version_phase_includes_recent_versions(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_recent_versions_use_aggregate_pending_truth(
+    db_session, mocker, _lts_split_active
+):
+    """A backend-confirmed promotion stays unshipped in the strategist payload
+    while another required artifact is still unconfirmed."""
+    from app import release_artifacts as artifact_registry
+    from app.models import ReleaseDeployArtifact, ReleaseVersion
+    from app.release_artifacts import (
+        BACKEND_REVISION_ARTIFACT_KIND,
+        ReleaseArtifactProvider,
+    )
+
+    await _ensure_releaseversion_table(db_session)
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=2),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        qualification_attempts=0,
+        last_qualification=None,
+    )
+    db_session.add_all([closed, open_v])
+    await db_session.commit()
+    await db_session.refresh(closed)
+
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=closed.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier="abc123def456",
+                served_at=now - timedelta(days=2),
+            ),
+            ReleaseDeployArtifact(
+                version_id=closed.id,
+                artifact_kind="synthetic_required",
+                serving_status="unconfirmed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+
+    recent = (payload.get("version_phase") or {}).get("recent_versions") or []
+    assert recent, "recent_versions should include the promoted version"
+    latest = recent[0]
+    artifacts = {entry["artifact_kind"]: entry for entry in latest["artifacts"]}
+    assert latest["serving_status"] == "unconfirmed"
+    assert latest["qualification_state"]["state"] == "promoted_unconfirmed"
+    assert artifacts["synthetic_required"]["serving_status"] == "unconfirmed"
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "NOT yet confirmed serving" in suffix, suffix
+    assert "synthetic_required" in suffix, suffix
+
+
+@pytest.mark.asyncio
 async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     """Version-phase LTS context is active only when the resolver sees distinct branches."""
     await _ensure_releaseversion_table(db_session)
@@ -4925,7 +5127,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    assert current_open_version.call_count == 1
+    # Two calls: (1) direct version-phase lookup, (2) release_readiness
+    # _compute_acceptance_aggregate — both inside the integration!=promotion gate.
+    assert current_open_version.call_count == 2
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 
@@ -5410,6 +5614,7 @@ async def test_qualification_substate_hint_promotion_in_flight(
                 "pr_number": 7357,
                 "pr_url": "https://github.com/x/y/pull/7357",
                 "auto_merge_enabled": True,
+                "enabled_at": (now - timedelta(minutes=30)).isoformat(),
             },
         },
     )
@@ -5434,7 +5639,12 @@ async def test_qualification_substate_hint_promotion_in_flight(
     assert "still running" in suffix  # the explicit "do NOT read as ..." clause
 
     vp = payload.get("version_phase") or {}
-    assert vp.get("qualification_state", {}).get("state") == "promotion_in_flight"
+    qstate = vp.get("qualification_state", {})
+    assert qstate.get("state") == "promotion_in_flight"
+    # The additive freshness context flows through to the strategic payload.
+    assert qstate.get("promotion_age_seconds", 0) >= 1700  # ~30 min
+    assert "promotion_past_timeout" in qstate
+    assert "promotion_timeout_seconds" in qstate
 
 
 @pytest.mark.asyncio
@@ -6797,6 +7007,119 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_deployment_state_and_failed_directive_use_aggregate_failed_truth(
+    db_session, mocker, _lts_split_active
+):
+    """A required non-backend artifact failure must keep the strategist in
+    deploy-failed mode even when the backend artifact is serving_confirmed."""
+    from app import release_artifacts as artifact_registry
+    from app.models import ReleaseDeployArtifact, ReleaseVersion
+    from app.release_artifacts import (
+        BACKEND_REVISION_ARTIFACT_KIND,
+        ReleaseArtifactProvider,
+    )
+
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "not_promoted", "confidence": 0.75},
+        qualification_attempts=1,
+    )
+    db_session.add_all([failed_version, current_version])
+    await db_session.commit()
+    await db_session.refresh(failed_version)
+
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=failed_version.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier="abc123def456",
+                served_at=now - timedelta(hours=3),
+            ),
+            ReleaseDeployArtifact(
+                version_id=failed_version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+
+    deployment_state = payload.get("deployment_state") or {}
+    assert deployment_state["deployed_sha"] is None
+    assert deployment_state["promoted_serving_status"] == "deploy_failed"
+    assert (
+        deployment_state["promoted_deploy_failure_reason"]
+        == "synthetic_deadline_elapsed"
+    )
+    assert "synthetic_required" in (deployment_state["promoted_artifact_gap"] or "")
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "deployment crisis" in suffix.lower(), suffix
+    assert "synthetic_required" in suffix, suffix
+
+
+@pytest.mark.asyncio
 async def test_deployment_state_absent_without_lts_split(db_session, mocker):
     """A single-branch project (integration branch == promotion target) emits no
     deployment_state block — there is no integration-vs-deployed distinction."""
@@ -6821,6 +7144,132 @@ async def test_deployment_state_absent_without_lts_split(db_session, mocker):
         if t.first_payload.get("type") == "strategic_review"
     )
     assert "deployment_state" not in payload
+
+
+async def _spawn_self_repo_with_deployment_state(
+    db_session, mocker, *, status, rolled_back_from_sha=None,
+    rollback_count=0, rollback_reason=None,
+):
+    """Spawn a self-repo strategic review under an LTS split with a seeded
+    DeploymentState row. Returns (deployment_state block, prompt_suffix)."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion, DeploymentState
+
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now - timedelta(hours=1),
+        )
+    )
+    db_session.add(
+        DeploymentState(
+            id=1,
+            current_sha="deadbeefcafe9999",
+            current_revision="rev-123",
+            status=status,
+            rolled_back_from_sha=rolled_back_from_sha,
+            rollback_count=rollback_count,
+            rollback_reason=rollback_reason,
+        )
+    )
+    await db_session.commit()
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+    return payload.get("deployment_state"), payload.get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_deployment_state_block_carries_rollback_provenance(
+    db_session, mocker
+):
+    """The deployment_state block surfaces the rollback provenance the operator
+    UI already shows: rolled-back-from SHA (12-char), count, and reason."""
+    ds, _suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="ROLLED_BACK",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=2,
+        rollback_reason="health check failed after deploy",
+    )
+    assert ds is not None, "deployment_state block missing under an LTS split"
+    assert ds["rolled_back_from_sha"] == "badc0ffee0dd"  # 12-char, like deployed_sha
+    assert ds["rollback_count"] == 2
+    assert ds["rollback_reason"] == "health check failed after deploy"
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_fires_on_rolled_back(db_session, mocker):
+    """A ROLLED_BACK deploy status injects a stabilization directive naming the
+    reason + count and steering the strategist away from advancing focus."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="ROLLED_BACK",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=1,
+        rollback_reason="health check failed after deploy",
+    )
+    assert "ROLLED_BACK" in suffix
+    assert "STABILIZATION" in suffix
+    assert "health check failed after deploy" in suffix
+    assert "Consecutive rollbacks: 1" in suffix
+    assert "badc0ffee0dd" in suffix
+    assert "do NOT advance focus" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_fires_on_halted(db_session, mocker):
+    """A HALTED deploy status injects the repeated-rollback-halt directive."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="HALTED",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=3,
+        rollback_reason="repeated boot crash",
+    )
+    assert "HALTED" in suffix
+    assert "STABILIZATION" in suffix
+    assert "manual intervention" in suffix
+    assert "Consecutive rollbacks: 3" in suffix
+    assert "repeated-rollback halt" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_absent_when_stable(db_session, mocker):
+    """A healthy (STABLE) deploy status emits no stabilization directive."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session, mocker, status="STABLE",
+    )
+    assert "STABILIZATION" not in suffix
+    assert "ROLLED_BACK" not in suffix
+    assert "HALTED" not in suffix
 
 
 @pytest.mark.asyncio
@@ -10549,3 +10998,208 @@ def test_direction_activity_score_legacy_falls_back_to_prs_merged():
     legacy = {"prs_merged": 4}
     # 4 merges * 3 = 12, no other signals.
     assert _direction_activity_score(legacy) == 12
+
+
+# ---------------------------------------------------------------------------
+# Direction-health/prioritization consumes the proven-vs-delivered signal.
+#
+# These exercise the strategic-DECISION consumption layer: the same scorers that
+# feed prioritization (autonomous_research._direction_score), health/quality, and
+# difficulty must distinguish a direction shipping PROVEN merges from one shipping
+# an equal pile of UNDECLARED merges — additively and fail-safe over legacy data.
+# ---------------------------------------------------------------------------
+
+
+def _accept_cycle(*, proven, declared, merged=2, **extra):
+    """A research_history cycle that recorded the acceptance contract.
+
+    ``merged`` verified write-task merges, of which ``proven`` are machine-proven
+    and ``declared`` declared forward evidence (proven ⊆ declared ⊆ merged).
+    """
+    entry = {
+        "tasks_created": merged,
+        "tasks_completed": merged,
+        "tasks_failed": 0,
+        "tasks_failed_infra": 0,
+        "prs_merged": merged,
+        "verified_prs_merged": merged,
+        "acceptance_merged_write_total": merged,
+        "acceptance_proven_merged": proven,
+        "acceptance_declared_merged": declared,
+        "acceptance_declaration_coverage": round(declared / merged, 3) if merged else None,
+    }
+    entry.update(extra)
+    return entry
+
+
+def test_direction_health_reflects_declaration_coverage():
+    """Proven-merge directions out-score equal-volume undeclared ones across the
+    automated health/prioritization scorers; legacy data is untouched."""
+    from app.direction_metrics import (
+        _compute_difficulty_index,
+        _compute_direction_quality_score,
+        _compute_productivity_score,
+        proof_weighted_merged,
+    )
+    from app.direction_outcomes import verified_merged_count
+
+    # Equal MERGE VOLUME (3 cycles, 2 verified merges each); only proof differs.
+    proven_dir = {"research_history": [_accept_cycle(proven=2, declared=2) for _ in range(3)]}
+    undeclared_dir = {"research_history": [_accept_cycle(proven=0, declared=0) for _ in range(3)]}
+
+    # 1. Quality/health: the undeclared pile no longer reads as fully healthy.
+    q_proven = _compute_direction_quality_score(proven_dir)
+    q_undeclared = _compute_direction_quality_score(undeclared_dir)
+    assert q_proven > q_undeclared
+
+    # 2. Productivity (prioritization input): proven work is more productive.
+    assert _compute_productivity_score(proven_dir) > _compute_productivity_score(
+        undeclared_dir
+    )
+
+    # 3. Difficulty (prioritization input): undeclared work reads as HARDER
+    #    (more tasks per proven merge) so it is deprioritized, not credited.
+    assert _compute_difficulty_index(undeclared_dir) > _compute_difficulty_index(
+        proven_dir
+    )
+
+    # 4. Proof-weighting only ever DISCOUNTS — never inflates above verified.
+    for entry in undeclared_dir["research_history"] + proven_dir["research_history"]:
+        assert proof_weighted_merged(entry) <= verified_merged_count(entry)
+
+    # 5. Fail-safe: the proof discount is GATED on acceptance data being present.
+    #    Stripping the acceptance_* fields yields the legacy twin of the undeclared
+    #    direction — no proof component, no discount — so it scores strictly HIGHER
+    #    than the undeclared one and its merges keep full (verified) credit.
+    legacy_twin = {
+        "research_history": [
+            {k: v for k, v in e.items() if not k.startswith("acceptance_")}
+            for e in undeclared_dir["research_history"]
+        ]
+    }
+    for entry in legacy_twin["research_history"]:
+        assert proof_weighted_merged(entry) == float(verified_merged_count(entry))
+    assert _compute_direction_quality_score(legacy_twin) > q_undeclared
+    assert _compute_productivity_score(legacy_twin) > _compute_productivity_score(
+        undeclared_dir
+    )
+
+
+# ── _summarize_memo_citations tests ──────────────────────────────────────────
+
+def test_summarize_memo_citations_legacy_shape_unchanged():
+    """Legacy {task_id, summary_excerpt} entries pass through unchanged."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [
+        {"task_id": "t1", "summary_excerpt": "First finding."},
+        {"task_id": "t2", "summary_excerpt": "Second finding."},
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 2
+    assert result[0]["task_id"] == "t1"
+    assert result[0]["summary_excerpt"] == "First finding."
+    assert result[1]["task_id"] == "t2"
+    assert result[1]["summary_excerpt"] == "Second finding."
+
+
+def test_summarize_memo_citations_strips_heavy_fields():
+    """Heavy fields are stripped, compact retirement excerpts survive."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [
+        {
+            "task_id": "t-ret",
+            "summary_excerpt": "Retirement memo.",
+            "reasoning_kind": "direction_retirement",
+            "direction_id": "dir-xyz",
+            "tags": ["retirement"],
+            "citations": ["task-cit-1", "task-cit-2"],
+            "final_metrics": {"merged_prs": 10},
+            "success_evidence": "All tests passed.",
+            "retirement_condition": "KPIs met.",
+            "rationale": "Long rationale text.",
+            "reasoning": "Full multi-paragraph reasoning that is verbose and should be dropped.",
+            "citation_refs": "task-cit-1, task-cit-2",
+            "final_metrics_excerpt": "final_prs_merged=10, final_cycles_active=4",
+            "rationale_excerpt": "Long rationale text.",
+            "reasoning_excerpt": "Direction: retired because KPIs were met.",
+        }
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["task_id"] == "t-ret"
+    assert entry["reasoning_kind"] == "direction_retirement"
+    assert entry["direction_id"] == "dir-xyz"
+    assert entry["tags"] == ["retirement"]
+    assert entry["success_evidence"] == "All tests passed."
+    assert entry["retirement_condition"] == "KPIs met."
+    assert entry["citation_refs"] == "task-cit-1, task-cit-2"
+    assert entry["final_metrics_excerpt"] == "final_prs_merged=10, final_cycles_active=4"
+    assert entry["rationale_excerpt"] == "Long rationale text."
+    assert entry["reasoning_excerpt"] == "Direction: retired because KPIs were met."
+    # Heavy/verbose fields stripped
+    assert "citations" not in entry, "_summarize_memo_citations must strip citations"
+    assert "final_metrics" not in entry, "_summarize_memo_citations must strip final_metrics"
+    assert "rationale" not in entry, "_summarize_memo_citations must strip rationale"
+    assert "reasoning" not in entry, "_summarize_memo_citations must strip full reasoning"
+
+
+def test_summarize_memo_citations_strips_full_reasoning_keeps_excerpt():
+    """Full reasoning is stripped in the budget-degraded path; reasoning_excerpt survives."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    long_reasoning = "Paragraph one. " * 100  # simulate a verbose reasoning blob
+    memos = [
+        {
+            "task_id": "t-full",
+            "summary_excerpt": "A retirement memo with full reasoning.",
+            "reasoning": long_reasoning,
+            "reasoning_excerpt": "Compact excerpt that fits in budget.",
+            "reasoning_kind": "direction_retirement",
+        }
+    ]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == 1
+    entry = result[0]
+    assert "reasoning" not in entry, "full reasoning must be stripped to honour budget bounds"
+    assert entry["reasoning_excerpt"] == "Compact excerpt that fits in budget."
+    assert entry["task_id"] == "t-full"
+
+
+def test_summarize_memo_citations_caps_entry_count():
+    """Entry count is capped to _MEMO_CITATIONS_KEEP (newest-first)."""
+    from app.strategic_spawning import _summarize_memo_citations, _MEMO_CITATIONS_KEEP
+
+    memos = [{"task_id": f"t{i}", "summary_excerpt": f"memo {i}"} for i in range(20)]
+    result = _summarize_memo_citations(memos)
+    assert len(result) == _MEMO_CITATIONS_KEEP
+    assert result[0]["task_id"] == "t0"
+
+
+def test_summarize_memo_citations_caps_excerpt_length():
+    """summary_excerpt is capped to _MEMO_EXCERPT_MAX_CHARS."""
+    from app.strategic_spawning import _summarize_memo_citations, _MEMO_EXCERPT_MAX_CHARS
+
+    long_text = "x" * (_MEMO_EXCERPT_MAX_CHARS + 100)
+    memos = [{"task_id": "t1", "summary_excerpt": long_text}]
+    result = _summarize_memo_citations(memos)
+    assert len(result[0]["summary_excerpt"]) == _MEMO_EXCERPT_MAX_CHARS
+
+
+def test_summarize_memo_citations_non_list_passthrough():
+    """Non-list input is returned as-is (guard for legacy callers)."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    assert _summarize_memo_citations(None) is None  # type: ignore[arg-type]
+    assert _summarize_memo_citations("invalid") == "invalid"  # type: ignore[arg-type]
+
+
+def test_summarize_memo_citations_non_dict_entries_preserved():
+    """Non-dict entries in the list are preserved unchanged."""
+    from app.strategic_spawning import _summarize_memo_citations
+
+    memos = [{"task_id": "t1", "summary_excerpt": "ok"}, "not-a-dict"]
+    result = _summarize_memo_citations(memos)
+    assert result[1] == "not-a-dict"

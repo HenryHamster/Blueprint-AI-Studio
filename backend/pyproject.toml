@@ -155,6 +155,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # single project's reconcile / a single member's teardown must be logged and
 # skipped, never crash the maintainer tick or the reaper cycle.
 "app/warm_pool_maintainer.py" = ["BLE001"]
+# knowledge_completion.py hosts the compute-experiment LLM analysis pass, which
+# uses a try/except inside a range(2) retry loop — the same intentional parse-error
+# retry pattern as review_learning.categorize_review_issues_llm. PERF203 is
+# suppressed because the try/except is the retry mechanism, not a performance issue.
+"app/knowledge_completion.py" = ["PERF203"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -196,6 +201,7 @@ markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",
     "integration: End-to-end tests requiring agent subprocess (run via --integration)",
+    "agent_image_gate: Opt out of the default agent-image serving-gate stub fixture and drive the gate directly",
 ]
 
 [tool.coverage.run]

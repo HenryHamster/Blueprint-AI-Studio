@@ -68,6 +68,7 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "compute_direction_progress",
         "compute_failure_grouping",
         "compute_migration_health",
+        "compute_migration_slot_contention",
         "compute_narrative_summary",
         "compute_outer_loop_convergence",
         "compute_rejection_pattern_summary",

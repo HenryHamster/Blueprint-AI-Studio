@@ -11,6 +11,7 @@ import {
   Legend,
 } from 'recharts';
 import { fetchEfficiencyAxes, type EfficiencyAxesResponse } from '../api';
+import { WarmStartOriginRow } from './WarmStartOriginRow';
 
 const TICK_STYLE = { fill: '#737373', fontSize: 10 };
 const GRID_COLOR = '#262626';
@@ -258,6 +259,13 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
             )}
           </LineChart>
         </ResponsiveContainer>
+        {/* Truthful per-origin companion to the contaminated aggregate reuse
+            line: buckets warm starts into pool/backlog/chain + pool-origin
+            share so the headline reuse trend is never read in isolation.
+            Renders nothing when the backend omits the breakdown. */}
+        <div className="mt-2 pt-2 border-t border-neutral-800 text-[10px] flex">
+          <WarmStartOriginRow breakdown={data?.warm_start_origin_breakdown} />
+        </div>
       </div>
     </section>
   );

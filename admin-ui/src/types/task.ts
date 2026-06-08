@@ -57,6 +57,17 @@ export interface PanelReviewVerdict {
   };
 }
 
+export interface TaskArtifact {
+  artifact_type: string;
+  pr_url?: string | null;
+  commit_hash?: string | null;
+  repo_url?: string | null;
+  storage_uri?: string | null;
+  logs?: string | null;
+  iteration: number;
+  created_at?: string | null;
+}
+
 export interface Task {
   id: string;
   project_id?: string;
@@ -105,7 +116,7 @@ export interface Task {
   unverified_merge_reason?: string | null;
   evaluation_summary?: TaskEvaluationSummary | null;
   payloads?: Record<string, unknown>[];
-  artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
+  artifacts?: TaskArtifact[];
   pr_url?: string;
   commit_hash?: string;
   repo_url?: string;

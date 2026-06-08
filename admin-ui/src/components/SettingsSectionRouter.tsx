@@ -27,6 +27,7 @@ import type {
   AuthMode,
   CategoryRoutingEntry,
   DeployState,
+  FailedRollbackInfo,
   MaxPlanAccount,
   ProviderCatalogEntry,
   ProviderName,
@@ -190,6 +191,9 @@ export interface SettingsSectionRouterProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  // Standing failed-rollback signal (client-side), rendered as a durable banner
+  // in the deploy section so it outlives the transient rollback error toast.
+  failedRollback: FailedRollbackInfo | null;
   zoneHealth:
     | Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }>
     | null;
@@ -339,6 +343,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onRollback={props.onRollback}
           onMarkStable={props.onMarkStable}
           onRepairState={props.onRepairState}
+          failedRollback={props.failedRollback}
           zoneHealth={props.zoneHealth}
         />
       );

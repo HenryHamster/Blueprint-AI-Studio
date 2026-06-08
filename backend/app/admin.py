@@ -248,6 +248,7 @@ async def get_all_tasks(
                     Artifact.pr_url,
                     Artifact.commit_hash,
                     Artifact.repo_url,
+                    Artifact.storage_uri,
                     Artifact.iteration,
                     Artifact.created_at,
                 )
@@ -267,6 +268,10 @@ async def get_all_tasks(
                     "pr_url": a.pr_url,
                     "commit_hash": a.commit_hash,
                     "repo_url": a.repo_url,
+                    # Additive: storage-backed artifacts expose their gs:// URI so
+                    # operator surfaces can resolve a signed download. Always present
+                    # (null for code/log artifacts) — existing consumers ignore it.
+                    "storage_uri": a.storage_uri,
                     "iteration": a.iteration,
                     "created_at": a.created_at.isoformat() if a.created_at else None,
                 }
@@ -972,6 +977,9 @@ async def get_task(
                 "pr_url": a.pr_url,
                 "commit_hash": a.commit_hash,
                 "repo_url": a.repo_url,
+                # Additive: see the task-list serializer above — exposes the
+                # gs:// reference for signed-download resolution, null otherwise.
+                "storage_uri": a.storage_uri,
                 "iteration": a.iteration,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
             }

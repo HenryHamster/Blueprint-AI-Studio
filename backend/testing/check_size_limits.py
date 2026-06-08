@@ -140,8 +140,17 @@ def resolve_section_root(
 
 
 def count_lines(path: str) -> int:
-    """Line-count a file the same way test_invariants.py does."""
-    with open(path) as f:
+    """Line-count a file the same way test_invariants.py does.
+
+    The line count is encoding-invariant (only the newline byte matters), so
+    ``errors="replace"`` yields the identical count to test_invariants.py's
+    default ``open()`` for our utf-8 sources. ``errors="replace"`` (not a bare
+    utf-8 pin) is deliberate: this checker runs on EVERY ./check now, so a stray
+    non-utf-8 file must NOT raise UnicodeDecodeError and hard-fail every agent's
+    gate fleet-wide — it degrades (still counts lines correctly) and any real
+    encoding problem still surfaces via the actual test suite.
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
         return len(f.readlines())
 
 

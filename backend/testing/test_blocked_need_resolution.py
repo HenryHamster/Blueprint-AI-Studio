@@ -14,7 +14,9 @@ from app.blocked_need_resolution import (
     need_satisfied_by_completed,
     resolve_blocked_need,
 )
+from app.capability_registry import derive_provider_marker, registry_capability_names
 from app.models import Task, TaskStatus
+from app.problem_model import Capability, ProblemModel
 
 
 def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
@@ -166,6 +168,40 @@ def test_capability_resolves_on_marker_in_list():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "auth-tokens"}  # case-insensitive
     assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_floor_stamped_provider_resolves_without_false_match():
+    foundation = _task(
+        title="Build seeded evaluation harness",
+        payloads=[{"type": "plan"}],
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    floor_marker = derive_provider_marker(foundation)
+
+    assert floor_marker is not None
+    assert resolve_blocked_need(
+        blocked, {"kind": "capability", "ref": floor_marker}, [foundation]
+    ) is foundation
+    assert resolve_blocked_need(
+        blocked,
+        {"kind": "capability", "ref": "seeded-evaluation-harness"},
+        [foundation],
+    ) is None
+
+
+def test_registry_capability_names_canonicalize_problem_model_names():
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="Seeded evaluation harness", status="working"),
+            Capability(name="seeded-evaluation-harness", status="planned"),
+            Capability(name=" PR Promotion ", status="partial"),
+        ]
+    )
+
+    assert registry_capability_names(model) == [
+        "seeded-evaluation-harness",
+        "pr-promotion",
+    ]
 
 
 def test_capability_ambiguous_resolves_to_canonical():
@@ -476,3 +512,62 @@ def test_dead_match_excludes_co_deferred_shelving_by_capability():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "auth-tokens"}
     assert need_matched_dead_foundation(blocked, need, [shelved]) is False
+
+
+# ── knowledge_substance_satisfies_need ────────────────────────────────────────
+
+def test_dangling_task_ref_satisfied_by_completed_knowledge_document():
+    """Incident shape (2026-06-07): task 7186f089 permanently BLOCKED on finding-hash
+    'bfb447f23b6d44f6' whose originating task was CANCELLED, but a KnowledgeDocument
+    persists the substance — the need must be satisfied, not parked or terminated."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="bfb447f23b6d44f6", topic="better-runs-blueprint")]
+    need = {"kind": "task", "ref": "bfb447f23b6d44f6"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_knowledge_topic_equality_satisfies_need():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash=None, topic="auth-subsystem-design")]
+    need = {"kind": "task", "ref": "auth-subsystem-design"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_knowledge_finding_hash_mismatch_returns_false():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="aaaa1111", topic="some-topic")]
+    need = {"kind": "task", "ref": "bbbb2222"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_knowledge_topic_near_miss_not_fuzzy():
+    """Substring/prefix matches must NOT satisfy — exact equality only."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash=None, topic="auth-subsystem-design")]
+    need = {"kind": "task", "ref": "auth"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_knowledge_wrong_kind_not_satisfied():
+    """Only kind='task' is handled — capability/pr needs are not matched."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [KnowledgeSubstance(finding_hash="abc", topic="abc")]
+    assert knowledge_substance_satisfies_need({"kind": "capability", "ref": "abc"}, substance) is False
+    assert knowledge_substance_satisfies_need({"kind": "pr", "ref": "abc"}, substance) is False
+
+
+def test_knowledge_empty_index_returns_false():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+
+    need = {"kind": "task", "ref": "anything"}
+    assert knowledge_substance_satisfies_need(need, []) is False

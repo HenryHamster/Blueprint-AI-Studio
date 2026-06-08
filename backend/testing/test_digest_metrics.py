@@ -19,7 +19,11 @@ from app.digest_metrics import (
     compute_effort_model_efficiency,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_format_compliance_metrics,
     compute_migration_health,
+    compute_migration_slot_contention,
+    compute_migration_slot_contention_summary,
+    _MIGRATION_SLOT_HOLD_ALERT_SECONDS,
     compute_narrative_summary,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
@@ -182,6 +186,366 @@ def test_compute_narrative_summary_no_dominant_failure_class():
     )
 
 
+def test_timeout_advice_reflects_dominant_subtype():
+    """Timeout advice is driven by the actual dominant timeout subtype, not generic complexity."""
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+    )
+
+    # OOM-dominant timeouts → memory/footprint advice
+    oom_tasks = [
+        make_task(
+            title=f"OOM Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": "oom"},
+            latest_status_message="OutOfMemory",
+        )
+        for i in range(3)
+    ]
+    oom_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "oom",
+                    }
+                    for t in oom_tasks
+                ],
+            }
+        ],
+        failed_tasks=oom_tasks,
+        error_log_map={},
+    )
+    assert "memory" in oom_narrative.lower() or "footprint" in oom_narrative.lower()
+    assert "complexity" not in oom_narrative.lower()
+
+    # Heartbeat-lost-dominant timeouts → hangs/liveness advice
+    hb_tasks = [
+        make_task(
+            title=f"Heartbeat Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "heartbeat_lost",
+            },
+            latest_status_message="No heartbeat",
+        )
+        for i in range(3)
+    ]
+    hb_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "heartbeat_lost",
+                    }
+                    for t in hb_tasks
+                ],
+            }
+        ],
+        failed_tasks=hb_tasks,
+        error_log_map={},
+    )
+    assert "hangs" in hb_narrative.lower() or "liveness" in hb_narrative.lower()
+    assert "complexity" not in hb_narrative.lower()
+
+    # Execution-timeout-dominant timeouts → complexity/scope advice
+    exec_tasks = [
+        make_task(
+            title=f"Execution Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "execution_timeout",
+            },
+            latest_status_message="Task timeout",
+        )
+        for i in range(3)
+    ]
+    exec_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "execution_timeout",
+                    }
+                    for t in exec_tasks
+                ],
+            }
+        ],
+        failed_tasks=exec_tasks,
+        error_log_map={},
+    )
+    assert "complexity" in exec_narrative.lower() or "scope" in exec_narrative.lower()
+
+    # Cascade-cancellation-dominant timeouts → upstream advice
+    cascade_tasks = [
+        make_task(
+            title=f"Cascade Cancel {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "cascade_cancellation",
+            },
+            latest_status_message="Cascade cancel",
+        )
+        for i in range(3)
+    ]
+    cascade_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "cascade_cancellation",
+                    }
+                    for t in cascade_tasks
+                ],
+            }
+        ],
+        failed_tasks=cascade_tasks,
+        error_log_map={},
+    )
+    assert "upstream" in cascade_narrative.lower() or "dependencies" in cascade_narrative.lower()
+
+
+# ---------------------------------------------------------------------------
+# Durable windowed AGENT_TIMEOUT-rate measure (compute_timeout_rate)
+# ---------------------------------------------------------------------------
+
+
+def _timeout_task(subtype: str, *, started: bool = True):
+    """A terminal task with PERSISTED AGENT_TIMEOUT ground truth for the measure."""
+    from app.failure_classification import AGENT_TIMEOUT
+
+    return make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow() if started else None,
+        context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": subtype},
+    )
+
+
+def _nontimeout_terminal_task(failure_category: str | None = None):
+    """A terminal task that reached execution but is NOT an AGENT_TIMEOUT."""
+    ctx = {"failure_category": failure_category} if failure_category else {}
+    return make_task(
+        status=TaskStatus.COMPLETED if failure_category is None else TaskStatus.FAILED,
+        started_at=_utcnow(),
+        context=ctx,
+    )
+
+
+def test_compute_timeout_rate_empty_window_zero_rate():
+    """Empty window: rate undefined (None) when nothing reached execution."""
+    from app.digest_metrics import compute_timeout_rate
+
+    block = compute_timeout_rate([])
+    assert block["denominator"] == 0
+    assert block["timeout_count"] == 0
+    assert block["overall_rate"] is None
+    assert block["dominant_subtype"] is None
+    # All seven subtypes are present and zero-filled.
+    assert set(block["by_subtype"]) == {
+        "heartbeat_lost",
+        "oom",
+        "execution_timeout",
+        "cascade_cancellation",
+        "iteration_limit",
+        "process_crash",
+        "unknown",
+    }
+    assert all(v["count"] == 0 for v in block["by_subtype"].values())
+
+
+def test_compute_timeout_rate_zero_timeouts_real_zero():
+    """A window with execution but no timeouts: real 0.0 rate, not None."""
+    from app.digest_metrics import compute_timeout_rate
+
+    tasks = [_nontimeout_terminal_task() for _ in range(5)]
+    tasks += [_nontimeout_terminal_task("CODE_ERROR") for _ in range(3)]
+    block = compute_timeout_rate(tasks)
+    assert block["denominator"] == 8
+    assert block["timeout_count"] == 0
+    assert block["overall_rate"] == 0.0
+    assert block["dominant_subtype"] is None
+
+
+def test_compute_timeout_rate_exact_rate_and_dominant_subtype():
+    """Known persisted subtypes yield the EXACT expected rate and dominant subtype."""
+    from app.digest_metrics import compute_timeout_rate
+
+    # 4 oom + 1 heartbeat_lost timeouts among 10 execution-reached tasks.
+    tasks = [_timeout_task("oom") for _ in range(4)]
+    tasks.append(_timeout_task("heartbeat_lost"))
+    tasks += [_nontimeout_terminal_task() for _ in range(5)]
+
+    block = compute_timeout_rate(tasks)
+    assert block["denominator"] == 10
+    assert block["timeout_count"] == 5
+    # 5 timeouts / 10 execution-reached = exactly 0.5.
+    assert block["overall_rate"] == 0.5
+    assert block["by_subtype"]["oom"]["count"] == 4
+    assert block["by_subtype"]["oom"]["rate"] == 0.4
+    assert block["by_subtype"]["heartbeat_lost"]["rate"] == 0.1
+    # Per-subtype rates sum to the overall rate (same denominator).
+    assert round(sum(v["rate"] for v in block["by_subtype"].values()), 4) == 0.5
+    assert block["dominant_subtype"] == "oom"
+    assert block["dominant_share"] == 0.8  # 4/5
+
+
+def test_compute_timeout_rate_not_gameable_by_raw_volume():
+    """Raw volume alone does not move the rate when the denominator scales with it."""
+    from app.digest_metrics import compute_timeout_rate
+
+    # 2 timeouts among 10 execution-reached -> 0.2.
+    small = [_timeout_task("oom") for _ in range(2)] + [
+        _nontimeout_terminal_task() for _ in range(8)
+    ]
+    small_rate = compute_timeout_rate(small)["overall_rate"]
+
+    # Scale BOTH numerator and denominator by 5x: 10 timeouts among 50 -> still 0.2.
+    big = [_timeout_task("oom") for _ in range(10)] + [
+        _nontimeout_terminal_task() for _ in range(40)
+    ]
+    big_block = compute_timeout_rate(big)
+    assert small_rate == 0.2
+    assert big_block["overall_rate"] == 0.2  # raw volume 5x but rate unchanged
+    assert big_block["timeout_count"] == 10
+    assert big_block["denominator"] == 50
+
+
+def test_compute_timeout_rate_denominator_excludes_never_started():
+    """Tasks that never reached execution (no started_at) are out of the denominator."""
+    from app.digest_metrics import compute_timeout_rate
+
+    tasks = [_timeout_task("oom") for _ in range(2)]
+    tasks += [_nontimeout_terminal_task() for _ in range(2)]
+    # Two terminal tasks that never started — excluded from the denominator so a
+    # task that could not have timed out does not deflate the rate.
+    tasks += [_timeout_task("oom", started=False)]
+    tasks += [
+        make_task(status=TaskStatus.CANCELLED, started_at=None, context={})
+    ]
+    block = compute_timeout_rate(tasks)
+    # Denominator = 4 started tasks (the 2 timeouts + 2 non-timeouts). The
+    # never-started timeout still counts in timeout_count (it has persisted
+    # ground truth) but not in the denominator.
+    assert block["denominator"] == 4
+    assert block["timeout_count"] == 3
+    assert block["by_subtype"]["oom"]["count"] == 3
+
+
+def test_compute_timeout_rate_reads_persisted_not_derived():
+    """The measure ignores log/status text and reads only persisted ground truth."""
+    from app.digest_metrics import compute_timeout_rate
+    from app.failure_classification import AGENT_TIMEOUT
+
+    # Status/log text screams OOM, but persisted ground truth says heartbeat_lost.
+    # The measure MUST honour the persisted subtype, not re-derive from the text.
+    t = make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow(),
+        latest_status_message="OutOfMemory killed the worker, oom oom oom",
+        context={
+            "failure_category": AGENT_TIMEOUT,
+            "timeout_subtype": "heartbeat_lost",
+        },
+    )
+    block = compute_timeout_rate([t])
+    assert block["by_subtype"]["heartbeat_lost"]["count"] == 1
+    assert block["by_subtype"]["oom"]["count"] == 0
+
+    # A task whose status text looks like a timeout but has NO persisted
+    # AGENT_TIMEOUT category is NOT counted as a timeout.
+    not_persisted = make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow(),
+        latest_status_message="execution timeout after 1h",
+        context={"failure_category": "CODE_ERROR"},
+    )
+    block2 = compute_timeout_rate([not_persisted])
+    assert block2["timeout_count"] == 0
+
+
+def test_confident_dominant_timeout_subtype_gate():
+    """Dominant subtype is gated: needs >=2 and >=60%, and excludes 'unknown'."""
+    from app.digest_metrics import confident_dominant_timeout_subtype
+
+    # 3 oom of 4 timeouts -> 75% -> confident "oom".
+    tasks = [_timeout_task("oom") for _ in range(3)] + [_timeout_task("execution_timeout")]
+    assert confident_dominant_timeout_subtype(tasks) == "oom"
+
+    # 1 oom of 1 -> count < 2 -> not confident.
+    assert confident_dominant_timeout_subtype([_timeout_task("oom")]) is None
+
+    # 2-2 split -> 50% -> not confident.
+    split = [_timeout_task("oom") for _ in range(2)] + [
+        _timeout_task("heartbeat_lost") for _ in range(2)
+    ]
+    assert confident_dominant_timeout_subtype(split) is None
+
+    # 3 unknown of 3 -> dominant but 'unknown' is suppressed.
+    unknowns = [_timeout_task("unknown") for _ in range(3)]
+    assert confident_dominant_timeout_subtype(unknowns) is None
+
+
+def test_format_timeout_rate_drift_sentence():
+    """The before/after sentence renders fractions as whole-percent and direction."""
+    from app.digest_metrics import _format_timeout_rate_drift
+
+    down = _format_timeout_rate_drift({"current": 0.08, "baseline": 0.12})
+    assert down == "Agent-timeout rate 8%, down from a baseline of 12%."
+    up = _format_timeout_rate_drift({"current": 0.20, "baseline": 0.10})
+    assert up == "Agent-timeout rate 20%, up from a baseline of 10%."
+    same = _format_timeout_rate_drift({"current": 0.10, "baseline": 0.10})
+    assert same == "Agent-timeout rate 10%, unchanged from baseline."
+    # Missing baseline -> no sentence (nothing durable to report yet).
+    assert _format_timeout_rate_drift({"current": 0.08, "baseline": None}) is None
+    assert _format_timeout_rate_drift(None) is None
+
+
+def test_narrative_timeout_before_after_sentence_appended():
+    """When timeouts dominate AND a drift block is supplied, the narrative reports drift."""
+    oom_tasks = [_timeout_task("oom") for _ in range(3)]
+    from app.failure_classification import AGENT_TIMEOUT
+
+    narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {"failure_class": AGENT_TIMEOUT, "count": 3, "label": "Agent Timeout"}
+        ],
+        failed_tasks=oom_tasks,
+        timeout_rate_drift={"current": 0.05, "baseline": 0.12},
+    )
+    # Persisted-ground-truth dominant subtype still routes the advice (oom).
+    assert "memory" in narrative.lower() or "footprint" in narrative.lower()
+    # Before/after sentence appended.
+    assert "Agent-timeout rate 5%, down from a baseline of 12%." in narrative
+
+
 def test_compute_narrative_summary_completion_trend_prefix():
     completed = [
         make_task(title="Completed Alpha", status=TaskStatus.COMPLETED),
@@ -263,30 +627,33 @@ def test_compute_migration_health_counts_migration_errors_only_for_migrate_tasks
 
 def test_compute_migration_health_reports_migration_slot_contention():
     now = _utcnow()
+    project_id = uuid4()
     holder = make_task(
+        project_id=project_id,
         status=TaskStatus.IN_PROGRESS,
         title="Author migration",
         payloads=[{"type": "migrate"}],
         started_at=now - timedelta(hours=3, minutes=15),
     )
     oldest_waiter = make_task(
-        status=TaskStatus.QUEUED,
-        title="Queued migration waiter",
+        project_id=project_id,
+        status=TaskStatus.BLOCKED,
+        title="Blocked migration waiter",
         payloads=[
             {
                 "type": "create",
                 "related_files": ["backend/app/models.py"],
             }
         ],
-        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        context={"related_files": ["backend/app/models.py"]},
         created_at=now - timedelta(hours=1, minutes=45),
         updated_at=now - timedelta(hours=1, minutes=30),
     )
     newer_waiter = make_task(
+        project_id=project_id,
         status=TaskStatus.QUEUED,
         title="Younger migration waiter",
         payloads=[{"type": "migrate"}],
-        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
         created_at=now - timedelta(minutes=50),
         updated_at=now - timedelta(minutes=20),
     )
@@ -3909,3 +4276,419 @@ def test_first_attempt_breakdowns_verified_overall_no_measured_is_none():
     tasks = [make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}], context={})]
     result = _compute_first_attempt_breakdowns(tasks)
     assert result["verified_overall"] is None
+
+
+# ── Migration-serialization slot contention ─────────────────────────────────
+
+
+def _mk_migration_task(project_id, status, **kwargs):
+    """A migration-producing task (migrate type) for slot-contention tests."""
+    return make_task(
+        project_id=project_id,
+        status=status,
+        payloads=[{"type": "migrate"}],
+        **kwargs,
+    )
+
+
+def test_migration_slot_contention_holder_with_waiters():
+    """A holder past the threshold with waiters reports hold age, waiter count,
+    longest wait, and flips threshold_exceeded."""
+    pid = uuid4()
+    now = _utcnow()
+    holder = _mk_migration_task(
+        pid,
+        TaskStatus.IN_PROGRESS,
+        title="holding-migration",
+        started_at=now - timedelta(seconds=_MIGRATION_SLOT_HOLD_ALERT_SECONDS + 600),
+    )
+    w1 = _mk_migration_task(
+        pid, TaskStatus.QUEUED, updated_at=now - timedelta(minutes=30)
+    )
+    w2 = _mk_migration_task(
+        pid, TaskStatus.BLOCKED, updated_at=now - timedelta(minutes=90)
+    )
+    result = compute_migration_slot_contention_summary([holder], [w1, w2])
+
+    assert result["slot_held"] is True
+    assert result["holder_task_id"] == str(holder.id)
+    assert result["holder_title"] == "holding-migration"
+    assert result["waiting_count"] == 2
+    # longest wait is the BLOCKED task at ~90m.
+    assert result["longest_wait_seconds"] >= 90 * 60 - 5
+    assert result["holder_held_seconds"] >= _MIGRATION_SLOT_HOLD_ALERT_SECONDS
+    assert result["threshold_exceeded"] is True
+    assert len(result["projects"]) == 1
+    proj = result["projects"][0]
+    assert proj["project_id"] == str(pid)
+    assert proj["holder_count"] == 1
+    assert proj["threshold_exceeded"] is True
+
+
+def test_migration_slot_contention_no_holder():
+    """No IN_PROGRESS migration task -> no holder, no contention signal."""
+    result = compute_migration_slot_contention_summary([], [])
+    assert result["slot_held"] is False
+    assert result["holder_task_id"] is None
+    assert result["waiting_count"] == 0
+    assert result["threshold_exceeded"] is False
+    assert result["projects"] == []
+
+
+def test_migration_slot_contention_held_briefly_no_threshold():
+    """A recent hold with waiters is NOT threshold_exceeded; a long hold with NO
+    waiters is also NOT threshold_exceeded (no one is parked)."""
+    pid = uuid4()
+    now = _utcnow()
+    # Recently-started holder + a waiter: contended but under threshold.
+    fresh_holder = _mk_migration_task(
+        pid, TaskStatus.IN_PROGRESS, started_at=now - timedelta(minutes=5)
+    )
+    waiter = _mk_migration_task(
+        pid, TaskStatus.QUEUED, updated_at=now - timedelta(minutes=3)
+    )
+    result = compute_migration_slot_contention_summary([fresh_holder], [waiter])
+    assert result["slot_held"] is True
+    assert result["waiting_count"] == 1
+    assert result["threshold_exceeded"] is False
+
+    # Long-held solo holder, no waiters: not a contention/threshold event.
+    pid2 = uuid4()
+    long_solo = _mk_migration_task(
+        pid2,
+        TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(seconds=_MIGRATION_SLOT_HOLD_ALERT_SECONDS * 3),
+    )
+    result2 = compute_migration_slot_contention_summary([long_solo], [])
+    assert result2["slot_held"] is True
+    assert result2["waiting_count"] == 0
+    assert result2["threshold_exceeded"] is False
+
+
+def test_migration_slot_contention_per_project_grouping():
+    """Holders/waiters are grouped per project; aggregate uses the longest-held
+    holder as the representative and sums waiters across projects."""
+    pa, pb = uuid4(), uuid4()
+    now = _utcnow()
+    holder_a = _mk_migration_task(
+        pa,
+        TaskStatus.IN_PROGRESS,
+        title="a-holder",
+        started_at=now - timedelta(seconds=_MIGRATION_SLOT_HOLD_ALERT_SECONDS + 1000),
+    )
+    waiter_a = _mk_migration_task(pa, TaskStatus.QUEUED, updated_at=now - timedelta(minutes=20))
+    holder_b = _mk_migration_task(
+        pb, TaskStatus.IN_PROGRESS, title="b-holder", started_at=now - timedelta(minutes=10)
+    )
+    result = compute_migration_slot_contention_summary(
+        [holder_a, holder_b], [waiter_a]
+    )
+    assert len(result["projects"]) == 2
+    by_pid = {p["project_id"]: p for p in result["projects"]}
+    assert by_pid[str(pa)]["waiting_count"] == 1
+    assert by_pid[str(pa)]["threshold_exceeded"] is True
+    assert by_pid[str(pb)]["waiting_count"] == 0
+    assert by_pid[str(pb)]["threshold_exceeded"] is False
+    # Aggregate: representative holder is project A (longest held + breaching).
+    assert result["holder_task_id"] == str(holder_a.id)
+    assert result["waiting_count"] == 1
+    assert result["threshold_exceeded"] is True
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_query_filters_and_scopes(db_session):
+    """The DB-backed query counts ONLY migration-producing tasks (a non-migration
+    QUEUED task is excluded) and scopes to the given project."""
+    project = make_project(name="Slot contention query", user_id="user1")
+    other = make_project(name="Other project", user_id="user1")
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    now = _utcnow()
+    holder = _mk_migration_task(
+        project.id,
+        TaskStatus.IN_PROGRESS,
+        title="mig-holder",
+        started_at=now - timedelta(seconds=_MIGRATION_SLOT_HOLD_ALERT_SECONDS + 300),
+    )
+    # Migration-producing waiter (related_files under alembic/versions).
+    mig_waiter = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="mig-waiter",
+        payloads=[{"type": "create"}],
+        context={"related_files": ["backend/alembic/versions/0200_x.py"]},
+        updated_at=now - timedelta(minutes=40),
+    )
+    # Non-migration QUEUED task — must NOT be counted as a waiter.
+    plain_waiter = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="plain-waiter",
+        payloads=[{"type": "create"}],
+        context={"related_files": ["admin-ui/src/App.tsx"]},
+    )
+    # A migration task in another project — excluded by scoping.
+    other_holder = _mk_migration_task(
+        other.id, TaskStatus.IN_PROGRESS, started_at=now - timedelta(hours=5)
+    )
+    db_session.add_all([holder, mig_waiter, plain_waiter, other_holder])
+    await db_session.commit()
+
+    result = await compute_migration_slot_contention(db_session, project_id=project.id)
+    assert result["slot_held"] is True
+    assert result["holder_task_id"] == str(holder.id)
+    assert result["waiting_count"] == 1  # plain_waiter excluded
+    assert result["threshold_exceeded"] is True
+    assert len(result["projects"]) == 1
+    assert result["projects"][0]["project_id"] == str(project.id)
+
+
+# ── compute_format_compliance_metrics ──────────────────────────────────────
+
+
+def _fc_task(task_type, summary, status=TaskStatus.COMPLETED):
+    """Build a terminal task carrying a format_compliance_summary (or None)."""
+    return make_task(
+        status=status,
+        payloads=[{"type": task_type}],
+        format_compliance_summary=summary,
+    )
+
+
+def test_format_compliance_metrics_malformed_then_repaired_run():
+    """A malformed-then-repaired run is non-compliant (0.0) but its repair counts
+    as a success (1.0); a clean run is well-formed; a NULL-summary task is excluded."""
+    tasks = [
+        # create #1: one unparseable final output, repaired successfully on re-ask.
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"unbalanced_json": 1},
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        ),
+        # create #2: clean run — no format error, no repair needed.
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {},
+                "format_error_total": 0,
+                "format_repair_attempts": 0,
+                "format_repair_successes": 0,
+            },
+        ),
+        # fix: two misses, only one repair succeeded.
+        _fc_task(
+            "fix",
+            {
+                "format_miss_by_reason": {"missing_required_key": 1, "no_json_start": 1},
+                "format_error_total": 2,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+            },
+            status=TaskStatus.FAILED,
+        ),
+        # NULL summary (older agent) — excluded entirely from the measure.
+        _fc_task("create", None),
+    ]
+
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+
+    # Three tasks carry telemetry (the NULL one is excluded).
+    assert overall["tasks_measured"] == 3
+    # Only the clean create run is well-formed (format_error_total == 0).
+    assert overall["well_formed_tasks"] == 1
+    assert overall["format_compliance_rate"] == round(1 / 3, 3)
+    # Self-repair: 2 of 3 attempts succeeded across the window.
+    assert overall["format_error_total"] == 3
+    assert overall["repair_attempts"] == 3
+    assert overall["repair_successes"] == 2
+    assert overall["self_repair_success_rate"] == round(2 / 3, 3)
+
+    # By-type breakdown.
+    by_type = result["by_type"]
+    assert set(by_type) == {"create", "fix"}
+
+    create = by_type["create"]
+    assert create["tasks_measured"] == 2
+    assert create["well_formed_tasks"] == 1
+    assert create["format_compliance_rate"] == 0.5
+    # One repair attempt, one success.
+    assert create["self_repair_success_rate"] == 1.0
+
+    fix = by_type["fix"]
+    assert fix["tasks_measured"] == 1
+    assert fix["well_formed_tasks"] == 0
+    assert fix["format_compliance_rate"] == 0.0
+    assert fix["self_repair_success_rate"] == 0.5
+
+
+def test_format_compliance_metrics_null_summaries_excluded():
+    """Tasks whose format_compliance_summary is NULL are not counted (neutral)."""
+    tasks = [
+        _fc_task("create", None),
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+    ]
+    result = compute_format_compliance_metrics(tasks)
+    assert result["overall"]["tasks_measured"] == 0
+    assert result["overall"]["format_compliance_rate"] is None
+    assert result["overall"]["self_repair_success_rate"] is None
+    assert result["by_type"] == {}
+
+
+def test_format_compliance_metrics_zero_repair_denominator_is_none():
+    """A measured task with format errors but no repair attempt yields a defined
+    compliance rate (0.0) but a None self-repair rate (empty denominator)."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"no_matching_candidate": 1},
+                "format_error_total": 1,
+                "format_repair_attempts": 0,
+                "format_repair_successes": 0,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["tasks_measured"] == 1
+    assert overall["format_compliance_rate"] == 0.0
+    assert overall["repair_attempts"] == 0
+    assert overall["self_repair_success_rate"] is None
+
+
+def test_format_compliance_metrics_empty_list():
+    """An empty terminal-task list returns an empty/None-rate structure."""
+    result = compute_format_compliance_metrics([])
+    assert result["overall"]["tasks_measured"] == 0
+    assert result["overall"]["format_compliance_rate"] is None
+    assert result["overall"]["self_repair_success_rate"] is None
+    assert result["by_type"] == {}
+
+
+def _fc_clean(task_type="create"):
+    """Task with a clean (well-formed) format_compliance_summary."""
+    return _fc_task(
+        task_type,
+        {
+            "format_error_total": 0,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+    )
+
+
+def _fc_miss(task_type="create"):
+    """Task with one format miss, one repair attempt, one success."""
+    return _fc_task(
+        task_type,
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+        },
+    )
+
+
+def test_format_compliance_reports_prior_window_and_trend():
+    """Acceptance test: prior-window rate + trend appear in overall and by_type.
+
+    Current window: 8 clean / 10 measured → compliance_rate = 0.8
+    Prior window:   4 clean / 10 measured → compliance_rate = 0.4
+    Delta = 0.4 > 0.05 → trend = "improving"
+    """
+    curr_tasks = [_fc_clean() for _ in range(8)] + [_fc_miss() for _ in range(2)]
+    prev_tasks = [_fc_clean() for _ in range(4)] + [_fc_miss() for _ in range(6)]
+
+    result = compute_format_compliance_metrics(curr_tasks, prev_terminal_tasks=prev_tasks)
+    overall = result["overall"]
+
+    assert overall["format_compliance_rate"] == pytest.approx(0.8)
+    assert overall["prev_format_compliance_rate"] == pytest.approx(0.4)
+    assert overall["trend"] == "improving"
+    # Self-repair: curr has 2 attempts/successes → 1.0; prev has 6 attempts/successes → 1.0.
+    assert overall["self_repair_success_rate"] == 1.0
+    assert overall["prev_self_repair_success_rate"] == 1.0
+
+    # by_type "create" block also carries the comparison fields.
+    create = result["by_type"]["create"]
+    assert "prev_format_compliance_rate" in create
+    assert "prev_self_repair_success_rate" in create
+    assert "trend" in create
+
+
+def test_compute_format_compliance_metrics_trend_stable():
+    """Delta ≤ 0.05 in either direction produces trend = 'stable'."""
+    # curr = 0.7, prev = 0.72 → delta = -0.02 → stable
+    curr = [_fc_clean() for _ in range(7)] + [_fc_miss() for _ in range(3)]
+    prev = [_fc_clean() for _ in range(72)] + [_fc_miss() for _ in range(28)]
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    assert result["overall"]["trend"] == "stable"
+
+
+def test_compute_format_compliance_metrics_trend_declining():
+    """Delta < -0.05 produces trend = 'declining'."""
+    # curr = 0.4, prev = 0.8 → delta = -0.4 → declining
+    curr = [_fc_clean() for _ in range(4)] + [_fc_miss() for _ in range(6)]
+    prev = [_fc_clean() for _ in range(8)] + [_fc_miss() for _ in range(2)]
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    assert result["overall"]["trend"] == "declining"
+    assert result["overall"]["prev_format_compliance_rate"] == pytest.approx(0.8)
+
+
+def test_compute_format_compliance_metrics_no_prev():
+    """Without prev_terminal_tasks the snapshot keys are absent (backward-compat)."""
+    tasks = [_fc_clean()]
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+    assert "trend" not in overall
+    assert "prev_format_compliance_rate" not in overall
+    assert "prev_self_repair_success_rate" not in overall
+
+
+def test_compute_format_compliance_metrics_prev_empty_denominator():
+    """Prev window with no measured tasks yields None prev rates and None trend."""
+    curr = [_fc_clean()]
+    prev = [_fc_task("create", None)]  # NULL summary → not measured
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    overall = result["overall"]
+    assert overall["prev_format_compliance_rate"] is None
+    assert overall["trend"] is None
+
+
+def test_compute_format_compliance_metrics_by_type_trend():
+    """Per-type blocks carry prev/trend; types absent in curr but present in prev appear."""
+    curr_tasks = [
+        _fc_clean("create"),
+        _fc_clean("create"),
+        # No "fix" tasks in current window
+    ]
+    prev_tasks = [
+        _fc_miss("create"),
+        _fc_miss("create"),
+        _fc_clean("fix"),  # "fix" only in prev
+    ]
+
+    result = compute_format_compliance_metrics(curr_tasks, prev_terminal_tasks=prev_tasks)
+
+    # "create": curr=1.0, prev=0.0 → improving
+    create = result["by_type"]["create"]
+    assert create["format_compliance_rate"] == 1.0
+    assert create["prev_format_compliance_rate"] == 0.0
+    assert create["trend"] == "improving"
+
+    # "fix": absent in curr → 0 tasks measured, rate None; prev=1.0 → trend None
+    fix = result["by_type"]["fix"]
+    assert fix["tasks_measured"] == 0
+    assert fix["format_compliance_rate"] is None
+    assert fix["prev_format_compliance_rate"] == 1.0
+    assert fix["trend"] is None

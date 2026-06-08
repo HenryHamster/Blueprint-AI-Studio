@@ -30,10 +30,14 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     acceptance_blocks_success,
+    acceptance_is_consumed,
+    acceptance_is_proven,
+    acceptance_was_declared,
+    classify_merged_acceptance,
 )
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
-from app.task_capabilities import PRODUCT_TASK_TYPES
+from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
 
@@ -147,6 +151,139 @@ def verified_merged_count(entry: dict) -> int:
     if "verified_prs_merged" in entry:
         return int(entry.get("verified_prs_merged") or 0)
     return int(entry.get("prs_merged") or 0)
+
+
+def proven_merged_count(entry: dict) -> int:
+    """Machine-checked PROVEN merged-PR count for a research_history entry.
+
+    The honest counterpart to :func:`verified_merged_count`: counts only merges
+    proven by machine-checked evidence (a satisfied ``named_test``), as recorded
+    in the additive ``acceptance_proven_merged`` field by
+    ``_update_direction_research_outcomes``. Strictly distinct from — and never
+    larger than — ``verified_prs_merged``: a soft (behavior/artifact) or
+    undeclared merge counts as verified but NOT proven. Legacy entries written
+    before the field existed degrade to ``0`` (nothing is retroactively claimed
+    as proven), never to the raw merged count.
+    """
+    return int(entry.get("acceptance_proven_merged") or 0)
+
+
+def consumed_merged_count(entry: dict) -> int:
+    """Merged downstream_artifact count proven by downstream consumption."""
+    return int(entry.get("acceptance_consumed_merged") or 0)
+
+
+def declared_merged_count(entry: dict) -> int:
+    """Plan-time-declared merged-PR count for a research_history entry.
+
+    Counts merged WRITE tasks that DECLARED forward acceptance evidence at plan
+    time (a verdict was stamped), as recorded in the additive
+    ``acceptance_declared_merged`` field by ``_update_direction_research_outcomes``.
+    The numerator of declaration coverage; pair it with
+    ``acceptance_merged_write_total`` (the coverage denominator) to recompute
+    ``declared / merged_write_total`` across cycles without lossy per-cycle
+    fraction-averaging. Legacy entries written before the field existed degrade to
+    ``0`` (nothing retroactively claimed as declared).
+    """
+    return int(entry.get("acceptance_declared_merged") or 0)
+
+
+def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
+    """Return the acceptance-evidence metric invariants VIOLATED by ``entry``.
+
+    Empty list ⇒ every guarantee holds. Pure and read-only over a single
+    research_history entry's already-computed aggregates — it never mutates,
+    recomputes, or changes any metric value. It is the durable guard that locks
+    the SEMANTIC relationships between the acceptance-evidence metrics so a future
+    refactor of their definitions cannot silently let, say, ``proven`` drift above
+    ``verified``, or a soft / undeclared / degraded merge be retro-counted as
+    proven, with nothing failing:
+
+      * proven ⊆ declared ⊆ merged-write
+        (0 ≤ acceptance_proven_merged ≤ acceptance_declared_merged
+         ≤ acceptance_merged_write_total)
+      * proven ⊆ verified ⊆ merged
+        (0 ≤ acceptance_proven_merged ≤ verified_prs_merged ≤ prs_merged)
+      * declared ⊆ merged          (acceptance_declared_merged ≤ prs_merged)
+      * coverage identity          (acceptance_declaration_coverage ==
+        round(declared / merged-write, 3), or None ⇔ merged-write == 0)
+
+    Fail-safe over legacy rows: a field written before it existed reads as 0 via
+    :func:`proven_merged_count` / :func:`verified_merged_count` and ``.get``
+    defaults, and the merged-write denominator / coverage identity checks are
+    skipped when the denominator was never recorded — so historical entries never
+    spuriously "violate".
+    """
+    violations: list[str] = []
+    proven = proven_merged_count(entry)
+    consumed = consumed_merged_count(entry)
+    declared = int(entry.get("acceptance_declared_merged") or 0)
+    verified = verified_merged_count(entry)
+    prs_merged = int(entry.get("prs_merged") or 0)
+
+    if proven < 0:
+        violations.append(f"proven ({proven}) is negative")
+    if consumed < 0:
+        violations.append(f"consumed ({consumed}) is negative")
+    if consumed > proven:
+        violations.append(f"consumed ({consumed}) exceeds proven ({proven})")
+    if proven > declared:
+        violations.append(f"proven ({proven}) exceeds declared ({declared})")
+    if proven > verified:
+        violations.append(f"proven ({proven}) exceeds verified ({verified})")
+    if verified > prs_merged:
+        violations.append(f"verified ({verified}) exceeds prs_merged ({prs_merged})")
+    if declared > prs_merged:
+        violations.append(f"declared ({declared}) exceeds prs_merged ({prs_merged})")
+
+    coverage = entry.get("acceptance_declaration_coverage")
+    if "acceptance_merged_write_total" in entry:
+        merged_write = int(entry.get("acceptance_merged_write_total") or 0)
+        verified_write = int(entry.get("acceptance_verified_write_merged") or 0)
+        if declared > merged_write:
+            violations.append(
+                f"declared ({declared}) exceeds merged-write ({merged_write})"
+            )
+        if merged_write > prs_merged:
+            violations.append(
+                f"merged-write ({merged_write}) exceeds prs_merged ({prs_merged})"
+            )
+        if verified_write > merged_write:
+            violations.append(
+                "verified-write "
+                f"({verified_write}) exceeds merged-write ({merged_write})"
+            )
+        if verified_write > verified:
+            violations.append(
+                f"verified-write ({verified_write}) exceeds verified ({verified})"
+            )
+        if merged_write <= 0:
+            if coverage is not None:
+                violations.append(
+                    f"coverage ({coverage}) is not None with zero merged-write"
+                )
+        else:
+            expected = round(declared / merged_write, 3)
+            if coverage != expected:
+                violations.append(
+                    f"coverage ({coverage}) != declared/merged-write "
+                    f"({declared}/{merged_write} = {expected})"
+                )
+    elif coverage is not None and not (0.0 <= coverage <= 1.0):
+        # Legacy entry without the explicit denominator — at minimum coverage
+        # must be a fraction.
+        violations.append(f"coverage ({coverage}) outside [0, 1]")
+
+    return violations
+
+
+def acceptance_metrics_consistent(entry: dict) -> bool:
+    """Whether ``entry``'s acceptance-evidence metrics satisfy every invariant.
+
+    Thin boolean wrapper over :func:`acceptance_metric_invariant_violations`
+    (True ⇔ no violations) for call sites that only need the verdict.
+    """
+    return not acceptance_metric_invariant_violations(entry)
 
 
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
@@ -279,6 +416,245 @@ def _update_cochange_index(
     flag_modified(project, "design_doc")
 
 
+# ---------------------------------------------------------------------------
+# Durable metric-governance manifest.
+#
+# Single source of truth for every metric field written into a direction's
+# research_history entry by ``_update_direction_research_outcomes``. This
+# replaces the ad-hoc inline ``Retired: …`` comments that used to be the only
+# record of a metric's meaning and disposition (a comment disappears silently
+# when the code is touched; this manifest is queryable and test-enforced).
+#
+# Each key is an emitted (or formerly-emitted) ``entry["<field>"]`` field.
+# Each value declares ONE of:
+#   * {"consumer": "<module/surface that reads it>"} — an active field with a
+#     named reader. The consumer string names where the field is read (NOT the
+#     write site here); it is documentation, not test-enforced for accuracy.
+#   * {"status": "pending", "reason": "...", "date": "YYYY-MM-DD"} — a field
+#     that is computed every cycle but currently has NO named consumer. This is
+#     the exact recurrence-class the manifest exists to surface: a new metric
+#     cannot land without either naming a consumer or being recorded here, and
+#     the guard test fails on any emitted field absent from this manifest.
+#   * {"status": "retired", "reason": "...", "date": "YYYY-MM-DD"} — a field
+#     the computation NO LONGER writes. Kept as an auditable trail of what the
+#     metric meant and why it was dropped (replaces a deleted inline comment).
+#
+# The guard test ``backend/testing/test_direction_outcome_metric_manifest.py``
+# AST-extracts every ``entry["..."]`` Store target from the function below and
+# asserts: (a) every emitted field is present here (no undeclared metric), and
+# (b) every manifest key carrying a "consumer" is still emitted (no stale
+# consumer record). "pending"/"retired" keys are exempt from (b) by design.
+RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
+    # --- Cost ---
+    "cost_by_provider_model": {
+        "consumer": "direction_lifecycle.py (cost evidence), digest_direction_progress.py"
+    },
+    "estimated_cost_usd": {
+        "consumer": "direction_lifecycle.py / admin.py (cumulative spend), strategic_analysis.py"
+    },
+    # --- Terminal task counts ---
+    "tasks_completed": {
+        "consumer": "direction_metrics.py, strategic_completion.py, research_completion.py"
+    },
+    "tasks_failed": {
+        "consumer": "anomaly_detection.py, direction_lifecycle.py, strategic_spawning.py, digest_direction_progress.py"
+    },
+    "tasks_cancelled": {"consumer": "direction_metrics.py (terminal-outcome tracking)"},
+    "tasks_completed_no_pr": {
+        "consumer": "direction_metrics.py, strategic_completion.py (no-PR completions)"
+    },
+    # --- PR / merge counts ---
+    "prs_merged": {
+        "consumer": "digest_direction_progress.py, direction_lifecycle.py, strategic_spawning.py, DirectionCard.tsx (+ many)"
+    },
+    "prs_rejected": {
+        "consumer": "review_pipeline.py, pipeline_health.py, strategic_spawning.py"
+    },
+    "autonomous_prs_merged": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, DirectionCard.tsx"
+    },
+    "assisted_prs_merged": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py"
+    },
+    "verified_prs_merged": {
+        "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
+    },
+    # --- Acceptance aggregates: now wired to decision + digest consumers. ---
+    # These expose proven-by-evidence and declaration-coverage truth distinct
+    # from "merely merged". As of 2026-06-07 they are folded into the lifetime
+    # rollups consumed by the digest and by strategic spawning's direction
+    # scoring (and summed in direction_metrics.py's aggregate).
+    "acceptance_proven_merged": {
+        "consumer": "digest_direction_progress.py (lifetime proven rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_proven_merged)"
+    },
+    "acceptance_consumed_merged": {
+        "consumer": "digest_direction_progress.py (lifetime consumed rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_consumed_merged)"
+    },
+    "acceptance_declared_merged": {
+        "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
+    },
+    "acceptance_merged_write_total": {
+        "consumer": "digest_direction_progress.py + strategic_spawning.py (coverage denominator), direction_metrics.py (total_acceptance_merged_write_total)"
+    },
+    "acceptance_verified_write_merged": {
+        "consumer": "direction_metrics.py (proof_weighted_merged / _agg_proof_weighted_merged write-slice weighting)"
+    },
+    "acceptance_declaration_coverage": {
+        "consumer": "digest_direction_progress.py (per-cycle + lifetime coverage surface), strategic_spawning.py"
+    },
+    # --- Operator / autonomy ---
+    "operator_action_count": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, digest_direction_progress.py"
+    },
+    # --- Preventive-context cohort ---
+    "preventive_context_tasks_created": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    "preventive_context_tasks_merged": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    "preventive_context_tasks_failed": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    # --- Conversion: stored copy is unread. ---
+    # Every conversion surface RECOMPUTES conversion from merged/created rather
+    # than reading this field (digest_direction_progress.py:466, pipeline_health,
+    # the UI/agent direction-level conversion_rate is the recomputed digest
+    # value, not this entry key). Pending: retire or make this the single source.
+    "conversion_rate": {
+        "status": "pending",
+        "reason": "stored entry copy is never read; conversion surfaces recompute it (digest_direction_progress.py:466). Candidate for retirement or for becoming the single source",
+        "date": "2026-06-07",
+    },
+    # --- Generalized (all-task-type) outcomes ---
+    "generalized_successes": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, strategic_analysis.py, DirectionCard.tsx"
+    },
+    "generalized_health_rate": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, routers/directions.py, DirectionCard.tsx"
+    },
+    "outcome_kind_breakdown": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, DirectionCard.tsx"
+    },
+    # --- Structured-output format-compliance (equipping direction d-46468a41) ---
+    # Per-cycle copies of the windowed digest measure
+    # (digest_metrics.compute_format_compliance_metrics, surfaced as the
+    # admin_digest "format_compliance" key). Both are built straight from the
+    # extraction layer's own parse verdict, so they are non-gameable. The live
+    # decision/operator surface today is the windowed digest measure; these
+    # per-direction copies are emitted for a future strategic/operator reader and
+    # carry no consumer yet, so they are declared pending (not consumer).
+    "format_compliance_rate": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx (per-direction expanded panel)"
+    },
+    "self_repair_success_rate": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx (per-direction expanded panel)"
+    },
+    # --- Review-quality signals ---
+    "reviews_dismissed": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "reviews_overridden": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "user_issues_caught": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    # --- Timing / iteration ---
+    "avg_time_to_merge_hours": {
+        "consumer": "digest_direction_progress.py, routers/agent.py, strategic_analysis.py"
+    },
+    "median_review_iterations": {
+        "consumer": "autonomous_research.py, efficiency_snapshot.py, direction_metrics.py, routers/agent.py"
+    },
+    "avg_review_iterations": {
+        "consumer": "autonomous_research.py (rolling review-iteration guidance)"
+    },
+    # --- Failure detail / taxonomy ---
+    "failed_task_details": {
+        "consumer": "research_context.py, strategic_spawning.py, agent/research-plan.ts"
+    },
+    "tasks_failed_infra": {
+        "consumer": "direction_lifecycle.py, strategic_spawning.py, strategic_completion.py"
+    },
+    "taxonomy_summary": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_spawning.py"
+    },
+    "no_op_task_details": {
+        "consumer": "research_context.py (stale-finding retagging)"
+    },
+    "unproven_merge_details": {
+        "consumer": "research_context.py (unproven-merge retagging)"
+    },
+    "stage_dropout": {
+        "consumer": "digest_direction_progress.py, pipeline_health.py, claim_task_helpers.py"
+    },
+    # --- Type / scope distribution ---
+    "type_distribution": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_analysis.py"
+    },
+    "type_breakdown": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "product_ratio": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_analysis.py"
+    },
+    "scope_breakdown": {
+        "consumer": "digest_direction_progress.py, pipeline_health.py, spawn_calibration.py, agent/research-plan.ts"
+    },
+    "escalation_outcomes": {
+        "consumer": "research_completion.py, routers/admin_digest.py, strategic_analysis.py"
+    },
+    # --- Prompt quality / decomposition ---
+    "prompt_telemetry": {
+        "consumer": "synthesize_prompt_quality_patterns (this module) -> digest_direction_progress.py, routers/agent.py"
+    },
+    "decomposition_quality": {
+        "consumer": "digest_direction_progress.py, playbook_learning.py, spawn_calibration.py"
+    },
+    "cochange_decomposition": {
+        "consumer": "research_completion.py (co-change split outcomes)"
+    },
+    # --- Retired: no longer emitted by the computation. ---
+    # Auditable trail replacing the deleted inline ``Retired: …`` comments.
+    "tasks_blocked": {
+        "status": "retired",
+        "reason": "claimed operator/analytics visibility but had no named consumer (no backend module, analytics, or UI read it)",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_created": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_merged": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_failed": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "avg_implementation_hours": {
+        "status": "retired",
+        "reason": "split of avg_time_to_merge_hours into implementation vs review time; no named consumer",
+        "date": "2026-06-05",
+    },
+    "avg_review_hours": {
+        "status": "retired",
+        "reason": "split of avg_time_to_merge_hours into implementation vs review time; no named consumer",
+        "date": "2026-06-05",
+    },
+    "structural_count": {
+        "status": "retired",
+        "reason": "raw structural-task count was stored but never read; the derived product_ratio is what digest_direction_progress.py consumes",
+        "date": "2026-06-05",
+    },
+}
+
+
 async def _update_direction_research_outcomes(
     project_id: uuid.UUID,
     direction_id: str,
@@ -396,9 +772,7 @@ async def _update_direction_research_outcomes(
     # BLOCKED tasks are counted separately from FAILED — they are parked on an
     # absent precondition, not failures, and the auto-unblock sweep is expected
     # to return them to QUEUED.
-    # Retired: tasks_blocked. Was claimed to be visible to operators/analytics
-    # but has no named consumer (grep: no backend module, analytics, or admin-ui
-    # component reads it). Retired 2026-06-05.
+    # tasks_blocked retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
     entry["prs_merged"] = sum(
         1
         for ct in child_tasks_rows
@@ -441,20 +815,88 @@ async def _update_direction_research_outcomes(
     # alongside prs_merged for back-compat; consumers that need "proven fix"
     # counts should prefer this field over the raw prs_merged.
     #
-    # The acceptance exclusion mirrors the per-task outcome layer
-    # (``task_outcomes._evaluate_write``): a code task that DECLARED acceptance
-    # evidence carries a durable verdict under ``code_acceptance_verdict``; when
-    # that evidence was declared but NOT satisfied, the merge does not prove the
-    # claimed behavior and must not inflate verified progress. Rows with no
-    # recorded verdict (no declaration, legacy rows) are never excluded — the
-    # predicate is additive and backward-compatible.
-    entry["verified_prs_merged"] = sum(
-        1
+    # The shared acceptance classifier keeps the direction window and release
+    # window in sync: the non-degraded buckets (proven + declared_unsatisfied +
+    # no_declaration) still count as verified, while degraded rows stay out.
+    aggregate_buckets = {
+        "proven": 0,
+        "consumed": 0,
+        "declared_unsatisfied": 0,
+        "merged_unverified_degraded": 0,
+        "no_declaration": 0,
+    }
+    for ct in _merged_rows:
+        aggregate_buckets[classify_merged_acceptance(ct)] += 1
+    entry["verified_prs_merged"] = (
+        aggregate_buckets["proven"]
+        + aggregate_buckets["consumed"]
+        + aggregate_buckets["no_declaration"]
+    )
+    # Honest proven-by-evidence + declaration-coverage aggregates. These are
+    # STRICTLY ADDITIVE: they do not change verified_prs_merged, prs_merged, or
+    # conversion_rate above — they expose a separate, stronger truth distinct
+    # from "merely delivered". Restricted to merged WRITE tasks (the code-
+    # producing types that can carry an acceptance declaration) so read-only
+    # children never dilute the coverage denominator.
+    #
+    #   * acceptance_verified_write_merged — verified merged WRITE tasks only.
+    #     This is the write-only slice used by proof_weighted_merged so read-only
+    #     merged work keeps full credit instead of being tier-weighted.
+    #   * acceptance_proven_merged — merges machine-checked PROVEN: a satisfied
+    #     named_test that ran green under a real merge-test verdict and exercises
+    #     a changed production seam (acceptance_is_proven). A soft
+    #     observable_behavior / downstream_artifact merge (satisfied by a shipped
+    #     diff only) and every undeclared merge are EXCLUDED — they prove nothing
+    #     about the specific claim.
+    #   * acceptance_declared_merged — merges that DECLARED any acceptance
+    #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
+    #     stamped). Undeclared / legacy merges are excluded.
+    #   * acceptance_declaration_coverage — declared / merged-write, the fraction
+    #     of merged code work that committed to forward evidence. None when no
+    #     merged write task exists (no denominator), never retro-failing legacy
+    #     rows.
+    _merged_write_rows = [
+        ct
         for ct in _merged_rows
+        if (ct.first_payload or {}).get("type") in WRITE_TASK_TYPES
+    ]
+    entry["acceptance_verified_write_merged"] = sum(
+        1
+        for ct in _merged_write_rows
         if merge_verification_status(ct) != "unverified_degraded"
         and not acceptance_blocks_success(
             (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
         )
+    )
+    entry["acceptance_proven_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_is_proven((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_consumed_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_is_consumed((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_declared_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_was_declared((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    _merged_write_count = len(_merged_write_rows)
+    # Persist the coverage denominator so lifetime/window coverage can be
+    # recomputed as declared / merged_write_total (summing counts) rather than
+    # averaging per-cycle fractions — the latter is lossy across cycles. It is
+    # also the merged WRITE-task count over which acceptance_declaration_coverage
+    # is taken; exposing it makes the coverage identity auditable and lets the
+    # acceptance-metric invariant guard (acceptance_metric_invariant_violations)
+    # pin proven ≤ declared ≤ merged-write without re-deriving it from a rounded
+    # ratio.
+    entry["acceptance_merged_write_total"] = _merged_write_count
+    entry["acceptance_declaration_coverage"] = (
+        round(entry["acceptance_declared_merged"] / _merged_write_count, 3)
+        if _merged_write_count > 0
+        else None
     )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(
@@ -478,9 +920,8 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    # Retired: remediation_tasks_created, remediation_tasks_merged, remediation_tasks_failed.
-    # Were intended to track remediation burden but have no named consumer (grep: no backend
-    # module, analytics, or admin-ui component reads them). Retired 2026-06-05.
+    # remediation_tasks_{created,merged,failed} retired 2026-06-05 —
+    # see RESEARCH_HISTORY_METRIC_MANIFEST.
     # Collect changed files from merged PRs for co-change index update
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])
@@ -535,6 +976,18 @@ async def _update_direction_research_outcomes(
     )
     if _outcome_kind_counts:
         entry["outcome_kind_breakdown"] = _outcome_kind_counts
+    # Structured-output format-compliance for this cycle's child tasks. Reuses
+    # the same windowed aggregator the digest measure uses (the extraction
+    # layer's own parse verdict is ground truth, so neither rate is gameable).
+    # Tasks with a NULL format_compliance_summary are skipped. None when no
+    # child task carried the telemetry.
+    from app.digest_metrics import (  # noqa: PLC0415
+        compute_format_compliance_metrics,
+    )
+
+    _fc_overall = compute_format_compliance_metrics(child_tasks_rows)["overall"]
+    entry["format_compliance_rate"] = _fc_overall["format_compliance_rate"]
+    entry["self_repair_success_rate"] = _fc_overall["self_repair_success_rate"]
     # Review quality signals: track how users respond to Blueprint's reviews
     entry["reviews_dismissed"] = sum(
         1
@@ -568,10 +1021,8 @@ async def _update_direction_research_outcomes(
         if merge_durations
         else None
     )
-    # Retired: avg_implementation_hours, avg_review_hours. These split avg_time_to_merge_hours
-    # into implementation vs review-pipeline time for research-agent consumption, but have
-    # no named consumer (grep: no backend module, analytics, or admin-ui component reads them).
-    # Retired 2026-06-05.
+    # avg_implementation_hours, avg_review_hours retired 2026-06-05 —
+    # see RESEARCH_HISTORY_METRIC_MANIFEST.
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
     review_iters = [
@@ -644,6 +1095,32 @@ async def _update_direction_research_outcomes(
         )
     entry["no_op_task_details"] = no_op_details[:5]  # cap at 5 to avoid bloat
 
+    # Capture delivered-but-unproven merge details (mirror of the two lists
+    # above). When a merged WRITE task DECLARED acceptance evidence at plan time
+    # but that evidence was UNSATISFIED at merge, the acceptance gate records a
+    # ``code_acceptance_verdict`` with satisfied=False and the per-task scorer
+    # downgrades the merge to NEUTRAL (see acceptance_gate.acceptance_blocks_success
+    # and task_outcomes._evaluate_write). Such a merge is neither a failure
+    # (excluded from failed_task_details) nor a no-op (excluded from
+    # no_op_task_details), so without this list the next research cycle would see
+    # the originating finding as shipped and stop chasing it — even though its own
+    # declared evidence did not hold. We record title + the (truncated) verdict
+    # ``reason`` so the prior-outcomes retagger can mark the finding '(unproven)'
+    # and research re-targets it instead of treating it as resolved.
+    unproven_merge_details = []
+    for ct in _merged_write_rows:
+        verdict = (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not acceptance_blocks_success(verdict):
+            continue
+        reason = str((verdict or {}).get("reason") or "")[:120]
+        unproven_merge_details.append(
+            {
+                "title": ct.title or "",
+                "reason": reason,
+            }
+        )
+    entry["unproven_merge_details"] = unproven_merge_details[:5]  # cap at 5
+
     # Stage dropout: per-cycle breakdown of why tasks didn't reach main
     sd_code_error = 0
     sd_infra = 0
@@ -714,8 +1191,7 @@ async def _update_direction_research_outcomes(
     entry["product_ratio"] = (
         round(product_count / total_typed, 2) if total_typed > 0 else 0.0
     )
-    # Retired: structural_count. Raw count stored but never read; product_ratio (derived
-    # from this) IS consumed by digest_direction_progress.py. Retired 2026-06-05.
+    # structural_count retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
 
     # Track per-scope merge rates so research agents can calibrate scope assignments.
     # calibrated_in: tasks calibrated INTO this scope from a larger one (counted at the
@@ -1128,12 +1604,24 @@ async def _update_direction_research_outcomes(
                 if moved:
                     parsed["established"] = new_established
             elif is_merged_completion(ct):
-                # Promote (proposed) finding to (confirmed)
+                # Promote (proposed) finding. A merge whose DECLARED acceptance
+                # evidence was UNSATISFIED (acceptance_blocks_success) shipped a
+                # fix whose own claim did not hold — tag it '(unproven)' rather
+                # than '(confirmed)' so this cycle's context already reflects that
+                # research should re-target it, not treat it as resolved. Verified
+                # / undeclared / legacy merges still promote to '(confirmed)'.
+                promoted_tag = (
+                    "unproven"
+                    if acceptance_blocks_success(
+                        (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+                    )
+                    else "confirmed"
+                )
                 new_established = []
                 for item in parsed["established"]:
                     if title.lower() in item.lower() and "(proposed)" in item:
                         new_established.append(
-                            item.replace("(proposed)", "(confirmed)")
+                            item.replace("(proposed)", f"({promoted_tag})")
                         )
                     else:
                         new_established.append(item)

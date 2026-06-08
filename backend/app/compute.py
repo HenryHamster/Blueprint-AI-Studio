@@ -42,9 +42,14 @@ from app.provision_error_scope import (
     QUOTA_SCOPE_GLOBAL,
     QUOTA_SCOPE_REGIONAL,
     _GLOBAL_QUOTA_MARKERS,
+    _clear_gpu_quota_cooldowns_after_success,
     _clear_quota_cooldowns_after_success,
     _global_quota_state,
+    _gpu_global_quota_state,
+    _gpu_region_quota_state,
     _record_global_quota_exhaustion,
+    _record_gpu_global_quota_exhaustion,
+    _record_gpu_region_quota_exhaustion,
     _record_region_quota_exhaustion,
     _region_quota_state,
     _zone_region,
@@ -202,36 +207,46 @@ _zone_health: dict[str, dict] = {}
 #   }
 # }
 
+# GPU-specific zone health — isolated from CPU fleet state so GPU stockouts
+# never contaminate CPU zone selection (and vice versa).
+_gpu_zone_health: dict[str, dict] = {}
+_gpu_zone_failures: dict[str, datetime] = {}
 
-def _zone_success_rate(zone: str) -> float:
+
+def _zone_success_rate(zone: str, *, gpu: bool = False) -> float:
     """Return the recent success rate for a zone (0.0-1.0).
 
-    Reads the rolling ``recent_outcomes`` deque stored in ``_zone_health``.
+    When ``gpu=True`` reads from the GPU-isolated health state so GPU zone
+    selection is informed by GPU-specific history, not CPU fleet history.
     Returns the neutral rate (0.5) when no history exists so unknown zones
     sort in the middle, neither preferred nor penalised.
     Caller is responsible for holding ``_zone_lock`` when thread safety matters.
     """
-    outcomes = _zone_health.get(zone, {}).get("recent_outcomes")
+    h = _gpu_zone_health if gpu else _zone_health
+    outcomes = h.get(zone, {}).get("recent_outcomes")
     if not outcomes:
         return _ZONE_NEUTRAL_RATE
     return sum(outcomes) / len(outcomes)
 
 
-def _zone_blocked_until(zone: str, now: datetime) -> datetime | None:
+def _zone_blocked_until(zone: str, now: datetime, *, gpu: bool = False) -> datetime | None:
     """Effective blocking expiry for a zone: the latest of its own cooldown,
     its region's quota cooldown, and the project-global quota cooldown.
+    When ``gpu=True`` uses the GPU-isolated health/quota state so GPU failures
+    cannot block CPU provisioning (and CPU failures cannot block GPU jobs).
     Returns ``None`` when the zone is not blocked. Caller must hold
     ``_zone_lock`` when thread safety matters."""
     candidates = []
-    zone_cd = _zone_health.get(zone, {}).get("cooldown_expires_at")
+    zh = _gpu_zone_health if gpu else _zone_health
+    zone_cd = zh.get(zone, {}).get("cooldown_expires_at")
     if zone_cd and now < zone_cd:
         candidates.append(zone_cd)
-    region_cd = _region_quota_state.get(_zone_region(zone), {}).get(
-        "cooldown_expires_at"
-    )
+    rqs = _gpu_region_quota_state if gpu else _region_quota_state
+    region_cd = rqs.get(_zone_region(zone), {}).get("cooldown_expires_at")
     if region_cd and now < region_cd:
         candidates.append(region_cd)
-    global_cd = _global_quota_state.get("cooldown_expires_at")
+    gqs = _gpu_global_quota_state if gpu else _global_quota_state
+    global_cd = gqs.get("cooldown_expires_at")
     if global_cd and now < global_cd:
         candidates.append(global_cd)
     return max(candidates) if candidates else None
@@ -328,6 +343,99 @@ AGENT_IMAGE_FAMILY = os.getenv(
     f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2",
 )
 
+# --- Single-GPU provisioning FACTS — ADDITIVE & INERT ---
+# These constants/helpers describe how to provision a single-GPU VM. They are
+# NOT consumed by _provision_gcp / provision_ephemeral_vm yet; a later subtask
+# wires them into the existing cooldown / success-rate / quota machinery. All
+# facts come from the gce-gpu-provisioning knowledge document.
+
+# Driver-preinstalled GPU boot image family (Google Deep Learning VM, NVIDIA
+# drivers + ML stack + gVNIC preinstalled). Pinned and overridable the same way
+# AGENT_IMAGE_FAMILY is. A later subtask may resolve this family to a concrete
+# versioned image.
+GPU_IMAGE_FAMILY = os.getenv(
+    "GPU_IMAGE_FAMILY",
+    "projects/deeplearning-platform-release/global/images/family/"
+    "common-cu128-ubuntu-2204-nvidia-570",
+)
+
+# Per-region subnet names derived from the fleet FALLBACK_ZONES ring, so GPU
+# zones reuse the existing per-region subnets rather than inventing new ones.
+_REGION_SUBNETS: dict[str, str] = {}
+for _gpu_zone, _gpu_subnet in FALLBACK_ZONES:
+    _REGION_SUBNETS.setdefault(_gpu_zone.rsplit("-", 1)[0], _gpu_subnet)
+
+# GPU-availability zone lists per accelerator (GCP type string), from the
+# knowledge doc's GPU-locations table. INDEPENDENT of the fleet FALLBACK_ZONES
+# ring: GPU zones differ per accelerator and per region.
+_GPU_ZONE_NAMES: dict[str, list[str]] = {
+    "nvidia-tesla-t4": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-central1-f",
+        "us-east1-b",
+        "us-east1-c",
+        "us-east1-d",
+        "us-east4-a",
+        "us-east4-b",
+        "us-east4-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+    "nvidia-l4": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-east1-b",
+        "us-east1-c",
+        "us-east1-d",
+        "us-east4-a",
+        "us-east4-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+    "nvidia-tesla-v100": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-central1-f",
+        "us-east1-b",
+        "us-east1-c",
+        "us-west1-a",
+        "us-west1-b",
+    ],
+}
+
+# Resolved per-accelerator (zone, subnet) rings, reusing the fleet per-region
+# subnets. Keyed by GCP accelerator type string.
+GPU_FALLBACK_ZONES: dict[str, list[tuple[str, str]]] = {
+    _accel: [(_zone, _REGION_SUBNETS[_zone.rsplit("-", 1)[0]]) for _zone in _zones]
+    for _accel, _zones in _GPU_ZONE_NAMES.items()
+}
+
+
+def gpu_zone_candidates(accelerator: str) -> list[tuple[str, str]]:
+    """Ordered (zone, subnet) candidates where ``accelerator`` is available.
+
+    Pure helper: returns a fresh list drawn from ``GPU_FALLBACK_ZONES``,
+    independent of the fleet ``FALLBACK_ZONES`` ring. Accepts either a GCP
+    accelerator type string (e.g. ``"nvidia-tesla-t4"``) or a canonical short
+    name (e.g. ``"T4"``). Returns ``[]`` for unknown accelerators.
+
+    The dependent subtask feeds this into the existing cooldown / success-rate /
+    quota machinery; it does nothing on its own.
+    """
+    accel = accelerator
+    if accel not in GPU_FALLBACK_ZONES:
+        from app.vm_cost_rates import resolve_accelerator_spec
+
+        spec = resolve_accelerator_spec(accelerator)
+        if spec is not None:
+            accel = spec.gcp_type
+    return list(GPU_FALLBACK_ZONES.get(accel, []))
+
+
 # Scripts baked into the startup script as base64 blobs. Loaded at module
 # import time so a missing file fails fast instead of during VM provisioning.
 # See backend/app/_agent_scripts/__init__.py for rationale.
@@ -394,9 +502,41 @@ def _validate_image_family() -> None:
         ) from e
 
 
+def _validate_gpu_image_family() -> None:
+    """Verify the GPU boot image family exists in GCP. Prevents all-zone cascading failure.
+
+    Independent of _validate_image_family — a missing GPU image must not disable
+    CPU provisioning.
+    """
+    from google.cloud import compute_v1
+
+    try:
+        client = compute_v1.ImagesClient()
+        family_name = GPU_IMAGE_FAMILY.split("/")[-1]
+        project = "deeplearning-platform-release"
+        if GPU_IMAGE_FAMILY.startswith("projects/"):
+            parts = GPU_IMAGE_FAMILY.split("/")
+            project = parts[1]
+        image = client.get_from_family(project=project, family=family_name)
+        logger.info(
+            f"[STARTUP] GPU image family '{family_name}' validated in project '{project}'"
+            f" — resolved to '{image.name}'"
+        )
+    except Exception as e:
+        logger.exception("[STARTUP] GPU image family validation failed")
+        raise RuntimeError(
+            f"GPU_IMAGE_FAMILY '{GPU_IMAGE_FAMILY}' not found: {e}"
+        ) from e
+
+
 _image_family_valid: bool | None = None  # None = not yet checked, True/False = result
 _image_family_last_check: float = 0.0
 _IMAGE_FAMILY_RECHECK_INTERVAL: float = 300.0  # Retry validation every 5 min if failed
+
+# GPU image family validation state — independent of _image_family_valid so a
+# bad GPU image cannot disable CPU provisioning.
+_gpu_image_family_valid: bool | None = None
+_gpu_image_family_last_check: float = 0.0
 
 if not LOCAL_MODE and os.getenv(
     "K_REVISION"
@@ -411,6 +551,16 @@ if not LOCAL_MODE and os.getenv(
         _image_family_last_check = time.time()
         logger.exception(
             f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s"
+        )
+    try:
+        _validate_gpu_image_family()
+        _gpu_image_family_valid = True
+        _gpu_image_family_last_check = time.time()
+    except Exception:
+        _gpu_image_family_valid = False
+        _gpu_image_family_last_check = time.time()
+        logger.exception(
+            f"[STARTUP] GPU image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s"
         )
 
 # Manifest builder + payload URI validator are imported at the top of this
@@ -569,6 +719,38 @@ def _ensure_image_family_valid() -> None:
             raise RuntimeError(
                 f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
                 f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
+            )
+
+
+def _ensure_gpu_image_family_valid() -> None:
+    """Block GPU provisioning when the GPU boot image family is invalid.
+
+    Mirrors _ensure_image_family_valid but uses isolated state so a missing GPU
+    image does NOT disable CPU provisioning. Raises RuntimeError while invalid.
+    No-op in LOCAL_MODE.
+    """
+    global _gpu_image_family_valid, _gpu_image_family_last_check
+    if _gpu_image_family_valid is False and not LOCAL_MODE:
+        now = time.time()
+        if now - _gpu_image_family_last_check >= _IMAGE_FAMILY_RECHECK_INTERVAL:
+            try:
+                _validate_gpu_image_family()
+                _gpu_image_family_valid = True
+                _gpu_image_family_last_check = now
+                logger.info(
+                    "[COMPUTE] GPU image family re-validation succeeded — GPU provisioning re-enabled"
+                )
+            except Exception as revalidate_err:
+                _gpu_image_family_last_check = now
+                logger.exception("[COMPUTE] GPU image family re-validation still failing")
+                raise RuntimeError(
+                    f"GPU provisioning disabled: image family '{GPU_IMAGE_FAMILY}' "
+                    f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
+                ) from revalidate_err
+        else:
+            raise RuntimeError(
+                f"GPU provisioning disabled: image family '{GPU_IMAGE_FAMILY}' "
+                f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _gpu_image_family_last_check):.0f}s."
             )
 
 
@@ -803,6 +985,45 @@ def record_vm_source_sha(vm_instance_id: str, source_sha: str) -> None:
 def get_vm_source_sha(vm_instance_id: str) -> str | None:
     """Return the source git SHA reported by a VM, or None if not yet reported."""
     return _vm_source_shas.get(vm_instance_id)
+
+
+async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
+    """True iff the running agent fleet is observed serving ``promoted_sha``.
+
+    Default fleet-serving definition for the agent VM image release artifact: at
+    least one currently-active (LIVE: PROVISIONING / IDLE / LEASED) warm-pool VM
+    reports ``agent_source_sha == promoted_sha`` — i.e. the freshly baked image
+    is live and running on the fleet.  DB-backed so the read survives an
+    orchestrator restart (the durable ``PoolVm.agent_source_sha`` is populated by
+    heartbeats via :func:`persist_pool_vm_image_state`); the in-memory heartbeat
+    map is consulted as a warm fallback before a row is persisted (and for
+    task-bound VMs that have no PoolVm registry row).
+
+    A read-only observation: returns ``False`` (not-yet-serving) rather than
+    raising on any error so it can never abort the serving-confirmation sweep.
+    """
+    if not promoted_sha:
+        return False
+    try:
+        from sqlalchemy import select
+
+        from app.models import PoolVm
+        from app.warm_pool import LIVE_POOL_STATES
+
+        match = (
+            await session.execute(
+                select(PoolVm.id).where(
+                    PoolVm.agent_source_sha == promoted_sha,
+                    PoolVm.state.in_(LIVE_POOL_STATES),
+                )
+            )
+        ).first()
+        if match is not None:
+            return True
+    except Exception as e:  # noqa: BLE001 — observation must never raise
+        logger.debug(f"[COMPUTE] fleet_serving_source_sha DB read failed: {e}")
+    # In-memory heartbeat fallback (warm before a PoolVm row is persisted).
+    return any(sha == promoted_sha for sha in _vm_source_shas.values())
 
 
 async def persist_pool_vm_image_state(
@@ -1470,18 +1691,47 @@ async def _provision_gcp(
     provisioning_model: str | None = None,
     startup_script_override: str | None = None,
     machine_type: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ):
     """Provision a GCP VM. When ``startup_script_override`` is provided it is used
     verbatim as the instance startup-script (the taskless warm-pool path passes
     a pre-built pool script + a pre-stored secret), and ``task_id`` may be None.
+
+    When ``accelerator`` names a supported single-GPU shape, the VM is provisioned
+    as a GPU instance: GPU-availability zone candidates (not the fleet ring), a
+    guest accelerator for N1+T4/V100 (built-in for G2+L4), the driver-preinstalled
+    GPU image family, and ``on_host_maintenance=TERMINATE`` (GPUs cannot
+    live-migrate). CPU jobs and agent/pool VMs are unaffected — every GPU branch is
+    gated on ``accel_spec`` being non-None.
     """
     from google.cloud import compute_v1
 
+    # Resolve the accelerator request to a supported single-GPU shape. None ⇒ a
+    # plain CPU VM, so all GPU-specific branches below are inert for CPU jobs.
+    accel_spec = None
+    if accelerator is not None:
+        from app.vm_cost_rates import resolve_accelerator_spec
+
+        accel_spec = resolve_accelerator_spec(accelerator)
+        if accel_spec is None:
+            # A GPU was requested but is not a supported single-GPU shape. Fail
+            # loudly rather than silently falling back to a CPU VM.
+            raise RuntimeError(
+                f"unsupported accelerator {accelerator!r} for GPU provisioning"
+            )
+    is_gpu = accel_spec is not None
+
     logger.info(
         f"Starting provisioning for VM: {vm_instance_id} "
-        f"(Task: {task_id if task_id is not None else 'pool'})"
+        f"(Task: {task_id if task_id is not None else 'pool'}"
+        f"{f', GPU: {accel_spec.name}' if is_gpu else ''})"
     )
-    effective_machine_type = machine_type or MACHINE_TYPE
+    # GPU jobs boot the GPU machine shape (n1-standard-1 / g2-standard-4); CPU
+    # jobs keep the caller's machine type or the fleet default, unchanged.
+    effective_machine_type = machine_type or (
+        accel_spec.machine_type if is_gpu else MACHINE_TYPE
+    )
 
     if secret_version_name is None and task_id is not None:
         # Secret was not pre-computed by the caller — build and store it now.
@@ -1527,7 +1777,9 @@ async def _provision_gcp(
     instance_config.name = vm_instance_id
 
     initialize_params = compute_v1.AttachedDiskInitializeParams()
-    initialize_params.source_image = AGENT_IMAGE_FAMILY
+    # GPU jobs boot the driver-preinstalled Deep Learning VM GPU image family
+    # (NVIDIA drivers + ML stack baked in); CPU jobs keep the agent image.
+    initialize_params.source_image = GPU_IMAGE_FAMILY if is_gpu else AGENT_IMAGE_FAMILY
     initialize_params.disk_size_gb = 50
 
     disk = compute_v1.AttachedDisk()
@@ -1586,6 +1838,7 @@ async def _provision_gcp(
     _effective_provisioning_model = (
         provisioning_model or VM_PROVISIONING_MODEL
     ).upper()
+    scheduling = None
     if _effective_provisioning_model == "SPOT":
         scheduling = compute_v1.Scheduling()
         scheduling.provisioning_model = "SPOT"
@@ -1594,6 +1847,16 @@ async def _provision_gcp(
         # mid-run interruption). Letting GCP DELETE them on preemption avoids
         # accumulating TERMINATED zombies that cleanup has to chase.
         scheduling.instance_termination_action = "DELETE"
+    if is_gpu:
+        # GPUs cannot live-migrate — the instance MUST terminate on host
+        # maintenance or the insert is rejected. automatic_restart is allowed
+        # (and useful) only for STANDARD VMs; SPOT GPU VMs are best-effort
+        # capacity, so leave restart at its preemption default.
+        scheduling = scheduling or compute_v1.Scheduling()
+        scheduling.on_host_maintenance = "TERMINATE"
+        if _effective_provisioning_model != "SPOT":
+            scheduling.automatic_restart = True
+    if scheduling is not None:
         instance_config.scheduling = scheduling
 
     _cancel_event = threading.Event()
@@ -1604,23 +1867,53 @@ async def _provision_gcp(
         skipped_cooldown = []
 
         now_pre = datetime.now(timezone.utc)
-        # Project-global quota cooldown: a CPUS_ALL_REGIONS-style exhaustion
+        # Project-global quota cooldown: a CPUS/GPUS_ALL_REGIONS-style exhaustion
         # blocks EVERY zone identically, so cycling zones would only burn time
         # and re-trip the quota. Fail fast; the message contains "quota" so the
         # orchestrator/reaper INFRA_PROVISION_PATTERNS classify it infra-wide
-        # (requeue without burning task retry budget).
-        global_quota_cd = _global_quota_state.get("cooldown_expires_at")
+        # (requeue without burning task retry budget). GPU jobs use the isolated
+        # GPU quota state so a GPUS_ALL_REGIONS event never blocks CPU provisions.
+        _active_global_quota = _gpu_global_quota_state if is_gpu else _global_quota_state
+        global_quota_cd = _active_global_quota.get("cooldown_expires_at")
         if global_quota_cd and now_pre < global_quota_cd:
             remaining = (global_quota_cd - now_pre).total_seconds()
             raise Exception(
                 f"Global quota cooldown active — project-wide quota exhausted "
-                f"(e.g. CPUS_ALL_REGIONS); retry in {remaining:.0f}s"
+                f"(e.g. {'GPUS' if is_gpu else 'CPUS'}_ALL_REGIONS); retry in {remaining:.0f}s"
             )
-        # _active_fallback_zones() filters out admin-disabled regions (DISABLED_REGIONS env)
-        # so spawn attempts skip regions with no subnet provisioned.
-        active_zones = _active_fallback_zones()
+        # Local aliases for zone health/failure state — GPU jobs use isolated
+        # dicts so failures never cross-contaminate CPU and GPU provisioning lanes.
+        _active_zone_health = _gpu_zone_health if is_gpu else _zone_health
+        _active_zone_failures = _gpu_zone_failures if is_gpu else _zone_failures
+        _record_global_quota = (
+            _record_gpu_global_quota_exhaustion if is_gpu
+            else _record_global_quota_exhaustion
+        )
+        _record_region_quota = (
+            _record_gpu_region_quota_exhaustion if is_gpu
+            else _record_region_quota_exhaustion
+        )
+        _clear_quota_success = (
+            _clear_gpu_quota_cooldowns_after_success if is_gpu
+            else _clear_quota_cooldowns_after_success
+        )
+        # GPU jobs draw from the per-accelerator GPU-availability (zone, subnet)
+        # ring (GPU zones differ per accelerator and from the fleet ring); CPU
+        # jobs use the fleet ring. Either way admin-disabled regions (no subnet)
+        # are filtered out, and the SAME cooldown / success-rate / quota machinery
+        # below applies. An empty GPU ring (all zones disabled) fails loudly via
+        # the "All zones exhausted" path rather than falling back to a CPU VM.
+        if is_gpu:
+            active_zones = [
+                (z, s)
+                for z, s in gpu_zone_candidates(accel_spec.gcp_type)
+                if not _zone_in_disabled_region(z)
+            ]
+        else:
+            active_zones = _active_fallback_zones()
         healthy_zones = [
-            (z, s) for z, s in active_zones if _zone_blocked_until(z, now_pre) is None
+            (z, s) for z, s in active_zones
+            if _zone_blocked_until(z, now_pre, gpu=is_gpu) is None
         ]
         cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
         # Sort healthy zones by recent success rate (descending) so well-performing
@@ -1628,7 +1921,8 @@ async def _provision_gcp(
         # Use stable sort with a small random tiebreak to distribute load across
         # equal-rate zones (e.g. all-new zones with 0.5 default).
         healthy_zones.sort(
-            key=lambda zs: (_zone_success_rate(zs[0]), random.random()), reverse=True
+            key=lambda zs: (_zone_success_rate(zs[0], gpu=is_gpu), random.random()),
+            reverse=True,
         )
         zones_to_try = healthy_zones + cooled_zones
 
@@ -1645,7 +1939,7 @@ async def _provision_gcp(
             # cooldown, or the project-global quota cooldown (a regional/global
             # quota event earlier in THIS loop must skip the remaining zones it
             # covers instead of burning a 240s insert on each).
-            if _zone_blocked_until(zone, now) is not None:
+            if _zone_blocked_until(zone, now, gpu=is_gpu) is not None:
                 skipped_cooldown.append(zone)
                 continue
 
@@ -1654,6 +1948,17 @@ async def _provision_gcp(
                 instance_config.machine_type = (
                     f"zones/{zone}/machineTypes/{effective_machine_type}"
                 )
+                # GPU jobs attach a zone-qualified guest accelerator for N1+T4/V100;
+                # G2+L4 carries the GPU in the machine type (bundled), so no guest
+                # accelerator entry. CPU jobs never touch guest_accelerators.
+                if is_gpu and not accel_spec.bundled:
+                    gpu_accel = compute_v1.AcceleratorConfig()
+                    gpu_accel.accelerator_type = (
+                        f"projects/{GCP_PROJECT_ID}/zones/{zone}"
+                        f"/acceleratorTypes/{accel_spec.gcp_type}"
+                    )
+                    gpu_accel.accelerator_count = accelerator_count
+                    instance_config.guest_accelerators = [gpu_accel]
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
                 # pd-balanced (SSD-backed) boots faster than the pd-standard
@@ -1692,7 +1997,7 @@ async def _provision_gcp(
 
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
-                    health = _zone_health.setdefault(zone, {})
+                    health = _active_zone_health.setdefault(zone, {})
                     health["last_success"] = datetime.now(timezone.utc)
                     prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
@@ -1701,9 +2006,9 @@ async def _provision_gcp(
                         "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                     )
                     outcomes.append(True)
-                    _clear_quota_cooldowns_after_success(zone)
-                    was_in_cooldown = zone in _zone_failures
-                    cooldown_since = _zone_failures.pop(zone, None)
+                    _clear_quota_success(zone)
+                    was_in_cooldown = zone in _active_zone_failures
+                    cooldown_since = _active_zone_failures.pop(zone, None)
 
                 if was_in_cooldown and prev_failures > 0:
                     cooldown_duration = (
@@ -1736,7 +2041,7 @@ async def _provision_gcp(
                             )
                             with _zone_lock:
                                 _vm_zones[vm_instance_id] = zone
-                                health = _zone_health.setdefault(zone, {})
+                                health = _active_zone_health.setdefault(zone, {})
                                 health["last_success"] = datetime.now(timezone.utc)
                                 health["consecutive_failures"] = 0
                                 health.pop("cooldown_expires_at", None)
@@ -1745,7 +2050,7 @@ async def _provision_gcp(
                                     _deque(maxlen=ZONE_HISTORY_WINDOW),
                                 )
                                 outcomes.append(True)
-                                _zone_failures.pop(zone, None)
+                                _active_zone_failures.pop(zone, None)
                             return f"adopted-{vm_instance_id}-in-{zone}"
                         logger.warning(
                             f"[PROVISION] {vm_instance_id} exists in {zone} but status={existing_status} — "
@@ -1781,9 +2086,9 @@ async def _provision_gcp(
                     # cooldowns that outlive the quota event.
                     scope = classify_provision_error_scope(err_str)
                     if scope == QUOTA_SCOPE_GLOBAL:
-                        # _record_global_quota_exhaustion carries the deduped
-                        # ERROR-level operator alert; this is the per-attempt log.
-                        cooldown_secs = _record_global_quota_exhaustion(err_str)
+                        # _record_{gpu_}global_quota_exhaustion carries deduped
+                        # ERROR-level operator alert for CPU; this is the per-attempt log.
+                        cooldown_secs = _record_global_quota(err_str)
                         logger.warning(
                             f"[PROVISION] Project-global quota exhausted while provisioning "
                             f"{vm_instance_id} in {zone} — project-level cooldown "
@@ -1793,7 +2098,7 @@ async def _provision_gcp(
                         raise
                     if scope == QUOTA_SCOPE_REGIONAL:
                         region = _zone_region(zone)
-                        cooldown_secs = _record_region_quota_exhaustion(region, err_str)
+                        cooldown_secs = _record_region_quota(region, err_str)
                         logger.warning(
                             f"Region {region} quota exhausted for {vm_instance_id} — "
                             f"region cooldown {cooldown_secs}s, no zone marked; "
@@ -1813,9 +2118,9 @@ async def _provision_gcp(
 
                     with _zone_lock:
                         now_fail = datetime.now(timezone.utc)
-                        entering_cooldown = zone not in _zone_failures
-                        _zone_failures[zone] = now_fail
-                        health = _zone_health.setdefault(zone, {})
+                        entering_cooldown = zone not in _active_zone_failures
+                        _active_zone_failures[zone] = now_fail
+                        health = _active_zone_health.setdefault(zone, {})
                         old_cf = health.get("consecutive_failures", 0)
                         last_fail_time = health.get("last_failure")
                         # Debounce parallel failures: with N concurrent slots, a single zone
@@ -1866,7 +2171,7 @@ async def _provision_gcp(
             soonest_wait = float("inf")
             for z, sn in active_zones:
                 # Effective block = zone cooldown OR region/global quota cooldown
-                expires = _zone_blocked_until(z, now_check)
+                expires = _zone_blocked_until(z, now_check, gpu=is_gpu)
                 if expires:
                     remaining = (expires - now_check).total_seconds()
                     if remaining < soonest_wait:
@@ -1887,6 +2192,16 @@ async def _provision_gcp(
                     instance_config.machine_type = (
                         f"zones/{wait_zone}/machineTypes/{effective_machine_type}"
                     )
+                    # Re-point the zone-qualified guest accelerator at the wait zone
+                    # (the URL is zonal). G2+L4 stays bundled in the machine type.
+                    if is_gpu and not accel_spec.bundled:
+                        gpu_accel = compute_v1.AcceleratorConfig()
+                        gpu_accel.accelerator_type = (
+                            f"projects/{GCP_PROJECT_ID}/zones/{wait_zone}"
+                            f"/acceleratorTypes/{accel_spec.gcp_type}"
+                        )
+                        gpu_accel.accelerator_count = accelerator_count
+                        instance_config.guest_accelerators = [gpu_accel]
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
                     disk.initialize_params.disk_type = (
@@ -1903,7 +2218,7 @@ async def _provision_gcp(
                     operation.result(timeout=240)
                     with _zone_lock:
                         _vm_zones[vm_instance_id] = wait_zone
-                        health = _zone_health.setdefault(wait_zone, {})
+                        health = _active_zone_health.setdefault(wait_zone, {})
                         health["last_success"] = datetime.now(timezone.utc)
                         health["consecutive_failures"] = 0
                         health.pop("cooldown_expires_at", None)
@@ -1911,8 +2226,8 @@ async def _provision_gcp(
                             "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                         )
                         outcomes.append(True)
-                        _clear_quota_cooldowns_after_success(wait_zone)
-                        _zone_failures.pop(wait_zone, None)
+                        _clear_quota_success(wait_zone)
+                        _active_zone_failures.pop(wait_zone, None)
                     logger.info(
                         f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)"
                     )
@@ -2008,14 +2323,21 @@ async def provision_ephemeral_vm(
     startup_script: str,
     machine_type: str | None = None,
     provisioning_model: str | None = None,
+    accelerator: str | None = None,
+    accelerator_count: int = 1,
 ) -> bool:
     """Provision a non-agent VM that runs a caller-supplied startup script.
 
     This reuses the shared GCP fallback-zone, secret-free boot, and teardown
     plumbing already used by agent VMs while keeping cloud imports hidden from
-    the higher-level compute-job service layer.
+    the higher-level compute-job service layer. When ``accelerator`` is provided
+    (a supported single-GPU short name or GCP type string) the VM is provisioned
+    as a GPU instance — GPU-availability zones, guest accelerator, driver image,
+    and TERMINATE host-maintenance — instead of a plain CPU VM.
     """
     _ensure_image_family_valid()
+    if accelerator is not None:
+        _ensure_gpu_image_family_valid()
     if LOCAL_MODE:
         raise RuntimeError(
             "provision_ephemeral_vm is unavailable in LOCAL_MODE; use the local backend"
@@ -2026,6 +2348,8 @@ async def provision_ephemeral_vm(
         provisioning_model=provisioning_model,
         startup_script_override=startup_script,
         machine_type=machine_type,
+        accelerator=accelerator,
+        accelerator_count=accelerator_count,
     )
 
 
@@ -2160,6 +2484,74 @@ def _delete_single_vm(vm_name: str, zone: str) -> bool:
         if "was not found" in str(e) or "404" in str(e):
             return True  # Already gone
         logger.exception(f"[VM DELETE] Failed to delete {vm_name} in {zone}")
+        return False
+
+
+async def stop_vm(vm_instance_id: str, *, reason: str) -> bool:
+    """Best-effort graceful stop for a Blueprint-managed GCE VM.
+
+    Used by compute-job teardown before delete so the guest has a window to run
+    its shutdown trap and flush durable artifacts.
+    """
+
+    def _find_and_stop():
+        from google.cloud import compute_v1
+
+        instance_client = compute_v1.InstancesClient()
+        zones_to_try = []
+        with _zone_lock:
+            known_zone = _vm_zones.get(vm_instance_id)
+        if known_zone:
+            zones_to_try.append(known_zone)
+        zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
+
+        for zone in zones_to_try:
+            try:
+                instance = instance_client.get(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
+                status = getattr(instance, "status", "") or ""
+                if status in ("TERMINATED", "STOPPING"):
+                    return True
+                operation = instance_client.stop(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
+                operation.result(timeout=180)
+                logger.info(
+                    "[VM STOP] Successfully stopped %s in %s for %s",
+                    vm_instance_id,
+                    zone,
+                    reason,
+                )
+                return True
+            except Exception as e:
+                if "was not found" in str(e) or "404" in str(e):
+                    continue
+                raise
+        logger.warning("[VM STOP] %s not found in any zone", vm_instance_id)
+        return True
+
+    try:
+        async with _gcp_ops_semaphore:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_find_and_stop),
+                timeout=210,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("[VM STOP] Timeout stopping VM %s (>210s)", vm_instance_id)
+        return False
+    except Exception as e:
+        from google.api_core.exceptions import GoogleAPICallError, RetryError
+
+        if isinstance(e, (RetryError, GoogleAPICallError)):
+            logger.warning(
+                "[VM STOP] Failed to stop VM %s: GCE API transient: %s: %s",
+                vm_instance_id,
+                type(e).__name__,
+                e,
+            )
+        else:
+            logger.warning("[VM STOP] Failed to stop VM %s", vm_instance_id, exc_info=True)
         return False
 
 

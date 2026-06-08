@@ -13,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 import os
+import shlex
 import signal
 import uuid
 
@@ -25,6 +26,7 @@ from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
 from app import provision_error_scope
+from app import storage
 from app.compute_backends import (
     ComputeCostResult,
     GcpComputeBackend,
@@ -35,6 +37,8 @@ from app.compute_backends import (
 )
 from app.database import resolve_async_engine
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -185,9 +189,13 @@ class TestStoreAgentSecretIamRetry:
         side_effects = [Aborted(f"etag mismatch {i}") for i in range(6)]
         client = _make_client(set_iam_side_effects=side_effects)
 
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ), pytest.raises(Aborted):
+        with (
+            patch(
+                "google.cloud.secretmanager.SecretManagerServiceClient",
+                return_value=client,
+            ),
+            pytest.raises(Aborted),
+        ):
             compute._store_agent_secret("vm123", '{"token": "abc"}')
 
         assert client.set_iam_policy.call_count == 5
@@ -455,7 +463,9 @@ async def test_gcp_compute_backend_uses_persisted_zone_for_restart_serial_recove
         )
 
     def fail_get_vm_status(*args, **kwargs):
-        raise AssertionError("serial marker should finalize the job before VM status lookup")
+        raise AssertionError(
+            "serial marker should finalize the job before VM status lookup"
+        )
 
     monkeypatch.setattr(compute, "get_vm_serial_output", fake_get_vm_serial_output)
     monkeypatch.setattr(compute, "get_vm_status", fail_get_vm_status)
@@ -491,18 +501,348 @@ async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
     assert result.metadata["zone"] == "us-central1-f"
 
 
+@pytest.mark.asyncio
+async def test_gpu_compute_job_builds_accelerator_instance_config(
+    monkeypatch, clean_zone_health
+):
+    """A GPU compute-job provision builds a GCE instance config with the GPU
+    machine type, an attached guest accelerator (correct zonal type + count=1),
+    the driver-preinstalled GPU image, ``on_host_maintenance=TERMINATE``, and a
+    zone drawn from the GPU-availability ring — NOT the plain fleet ring.
+
+    Exercises the production ``compute._provision_gcp`` GPU branch end-to-end with
+    a fake GCE client capturing the built ``Instance`` proto (no real GCP calls).
+    """
+    from google.cloud import compute_v1
+
+    # Force GPU zone selection to a single candidate so the insert zone is
+    # deterministic; the candidate is returned by gpu_zone_candidates, proving
+    # _provision_gcp consults the GPU ring rather than the fleet ring.
+    gpu_zone = "us-east4-c"
+    monkeypatch.setattr(
+        compute,
+        "gpu_zone_candidates",
+        lambda accel: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+
+    def _fail_fleet():
+        raise AssertionError("GPU job must not draw zones from the fleet ring")
+
+    monkeypatch.setattr(compute, "_active_fallback_zones", _fail_fleet)
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+
+    captured: dict = {}
+
+    class _FakeOp:
+        name = "op-gpu-1"
+
+        def result(self, timeout=None):
+            return None
+
+    class _FakeInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            captured["zone"] = zone
+            captured["instance"] = instance_resource
+            return _FakeOp()
+
+        def delete(self, project, zone, instance):
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FakeInstancesClient())
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gputest",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        machine_type="n1-standard-1",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+
+    assert ok is True
+    # Zone drawn from the GPU-availability ring.
+    assert captured["zone"] == gpu_zone
+    instance = captured["instance"]
+    # GPU machine type.
+    assert instance.machine_type == f"zones/{gpu_zone}/machineTypes/n1-standard-1"
+    # Attached guest accelerator: correct zonal type URL + count=1.
+    assert len(instance.guest_accelerators) == 1
+    accel = instance.guest_accelerators[0]
+    assert accel.accelerator_type == (
+        f"projects/{compute.GCP_PROJECT_ID}/zones/{gpu_zone}"
+        f"/acceleratorTypes/nvidia-tesla-t4"
+    )
+    assert accel.accelerator_count == 1
+    # Driver-preinstalled GPU image family, not the agent image.
+    src_image = instance.disks[0].initialize_params.source_image
+    assert src_image == compute.GPU_IMAGE_FAMILY
+    assert src_image != compute.AGENT_IMAGE_FAMILY
+    # GPUs cannot live-migrate.
+    assert instance.scheduling.on_host_maintenance == "TERMINATE"
+    # STANDARD GPU VM keeps automatic_restart.
+    assert instance.scheduling.automatic_restart is True
+
+
+# ─── GPU provision isolation tests ──────────────────────────────────────────
+
+
+def _make_gpu_failure_provision_monkeypatch(monkeypatch, error_msg: str):
+    """Set up monkeypatches for a GPU provision that always fails with error_msg.
+
+    Returns (acquire_called, insert_called) mutable lists so callers can assert
+    that the provision actually ran and hit the expected code path.
+    """
+    from google.cloud import compute_v1
+
+    gpu_zone = "us-east4-c"
+    monkeypatch.setattr(
+        compute,
+        "gpu_zone_candidates",
+        lambda accel: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+    monkeypatch.setattr(
+        compute, "_active_fallback_zones",
+        lambda: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+    # On any provision failure, _provision_gcp's cleanup path calls
+    # _delete_agent_secret, which constructs a real SecretManagerServiceClient
+    # (needs GCP ADC, absent in CI) → DefaultCredentialsError before the test
+    # ever reaches its isolation assertion. Stub it, matching the existing
+    # provision-failure tests elsewhere in this file.
+    monkeypatch.setattr(compute, "_delete_agent_secret", lambda vm_id: None)
+
+    class _FailingInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            raise Exception(error_msg)
+
+        def delete(self, project, zone, instance):
+            class _FakeOp:
+                def result(self, timeout=None):
+                    return None
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingInstancesClient())
+
+
+@pytest.mark.asyncio
+async def test_gpu_provision_failure_does_not_block_cpu_fleet(
+    monkeypatch, clean_zone_health
+):
+    """GPU provisioning failures (zone stockout and GPUS_ALL_REGIONS) must NOT
+    arm or modify the CPU fleet's zone health or global quota cooldown state.
+
+    This is the primary acceptance evidence for the GPU/CPU isolation work:
+    injecting each GPU failure mode leaves the CPU fleet's zone selection and
+    global-quota gate completely unaffected. Proven by asserting that CPU
+    state dicts are empty after a GPU failure, and GPU state dicts carry the
+    failure evidence.
+    """
+    # --- Phase 1: GPU zone stockout (ZONE_RESOURCE_POOL_EXHAUSTED) ---
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch, "ZONE_RESOURCE_POOL_EXHAUSTED: GPU capacity unavailable"
+    )
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-isolation-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+    assert ok is False  # provision failed (expected)
+
+    # CPU zone health must be completely clean.
+    assert compute._zone_health == {}, "GPU stockout must not write CPU _zone_health"
+    assert compute._zone_failures == {}, "GPU stockout must not write CPU _zone_failures"
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPU stockout must not arm CPU global quota cooldown"
+    )
+    assert provision_error_scope._region_quota_state == {}, (
+        "GPU stockout must not arm CPU region quota cooldown"
+    )
+
+    # GPU zone health carries the failure evidence.
+    assert len(compute._gpu_zone_health) > 0, (
+        "GPU stockout must record evidence in GPU zone health"
+    )
+
+    # Clean GPU state for next phase.
+    compute._gpu_zone_health.clear()
+    compute._gpu_zone_failures.clear()
+    provision_error_scope._gpu_global_quota_state.clear()
+    provision_error_scope._gpu_region_quota_state.clear()
+
+    # --- Phase 2: GPUS_ALL_REGIONS (project-wide GPU quota exhaustion) ---
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch,
+        "Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 1.0 globally.",
+    )
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-isolation-test-2",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+    assert ok is False
+
+    # CPU state must still be clean.
+    assert compute._zone_health == {}, "GPUS_ALL_REGIONS must not write CPU _zone_health"
+    assert compute._zone_failures == {}, (
+        "GPUS_ALL_REGIONS must not write CPU _zone_failures"
+    )
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPUS_ALL_REGIONS must not arm CPU global quota cooldown"
+    )
+    assert provision_error_scope._region_quota_state == {}, (
+        "GPUS_ALL_REGIONS must not arm CPU region quota cooldown"
+    )
+
+    # GPU global quota cooldown is armed.
+    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
+        "GPUS_ALL_REGIONS must arm GPU global quota cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gpu_zone_stockout_does_not_cool_cpu_zones(monkeypatch, clean_zone_health):
+    """A GPU zone stockout (ZONE_RESOURCE_POOL_EXHAUSTED) writes only to
+    _gpu_zone_health / _gpu_zone_failures, leaving CPU _zone_health untouched."""
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch, "ZONE_RESOURCE_POOL_EXHAUSTED: no GPU capacity in zone"
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-zonal-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+    )
+
+    assert compute._zone_health == {}, "GPU stockout wrote to CPU _zone_health"
+    assert compute._zone_failures == {}, "GPU stockout wrote to CPU _zone_failures"
+    assert len(compute._gpu_zone_health) > 0, "GPU stockout did not record GPU zone health"
+
+
+@pytest.mark.asyncio
+async def test_gpus_all_regions_does_not_arm_cpu_global_cooldown(
+    monkeypatch, clean_zone_health
+):
+    """GPUS_ALL_REGIONS exhaustion arms the GPU global cooldown but must not
+    touch the CPU fleet's _global_quota_state."""
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch,
+        "Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 1.0 globally.",
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-global-quota-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+    )
+
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPUS_ALL_REGIONS armed CPU global quota state"
+    )
+    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
+        "GPUS_ALL_REGIONS did not arm GPU global quota state"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cpu_zone_stockout_does_not_cool_gpu_zones(monkeypatch, clean_zone_health):
+    """A CPU zone stockout writes only to CPU _zone_health / _zone_failures,
+    leaving _gpu_zone_health untouched."""
+    from google.cloud import compute_v1
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+    # See _make_gpu_failure_provision_monkeypatch: the provision-failure cleanup
+    # path constructs a real SecretManagerServiceClient absent GCP ADC.
+    monkeypatch.setattr(compute, "_delete_agent_secret", lambda vm_id: None)
+
+    class _FailingCPUInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            raise Exception("ZONE_RESOURCE_POOL_EXHAUSTED: no e2 capacity in zone")
+
+        def delete(self, project, zone, instance):
+            class _FakeOp:
+                def result(self, timeout=None):
+                    return None
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingCPUInstancesClient())
+    monkeypatch.setattr(
+        compute,
+        "_active_fallback_zones",
+        lambda: [("us-central1-f", "agent-sandbox-subnet")],
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="agent-vm-cpu-stockout-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+    )
+
+    assert compute._gpu_zone_health == {}, "CPU stockout wrote to GPU _gpu_zone_health"
+    assert compute._gpu_zone_failures == {}, "CPU stockout wrote to GPU _gpu_zone_failures"
+    assert len(compute._zone_health) > 0, "CPU stockout did not record CPU zone health"
+
+
 def _metrics_marker(payload: object) -> str:
+    return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+def _command_log_marker(payload: object) -> str:
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
 
 def test_gcp_serial_parse_extracts_result_metrics():
     marker = _metrics_marker({"accuracy": 0.91, "tokens_per_sec": 1234, "ok": True})
+    command_log = _command_log_marker(
+        {"text": "stdout line\nstderr line\n", "truncated": False, "byte_count": 24}
+    )
     serial = "\n".join(
         [
             "BLUEPRINT_COMPUTE_REASON=completed",
             "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
             "BLUEPRINT_COMPUTE_EXIT_CODE=0",
             f"BLUEPRINT_COMPUTE_METRICS={marker}",
+            f"BLUEPRINT_COMPUTE_COMMAND_LOG={command_log}",
         ]
     )
     status = compute_backends_module._parse_serial_status(serial)
@@ -510,6 +850,11 @@ def test_gcp_serial_parse_extracts_result_metrics():
     assert status.status == ComputeJobStatus.SUCCEEDED
     # bool coerced to a number; all values numeric.
     assert status.metrics == {"accuracy": 0.91, "tokens_per_sec": 1234.0, "ok": 1.0}
+    assert status.command_log == {
+        "text": "stdout line\nstderr line\n",
+        "truncated": False,
+        "byte_count": 24,
+    }
 
 
 def test_gcp_serial_parse_missing_marker_yields_no_metrics():
@@ -526,17 +871,20 @@ def test_gcp_serial_parse_missing_marker_yields_no_metrics():
 
 
 def test_gcp_serial_parse_garbled_marker_is_tolerated():
+    bad_log = "not-valid-base64-$$$"
     serial = "\n".join(
         [
             "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
             "BLUEPRINT_COMPUTE_EXIT_CODE=0",
             "BLUEPRINT_COMPUTE_METRICS=not-valid-base64-$$$",
+            f"BLUEPRINT_COMPUTE_COMMAND_LOG={bad_log}",
         ]
     )
     status = compute_backends_module._parse_serial_status(serial)
     assert status is not None
     assert status.status == ComputeJobStatus.SUCCEEDED
     assert status.metrics is None
+    assert status.command_log is None
 
 
 def test_decode_result_metrics_filters_non_numeric_and_bounds():
@@ -604,6 +952,7 @@ async def test_local_state_file_parse_extracts_result_metrics():
 
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.metrics == {"accuracy": 0.88, "loss": 0.12}
+    assert terminal.command_log is None
 
 
 @pytest.mark.asyncio
@@ -636,10 +985,266 @@ async def test_local_state_file_parse_no_result_file_yields_no_metrics():
 
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.metrics is None
+    assert terminal.command_log is None
 
 
 @pytest.mark.asyncio
-async def test_process_compute_jobs_once_persists_result_metrics(db_session, monkeypatch):
+async def test_local_compute_job_persists_result_metrics_through_monitor(
+    db_session, monkeypatch
+):
+    """Regression: live-handle exit path must surface metrics just like recovery path.
+
+    When the monitor catches the subprocess still alive in its _processes dict and
+    then sees it exit (the live-handle path), the resulting ComputeStatusResult must
+    include any metrics written to BLUEPRINT_RESULT_FILE — identical to what the
+    restart-recovery path returns from _read_local_terminal_status.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Live Exit Metrics", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="live exit metrics parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command='echo \'{"accuracy": 0.95, "f1": 0.88}\' > "$BLUEPRINT_RESULT_FILE"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+
+    # Use the real LocalSubprocessComputeBackend — do NOT monkeypatch it away.
+    # The singleton _LOCAL_BACKEND is returned by get_compute_backend for the
+    # "local-subprocess" name, so the live _processes handle is retained across calls.
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Drive the monitor until terminal or timeout (subprocess should finish in <2s).
+    for _ in range(60):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in (ComputeJobStatus.SUCCEEDED, ComputeJobStatus.FAILED):
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise AssertionError(
+            f"compute job did not reach terminal status within timeout; status={job.status}"
+        )
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.polling_metadata.get("result_metrics") == {"accuracy": 0.95, "f1": 0.88}
+
+
+@pytest.mark.asyncio
+async def test_local_backend_artifact_dir_survives_subprocess_exit():
+    """The durable artifact-dir contract: a command writes a non-metric file to
+    $BLUEPRINT_ARTIFACT_DIR, and that file is still readable from the persisted
+    durable location after the subprocess has fully exited."""
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command='echo "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.txt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+
+    # Launch result records the durable artifact location for finalization/tests.
+    artifact_dir = result.metadata["artifact_dir"]
+    assert result.metadata["artifact_uri"] == f"file://{artifact_dir}"
+
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    for _ in range(60):
+        if compute_backends_module._read_local_terminal_status(compute_job) is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("expected local terminal marker for completed subprocess")
+
+    # Subprocess is gone; the artifact written to the contract dir is still on disk.
+    assert not compute_backends_module._is_pid_running(result.metadata["pid"])
+    artifact_path = os.path.join(artifact_dir, "model.txt")
+    with open(artifact_path, encoding="utf-8") as handle:
+        assert handle.read().strip() == "checkpoint-bytes"
+
+
+def test_local_wrapper_command_provisions_and_exports_artifact_dir():
+    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id("local-z")
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-z"
+    )
+    assert f"export BLUEPRINT_ARTIFACT_DIR={shlex.quote(artifact_dir)}" in wrapper
+    assert f"mkdir -p {shlex.quote(artifact_dir)}" in wrapper
+    # The artifact dir is durable: it must NOT be removed by the wrapper.
+    # Use trailing newline to avoid matching files inside the dir (e.g. command.log.json).
+    assert f"rm -f {shlex.quote(artifact_dir)}\n" not in wrapper
+    assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
+
+
+def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    assert "export BLUEPRINT_ARTIFACT_DIR=" in script
+    assert "mkdir -p" in script and compute_backends_module._GCP_ARTIFACT_DIR_PATH in script
+    assert "command.log.json" in script
+    # Upload targets ONLY this job's bundle object, bounded by a hard timeout, best-effort.
+    assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in script
+    assert "https://storage.example.com/upload" in script
+    assert "curl --fail --silent --show-error" in script
+    assert "python3 - " in script
+    assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in script
+    assert (
+        f"timeout {compute_backends_module._GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS}"
+        in script
+    )
+    # Upload must never change the job's exit code (always `|| true`).
+    assert "|| true" in script
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+
+    signed_url_calls: list[dict] = []
+    provision_calls: list[dict] = []
+
+    async def fake_signed_url(jid, *, expires_at=None):
+        signed_url_calls.append({"job_id": jid, "expires_at": expires_at})
+        return "https://storage.example.com/upload"
+
+    async def fake_provision(vm_id, *, startup_script, machine_type, provisioning_model, accelerator=None, accelerator_count=1):
+        provision_calls.append(
+            {
+                "vm_id": vm_id,
+                "startup_script": startup_script,
+                "machine_type": machine_type,
+                "provisioning_model": provisioning_model,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(
+        storage,
+        "generate_compute_job_artifact_upload_signed_url",
+        fake_signed_url,
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    result = await backend.launch(spec)
+
+    assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
+    assert len(signed_url_calls) == 1
+    assert signed_url_calls[0]["job_id"] == job_id
+    assert signed_url_calls[0]["expires_at"] is not None
+    assert len(provision_calls) == 1
+    startup_script = provision_calls[0]["startup_script"]
+    assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in startup_script
+    assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in startup_script
+    assert "https://storage.example.com/upload" in startup_script
+    assert "gcloud storage cp" not in startup_script
+    assert "gsutil -m cp -r" not in startup_script
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_terminate_stops_before_delete(monkeypatch):
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        project_id=uuid.uuid4(),
+        backend=compute_backends_module.GCP_BACKEND_NAME,
+        external_compute_id="compute-job-vm-123456789abc",
+    )
+
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_stop(vm_instance_id, *, reason):
+        calls.append(("stop", vm_instance_id, reason))
+        return True
+
+    async def fake_delete(vm_instance_id, *, reason):
+        calls.append(("delete", vm_instance_id, reason))
+        return True
+
+    monkeypatch.setattr(compute, "stop_vm", fake_stop)
+    monkeypatch.setattr(compute_backends_module, "_ensure_vm_deleted", fake_delete)
+
+    assert await backend.terminate(job, reason="budget") is True
+    assert calls == [
+        ("stop", "compute-job-vm-123456789abc", "compute_job_budget"),
+        ("delete", "compute-job-vm-123456789abc", "compute_job_budget"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_adopt_existing_vm_records_artifact_uri(monkeypatch):
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    started_at = datetime(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: "us-central1-f")
+    monkeypatch.setattr(compute, "get_vm_created_at", lambda *_args: started_at)
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=job_id,
+            command="echo ok",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+        )
+    )
+
+    assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
+    assert result.metadata["zone"] == "us-central1-f"
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_persists_result_metrics(
+    db_session, monkeypatch
+):
     project = Project(name="Compute Job Metrics", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -691,7 +1296,9 @@ async def test_process_compute_jobs_once_persists_result_metrics(db_session, mon
         async def terminate(self, persisted_job, *, reason):
             raise AssertionError("terminate should not be called")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -772,7 +1379,9 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         async def terminate(self, persisted_job, *, reason):
             raise AssertionError("terminate should not be called")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -790,6 +1399,241 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
     assert job.final_cost_usd == pytest.approx(0.03)
     assert job.polling_metadata["exit_code"] == 0
     assert job.polling_metadata["terminal_status"] == ComputeJobStatus.SUCCEEDED.value
+
+
+@pytest.mark.asyncio
+async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch):
+    """End-to-end (local backend): a job writes durable output and emits
+    stdout/stderr, and the monitor links that surviving location as a
+    first-class result with a bounded command log.
+
+    Proves the whole contract in one pass: the file is re-readable from the
+    durable location AFTER the subprocess (the local analogue of VM teardown) is
+    gone, and the persisted ``Artifact`` row, ``ComputeJob.artifact_id`` and
+    ``ComputeJob.result_reference`` all agree on that location.
+    """
+    # Drive the real local-subprocess backend through the create+monitor path.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Artifact Link", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command=(
+            'printf "stdout-line\\n"; '
+            'printf "stderr-line\\n" >&2; '
+            'printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"'
+        ),
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+    assert job.status == ComputeJobStatus.QUEUED
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Pass 1 launches the subprocess; subsequent passes poll it to terminal and
+    # link the artifact. The command is trivial, so a handful of passes suffices.
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+    # The durable artifact directory outlived the (now-exited) subprocess and the
+    # checkpoint is still re-readable from the persisted location.
+    external_id = job.external_compute_id
+    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
+        external_id
+    )
+    assert not compute_backends_module._is_pid_running(
+        int(job.polling_metadata["pid"])
+    )
+    with open(os.path.join(artifact_dir, "model.ckpt"), encoding="utf-8") as handle:
+        assert handle.read() == "checkpoint-bytes"
+
+    durable_uri = f"file://{artifact_dir}"
+
+    # The job is now linked to one first-class Artifact row, and all three
+    # references agree on the durable location.
+    assert job.artifact_id is not None
+    assert job.result_reference == durable_uri
+
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    assert artifact.task_id == task.id
+    assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
+    assert artifact.storage_uri == durable_uri
+    assert job.polling_metadata["command_log"]["truncated"] is False
+
+    # The artifact cites the durable result (no parallel persistence channel).
+    logged = json.loads(artifact.logs)
+    assert logged["compute_job_id"] == str(job.id)
+    assert logged["artifact_uri"] == durable_uri
+    assert logged["file_count"] >= 1
+    assert logged["command_log"]["truncated"] is False
+    assert "stdout-line" in logged["command_log"]["text"]
+    assert "stderr-line" in logged["command_log"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_compute_job_truncates_bounded_log_without_blocking_completion(
+    db_session, monkeypatch
+):
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Noisy Log", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command=(
+            "python3 - <<'PY'\n"
+            "import os, sys\n"
+            "sys.stdout.write('x' * 100000)\n"
+            "sys.stdout.write('\\n')\n"
+            "sys.stderr.write('y' * 100000)\n"
+            "sys.stderr.write('\\n')\n"
+            "path = os.path.join(os.environ['BLUEPRINT_ARTIFACT_DIR'], 'model.ckpt')\n"
+            "with open(path, 'w', encoding='utf-8') as handle:\n"
+            "    handle.write('checkpoint')\n"
+            "PY"
+        ),
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    logged = json.loads(artifact.logs)
+    assert logged["command_log"]["truncated"] is True
+    assert (
+        logged["command_log"]["byte_count"]
+        <= compute_backends_module._MAX_COMMAND_LOG_BYTES
+    )
+    assert (
+        len(logged["command_log"]["text"].encode("utf-8"))
+        <= compute_backends_module._MAX_COMMAND_LOG_BYTES
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_with_empty_artifact_dir_links_no_artifact(
+    db_session, monkeypatch
+):
+    """Fail-soft: a job that writes NOTHING to the artifact dir completes with no
+    Artifact row and no stamped linkage — an empty location is not a result."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Compute Empty Artifact", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",  # writes nothing to $BLUEPRINT_ARTIFACT_DIR or stdout/stderr
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    for _ in range(80):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+        if job.status in compute_jobs._COMPUTE_JOB_TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("compute job did not reach a terminal state")
+
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.artifact_id is None
+    assert job.result_reference is None
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -824,6 +1668,187 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert first.id == second.id
     assert len(jobs) == 1
+
+
+async def _make_compute_task(db_session):
+    project = Project(name="GPU Compute Job", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_accepts_prices_persists_and_forwards_gpu(
+    db_session, monkeypatch
+):
+    """A GPU accelerator request is accepted, priced (base+GPU), persisted on the
+    row, and forwarded into the launch spec the GCP backend hands to the
+    provisioner."""
+    from app.vm_cost_rates import (
+        get_compute_rate_per_second,
+        get_vm_rate_per_second,
+    )
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+
+    # Persisted on the row.
+    assert job.accelerator_type == "T4"
+    assert job.accelerator_count == 1
+
+    # Priced base (n1-standard-1) + GPU surcharge (T4): the persisted rate matches
+    # the accelerator-aware accessor and exceeds the bare base-machine rate.
+    expected_rate = get_compute_rate_per_second(
+        machine_type="n1-standard-1", accelerator="T4", count=1, spot=False
+    )
+    assert job.polling_metadata["cost_rate_per_second"] == pytest.approx(expected_rate)
+    base_only = get_vm_rate_per_second(machine_type="n1-standard-1", spot=False)
+    assert expected_rate > base_only  # GPU surcharge is included
+
+    # Forwarded into the launch spec (which GcpComputeBackend.launch passes to
+    # provision_ephemeral_vm → _provision_gcp).
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.accelerator == "T4"
+    assert spec.accelerator_count == 1
+    assert spec.machine_type == "n1-standard-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accelerator", "expected_machine_type"),
+    [
+        ("T4", "n1-standard-1"),
+        ("L4", "g2-standard-4"),
+        ("V100", "n1-standard-1"),
+    ],
+)
+async def test_accelerator_only_resolves_canonical_machine_type(
+    db_session, monkeypatch, accelerator, expected_machine_type
+):
+    """An accelerator-only request persists and prices the canonical GPU shape."""
+    from app.routers.agent_compute_jobs import LaunchComputeJobRequest
+    from app.vm_cost_rates import get_compute_rate_per_second
+
+    request = LaunchComputeJobRequest(
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator=accelerator,
+    )
+    assert request.machine_type is None
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator=accelerator,
+    )
+
+    assert job.machine_type == expected_machine_type
+    assert job.accelerator_type == accelerator
+    assert job.accelerator_count == 1
+    expected_rate = get_compute_rate_per_second(
+        machine_type=None,
+        accelerator=accelerator,
+        count=1,
+        spot=False,
+    )
+    assert job.polling_metadata["cost_rate_per_second"] == pytest.approx(expected_rate)
+
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.machine_type == expected_machine_type
+    assert spec.accelerator == accelerator
+    assert spec.accelerator_count == 1
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
+    """An A100 (over-quota, count=0) request is rejected loudly at create time."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="unsupported accelerator"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator="A100",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accelerator", "machine_type"),
+    [
+        ("T4", "g2-standard-4"),
+        ("L4", "n1-standard-1"),
+    ],
+)
+async def test_create_compute_job_rejects_gpu_machine_family_mismatch(
+    db_session, monkeypatch, accelerator, machine_type
+):
+    """A GPU paired with a mismatched explicit machine family is rejected."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="not a valid single-GPU shape"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type=machine_type,
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator=accelerator,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_gpu_on_local_backend(db_session, monkeypatch):
+    """A GPU can never be provisioned by the local-subprocess backend."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="local-subprocess"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="local-subprocess",
+            accelerator="T4",
+        )
 
 
 @pytest.mark.asyncio
@@ -871,7 +1896,9 @@ async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypa
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -933,7 +1960,9 @@ async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypat
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -981,7 +2010,9 @@ async def test_kill_compute_job_cancels_active_and_terminates(db_session, monkey
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
 
     killed = await compute_jobs.kill_compute_job(
         db_session,
@@ -1136,6 +2167,11 @@ def clean_zone_health():
         provision_error_scope._global_quota_state.clear()
         provision_error_scope._region_quota_state.clear()
         compute._zone_suspect_events.clear()
+        # GPU-isolated state
+        compute._gpu_zone_health.clear()
+        compute._gpu_zone_failures.clear()
+        provision_error_scope._gpu_global_quota_state.clear()
+        provision_error_scope._gpu_region_quota_state.clear()
 
     _reset()
     yield
@@ -1660,8 +2696,7 @@ _QUOTA_SCOPE_MATRIX = [
     # Global: the error text literally says "globally" / names an
     # ALL_REGIONS quota metric.
     (
-        "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. "
-        "Limit: 32.0 globally.",
+        "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. Limit: 32.0 globally.",
         provision_error_scope.QUOTA_SCOPE_GLOBAL,
     ),
     (
@@ -1675,8 +2710,7 @@ _QUOTA_SCOPE_MATRIX = [
     ("Quota exceeded. Limit: 64.0 globally.", provision_error_scope.QUOTA_SCOPE_GLOBAL),
     # Regional: region-scoped quota metrics.
     (
-        "403 QUOTA_EXCEEDED: Quota 'CPUS' exceeded. "
-        "Limit: 24.0 in region us-central1.",
+        "403 QUOTA_EXCEEDED: Quota 'CPUS' exceeded. Limit: 24.0 in region us-central1.",
         provision_error_scope.QUOTA_SCOPE_REGIONAL,
     ),
     (
@@ -1726,7 +2760,8 @@ class TestQuotaScopeClassification:
             "see quota documentation"
         )
         assert (
-            provision_error_scope.classify_provision_error_scope(err) == provision_error_scope.QUOTA_SCOPE_ZONAL
+            provision_error_scope.classify_provision_error_scope(err)
+            == provision_error_scope.QUOTA_SCOPE_ZONAL
         )
 
 
@@ -1743,7 +2778,9 @@ class TestGlobalQuotaBackoff:
     """Project-level backoff for global quota exhaustion — NO zone marks."""
 
     def test_record_sets_cooldown_and_marks_no_zones(self, clean_zone_health):
-        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(
+            _GLOBAL_QUOTA_ERR
+        )
         assert cooldown_secs == provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS
         expires = provision_error_scope._global_quota_state["cooldown_expires_at"]
         assert expires > datetime.now(timezone.utc)
@@ -1755,7 +2792,9 @@ class TestGlobalQuotaBackoff:
         provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
         assert compute.any_zone_available() is False
         recovery = compute.soonest_zone_recovery()
-        assert recovery == provision_error_scope._global_quota_state["cooldown_expires_at"]
+        assert (
+            recovery == provision_error_scope._global_quota_state["cooldown_expires_at"]
+        )
         wait = compute.zone_recovery_wait_seconds()
         assert wait is not None and wait > 0
 
@@ -1779,7 +2818,9 @@ class TestGlobalQuotaBackoff:
         provision_error_scope._global_quota_state["last_event"] = datetime.now(
             timezone.utc
         ) - timedelta(seconds=provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS + 1)
-        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(
+            _GLOBAL_QUOTA_ERR
+        )
         assert provision_error_scope._global_quota_state["consecutive"] == 2
         assert cooldown_secs == min(
             provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS * 2,
@@ -1788,7 +2829,9 @@ class TestGlobalQuotaBackoff:
 
     def test_backoff_capped(self):
         assert (
-            provision_error_scope._quota_backoff_seconds(100, provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS)
+            provision_error_scope._quota_backoff_seconds(
+                100, provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS
+            )
             == provision_error_scope._QUOTA_COOLDOWN_CAP_SECONDS
         )
 
@@ -1833,7 +2876,9 @@ class TestRegionQuotaBackoff:
     region's zones, marks no individual zone."""
 
     def test_record_blocks_only_that_region(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
         now = datetime.now(timezone.utc)
         assert compute._zone_blocked_until("us-central1-f", now) is not None
         assert compute._zone_blocked_until("us-central1-a", now) is not None
@@ -1845,32 +2890,53 @@ class TestRegionQuotaBackoff:
         assert compute._zone_health == {}
 
     def test_all_regions_blocked_means_nothing_available(self, clean_zone_health):
-        regions = {provision_error_scope._zone_region(z) for z, _ in compute.FALLBACK_ZONES}
+        regions = {
+            provision_error_scope._zone_region(z) for z, _ in compute.FALLBACK_ZONES
+        }
         for region in regions:
-            provision_error_scope._record_region_quota_exhaustion(region, _REGIONAL_QUOTA_ERR)
+            provision_error_scope._record_region_quota_exhaustion(
+                region, _REGIONAL_QUOTA_ERR
+            )
         assert compute.any_zone_available() is False
 
     def test_success_in_region_clears_its_cooldown_only(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        provision_error_scope._record_region_quota_exhaustion("us-east4", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-east4", _REGIONAL_QUOTA_ERR
+        )
         provision_error_scope._clear_quota_cooldowns_after_success("us-central1-f")
         assert "us-central1" not in provision_error_scope._region_quota_state
         assert "us-east4" in provision_error_scope._region_quota_state
 
     def test_summary_surfaces_region_cooldowns(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
         summary = compute.get_zone_health_summary()
         assert "us-central1" in summary["region_quota_cooldowns"]
 
     def test_region_debounce_and_escalation(self, clean_zone_health):
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 1
-        provision_error_scope._region_quota_state["us-central1"]["last_event"] = datetime.now(
-            timezone.utc
-        ) - timedelta(seconds=provision_error_scope.REGION_QUOTA_COOLDOWN_SECONDS + 1)
-        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
-        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 2
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        assert (
+            provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 1
+        )
+        provision_error_scope._region_quota_state["us-central1"]["last_event"] = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=provision_error_scope.REGION_QUOTA_COOLDOWN_SECONDS + 1)
+        )
+        provision_error_scope._record_region_quota_exhaustion(
+            "us-central1", _REGIONAL_QUOTA_ERR
+        )
+        assert (
+            provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 2
+        )
 
 
 class TestZoneSuspectCorroboration:
@@ -1900,9 +2966,7 @@ class TestZoneSuspectCorroboration:
         health = compute._zone_health[zone]
         assert health["consecutive_failures"] == 1
         assert health["cooldown_expires_at"] > datetime.now(timezone.utc)
-        assert (
-            health["last_failure_reason"] == "HEARTBEAT_STARVATION_CORROBORATED"
-        )
+        assert health["last_failure_reason"] == "HEARTBEAT_STARVATION_CORROBORATED"
         # Exactly one success-rate hit for the whole corroborated event.
         assert list(health["recent_outcomes"]) == [False]
         # Evidence consumed: the next charge needs fresh corroboration.
@@ -2346,3 +3410,452 @@ async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_s
         db_session, project_id=None, since=today_start
     )
     assert cross == pytest.approx(4.75)
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU FACTS — pricing, accelerator gate, and zone candidates (inert).
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_rate_includes_base_plus_accelerator():
+    """N1 GPU rate = base machine + GPU surcharge (on-demand and spot)."""
+    from app import vm_cost_rates as vcr
+
+    # N1 + T4: base n1-standard-1 + T4 surcharge.
+    t4_on = vcr.get_compute_rate_per_second("n1-standard-1", accelerator="T4")
+    t4_spot = vcr.get_compute_rate_per_second(
+        "n1-standard-1", accelerator="T4", spot=True
+    )
+    assert t4_on == pytest.approx(0.39749975 / 3600)
+    assert t4_spot == pytest.approx(0.17481125 / 3600)
+    # Explicitly = base + surcharge, not a bundled lookup.
+    assert t4_on == pytest.approx((0.04749975 + 0.35) / 3600)
+    assert t4_spot == pytest.approx((0.01381125 + 0.161) / 3600)
+
+    # N1 + V100.
+    v100_on = vcr.get_compute_rate_per_second("n1-standard-1", accelerator="V100")
+    v100_spot = vcr.get_compute_rate_per_second(
+        "n1-standard-1", accelerator="V100", spot=True
+    )
+    assert v100_on == pytest.approx(2.52749975 / 3600)
+    assert v100_spot == pytest.approx(1.10501125 / 3600)
+    assert v100_on == pytest.approx((0.04749975 + 2.48) / 3600)
+
+
+def test_gpu_rate_g2_l4_is_bundled():
+    """G2 + L4 rate comes from the bundled machine price (no separate surcharge)."""
+    from app import vm_cost_rates as vcr
+
+    l4_on = vcr.get_compute_rate_per_second("g2-standard-4", accelerator="L4")
+    l4_spot = vcr.get_compute_rate_per_second(
+        "g2-standard-4", accelerator="L4", spot=True
+    )
+    assert l4_on == pytest.approx(0.70683228 / 3600)
+    assert l4_spot == pytest.approx(0.058736 / 3600)
+    # L4 has no entry in the per-GPU surcharge table — it is bundled into G2.
+    assert "nvidia-l4" not in vcr.GPU_ACCELERATOR_SURCHARGE_RATES
+
+
+def test_compute_rate_without_accelerator_matches_cpu_rate():
+    """accelerator=None falls through to the unchanged CPU (e2) accessor."""
+    from app import vm_cost_rates as vcr
+
+    for mt in vcr.supported_machine_types():
+        assert vcr.get_compute_rate_per_second(mt) == vcr.get_vm_rate_per_second(mt)
+        assert vcr.get_compute_rate_per_second(
+            mt, spot=True
+        ) == vcr.get_vm_rate_per_second(mt, spot=True)
+
+
+def test_accelerator_gate_rejects_a100_count_and_unknown():
+    """A100 (out of quota), count!=1, and unknown names are rejected."""
+    from app import vm_cost_rates as vcr
+
+    spec, reason = vcr.validate_accelerator_request("A100")
+    assert spec is None and reason and "A100" in reason
+
+    spec, reason = vcr.validate_accelerator_request("T4", count=2)
+    assert spec is None and reason and "count" in reason
+
+    spec, reason = vcr.validate_accelerator_request("nvidia-tesla-h100")
+    assert spec is None and reason
+
+    # The accessor surfaces the same rejections as exceptions.
+    with pytest.raises(vcr.AcceleratorRejection):
+        vcr.get_compute_rate_per_second("a2-highgpu-1g", accelerator="A100")
+    with pytest.raises(vcr.AcceleratorRejection):
+        vcr.get_compute_rate_per_second("n1-standard-1", accelerator="T4", count=4)
+
+
+def test_supported_accelerators_type_strings_and_families():
+    """Each accelerator maps to the correct GCP type string and machine family."""
+    from app import vm_cost_rates as vcr
+
+    assert set(vcr.SUPPORTED_ACCELERATORS) == {"T4", "L4", "V100"}
+    assert "A100" not in vcr.SUPPORTED_ACCELERATORS
+
+    t4 = vcr.SUPPORTED_ACCELERATORS["T4"]
+    assert t4.gcp_type == "nvidia-tesla-t4"
+    assert t4.machine_family == "n1" and not t4.bundled
+    assert t4.machine_type == "n1-standard-1"
+
+    v100 = vcr.SUPPORTED_ACCELERATORS["V100"]
+    assert v100.gcp_type == "nvidia-tesla-v100"
+    assert v100.machine_family == "n1" and not v100.bundled
+
+    l4 = vcr.SUPPORTED_ACCELERATORS["L4"]
+    assert l4.gcp_type == "nvidia-l4"
+    assert l4.machine_family == "g2" and l4.bundled
+    assert l4.machine_type == "g2-standard-4"
+
+
+def test_gpu_facts_do_not_leak_into_cpu_create_gate():
+    """Regression guard: GPU shapes must NOT enter the CPU-only create gate."""
+    from app import vm_cost_rates as vcr
+
+    assert set(vcr.supported_machine_types()) == {
+        "e2-standard-2",
+        "e2-standard-4",
+        "e2-standard-8",
+        "e2-standard-16",
+        "e2-standard-32",
+    }
+    assert all(mt.startswith("e2-") for mt in vcr.supported_machine_types())
+    for gpu_mt in ("n1-standard-1", "g2-standard-4"):
+        assert not vcr.is_supported_machine_type(gpu_mt)
+        assert gpu_mt not in vcr.VM_COST_RATES
+
+
+def test_gpu_zone_candidates_non_empty_mapped_and_distinct_from_fleet():
+    """Per-accelerator zone candidates are non-empty, subnet-correct, and not the fleet ring."""
+    from app import compute
+
+    fleet_zones = {z for z, _ in compute.FALLBACK_ZONES}
+
+    region_subnets = {}
+    for z, s in compute.FALLBACK_ZONES:
+        region_subnets.setdefault(z.rsplit("-", 1)[0], s)
+
+    for accel in ("T4", "L4", "V100", "nvidia-tesla-t4"):
+        candidates = compute.gpu_zone_candidates(accel)
+        assert candidates, f"expected non-empty zone list for {accel}"
+        for zone, subnet in candidates:
+            assert subnet == region_subnets[zone.rsplit("-", 1)[0]]
+
+    # V100 has no us-east4 zones; T4 does — the maps are genuinely per-accelerator.
+    t4_zones = {z for z, _ in compute.gpu_zone_candidates("T4")}
+    v100_zones = {z for z, _ in compute.gpu_zone_candidates("V100")}
+    assert any(z.startswith("us-east4") for z in t4_zones)
+    assert not any(z.startswith("us-east4") for z in v100_zones)
+
+    # Independent of the fleet ring: the GPU lists include zones not in FALLBACK_ZONES.
+    assert t4_zones - fleet_zones, "GPU zone ring should differ from the fleet ring"
+
+    # Unknown accelerators yield an empty candidate list.
+    assert compute.gpu_zone_candidates("nvidia-a100") == []
+
+
+def test_gpu_image_family_is_driver_preinstalled():
+    """GPU image family defaults to a driver-preinstalled DLVM family."""
+    from app import compute
+
+    # Driver-preinstalled Deep Learning VM family (NVIDIA driver baked in).
+    assert "nvidia" in compute.GPU_IMAGE_FAMILY
+    assert "deeplearning-platform-release" in compute.GPU_IMAGE_FAMILY
+    # Pinned the same way AGENT_IMAGE_FAMILY is (fully-qualified family path).
+    assert compute.GPU_IMAGE_FAMILY.startswith("projects/")
+
+
+class TestGpuImageFamilyValidation:
+    """GPU image family is validated at startup and gates GPU provisioning."""
+
+    def test_ensure_gpu_image_family_valid_raises_when_invalid(self, monkeypatch):
+        """_ensure_gpu_image_family_valid raises RuntimeError when GPU image is invalid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", 1.0)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        # Set last check to far in the future so recheck interval has NOT elapsed.
+        import time
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
+
+        with pytest.raises(RuntimeError, match="GPU"):
+            compute._ensure_gpu_image_family_valid()
+
+    def test_ensure_gpu_image_family_valid_passes_when_valid(self, monkeypatch):
+        """_ensure_gpu_image_family_valid is a no-op when GPU image is valid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        # Should not raise.
+        compute._ensure_gpu_image_family_valid()
+
+    def test_ensure_gpu_image_family_valid_rechecks_after_interval(self, monkeypatch):
+        """Re-validates after _IMAGE_FAMILY_RECHECK_INTERVAL elapses."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", 0.0)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        validate_calls = []
+
+        def fake_validate():
+            validate_calls.append(True)
+            # Simulate successful validation by letting state be set normally.
+
+        monkeypatch.setattr(compute, "_validate_gpu_image_family", fake_validate)
+
+        # Should not raise — recheck interval elapsed, revalidation succeeds.
+        compute._ensure_gpu_image_family_valid()
+        assert len(validate_calls) == 1
+        assert compute._gpu_image_family_valid is True
+
+    def test_ensure_gpu_image_family_valid_noop_in_local_mode(self, monkeypatch):
+        """_ensure_gpu_image_family_valid is a no-op in LOCAL_MODE even when invalid."""
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "LOCAL_MODE", True)
+        # Should not raise in LOCAL_MODE regardless of GPU image state.
+        compute._ensure_gpu_image_family_valid()
+
+    async def test_provision_ephemeral_vm_gpu_calls_gpu_gate(self, monkeypatch):
+        """provision_ephemeral_vm calls _ensure_gpu_image_family_valid when accelerator is set."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        gpu_gate_calls = []
+
+        def fake_gpu_gate():
+            gpu_gate_calls.append(True)
+
+        monkeypatch.setattr(compute, "_ensure_gpu_image_family_valid", fake_gpu_gate)
+
+        async def fake_provision_gcp(**kwargs):
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_provision_gcp)
+
+        await compute.provision_ephemeral_vm(
+            "compute-job-vm-test",
+            startup_script="#!/bin/bash\ntrue",
+            accelerator="T4",
+        )
+        assert len(gpu_gate_calls) == 1
+
+    async def test_provision_ephemeral_vm_cpu_skips_gpu_gate(self, monkeypatch):
+        """provision_ephemeral_vm does NOT call _ensure_gpu_image_family_valid when accelerator is None."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        gpu_gate_calls = []
+
+        def fake_gpu_gate():
+            gpu_gate_calls.append(True)
+
+        monkeypatch.setattr(compute, "_ensure_gpu_image_family_valid", fake_gpu_gate)
+
+        async def fake_provision_gcp(**kwargs):
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_provision_gcp)
+
+        await compute.provision_ephemeral_vm(
+            "compute-job-vm-cpu-test",
+            startup_script="#!/bin/bash\ntrue",
+            accelerator=None,
+        )
+        assert len(gpu_gate_calls) == 0
+
+    def test_gpu_validation_failure_does_not_block_cpu_provisioning(self, monkeypatch):
+        """A failed GPU image validation leaves CPU provisioning (_ensure_image_family_valid) unaffected."""
+        # CPU image is valid; GPU image is not.
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        import time
+        monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
+
+        # CPU gate passes.
+        compute._ensure_image_family_valid()
+
+        # GPU gate raises.
+        with pytest.raises(RuntimeError, match="GPU"):
+            compute._ensure_gpu_image_family_valid()
+
+
+# ---------------------------------------------------------------------------
+# Storage artifact IAM / signed-URL helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeIamPolicy:
+    """Minimal stand-in for the storage IAM Policy used by the artifact grant."""
+
+    def __init__(self, bindings=None, version=1):
+        self.bindings = list(bindings or [])
+        self.version = version
+
+
+class _FakeBucket:
+    def __init__(self, policy):
+        self._policy = policy
+        self.set_calls = []
+
+    def get_iam_policy(self, requested_policy_version=1):
+        return self._policy
+
+    def set_iam_policy(self, policy):
+        self.set_calls.append(policy)
+        self._policy = policy
+
+
+class _FakeStorageClient:
+    def __init__(self, bucket):
+        self._bucket = bucket
+
+    def bucket(self, _name):
+        return self._bucket
+
+
+def test_compute_job_artifact_uri_and_prefix_are_per_job():
+    job_id = uuid.uuid4()
+    prefix = storage.compute_job_artifact_object_prefix(job_id)
+    assert prefix == f"compute-jobs/{job_id}/artifacts"
+    assert storage.compute_job_artifact_uri(job_id) == (
+        f"gs://{storage.ARTIFACT_BUCKET_NAME}/{prefix}/bundle.tar.gz"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_job_artifact_upload_signed_url_targets_bundle_object(monkeypatch):
+    job_id = uuid.uuid4()
+    expected_object = storage.compute_job_artifact_object_name(job_id)
+    expires_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    blob = MagicMock()
+    blob.generate_signed_url.return_value = "https://storage.example.com/upload"
+    bucket = MagicMock()
+    bucket.blob.return_value = blob
+    client = MagicMock()
+    client.bucket.return_value = bucket
+
+    with patch("google.cloud.storage.Client", return_value=client):
+        url = await storage.generate_compute_job_artifact_upload_signed_url(
+            job_id, expires_at=expires_at
+        )
+
+    assert url == "https://storage.example.com/upload"
+    client.bucket.assert_called_once_with(storage.ARTIFACT_BUCKET_NAME)
+    bucket.blob.assert_called_once_with(expected_object)
+    blob.generate_signed_url.assert_called_once()
+    call_kwargs = blob.generate_signed_url.call_args.kwargs
+    assert call_kwargs["version"] == "v4"
+    assert call_kwargs["method"] == "PUT"
+    assert call_kwargs["content_type"] == "application/gzip"
+    assert call_kwargs["expiration"] == expires_at
+
+
+def test_artifact_condition_scopes_writes_to_one_job_prefix_only():
+    job_id = uuid.uuid4()
+    expression = storage._compute_job_artifact_condition_expression(job_id)
+    expected_prefix = (
+        f"projects/_/buckets/{storage.ARTIFACT_BUCKET_NAME}/objects/"
+        f"compute-jobs/{job_id}/artifacts/"
+    )
+    assert expression == f'resource.name.startsWith("{expected_prefix}")'
+    # Never the whole bucket: a bare bucket-root prefix must not appear.
+    assert (
+        f'resource.name.startsWith("projects/_/buckets/{storage.ARTIFACT_BUCKET_NAME}/objects/")'
+        not in expression
+    )
+
+
+def test_artifact_condition_includes_self_expiry_when_given():
+    job_id = uuid.uuid4()
+    expires_at = datetime(2026, 6, 7, 12, 0, 0)
+    expression = storage._compute_job_artifact_condition_expression(job_id, expires_at)
+    assert 'request.time < timestamp("2026-06-07T12:00:00Z")' in expression
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_adds_prefix_scoped_binding(monkeypatch):
+    job_id = uuid.uuid4()
+    bucket = _FakeBucket(_FakeIamPolicy())
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    ok = await storage.grant_compute_job_artifact_writer(
+        job_id, member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+
+    assert ok is True
+    assert len(bucket.set_calls) == 1
+    binding = bucket._policy.bindings[-1]
+    assert binding["role"] == "roles/storage.objectAdmin"
+    assert binding["members"] == {"serviceAccount:vpm@example.iam.gserviceaccount.com"}
+    assert str(job_id) in binding["condition"]["expression"]
+    assert binding["condition"]["title"] == (
+        storage._compute_job_artifact_condition_title(job_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_replaces_stale_binding_for_same_job(monkeypatch):
+    job_id = uuid.uuid4()
+    title = storage._compute_job_artifact_condition_title(job_id)
+    stale = {
+        "role": "roles/storage.objectAdmin",
+        "members": {"serviceAccount:old@example.iam.gserviceaccount.com"},
+        "condition": {"title": title, "expression": "stale"},
+    }
+    other = {"role": "roles/storage.objectViewer", "members": {"user:keep@example.com"}}
+    bucket = _FakeBucket(_FakeIamPolicy(bindings=[stale, other]))
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    await storage.grant_compute_job_artifact_writer(
+        job_id, member="serviceAccount:new@example.iam.gserviceaccount.com"
+    )
+
+    titled = [
+        b for b in bucket._policy.bindings if (b.get("condition") or {}).get("title") == title
+    ]
+    assert len(titled) == 1
+    assert titled[0]["members"] == {"serviceAccount:new@example.iam.gserviceaccount.com"}
+    # Unrelated bindings are preserved.
+    assert other in bucket._policy.bindings
+
+
+@pytest.mark.asyncio
+async def test_revoke_artifact_writer_removes_only_its_binding(monkeypatch):
+    job_id = uuid.uuid4()
+    title = storage._compute_job_artifact_condition_title(job_id)
+    mine = {
+        "role": "roles/storage.objectAdmin",
+        "members": {"serviceAccount:vpm@example.iam.gserviceaccount.com"},
+        "condition": {"title": title, "expression": "expr"},
+    }
+    other = {"role": "roles/storage.objectViewer", "members": {"user:keep@example.com"}}
+    bucket = _FakeBucket(_FakeIamPolicy(bindings=[mine, other]))
+    monkeypatch.setattr(
+        storage.storage, "Client", lambda project=None: _FakeStorageClient(bucket)
+    )
+
+    ok = await storage.revoke_compute_job_artifact_writer(
+        job_id, member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+
+    assert ok is True
+    assert mine not in bucket._policy.bindings
+    assert other in bucket._policy.bindings
+
+
+@pytest.mark.asyncio
+async def test_grant_artifact_writer_is_best_effort_on_error(monkeypatch):
+    def _boom(project=None):
+        raise RuntimeError("iam down")
+
+    monkeypatch.setattr(storage.storage, "Client", _boom)
+    ok = await storage.grant_compute_job_artifact_writer(
+        uuid.uuid4(), member="serviceAccount:vpm@example.iam.gserviceaccount.com"
+    )
+    assert ok is False

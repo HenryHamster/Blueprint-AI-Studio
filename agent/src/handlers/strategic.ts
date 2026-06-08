@@ -13,6 +13,10 @@ import {
   writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
+import {
+  recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+} from '../telemetry.js';
+import { attemptStructuredRepair } from './structured-repair.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
 import {
@@ -37,6 +41,8 @@ import {
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
   buildPortfolioComposition,
+  buildAvailableCapabilitiesSection,
+  CAPABILITY_DECLARATION_DOC,
 } from './research-plan.js';
 import {
   buildSystemMaturitySection,
@@ -76,6 +82,19 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
  * (not in strategic-sections.ts) so it does not have to be threaded through that
  * module's exhaustive vi.mock in strategic.test.ts.
  */
+/**
+ * Render the shared capability vocabulary section (canonical registry names +
+ * statuses) followed by the uniform provides_capability / prerequisite
+ * declaration guidance, so the strategist declares cross-lane capability refs
+ * from the SAME registry namespace research, plan, and design use. Returns ''
+ * when no capabilities are available so the prompt is unchanged.
+ */
+export function buildStrategicAvailableCapabilitiesSection(caps: unknown): string {
+  const section = buildAvailableCapabilitiesSection(caps);
+  if (!section) return '';
+  return `${section}${CAPABILITY_DECLARATION_DOC}\n`;
+}
+
 export function buildStagedDirectionsSection(staged: Array<Record<string, unknown>>): string {
   if (!Array.isArray(staged) || staged.length === 0) return '';
   const lines = staged.map(d => {
@@ -149,6 +168,11 @@ export function renderDesignDocIndexOverview(index: Record<string, unknown> | un
   );
   return blocks.join('\n\n');
 }
+
+// Schema restated to the agent on a bounded self-repair re-ask when a clean exit
+// emitted the legacy inline strategic markers but the JSON failed to extract.
+const STRATEGIC_COMPLETION_SCHEMA_HINT =
+  `{\n  "problem_model": { ... } | "vision": "...",\n  "direction_operations": [ { "op": "create_direction" | "update_direction" | "retire_direction", ... } ]\n}\nThe object MUST contain "direction_operations" and at least one of "problem_model" or "vision".`;
 
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -578,6 +602,12 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
+      // Shared capability vocabulary + uniform provides_capability / prerequisite
+      // declaration guidance, so the strategist draws cross-lane capability refs
+      // from the same registry namespace every other task type uses.
+      availableCapabilitiesSection: buildStrategicAvailableCapabilitiesSection(
+        payload.available_capabilities,
+      ),
     });
 
     // Append the backend-supplied prompt_suffix as "Additional instructions"
@@ -680,7 +710,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # the SAME create-direction call — it is born staged (inert, gated to the open
 # version) in one atomic op, so it never passes through a research-eligible
 # active state. Requires an open version (skips 409 if none). Do NOT create-then-stage.
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit", "success_evidence": "updated observable outcome (optional)", "retirement_condition": "updated measurable retirement condition (optional)"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 # Stage a direction for the NEXT version: it goes inert (no work spawned) and
 # auto-activates when the current version promotes and the next one opens. Use
@@ -755,7 +785,7 @@ ${analysisText.slice(0, 50_000)}
 
 1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
-   Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
+   Fallback (use judgment): if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
 
    This is the canonical source of truth — EVERY cycle must emit it so the revision bumps and the cycle is auditable.
 
@@ -902,7 +932,43 @@ ${analysisText.slice(0, 50_000)}
       logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
     }
     if (!logs) {
-      const completionLogs = buildStrategicCompletionLogs(allOutput, lastResultText);
+      let completionLogs = buildStrategicCompletionLogs(allOutput, lastResultText);
+      // Bounded single self-repair. buildStrategicCompletionLogs sets `warning`
+      // ONLY when the legacy inline markers (direction_operations AND
+      // (problem_model OR vision)) ARE present but the JSON failed to extract —
+      // a command-based run that legitimately emits no inline JSON produces no
+      // warning and is NOT re-asked. On that markers-present-but-unparseable
+      // path, with a clean exit, re-ask ONCE for the JSON only and re-extract.
+      // Mirrors handleMemo / the audit handlers (see structured-repair.ts).
+      if (completionLogs.warning && exitCode === 0) {
+        recordFormatMiss('no_matching_candidate');
+        recordFormatRepairAttempt();
+        const retryRun = await attemptStructuredRepair(
+          lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,
+          'Running strategic execution (retry: emitting decisions)...',
+          ws, statusRef, model, effort, disallowedTools,
+          runClaudeCode, sendLog,
+        );
+        // For JSON-stream providers, lastResultText is the clean final answer
+        // while allOutput is the raw provider stream where JSON keys may be
+        // escaped inside outer events. Combine them so marker detection and
+        // extraction work regardless of provider stream format.
+        const retryEffective = retryRun.lastResultText
+          ? retryRun.allOutput + '\n' + retryRun.lastResultText
+          : retryRun.allOutput;
+        const retryLogs = buildStrategicCompletionLogs(retryEffective, retryRun.lastResultText);
+        // Only count success when the retry actually carried the inline markers
+        // AND extracted cleanly (no warning) — otherwise a marker-less fallback
+        // would masquerade as a successful repair.
+        const retryHasMarkers = retryEffective.includes('"direction_operations"')
+          && (retryEffective.includes('"problem_model"') || retryEffective.includes('"vision"'));
+        if (retryHasMarkers && !retryLogs.warning) {
+          recordFormatRepairSuccess();
+          completionLogs = retryLogs;
+        } else {
+          sendLog(ws, `[WARNING] Strategic self-repair re-ask did not yield parseable inline JSON; keeping fallback.\n`);
+        }
+      }
       if (completionLogs.warning) {
         sendLog(ws, `[WARNING] ${completionLogs.warning}\n`);
       }

@@ -3,6 +3,37 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
 
+// A compute_experiment document — proves compute knowledge is recognized as a
+// first-class source kind with 'Compute' badge and filter option.
+const computeDoc = {
+  id: 'doc-compute-experiment-1',
+  title: 'GPU benchmark: matrix multiply throughput',
+  summary: 'Measured TFLOPS on A100 for various batch sizes.',
+  topic: 'compute-performance',
+  direction_id: 'd-compute-1',
+  tags: ['gpu', 'benchmark'],
+  source_citations: ['gs://blueprint-agent-artifacts/jobs/job-1/results.json'],
+  source_task_id: 'task-ce-1',
+  authoring_branch: null,
+  head_sha: null,
+  source_kind: 'compute_experiment',
+  created_at: '2026-06-01T00:00:00Z',
+  updated_at: '2026-06-01T00:00:00Z',
+  forward_quality_verdict: {
+    passed: true,
+    reason: 'Artifact-cited analysis passed acceptance gate.',
+    strategy: 'forward-quality',
+    probes: {
+      grounding: {
+        file_citations: 1,
+        grounded: 1,
+        unresolved: [],
+      },
+      topic_responsiveness: { passed: true, overlap: 3, total: 3 },
+    },
+  },
+};
+
 // A web_research document carrying a grounding stamp (cited URLs probed for
 // reachability) — proves the Acceptance-probes panel lights up for web_research
 // with modality-neutral 'citation(s)' wording, not the design-only 'file
@@ -46,6 +77,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: vi.fn(() =>
     Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
   ),
+  resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
 }));
 
 describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
@@ -76,10 +108,12 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
       );
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const buttons = (host as HTMLDivElement).querySelectorAll('button');
-    const docButton = Array.from(buttons).find(b => b.textContent?.includes('Survey of reachable web sources'));
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
     expect(docButton).toBeTruthy();
-    await act(async () => { docButton!.click(); });
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { docButton.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
   }
 
@@ -111,5 +145,108 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Grounded 1 of 1 citation');
     expect(text).not.toContain('1 of 1 citations');
+  });
+
+  test('resolves gs:// citations through the signed download API', async () => {
+    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: ['gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf'],
+    } as never);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    await openDetail();
+    const citationButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(
+      (button) => button.textContent?.includes('gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf'),
+    );
+    expect(citationButton).toBeTruthy();
+    if (!citationButton) throw new Error('expected gs:// citation button');
+    await act(async () => { citationButton.click(); });
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledWith(
+      'project-test',
+      'gs://blueprint-agent-artifacts/tasks/task-wr-1/citations/report.pdf',
+    );
+    expect(openSpy).toHaveBeenCalled();
+  });
+
+  test('renders null citations as plain text instead of crashing', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: [null, 'https://example.com/live'],
+    } as never);
+    await openDetail();
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('null');
+    expect(text).toContain('https://example.com/live');
+  });
+});
+
+describe('KnowledgeBrowser — compute_experiment source kind', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function renderWithComputeDoc() {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValueOnce({ documents: [computeDoc], total: 1, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({ ...computeDoc, body: '# Compute analysis\n\nResults here.' } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+  }
+
+  test('renders compute_experiment as a first-class source kind and filter option', async () => {
+    await renderWithComputeDoc();
+
+    // The document card should have a badge that says 'Compute'.
+    const docCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU benchmark'),
+    );
+    expect(docCard).toBeTruthy();
+    // Badge within the document card should read 'Compute', not 'Unknown'.
+    expect(docCard?.textContent).toContain('Compute');
+    expect(docCard?.textContent).not.toContain('Unknown');
+
+    // Filter bar exposes a 'Compute' button.
+    const computeButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(
+      b => b.textContent?.trim() === 'Compute',
+    );
+    expect(computeButton).toBeTruthy();
+  });
+
+  test('compute document with grounding probe surfaces acceptance detail in detail view', async () => {
+    await renderWithComputeDoc();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU benchmark'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected compute document button');
+    await act(async () => { docButton.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Grounded 1 of 1 citation');
+    expect(text).toContain('Acceptance probes');
   });
 });

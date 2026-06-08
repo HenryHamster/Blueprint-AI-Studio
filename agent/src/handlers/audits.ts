@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed } from '../json-extract.js';
+import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
   PARALLEL_AUDIT_GUIDANCE,
@@ -18,6 +18,7 @@ import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 
 // Read the read-only mid-run helper guidance for an audit handler. project_id is
 // set for all task types by the backend; when it is absent we provision NOTHING
@@ -176,14 +177,23 @@ Rules:
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
   if (!logs) {
-    if (lastResultText && lastResultText.includes('"severity"')) {
-      logs = sanitize(lastResultText);
+    const repaired = await repairStructuredOutput<unknown[]>({
+      mode: 'array',
+      requiredKeys: ['severity'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior security audit response did not end with a parseable JSON findings array.
+Return ONLY the JSON array for /tmp/security_findings_${taskId}.json. Each finding object must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing security audit JSON...',
+    });
+    if (repaired.value !== null) {
+      logs = sanitize(JSON.stringify(repaired.value));
     } else {
-      const findingsArr = extractJsonArrayDetailed(allOutput, 'severity');
-      if (!findingsArr.ok) {
-        sendLog(ws, `[WARNING] Could not extract security findings JSON: ${describeJsonExtractionResult(findingsArr)}\n`);
-      }
-      logs = sanitize(findingsArr.ok ? JSON.stringify(findingsArr.value) : (lastResultText || allOutput.slice(-50_000)));
+      logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
   }
 
@@ -322,16 +332,31 @@ Rules:
   if (handlerOutput !== null) {
     logs = sanitize(JSON.stringify(handlerOutput));
   } else {
-    const haystack = (allOutput || '') + '\n' + (lastResultText || '');
-    const objExtract = extractJsonObjectDetailed(haystack, 'findings', 'system_id');
-    if (objExtract.ok) {
-      logs = sanitize(JSON.stringify(objExtract.value));
+    const objRepair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['findings', 'system_id'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.
+Return ONLY the JSON object for /tmp/self_audit_findings_${taskId}.json with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing self audit JSON...',
+    });
+    if (objRepair.value !== null) {
+      logs = sanitize(JSON.stringify(objRepair.value));
     } else {
+      const retryText = objRepair.retry
+        ? `${objRepair.retry.lastResultText || ''}\n${objRepair.retry.allOutput || ''}\n`
+        : '';
+      const haystack = `${retryText}${lastResultText || ''}\n${allOutput || ''}`;
       const arrExtract = extractJsonArrayDetailed(haystack, 'system_id');
       if (arrExtract.ok) {
         logs = sanitize(JSON.stringify({ findings: arrExtract.value }));
       } else {
-        sendLog(ws, `[WARNING] Could not extract self audit findings JSON: ${describeJsonExtractionResult(objExtract)}\n`);
+        sendLog(ws, `[WARNING] Could not extract self audit findings JSON: ${describeJsonExtractionResult(arrExtract)}\n`);
         logs = sanitize(lastResultText || allOutput.slice(-50_000));
       }
     }
@@ -629,16 +654,26 @@ Rules:
   if (enrichedOutput !== null) {
     logs = sanitize(JSON.stringify(enrichedOutput));
   } else {
-    const haystack = (allOutput || '') + '\n' + (lastResultText || '');
-    const objExtract = extractJsonObjectDetailed(haystack, 'audit_score', 'findings');
-    if (objExtract.ok) {
+    const repaired = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['audit_score', 'findings'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior release audit response did not end with a parseable JSON report object.
+Return ONLY the JSON object for /tmp/release_audit_report_${taskId}.json with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing release audit JSON...',
+    });
+    if (repaired.value !== null) {
       const enrichedExtracted = computedTestErosion !== null
-        ? { ...objExtract.value, computed_test_erosion: computedTestErosion }
-        : objExtract.value;
+        ? { ...repaired.value, computed_test_erosion: computedTestErosion }
+        : repaired.value;
       logs = sanitize(JSON.stringify(enrichedExtracted));
     } else {
       releaseAuditUnparseable = exitCode === 0;
-      sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
       logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
   }

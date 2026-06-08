@@ -355,8 +355,6 @@ async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
     cat = result["categories"]["test-coverage"]
     assert cat["current_reviewer_finding_count"] == 5
     assert cat["previous_reviewer_finding_count"] == 5
-    assert cat["current_human_count"] == 5
-    assert cat["previous_human_count"] == 5
     # 5 findings == _MIN_SR_FINDINGS, so not low-confidence
     assert cat["low_confidence_finding_count"] is False
 
@@ -9576,15 +9574,15 @@ async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
         assert cat_data["trend"] in ("stable", "increasing", "decreasing"), (
             f"category {cat_name!r} has unexpected trend: {cat_data['trend']!r}"
         )
-        # current_hit_rate is None only when current_human_count == 0 (e.g. a
+        # current_hit_rate is None only when current_reviewer_finding_count == 0 (e.g. a
         # category present in _all_iterations but not _first_attempt set); for
         # categories that have findings in the current window, rate must be a
         # real float in [0, 1].
-        if cat_data["current_human_count"] > 0:
+        if cat_data["current_reviewer_finding_count"] > 0:
             hr = cat_data["current_hit_rate"]
             assert hr is not None, (
                 f"category {cat_name!r} has None current_hit_rate despite "
-                f"current_human_count={cat_data['current_human_count']} — metric degenerated"
+                f"current_reviewer_finding_count={cat_data['current_reviewer_finding_count']} — metric degenerated"
             )
             assert isinstance(hr, float), (
                 f"category {cat_name!r} current_hit_rate must be a float, got {hr!r}"
@@ -9594,8 +9592,8 @@ async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
             )
 
     # At least the two explicitly-seeded categories must have current findings
-    assert any(d["current_human_count"] > 0 for d in cats.values()), (
-        "No category has current_human_count > 0 — metric degenerated"
+    assert any(d["current_reviewer_finding_count"] > 0 for d in cats.values()), (
+        "No category has current_reviewer_finding_count > 0 — metric degenerated"
     )
 
     # ── Origin-split wiring ───────────────────────────────────────────────────

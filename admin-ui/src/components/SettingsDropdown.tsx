@@ -6,7 +6,7 @@ import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogO
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
-import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 
 
 interface SettingsDropdownProps {
@@ -132,6 +132,8 @@ interface SettingsDropdownProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  // Standing failed-rollback signal (client-side), threaded to the deploy panel.
+  failedRollback: FailedRollbackInfo | null;
   // Zone health
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
   // Notification config
@@ -313,6 +315,7 @@ export function SettingsDropdown({
   onResetHealth,
   onRollback,
   onMarkStable,
+  failedRollback,
   onRepairState,
   zoneHealth,
   notificationConfig,
@@ -592,6 +595,7 @@ export function SettingsDropdown({
                   onRollback={onRollback}
                   onMarkStable={onMarkStable}
                   onRepairState={onRepairState}
+                  failedRollback={failedRollback}
                   zoneHealth={zoneHealth}
                   notificationConfig={notificationConfig}
                   onUpdateNotificationConfig={onUpdateNotificationConfig}

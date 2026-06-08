@@ -38,6 +38,7 @@ from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
 from datetime import datetime, timezone
+from app.capability_registry import derive_provider_marker
 from app.time_utils import _utcnow
 from app.vm_cost_rates import get_vm_rate_per_second
 
@@ -83,6 +84,17 @@ _TASK_BANKED_LLM_INPUT_TOKENS_KEY = "llm_input_tokens_banked"
 _TASK_BANKED_LLM_OUTPUT_TOKENS_KEY = "llm_output_tokens_banked"
 _TASK_BANKED_LLM_CALL_COUNT_KEY = "llm_call_count_banked"
 _TASK_ATTEMPT_HISTORY_KEY = "attempt_history"
+
+
+def _coerce_provider_context_values(raw: object) -> list[str]:
+    values: list[str] = []
+    if isinstance(raw, str) and raw.strip():
+        values.append(raw.strip())
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                values.append(item.strip())
+    return values
 
 
 class ProjectStatus(str, Enum):
@@ -979,6 +991,15 @@ class Task(SQLModel, table=True):
     api_call_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Cumulative per-task structured-output format-compliance telemetry posted
+    # by the agent on every heartbeat, sibling to api_call_summary. Shape:
+    # {"format_miss_by_reason": {<reason>: int, ...}, "format_error_total": int,
+    # "format_repair_attempts": int, "format_repair_successes": int,
+    # "last_updated_at": iso8601}. Backwards-compatible — older agents that
+    # don't ship these fields leave this column NULL.
+    format_compliance_summary: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Retry-attribution banking now has dedicated nullable columns. The
     # accessors below still fall back to legacy context keys so in-flight rows
     # written before the migration keep their banked totals during rollout.
@@ -1600,6 +1621,17 @@ class ComputeJob(SQLModel, table=True):
     machine_type: str | None = Field(
         default=None, sa_column=Column(String(128), nullable=True)
     )
+    # Single-GPU accelerator request. ``accelerator_type`` is the canonical short
+    # name (e.g. "T4"/"L4"/"V100"); ``accelerator_count`` defaults to 1 when an
+    # accelerator is requested. Both are NULL for CPU-only jobs — the create path
+    # leaves them unset unless a valid single-GPU accelerator is paired with a
+    # GPU machine type, so existing CPU jobs are byte-for-byte unchanged.
+    accelerator_type: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    accelerator_count: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
 
     status: ComputeJobStatus = Field(
         default=ComputeJobStatus.QUEUED,
@@ -1986,6 +2018,37 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
                 emit_task_revived_notify(session, str(instance.id))
     except Exception as exc:  # noqa: BLE001 — never block the flush
         logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
+
+
+@event.listens_for(Task, "before_insert")
+def _stamp_task_provider_floor(mapper, connection, target: Task):
+    """Persist the namespaced provider floor marker onto every new task.
+
+    The matcher layer also derives this marker on the fly, but stamping it into
+    ``context['provides_capability']`` ensures persisted rows are never silent
+    non-providers and keeps future read paths JSONB-compatible without extra
+    task-type wiring. Fail-open by construction: a stamp failure must never
+    abort the insert.
+    """
+    try:
+        derived = derive_provider_marker(target)
+        if not derived:
+            return
+        existing_ctx = target.context if isinstance(target.context, dict) else {}
+        # Treat EITHER accepted marker key as already-providing.  If the task
+        # already advertises an explicit capability via `provides_capability` OR
+        # `capability`, leave the stored value completely untouched — the floor
+        # must never clobber or augment an explicit stamp.
+        already_provides = _coerce_provider_context_values(
+            existing_ctx.get("provides_capability")
+        ) or _coerce_provider_context_values(existing_ctx.get("capability"))
+        if already_provides:
+            return
+        new_ctx = dict(existing_ctx)
+        new_ctx["provides_capability"] = derived
+        target.context = new_ctx
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning("[MODELS] before_insert provider-floor stamp failed: %s", exc)
 
 
 @event.listens_for(Task.status, "set")
@@ -2778,6 +2841,14 @@ class Artifact(SQLModel, table=True):
     storage_uri: str | None = None
     logs: str | None = None
 
+    # Logical identifier used by downstream consumers to reference this artifact
+    # by slug rather than by UUID. NULL for legacy rows and artifact types that
+    # don't participate in the consumption seam. Indexed for slug-lookup queries.
+    logical_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True, index=True),
+    )
+
     iteration: int = Field(default=0)
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -2785,6 +2856,74 @@ class Artifact(SQLModel, table=True):
     )
 
     task: Task = Relationship(back_populates="artifacts")
+    consumptions: list["ArtifactConsumption"] = Relationship(back_populates="artifact")
+
+
+class ArtifactConsumption(SQLModel, table=True):
+    """Durable record that a consumer task claimed a specific artifact.
+
+    Provides a proof-of-consumption seam: when a downstream task actually reads
+    and uses an artifact (identified by ``artifact_id`` and optionally the
+    ``logical_key`` slug), it writes one row here. The unique constraint on
+    ``(consumer_task_id, artifact_id)`` prevents double-recording. Producer and
+    consumer task links are SET NULL on delete so consumption history survives
+    task cleanup, mirroring ComputeJob.task_id.
+    """
+
+    __tablename__ = "artifactconsumption"
+    __table_args__ = (
+        UniqueConstraint(
+            "consumer_task_id",
+            "artifact_id",
+            name="uq_artifactconsumption_consumer_artifact",
+        ),
+        Index("ix_artifactconsumption_artifact_id", "artifact_id"),
+        Index("ix_artifactconsumption_consumer_task_id", "consumer_task_id"),
+        Index("ix_artifactconsumption_producer_task_id", "producer_task_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    artifact_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifact.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        )
+    )
+    consumer_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        ),
+    )
+    producer_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        ),
+    )
+
+    # Snapshot of the slug at consumption time; may diverge from Artifact.logical_key
+    # if the key is later updated, making consumption records self-describing.
+    logical_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    artifact: "Artifact" = Relationship(back_populates="consumptions")
 
 
 class KnowledgeDocument(SQLModel, table=True):
@@ -3710,9 +3849,7 @@ class MigrationReservation(SQLModel, table=True):
     provisional_revision: str = Field(
         sa_column=Column(String(64), nullable=False, index=True)
     )
-    provisional_down_revision: str = Field(
-        sa_column=Column(String(64), nullable=False)
-    )
+    provisional_down_revision: str = Field(sa_column=Column(String(64), nullable=False))
 
     status: MigrationReservationStatus = Field(
         default=MigrationReservationStatus.ACTIVE,

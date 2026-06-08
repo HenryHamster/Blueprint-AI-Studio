@@ -111,6 +111,86 @@ export function isSafeUrl(url: string): boolean {
   }
 }
 
+export function isResolvableStorageUri(url: string): boolean {
+  return /^gs:\/\/\S+$/i.test(url);
+}
+
+async function openResolvedArtifactReference(
+  projectId: string,
+  reference: string,
+): Promise<boolean> {
+  const pendingTab = window.open('', '_blank');
+  try {
+    const { resolveArtifactDownloadUrl } = await import('../api');
+    const resolvedUrl = await resolveArtifactDownloadUrl(projectId, reference);
+    if (!isSafeUrl(resolvedUrl)) {
+      throw new Error('resolver returned an unsafe URL');
+    }
+    if (pendingTab) {
+      pendingTab.opener = null;
+      pendingTab.location.replace(resolvedUrl);
+    } else {
+      window.open(resolvedUrl, '_blank', 'noopener,noreferrer');
+    }
+    return true;
+  } catch {
+    pendingTab?.close();
+    return false;
+  }
+}
+
+interface ResolvedReferenceLinkProps {
+  projectId?: string | null;
+  reference: string;
+  className: string;
+  children?: React.ReactNode;
+}
+
+export function ResolvedReferenceLink({
+  projectId,
+  reference,
+  className,
+  children,
+}: ResolvedReferenceLinkProps) {
+  const [opening, setOpening] = useState(false);
+  const label = children ?? reference;
+
+  if (isSafeUrl(reference)) {
+    return (
+      <a
+        href={reference}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={className}
+      >
+        {label}
+      </a>
+    );
+  }
+
+  if (!projectId || !isResolvableStorageUri(reference)) {
+    return <span className={className}>{label}</span>;
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        if (opening) return;
+        setOpening(true);
+        void openResolvedArtifactReference(projectId, reference).finally(() => {
+          setOpening(false);
+        });
+      }}
+      disabled={opening}
+      className={className}
+      title={reference}
+    >
+      {label}
+    </button>
+  );
+}
+
 export function linkifyStatusMessage(msg: string, prUrl?: string): React.ReactNode {
   // Derive base URL from pr_url, e.g. https://github.com/owner/repo/pull/42 -> https://github.com/owner/repo/pull/
   let baseUrl: string | undefined;

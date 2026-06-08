@@ -96,6 +96,9 @@ def _build_retired_directions_summary(
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (
             agg.get("total_prs_merged") or 0
         )
+        verified_total_merged = sum(verified_merged_count(h) for h in history) + (
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -118,8 +121,8 @@ def _build_retired_directions_summary(
             sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
         )
         cost_per_merge = (
-            round(estimated_cost_usd / total_merged, 2)
-            if total_merged > 0 and estimated_cost_usd > 0
+            round(estimated_cost_usd / verified_total_merged, 2)
+            if verified_total_merged > 0 and estimated_cost_usd > 0
             else None
         )
 
@@ -718,8 +721,18 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     def _lifetime_merged(d: dict) -> int:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
-        return sum(h.get("prs_merged", 0) for h in history) + (
+        return sum(int(h.get("prs_merged") or 0) for h in history) + int(
             agg.get("total_prs_merged") or 0
+        )
+
+    def _lifetime_verified_merged(d: dict) -> int:
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        verified_history_total = 0
+        for h in history:
+            verified_history_total += int(verified_merged_count(h))
+        return verified_history_total + int(
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
 
     def _lifetime_generalized_successes(d: dict) -> int:
@@ -731,8 +744,9 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         return sum(
-            h.get("generalized_successes", h.get("prs_merged", 0)) for h in history
-        ) + (agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+            int(h.get("generalized_successes", h.get("prs_merged", 0)) or 0)
+            for h in history
+        ) + int(agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
 
     quality_scores = [
         round(_compute_direction_quality_score(d), 3) for d in directions if d.get("id")
@@ -764,19 +778,20 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
             )
             continue
         merged = _lifetime_merged(d)
+        verified_merged = _lifetime_verified_merged(d)
         gen_successes = _lifetime_generalized_successes(d)
         auto_paused = bool(d.get("auto_paused"))
         qscore = round(_compute_direction_quality_score(d), 3)
         above_median = qscore > median_quality
-        # Code-based success: merged >= 1 (PR-based, labeled sub-metric).
-        success = merged >= 1 and not auto_paused
+        # Code-based success: at least one VERIFIED merge (raw prs_merged stays exposed).
+        success = verified_merged >= 1 and not auto_paused
         # Generalized success: any terminal evaluation success, not just PR merges.
         generalized_success = gen_successes >= 1 and not auto_paused
         if success:
             successes += 1
         if generalized_success:
             generalized_successes_count += 1
-        entry: dict = {
+        created_entry: dict = {
             "direction_id": cid,
             "prs_merged": merged,
             "auto_paused": auto_paused,
@@ -786,8 +801,8 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
             "generalized_success": generalized_success,
         }
         if gen_successes != merged:
-            entry["generalized_successes"] = gen_successes
-        created_breakdown.append(entry)
+            created_entry["generalized_successes"] = gen_successes
+        created_breakdown.append(created_entry)
 
     retired_breakdown: list = []
     retired_good = 0
@@ -873,7 +888,7 @@ def _build_strategic_effectiveness(
     def _direction_lifetime_merged(d: dict) -> int:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
-        return sum(h.get("prs_merged", 0) for h in history) + (
+        return sum(int(h.get("prs_merged") or 0) for h in history) + int(
             agg.get("total_prs_merged") or 0
         )
 
@@ -882,8 +897,9 @@ def _build_strategic_effectiveness(
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         return sum(
-            h.get("generalized_successes", h.get("prs_merged", 0)) for h in history
-        ) + (agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+            int(h.get("generalized_successes", h.get("prs_merged", 0)) or 0)
+            for h in history
+        ) + int(agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
 
     recent = completed[-5:]
     cycle_metrics: list = []
@@ -993,7 +1009,7 @@ def _compute_prediction_calibration_factor(
         d.get("id"): d for d in (project.directions or []) if d.get("id")
     }
 
-    ratios: list = []
+    ratios: list[float] = []
     cycles_seen = 0
 
     for entry in reversed(cycle_history):
@@ -1006,7 +1022,7 @@ def _compute_prediction_calibration_factor(
         if cycles_seen > lookback_cycles:
             break
         for direction_id, prediction in created_predictions.items():
-            predicted = prediction.get("similar_past_merges") or 0
+            predicted = float(prediction.get("similar_past_merges") or 0)
             if predicted <= 0:
                 continue
             d = directions_by_id.get(direction_id)
@@ -1018,9 +1034,12 @@ def _compute_prediction_calibration_factor(
             # prediction against degraded/unverified merges would teach the
             # predictor that work shipped when it did not. Legacy fallback handled
             # by verified_merged_count / the aggregate .get chain.
-            actual = sum(verified_merged_count(h) for h in history) + (
-                agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
-                or 0
+            actual = float(
+                sum(verified_merged_count(h) for h in history)
+                + int(
+                    agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+                    or 0
+                )
             )
             ratios.append(actual / predicted)
 

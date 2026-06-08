@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink } from 'lucide-react';
 import { fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
-import { isSafeUrl } from './TaskCard';
+import { ResolvedReferenceLink } from './TaskCard';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -134,6 +134,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                   <div className="text-[10px] text-neutral-500 font-mono mt-0.5 break-words">
                     {job.backend}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
+                    {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                   </div>
                 </div>
                 <span
@@ -182,21 +183,31 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
               {job.result_reference && (
                 <div className="mt-1.5 flex items-start gap-1.5 text-[10px] text-neutral-400 font-mono break-words">
                   <span className="shrink-0 text-neutral-500">Result</span>
-                  {isSafeUrl(job.result_reference) ? (
-                    <a
-                      href={job.result_reference}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-sky-300 hover:text-sky-200 hover:underline break-all min-w-0"
-                    >
-                      <span className="break-all">{job.result_reference}</span>
-                      <ExternalLink className="w-3 h-3 shrink-0" />
-                    </a>
-                  ) : (
-                    <span className="break-all text-neutral-300">{job.result_reference}</span>
-                  )}
+                  <ResolvedReferenceLink
+                    projectId={projectId}
+                    reference={job.result_reference}
+                    className="inline-flex items-center gap-1 text-sky-300 hover:text-sky-200 hover:underline break-all min-w-0 text-left disabled:opacity-70"
+                  >
+                    <span className="break-all">{job.result_reference}</span>
+                    <ExternalLink className="w-3 h-3 shrink-0" />
+                  </ResolvedReferenceLink>
                 </div>
               )}
+              {!isComputeJobActive(job) && job.accelerator_type && (() => {
+                const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+                if (!metrics) return null;
+                const entries = Object.entries(metrics);
+                if (entries.length === 0) return null;
+                return (
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono">
+                    {entries.map(([k, v]) => (
+                      <span key={k}>
+                        <span className="text-neutral-500">{k}:</span> {String(v)}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
           );
         })}

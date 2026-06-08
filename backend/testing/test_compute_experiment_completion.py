@@ -15,15 +15,21 @@ the forward gate rather than completing clean.
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.compute_experiment_contract import (
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
+    COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
+)
 from app.compute_backends import (
     ComputeCostResult,
     ComputeLaunchResult,
@@ -31,6 +37,8 @@ from app.compute_backends import (
 )
 from app.database import resolve_async_engine
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -160,6 +168,79 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+
+
+@pytest.mark.asyncio
+async def test_compute_result_artifact_logical_key_delivered_to_dependent(
+    db_session, _quiet_compute_io
+):
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    result_reference = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=result_reference),
+        db_session,
+    )
+
+    await db_session.refresh(job)
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
+    assert artifact.logical_key == "experiment-result-bundle"
+    assert artifact.storage_uri == result_reference
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs == [
+        {
+            "artifact_id": str(artifact.id),
+            "logical_key": "experiment-result-bundle",
+            "artifact_type": ArtifactType.COMPUTE_RESULT.value,
+            "source_task_id": str(task.id),
+            "storage_uri": result_reference,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -614,6 +695,92 @@ async def test_compute_knowledge_delivered_to_queued_dependent(
     assert prereqs[0]["source_task_id"] == str(task.id)
 
 
+@pytest.mark.asyncio
+async def test_prerequisite_measured_negative_completes_and_delivers_while_broken_fails(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode treats the criterion as advisory, not as the gate.
+
+    A measured negative result still completes and delivers durable knowledge to
+    its queued dependent, while a broken run with no measured verdict still
+    fails and delivers nothing.
+    """
+    from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+
+    negative = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    negative.context = {
+        **(negative.context or {}),
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+        ),
+    }
+    negative_dependent = Task(
+        project_id=negative.project_id,
+        title="act on negative measurement",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(negative.id)],
+    )
+    db_session.add(negative)
+    db_session.add(negative_dependent)
+    await db_session.commit()
+    await db_session.refresh(negative)
+    await db_session.refresh(negative_dependent)
+
+    await _handle_compute_experiment_completion(
+        negative, _result_artifact(accuracy=0.42), db_session
+    )
+
+    await db_session.refresh(negative)
+    await db_session.refresh(negative_dependent)
+    assert negative.status == TaskStatus.COMPLETED
+    assert negative.plan_output["compute_result"]["criterion"]["met"] is False
+    assert negative.context["compute_success_criterion"]["met"] is False
+    negative_docs = await _knowledge_docs_for(db_session, negative)
+    assert len(negative_docs) == 1
+    negative_prereqs = (negative_dependent.context or {}).get(
+        KNOWLEDGE_PREREQUISITES_KEY
+    )
+    assert negative_prereqs and negative_prereqs[0]["source_task_id"] == str(
+        negative.id
+    )
+
+    broken = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    broken.context = {
+        **(broken.context or {}),
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+        ),
+    }
+    broken_dependent = Task(
+        project_id=broken.project_id,
+        title="act on broken measurement",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(broken.id)],
+    )
+    db_session.add(broken)
+    db_session.add(broken_dependent)
+    await db_session.commit()
+    await db_session.refresh(broken)
+    await db_session.refresh(broken_dependent)
+
+    await _handle_compute_experiment_completion(
+        broken, json.dumps({"job_id": "job-broken", "status": "FAILED"}), db_session
+    )
+
+    await db_session.refresh(broken)
+    await db_session.refresh(broken_dependent)
+    assert broken.status == TaskStatus.FAILED
+    assert broken.context["evaluation_gate"]["passed"] is False
+    assert await _knowledge_docs_for(db_session, broken) == []
+    assert (broken_dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
+
+
 # ── Full lifecycle: substrate kill → task completion ────────────────────────
 
 
@@ -823,3 +990,252 @@ async def test_lifecycle_success_completes_through_task(
     assert task.status == TaskStatus.COMPLETED
     assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
     assert task.plan_output["compute_result"]["final_cost_usd"] == pytest.approx(0.03)
+
+
+# ── Cited LLM analysis over durable artifacts as acceptance evidence ──────────
+
+
+async def _setup_durable_job_with_artifact(
+    db_session,
+    task: Task,
+    *,
+    accuracy: float = 0.93,
+    file_count: int = 3,
+) -> tuple[ComputeJob, str]:
+    """Create a terminal ComputeJob whose durable artifacts SURVIVED VM teardown.
+
+    Mirrors the artifact-survival scaffolding already shipped on this branch: a
+    per-job artifact bundle URI, an auto-populated COMPUTE_RESULT Artifact row
+    whose ``.logs`` JSON carries ``artifact_uri``/``file_count``, preserved numeric
+    metrics on ``polling_metadata['result_metrics']``, and the job pointing at the
+    artifact via ``artifact_id``. Returns ``(job, artifact_uri)``.
+    """
+    # create_compute_job rejects a terminal task; the experiment is still running
+    # when its job is launched. The completion handler drives it to COMPLETED.
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    artifact_uri = f"gs://test-bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz"
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri=artifact_uri,
+        logs=json.dumps(
+            {
+                "compute_job_id": str(job.id),
+                "backend": "gcp_batch",
+                "artifact_uri": artifact_uri,
+                "file_count": file_count,
+                "outcome": "SUCCESS",
+                "final_cost_usd": 0.37,
+            },
+            sort_keys=True,
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Simulate VM teardown: the job is terminal, the durable artifact + preserved
+    # metrics remain on the row, and the artifact is re-readable post-teardown.
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.completed_at = datetime.utcnow()
+    job.artifact_id = artifact.id
+    job.result_reference = artifact_uri
+    job.polling_metadata = {"result_metrics": {"accuracy": accuracy}}
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    return job, artifact_uri
+
+
+def _mock_anthropic_returning(citations: list[str]):
+    """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
+    fake_text = json.dumps(
+        {
+            "title": "Analysis: X speeds up Y on bench-suite-v2",
+            "summary": (
+                "Grounded analysis of the durable artifacts: the run reached "
+                "accuracy 0.93, clearing the declared bar, and the checkpoints "
+                "and metrics survive VM teardown."
+            ),
+            "body": (
+                "# Compute experiment analysis\n\n"
+                "The experiment produced durable artifacts and a measured "
+                "accuracy that meets the success criterion. See the cited "
+                "artifact bundle and metric references for the evidence."
+            ),
+            "source_citations": citations,
+        }
+    )
+    mock_content_item = MagicMock()
+    mock_content_item.text = fake_text
+    mock_resp = MagicMock()
+    mock_resp.content = [mock_content_item]
+    mock_create = AsyncMock(return_value=mock_resp)
+    mock_messages = MagicMock()
+    mock_messages.create = mock_create
+    mock_client = MagicMock()
+    mock_client.messages = mock_messages
+    return MagicMock(return_value=mock_client), mock_create
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_knowledge_uses_llm_with_artifact_citations(
+    db_session, mocker, _quiet_compute_io
+):
+    """The PRIMARY path persists a cited LLM analysis over the durable artifacts.
+
+    Runs a compute_experiment to terminal completion, simulates VM teardown,
+    re-reads the durable artifact, and asserts the persisted KnowledgeDocument
+    carries REAL artifact/metric citations (resolving to durable evidence, not a
+    bare result_reference) and was produced by the LLM path.
+    """
+    # Signed-URL minting hits GCS; force the optional best-effort path to no-op so
+    # the candidate citation set is deterministic (artifact + metric refs only).
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    result_reference = "https://signed.example.com/jobs/result.json"
+    mock_cls, mock_create = _mock_anthropic_returning([artifact_uri, metric_ref])
+
+    logs = _result_artifact(
+        job_id=str(job.id),
+        accuracy=0.93,
+        result_reference=result_reference,
+    )
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    # The LLM was actually invoked over the assembled evidence.
+    mock_create.assert_awaited_once()
+    prompt = mock_create.await_args.kwargs["messages"][0]["content"]
+    assert artifact_uri in prompt  # grounded in the durable artifact bundle
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.source_kind == "compute_experiment"
+    # REAL artifact/metric citations, NOT just the bare result_reference.
+    assert artifact_uri in doc.source_citations
+    assert metric_ref in doc.source_citations
+    assert result_reference not in doc.source_citations
+    # Produced by the LLM path and the verdict records the mode + measured facts.
+    verdict = doc.forward_quality_verdict
+    assert verdict["analysis_mode"] == "llm"
+    assert verdict["outcome"] == "SUCCESS"
+    assert verdict["criterion_met"] is True
+    assert verdict["criterion"]["value"] == pytest.approx(0.93)
+    # The LLM-authored prose replaced the deterministic template body.
+    assert "analysis" in doc.body.lower()
+    assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
+    # The compute_result the handler owns is untouched by the knowledge pass.
+    assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_knowledge_falls_back_without_llm(
+    db_session, _quiet_compute_io
+):
+    """With no ANTHROPIC_API_KEY the deterministic outcome/cost/criterion document
+    is persisted unchanged — durable knowledge never depends on the LLM."""
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    result_reference = "https://signed.example.com/jobs/result.json"
+    logs = _result_artifact(
+        job_id=str(job.id),
+        accuracy=0.93,
+        result_reference=result_reference,
+    )
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.forward_quality_verdict["analysis_mode"] == "fallback"
+    assert doc.forward_quality_verdict["outcome"] == "SUCCESS"
+    # Deterministic template: the only citation is the bare result_reference, and
+    # the body is the hardcoded verdict markdown.
+    assert doc.source_citations == [result_reference]
+    assert "Compute experiment verdict" in doc.body
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_knowledge_falls_back_on_ungrounded_citation(
+    db_session, mocker, _quiet_compute_io
+):
+    """If the LLM returns only an ungrounded / bare-result citation it fails the
+    citation gate and the deterministic document is persisted instead."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    result_reference = "https://signed.example.com/jobs/result.json"
+    # The model cites a fabricated URL that is NOT in the durable evidence set,
+    # plus the bare result_reference — neither grounds the doc in real artifacts.
+    mock_cls, _ = _mock_anthropic_returning(
+        ["https://fabricated.example.com/made-up", result_reference]
+    )
+    logs = _result_artifact(
+        job_id=str(job.id),
+        accuracy=0.93,
+        result_reference=result_reference,
+    )
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    assert docs[0].source_citations == [result_reference]

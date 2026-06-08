@@ -258,6 +258,9 @@ async def test_reconcile_promotion_failed_records_promotion_custom_branches(
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
+    # The qualifier's composite confidence must survive into the reconcile-
+    # recorded promotion so the announcement / verdict report the true score.
+    assert version.last_qualification["confidence"] == 0.95
 
 
 @pytest.mark.asyncio
@@ -311,6 +314,70 @@ async def test_reconcile_pending_auto_merge_records_promotion_custom_branches(
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
+    # Confidence carried from the pending qualifier record into the promotion.
+    assert version.last_qualification["confidence"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_calls_get_branch_sha_valid_signature(
+    db_session, mocker
+):
+    """Regression: the reconcile path must call ``github.get_branch_sha`` with a
+    signature the real function accepts.  Both reconcile sites pass
+    ``project_id=...``; before ``get_branch_sha`` grew that kwarg every call
+    raised ``TypeError`` (swallowed by the broad ``except`` as a warning) so the
+    promotion target's HEAD was never resolved and ``promoted_sha`` silently fell
+    back to ``candidate_sha``.  An ``autospec`` mock binds the REAL signature, so
+    a bad call here raises just as it would in production."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    # autospec binds the real get_branch_sha signature: passing project_id is now
+    # valid; the pre-fix signature (no project_id param) would raise TypeError.
+    branch_sha = mocker.patch(
+        "app.github.get_branch_sha", autospec=True, return_value="release0" * 5
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.9657,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/acme/widget/pull/42",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    # get_branch_sha was actually called (not swallowed as a TypeError) and with
+    # the project_id kwarg threaded through.
+    branch_sha.assert_awaited()
+    assert branch_sha.await_args.kwargs.get("project_id") == str(version.project_id)
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    # promoted_sha resolved from the promotion target HEAD, not candidate_sha.
+    assert version.promoted_sha == "release0" * 5
+    assert version.last_qualification["confidence"] == 0.9657
 
 
 @pytest.mark.asyncio
@@ -1129,13 +1196,20 @@ from app.models import (  # noqa: E402
     DeploymentStatus,
     QualificationVerdict,
     ReleaseDeployArtifact,
+    ReleaseVersion,
 )
 from app import release_artifacts as artifact_registry  # noqa: E402
 from app.release_artifacts import (  # noqa: E402
+    AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
     ReleaseArtifactProvider,
+    _previously_deployed_sha,
+    aggregate_required_artifact_status,
     get_or_create_release_deploy_artifact,
+    is_backend_revision_artifact,
+    iter_release_artifact_providers,
 )
+from app.release_promotion import _record_promotion_success  # noqa: E402
 from app.release_reconciliation import (  # noqa: E402
     _classify_serving_outcome,
     _confirm_serving_or_fail,
@@ -1331,6 +1405,46 @@ async def _set_deploy_state(db_session, **kwargs):
     else:
         db_session.add(DeploymentState(id=1, **kwargs))
     await db_session.commit()
+
+
+@pytest.fixture(autouse=True)
+def _default_agent_image_gate(request, mocker):
+    """Default the agent VM image serving gate to a non-bake promotion.
+
+    The ``agent_image`` provider is registered REQUIRED, so once imported it runs
+    for every promoted self-repo version the serving sweep touches.  Legacy
+    serving tests predate the gate and assert backend-only outcomes; this fixture
+    defaults the gate to "no bake-path change → confirm immediately" and stubs the
+    GitHub credential resolution + diff-base derivation so NO test hits the
+    network.  Patches target the lazy-import seams ``_check_agent_image_serving``
+    resolves at call time:
+
+      * ``app.release_promotion._resolve_github_with_session`` — the lazy import
+        inside the check (the module-level binding in ``release_reconciliation``
+        is a SEPARATE reference, so the promotion-reconcile paths are untouched).
+      * ``app.github_refs.agent_image_rebake_expected`` — the bake-diff lookup.
+      * ``app.release_artifacts._previously_deployed_sha`` — the diff base, so the
+        gate gets an observable base even when the test's DeploymentState has no
+        ``prior_deploy_sha``.
+
+    Tests marked ``agent_image_gate`` opt OUT and drive the gate themselves so the
+    bake / fleet / indeterminate branches are exercised with exactly one patch per
+    seam (no fixture-vs-test override ambiguity).
+    """
+    if request.node.get_closest_marker("agent_image_gate"):
+        return
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_artifacts._previously_deployed_sha",
+        return_value="p" * 40,
+    )
 
 
 @pytest.mark.asyncio
@@ -1544,6 +1658,23 @@ async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
     assert by_kind["synthetic_required"].serving_status == "unconfirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_A
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "unconfirmed"
+    assert state["state"] == "promoted_unconfirmed"
+    assert {entry["artifact_kind"]: entry["serving_status"] for entry in evidence} == {
+        BACKEND_REVISION_ARTIFACT_KIND: "serving_confirmed",
+        "synthetic_required": "unconfirmed",
+    }
 
     verdict = (
         (
@@ -1581,6 +1712,30 @@ async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
     assert verdict.post_promotion_outcome == "serving_confirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_A
+    refreshed_artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, refreshed_artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "serving_confirmed"
+    assert state["state"] == "promoted"
 
 
 @pytest.mark.asyncio
@@ -1663,6 +1818,22 @@ async def test_required_artifact_deadline_failure_records_reason_code(
     assert version.serving_status == "deploy_failed"
     assert version.served_sha == _SHA_A
     assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, artifacts
+    )
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert aggregate["serving_status"] == "deploy_failed"
+    assert state["state"] == "promotion_deploy_failed"
+    assert "synthetic_required" in artifact_registry.summarize_required_artifact_gap(
+        evidence
+    )
 
     verdict = (
         (
@@ -1676,6 +1847,21 @@ async def test_required_artifact_deadline_failure_records_reason_code(
         .one()
     )
     assert verdict.post_promotion_outcome == "deploy_failed"
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(
+        "synthetic_required" in (alert.message or "") for alert in alerts
+    ), "deploy-failed alert should describe the failed required artifact"
 
 
 @pytest.mark.asyncio
@@ -2307,3 +2493,492 @@ async def test_recover_skips_beyond_recovery_window(db_session):
     await db_session.refresh(version)
     assert version.serving_status == "deploy_failed"
     assert version.served_sha is None
+
+
+# ===========================================================================
+# Agent VM image serving gate — the agent_image release deploy artifact.
+#
+# A self-repo promotion whose diff touches the agent VM image bake paths
+# (agent/ or infra/packer/) is only fully served once a fresh agent image is
+# baked AND the running fleet is observed serving the promoted source SHA.  The
+# agent_image provider makes that a REQUIRED serving-verified artifact so the
+# aggregate serving status (and therefore the operator panel + strategist
+# payload) reflects real fleet-serving truth.  These tests pin the four
+# contract behaviors, mocking GitHub I/O / fleet observation at the service
+# boundary (the autouse _default_agent_image_gate fixture is re-patched here).
+# ===========================================================================
+
+
+async def _aggregate_serving_status(db_session, version_id):
+    """Compute the operator-facing aggregate serving status from artifact rows.
+
+    Mirrors how the version-lifecycle view / strategist payload derive truth:
+    over the REQUIRED registered providers + their persisted artifact rows, not
+    the legacy ``version.serving_status`` scalar (which only ever mirrors the
+    backend_revision artifact)."""
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    providers = {p.artifact_kind: p for p in iter_release_artifact_providers()}
+    rows = [(providers[a.artifact_kind], a) for a in artifacts if a.artifact_kind in providers]
+    status, _reason = aggregate_required_artifact_status(rows)
+    return status
+
+
+def test_previously_deployed_sha_uses_prior_when_current_advanced():
+    """When the post-promotion revision already advanced current_sha to the
+    promoted SHA, the diff base is the recorded prior_deploy_sha."""
+    ds = DeploymentState(
+        id=1, current_sha=_SHA_A, prior_deploy_sha=_SHA_B, deployed_at=_utcnow()
+    )
+    assert _previously_deployed_sha(ds, _SHA_A) == _SHA_B
+
+
+def test_previously_deployed_sha_uses_current_when_not_advanced():
+    """When current_sha still holds the pre-promotion serving SHA, that is the
+    diff base."""
+    ds = DeploymentState(
+        id=1, current_sha=_SHA_B, prior_deploy_sha="c" * 40, deployed_at=_utcnow()
+    )
+    assert _previously_deployed_sha(ds, _SHA_A) == _SHA_B
+
+
+def test_previously_deployed_sha_indeterminate_returns_none():
+    """No DeploymentState, or current==promoted with no prior, is an
+    unobservable diff base → None (indeterminate)."""
+    assert _previously_deployed_sha(None, _SHA_A) is None
+    ds = DeploymentState(
+        id=1, current_sha=_SHA_A, prior_deploy_sha=None, deployed_at=_utcnow()
+    )
+    assert _previously_deployed_sha(ds, _SHA_A) is None
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, mocker):
+    """(a) A self-repo promotion that TOUCHES the bake paths stays unconfirmed
+    until the fleet reports the promoted SHA, then flips to serving_confirmed."""
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=True),
+    )
+    fleet = mocker.patch(
+        "app.compute.fleet_serving_source_sha",
+        new=AsyncMock(return_value=False),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # Backend revision boots serving the promoted SHA — it confirms; the agent
+    # image gate alone keeps the aggregate unconfirmed.  prior_deploy_sha gives
+    # the bake-diff an observable base (the SHA serving before this promotion).
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {a.artifact_kind: a for a in artifacts}
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "unconfirmed"
+    fleet.assert_awaited()
+    # The operator-facing aggregate stays NOT fully serving even though the
+    # backend revision booted — the agent image has not reached the fleet.
+    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+
+    # The fleet now reports the promoted SHA — the agent image is live and the
+    # aggregate confirms.
+    fleet.return_value = True
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=30),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {a.artifact_kind: a for a in artifacts}
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].served_identifier == _SHA_A
+    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_non_bake_confirms_immediately(db_session, mocker):
+    """(b) A self-repo promotion that does NOT touch the bake paths confirms the
+    agent_image artifact immediately (without consulting the fleet) so the
+    aggregate tracks the backend revision alone."""
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=False),
+    )
+    fleet = mocker.patch(
+        "app.compute.fleet_serving_source_sha",
+        new=AsyncMock(return_value=False),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {a.artifact_kind: a for a in artifacts}
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].served_identifier == _SHA_A
+    # No bake expected → the fleet is never consulted.
+    fleet.assert_not_awaited()
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_indeterminate_rebake_lookup_stays_unconfirmed(
+    db_session, mocker
+):
+    """(c) An indeterminate rebake lookup (API/ref error → None) is treated as
+    NOT-YET-CONFIRMED, never deploy_failed — even past the confirmation
+    deadline the agent_image artifact never lands a deploy_failed of its own."""
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=None),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    # Within the window: agent_image cannot decide → aggregate unconfirmed.
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    assert version.deploy_failure_reason is None
+
+    # Past the deadline the agent_image gate STILL does not fail — indeterminate
+    # signals are never escalated to deploy_failed by this provider.
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(hours=2),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == AGENT_IMAGE_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert artifact.serving_status == "unconfirmed"
+    assert artifact.reason_code is None
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
+    db_session, mocker
+):
+    """(c) A bake IS expected but no fleet VM has reported a source SHA yet —
+    the fleet observation is indeterminate → not-yet-confirmed, never
+    deploy_failed."""
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.compute.fleet_serving_source_sha",
+        new=AsyncMock(return_value=False),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(hours=2),  # past the deadline
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    # Aggregate stays NOT fully serving (never deploy_failed) and the agent_image
+    # artifact carries no failure reason — indeterminate fleet ≠ failed deploy.
+    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    assert version.deploy_failure_reason is None
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == AGENT_IMAGE_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert artifact.serving_status == "unconfirmed"
+    assert artifact.reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_self_repo_promotion_creates_both_serving_artifacts(db_session):
+    """A self-repo promotion opens the multi-artifact serving window: BOTH the
+    backend_revision and agent_image artifacts are created with the confirmation
+    deadline, alongside an unconfirmed version serving status."""
+    project = Project(
+        name="Promote-SelfRepo",
+        user_id="promote-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        "cand" * 10,
+        {"status": "promoted", "confidence": 0.9},
+        "https://github.com/acme/widget/pull/7",
+        promoted_sha=_SHA_A,
+        lock_released=False,
+    )
+    await db_session.commit()
+    assert result["status"] == "promoted"
+
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+    assert version.deploy_confirm_deadline is not None
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    kinds = {a.artifact_kind for a in artifacts}
+    assert kinds == {BACKEND_REVISION_ARTIFACT_KIND, AGENT_IMAGE_ARTIFACT_KIND}
+    for a in artifacts:
+        assert a.confirmation_deadline == version.deploy_confirm_deadline
+
+
+@pytest.mark.asyncio
+async def test_non_self_repo_promotion_creates_no_agent_image_artifact(db_session):
+    """(d) A non-self-repo promotion is unaffected: NO serving artifacts are
+    created (no agent_image) and serving_status stays NULL."""
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        "cand" * 10,
+        {"status": "promoted", "confidence": 0.9},
+        "https://github.com/acme/widget/pull/9",
+        promoted_sha=_SHA_A,
+        lock_released=False,
+    )
+    await db_session.commit()
+    assert result["status"] == "promoted"
+
+    await db_session.refresh(version)
+    assert version.serving_status is None
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == []
+
+
+def test_summarize_skips_absent_required_non_backend_provider():
+    """A promoted version with a CONFIRMED backend_revision row and NO
+    agent_image row must NOT be stranded ``unconfirmed`` by the absent required
+    non-backend provider.
+
+    This guards the ``summarize_release_artifacts`` missing-required-non-backend
+    -row branch directly: the absent provider contributes a vacuous (``None``)
+    evidence row that is excluded from the aggregate, so the aggregate is
+    computed over the rows that actually exist (here, the confirmed
+    backend_revision alone) and resolves to ``serving_confirmed`` — not the
+    false-negative ``unconfirmed`` the prior behavior produced. Operator-facing
+    serving truth flows from this aggregate into admin_release_version,
+    strategic_spawning, and release_reconciliation, so a regression here would
+    silently flip every such promoted version to a permanent false-negative.
+    """
+    # Precondition: the agent_image provider must be registered REQUIRED, else
+    # this test would not exercise the absent-required-non-backend-row branch.
+    agent_provider = artifact_registry._ARTIFACT_PROVIDERS[AGENT_IMAGE_ARTIFACT_KIND]
+    assert agent_provider.required is True
+    assert not is_backend_revision_artifact(AGENT_IMAGE_ARTIFACT_KIND)
+
+    version = ReleaseVersion(
+        project_id=1,
+        version_number=1,
+        status="promoted",
+        promoted_sha=_SHA_A,
+        served_sha=_SHA_A,
+        serving_status="serving_confirmed",
+    )
+    backend_row = ReleaseDeployArtifact(
+        version_id=1,
+        artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+        serving_status="serving_confirmed",
+        served_identifier=_SHA_A,
+    )
+
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(
+        version, [backend_row]
+    )
+
+    # The aggregate is NOT stranded unconfirmed by the absent agent_image row.
+    assert aggregate["serving_status"] == "serving_confirmed"
+    assert aggregate["reason_code"] is None
+
+    by_kind = {entry["artifact_kind"]: entry for entry in evidence}
+    # The absent required provider is surfaced as a vacuous (None) evidence row
+    # rather than being silently dropped — it just does not feed the aggregate.
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] == (
+        "serving_confirmed"
+    )
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["serving_status"] is None
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["required"] is True

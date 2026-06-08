@@ -41,7 +41,7 @@ import {
   buildReviewScopeOverflowPreamble, buildReviewScopeBudgetSection,
   buildReviewFixResponsesIntro,
   buildReviewMasterPreamble, buildReviewDiffAccessHint,
-  buildReviewCoreGuidance,
+  buildReviewCoreGuidance, buildReviewVerdictInstructions,
   buildRollupReviewGuidance, buildPlannedFilesClassificationGuidance,
   computeReviewPromptFingerprint,
 } from '../prompts/review-prompt.js';
@@ -50,6 +50,7 @@ export {
   computeReviewPromptFingerprint,
   buildTypeCheckInstructions,
 } from '../prompts/review-prompt.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 
 // ── Extracted helper modules ──────────────────────────────────────────────────
 import { annotateResolvedIssues, fmtAnnotatedIssue } from './review-fix-issue-dedup.js';
@@ -578,33 +579,62 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   // downstream fix agent so it can start from the reviewer's locations
   // instead of redoing the investigation from scratch.
   const investigatedFiles = extractInvestigatedFiles(snapshotToolTrace());
-  try {
-    if (fs.existsSync(`/tmp/review_verdict_${taskId}.json`)) {
-      const verdictJson = fs.readFileSync(`/tmp/review_verdict_${taskId}.json`, 'utf-8').trim();
-      // Validate it's actual verdict JSON
-      const parsed = JSON.parse(verdictJson) as Record<string, unknown>;
-      if (parsed.verdict) {
-        // Inject investigated_files alongside the agent-emitted verdict
-        // fields, then re-serialize. Capped to keep verdict_json under
-        // schemas.StatusUpdate.verdict_json max_length=10000.
-        if (investigatedFiles.length > 0 && !parsed.investigated_files) {
-          parsed.investigated_files = investigatedFiles.slice(0, 25);
-        }
-        if (parallelReviewInjected) {
-          parsed.review_was_parallelized = true;
-        }
-        const augmented = JSON.stringify(parsed);
-        verdictJsonField = augmented;
-        // Also append to logs for backwards compatibility
-        const reviewText = sanitize(lastResultText || allOutput.slice(-50_000));
-        logs = reviewText + '\n\n' + augmented;
-        sendLog(ws, `Verdict read from file: ${typeof parsed.verdict === 'string' ? parsed.verdict : JSON.stringify(parsed.verdict)}\n`);
-      }
+  const reviewOutput = sanitize(lastResultText || allOutput.slice(-50_000));
+  function augmentVerdict(parsed: Record<string, unknown>): string {
+    const augmented = { ...parsed };
+    if (investigatedFiles.length > 0 && !augmented.investigated_files) {
+      augmented.investigated_files = investigatedFiles.slice(0, 25);
     }
-  } catch { /* fall through to output parsing */ }
+    if (parallelReviewInjected) {
+      augmented.review_was_parallelized = true;
+    }
+    return JSON.stringify(augmented);
+  }
+  function readReviewVerdictFromTempFile(): Record<string, unknown> | null {
+    const verdictPath = `/tmp/review_verdict_${taskId}.json`;
+    if (!fs.existsSync(verdictPath)) return null;
+    try {
+      const verdictJson = fs.readFileSync(verdictPath, 'utf-8').trim();
+      const parsed = JSON.parse(verdictJson) as Record<string, unknown>;
+      return parsed.verdict ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  const parsedVerdict = readReviewVerdictFromTempFile();
+  if (parsedVerdict) {
+    // Inject investigated_files alongside the agent-emitted verdict fields,
+    // then re-serialize. Capped to keep verdict_json under
+    // schemas.StatusUpdate.verdict_json max_length=10000.
+    const augmented = augmentVerdict(parsedVerdict);
+    verdictJsonField = augmented;
+    // Also append to logs for backwards compatibility
+    logs = reviewOutput + '\n\n' + augmented;
+    sendLog(ws, `Verdict read from file: ${typeof parsedVerdict.verdict === 'string' ? parsedVerdict.verdict : JSON.stringify(parsedVerdict.verdict)}\n`);
+  }
 
   if (!logs) {
-    logs = sanitize(lastResultText || allOutput.slice(-50_000));
+    logs = reviewOutput;
+  }
+
+  if (!verdictJsonField && exitCode === 0) {
+    const repair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['verdict'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: buildReviewVerdictInstructions(taskId),
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Retrying review verdict extraction...',
+    });
+    if (repair.value !== null) {
+      verdictJsonField = augmentVerdict(repair.value);
+      logs = reviewOutput + '\n\n' + verdictJsonField;
+      sendLog(ws, `Verdict recovered via repair: ${typeof repair.value.verdict === 'string' ? repair.value.verdict : JSON.stringify(repair.value.verdict)}\n`);
+    }
   }
 
   // Surface the PR's current changed-file list to the orchestrator so the
@@ -1138,17 +1168,32 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
           phaseLabel: 'CI failure repro',
         },
       );
+      // ./check now VERIFIES these exact selectors locally (sanctioned
+      // harness, targeted run) and ./pr open gates on ./check — so the push
+      // is blocked until the CI-failing tests pass. Tell the agent so the
+      // gate failure is expected, not a surprise.
+      const ciGateNote =
+        `These selector(s) are now part of your ./check gate: ./check runs them via the sanctioned ` +
+        `test harness and ./pr open will NOT push until they pass locally. Iterate edit → ./check until ` +
+        `the targeted CI selector(s) are green, then ./pr open.\n`;
       if (repro.failureSummary) {
         enrichedPrompt =
           `## Local targeted CI repro\n` +
           `The CI-failing pytest selector(s) were reproduced locally before edits. Use this focused output as the primary failure evidence:\n\n` +
           `${repro.failureSummary.slice(-5000)}\n\n` +
+          ciGateNote + `\n` +
           enrichedPrompt;
       } else if (repro.passed) {
         enrichedPrompt =
           `## Local targeted CI repro\n` +
           `The CI-failing pytest selector(s) passed locally before edits. Re-check whether the CI failure is stale, environment-specific, or covered by another failing check before changing code.\n\n` +
+          ciGateNote + `\n` +
           enrichedPrompt;
+      } else {
+        // Repro neither produced a failure summary nor cleanly passed (e.g.
+        // an infra error in the pre-edit repro). The ./check gate still runs
+        // the selectors, so the agent must know it's there.
+        enrichedPrompt = `## CI failure selectors\n` + ciGateNote + `\n` + enrichedPrompt;
       }
     } else {
       sendLog(ws, 'No pytest selectors could be extracted from CI failure logs — skipping targeted repro and relying on CI context plus impact tests.\n');
@@ -1191,6 +1236,11 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
     buildConfig: fixBuildConfig,
+    // Close the ci_failure fix loop: thread the exact CI-failing selectors
+    // into ./check so ./pr open can't push until they pass locally. Empty for
+    // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===
+    // 'ci_failure'), so review-feedback fixes keep the existing gate untouched.
+    ciFailureSelectors,
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix

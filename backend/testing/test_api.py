@@ -459,6 +459,50 @@ async def _make_project_with_member(db_session):
 
 
 @pytest.mark.asyncio
+async def test_admin_task_artifacts_expose_storage_uri(
+    client: AsyncClient, db_session
+):
+    """Storage-backed artifacts surface their gs:// URI additively in both the
+    task-list and task-detail serializers, so operator surfaces can resolve a
+    signed download. The field is always present (null for non-storage
+    artifacts) and existing fields stay intact."""
+    project = await _make_project_with_member(db_session)
+    task = Task(
+        project_id=project.id,
+        title="screenshot task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(task)
+    await db_session.flush()
+    storage_uri = f"gs://blueprint-agent-artifacts/tasks/{task.id}/plot.png"
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=storage_uri,
+        )
+    )
+    await db_session.commit()
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    listed = next(
+        t for t in list_resp.json()["tasks"] if t["id"] == str(task.id)
+    )
+    list_arts = listed["artifacts"]
+    assert len(list_arts) == 1
+    assert list_arts[0]["storage_uri"] == storage_uri
+    # Additive — existing fields remain.
+    assert "artifact_type" in list_arts[0]
+
+    detail_resp = await client.get(f"/api/admin/tasks/{task.id}")
+    assert detail_resp.status_code == 200
+    detail_arts = detail_resp.json()["artifacts"]
+    assert detail_arts[0]["storage_uri"] == storage_uri
+
+
+@pytest.mark.asyncio
 async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_session):
     """Both the list and detail admin task endpoints should expose estimated_cost_usd
     computed from VM provisioning timestamps and the spot/on-demand rate. Tasks with

@@ -1,8 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle } from 'lucide-react';
-import { isSafeUrl } from './TaskCard';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu } from 'lucide-react';
+import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
-import { fetchKnowledgeDocuments, fetchKnowledgeDocument, type KnowledgeDocument, type KnowledgeForwardQualityVerdict } from '../api';
+import {
+  fetchKnowledgeDocuments,
+  fetchKnowledgeDocument,
+  type KnowledgeCitation,
+  type KnowledgeDocument,
+  type KnowledgeForwardQualityVerdict,
+} from '../api';
 import { parseTimestamp } from '../utils/time';
 
 interface KnowledgeBrowserProps {
@@ -24,13 +30,17 @@ function relativeDate(dateStr: string | null): string {
 }
 
 /** A citation can be a bare URL string or an object with ref/url/title/excerpt. */
-function citationParts(c: unknown): { href: string | null; label: string; excerpt?: string } {
-  if (typeof c === 'string') return { href: isSafeUrl(c) ? c : null, label: c };
-  const o = (c ?? {}) as Record<string, unknown>;
-  const href = typeof o.url === 'string' ? o.url : typeof o.ref === 'string' ? o.ref : null;
-  const label = typeof o.title === 'string' ? o.title : href ?? JSON.stringify(o);
-  const excerpt = typeof o.excerpt === 'string' ? o.excerpt : undefined;
-  return { href: href && isSafeUrl(href) ? href : null, label, excerpt };
+function citationParts(c: KnowledgeCitation | null | undefined): { reference: string | null; label: string; excerpt?: string } {
+  if (typeof c === 'string') return { reference: c, label: c };
+  if (!c || typeof c !== 'object') {
+    const label = JSON.stringify(c) ?? String(c);
+    return { reference: null, label };
+  }
+  const record = c as Partial<Record<'ref' | 'url' | 'title' | 'excerpt', unknown>>;
+  const href = typeof record.url === 'string' ? record.url : typeof record.ref === 'string' ? record.ref : null;
+  const label = typeof record.title === 'string' && record.title.length > 0 ? record.title : href ?? JSON.stringify(c) ?? 'Unknown citation';
+  const excerpt = typeof record.excerpt === 'string' ? record.excerpt : undefined;
+  return { reference: href, label, excerpt };
 }
 
 /**
@@ -41,11 +51,12 @@ function citationParts(c: unknown): { href: string | null; label: string; excerp
 const SOURCE_KIND_STYLES: Record<string, { bg: string; text: string; icon: typeof FileCode; label: string }> = {
   design: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-300', icon: FileCode, label: 'Design' },
   web_research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-300', icon: Globe, label: 'Web Research' },
+  compute_experiment: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-300', icon: Cpu, label: 'Compute' },
   unknown: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: HelpCircle, label: 'Unknown' },
 };
 
 /** Selectable origins for the filter control (order matters for the segmented control). */
-const SOURCE_KIND_OPTIONS = ['design', 'web_research', 'unknown'] as const;
+const SOURCE_KIND_OPTIONS = ['design', 'web_research', 'compute_experiment', 'unknown'] as const;
 
 function SourceKindBadge({ kind }: { kind?: string }) {
   if (!kind) return null;
@@ -304,11 +315,20 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-1">Citations</div>
                 <ul className="space-y-1 text-[11px]">
                   {selected.source_citations.map((c, i) => {
-                    const { href, label, excerpt } = citationParts(c);
+                    const { reference, label, excerpt } = citationParts(c);
+                    const resolvableReference = reference && (isSafeUrl(reference) || isResolvableStorageUri(reference))
+                      ? reference
+                      : null;
                     return (
                       <li key={i} className="leading-snug">
-                        {href ? (
-                          <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 break-all">{label}</a>
+                        {resolvableReference ? (
+                          <ResolvedReferenceLink
+                            projectId={selectedProjectId}
+                            reference={resolvableReference}
+                            className="text-blue-400 hover:text-blue-300 break-all text-left"
+                          >
+                            {label}
+                          </ResolvedReferenceLink>
                         ) : (
                           <span className="text-neutral-300 break-all">{label}</span>
                         )}
@@ -407,11 +427,19 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               )}
               {docs.map(doc => (
                 // reason: document card opener in compact results list; px-3 py-2.5 row matches list density
-                <button
-                  data-viewport-allow-small-target
+                <div
                   key={doc.id}
+                  role="button"
+                  tabIndex={0}
+                  data-viewport-allow-small-target
                   onClick={() => openDoc(doc)}
-                  className="w-full text-left bg-neutral-900/50 border border-neutral-800 rounded-lg px-3 py-2.5 hover:bg-neutral-800/40 transition-colors"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      openDoc(doc);
+                    }
+                  }}
+                  className="w-full cursor-pointer text-left bg-neutral-900/50 border border-neutral-800 rounded-lg px-3 py-2.5 hover:bg-neutral-800/40 transition-colors"
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-neutral-200 flex-1 truncate">{doc.title}</span>
@@ -439,15 +467,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     )}
                     {(doc.tags ?? []).slice(0, 4).map(t => (
                       // reason: tag filter chip in compact card footer; text-[9px] inline control
-                      <button
-                        data-viewport-allow-small-target
-                        key={t}
-                        onClick={e => { e.stopPropagation(); setTagFilter(t); }}
-                        className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 hover:bg-neutral-700 transition-colors"
-                      >#{t}</button>
-                    ))}
-                  </div>
-                </button>
+                    <button
+                      data-viewport-allow-small-target
+                      key={t}
+                      onClick={e => { e.stopPropagation(); setTagFilter(t); }}
+                      className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 hover:bg-neutral-700 transition-colors"
+                    >#{t}</button>
+                  ))}
+                </div>
+                </div>
               ))}
             </div>
           </>

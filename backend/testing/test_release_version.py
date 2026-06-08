@@ -265,6 +265,188 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
+# compute_version_acceptance_aggregate — proven/declared-unsatisfied/undeclared
+# classification of version-window merged tasks
+# ===========================================================================
+
+
+def _landed_ctx(extra: dict | None = None) -> dict:
+    """A landed-on-integration task context, optionally with extra keys."""
+    ctx = {"pr_merged": True, "landed_on_integration": True}
+    if extra:
+        ctx.update(extra)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_classifies_each_bucket(db_session):
+    """A merged task with a satisfied verdict is `proven`, an explicitly
+    unsatisfied verdict is `declared_unsatisfied`, and one with no verdict key
+    is `undeclared`."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # proven — verdict recorded and satisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": True, "kind": "named_test"}}
+        ),
+        updated_at=_utcnow(),
+    )
+    # declared_unsatisfied — verdict recorded and explicitly NOT satisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": False, "kind": "named_test"}}
+        ),
+        updated_at=_utcnow(),
+    )
+    # undeclared — no verdict key (the common/legacy case).
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 1,
+        "declared_unsatisfied": 1,
+        "undeclared": 1,
+        "total": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_excludes_unlanded_and_non_completed(db_session):
+    """Only COMPLETED + landed tasks are classified; an unmerged completion and
+    a non-completed task are excluded from every bucket."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # Landed + declared-unsatisfied — counted.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow(),
+    )
+    # COMPLETED but never merged — excluded.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context={"code_acceptance_verdict": {"satisfied": False}},
+        updated_at=_utcnow(),
+    )
+    # In-flight with a declared verdict — excluded (not COMPLETED).
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.IN_PROGRESS,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 1,
+        "undeclared": 0,
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_respects_since_window(db_session):
+    """Tasks merged before ``since`` are outside the version window and excluded."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    # Before the window — excluded even though declared-unsatisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
+        updated_at=_utcnow() - timedelta(hours=2),
+    )
+    # Inside the window — counted.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": True}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 1,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_empty_window_zeros(db_session):
+    """An empty window returns all-zero counts, not None."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "total": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
+    """A recorded verdict that is neither satisfied nor explicitly unsatisfied
+    is fail-safe — bucketed as undeclared so it never lowers readiness."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"kind": "named_test"}}),
+        updated_at=_utcnow(),
+    )
+
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert agg == {
+        "proven": 0,
+        "declared_unsatisfied": 0,
+        "undeclared": 1,
+        "total": 1,
+    }
+
+
+# ===========================================================================
 # count_in_flight_tasks — non-terminal task count for the version-cut disclosure
 # ===========================================================================
 
@@ -672,6 +854,52 @@ def test_to_phase_block_carries_qualification_state():
     assert block["qualification_state"]["state"] == "qualifying"
 
 
+def test_to_phase_block_carries_promotion_freshness():
+    """The strategic version_phase payload inherits the in-flight freshness keys
+    via the shared qualification_state pass-through."""
+    enabled_at = (_utcnow() - timedelta(minutes=10)).isoformat()
+    version = ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        },
+    )
+    qstate = rv.to_phase_block(version)["qualification_state"]
+    assert qstate["state"] == "promotion_in_flight"
+    assert qstate["promotion_enabled_at"] == enabled_at
+    assert qstate["promotion_age_seconds"] >= 590
+    assert "promotion_past_timeout" in qstate
+
+
+def test_to_phase_block_carries_audit_crashed_state():
+    """Given a crashed audit child, to_phase_block surfaces the reconciled
+    ``audit_crashed`` qualification_state so the strategic payload never tells the
+    agent to wait on a dead audit. Default (no audit_child) stays ``qualifying``."""
+    version = ReleaseVersion(
+        version_number=5,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"status": "pending"},
+    )
+    # No audit-child signal: unchanged behavior.
+    assert rv.to_phase_block(version)["qualification_state"]["state"] == "qualifying"
+    # Crashed audit child: reconciled to audit_crashed.
+    block = rv.to_phase_block(
+        version, {"task_status": "FAILED", "report": None}
+    )
+    assert block["qualification_state"]["state"] == "audit_crashed"
+    assert "wait for the verdict" not in block["qualification_state"]["summary"].lower()
+
+
 def test_to_phase_block_qualification_state_none_when_unqualified():
     """An unqualified version (no verdict) yields qualification_state=None."""
     version = ReleaseVersion(
@@ -682,6 +910,47 @@ def test_to_phase_block_qualification_state_none_when_unqualified():
         last_qualification=None,
     )
     assert rv.to_phase_block(version)["qualification_state"] is None
+
+
+def test_to_phase_block_carries_acceptance_aggregate():
+    """to_phase_block surfaces the stored version-window acceptance aggregate
+    additively, without disturbing the existing keys."""
+    version = ReleaseVersion(
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        goal="Ship proven-vs-merged surfacing",
+    )
+    aggregate = {
+        "merged": 5,
+        "proven": 3,
+        "declared_unsatisfied": 1,
+        "merged_unverified_degraded": 1,
+        "no_declaration": 1,
+        "proven_rate": 0.6,
+    }
+    version.last_qualification = {"acceptance_aggregate": aggregate}
+    block = rv.to_phase_block(version)
+    # The aggregate passes through verbatim...
+    assert block["acceptance_aggregate"] == aggregate
+    # ...and the existing shape keys are untouched.
+    assert block["version_number"] == 3
+    assert block["goal"] == "Ship proven-vs-merged surfacing"
+
+
+def test_to_phase_block_acceptance_aggregate_none_on_legacy():
+    """A legacy version with no stored aggregate yields acceptance_aggregate=None
+    (backward-compatible) — the key is always present."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    block = rv.to_phase_block(version)
+    assert "acceptance_aggregate" in block
+    assert block["acceptance_aggregate"] is None
 
 
 # ===========================================================================
@@ -721,6 +990,216 @@ def test_qual_state_pending_with_promotion_is_promotion_in_flight():
     # The summary must NOT tell the agent the audit is still running.
     assert "passed" in state["summary"].lower()
     assert "armed" in state["summary"].lower()
+
+
+def test_summarize_qualification_state_audit_crashed_overrides_pending():
+    """A pending verdict whose audit child crashed (FAILED/CANCELLED, no report)
+    must reconcile to ``audit_crashed`` — NOT the misleading ``qualifying``/'wait
+    for the verdict' — so the panel badge and the audit-findings section agree.
+    """
+    for crashed_status in ("FAILED", "CANCELLED"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": crashed_status, "report": None},
+        )
+        assert state["state"] == "audit_crashed", crashed_status
+        # The reconciled summary must NOT tell the reader to wait for the verdict.
+        summary = state["summary"].lower()
+        assert "wait for the verdict" not in summary, crashed_status
+        assert "crashed" in summary, crashed_status
+
+    # An unknown terminal status with no report is also a crash (matches the
+    # frontend default branch).
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "ABORTED", "report": None},
+    )
+    assert state["state"] == "audit_crashed"
+
+
+def test_qual_state_pending_no_audit_signal_stays_qualifying():
+    """Without an audit-child signal (default None), behavior is unchanged."""
+    state = rv.summarize_qualification_state({"status": "pending"})
+    assert state["state"] == "qualifying"
+    # A crashed-but-with-report audit is NOT a crashed-no-report case.
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "FAILED", "report": {"score": 0.9}},
+    )
+    assert state["state"] == "qualifying"
+
+
+def test_qual_state_pending_running_audit_child_stays_qualifying():
+    """A non-terminal audit child (still running) must keep ``qualifying``."""
+    for running in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": running, "report": None},
+        )
+        assert state["state"] == "qualifying", running
+
+
+def test_qual_state_pending_blocked_and_completed_not_crashed():
+    """BLOCKED (waiting on a precondition) and COMPLETED-without-report (a
+    finished-but-empty anomaly) must NOT be misclassified as crashed."""
+    for non_crash in ("BLOCKED", "COMPLETED"):
+        state = rv.summarize_qualification_state(
+            {"status": "pending"},
+            audit_child={"task_status": non_crash, "report": None},
+        )
+        assert state["state"] == "qualifying", non_crash
+
+
+def test_qual_state_running_smoketest_does_not_mask_crashed_audit():
+    """When the audit child has already crashed, the reconciled crash state must
+    win even though finalization legitimately still waits on the smoketest — the
+    audit-child signal we thread in describes the audit, and a crashed audit is
+    reported as crashed regardless of a still-running sibling."""
+    state = rv.summarize_qualification_state(
+        {"status": "pending"},
+        audit_child={"task_status": "FAILED", "report": None},
+    )
+    assert state["state"] == "audit_crashed"
+
+
+def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():
+    """A fresh enabled_at yields additive age / auto-timeout context without
+    disturbing the existing state name or PR keys."""
+    enabled_at = (_utcnow() - timedelta(minutes=5)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    assert state["promotion_pr_number"] == 7357
+    assert state["promotion_enabled_at"] == enabled_at
+    assert state["promotion_age_seconds"] >= 290  # ~5 min, allow clock slack
+    assert state["promotion_age_seconds"] < 600
+    assert state["promotion_timeout_seconds"] > 0
+    assert state["promotion_past_timeout"] is False
+    assert state["promotion_nearing_timeout"] is False
+    # The freshness is reflected in the human summary.
+    assert "in flight" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_past_timeout():
+    """An enabled_at older than the cap flags promotion_past_timeout."""
+    from app import release_reconciliation
+
+    cap = release_reconciliation._promotion_pending_timeout_seconds()
+    enabled_at = (_utcnow() - timedelta(seconds=cap + 3600)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_past_timeout"] is True
+    assert state["promotion_nearing_timeout"] is False
+    assert "passed the auto-timeout" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_nearing_timeout():
+    """An enabled_at past 80% of the cap (but under it) flags nearing."""
+    from app import release_reconciliation
+
+    cap = release_reconciliation._promotion_pending_timeout_seconds()
+    # 90% of the cap — nearing but not past.
+    enabled_at = (_utcnow() - timedelta(seconds=cap * 0.9)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_past_timeout"] is False
+    assert state["promotion_nearing_timeout"] is True
+    assert "nearing the auto-timeout" in state["summary"].lower()
+
+
+def test_qual_state_promotion_in_flight_respects_runtime_cap_override(monkeypatch):
+    """The cap is the same configurable one the reconciliation sweep uses."""
+    from app.shared_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "promotion_pending_timeout_seconds", 600.0)
+    enabled_at = (_utcnow() - timedelta(seconds=700)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": enabled_at,
+            },
+        }
+    )
+    assert state["promotion_timeout_seconds"] == 600.0
+    assert state["promotion_past_timeout"] is True
+
+
+def test_qual_state_promotion_in_flight_missing_enabled_at_is_timeless():
+    """Missing enabled_at falls back to the prior keyless behavior, no error."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    assert state["promotion_pr_number"] == 7357
+    for key in rv._PROMOTION_FRESHNESS_KEYS:
+        assert key not in state
+
+
+def test_qual_state_promotion_in_flight_invalid_enabled_at_is_timeless():
+    """An unparseable enabled_at falls back to keyless behavior, no error."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "auto_merge_enabled": True,
+                "enabled_at": "not-a-timestamp",
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    for key in rv._PROMOTION_FRESHNESS_KEYS:
+        assert key not in state
+
+
+def test_format_promotion_freshness_phrasing():
+    """The shared 409 suffix formatter renders age + timeout state, '' when bare."""
+    assert rv.format_promotion_freshness(None) == ""
+    assert rv.format_promotion_freshness({"promotion_pr_number": 1}) == ""
+    past = rv.format_promotion_freshness(
+        {"promotion_age_seconds": 7200, "promotion_past_timeout": True}
+    )
+    assert "in flight ~2h" in past
+    assert "past auto-timeout" in past
+    nearing = rv.format_promotion_freshness(
+        {"promotion_age_seconds": 3600, "promotion_nearing_timeout": True}
+    )
+    assert "nearing auto-timeout" in nearing
 
 
 def test_qual_state_promotion_failed_surfaces_reason():

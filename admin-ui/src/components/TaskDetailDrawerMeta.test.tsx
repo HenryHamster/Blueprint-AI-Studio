@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { fetchComputeJobs } from '../api';
+import { fetchComputeJobs, resolveArtifactDownloadUrl } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -18,6 +18,7 @@ vi.mock('../api', () => ({
   API_BASE_URL: 'http://localhost:8000',
   fetchComputeJobs: vi.fn(async () => []),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
+  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -504,6 +505,62 @@ describe('DetailsTab — Merge Test Gate', () => {
       'href',
       'https://storage.example.com/jobs/job-1/result.json',
     );
+  });
+
+  it('resolves a gs:// compute result through the admin API before opening', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      {
+        id: 'job-1',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-1',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        result_reference: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    const button = await screen.findByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/result\.json/i });
+    button.click();
+    expect(await screen.findByText('gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json')).toBeInTheDocument();
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith(
+      'proj-1',
+      'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
+    );
+    expect(openSpy).toHaveBeenCalled();
+  });
+
+  it('renders storage-backed task artifacts through the signed download resolver', () => {
+    const task = makeTask({
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      artifacts: [
+        {
+          artifact_type: 'COMPUTE_RESULT',
+          storage_uri: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/artifacts/metrics.json',
+          iteration: 2,
+          created_at: '2026-01-01T00:10:00Z',
+        },
+      ],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Artifacts')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/artifacts\/metrics\.json/i })).toBeInTheDocument();
   });
 
   it('renders structured panel review verdict details without falling back to raw plan JSON', () => {

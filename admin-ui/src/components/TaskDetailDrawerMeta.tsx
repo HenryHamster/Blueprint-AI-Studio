@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle } from 'lucide-react';
-import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
+import { getHeartbeatStatus, isSafeUrl, ResolvedReferenceLink, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
@@ -62,6 +62,14 @@ function formatCreatedBy(value: string): string {
   if (value === 'ORCHESTRATOR') return 'Orchestrator';
   if (value.startsWith('AGENT_')) return `Agent (${value.slice(6)})`;
   return value;
+}
+
+function formatArtifactTypeLabel(artifactType: string): string {
+  return artifactType
+    .toLowerCase()
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
 function DirectionsSection({ directions }: { directions: { text: string; priority?: string; status?: string }[] }) {
@@ -180,19 +188,14 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
             </DetailRow>
             {job.result_reference && (
               <DetailRow label="Result">
-                {isSafeUrl(job.result_reference) ? (
-                  <a
-                    href={job.result_reference}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 hover:underline break-all"
-                  >
-                    <span className="break-all">{job.result_reference}</span>
-                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                  </a>
-                ) : (
-                  <span className="break-all text-neutral-300 font-mono text-xs">{job.result_reference}</span>
-                )}
+                <ResolvedReferenceLink
+                  projectId={projectId}
+                  reference={job.result_reference}
+                  className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 hover:underline break-all text-left disabled:opacity-70"
+                >
+                  <span className="break-all">{job.result_reference}</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </ResolvedReferenceLink>
               </DetailRow>
             )}
           </div>
@@ -536,7 +539,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict, mergeTestResult, unverifiedMergeReason } = useMemo(() => {
+  const { prArtifacts, commitArtifacts, investigationArtifacts, storageArtifacts, mergeTestVerdict, mergeTestResult, unverifiedMergeReason } = useMemo(() => {
     const artifacts = task.artifacts ?? [];
     // Surface the no-CI merge gate's verdict. The verify_tests handler posts a
     // MERGE_TEST_RESULT artifact whose `logs` carry the JSON verdict
@@ -568,6 +571,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       prArtifacts: artifacts.filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
       commitArtifacts: artifacts.filter(a => a.artifact_type === 'GIT_COMMIT'),
       investigationArtifacts: artifacts.filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
+      storageArtifacts: artifacts.filter(
+        (a) => !!a.storage_uri && a.artifact_type !== 'PULL_REQUEST' && a.artifact_type !== 'GIT_COMMIT',
+      ),
       mergeTestVerdict,
       mergeTestResult,
       unverifiedMergeReason: typeof task.unverified_merge_reason === 'string' ? task.unverified_merge_reason : null,
@@ -1390,6 +1396,39 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                         </div>
                       ))}
                     </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {storageArtifacts.length > 0 && (
+            <>
+              <SectionHeader>Artifacts</SectionHeader>
+              <div className="space-y-2">
+                {storageArtifacts.map((artifact, index) => (
+                  <div
+                    key={`${artifact.artifact_type}-${artifact.iteration ?? 1}-${artifact.storage_uri ?? index}`}
+                    className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2"
+                  >
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] mb-1">
+                      <span className="rounded border border-neutral-700 bg-neutral-900/70 px-1.5 py-0.5 font-semibold text-neutral-200">
+                        {formatArtifactTypeLabel(artifact.artifact_type)}
+                      </span>
+                      <span className="font-mono text-neutral-500">Iteration {artifact.iteration ?? 1}</span>
+                      {artifact.created_at && (
+                        <span className="text-neutral-500">{formatAbsolute(artifact.created_at)}</span>
+                      )}
+                    </div>
+                    {artifact.storage_uri && (
+                      <ResolvedReferenceLink
+                        projectId={task.project_id}
+                        reference={artifact.storage_uri}
+                        className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors break-all min-w-0 min-h-[44px] text-left disabled:opacity-70"
+                      >
+                        <span className="break-all min-w-0">{artifact.storage_uri}</span>
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                      </ResolvedReferenceLink>
+                    )}
                   </div>
                 ))}
               </div>

@@ -603,6 +603,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 retryRecoveryCostUsd={digest.retry_recovery_cost_usd}
                 resurrectionOutcomeSummary={digest.resurrection_outcome_summary}
                 migrationHealth={digest.migration_health}
+                migrationSlotContention={digest.migration_slot_contention}
                 preventionEfficacy={digest.prevention_efficacy}
                 releaseQualifierInfraMetrics={digest.release_qualifier_infra_metrics}
                 retryPatternSummary={digest.retry_pattern_summary}

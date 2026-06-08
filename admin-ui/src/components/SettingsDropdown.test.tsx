@@ -122,6 +122,7 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     onRollback: vi.fn(),
     onMarkStable: vi.fn(),
     onRepairState: vi.fn(),
+    failedRollback: null,
     zoneHealth: null,
     notificationConfig: { webhook_url: '', enabled_events: [], throttle_seconds: 60 },
     onUpdateNotificationConfig: vi.fn(),

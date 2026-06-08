@@ -372,6 +372,16 @@ if BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}" && [ -s "$BASE_COMMIT_FILE"
   fi
 fi
 
+CONSUMED_ARTIFACTS_JSON=""
+CONSUMED_ARTIFACTS_FILE="/tmp/consumed_artifacts_${cfg.taskId}.json"
+if [ -s "$CONSUMED_ARTIFACTS_FILE" ]; then
+  if jq -e 'type == "array"' "$CONSUMED_ARTIFACTS_FILE" >/dev/null 2>&1; then
+    CONSUMED_ARTIFACTS_JSON=$(jq '[.[] | select(type == "string" and length > 0)] | unique' "$CONSUMED_ARTIFACTS_FILE")
+  else
+    echo "[done] /tmp/consumed_artifacts_${cfg.taskId}.json exists but is not a JSON array — skipping consumed_artifact_ids" >&2
+  fi
+fi
+
 # Retry on 429/5xx/network — orchestrator returns 429 on FOR-UPDATE
 # contention with Retry-After: 5. Without retry, contended completions
 # never reach the orchestrator and the task stays IN_PROGRESS until the
@@ -415,6 +425,7 @@ PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
   --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
   --argjson self_review "$SELF_REVIEW_JSON" \\
   --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
+  --argjson consumed_artifacts "\${CONSUMED_ARTIFACTS_JSON:-null}" \\
   --arg warn_reason "\${WARN_OUT_OF_SCOPE_REASON:-}" \\
   --arg reproduce_status "\${REPRODUCE_VERDICT_STATUS:-}" \\
   --arg reproduce_reason "\${REPRODUCE_VERDICT_REASON:-}" \\
@@ -422,6 +433,7 @@ PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
    + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
    + {self_review_outcome: $self_review}
    + (if $changed_files then {changed_files: $changed_files} else {} end)
+   + (if $consumed_artifacts then {consumed_artifact_ids: $consumed_artifacts} else {} end)
    + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)
    + (if ($reproduce_status | length) > 0 then {reproduce_verdict: {status: $reproduce_status, reason: $reproduce_reason}} else {} end)')
 

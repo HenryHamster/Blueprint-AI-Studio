@@ -13,8 +13,9 @@ vi.mock('../api', () => ({
 // ProviderCostPanel also calls useEfficiencySnapshot, which issues its own
 // apiFetch on a separate poll interval. Stub it so apiFetch call-count
 // assertions reflect only the provider-cost-summary endpoint.
+const mockUseEfficiencySnapshot = vi.fn(() => null);
 vi.mock('../hooks/useEfficiencySnapshot', () => ({
-  useEfficiencySnapshot: () => null,
+  useEfficiencySnapshot: (...args: unknown[]) => mockUseEfficiencySnapshot(...args),
   fmtEffSecs: () => '—',
   fmtEffRate: () => '—',
   fmtEffIter: () => '—',
@@ -123,5 +124,88 @@ describe('ProviderCostPanel', () => {
 
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=24', undefined);
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=168', undefined);
+  });
+});
+
+describe('ProviderCostPanel — warm-start origin breakdown', () => {
+  const costRow = {
+    provider: 'openai',
+    account_id: null,
+    account_name: 'Default',
+    total_tasks: 5,
+    success_count: 4,
+    merged_count: 3,
+    total_cost_usd: 10,
+    success_rate: 0.8,
+    cost_per_merged_pr: 3.33,
+  };
+
+  const efficiencySnapshot = {
+    computed_at: new Date().toISOString(),
+    window_24h: {
+      setup_p50_secs: null,
+      setup_p95_secs: null,
+      setup_sample_n: 0,
+      warm_reuse_rate: 0.5,
+      warm_reuse_sample_n: 8,
+      review_iter_median: null,
+      review_iter_p95: null,
+      review_iter_sample_n: 0,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+      warm_start_origin_breakdown: {
+        warm_pool: 2,
+        backlog_reuse: 1,
+        chain_continuity: 1,
+        warm_total: 4,
+        pool_origin_share: 0.5,
+      },
+    },
+    window_7d: {
+      setup_p50_secs: null,
+      setup_p95_secs: null,
+      setup_sample_n: 0,
+      warm_reuse_rate: null,
+      warm_reuse_sample_n: 0,
+      review_iter_median: null,
+      review_iter_p95: null,
+      review_iter_sample_n: 0,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+    },
+  };
+
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+    apiFetchMock.mockResolvedValue(jsonResponse({ window_hours: 24, rows: [costRow] }));
+  });
+
+  afterEach(() => {
+    mockUseEfficiencySnapshot.mockReturnValue(null);
+  });
+
+  it('renders warm-start origin breakdown alongside the aggregate reuse rate', async () => {
+    mockUseEfficiencySnapshot.mockReturnValue(efficiencySnapshot);
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+    await act(async () => {});
+
+    const row = screen.getByTestId('warm-start-origin-breakdown');
+    expect(row.textContent).toContain('warm by origin');
+    expect(row.textContent).toContain('2');
+    expect(row.textContent).toContain('1');
+    expect(screen.getByTestId('warm-start-pool-share').textContent).toContain('50%');
+  });
+
+  it('does not render breakdown row when warm_start_origin_breakdown is absent', async () => {
+    mockUseEfficiencySnapshot.mockReturnValue({
+      ...efficiencySnapshot,
+      window_24h: { ...efficiencySnapshot.window_24h, warm_start_origin_breakdown: undefined },
+    });
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+    await act(async () => {});
+
+    expect(screen.queryByTestId('warm-start-origin-breakdown')).toBeNull();
   });
 });

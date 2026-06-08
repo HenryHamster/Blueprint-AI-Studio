@@ -124,6 +124,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "promotion_enabled_by_project",
         "promotion_threshold",
         "promotion_weights",
+        "park_and_retarget_enabled",
+        "park_and_retarget_budget_seconds",
         "provider_selection_mode",
         "provider_settings_by_effort",
         "provider_settings_defaults",
@@ -395,6 +397,12 @@ async def get_settings(
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
+        ),
+        "park_and_retarget_enabled": bool(
+            _runtime_config.get("park_and_retarget_enabled", False)
+        ),
+        "park_and_retarget_budget_seconds": int(
+            _runtime_config.get("park_and_retarget_budget_seconds", 600)
         ),
         "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
         "warm_pool_account_retarget_enabled": bool(
@@ -959,6 +967,28 @@ async def _apply_settings(
                 detail="cochange_decomposition_enabled must be a boolean",
             )
         _runtime_config["cochange_decomposition_enabled"] = val
+    if "park_and_retarget_enabled" in payload:
+        val = payload["park_and_retarget_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="park_and_retarget_enabled must be a boolean",
+            )
+        _runtime_config["park_and_retarget_enabled"] = val
+    if "park_and_retarget_budget_seconds" in payload:
+        try:
+            val = int(payload["park_and_retarget_budget_seconds"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="park_and_retarget_budget_seconds must be a number",
+            ) from None
+        if val < 30 or val > 1800:
+            raise HTTPException(
+                status_code=400,
+                detail="park_and_retarget_budget_seconds must be between 30 and 1800",
+            )
+        _runtime_config["park_and_retarget_budget_seconds"] = val
     if "warm_pool_enabled" in payload:
         val = payload["warm_pool_enabled"]
         if not isinstance(val, bool):
@@ -2196,6 +2226,12 @@ async def _apply_settings(
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)
+                    ),
+                    "park_and_retarget_enabled": bool(
+                        _runtime_config.get("park_and_retarget_enabled", False)
+                    ),
+                    "park_and_retarget_budget_seconds": int(
+                        _runtime_config.get("park_and_retarget_budget_seconds", 600)
                     ),
                     "warm_pool_enabled": bool(
                         _runtime_config.get("warm_pool_enabled", False)

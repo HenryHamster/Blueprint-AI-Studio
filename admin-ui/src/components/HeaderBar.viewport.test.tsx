@@ -172,6 +172,7 @@ function makeProps() {
     onRollback: noopAsync,
     onMarkStable: noopAsync,
     onRepairState: noopAsync,
+    failedRollback: null,
     zoneHealth: null,
     showUserManagement: false,
     onToggleUserManagement: noop,

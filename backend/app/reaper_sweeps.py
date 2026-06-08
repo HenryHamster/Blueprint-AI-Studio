@@ -774,8 +774,26 @@ async def _fetch_active_candidates(session, project_id) -> list:
     )
 
 
+async def _fetch_knowledge_substance_index(session, project_id) -> list:
+    """Substance index for durable KnowledgeDocuments in a project.
+
+    Delegates to :func:`knowledge_query.fetch_knowledge_substance_index` so the
+    SQL join lives in one place and the result is cached per project across the
+    sweep batch (exactly as the active/completed/dead candidate caches are).
+    """
+    from app.knowledge_query import fetch_knowledge_substance_index
+
+    return await fetch_knowledge_substance_index(session, project_id)
+
+
 async def _classify_blocker_needs(
-    task, session, *, candidate_cache: dict, completed_cache: dict, dead_cache: dict
+    task,
+    session,
+    *,
+    candidate_cache: dict,
+    completed_cache: dict,
+    dead_cache: dict,
+    knowledge_cache: dict,
 ) -> dict:
     """Classify EVERY recorded need of a blocked task against the live foundations.
 
@@ -786,11 +804,16 @@ async def _classify_blocker_needs(
       ``had_needs``       — the task carried ≥1 machine-resolvable need
       ``edges``           — foundation ids to wire (need → active in-flight task)
       ``completed_needs`` — needs satisfied by already-completed/merged work
+                            (includes knowledge-document-satisfied needs)
       ``residual``        — needs not yet accounted for (no foundation matches)
       ``dead``            — ≥1 need names a terminally FAILED/CANCELLED foundation
 
-    Resolution per need is active → completed → dead → residual, mirroring the
-    single-need ordering. Reuses the shared conservative predicates in
+    Resolution per need is active → completed → knowledge → dead → residual.
+    Knowledge-satisfied needs (a dangling kind='task' ref whose substance persists
+    as a durable KnowledgeDocument) are routed into ``completed_needs`` so the
+    existing resume path handles them without wiring a depends_on edge. This
+    prevents the dead-foundation path from cancelling a dependent whose need IS
+    durably satisfied. Reuses the shared conservative predicates in
     :mod:`app.blocked_need_resolution` (no parallel matcher); candidate sets are
     fetched lazily and cached per project across the sweep batch. A foundation
     already present in ``task.depends_on`` is treated as already-wired (it is not
@@ -801,6 +824,7 @@ async def _classify_blocker_needs(
         resolve_blocked_need,
         completed_foundation_for_need,
         need_matched_dead_foundation,
+        knowledge_substance_satisfies_need,
     )
 
     needs = get_blocker_needs(task)
@@ -829,6 +853,10 @@ async def _classify_blocker_needs(
     if dead is None:
         dead = await _fetch_dead_candidates(session, task.project_id)
         dead_cache[task.project_id] = dead
+    knowledge = knowledge_cache.get(task.project_id)
+    if knowledge is None:
+        knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
+        knowledge_cache[task.project_id] = knowledge
 
     # Stranded-parent set so a ghost-merge / unshipped foundation does NOT satisfy
     # a completed need — mirrors the respawn-dedup layer's "shipped" notion
@@ -854,6 +882,12 @@ async def _classify_blocker_needs(
             completed_foundation_for_need(task, need, completed, failed_parents)
             is not None
         ):
+            disp["completed_needs"].append(need)
+            continue
+        # Durable-knowledge fallback: a dangling kind='task' need whose originating
+        # task is CANCELLED but whose substance persists as a KnowledgeDocument is
+        # satisfied — do NOT route it to the dead-foundation path.
+        if knowledge_substance_satisfies_need(need, knowledge):
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
@@ -1442,6 +1476,10 @@ async def sweep_unblock_blocked_tasks(
     # foundation that has definitively died makes its dependent impossible — it is
     # cancelled rather than parked to re-arm forever.
     dead_cache: dict = {}
+    # Durable knowledge-document substance index: a dangling kind='task' need whose
+    # originating task is CANCELLED but whose substance persists as a durable
+    # KnowledgeDocument is satisfied rather than routed to the dead-foundation path.
+    knowledge_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1467,11 +1505,17 @@ async def sweep_unblock_blocked_tasks(
         flag_modified(task, "context")
         # A parked blocker that still carries a machine-resolvable need is parked
         # at the LOW re-evaluation cadence (so it comes back due and resumes when
-        # its foundation lands), not the multi-year horizon. A need-less blocker
-        # keeps the far-future park and stays for the operator exactly as today.
+        # its foundation lands), not the multi-year horizon.  Transient blockers
+        # (file_conflict, pending_rollup) are also parked at the LOW cadence so
+        # they self-heal when the overlapping in-flight task merges — hard-parking
+        # them at +10y caused operator-requeue whack-a-mole (incident 2026-06-07).
+        # A need-less non-transient blocker keeps the far-future park.
         has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
+        is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
         task.recheck_after = now + (
-            _BLOCKED_PARKED_REEVAL_INTERVAL if has_need else _BLOCKED_ESCALATED_PARK
+            _BLOCKED_PARKED_REEVAL_INTERVAL
+            if (has_need or is_transient)
+            else _BLOCKED_ESCALATED_PARK
         )
         session.add(task)
 
@@ -1487,6 +1531,7 @@ async def sweep_unblock_blocked_tasks(
             candidate_cache=candidate_cache,
             completed_cache=completed_cache,
             dead_cache=dead_cache,
+            knowledge_cache=knowledge_cache,
         )
 
         # Already escalated terminally — leave parked for the operator. On
@@ -1520,8 +1565,43 @@ async def sweep_unblock_blocked_tasks(
                 if outcome in ("cancelled", "held"):
                     changed = True
                     continue
-            # Need-less parked blocker — re-park without re-alerting, keeping the
-            # multi-year horizon so it stays for the operator exactly as today.
+            # Need-less parked blocker — handle transient vs durable separately.
+            # Transient blockers (file_conflict, pending_rollup) clear when the
+            # overlapping in-flight task merges; re-evaluate their precondition
+            # state so they requeue automatically when the conflict lifts, or
+            # re-arm with bounded backoff while it persists.  A need-less
+            # NON-transient blocker keeps the far-future park and stays for
+            # the operator.
+            is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
+            if is_transient:
+                state = await _blocked_precondition_state(
+                    task, session, verify_pr_merged
+                )
+                if state == "clear":
+                    _clear_blocked_fields(task, preserve_first_blocked=False)
+                    task.status = TaskStatus.QUEUED
+                    task.latest_status_message = (
+                        "Unblocked — transient conflict cleared, requeued"
+                    )
+                    flag_modified(task, "context")
+                    session.add(task)
+                    requeued += 1
+                    changed = True
+                    pending_broadcasts.append(
+                        (
+                            str(task.project_id),
+                            {
+                                "task_id": str(task.id),
+                                "status": "QUEUED",
+                                "message": task.latest_status_message,
+                            },
+                        )
+                    )
+                else:
+                    task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+                    session.add(task)
+                    changed = True
+                continue
             if task.recheck_after is None or task.recheck_after <= now:
                 task.recheck_after = now + _BLOCKED_ESCALATED_PARK
                 session.add(task)
@@ -1741,6 +1821,115 @@ async def sweep_unblock_blocked_tasks(
             )
     if requeued:
         logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
+    return requeued
+
+
+async def event_driven_unblock_dependents(
+    landed_task: "Task",
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Fast-path event-driven re-resolution of BLOCKED dependents when a foundation lands.
+
+    Called immediately after a task commits to COMPLETED + merge-unblock signal.
+    Scans same-project BLOCKED dependents with machine-resolvable needs and
+    resumes any whose needs are now satisfied by the just-landed foundation.
+
+    Fail-open: any per-task error is swallowed and logged; the function never
+    propagates an exception to its caller. Bounded: scans at most ``batch_size``
+    BLOCKED rows per call. Idempotent alongside the periodic sweep: uses
+    ``FOR UPDATE SKIP LOCKED`` so a row being evaluated by the sweep is skipped
+    here, and vice versa.
+
+    Returns the number of tasks resumed (0 on error or no-match).
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.landed_signal import has_merge_unblock_signal
+    from app.task_blocked import get_blocker_needs
+
+    if not has_merge_unblock_signal(landed_task):
+        return 0
+
+    now = _utcnow()
+
+    # Fetch BLOCKED dependents in the same project; skip-lock for sweep parity.
+    due_stmt = (
+        select(Task)
+        .where(
+            Task.status == TaskStatus.BLOCKED,
+            Task.project_id == landed_task.project_id,
+        )
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    candidates = (await session.execute(due_stmt)).scalars().all()
+    if not candidates:
+        return 0
+
+    requeued = 0
+    changed = False
+    pending_broadcasts: list[tuple[str, dict]] = []
+    candidate_cache: dict = {}
+    completed_cache: dict = {}
+    dead_cache: dict = {}
+    knowledge_cache: dict = {}
+
+    for task in candidates:
+        # Skip tasks with no machine-resolvable needs; the sweep handles those.
+        if not get_blocker_needs(task):
+            continue
+        ctx = task.context or {}
+        parked = bool(ctx.get("_blocked_escalated"))
+        try:
+            disp = await _classify_blocker_needs(
+                task,
+                session,
+                candidate_cache=candidate_cache,
+                completed_cache=completed_cache,
+                dead_cache=dead_cache,
+                knowledge_cache=knowledge_cache,
+            )
+            if not disp["had_needs"]:
+                continue
+            outcome = await _apply_needs_disposition(
+                task,
+                ctx,
+                session,
+                now,
+                disp,
+                completed_cache=completed_cache,
+                pending_broadcasts=pending_broadcasts,
+                parked=parked,
+            )
+            if outcome == "resumed":
+                requeued += 1
+                changed = True
+            elif outcome in ("cancelled", "held"):
+                changed = True
+        except Exception:
+            logger.exception(
+                "[REAPER] event_driven_unblock_dependents failed for task %s — skipping",
+                task.id,
+            )
+
+    if changed:
+        await session.commit()
+    for project_id, payload in pending_broadcasts:
+        try:
+            await _bcast(project_id, "task_updated", payload)
+        except Exception:
+            logger.debug(
+                "[REAPER] event-driven unblock broadcast failed for %s",
+                payload.get("task_id"),
+                exc_info=True,
+            )
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock: landing of %s unblocked %d dependent(s) → QUEUED",
+            landed_task.id,
+            requeued,
+        )
     return requeued
 
 
@@ -2022,6 +2211,66 @@ async def sweep_merge_gate_verification_degradation(session) -> int:
             degraded,
             health["project_count"],
             reason,
+        )
+    return created
+
+
+async def sweep_migration_slot_contention(session) -> int:
+    """Alert per-project when a migration task has held the serialization slot too
+    long while schema-touching tasks are parked waiting on it.
+
+    Computes fleet-wide migration-slot contention
+    (:func:`digest_metrics.compute_migration_slot_contention`) and, for each
+    project whose holder has held the slot beyond
+    ``migration_slot_hold_alert_seconds`` while at least
+    ``migration_slot_min_waiters`` tasks are deferred, raises a deduplicated
+    operator alert. A multi-hour hold parking the schema queue (the recent
+    incident: ~2h holding, 5+ tasks parked) is invisible to the throughput-only
+    migration-health summary and to the escalated-only parked-blocker signal —
+    the deferred siblings are QUEUED, not BLOCKED. This raises the proactive
+    signal every other contention/degradation surface already has. Alerting only —
+    it never influences serialization. Returns the number of NEW alerts created.
+    """
+    import uuid as _uuid
+
+    from app.alert_dispatch import _maybe_create_migration_slot_contention_alert
+    from app.digest_metrics import compute_migration_slot_contention
+    from app.shared_state import runtime_config
+
+    hold_alert_seconds = float(
+        runtime_config.get("migration_slot_hold_alert_seconds", 3600)
+    )
+    min_waiters = int(runtime_config.get("migration_slot_min_waiters", 1))
+
+    contention = await compute_migration_slot_contention(session)
+    created = 0
+    for proj in contention.get("projects", []):
+        if not proj.get("slot_held"):
+            continue
+        held = proj.get("holder_held_seconds")
+        waiting = proj.get("waiting_count", 0)
+        if held is None or held < hold_alert_seconds or waiting < min_waiters:
+            continue
+        pid_raw = proj.get("project_id")
+        if not pid_raw:
+            continue
+        try:
+            pid = _uuid.UUID(str(pid_raw))
+        except (ValueError, TypeError):
+            continue
+        created += await _maybe_create_migration_slot_contention_alert(
+            session,
+            pid,
+            holder_task_id=proj.get("holder_task_id"),
+            held_seconds=held,
+            waiting_count=waiting,
+            longest_wait_seconds=proj.get("longest_wait_seconds"),
+        )
+    if created:
+        await session.commit()
+        logger.info(
+            "[REAPER] raised migration-slot-contention alert on %d project(s)",
+            created,
         )
     return created
 
@@ -2792,3 +3041,82 @@ async def sweep_resolve_stale_open_bug_messages(
         )
 
     return resolved
+
+
+# ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────
+#
+# A file_conflict or pending_rollup blocker that was escalated before Fix 2
+# landed was hard-parked at ``_BLOCKED_ESCALATED_PARK`` (+10 years).  These
+# rows never appear in the normal Step-12 due query (``recheck_after <= now``)
+# and would stay stranded forever without this targeted recovery pass.  The
+# fix: find them, reset ``recheck_after`` to the bounded cadence, and let the
+# next Step-12 cycle re-evaluate and requeue them when the conflict lifts.
+#
+# The recovery touch is the minimal safe change: it preserves ``_blocked_escalated``
+# (so the alert is not re-fired) and just gives the row a near-future due date
+# so Step 12 picks it up.  Step 12's updated "need-less parked transient" path
+# (Fix 2) then actually decides whether to requeue or re-arm.
+
+# A recheck_after more than this far in the future is considered "hard-parked"
+# by the old +10y sentinel path; any legitimate bounded recheck will be shorter.
+_TRANSIENT_BLOCKER_PARK_SENTINEL = timedelta(days=365)
+
+
+async def sweep_recover_stranded_transient_blockers(
+    session, now: datetime, *, batch_size: int = 200
+) -> int:
+    """Self-healing recovery for transient blockers previously hard-parked at +10y.
+
+    Finds BLOCKED tasks whose ``blocker_kind`` is a transient kind
+    (``file_conflict`` or ``pending_rollup``) and whose ``recheck_after`` is
+    more than ``_TRANSIENT_BLOCKER_PARK_SENTINEL`` (365 days) in the future —
+    the signature of the old hard-park sentinel — and resets ``recheck_after``
+    to ``now + _BLOCKED_PARKED_REEVAL_INTERVAL`` so the Step-12 sweep picks them
+    up on the next cycle.  Idempotent and safe to run repeatedly.
+
+    Returns the number of rows recovered.
+    """
+    sentinel_cutoff = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.BLOCKED,
+                    Task.blocker_kind.in_(["file_conflict", "pending_rollup"]),
+                    Task.recheck_after > sentinel_cutoff,
+                )
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    recovered = 0
+    for task in rows:
+        ctx = task.context or {}
+        if not ctx.get("_blocked_escalated"):
+            # Unexpected: far-future recheck on a non-escalated transient blocker
+            # (shouldn't happen but guard defensively; don't touch it).
+            continue
+        task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+        session.add(task)
+        recovered += 1
+        logger.info(
+            "[REAPER] Recovery: reset hard-parked transient blocker %s "
+            "(kind=%s) to bounded re-eval",
+            task.id,
+            task.blocker_kind,
+        )
+
+    if recovered:
+        await session.commit()
+        logger.info(
+            "[REAPER] Recovery: un-stranded %d hard-parked transient blocker(s)",
+            recovered,
+        )
+    return recovered

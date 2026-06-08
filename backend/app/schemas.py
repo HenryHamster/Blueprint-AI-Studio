@@ -18,6 +18,13 @@ class DeployPayload(BaseModel):
     github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
 
 
+class ArtifactDownloadResponse(BaseModel):
+    """Signed, time-limited GET URL minted for a project-owned ``gs://`` artifact
+    reference by ``GET /api/admin/artifacts/download-url``."""
+
+    url: str
+
+
 class TaskEvaluationSummaryItem(BaseModel):
     label: str
     value: str
@@ -109,6 +116,10 @@ class AgentStatusPayload(BaseModel):
     execution_mode: str | None = Field(None, max_length=50)
     scope_gate_triggered: str | None = Field(None, max_length=50)
     changed_files: List[str] | None = Field(None, max_length=100)
+    # Artifact ids this task actually consumed while completing. New agents send
+    # this explicitly; older agents are handled by a backend fallback over
+    # delivered artifact_prerequisites for direct depends_on producers.
+    consumed_artifact_ids: List[uuid.UUID] | None = Field(None, max_length=100)
     test_failure_summary: str | None = Field(None, max_length=5000)
     # Kept as Dict[str, Any] so agent_status.py can store it directly in the
     # task.context JSON column without an extra .model_dump() call.
@@ -241,6 +252,14 @@ class HeartbeatRequest(BaseModel):
     llm_call_count: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
+    # Cumulative per-task structured-output format-compliance telemetry, sibling
+    # to the LLM fields above. Optional/backwards-compatible — older agents that
+    # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason
+    # maps each extraction-layer reason class to a count of unparseable final outputs.
+    format_miss_by_reason: Dict[str, int] | None = None
+    format_error_total: int | None = Field(None, ge=0)
+    format_repair_attempts: int | None = Field(None, ge=0)
+    format_repair_successes: int | None = Field(None, ge=0)
 
 
 class ComputeJobResponse(BaseModel):
@@ -254,6 +273,8 @@ class ComputeJobResponse(BaseModel):
     backend: str
     external_compute_id: str | None = None
     machine_type: str | None = None
+    accelerator_type: str | None = None
+    accelerator_count: int | None = None
     status: ComputeJobStatus
     terminal_reason: str | None = None
     outcome: ComputeJobOutcome | None = None

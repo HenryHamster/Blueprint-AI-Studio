@@ -673,6 +673,205 @@ async def test_compute_experiment_persist_sets_source_kind(
     assert "accuracy" in doc.body
 
 
+# ── compute-experiment citation grounding ────────────────────────────────────
+#
+# Compute-experiment knowledge documents now carry a citation-grounding stamp
+# in their persisted verdict, mirroring the design/web_research lanes.
+# The stamp records how many citations were checked vs. resolved to real durable
+# artifacts, and a document whose citations are ALL unresolved is flagged
+# citation_grounding_miss=True (additive/best-effort — never blocks completion).
+
+
+async def _make_compute_task(db_session, *, project_name="CE", direction_id=None):
+    project = make_project(name=project_name)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    ctx = {}
+    if direction_id:
+        ctx["direction_id"] = direction_id
+
+    task = make_task(
+        project_id=project.id,
+        title="compute_experiment: benchmark Y",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": "benchmark-Y",
+                "base_branch": "main",
+            }
+        ],
+        context=ctx or None,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_unresolved_citation_is_flagged_ungrounded(
+    db_session, _quiet_broadcast
+):
+    """When a compute document's result_reference has no backing Artifact row,
+    the persisted verdict carries citation_grounding_miss=True and
+    probes.grounding.grounded==0. The document is still persisted (best-effort)."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    _project, task = await _make_compute_task(db_session, project_name="CEungrounded")
+
+    # No logs → no ComputeJob → result_reference has no artifact backing.
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.10,
+        criterion=None,
+        result_reference="gs://bucket/jobs/no-artifact/result.json",
+        session=db_session,
+        logs=None,
+    )
+
+    assert doc is not None
+    assert doc.source_kind == "compute_experiment"
+    verdict = doc.forward_quality_verdict
+    # The document persists — grounding miss is flagged, not a hard failure.
+    assert verdict.get("citation_grounding_miss") is True
+    grounding = verdict["probes"]["grounding"]
+    assert grounding["file_citations"] == 1
+    assert grounding["grounded"] == 0
+    assert "gs://bucket/jobs/no-artifact/result.json" in grounding["unresolved"]
+
+
+@pytest.mark.asyncio
+async def test_compute_fallback_stamps_grounding_when_artifact_resolves(
+    db_session, _quiet_broadcast
+):
+    """When the fallback path finds a real Artifact via the ComputeJob, the persisted
+    verdict records grounded==1 and citation_grounding_miss is absent."""
+    import json as _json
+
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+    from app.models import Artifact, ArtifactType, ComputeJob, ComputeJobStatus
+
+    _project, task = await _make_compute_task(db_session, project_name="CEgrounded")
+
+    # Create an Artifact row to represent the durable result.
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="gs://bucket/jobs/real-job/",
+        logs=_json.dumps({"artifact_uri": "gs://bucket/jobs/real-job/", "file_count": 3}),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Create a ComputeJob that links to the artifact.
+    job = ComputeJob(
+        project_id=_project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference="gs://bucket/jobs/real-job/result.json",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = _json.dumps({"job_id": str(job.id), "outcome": "SUCCESS"})
+
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.20,
+        criterion=None,
+        result_reference="gs://bucket/jobs/real-job/result.json",
+        session=db_session,
+        logs=logs,
+    )
+
+    assert doc is not None
+    verdict = doc.forward_quality_verdict
+    # Artifact resolved → grounded=1, no miss flag.
+    assert "citation_grounding_miss" not in verdict
+    grounding = verdict["probes"]["grounding"]
+    assert grounding["file_citations"] == 1
+    assert grounding["grounded"] == 1
+    assert grounding["unresolved"] == []
+
+
+@pytest.mark.asyncio
+async def test_compute_grounding_errs_toward_acceptance_on_missing_stamp(
+    db_session, _quiet_broadcast
+):
+    """Compute documents without a result_reference persist cleanly with no
+    citation_grounding_miss flag — older agents or jobs without an artifact URI
+    are never blocked by the grounding check."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    _project, task = await _make_compute_task(db_session, project_name="CEnoreference")
+
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="FAILED",
+        cost=0.05,
+        criterion=None,
+        result_reference=None,
+        session=db_session,
+    )
+
+    assert doc is not None
+    verdict = doc.forward_quality_verdict
+    # No result_reference → 0 citations checked → miss gate never fires.
+    assert "citation_grounding_miss" not in verdict
+
+
+@pytest.mark.asyncio
+async def test_compute_persist_attaches_grounding_probe_to_verdict(
+    db_session, _quiet_broadcast
+):
+    """_persist_compute_knowledge_document attaches grounding probe detail from
+    a _citation_grounding stamp on the document dict into the persisted verdict."""
+    from app.knowledge_completion import _persist_compute_knowledge_document
+
+    _project, task = await _make_compute_task(db_session, project_name="CEprobe")
+
+    document = {
+        "title": "Probe test",
+        "summary": "Summary for probe test.",
+        "body": "# Body",
+        "topic": "probe",
+        "tags": ["compute_experiment"],
+        "citations": ["gs://bucket/job/result.json"],
+        "verdict_record": {
+            "strategy": "metric",
+            "outcome": "SUCCESS",
+            "cost_usd": 0.10,
+            "criterion": None,
+            "criterion_met": None,
+        },
+        "_citation_grounding": {
+            "checked": True,
+            "file_citations": 2,
+            "grounded": 1,
+            "unresolved": ["gs://bucket/job/missing.json"],
+        },
+    }
+
+    doc = await _persist_compute_knowledge_document(task, document, "fallback", db_session)
+
+    verdict = doc.forward_quality_verdict
+    grounding = verdict["probes"]["grounding"]
+    assert grounding["file_citations"] == 2
+    assert grounding["grounded"] == 1
+    assert grounding["unresolved"] == ["gs://bucket/job/missing.json"]
+    # One citation grounded → miss should NOT fire.
+    assert "citation_grounding_miss" not in verdict
+
+
 # ── knowledge-prerequisite delivery to dependents ───────────────────────────
 #
 # When a plan commissions a web_research/design prerequisite and makes an

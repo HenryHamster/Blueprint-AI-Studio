@@ -2382,7 +2382,7 @@ class TestBatchedDepRowsSurviveCommit:
         detached_dep = dep_by_id[dep.id]
         assert detached_dep.status == TaskStatus.COMPLETED
         assert detached_dep.first_payload.get("type") == "research"
-        assert detached_dep.context == {}
+        assert isinstance(detached_dep.context, dict)  # accessible without DetachedInstanceError
 
         async def _noop_verify(_task, _session):
             return True
@@ -3871,6 +3871,155 @@ class TestWarmVMSkipProvision:
             # VM's name (which would race the reaper's delete on a name clash).
             assert row.vm_instance_id != target_vm
             assert (row.vm_instance_id or "").startswith("agent-vm-")
+
+    @pytest.mark.asyncio
+    async def test_parked_retarget_unresponsive_clears_and_resets_vm_id(
+        self, orch_warm_db, mocker
+    ):
+        """A parked-for-retarget task whose held VM becomes unresponsive must
+        have warm fields AND park fields cleared from context, and vm_instance_id
+        reset to None so the cold fall-through mints a FRESH id (not the stale
+        parked-VM name that would race the reaper's delete on GCP)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        record_clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear"
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Park-Retarget-Unresponsive", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            parked_vm = "agent-vm-parked-rl-001"
+            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                # agent_status stamps the held VM id onto vm_instance_id
+                vm_instance_id=parked_vm,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": parked_vm,
+                    "warm_handoff_deadline": deadline,
+                    "parked_for_retarget": True,
+                    "park_deadline": deadline,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        # No heartbeat → VM unresponsive → orchestrator clears warm pin
+        _shared_state.vm_last_heartbeat.pop(parked_vm, None)
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            ctx = row.context or {}
+            # Warm fields cleared
+            assert "warm_target_vm_id" not in ctx
+            assert "warm_handoff_deadline" not in ctx
+            # Park fields also cleared (no stale flags for a re-provisioned task)
+            assert "parked_for_retarget" not in ctx
+            assert "park_deadline" not in ctx
+            # Load-bearing reset: vm_instance_id must be None (or a FRESH id)
+            # so the cold provision path never re-creates the parked VM name.
+            assert row.vm_instance_id != parked_vm, (
+                "vm_instance_id must not retain the stale parked-VM name after "
+                "warm-pin clear — GCP name collision hazard"
+            )
+
+        # Continuity pin-clear metric fires (parked retarget is not a pool pin)
+        assert record_clear_spy.called
+        _vm_arg, _reason_arg = _extract_warm_pin_clear_args(record_clear_spy)
+        assert _vm_arg == parked_vm
+        assert _reason_arg == "vm_unresponsive"
+
+    @pytest.mark.asyncio
+    async def test_parked_retarget_deadline_expired_clears_and_resets_vm_id(
+        self, orch_warm_db, mocker
+    ):
+        """A parked-for-retarget task whose park deadline has expired must have
+        warm and park context fields cleared and vm_instance_id reset so the cold
+        fall-through mints a FRESH id (deadline_expired suppress path)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        record_clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear"
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Park-Retarget-Expired", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            parked_vm = "agent-vm-parked-rl-expired-002"
+            # Already-expired deadline → deadline_expired path
+            expired = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=parked_vm,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": parked_vm,
+                    "warm_handoff_deadline": expired,
+                    "parked_for_retarget": True,
+                    "park_deadline": expired,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        # Register a heartbeat so the VM appears alive — the expired deadline
+        # alone must trigger the clear (not unresponsive).
+        _shared_state.vm_last_heartbeat[parked_vm] = datetime.utcnow()
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.vm_last_heartbeat.pop(parked_vm, None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            ctx = row.context or {}
+            assert "warm_target_vm_id" not in ctx
+            assert "parked_for_retarget" not in ctx
+            assert "park_deadline" not in ctx
+            # vm_instance_id reset — no stale parked-VM name survives
+            assert row.vm_instance_id != parked_vm, (
+                "Expired park deadline must reset vm_instance_id (GCP name-collision hazard)"
+            )
+
+        assert record_clear_spy.called
+        _vm_arg, _reason_arg = _extract_warm_pin_clear_args(record_clear_spy)
+        assert _vm_arg == parked_vm
+        assert _reason_arg == "deadline_expired"
 
     @pytest.mark.asyncio
     async def test_pool_dispatch_lease_hit_skips_cold_provision(

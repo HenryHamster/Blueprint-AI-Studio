@@ -380,6 +380,202 @@ describe('handleMemo', () => {
     expect(runClaudeCode).toHaveBeenCalledTimes(1);
   });
 
+  it('direction_retirement: synthesizes memo with outcome metrics from retirement_metrics without calling Claude', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      direction_id: 'dir-abc',
+      source_task_id: 'task-ret-1',
+      source_finding: {
+        direction_text: 'Improve DB query performance across the board.',
+        rationale: 'Direction fully achieved — all queries now under 50ms.',
+        success_evidence: 'P95 latency dropped from 800ms to 40ms after 3 PRs.',
+        retirement_condition: 'all_objectives_met',
+        retirement_metrics: {
+          final_quality_score: 0.91,
+          final_prs_merged: 5,
+          final_cycles_active: 3,
+        },
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    // rationale field read from sf.rationale (not sf.retirement_rationale)
+    expect(call.logs).toContain('Direction fully achieved');
+    // Outcome metrics must appear (from sf.retirement_metrics, not top-level sf)
+    expect(call.logs).toContain('quality_score=0.91');
+    expect(call.logs).toContain('prs_merged=5');
+    expect(call.logs).toContain('cycles_active=3');
+    // success_evidence and retirement_condition should also appear
+    expect(call.logs).toContain('P95 latency dropped');
+    expect(call.logs).toContain('all_objectives_met');
+    // direction citation must appear when direction_id is present
+    expect(call.logs).toContain('direction:dir-abc');
+    expect(call.logs).toContain('task:task-ret-1');
+  });
+
+  it('direction_retirement: falls through to Claude when both direction_text and rationale are absent', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: { retirement_condition: 'timeout' },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+  });
+
+  it('direction_retirement: omits Outcome metrics block when retirement_metrics is absent', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: {
+        direction_text: 'Refactor auth module.',
+        rationale: 'Scope too large; retired.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).not.toContain('Outcome metrics');
+  });
+
+  it('direction_retirement: emits direction:<id> citation when direction_id present', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      direction_id: 'dir-xyz',
+      source_finding: {
+        direction_text: 'Reduce DB coupling.',
+        rationale: 'Goal achieved.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const parsed = JSON.parse(call.logs as string) as { citations: string[] };
+    expect(parsed.citations).toContain('direction:dir-xyz');
+    expect(parsed.citations).not.toContain(expect.stringMatching(/^task:/));
+  });
+
+  it('direction_retirement: emits both direction:<id> and task:<id> when both present', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      direction_id: 'dir-123',
+      source_task_id: 'task-456',
+      source_finding: {
+        direction_text: 'Improve logging.',
+        rationale: 'Shipped.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const parsed = JSON.parse(call.logs as string) as { citations: string[] };
+    expect(parsed.citations).toContain('direction:dir-123');
+    expect(parsed.citations).toContain('task:task-456');
+  });
+
+  it('direction_retirement: emits empty citations when neither direction_id nor source_task_id present', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: {
+        direction_text: 'Speed up CI.',
+        rationale: 'Obsolete direction.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const parsed = JSON.parse(call.logs as string) as { citations: string[] };
+    expect(parsed.citations).toEqual([]);
+  });
+
+  it('direction_retirement: renders recent_history_summary when present in source_finding', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      direction_id: 'dir-hist',
+      source_finding: {
+        direction_text: 'Reduce flaky tests.',
+        rationale: 'Flakiness resolved.',
+        recent_history_summary: [
+          { cycles: 2, prs_merged: 3, tasks_completed: 5, tasks_failed: 1 },
+          { cycles: 1, prs_merged: 1, tasks_completed: 2, tasks_failed: 0 },
+        ],
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('Recent history:');
+    expect(call.logs).toContain('cycles=2');
+    expect(call.logs).toContain('prs_merged=3');
+    expect(call.logs).toContain('tasks_completed=5');
+    expect(call.logs).toContain('tasks_failed=1');
+  });
+
+  it('direction_retirement: omits recent_history_summary block when absent from source_finding', async () => {
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      source_finding: {
+        direction_text: 'Remove legacy auth.',
+        rationale: 'Done.',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).not.toContain('Recent history:');
+  });
+
+  it('synthesizes direction_retirement memo from production payload shape', async () => {
+    // Production shape: direction_id set, source_task_id absent,
+    // source_finding has recent_history_summary and retirement_metrics.
+    const payload = {
+      reasoning_kind: 'direction_retirement',
+      direction_id: 'dir-prod-001',
+      source_finding: {
+        direction_text: 'Consolidate duplicate service clients across the codebase.',
+        rationale: 'All clients replaced with shared singleton.',
+        success_evidence: 'PR #1012 removed 4 duplicate client instantiations.',
+        retirement_condition: 'all_objectives_met',
+        retirement_metrics: {
+          final_quality_score: 0.88,
+          final_prs_merged: 4,
+          final_cycles_active: 2,
+        },
+        recent_history_summary: [
+          { cycles: 2, prs_merged: 4, tasks_completed: 7, tasks_failed: 2 },
+        ],
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const parsed = JSON.parse(call.logs as string) as { citations: string[]; reasoning: string };
+    // direction citation must appear (no task citation since source_task_id absent)
+    expect(parsed.citations).toContain('direction:dir-prod-001');
+    expect(parsed.citations.some((c) => c.startsWith('task:'))).toBe(false);
+    // recent_history_summary rendered
+    expect(parsed.reasoning).toContain('Recent history:');
+    expect(parsed.reasoning).toContain('cycles=2');
+    expect(parsed.reasoning).toContain('prs_merged=4');
+    // outcome metrics rendered
+    expect(parsed.reasoning).toContain('quality_score=0.88');
+    expect(parsed.reasoning).toContain('prs_merged=4');
+    expect(parsed.reasoning).toContain('cycles_active=2');
+  });
 
   // ── Codex JSONL path regression tests ────────────────────────────────────
 
