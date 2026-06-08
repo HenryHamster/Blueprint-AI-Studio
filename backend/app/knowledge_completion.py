@@ -255,6 +255,31 @@ def _web_research_grounding_miss(document: dict[str, Any]) -> str | None:
     return None
 
 
+def _compute_grounding_miss(document: dict[str, Any]) -> str | None:
+    """Return an operator-readable reason when a COMPUTE document is ungrounded.
+
+    Mirrors :func:`_design_grounding_miss` for the compute-experiment lane.
+    A compute document's value is that its citations resolve to REAL durable
+    artifacts. The backend stamps ``_citation_grounding`` when it checks; this
+    gate flags ONLY the clear case — checked, cited artifacts, NONE resolve. It
+    errs toward acceptance: a missing/unchecked stamp or zero citations passes,
+    so older agents and jobs without a result_reference are completely unaffected.
+    This never raises and never blocks completion — it is additive observability.
+    """
+    grounding = document.get("_citation_grounding")
+    if not isinstance(grounding, dict) or not grounding.get("checked"):
+        return None
+    file_citations = int(grounding.get("file_citations") or 0)
+    grounded = int(grounding.get("grounded") or 0)
+    if file_citations > 0 and grounded <= 0:
+        return (
+            "compute artifact citations are unresolved: all "
+            f"{file_citations} citation(s) point to artifacts not found in the "
+            "durable store"
+        )
+    return None
+
+
 def _grounding_probe_detail(document: dict[str, Any]) -> dict[str, Any] | None:
     """Structured citation-grounding detail lifted from ``_citation_grounding``.
 
@@ -1032,6 +1057,43 @@ async def _load_compute_job_from_logs(
         return None
 
 
+async def _compute_citation_grounding_stamp(
+    result_reference: str | None,
+    logs: str | None,
+    session: AsyncSession,
+) -> dict[str, Any]:
+    """Build a citation-grounding stamp for the deterministic fallback document.
+
+    The fallback document's only citation is the ``result_reference``. This
+    helper checks whether that reference is backed by a real durable :class:`Artifact`
+    row by loading the :class:`ComputeJob` from ``logs`` and verifying its
+    ``artifact_id``. Returns a ``_citation_grounding`` dict using the same shape
+    as the design / web_research lanes so :func:`_grounding_probe_detail` and
+    :func:`_compute_grounding_miss` apply symmetrically. Never raises — any
+    storage error is treated as unresolved, which is the conservative choice.
+    """
+    if not result_reference or not _is_usable_citation(result_reference):
+        # No citation to probe — 0 checked means the miss gate won't fire.
+        return {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []}
+
+    grounded = 0
+    job = await _load_compute_job_from_logs(logs, session)
+    if job is not None and job.artifact_id is not None:
+        try:
+            artifact = await session.get(Artifact, job.artifact_id)
+            if artifact is not None:
+                grounded = 1
+        except Exception:  # noqa: BLE001 — best-effort, never breaks completion
+            pass
+
+    return {
+        "checked": True,
+        "file_citations": 1,
+        "grounded": grounded,
+        "unresolved": [] if grounded > 0 else [result_reference],
+    }
+
+
 async def _gather_compute_evidence(
     task: Task,
     *,
@@ -1359,6 +1421,18 @@ async def _analyze_compute_experiment_with_llm(
     verdict_record["analysis_mode"] = "llm"
     verdict_record["analysis_model"] = _COMPUTE_LLM_ANALYSIS_MODEL
 
+    # Stamp citation-grounding counts so _persist_compute_knowledge_document can
+    # attach them to the verdict, mirroring the design/web_research grounding stamp.
+    # At this point we already know: at least one usable citation is in real_evidence
+    # (the gate above enforced it), so grounded >= 1 and citation_grounding_miss
+    # will not fire for LLM-produced documents.
+    grounding_stamp = {
+        "checked": True,
+        "file_citations": len(usable),
+        "grounded": sum(1 for c in usable if c in real_evidence),
+        "unresolved": [c for c in usable if c not in real_evidence],
+    }
+
     return {
         "title": title,
         "summary": summary,
@@ -1367,6 +1441,7 @@ async def _analyze_compute_experiment_with_llm(
         "tags": fallback["tags"],
         "citations": usable[:_COMPUTE_MAX_CITATIONS],
         "verdict_record": verdict_record,
+        "_citation_grounding": grounding_stamp,
     }
 
 
@@ -1395,6 +1470,21 @@ async def _persist_compute_knowledge_document(
 
     verdict_record = dict(document["verdict_record"])
     verdict_record.setdefault("analysis_mode", mode)
+
+    # Attach citation-grounding probe detail (additive, best-effort).
+    # Reuses the shared _grounding_probe_detail helper so the shape is identical
+    # to the design/web_research lanes. Only present when the document carries a
+    # checked _citation_grounding stamp — older documents that lack it are unaffected.
+    grounding = _grounding_probe_detail(document)
+    if grounding is not None:
+        probes = dict(verdict_record.get("probes") or {})
+        probes["grounding"] = grounding
+        verdict_record["probes"] = probes
+
+    # Flag documents whose citations are fully unresolved (all citations point at
+    # artifacts not found in the durable store). Additive — never blocks completion.
+    if _compute_grounding_miss(document) is not None:
+        verdict_record["citation_grounding_miss"] = True
 
     doc = KnowledgeDocument(
         project_id=task.project_id,
@@ -1526,6 +1616,23 @@ async def persist_compute_experiment_knowledge(
     if analysis is not None:
         document = analysis
         mode = "llm"
+    else:
+        # Fallback path: stamp citation grounding based on whether result_reference
+        # resolves to a real Artifact row via the ComputeJob. Best-effort — any
+        # error here is swallowed; the fallback document persists either way.
+        try:
+            grounding_stamp = await _compute_citation_grounding_stamp(
+                result_reference, logs, session
+            )
+            document = dict(document)
+            document["_citation_grounding"] = grounding_stamp
+        except Exception:  # noqa: BLE001 — grounding stamp must never break completion
+            logger.warning(
+                "[COMPUTE] citation grounding stamp failed for task %s; "
+                "persisting fallback without grounding detail",
+                task.id,
+                exc_info=True,
+            )
 
     return await _persist_compute_knowledge_document(task, document, mode, session)
 

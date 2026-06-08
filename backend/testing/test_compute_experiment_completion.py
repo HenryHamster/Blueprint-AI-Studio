@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -167,6 +168,79 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+
+
+@pytest.mark.asyncio
+async def test_compute_result_artifact_logical_key_delivered_to_dependent(
+    db_session, _quiet_compute_io
+):
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    result_reference = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=result_reference),
+        db_session,
+    )
+
+    await db_session.refresh(job)
+    artifact = await db_session.get(Artifact, job.artifact_id)
+    assert artifact is not None
+    assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
+    assert artifact.logical_key == "experiment-result-bundle"
+    assert artifact.storage_uri == result_reference
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs == [
+        {
+            "artifact_id": str(artifact.id),
+            "logical_key": "experiment-result-bundle",
+            "artifact_type": ArtifactType.COMPUTE_RESULT.value,
+            "source_task_id": str(task.id),
+            "storage_uri": result_reference,
+        }
+    ]
 
 
 @pytest.mark.asyncio

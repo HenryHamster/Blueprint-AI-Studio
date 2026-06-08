@@ -148,6 +148,7 @@ async def compute_direction_progress(
         # only named-test proof, declared counts merges that committed to forward
         # evidence at plan time, merged_write_total is the coverage denominator.
         proven_prs_merged = 0
+        consumed_prs_merged = 0
         declared_prs_merged = 0
         merged_write_total = 0
         autonomous_prs_merged = 0
@@ -190,6 +191,7 @@ async def compute_direction_progress(
                 prs_merged += entry.get("prs_merged") or 0
                 verified_prs_merged += verified_merged_count(entry)
                 proven_prs_merged += proven_merged_count(entry)
+                consumed_prs_merged += entry.get("acceptance_consumed_merged", 0) or 0
                 declared_prs_merged += declared_merged_count(entry)
                 merged_write_total += entry.get("acceptance_merged_write_total", 0) or 0
                 # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
@@ -434,6 +436,9 @@ async def compute_direction_progress(
         lifetime_proven_prs_merged = sum(
             proven_merged_count(h) for h in _history_all
         ) + (_agg.get("total_acceptance_proven_merged", 0) or 0)
+        lifetime_consumed_prs_merged = sum(
+            h.get("acceptance_consumed_merged", 0) for h in _history_all
+        ) + (_agg.get("total_acceptance_consumed_merged", 0) or 0)
         lifetime_declared_prs_merged = sum(
             declared_merged_count(h) for h in _history_all
         ) + (_agg.get("total_acceptance_declared_merged", 0) or 0)
@@ -683,6 +688,7 @@ async def compute_direction_progress(
                     # code committed to forward evidence. Lifetime counterparts
                     # surfaced below alongside lifetime_verified_prs_merged.
                     "proven_prs_merged": proven_prs_merged,
+                    "consumed_prs_merged": consumed_prs_merged,
                     "acceptance_declaration_coverage": acceptance_declaration_coverage,
                     "autonomous_prs_merged": autonomous_prs_merged,
                     "assisted_prs_merged": assisted_prs_merged,
@@ -738,6 +744,7 @@ async def compute_direction_progress(
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,
                     "lifetime_proven_prs_merged": lifetime_proven_prs_merged,
+                    "lifetime_consumed_prs_merged": lifetime_consumed_prs_merged,
                     "lifetime_acceptance_declaration_coverage": (
                         lifetime_acceptance_declaration_coverage
                     ),

@@ -38,6 +38,10 @@ from app.models import (
     TaskStatus,
 )
 from app.compute_jobs import stamp_compute_job_result_reference
+from app.artifact_prerequisites import (
+    deliver_artifact_to_dependents,
+    stamp_artifact_logical_key,
+)
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -2416,6 +2420,7 @@ async def _handle_panel_review_completion(
         artifact_type=_PANEL_REVIEW_ARTIFACT_TYPE,
         logs=json.dumps(parsed),
     )
+    stamp_artifact_logical_key(artifact, task)
     session.add(artifact)
 
     task.plan_output = parsed
@@ -2427,6 +2432,9 @@ async def _handle_panel_review_completion(
     )
     session.add(task)
     await session.commit()
+    await session.refresh(artifact)
+
+    await deliver_artifact_to_dependents(task, artifact, session, commit=True)
 
     await broadcast_to_project(
         str(task.project_id),
@@ -2746,13 +2754,13 @@ def _apply_synthesized_memo(
     from app.models import Artifact, ArtifactType  # noqa: PLC0415
 
     normalized = _normalize_memo(memo)
-    session.add(
-        Artifact(
-            task_id=memo_task.id,
-            artifact_type=ArtifactType.MEMO,
-            logs=json.dumps(normalized),
-        )
+    artifact = Artifact(
+        task_id=memo_task.id,
+        artifact_type=ArtifactType.MEMO,
+        logs=json.dumps(normalized),
     )
+    stamp_artifact_logical_key(artifact, memo_task)
+    session.add(artifact)
     po = dict(memo_task.plan_output) if isinstance(memo_task.plan_output, dict) else {}
     po["memo"] = normalized
     memo_task.plan_output = po
@@ -2836,6 +2844,7 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
         artifact_type=ArtifactType.MEMO,
         logs=serialized,
     )
+    stamp_artifact_logical_key(artifact, task)
     session.add(artifact)
 
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
@@ -2851,6 +2860,8 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
     await session.commit()
     await session.refresh(artifact)
+
+    await deliver_artifact_to_dependents(task, artifact, session, commit=True)
 
     await broadcast_to_project(
         str(task.project_id),

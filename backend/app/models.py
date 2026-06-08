@@ -2841,6 +2841,14 @@ class Artifact(SQLModel, table=True):
     storage_uri: str | None = None
     logs: str | None = None
 
+    # Logical identifier used by downstream consumers to reference this artifact
+    # by slug rather than by UUID. NULL for legacy rows and artifact types that
+    # don't participate in the consumption seam. Indexed for slug-lookup queries.
+    logical_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True, index=True),
+    )
+
     iteration: int = Field(default=0)
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -2848,6 +2856,74 @@ class Artifact(SQLModel, table=True):
     )
 
     task: Task = Relationship(back_populates="artifacts")
+    consumptions: list["ArtifactConsumption"] = Relationship(back_populates="artifact")
+
+
+class ArtifactConsumption(SQLModel, table=True):
+    """Durable record that a consumer task claimed a specific artifact.
+
+    Provides a proof-of-consumption seam: when a downstream task actually reads
+    and uses an artifact (identified by ``artifact_id`` and optionally the
+    ``logical_key`` slug), it writes one row here. The unique constraint on
+    ``(consumer_task_id, artifact_id)`` prevents double-recording. Producer and
+    consumer task links are SET NULL on delete so consumption history survives
+    task cleanup, mirroring ComputeJob.task_id.
+    """
+
+    __tablename__ = "artifactconsumption"
+    __table_args__ = (
+        UniqueConstraint(
+            "consumer_task_id",
+            "artifact_id",
+            name="uq_artifactconsumption_consumer_artifact",
+        ),
+        Index("ix_artifactconsumption_artifact_id", "artifact_id"),
+        Index("ix_artifactconsumption_consumer_task_id", "consumer_task_id"),
+        Index("ix_artifactconsumption_producer_task_id", "producer_task_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    artifact_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifact.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        )
+    )
+    consumer_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        ),
+    )
+    producer_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=False,
+        ),
+    )
+
+    # Snapshot of the slug at consumption time; may diverge from Artifact.logical_key
+    # if the key is later updated, making consumption records self-describing.
+    logical_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    artifact: "Artifact" = Relationship(back_populates="consumptions")
 
 
 class KnowledgeDocument(SQLModel, table=True):

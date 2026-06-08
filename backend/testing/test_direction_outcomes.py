@@ -4776,6 +4776,26 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "declared": True,
         "verified": True,
     },
+    # Downstream artifact proven by a later consumer: consumed is a strict subset
+    # of proven, and records the distinct acceptance_consumed_merged aggregate.
+    "consumed": {
+        "context": {
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": True,
+                "consumed": True,
+                "kind": "downstream_artifact",
+            },
+        },
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": True,
+        "consumed": True,
+        "declared": True,
+        "verified": True,
+    },
     # Satisfied-but-soft observable_behavior merge: declared + verified, not proven.
     "soft": {
         "context": {
@@ -4790,6 +4810,7 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "write": True,
         "merged": True,
         "proven": False,
+        "consumed": False,
         "declared": True,
         "verified": True,
     },
@@ -4807,6 +4828,7 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "write": True,
         "merged": True,
         "proven": False,
+        "consumed": False,
         "declared": True,
         "verified": False,
     },
@@ -4817,6 +4839,7 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "write": True,
         "merged": True,
         "proven": False,
+        "consumed": False,
         "declared": False,
         "verified": True,
     },
@@ -4830,6 +4853,7 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "write": True,
         "merged": True,
         "proven": False,
+        "consumed": False,
         "declared": False,
         "verified": False,
     },
@@ -4841,6 +4865,7 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "write": False,
         "merged": True,
         "proven": False,
+        "consumed": False,
         "declared": False,
         "verified": True,
     },
@@ -4854,12 +4879,14 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
     merged_write = [r for r in merged if r["write"]]
     declared = sum(1 for r in merged_write if r["declared"])
     proven = sum(1 for r in merged_write if r["proven"])
+    consumed = sum(1 for r in merged_write if r.get("consumed"))
     verified_write = sum(1 for r in merged_write if r["verified"])
     verified = sum(1 for r in merged if r["verified"])
     prs_merged = len(merged)
     mw = len(merged_write)
     return {
         "acceptance_proven_merged": proven,
+        "acceptance_consumed_merged": consumed,
         "acceptance_declared_merged": declared,
         "acceptance_verified_write_merged": verified_write,
         "acceptance_merged_write_total": mw,
@@ -4908,9 +4935,9 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
     "mix",
     [
         # All distinct scenario kinds together.
-        ["proven", "soft", "declared_unsat", "undeclared", "degraded", "readonly"],
+        ["proven", "consumed", "soft", "declared_unsat", "undeclared", "degraded", "readonly"],
         # Proven-heavy.
-        ["proven", "proven", "proven", "soft"],
+        ["proven", "consumed", "proven", "soft"],
         # No proven at all (soft + undeclared + degraded).
         ["soft", "undeclared", "degraded"],
         # Only read-only merges → no merged-write denominator.
@@ -5011,6 +5038,7 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     # A clean, consistent entry has no violations.
     clean = {
         "acceptance_proven_merged": 1,
+        "acceptance_consumed_merged": 1,
         "acceptance_declared_merged": 2,
         "acceptance_verified_write_merged": 2,
         "acceptance_merged_write_total": 3,
@@ -5023,6 +5051,10 @@ def test_acceptance_metric_invariant_violations_detects_drift():
 
     # proven drifts above declared.
     assert acceptance_metric_invariant_violations({**clean, "acceptance_proven_merged": 3})
+    # consumed drifts above proven.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_consumed_merged": 2, "acceptance_proven_merged": 1}
+    )
     # proven drifts above verified.
     assert acceptance_metric_invariant_violations(
         {**clean, "acceptance_proven_merged": 1, "verified_prs_merged": 0}

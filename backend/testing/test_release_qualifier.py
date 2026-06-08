@@ -12584,6 +12584,7 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
     expected = {
         "merged": 4,
         "proven": 1,
+        "consumed": 0,
         "declared_unsatisfied": 1,
         "merged_unverified_degraded": 1,
         "no_declaration": 1,
@@ -12665,6 +12666,7 @@ async def test_finalize_records_version_acceptance_aggregate_for_undeclared_wind
     expected = {
         "merged": 2,
         "proven": 0,
+        "consumed": 0,
         "declared_unsatisfied": 0,
         "merged_unverified_degraded": 0,
         "no_declaration": 2,

@@ -85,7 +85,12 @@ from app.task_lifecycle import (
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
+from app.artifact_prerequisites import (
+    deliver_artifact_to_dependents,
+    stamp_artifact_logical_key,
+)
 from app.landed_signal import merge_verification_status as _merge_verification_status
+from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.time_utils import _utcnow, set_retry_after
 from app.agent_status_spawn import (
@@ -1243,6 +1248,11 @@ async def update_agent_status(
             ctx = dict(task.context or {})
             ctx["prompt_fingerprint"] = payload.prompt_fingerprint
             task.context = ctx
+
+    if payload.status == TaskStatus.COMPLETED:
+        await record_artifact_consumptions_for_task(
+            task, session, payload.consumed_artifact_ids
+        )
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).
@@ -1251,6 +1261,7 @@ async def update_agent_status(
     # (ux_artifact_task_pull_request) that makes the second INSERT raise
     # IntegrityError; we catch it and treat as the dedup-skip path.
     if payload.artifact_type:
+        should_stamp_and_deliver = payload.status == TaskStatus.COMPLETED
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
             _PR_URL_RE = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+$"
             if payload.pr_url and not re.match(_PR_URL_RE, payload.pr_url):
@@ -1287,6 +1298,8 @@ async def update_agent_status(
                     storage_uri=payload.storage_uri,
                     logs=payload.logs,
                 )
+                if should_stamp_and_deliver:
+                    stamp_artifact_logical_key(artifact, task)
                 session.add(artifact)
                 # Persist PR linkage onto the task row, not just the artifact, so
                 # the task itself stays queryable (parentless tasks otherwise lose
@@ -1304,6 +1317,8 @@ async def update_agent_status(
                         f"continuing with peer's row: {ie}"
                     )
                     return {"status": "accepted_dedup_race"}
+                if should_stamp_and_deliver:
+                    await deliver_artifact_to_dependents(task, artifact, session)
                 # Store changed files and enriched retry info in task context
                 if (
                     payload.changed_files
@@ -1350,7 +1365,12 @@ async def update_agent_status(
                 storage_uri=payload.storage_uri,
                 logs=payload.logs,
             )
+            if should_stamp_and_deliver:
+                stamp_artifact_logical_key(artifact, task)
             session.add(artifact)
+            await session.flush()
+            if should_stamp_and_deliver:
+                await deliver_artifact_to_dependents(task, artifact, session)
             # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
             if (
                 payload.changed_files

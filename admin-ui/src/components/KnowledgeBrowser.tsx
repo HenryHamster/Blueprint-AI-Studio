@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu } from 'lucide-react';
 import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import {
@@ -51,11 +51,12 @@ function citationParts(c: KnowledgeCitation | null | undefined): { reference: st
 const SOURCE_KIND_STYLES: Record<string, { bg: string; text: string; icon: typeof FileCode; label: string }> = {
   design: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-300', icon: FileCode, label: 'Design' },
   web_research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-300', icon: Globe, label: 'Web Research' },
+  compute_experiment: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-300', icon: Cpu, label: 'Compute' },
   unknown: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: HelpCircle, label: 'Unknown' },
 };
 
 /** Selectable origins for the filter control (order matters for the segmented control). */
-const SOURCE_KIND_OPTIONS = ['design', 'web_research', 'unknown'] as const;
+const SOURCE_KIND_OPTIONS = ['design', 'web_research', 'compute_experiment', 'unknown'] as const;
 
 function SourceKindBadge({ kind }: { kind?: string }) {
   if (!kind) return null;

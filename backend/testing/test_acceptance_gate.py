@@ -10,6 +10,9 @@ Task objects, no DB — runs under ``bash scripts/test-backend.sh --standalone``
 
 import uuid
 
+import pytest
+from sqlmodel import select
+
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
@@ -19,10 +22,13 @@ from app.acceptance_gate import (
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
+    record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
 )
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
-from app.models import Task, TaskStatus
+from app.models import Artifact, ArtifactConsumption, ArtifactType, Task, TaskStatus
+from testing.factories import make_project
 
 
 def _make_code_task(
@@ -268,6 +274,217 @@ def test_downstream_artifact_empty_diff_fails_closed():
     verdict = evaluate_code_acceptance(task)
     assert verdict.satisfied is False
     assert "no changed files" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
+    """A real consumer consumption row upgrades only the matching producer verdict."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+    project_id = project.id
+    artifact_key = "release-promotion-record"
+    producer = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": artifact_key,
+        },
+        changed_files=["backend/app/release_promotion.py"],
+    )
+    producer.project_id = project_id
+    record_code_acceptance_verdict(producer)
+    assert producer.context[CODE_ACCEPTANCE_VERDICT_KEY] == {
+        "satisfied": True,
+        "proven": False,
+        "kind": "downstream_artifact",
+        "reason": (
+            "downstream_artifact 'release-promotion-record' is reflected in "
+            "the shipped changed files"
+        ),
+    }
+    consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
+    consumer.project_id = project_id
+    consumer.depends_on = [str(producer.id)]
+    db_session.add(producer)
+    db_session.add(consumer)
+    await db_session.flush()
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key=artifact_key,
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/release-promotion-record.json"
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    consumer.context = {
+        ARTIFACT_PREREQUISITES_KEY: [
+            {
+                "artifact_id": str(artifact.id),
+                "logical_key": artifact_key,
+                "source_task_id": str(producer.id),
+            }
+        ]
+    }
+    db_session.add(consumer)
+    await db_session.flush()
+
+    rows = await record_artifact_consumptions_for_task(
+        consumer, db_session, [artifact.id]
+    )
+    assert len(rows) == 1
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+
+    consumption = (
+        (
+            await db_session.execute(
+                select(ArtifactConsumption).where(
+                    ArtifactConsumption.consumer_task_id == consumer.id,
+                    ArtifactConsumption.artifact_id == artifact.id,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert consumption.producer_task_id == producer.id
+    assert consumption.logical_key == artifact_key
+    verdict = producer.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert verdict["satisfied"] is True
+    assert verdict["proven"] is True
+    assert verdict["consumed"] is True
+    assert verdict["consumed_artifact_id"] == str(artifact.id)
+    assert verdict["consumed_by_task_id"] == str(consumer.id)
+    assert consumer.context["consumed_artifact_ids"] == [str(artifact.id)]
+
+
+@pytest.mark.asyncio
+async def test_explicit_consumed_artifact_ids_ignore_undelivered_ids(db_session):
+    """Explicit consumption reports are limited to delivered artifact prerequisites."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+    project_id = project.id
+
+    producer = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "release-promotion-record",
+        },
+        changed_files=["backend/app/release_promotion.py"],
+    )
+    producer.project_id = project_id
+    record_code_acceptance_verdict(producer)
+    db_session.add(producer)
+    await db_session.flush()
+
+    delivered_artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="release-promotion-record",
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/release-promotion-record.json"
+        ),
+    )
+    stray_artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="other-artifact",
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/other-artifact.json"
+        ),
+    )
+    db_session.add(delivered_artifact)
+    db_session.add(stray_artifact)
+    await db_session.flush()
+
+    consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
+    consumer.project_id = project_id
+    consumer.depends_on = [str(producer.id)]
+    consumer.context = {
+        ARTIFACT_PREREQUISITES_KEY: [
+            {
+                "artifact_id": str(delivered_artifact.id),
+                "logical_key": "release-promotion-record",
+                "source_task_id": str(producer.id),
+            }
+        ]
+    }
+    db_session.add(consumer)
+    await db_session.flush()
+
+    rows = await record_artifact_consumptions_for_task(
+        consumer,
+        db_session,
+        [delivered_artifact.id, stray_artifact.id],
+    )
+    assert len(rows) == 1
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+
+    verdict = producer.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert verdict["consumed"] is True
+    assert verdict["consumed_artifact_id"] == str(delivered_artifact.id)
+    assert consumer.context["consumed_artifact_ids"] == [str(delivered_artifact.id)]
+
+
+@pytest.mark.asyncio
+async def test_empty_explicit_consumed_artifact_ids_do_not_fallback(db_session):
+    """An explicit empty report means no consumption, not legacy fallback."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+    producer = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "release-promotion-record",
+        },
+        changed_files=["backend/app/release_promotion.py"],
+    )
+    producer.project_id = project.id
+    record_code_acceptance_verdict(producer)
+    db_session.add(producer)
+    await db_session.flush()
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="release-promotion-record",
+        storage_uri=(
+            "gs://blueprint-agent-artifacts/tasks/"
+            f"{producer.id}/release-promotion-record.json"
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+
+    consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
+    consumer.project_id = project.id
+    consumer.depends_on = [str(producer.id)]
+    consumer.context = {
+        ARTIFACT_PREREQUISITES_KEY: [
+            {
+                "artifact_id": str(artifact.id),
+                "logical_key": "release-promotion-record",
+                "source_task_id": str(producer.id),
+            }
+        ]
+    }
+    db_session.add(consumer)
+    await db_session.flush()
+
+    rows = await record_artifact_consumptions_for_task(consumer, db_session, [])
+    assert rows == []
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+    assert consumer.context.get("consumed_artifact_ids") is None
+    assert producer.context[CODE_ACCEPTANCE_VERDICT_KEY].get("consumed") is not True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

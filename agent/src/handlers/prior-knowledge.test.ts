@@ -12,7 +12,9 @@ import {
   buildPriorKnowledgeSection,
   PRIOR_KNOWLEDGE_LIMIT,
   fetchKnowledgeDocumentById,
+  fetchArtifactDownloadUrl,
   buildPrerequisiteKnowledgeSection,
+  buildPrerequisiteArtifactSection,
   type PrereqKnowledgeDoc,
 } from './prior-knowledge.js';
 import { apiGet } from '../index.js';
@@ -149,6 +151,27 @@ describe('fetchKnowledgeDocumentById', () => {
   });
 });
 
+describe('fetchArtifactDownloadUrl', () => {
+  beforeEach(() => {
+    vi.mocked(apiGet).mockReset();
+  });
+
+  it('resolves a signed artifact URL through the agent endpoint', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ url: 'https://signed.example/artifact' });
+    await expect(fetchArtifactDownloadUrl('artifact-1')).resolves.toBe('https://signed.example/artifact');
+    expect(vi.mocked(apiGet).mock.calls[0][0]).toBe(
+      `/api/agent/artifacts/download-url?artifact_id=${encodeURIComponent('artifact-1')}`,
+    );
+  });
+
+  it('returns null fail-soft for blank ids and failed fetches', async () => {
+    await expect(fetchArtifactDownloadUrl('   ')).resolves.toBeNull();
+    expect(apiGet).not.toHaveBeenCalled();
+    vi.mocked(apiGet).mockRejectedValue(new Error('storage unavailable'));
+    await expect(fetchArtifactDownloadUrl('artifact-1')).resolves.toBeNull();
+  });
+});
+
 describe('buildPrerequisiteKnowledgeSection', () => {
   it('returns "" when there are no pointers', () => {
     expect(buildPrerequisiteKnowledgeSection([], new Map())).toBe('');
@@ -186,5 +209,49 @@ describe('buildPrerequisiteKnowledgeSection', () => {
       new Map(),
     );
     expect(section).toBe('');
+  });
+});
+
+describe('buildPrerequisiteArtifactSection', () => {
+  it('returns "" for an empty list', () => {
+    expect(buildPrerequisiteArtifactSection([], new Map(), 'task-abc')).toBe('');
+  });
+
+  it('renders artifact ids and signed URLs for commissioned artifacts', () => {
+    const section = buildPrerequisiteArtifactSection(
+      [
+        {
+          artifact_id: 'artifact-1',
+          logical_key: 'release-promotion-record',
+          source_task_id: 'producer-1',
+        },
+      ],
+      new Map([['artifact-1', 'https://signed.example/artifact']]),
+      'task-abc',
+    );
+    expect(section).toContain('## Commissioned Prerequisite Artifacts');
+    expect(section).toContain('release-promotion-record');
+    expect(section).toContain('artifact_id: artifact-1');
+    expect(section).toContain('signed_download_url: https://signed.example/artifact');
+  });
+
+  it('embeds the concrete task-specific consumed-artifacts file path', () => {
+    const section = buildPrerequisiteArtifactSection(
+      [{ artifact_id: 'artifact-2', logical_key: 'my-artifact' }],
+      new Map(),
+      'task-xyz-123',
+    );
+    expect(section).toContain('/tmp/consumed_artifacts_task-xyz-123.json');
+  });
+
+  it('instructs to write empty array rather than omit when no artifacts consumed', () => {
+    const section = buildPrerequisiteArtifactSection(
+      [{ artifact_id: 'artifact-3', logical_key: 'my-artifact' }],
+      new Map(),
+      'task-abc',
+    );
+    // Must tell agents to write [] explicitly, NOT to omit the file
+    expect(section).toContain('[]');
+    expect(section).not.toContain('omit the file and let legacy fallback');
   });
 });

@@ -11477,6 +11477,95 @@ async def test_agent_status_pr_artifact_stores_enriched_context(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_completed_downstream_artifact_stamps_and_delivers(
+    client: AsyncClient, db_session, mocker
+):
+    """COMPLETED non-PR artifacts with downstream_artifact evidence stamp the slug
+    and deliver a prerequisite pointer to queued dependents."""
+    from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Success Test",
+        user_id="test-user-downstream-success",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-success",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(task.id), "agent-vm-downstream-success")
+    headers = {"x-agent-token": token}
+    storage_uri = "gs://blueprint-agent-artifacts/tasks/downstream-output.json"
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "storage_uri": storage_uri,
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.logical_key == "producer-output-bundle"
+    assert artifact.storage_uri == storage_uri
+
+    await db_session.refresh(dependent)
+    assert (dependent.context or {})[ARTIFACT_PREREQUISITES_KEY] == [
+        {
+            "artifact_id": str(artifact.id),
+            "logical_key": "producer-output-bundle",
+            "artifact_type": ArtifactType.SMOKETEST_RESULT.value,
+            "source_task_id": str(task.id),
+            "storage_uri": storage_uri,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_status_malformed_pr_url_returns_400(
     client: AsyncClient, db_session, mocker
 ):
@@ -11539,6 +11628,85 @@ async def test_agent_status_malformed_pr_url_returns_400(
     payload["pr_url"] = valid_pr_url
     resp2 = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstream_artifact(
+    client: AsyncClient, db_session, mocker
+):
+    """FAILED non-PR diagnostic artifacts stay unstamped and are not delivered as
+    downstream prerequisites."""
+    from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Downstream Artifact Failure Test",
+        user_id="test-user-downstream-failed",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "producer-output-bundle",
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-downstream-failed",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    dependent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consume output"}],
+        vm_instance_id="agent-vm-downstream-failed-dependent",
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    token = create_agent_token(str(task.id), "agent-vm-downstream-failed")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Task failed.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.logical_key is None
+
+    await db_session.refresh(dependent)
+    assert ARTIFACT_PREREQUISITES_KEY not in (dependent.context or {})
 
 
 @pytest.mark.asyncio
@@ -18347,3 +18515,283 @@ async def test_heartbeat_image_persist_skipped_when_pool_disabled(
     await db_session.refresh(member)
     assert member.agent_image_name is None
     assert member.agent_image_build_ts is None
+
+
+# ---------------------------------------------------------------------------
+# /api/agent/artifacts/download-url — authorization and storage-failure tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_delivered_artifact_returns_url(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact delivered in task.context.artifact_prerequisites returns a signed URL."""
+    project = Project(name="ArtDL Auth Project", user_id="user-artdl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/some-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    fake_url = "https://storage.googleapis.com/bucket/signed?sig=abc"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_undelivered_artifact_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact id NOT in task.context.artifact_prerequisites returns 404."""
+    project = Project(name="ArtDL Undelivered Project", user_id="user-artdl-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-2",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/other-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Consumer has no artifact_prerequisites at all
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-2",
+        context={},
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-2")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_cross_project_artifact_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """An artifact from a different project is rejected with 404 even if id is delivered."""
+    project_a = Project(name="ArtDL Project A", user_id="user-artdl-003")
+    project_b = Project(name="ArtDL Project B", user_id="user-artdl-004")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    # Producer is in project_b
+    producer_b = Task(
+        project_id=project_b.id,
+        payloads=[{"type": "create", "prompt": "producer b"}],
+        vm_instance_id="vm-artdl-producer-b",
+    )
+    db_session.add(producer_b)
+    await db_session.commit()
+    await db_session.refresh(producer_b)
+
+    artifact_b = Artifact(
+        task_id=producer_b.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/cross-project-output.json",
+    )
+    db_session.add(artifact_b)
+    await db_session.commit()
+    await db_session.refresh(artifact_b)
+
+    # Consumer is in project_a but has the cross-project artifact id in prerequisites
+    consumer_a = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create", "prompt": "consumer a"}],
+        vm_instance_id="vm-artdl-consumer-a",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact_b.id), "logical_key": "cross-project"}
+            ]
+        },
+    )
+    db_session.add(consumer_a)
+    await db_session.commit()
+    await db_session.refresh(consumer_a)
+
+    token = create_agent_token(str(consumer_a.id), "vm-artdl-consumer-a")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact_b.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_storage_uri_error_returns_400(
+    client: AsyncClient, db_session, mocker
+):
+    """A malformed storage_uri on the artifact surfaces as 400."""
+    from app.storage import StorageUriError
+
+    project = Project(name="ArtDL StorageErr Project", user_id="user-artdl-005")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-err",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/bad-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-err",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=StorageUriError("malformed uri")),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-err")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_agent_artifact_download_url_generic_storage_failure_returns_503(
+    client: AsyncClient, db_session, mocker
+):
+    """A generic GCS failure surfaces as 503, not an unhandled 500."""
+    project = Project(name="ArtDL GCS Failure Project", user_id="user-artdl-006")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "producer"}],
+        vm_instance_id="vm-artdl-producer-gcs",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        storage_uri="gs://blueprint-agent-artifacts/tasks/gcs-output.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "consumer"}],
+        vm_instance_id="vm-artdl-consumer-gcs",
+        context={
+            "artifact_prerequisites": [
+                {"artifact_id": str(artifact.id), "logical_key": "output"}
+            ]
+        },
+    )
+    db_session.add(consumer)
+    await db_session.commit()
+    await db_session.refresh(consumer)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("gcs unavailable")),
+    )
+
+    token = create_agent_token(str(consumer.id), "vm-artdl-consumer-gcs")
+    resp = await client.get(
+        "/api/agent/artifacts/download-url",
+        params={"artifact_id": str(artifact.id)},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 503

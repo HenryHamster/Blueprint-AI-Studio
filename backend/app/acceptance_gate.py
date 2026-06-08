@@ -35,6 +35,7 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import uuid
 import operator
 import re
 from dataclasses import dataclass
@@ -42,6 +43,13 @@ from typing import Any, Callable, Iterable
 
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
+
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.artifact_prerequisites import downstream_artifact_logical_key
+from app.models import Artifact
+from app.models import ArtifactConsumption
 from app.models import Task
 from app.models import TaskStatus
 from app.payload_schemas import (
@@ -434,6 +442,173 @@ def acceptance_is_proven(recorded: Any) -> bool:
     return recorded.get("proven") is True
 
 
+def acceptance_is_consumed(recorded: Any) -> bool:
+    """Whether a downstream_artifact verdict has been proven by consumption."""
+    if not isinstance(recorded, dict):
+        return False
+    return recorded.get("consumed") is True
+
+
+def _fallback_consumed_artifact_ids(task: Task) -> list[uuid.UUID]:
+    """Delivered artifact prerequisites from direct dependencies for old agents."""
+    depends_on = {str(dep) for dep in (task.depends_on or []) if dep}
+    if not depends_on:
+        return []
+    raw = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    if not isinstance(raw, list):
+        return []
+    ids: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_task_id") or "") not in depends_on:
+            continue
+        try:
+            artifact_id = uuid.UUID(str(item.get("artifact_id") or ""))
+        except (TypeError, ValueError):
+            continue
+        if artifact_id not in seen:
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+    return ids
+
+
+def _authorized_consumed_artifact_ids(task: Task) -> set[uuid.UUID]:
+    """Artifact ids explicitly delivered to this task and therefore reportable."""
+    delivered = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    if not isinstance(delivered, list):
+        return set()
+    allowed: set[uuid.UUID] = set()
+    for item in delivered:
+        if not isinstance(item, dict):
+            continue
+        try:
+            artifact_id = uuid.UUID(str(item.get("artifact_id") or ""))
+        except (TypeError, ValueError):
+            continue
+        allowed.add(artifact_id)
+    return allowed
+
+
+def _normalize_consumed_artifact_ids(
+    task: Task, consumed_artifact_ids: Iterable[uuid.UUID | str] | None
+) -> list[uuid.UUID]:
+    if consumed_artifact_ids is None:
+        raw = _fallback_consumed_artifact_ids(task)
+    else:
+        raw = list(consumed_artifact_ids)
+    allowed = _authorized_consumed_artifact_ids(task) if consumed_artifact_ids is not None else set()
+    ids: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for value in raw:
+        try:
+            artifact_id = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+        if consumed_artifact_ids is not None and artifact_id not in allowed:
+            continue
+        if artifact_id not in seen:
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+    return ids
+
+
+async def record_artifact_consumptions_for_task(
+    task: Task,
+    session,
+    consumed_artifact_ids: Iterable[uuid.UUID | str] | None = None,
+) -> list[ArtifactConsumption]:
+    """Persist consumption rows and upgrade matching producer verdicts.
+
+    Idempotent and additive: duplicate reports no-op, missing/legacy producer
+    verdicts are left untouched, and existing proven/consumed verdicts are never
+    downgraded.
+    """
+    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids)
+    if not ids:
+        return []
+
+    artifacts = (
+        (await session.execute(select(Artifact).where(Artifact.id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    artifacts_by_id = {artifact.id: artifact for artifact in artifacts}
+    recorded: list[ArtifactConsumption] = []
+    recorded_id_strings: list[str] = []
+
+    for artifact_id in ids:
+        artifact = artifacts_by_id.get(artifact_id)
+        if artifact is None:
+            continue
+        producer = await session.get(Task, artifact.task_id)
+        if producer is None or producer.project_id != task.project_id:
+            continue
+        existing = (
+            (
+                await session.execute(
+                    select(ArtifactConsumption).where(
+                        ArtifactConsumption.consumer_task_id == task.id,
+                        ArtifactConsumption.artifact_id == artifact.id,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is None:
+            existing = ArtifactConsumption(
+                artifact_id=artifact.id,
+                consumer_task_id=task.id,
+                producer_task_id=artifact.task_id,
+                logical_key=artifact.logical_key,
+            )
+            session.add(existing)
+            await session.flush()
+        recorded.append(existing)
+        recorded_id_strings.append(str(artifact.id))
+
+        declared_key = downstream_artifact_logical_key(producer)
+        if (
+            not declared_key
+            or artifact.logical_key != declared_key
+        ):
+            continue
+        producer_ctx = dict(producer.context or {})
+        verdict = producer_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not (
+            isinstance(verdict, dict)
+            and verdict.get("kind") == "downstream_artifact"
+            and verdict.get("satisfied") is True
+        ):
+            continue
+        upgraded = dict(verdict)
+        if upgraded.get("proven") is not True or upgraded.get("consumed") is not True:
+            upgraded["proven"] = True
+            upgraded["consumed"] = True
+            upgraded["consumed_by_task_id"] = str(task.id)
+            upgraded["consumed_artifact_id"] = str(artifact.id)
+            producer_ctx[CODE_ACCEPTANCE_VERDICT_KEY] = upgraded
+            producer.context = producer_ctx
+            flag_modified(producer, "context")
+            session.add(producer)
+
+    if recorded_id_strings:
+        ctx = dict(task.context or {})
+        prior = ctx.get("consumed_artifact_ids")
+        merged = [str(v) for v in prior] if isinstance(prior, list) else []
+        for artifact_id in recorded_id_strings:
+            if artifact_id not in merged:
+                merged.append(artifact_id)
+        ctx["consumed_artifact_ids"] = merged
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+    return recorded
+
+
 def classify_merged_acceptance(task: Task) -> str:
     """Classify one merged task into the release acceptance buckets.
 
@@ -453,6 +628,8 @@ def classify_merged_acceptance(task: Task) -> str:
         return "no_declaration"
     if acceptance_blocks_success(recorded):
         return "declared_unsatisfied"
+    if acceptance_is_consumed(recorded):
+        return "consumed"
     return "proven"
 
 
@@ -463,6 +640,7 @@ def summarize_version_acceptance_aggregate(
     aggregate: dict[str, Any] = {
         "merged": 0,
         "proven": 0,
+        "consumed": 0,
         "declared_unsatisfied": 0,
         "merged_unverified_degraded": 0,
         "no_declaration": 0,
@@ -471,7 +649,10 @@ def summarize_version_acceptance_aggregate(
         if task.status != TaskStatus.COMPLETED:
             continue
         aggregate["merged"] += 1
-        aggregate[classify_merged_acceptance(task)] += 1
+        bucket = classify_merged_acceptance(task)
+        aggregate[bucket] += 1
+        if bucket == "consumed":
+            aggregate["proven"] += 1
     aggregate["proven_rate"] = (
         round(aggregate["proven"] / aggregate["merged"], 3)
         if aggregate["merged"] > 0

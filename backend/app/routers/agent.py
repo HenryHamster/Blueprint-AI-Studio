@@ -41,6 +41,7 @@ from app.models import (
 )
 from app.time_utils import _to_naive_utc
 from app.schemas import (
+    ArtifactDownloadResponse,
     UploadUrlRequest,
     HeartbeatRequest,
     SpawnTaskRequest,
@@ -58,6 +59,7 @@ from app.task_capabilities import (
 )
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
+from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.github import (
     create_check_run,
     get_pull_request,
@@ -3425,6 +3427,47 @@ async def get_upload_url(
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{req.task_id}/{safe_filename}"
 
     return {"upload_url": url, "storage_uri": storage_uri}
+
+
+@router.get("/artifacts/download-url", response_model=ArtifactDownloadResponse)
+@limiter.limit("300/minute")
+async def get_agent_artifact_download_url(
+    request: Request,
+    artifact_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed GET URL for an artifact delivered to this task."""
+    task_id = uuid.UUID(str(token.get("sub")))
+    task = await session.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    delivered = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    allowed_ids = {
+        str(p.get("artifact_id"))
+        for p in delivered
+        if isinstance(p, dict) and p.get("artifact_id")
+    } if isinstance(delivered, list) else set()
+    if str(artifact_id) not in allowed_ids:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    artifact = await session.get(Artifact, artifact_id)
+    if artifact is None or artifact.storage_uri is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    producer = await session.get(Task, artifact.task_id)
+    if producer is None or producer.project_id != task.project_id:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    from app.storage import StorageUriError, generate_download_signed_url
+
+    try:
+        url = await generate_download_signed_url(artifact.storage_uri)
+    except StorageUriError:
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+    return ArtifactDownloadResponse(url=url)
 
 
 class ViewportFailureScreenshotUrlRequest(BaseModel):

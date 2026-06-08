@@ -116,6 +116,10 @@ class AgentStatusPayload(BaseModel):
     execution_mode: str | None = Field(None, max_length=50)
     scope_gate_triggered: str | None = Field(None, max_length=50)
     changed_files: List[str] | None = Field(None, max_length=100)
+    # Artifact ids this task actually consumed while completing. New agents send
+    # this explicitly; older agents are handled by a backend fallback over
+    # delivered artifact_prerequisites for direct depends_on producers.
+    consumed_artifact_ids: List[uuid.UUID] | None = Field(None, max_length=100)
     test_failure_summary: str | None = Field(None, max_length=5000)
     # Kept as Dict[str, Any] so agent_status.py can store it directly in the
     # task.context JSON column without an extra .model_dump() call.

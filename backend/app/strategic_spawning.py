@@ -3498,6 +3498,9 @@ async def _spawn_strategic_review(
         total_proven_merged = sum(
             proven_merged_count(h) for h in history
         ) + (agg.get("total_acceptance_proven_merged", 0) or 0)
+        total_consumed_merged = sum(
+            h.get("acceptance_consumed_merged", 0) for h in history
+        ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
         # Declaration coverage = declared / merged-write, recomputed from summed
         # counts (not averaged per-cycle fractions) so it survives eviction.
         total_declared_merged = sum(
@@ -3574,6 +3577,7 @@ async def _spawn_strategic_review(
             # code even committed to forward evidence. Lets the strategist
             # prioritize closing the proof gap, not just delivery.
             "proven_prs_merged": total_proven_merged,
+            "consumed_prs_merged": total_consumed_merged,
             "acceptance_declaration_coverage": acceptance_declaration_coverage,
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),

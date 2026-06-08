@@ -30,6 +30,7 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     acceptance_blocks_success,
+    acceptance_is_consumed,
     acceptance_is_proven,
     acceptance_was_declared,
     classify_merged_acceptance,
@@ -167,6 +168,11 @@ def proven_merged_count(entry: dict) -> int:
     return int(entry.get("acceptance_proven_merged") or 0)
 
 
+def consumed_merged_count(entry: dict) -> int:
+    """Merged downstream_artifact count proven by downstream consumption."""
+    return int(entry.get("acceptance_consumed_merged") or 0)
+
+
 def declared_merged_count(entry: dict) -> int:
     """Plan-time-declared merged-PR count for a research_history entry.
 
@@ -210,12 +216,17 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
     """
     violations: list[str] = []
     proven = proven_merged_count(entry)
+    consumed = consumed_merged_count(entry)
     declared = int(entry.get("acceptance_declared_merged") or 0)
     verified = verified_merged_count(entry)
     prs_merged = int(entry.get("prs_merged") or 0)
 
     if proven < 0:
         violations.append(f"proven ({proven}) is negative")
+    if consumed < 0:
+        violations.append(f"consumed ({consumed}) is negative")
+    if consumed > proven:
+        violations.append(f"consumed ({consumed}) exceeds proven ({proven})")
     if proven > declared:
         violations.append(f"proven ({proven}) exceeds declared ({declared})")
     if proven > verified:
@@ -475,6 +486,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     # scoring (and summed in direction_metrics.py's aggregate).
     "acceptance_proven_merged": {
         "consumer": "digest_direction_progress.py (lifetime proven rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_proven_merged)"
+    },
+    "acceptance_consumed_merged": {
+        "consumer": "digest_direction_progress.py (lifetime consumed rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_consumed_merged)"
     },
     "acceptance_declared_merged": {
         "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
@@ -806,6 +820,7 @@ async def _update_direction_research_outcomes(
     # no_declaration) still count as verified, while degraded rows stay out.
     aggregate_buckets = {
         "proven": 0,
+        "consumed": 0,
         "declared_unsatisfied": 0,
         "merged_unverified_degraded": 0,
         "no_declaration": 0,
@@ -814,6 +829,7 @@ async def _update_direction_research_outcomes(
         aggregate_buckets[classify_merged_acceptance(ct)] += 1
     entry["verified_prs_merged"] = (
         aggregate_buckets["proven"]
+        + aggregate_buckets["consumed"]
         + aggregate_buckets["no_declaration"]
     )
     # Honest proven-by-evidence + declaration-coverage aggregates. These are
@@ -856,6 +872,11 @@ async def _update_direction_research_outcomes(
         1
         for ct in _merged_write_rows
         if acceptance_is_proven((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_consumed_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if acceptance_is_consumed((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
     )
     entry["acceptance_declared_merged"] = sum(
         1

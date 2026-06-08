@@ -9,7 +9,11 @@ from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.direction_outcomes import proven_merged_count, verified_merged_count
+from app.direction_outcomes import (
+    consumed_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.failure_classification import (
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
@@ -154,6 +158,7 @@ _HISTORY_AGG_DEFAULTS = {
     # denominator (merged WRITE tasks) so lifetime coverage = declared /
     # merged_write_total without lossy per-cycle fraction-averaging.
     "total_acceptance_proven_merged": 0,
+    "total_acceptance_consumed_merged": 0,
     "total_acceptance_declared_merged": 0,
     "total_acceptance_merged_write_total": 0,
     "total_prs_rejected": 0,
@@ -475,6 +480,7 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_acceptance_proven_merged"] += ev.get(
             "acceptance_proven_merged", 0
         )
+        agg["total_acceptance_consumed_merged"] += consumed_merged_count(ev)
         agg["total_acceptance_declared_merged"] += ev.get(
             "acceptance_declared_merged", 0
         )

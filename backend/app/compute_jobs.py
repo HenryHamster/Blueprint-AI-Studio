@@ -29,6 +29,11 @@ from app.compute_backends import (
     get_compute_backend,
     validate_backend_name,
 )
+from app.artifact_prerequisites import (
+    deliver_artifact_to_dependents,
+    downstream_artifact_logical_key,
+    stamp_artifact_logical_key,
+)
 from app.database import AsyncSessionLocal
 from app.models import (
     Artifact,
@@ -300,14 +305,48 @@ async def stamp_compute_job_result_reference(
     job_id: uuid.UUID,
     result_reference: str | None,
 ) -> ComputeJob | None:
-    """Persist a terminal result reference on the matching compute-job row."""
+    """Persist a terminal result reference on the matching compute-job row.
+
+    When the producer declared downstream_artifact acceptance evidence, the
+    reference is also represented as a first-class COMPUTE_RESULT Artifact so
+    queued dependents can receive the declared logical artifact pointer.
+    """
     reference = (result_reference or "").strip()
     if not reference:
         return None
     job = await get_compute_job_for_task(session, job_id=job_id, task_id=task_id)
     if job is None:
         return None
+    task = await session.get(Task, task_id)
+    logical_key = downstream_artifact_logical_key(task)
     job.result_reference = reference
+    artifact = None
+    if job.artifact_id is not None:
+        artifact = await session.get(Artifact, job.artifact_id)
+        if artifact is not None and logical_key:
+            artifact.logical_key = logical_key
+            if not artifact.storage_uri:
+                artifact.storage_uri = reference
+            session.add(artifact)
+    elif logical_key:
+        artifact = Artifact(
+            task_id=task_id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri=reference,
+            logical_key=logical_key,
+            logs=json.dumps(
+                {
+                    "compute_job_id": str(job.id),
+                    "result_reference": reference,
+                },
+                sort_keys=True,
+            ),
+        )
+        session.add(artifact)
+        await session.flush()
+        job.artifact_id = artifact.id
+    if task is not None and artifact is not None:
+        await deliver_artifact_to_dependents(task, artifact, session)
     job.updated_at = _utcnow()
     session.add(job)
     return job
@@ -696,6 +735,7 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     reference = await collect_terminal_artifact_reference(job)
     if reference is None:
         return
+    task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():
             artifact_logs = {
@@ -717,6 +757,7 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
                 storage_uri=reference.uri,
                 logs=json.dumps(artifact_logs, sort_keys=True),
             )
+            stamp_artifact_logical_key(artifact, task)
             session.add(artifact)
             await session.flush()  # assign artifact.id before stamping the job
         # SAVEPOINT released cleanly — safe to point the job at the durable result.
@@ -724,6 +765,8 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
         job.result_reference = reference.uri
         job.updated_at = _utcnow()
         session.add(job)
+        if task is not None:
+            await deliver_artifact_to_dependents(task, artifact, session)
     except Exception:
         logger.warning(
             "[COMPUTE_JOB] durable-artifact linkage failed for job=%s; "
