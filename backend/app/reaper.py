@@ -3875,7 +3875,31 @@ async def reaper_service():
                 # timed-out registrations, and strand-guard orphaned parked tasks.
                 _mark_reaper_progress()
                 try:
-                    await sweep_deliver_task_wakes(session, now)
+                    _wake_result = await sweep_deliver_task_wakes(session, now)
+                    # Per-cycle wake-delivery health: this return value used to be
+                    # discarded, leaving a wedged-but-not-crashed delivery path
+                    # invisible. Log the full breakdown whenever the cycle did
+                    # anything (or is stalled) so delivered / expired / stranded /
+                    # delivery-failed counts and the cross-cycle delivery-stall
+                    # signal are observable per cycle.
+                    if _wake_result.is_noteworthy():
+                        _wake_log = (
+                            logger.warning
+                            if _wake_result.delivery_stalled
+                            else logger.info
+                        )
+                        _wake_log(
+                            "[REAPER] Task-wake delivery: delivered=%d expired=%d "
+                            "stranded=%d delivery_failed=%d fired_undelivered=%d "
+                            "stalled=%s (stall_cycles=%d)",
+                            _wake_result.delivered,
+                            _wake_result.expired,
+                            _wake_result.stranded,
+                            _wake_result.delivery_failed,
+                            _wake_result.fired_undelivered,
+                            _wake_result.delivery_stalled,
+                            _wake_result.stall_cycles,
+                        )
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Task-wake delivery sweep error: {e}", exc_info=True

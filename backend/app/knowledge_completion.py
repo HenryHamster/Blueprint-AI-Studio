@@ -1509,20 +1509,37 @@ async def _persist_compute_knowledge_document(
     if _compute_grounding_miss(document) is not None:
         verdict_record["citation_grounding_miss"] = True
 
-    doc = KnowledgeDocument(
-        project_id=task.project_id,
-        source_task_id=task.id,
-        direction_id=direction_id,
-        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
-        title=title,
-        summary=summary,
-        body=document["body"],
-        topic=topic,
-        tags=tags,
-        source_citations=citations,
-        forward_quality_verdict=verdict_record,
+    existing = (
+        (
+            await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.project_id == task.project_id,
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind
+                    == SourceKind.COMPUTE_EXPERIMENT.value,
+                )
+            )
+        )
+        .scalars()
+        .first()
     )
-    session.add(doc)
+    if existing is None:
+        doc = KnowledgeDocument(
+            project_id=task.project_id,
+            source_task_id=task.id,
+            direction_id=direction_id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+            title=title,
+            summary=summary,
+            body=document["body"],
+            topic=topic,
+            tags=tags,
+            source_citations=citations,
+            forward_quality_verdict=verdict_record,
+        )
+        session.add(doc)
+    else:
+        doc = existing
 
     # Mirror a compact copy into plan_output for admin visibility WITHOUT
     # touching the compute_result the compute handler already wrote there.

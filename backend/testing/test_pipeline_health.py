@@ -1076,6 +1076,7 @@ async def test_return_structure_has_all_required_keys():
     assert set(result.keys()) == {
         "success_rate",
         "trend",
+        "park_wake_health",
         "failure_distribution",
         "failure_taxonomy",
         "failure_taxonomy_by_scope",

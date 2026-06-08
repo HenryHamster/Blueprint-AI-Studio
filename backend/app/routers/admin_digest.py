@@ -51,6 +51,7 @@ from app.digest_metrics import (
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
@@ -1313,6 +1314,12 @@ async def _compute_digest(
         session, project_id
     )
 
+    # --- Park/wake operational health (read-only) — PARKED population + wake
+    # delivery backlog for the park-and-wake primitive. Distinct from the
+    # parked_blockers block above (escalated BLOCKED tasks); this grounds
+    # "park/wake is healthy" in observed PARKED/FIRED runtime state. ---
+    park_wake_health = await compute_park_wake_health(session, project_id)
+
     # --- Fleet-wide no-CI merge-gate verification health (read-only) — surfaces
     # whether merges across the fleet actually ran real tests vs. fell open to an
     # UNVERIFIED merge, which fall-open reason dominates, and how many projects
@@ -1463,6 +1470,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
+        "park_wake_health": park_wake_health,
         "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,
         "migration_slot_contention": migration_slot_contention,

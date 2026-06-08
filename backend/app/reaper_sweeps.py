@@ -3117,9 +3117,106 @@ async def sweep_resolve_stale_open_bug_messages(
     return resolved
 
 
+# ── Wake-delivery sweep observability ────────────────────────────────────────
+#
+# The wake-delivery sweep historically returned a bare int (wakes delivered) and
+# the reaper discarded it — so a wedged-but-not-crashed delivery path left no
+# per-cycle signal. ``WakeSweepResult`` carries the full per-pass breakdown the
+# reaper now logs, WITHOUT changing the contract: it subclasses ``int`` and its
+# integer value IS ``delivered``, so every existing caller / test that compares
+# the return to an int keeps working unchanged.
+
+# Consecutive reaper cycles where the sweep delivered nothing while FIRED-but-
+# undelivered registrations remained. A genuinely-progressing or idle sweep
+# resets this to 0; only a stuck delivery path lets it climb. Module-level so it
+# persists across the leader's reaper cycles (the sweep is otherwise stateless).
+_wake_delivery_stall_cycles: int = 0
+# Consecutive no-progress cycles (with a non-empty FIRED backlog) after which the
+# cross-cycle delivery-stall signal trips. One cycle of no progress can be benign
+# (a registration fired mid-sweep); a sustained run is the wedged-sweep signature.
+_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD: int = 3
+
+
+def reset_wake_delivery_stall_state() -> None:
+    """Reset the cross-cycle delivery-stall counter (test hook / leader handoff)."""
+    global _wake_delivery_stall_cycles
+    _wake_delivery_stall_cycles = 0
+
+
+class WakeSweepResult(int):
+    """Per-cycle outcome of :func:`sweep_deliver_task_wakes`.
+
+    Subclasses ``int`` so the historical contract is preserved exactly — the
+    integer value equals ``delivered`` (pass-1 wakes), and existing callers/tests
+    that do ``assert result == 1`` keep working — while the reaper reads the
+    richer breakdown for per-cycle logging:
+
+      * ``delivered``         — PARKED tasks advanced this cycle (pass 1)
+      * ``expired``           — PENDING registrations aged out at deadline (pass 2)
+      * ``stranded``          — PARKED tasks failed with no live registration (pass 3)
+      * ``delivery_failed``   — FIRED registrations marked FAILED after a delivery
+                                error (poison rows)
+      * ``fired_undelivered`` — FIRED registrations still undelivered after the
+                                sweep (the residual delivery backlog)
+      * ``stall_cycles``      — consecutive no-progress cycles with a FIRED backlog
+      * ``delivery_stalled``  — True once ``stall_cycles`` crosses the threshold
+    """
+
+    delivered: int
+    expired: int
+    stranded: int
+    delivery_failed: int
+    fired_undelivered: int
+    stall_cycles: int
+    delivery_stalled: bool
+
+    def __new__(
+        cls,
+        delivered: int,
+        *,
+        expired: int = 0,
+        stranded: int = 0,
+        delivery_failed: int = 0,
+        fired_undelivered: int = 0,
+        stall_cycles: int = 0,
+        delivery_stalled: bool = False,
+    ) -> "WakeSweepResult":
+        self = super().__new__(cls, delivered)
+        self.delivered = int(delivered)
+        self.expired = int(expired)
+        self.stranded = int(stranded)
+        self.delivery_failed = int(delivery_failed)
+        self.fired_undelivered = int(fired_undelivered)
+        self.stall_cycles = int(stall_cycles)
+        self.delivery_stalled = bool(delivery_stalled)
+        return self
+
+    def as_log_fields(self) -> dict:
+        """Flat dict of the per-pass counts for structured per-cycle logging."""
+        return {
+            "delivered": self.delivered,
+            "expired": self.expired,
+            "stranded": self.stranded,
+            "delivery_failed": self.delivery_failed,
+            "fired_undelivered": self.fired_undelivered,
+            "stall_cycles": self.stall_cycles,
+            "delivery_stalled": self.delivery_stalled,
+        }
+
+    def is_noteworthy(self) -> bool:
+        """True when the cycle did anything (or is stalled) worth a log line."""
+        return bool(
+            self.delivered
+            or self.expired
+            or self.stranded
+            or self.delivery_failed
+            or self.delivery_stalled
+        )
+
+
 async def sweep_deliver_task_wakes(
     session, now: datetime, *, batch_size: int = 200
-) -> int:
+) -> "WakeSweepResult":
     """Leader-owned wake-delivery worker for the task park-and-wake primitive.
 
     Three passes, each claiming rows ``FOR UPDATE SKIP LOCKED`` so two sweeps (or
@@ -3133,8 +3230,11 @@ async def sweep_deliver_task_wakes(
        remaining PENDING/FIRED registration (e.g. their registration row was lost)
        — fail them so a parked task can never sit forever with nothing to wake it.
 
-    Returns the number of tasks actually woken (pass 1 deliveries). Idempotent and
-    safe to run every reaper cycle.
+    Returns a :class:`WakeSweepResult` — an ``int`` (== wakes delivered, the
+    historical contract) that ALSO carries the per-pass breakdown (expired,
+    stranded, delivery-failed, residual FIRED backlog) and the cross-cycle
+    delivery-stall signal, so the reaper can log per-cycle wake health.
+    Idempotent and safe to run every reaper cycle.
 
     Pass 1 commits per-registration (not once per batch). ``deliver_wake`` is
     caller-committed for EVERY branch — including the compute-job FINALIZE branch,
@@ -3147,7 +3247,14 @@ async def sweep_deliver_task_wakes(
     commit internal KnowledgeDocument rows; their post-commit broadcast + knowledge
     persistence run via ``run_compute_wake_post_commit`` AFTER the delivery commit.
     """
-    from app.task_completion import run_compute_wake_post_commit
+    from sqlalchemy import func
+
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.failure_classification import PARK_WAKE_STRANDED
+    from app.task_completion import (
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+        run_compute_wake_post_commit,
+    )
     from app.task_lifecycle import (
         _PARK_STRAND_SECONDS,
         deliver_wake,
@@ -3155,7 +3262,43 @@ async def sweep_deliver_task_wakes(
     )
 
     delivered = 0
+    expired = 0
+    stranded_count = 0
+    delivery_failed = 0
     touched = False
+
+    # Retry delivered compute-wake registrations that are carrying the durable
+    # post-commit marker before processing any new FIRED rows. This keeps the
+    # wake side effects recoverable even after the delivery row itself has been
+    # committed as DELIVERED.
+    retry_rows = (
+        (
+            await session.execute(
+                select(TaskWakeRegistration)
+                .where(
+                    TaskWakeRegistration.delivery_state
+                    == WakeDeliveryState.DELIVERED,
+                    TaskWakeRegistration.wake_source_kind
+                    == COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                )
+                .order_by(TaskWakeRegistration.delivered_at.asc().nullsfirst())
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for reg in retry_rows:
+        if _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {}):
+            continue
+        try:
+            await run_compute_wake_post_commit(session, reg)
+        except Exception:
+            logger.exception(
+                "[REAPER] Wake post-commit retry failed for registration %s",
+                reg.id,
+            )
 
     # Pass 1: deliver fired registrations, one registration per transaction. Each
     # FIRED row is claimed (FOR UPDATE SKIP LOCKED, LIMIT 1), delivered, and
@@ -3203,6 +3346,7 @@ async def sweep_deliver_task_wakes(
                     poisoned.delivered_at = now
                     session.add(poisoned)
                     await session.commit()
+                    delivery_failed += 1
                 else:
                     await session.rollback()
             continue
@@ -3234,7 +3378,8 @@ async def sweep_deliver_task_wakes(
     )
     for reg in due:
         touched = True
-        await expire_wake(session, reg, now=now)
+        if await expire_wake(session, reg, now=now):
+            expired += 1
 
     # Pass 3: strand-guard. A PARKED task whose parked_at is older than the strand
     # threshold and which has no live (PENDING/FIRED) registration cannot be woken
@@ -3273,6 +3418,7 @@ async def sweep_deliver_task_wakes(
         if live is not None:
             continue
         touched = True
+        stranded_count += 1
         task.status = TaskStatus.FAILED
         task.parked_at = None
         # Clear park_reason too so a stranded task carries no stale "Parked …"
@@ -3282,8 +3428,11 @@ async def sweep_deliver_task_wakes(
             "Parked task stranded with no live wake registration; failing"
         )[:500]
         ctx = dict(task.context or {})
-        ctx["failure_category"] = "park_wake_stranded"
-        ctx["failure_class"] = "park_wake_stranded"
+        # PARK_WAKE_STRANDED is a canonical recognized failure class (budget-exempt
+        # INFRA, human-labelled) so this terminal outcome no longer presents as a
+        # generic code-like residual fingerprint in failure distributions.
+        ctx["failure_category"] = PARK_WAKE_STRANDED
+        ctx["failure_class"] = PARK_WAKE_STRANDED
         task.context = ctx
         with contextlib.suppress(Exception):
             from app.jwt_revocation import emit_task_terminated_notify
@@ -3293,7 +3442,42 @@ async def sweep_deliver_task_wakes(
 
     if touched:
         await session.commit()
-    return delivered
+
+    # Residual delivery backlog: FIRED registrations still undelivered after the
+    # sweep (claimed by another worker, beyond batch_size, or fired mid-sweep). A
+    # healthy sweep drains this within a cycle; a persistent backlog with no
+    # delivery progress is the wedged-sweep signature.
+    fired_filters = [TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED]
+    fired_undelivered = (
+        await session.execute(
+            select(func.count())
+            .select_from(TaskWakeRegistration)
+            .where(*fired_filters)
+        )
+    ).scalar() or 0
+
+    # Cross-cycle delivery-stall signal: a non-empty FIRED backlog that the sweep
+    # made NO progress against this cycle climbs the counter; any progress (or an
+    # empty backlog) resets it. The signal trips once it sustains across the
+    # threshold so a single benign mid-sweep fire does not false-alarm.
+    global _wake_delivery_stall_cycles
+    if fired_undelivered > 0 and delivered == 0:
+        _wake_delivery_stall_cycles += 1
+    else:
+        _wake_delivery_stall_cycles = 0
+    delivery_stalled = (
+        _wake_delivery_stall_cycles >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
+    )
+
+    return WakeSweepResult(
+        delivered,
+        expired=expired,
+        stranded=stranded_count,
+        delivery_failed=delivery_failed,
+        fired_undelivered=int(fired_undelivered),
+        stall_cycles=_wake_delivery_stall_cycles,
+        delivery_stalled=delivery_stalled,
+    )
 
 
 # ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────

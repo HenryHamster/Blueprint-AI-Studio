@@ -7163,7 +7163,7 @@ async def test_compute_wake_delivery_commit_contract_is_truthful(tl_db, mocker):
     The caller (sweep or test) commits exactly once after deliver_wake returns True,
     making the DELIVERED state and task advance durable atomically.
     """
-    from app.models import WakeAction, WakeDeliveryState
+    from app.models import WakeAction, WakeDeliveryState, ComputeJob, ComputeJobStatus
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
 
     session, _factory = tl_db
@@ -7176,32 +7176,38 @@ async def test_compute_wake_delivery_commit_contract_is_truthful(tl_db, mocker):
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
 
+    # Create a real ComputeJob row so deliver_wake can resolve it (a missing or
+    # non-UUID wake_source_ref takes the "job_record_missing" early-exit path).
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(job)
+    await session.commit()
+
     # Park the task on the compute-job-terminal wake source with FINALIZE action.
     reg = await park_task(
         session,
         task,
         wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        wake_source_ref="job-xyz",
-        source_metadata={"compute_job_id": "job-xyz"},
+        wake_source_ref=str(job.id),
+        source_metadata={"compute_job_id": str(job.id)},
         wake_action=WakeAction.FINALIZE,
-        reason="waiting on compute job job-xyz",
+        reason="waiting on compute job",
     )
     await session.commit()
     await session.refresh(task)
     await session.refresh(reg)
 
     assert task.status == TaskStatus.PARKED
-    assert reg.delivery_state == WakeDeliveryState.PENDING
-
-    # Fire the registration.
-    fired = await fire_task_wakes(
-        session,
-        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        wake_source_ref="job-xyz",
-    )
-    await session.commit()
-    await session.refresh(reg)
-    assert fired == 1
+    # park_task's catch-up path fires the registration immediately when the
+    # ComputeJob is already terminal at park time — no separate fire_task_wakes call.
     assert reg.delivery_state == WakeDeliveryState.FIRED
 
     # Stub out the completion handler (owns_commit=False — pure mutation, no
@@ -7256,7 +7262,7 @@ async def test_compute_wake_delivery_handler_failure_leaves_task_recoverable(
     registration remains re-deliverable (or the poison handler can mark it FAILED,
     leaving the task PARKED with parked_at set so the strand-guard can recover it).
     """
-    from app.models import WakeAction, WakeDeliveryState
+    from app.models import WakeAction, WakeDeliveryState, ComputeJob, ComputeJobStatus
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
 
     session, _factory = tl_db
@@ -7269,14 +7275,29 @@ async def test_compute_wake_delivery_handler_failure_leaves_task_recoverable(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
 
+    # Create a real ComputeJob row so deliver_wake can resolve it (a missing or
+    # non-UUID wake_source_ref takes the "job_record_missing" early-exit path).
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        command="echo done",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    session.add(job)
+    await session.commit()
+
     reg = await park_task(
         session,
         task,
         wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        wake_source_ref="job-abc",
-        source_metadata={"compute_job_id": "job-abc"},
+        wake_source_ref=str(job.id),
+        source_metadata={"compute_job_id": str(job.id)},
         wake_action=WakeAction.FINALIZE,
-        reason="waiting on compute job job-abc",
+        reason="waiting on compute job",
     )
     await session.commit()
     await session.refresh(task)
@@ -7285,16 +7306,8 @@ async def test_compute_wake_delivery_handler_failure_leaves_task_recoverable(
     parked_at_before = task.parked_at
     assert parked_at_before is not None
     assert task.status == TaskStatus.PARKED
-
-    # Fire the registration.
-    fired = await fire_task_wakes(
-        session,
-        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        wake_source_ref="job-abc",
-    )
-    await session.commit()
-    await session.refresh(reg)
-    assert fired == 1
+    # park_task's catch-up path fires the registration immediately when the
+    # ComputeJob is already terminal at park time — no separate fire_task_wakes call.
     assert reg.delivery_state == WakeDeliveryState.FIRED
 
     # Stub the completion handler to raise — simulating a finalization failure.

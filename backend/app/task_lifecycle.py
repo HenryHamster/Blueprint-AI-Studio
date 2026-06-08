@@ -5294,7 +5294,6 @@ async def deliver_wake(
         registration.delivery_state = WakeDeliveryState.DELIVERED
         registration.delivered_at = now
         registration.claimed_at = registration.claimed_at or now
-        registration.result_state = "finalized"
         session.add(registration)
         # Clear the park markers before the completion handler mutates the task so
         # the finalized task carries no stale parked_at/park_reason (the completion
@@ -5302,7 +5301,28 @@ async def deliver_wake(
         task.parked_at = None
         task.park_reason = None
         session.add(task)
-        logs = build_compute_result_logs(job) if job is not None else "{}"
+        if job is None:
+            # The ComputeJob row is missing (dangling ref, deleted row, or
+            # unparseable wake_source_ref). Stamp a distinct, truthful failure
+            # classification so operators and auto-remediation can distinguish
+            # this from a legitimate metric-gate miss.
+            registration.result_state = "job_record_missing"
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = (
+                "Compute wake finalized: job record missing at delivery"
+            )[:500]
+            ctx = dict(task.context or {})
+            ctx["failure_category"] = "compute_job_record_missing"
+            ctx["failure_class"] = "compute_job_record_missing"
+            task.context = ctx
+            flag_modified(task, "context")
+            with contextlib.suppress(Exception):
+                from app.jwt_revocation import emit_task_terminated_notify
+
+                emit_task_terminated_notify(session, str(task.id))
+            return True
+        registration.result_state = "finalized"
+        logs = build_compute_result_logs(job)
         # _handle_compute_experiment_completion gates the artifact and sets the
         # task to its honest terminal status (COMPLETED on pass, FAILED on a missed
         # gate) and stamps the job result reference. With owns_commit=False it does

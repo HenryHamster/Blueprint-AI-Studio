@@ -227,6 +227,27 @@ VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
 # key in RegressionRemediationCase rows created by the coverage-drop signal.
 VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 
+# Park/wake orchestration outcomes for the task park-and-wake primitive. A PARKED
+# task waits on an external, non-agent wake source (e.g. a ComputeJob reaching a
+# terminal state) via a durable ``TaskWakeRegistration``. Two ways that wait can
+# end terminally WITHOUT the agent's code being at fault:
+#   * PARK_WAKE_TIMEOUT  — the source never fired before the registration's
+#     ``deadline_at``; the reaper aged the task out (``task_lifecycle.expire_wake``).
+#   * PARK_WAKE_STRANDED — the task sat PARKED past the strand threshold with no
+#     live (PENDING/FIRED) registration left to wake it — its registration row was
+#     lost — so the wake-delivery sweep failed it rather than strand it forever
+#     (``reaper_sweeps.sweep_deliver_task_wakes`` pass 3).
+# Both are orchestration faults, not code defects, so they are budget-exempt
+# (INFRA_CLASSES — no retry burn, no direction-health penalty) and route to the
+# infra taxonomy bucket. Registering them as canonical recognized classes (with
+# human labels + ALL_FAILURE_CLASSES membership) stops failure distributions from
+# presenting them as generic code-like residual fingerprints. The string VALUES
+# match the literals already written into ``task.context['failure_category']`` /
+# ``['failure_class']`` by the expire/strand paths, so the persisted-verdict
+# short-circuit in ``_classify_failure_class`` returns them unchanged.
+PARK_WAKE_TIMEOUT = "park_wake_timeout"
+PARK_WAKE_STRANDED = "park_wake_stranded"
+
 # Context key stamped on a co-deferred dependent task's context. When a research
 # cycle decomposes findings, a dependent finding whose prerequisite was deferred
 # in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
@@ -415,6 +436,8 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         SCOPE_EMPTY,
         REASSIGNED,
         NO_PROGRESS_TIMEOUT,
+        PARK_WAKE_TIMEOUT,
+        PARK_WAKE_STRANDED,
     }
 )
 
@@ -434,6 +457,8 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     SCOPE_EMPTY,
     REASSIGNED,
     NO_PROGRESS_TIMEOUT,
+    PARK_WAKE_TIMEOUT,
+    PARK_WAKE_STRANDED,
 )
 
 
@@ -674,6 +699,14 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # cf28097f): without this label the generic ``fatal`` + init-banner-only tail
     # was reclassified to RATE_LIMIT ("usage exhausted") above.
     "vm_config_missing": PROVISION_FAILURE,
+    # ``park_wake_timeout`` / ``park_wake_stranded`` — park/wake orchestration
+    # outcomes written by the reaper's wake-delivery sweep / expire path (lowercase
+    # literals matching the canonical class VALUES). Mapped here so the
+    # failure_category fast-path canonicalizes them explicitly instead of routing
+    # an unknown label through classify_failure(); both are budget-exempt INFRA
+    # classes (see INFRA_CLASSES) so neither burns the retry budget.
+    "park_wake_timeout": PARK_WAKE_TIMEOUT,
+    "park_wake_stranded": PARK_WAKE_STRANDED,
 }
 
 

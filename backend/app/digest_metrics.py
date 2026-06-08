@@ -26,6 +26,8 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
+    WakeDeliveryState,
     ReleaseVersion,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
@@ -77,6 +79,8 @@ from app.failure_classification import (
     EXTERNAL_API,
     MIGRATION_ERROR,
     NO_PROGRESS_TIMEOUT,
+    PARK_WAKE_STRANDED,
+    PARK_WAKE_TIMEOUT,
     PROVISION_FAILURE,
     RATE_LIMIT,
     REASSIGNED,
@@ -111,6 +115,8 @@ _FAILURE_CLASS_LABELS = {
     SCOPE_EMPTY: "Scope Empty",
     REASSIGNED: "Agent Reassigned",
     NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
+    PARK_WAKE_TIMEOUT: "Park/Wake — source never fired (timed out)",
+    PARK_WAKE_STRANDED: "Park/Wake — stranded (no live wake registration)",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
@@ -1974,6 +1980,97 @@ def apply_foundation_convergence_action(
     flag_modified(dependent, "depends_on")
     flag_modified(dependent, "context")
     return dependent
+
+
+# A FIRED-but-undelivered registration older than this is treated as a stalled
+# delivery: the wake source fired but the leader-owned wake-delivery sweep
+# (``reaper_sweeps.sweep_deliver_task_wakes``) never advanced the PARKED task.
+# Healthy delivery happens within one reaper cycle, so a registration sitting
+# FIRED for many minutes is the signature of a wedged-but-not-crashed sweep.
+_PARK_WAKE_DELIVERY_STALL_SECONDS = 15 * 60
+
+
+def _age_seconds(now: datetime, ts: "datetime | None") -> "int | None":
+    """Non-negative whole-second age of ``ts`` relative to ``now`` (naive-UTC safe).
+
+    Returns ``None`` when ``ts`` is missing. Both timestamps are coerced to naive
+    UTC so a stray tz-aware value cannot raise on the subtraction.
+    """
+    if ts is None:
+        return None
+    return max(
+        0,
+        int((_coerce_naive_utc(now) - _coerce_naive_utc(ts)).total_seconds()),
+    )
+
+
+async def compute_park_wake_health(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Read-only operational health for the task park-and-wake primitive.
+
+    Deliberately DISTINCT from ``parked_blockers`` (which is about escalated
+    BLOCKED tasks): this measures the ``TaskStatus.PARKED`` population and the
+    ``TaskWakeRegistration`` delivery backlog so v7 requalification can ground
+    "park/wake is healthy" in observed runtime state. Never mutates anything;
+    runs four small aggregate queries. Scoped to ``project_id`` when provided,
+    else fleet-wide.
+
+    Returns a dict with:
+      * ``parked_task_count``         — tasks currently in ``TaskStatus.PARKED``
+      * ``oldest_parked_age_seconds`` — age of the oldest PARKED task (None if none)
+      * ``fired_undelivered_count``   — FIRED registrations the sweep has not yet
+                                        delivered (the live delivery backlog)
+      * ``oldest_fired_age_seconds``  — age of the oldest FIRED registration (None)
+      * ``delivery_stalled``          — True when the oldest FIRED registration has
+                                        gone undelivered past the stall threshold
+      * ``delivery_stall_threshold_seconds`` — the threshold used, for context
+    """
+    now = _utcnow()
+
+    parked_filters = [Task.status == TaskStatus.PARKED]
+    if project_id is not None:
+        parked_filters.append(Task.project_id == project_id)
+    parked_task_count = (
+        await session.execute(
+            select(func.count()).select_from(Task).where(*parked_filters)
+        )
+    ).scalar() or 0
+    oldest_parked_at = (
+        await session.execute(select(func.min(Task.parked_at)).where(*parked_filters))
+    ).scalar()
+
+    fired_filters = [TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED]
+    if project_id is not None:
+        fired_filters.append(TaskWakeRegistration.project_id == project_id)
+    fired_undelivered_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(TaskWakeRegistration)
+            .where(*fired_filters)
+        )
+    ).scalar() or 0
+    oldest_fired_at = (
+        await session.execute(
+            select(func.min(TaskWakeRegistration.fired_at)).where(*fired_filters)
+        )
+    ).scalar()
+
+    oldest_fired_age_seconds = _age_seconds(now, oldest_fired_at)
+    delivery_stalled = (
+        oldest_fired_age_seconds is not None
+        and oldest_fired_age_seconds >= _PARK_WAKE_DELIVERY_STALL_SECONDS
+    )
+
+    return {
+        "parked_task_count": int(parked_task_count),
+        "oldest_parked_age_seconds": _age_seconds(now, oldest_parked_at),
+        "fired_undelivered_count": int(fired_undelivered_count),
+        "oldest_fired_age_seconds": oldest_fired_age_seconds,
+        "delivery_stalled": delivery_stalled,
+        "delivery_stall_threshold_seconds": _PARK_WAKE_DELIVERY_STALL_SECONDS,
+    }
 
 
 async def compute_dependency_health_signals(

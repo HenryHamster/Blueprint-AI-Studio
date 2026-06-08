@@ -1118,9 +1118,23 @@ async def compute_pipeline_health_summary(
 
     from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
 
+    # Park/wake operational health (read-only) — PARKED population + wake-delivery
+    # backlog for the park-and-wake primitive. Degrades to None on any error so a
+    # transient query failure never sinks the whole health summary.
+    park_wake_health: Dict[str, Any] | None = None
+    try:
+        from app.digest_metrics import compute_park_wake_health
+
+        park_wake_health = await compute_park_wake_health(session, project_id)
+    except Exception:
+        logger.exception(
+            "[ANALYTICS] park_wake_health computation failed (non-critical)"
+        )
+
     return {
         "success_rate": success_rate,
         "trend": trend,
+        "park_wake_health": park_wake_health,
         "failure_distribution": failure_distribution,
         "failure_taxonomy": failure_taxonomy,
         "failure_taxonomy_by_scope": failure_taxonomy_by_scope,

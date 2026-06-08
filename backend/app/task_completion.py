@@ -83,6 +83,9 @@ from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
 
+
+_COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
+
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
 # the same block without leaving duplicates.
@@ -2001,7 +2004,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
 async def _persist_compute_experiment_knowledge_best_effort(
     task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
-) -> None:
+) -> bool:
     """Persist a compute_experiment's measured verdict as durable knowledge.
 
     Best-effort, additive, and self-contained: it runs only when the experiment
@@ -2013,7 +2016,7 @@ async def _persist_compute_experiment_knowledge_best_effort(
     """
     measurement = _extract_compute_measurement(logs)
     if measurement is None:
-        return  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
+        return True  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
     outcome, cost = measurement
     try:
         from app.knowledge_completion import persist_compute_experiment_knowledge
@@ -2033,6 +2036,8 @@ async def _persist_compute_experiment_knowledge_best_effort(
             task.id,
             exc_info=True,
         )
+        return False
+    return True
 
 
 async def _finalize_compute_experiment(
@@ -2073,7 +2078,7 @@ async def _finalize_compute_experiment(
     )
 
 
-async def run_compute_wake_post_commit(session: AsyncSession, registration) -> None:
+async def run_compute_wake_post_commit(session: AsyncSession, registration) -> bool:
     """Post-commit broadcast + durable knowledge for a wake-finalized compute task.
 
     Invoked by ``reaper_sweeps.sweep_deliver_task_wakes`` AFTER it commits a
@@ -2084,7 +2089,8 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> N
     delivery row lock before its sibling registrations are processed.
 
     Strictly best-effort and fully self-contained: a no-op for any non-compute
-    wake kind, and any failure is swallowed so it can never break the sweep.
+    wake kind, and any failure is reported back as ``False`` so the sweep can
+    retry a delivered registration carrying the durable marker.
     """
     from app.compute_jobs import (
         COMPUTE_JOB_TERMINAL_WAKE_KIND,
@@ -2093,11 +2099,22 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> N
     from app.models import ComputeJob
 
     if registration.wake_source_kind != COMPUTE_JOB_TERMINAL_WAKE_KIND:
-        return
+        return True
     try:
         task = await session.get(Task, registration.task_id)
         if task is None:
-            return
+            return False
+        marker = dict(registration.source_metadata or {})
+        marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
+        marker_meta["attempts"] = int(marker_meta.get("attempts", 0) or 0) + 1
+        marker_meta["updated_at"] = _utcnow().isoformat()
+        if "started_at" not in marker_meta:
+            marker_meta["started_at"] = marker_meta["updated_at"]
+        marker[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = marker_meta
+        registration.source_metadata = marker
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
+        await session.commit()
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
@@ -2110,18 +2127,28 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> N
                     ComputeJob, uuid.UUID(str(registration.wake_source_ref))
                 )
         if job is None:
-            return
+            return False
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
-        await _persist_compute_experiment_knowledge_best_effort(
+        persisted = await _persist_compute_experiment_knowledge_best_effort(
             task, logs, criterion, session
         )
+        if not persisted:
+            return False
+        marker = dict(registration.source_metadata or {})
+        marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+        registration.source_metadata = marker
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
+        await session.commit()
+        return True
     except Exception:  # noqa: BLE001 — post-commit effects must never break the sweep
         logger.warning(
             "[COMPUTE] Post-commit wake side effects failed for task %s",
             getattr(registration, "task_id", None),
             exc_info=True,
         )
+        return False
 
 
 async def _handle_compute_experiment_completion(

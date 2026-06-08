@@ -62,6 +62,7 @@ from app.reaper import (
 )
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
+from app.reaper_sweeps import event_driven_unblock_on_knowledge
 
 
 def test_heartbeat_stale_cutoff_respects_runtime_config_override():
@@ -11785,9 +11786,6 @@ async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
 # only every 6h once escalated). These exercise the new fast path AND assert the
 # conservative matching + all-needs-resolved gate are preserved.
 
-from app.reaper_sweeps import event_driven_unblock_on_knowledge
-
-
 async def _knowledge_doc(db, project, source_task_id, *, topic):
     """Persist a durable KnowledgeDocument whose substance can satisfy a need.
 
@@ -12411,3 +12409,78 @@ async def test_recovery_sweep_then_unblock_sweep_requeues(reaper_db, mocker):
     assert requeued == 1
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker):
+    """A FIRED registration the sweep can't deliver, across consecutive no-progress
+    cycles, trips the cross-cycle delivery-stall signal; a delivering cycle resets it.
+
+    Simulates a wedged-but-not-crashed delivery path by stubbing ``deliver_wake``
+    to a no-op that leaves the registration FIRED — so the sweep makes no progress
+    while a FIRED backlog persists, exactly the regression the per-cycle reporting
+    is meant to surface.
+    """
+    import app.task_lifecycle as _tl
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.reaper_sweeps import (
+        _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
+        WakeSweepResult,
+        reset_wake_delivery_stall_state,
+        sweep_deliver_task_wakes,
+    )
+
+    reset_wake_delivery_stall_state()
+    project = await _make_project(reaper_db)
+
+    now = datetime.utcnow()
+    task = Task(
+        project_id=project.id,
+        title="park-stall",
+        status=TaskStatus.PARKED,
+        parked_at=now - timedelta(minutes=1),
+        payloads=[],
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_action=WakeAction.RESUME,
+        delivery_state=WakeDeliveryState.FIRED,
+        fired_at=now - timedelta(minutes=1),
+    )
+    reaper_db.add(reg)
+    await reaper_db.commit()
+
+    real_deliver = _tl.deliver_wake
+
+    async def _wedged_deliver(session, registration, *, now=None):
+        # Leaves the registration FIRED — no progress, no state change.
+        return False
+
+    mocker.patch.object(_tl, "deliver_wake", new=_wedged_deliver)
+
+    # No-progress cycles with a persistent FIRED backlog climb the stall counter.
+    for cycle in range(1, _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD + 1):
+        result = await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+        assert isinstance(result, WakeSweepResult)
+        assert result.delivered == 0
+        assert result.fired_undelivered == 1
+        assert result.stall_cycles == cycle
+        # Trips only once it sustains across the threshold.
+        assert result.delivery_stalled is (
+            cycle >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
+        )
+
+    # A genuinely-delivering cycle drains the backlog and resets the signal.
+    mocker.patch.object(_tl, "deliver_wake", new=real_deliver)
+    recovered = await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+    assert recovered.delivered == 1
+    assert recovered.fired_undelivered == 0
+    assert recovered.stall_cycles == 0
+    assert recovered.delivery_stalled is False
+
+    reset_wake_delivery_stall_state()
