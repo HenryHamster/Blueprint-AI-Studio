@@ -1591,3 +1591,143 @@ async def test_fallback_verdict_records_skip_reason_when_analysis_disabled(
     assert verdict.get("fallback_reason") == "analysis-disabled", (
         f"expected fallback_reason='analysis-disabled', got {verdict.get('fallback_reason')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_compute_llm_strips_signed_url_when_durable_citation_also_present(
+    db_session, mocker, _quiet_compute_io
+):
+    """When the LLM cites BOTH a durable gs:// artifact AND a transient signed
+    https:// URL, only the gs:// citation survives in source_citations.
+
+    Signed URLs expire and are transient; only durable artifact/metric citations
+    are acceptance-grade evidence. This verifies that supplementary citations
+    included in the LLM prompt (for convenience) are stripped from storage even
+    when the LLM explicitly cites them alongside real durable evidence.
+    """
+    signed_url = "https://signed.storage.example.com/token=abc123/artifacts.tar.gz"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=signed_url),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    # LLM cites BOTH the durable artifact/metric AND the transient signed URL.
+    mock_cls, mock_create = _mock_anthropic_returning(
+        [artifact_uri, metric_ref, signed_url]
+    )
+
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    mock_create.assert_awaited_once()
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.forward_quality_verdict["analysis_mode"] == "llm"
+
+    # Durable citations survive.
+    assert artifact_uri in doc.source_citations
+    assert metric_ref in doc.source_citations
+    # Transient signed URL is stripped even though the LLM cited it.
+    assert signed_url not in doc.source_citations, (
+        "transient signed HTTPS URL must be stripped from source_citations even "
+        "when the LLM also cited durable artifact evidence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_grounding_mismatched_result_reference_unresolved(
+    db_session, _quiet_compute_io
+):
+    """Fallback grounding marks a citation unresolved when result_reference does
+    not match the ComputeJob's artifact URI — bare artifact-row presence is not
+    sufficient. The mismatched citation is stripped from source_citations."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="MismatchGroundingTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: mismatched ref",
+        status=TaskStatus.COMPLETED,
+        payloads=[{
+            "type": "compute_experiment",
+            "experiment": "mismatch-test",
+            "base_branch": "main",
+        }],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Artifact is for job-a's bundle.
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="gs://bucket/jobs/job-a/artifacts/",
+        logs=json.dumps({
+            "artifact_uri": "gs://bucket/jobs/job-a/artifacts/",
+            "file_count": 2,
+        }),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference="gs://bucket/jobs/job-a/artifacts/result.json",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # result_reference points to a DIFFERENT path — mismatched.
+    mismatched_ref = "gs://bucket/jobs/job-b/result.json"
+    logs_json = json.dumps({"job_id": str(job.id), "outcome": "SUCCESS"})
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.10,
+            criterion=None,
+            result_reference=mismatched_ref,
+            session=db_session,
+            logs=logs_json,
+        )
+
+    assert doc is not None
+    # Mismatched reference is not backed by the artifact → citation stripped.
+    assert mismatched_ref not in doc.source_citations, (
+        "a gs:// result_reference that doesn't match the artifact URI must not "
+        "be stored as durable citation evidence"
+    )
+    grounding = (doc.forward_quality_verdict.get("probes") or {}).get("grounding") or {}
+    assert grounding.get("grounded", 0) == 0, (
+        "grounded must be 0 when result_reference doesn't match the artifact URI"
+    )

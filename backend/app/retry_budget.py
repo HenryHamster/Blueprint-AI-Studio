@@ -242,6 +242,7 @@ async def compute_effective_max_requeues(
                 child.context = child_ctx
                 _flag_modified(child, "context")
                 session.add(child)
+                await session.flush()
             return 0
 
     return max_requeues - reduction

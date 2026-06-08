@@ -1130,7 +1130,14 @@ async def _compute_citation_grounding_stamp(
         try:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None:
-                grounded = 1
+                # Require the result_reference to actually match the artifact's
+                # durable storage URI — bare artifact-row presence is not enough.
+                storage_prefix = (artifact.storage_uri or "").rstrip("/")
+                ref = (result_reference or "").rstrip("/")
+                if storage_prefix and (
+                    ref == storage_prefix or ref.startswith(storage_prefix + "/")
+                ):
+                    grounded = 1
         except Exception:  # noqa: BLE001 — best-effort, never breaks completion
             pass
 
@@ -1505,7 +1512,9 @@ async def _analyze_compute_experiment_with_llm(
         "body": body,
         "topic": fallback["topic"],
         "tags": fallback["tags"],
-        "citations": usable[:_COMPUTE_MAX_CITATIONS],
+        # Only persist durable citations (real_evidence); supplementary signed
+        # URLs are prompt helpers that must not survive into source_citations.
+        "citations": [c for c in usable if c in real_evidence][:_COMPUTE_MAX_CITATIONS],
         "verdict_record": verdict_record,
         "_citation_grounding": grounding_stamp,
     }, ""

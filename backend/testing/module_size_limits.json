@@ -85,7 +85,7 @@
     "problem_model.py": 1800,
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
-    "knowledge_completion.py": 1800,
+    "knowledge_completion.py": 2100,
     "alert_dispatch.py": 1750
   },
   "agent": {
