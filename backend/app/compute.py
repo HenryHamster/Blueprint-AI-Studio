@@ -1763,7 +1763,10 @@ async def _provision_gcp(
         # pre-built pool startup script that beacons via VM-scoped /vm-heartbeat.
         startup_script = startup_script_override
     else:
-        from app.compute_startup_script import build_agent_startup_script
+        from app.compute_startup_script import (
+            build_agent_startup_script,
+            resolve_vm_ttl_seconds,
+        )
 
         startup_script = build_agent_startup_script(
             task_id=str(task_id),
@@ -1771,6 +1774,9 @@ async def _provision_gcp(
             payload_uri_b64=payload_uri_b64,
             orchestrator_url=ORCHESTRATOR_URL,
             materialize_manifest_b64=_MATERIALIZE_MANIFEST_B64,
+            # Dedicated cold VM for a known task → apply the per-task-type
+            # self-destruct ceiling (compute_experiment gets 24h; default 4h).
+            ttl_seconds=resolve_vm_ttl_seconds(task_type),
         )
 
     instance_config = compute_v1.Instance()

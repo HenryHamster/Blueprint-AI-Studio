@@ -14,6 +14,57 @@ script can silently break VM startup in ways that only surface in
 production. See CLAUDE.md guidance on cross-language code generation.
 """
 
+import os
+
+# VM self-destruct watchdog ceiling (seconds). DEFENSE-IN-DEPTH failsafe, NOT a
+# per-task wall-clock cap: it only ever fires when the control plane loses track
+# of a VM (orphan, reaper halted, network partition) so the instance can't bill
+# indefinitely. Real per-task enforcement is the reaper's liveness timeouts
+# (no-heartbeat ~5min, no-progress ~8min) which catch a *stalled* task far
+# faster; a healthy task heartbeating every 30s never trips them. Set generously
+# (4h) so a legitimately long-running task (release_audit auditing a full
+# promotion diff; future compute_experiment) is never guillotined mid-run — the
+# prior 1h value killed the release audit at the 1h boot mark while it was still
+# making steady progress. Env-tunable for ops without a logic redeploy.
+DEFAULT_VM_SELF_DESTRUCT_TTL_SECONDS = int(
+    os.getenv("VM_SELF_DESTRUCT_TTL_SECONDS", "14400")
+)
+
+# Per-task-type self-destruct TTL overrides (seconds). Most tasks use the 4h
+# default above; a few task types legitimately run far longer and need a more
+# generous failsafe ceiling so the watchdog never guillotines real work.
+#
+#   compute_experiment (v7, not yet implemented): runs ML / compute jobs that
+#   can legitimately take many hours. It gets a 24h ceiling. NOTE this is a
+#   deliberate choice to KEEP a (very generous) bounded failsafe rather than
+#   EXEMPT compute entirely: an orphaned compute VM is the single most expensive
+#   thing the fleet can leak (long-running, and v7 may schedule it on pricier
+#   hardware), so an unbounded "never self-destruct" VM is exactly the wrong
+#   risk to take. 24h never kills a real <=24h experiment but still caps a
+#   runaway. If v7's compute backend grows its own authoritative job-lifecycle
+#   cleanup, revisit whether the agent-VM ceiling can be raised further.
+#
+# This policy only applies to DEDICATED cold VMs provisioned for a KNOWN task
+# (build_agent_startup_script, where task_type is available at provision time).
+# Warm-pool VMs (build_pool_agent_startup_script) are TASKLESS — they boot before
+# a task is claimed and cannot know they will run a compute_experiment, so they
+# use the default ceiling. A v7 compute_experiment must therefore provision a
+# dedicated VM, not lease a warm-pool one, to receive its 24h ceiling.
+_VM_TTL_OVERRIDES_BY_TASK_TYPE: dict[str, int] = {
+    "compute_experiment": 86400,  # 24h
+}
+
+
+def resolve_vm_ttl_seconds(task_type: str | None) -> int:
+    """Resolve the VM self-destruct ceiling (seconds) for a task type.
+
+    Returns the per-type override when one is registered, else the 4h default.
+    Pure / DB-free so the provision path and tests can call it cheaply.
+    """
+    return _VM_TTL_OVERRIDES_BY_TASK_TYPE.get(
+        task_type or "", DEFAULT_VM_SELF_DESTRUCT_TTL_SECONDS
+    )
+
 
 def build_agent_startup_script(
     *,
@@ -22,6 +73,7 @@ def build_agent_startup_script(
     payload_uri_b64: str,
     orchestrator_url: str,
     materialize_manifest_b64: str,
+    ttl_seconds: int = DEFAULT_VM_SELF_DESTRUCT_TTL_SECONDS,
 ) -> str:
     # Aliases preserve identifier names from the pre-extraction f-string so
     # the bash body below remains byte-identical to its compute.py origin.
@@ -84,7 +136,7 @@ def build_agent_startup_script(
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
     # Graceful: stop the service first (SIGTERM), wait 30s for cleanup, then poweroff
-    TTL_SECONDS=3600
+    TTL_SECONDS={ttl_seconds}
     (
       sleep $TTL_SECONDS
       echo "TTL reached ($TTL_SECONDS s). Gracefully stopping agent service..."
@@ -314,6 +366,7 @@ def build_pool_agent_startup_script(
     secret_version_name: str,
     orchestrator_url: str,
     materialize_manifest_b64: str,
+    ttl_seconds: int = DEFAULT_VM_SELF_DESTRUCT_TTL_SECONDS,
 ) -> str:
     """TASKLESS (warm-pool) variant of the agent startup script.
 
@@ -364,7 +417,7 @@ def build_pool_agent_startup_script(
     echo "Starting Pool Agent VM Initialization (taskless)..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
-    TTL_SECONDS=3600
+    TTL_SECONDS={ttl_seconds}
     (
       sleep $TTL_SECONDS
       echo "TTL reached ($TTL_SECONDS s). Gracefully stopping agent service..."
