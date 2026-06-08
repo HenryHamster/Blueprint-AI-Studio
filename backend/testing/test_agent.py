@@ -16,6 +16,8 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobOutcome,
+    ComputeJobStatus,
     DeploymentState,
     DeploymentStatus,
     KnowledgeDocument,
@@ -26,6 +28,8 @@ from app.models import (
     ProjectStatus,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
+    WakeDeliveryState,
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
@@ -18986,3 +18990,349 @@ async def test_agent_artifact_download_url_generic_storage_failure_returns_503(
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_terminal_before_park_callback_finalizes_once(
+    client: AsyncClient, db_session, mocker
+):
+    """Regression: a compute job that reaches terminal BEFORE the agent POSTs PARKED
+    must still wake and finalize the task EXACTLY ONCE through the real HTTP endpoint.
+
+    Drives the terminal-before-park ordering through the /api/agent/status route:
+      1. Seed a compute_experiment task and a ComputeJob already in SUCCEEDED state.
+      2. POST the same PARKED payload shape that compute-experiment.ts sends.
+      3. park_task's register-then-recheck fires the registration immediately (PENDING->FIRED).
+      4. sweep_deliver_task_wakes finalizes the task COMPLETED with the honest
+         compute_result/final_cost_usd — never a park_wake_timeout.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Terminal Before Park Endpoint", user_id="test-user-park-1"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: terminal before park via endpoint",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Seed a ComputeJob already in terminal SUCCEEDED state with a known cost.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.42,
+        completed_at=datetime.utcnow() - timedelta(seconds=10),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # No wake registration exists yet — the monitor fired nothing (lost-wakeup window).
+    pre_regs = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert pre_regs == [], "no registration should exist before the task parks"
+
+    # POST the same PARKED payload shape sent by agent/src/handlers/compute-experiment.ts
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "PARKED",
+            "park_request": {
+                "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                "wake_source_ref": str(job.id),
+                "wake_action": "finalize",
+                "deadline_seconds": 3600,
+                "reason": f"Parked on compute job {job.id} terminal",
+                "source_metadata": {
+                    "job_id": str(job.id),
+                    "experiment": "test-experiment",
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "parked"
+    assert data["task_id"] == str(task.id)
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    # The register-then-recheck in park_task must fire the registration immediately
+    # because the job was already terminal — it must NOT be left PENDING to time out.
+    regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    assert len(regs) == 1, "exactly one registration must be created"
+    reg = regs[0]
+    assert reg.delivery_state == WakeDeliveryState.FIRED, (
+        "park-time terminal recheck must fire the registration for an already-terminal job"
+    )
+    assert reg.fired_at is not None
+    assert reg.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
+    assert reg.wake_source_ref == str(job.id)
+
+    # The leader sweep finalizes the parked task exactly once.
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert task.status == TaskStatus.COMPLETED
+    assert task.parked_at is None
+    assert (task.context or {}).get("failure_category") != "park_wake_timeout"
+    compute_result = (task.plan_output or {}).get("compute_result")
+    assert compute_result is not None
+    assert compute_result["outcome"] == "SUCCESS"
+    assert compute_result["final_cost_usd"] == pytest.approx(0.42)
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.result_state == "finalized"
+    assert reg.attempt_count == 1
+
+    # Idempotency: a second sweep is a strict no-op.
+    first_delivered_at = reg.delivered_at
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
+
+    db_session.expire_all()
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.delivered_at == first_delivered_at
+    assert reg.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent(
+    client: AsyncClient, db_session, mocker
+):
+    """A duplicate PARKED POST (lost-response retry) must be idempotent.
+
+    The second POST on an already-PARKED task must return {"status": "parked"},
+    not create a second registration row, and not mutate the task or the
+    existing registration.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Park Idempotent Endpoint", user_id="test-user-park-2"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-idem-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: idempotent park retry",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.10,
+        completed_at=datetime.utcnow() - timedelta(seconds=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    token = create_agent_token(str(task.id), vm_id)
+    park_payload = {
+        "task_id": str(task.id),
+        "status": "PARKED",
+        "park_request": {
+            "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            "wake_source_ref": str(job.id),
+            "wake_action": "finalize",
+            "deadline_seconds": 3600,
+            "reason": f"Parked on compute job {job.id} terminal",
+            "source_metadata": {"job_id": str(job.id), "experiment": "test"},
+        },
+    }
+
+    # First POST: parks the task and creates+fires the registration.
+    resp1 = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={"x-agent-token": token},
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    regs_after_first = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_first) == 1
+    first_reg_id = regs_after_first[0].id
+    first_reg_state = regs_after_first[0].delivery_state
+    first_parked_at = task.parked_at
+
+    # Second POST: duplicate retry — must be idempotent.
+    resp2 = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+
+    # Task remains PARKED, no mutation.
+    assert task.status == TaskStatus.PARKED
+    assert task.parked_at == first_parked_at
+
+    # Still exactly one registration — no duplicate created.
+    regs_after_second = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_second) == 1, "duplicate POST must not create a second registration"
+    assert regs_after_second[0].id == first_reg_id
+    assert regs_after_second[0].delivery_state == first_reg_state
+
+
+@pytest.mark.asyncio
+async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
+    client: AsyncClient, db_session, mocker
+):
+    """A stale non-PARKED callback after parking must be rejected as a no-op.
+
+    Once a task is PARKED the wake-delivery worker owns it. A stale COMPLETED or
+    FAILED callback from the same agent VM must return {"status": "parked"} and
+    leave the task PARKED with the registration count unchanged.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Compute Park Stale Callback Endpoint", user_id="test-user-park-3"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-stale-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: stale callback after park",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        final_cost_usd=0.05,
+        completed_at=datetime.utcnow() - timedelta(seconds=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    token = create_agent_token(str(task.id), vm_id)
+
+    # First: park the task normally.
+    park_resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "PARKED",
+            "park_request": {
+                "wake_source_kind": COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                "wake_source_ref": str(job.id),
+                "wake_action": "finalize",
+                "deadline_seconds": 3600,
+                "reason": f"Parked on compute job {job.id} terminal",
+                "source_metadata": {"job_id": str(job.id), "experiment": "test"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert park_resp.status_code == 200
+    assert park_resp.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+
+    regs_after_park = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_park) == 1
+    reg_state_after_park = regs_after_park[0].delivery_state
+
+    # Now POST a stale COMPLETED callback on the already-PARKED task.
+    stale_resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "stale completion from agent that already parked",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert stale_resp.status_code == 200
+    data = stale_resp.json()
+    assert data["status"] == "parked", (
+        "stale non-PARKED callback on a PARKED task must return parked no-op response"
+    )
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+
+    # Task must remain PARKED — the stale callback must not advance it.
+    assert task.status == TaskStatus.PARKED
+
+    # Registration count and state must be unchanged.
+    regs_after_stale = (
+        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
+    )
+    assert len(regs_after_stale) == 1, "stale callback must not create or remove registrations"
+    assert regs_after_stale[0].delivery_state == reg_state_after_park
