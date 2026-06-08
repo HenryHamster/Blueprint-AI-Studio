@@ -25,7 +25,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
-from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.artifact_prerequisites import (
+    ARTIFACT_PREREQUISITES_KEY,
+    deliver_artifact_to_dependents,
+)
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -168,6 +171,58 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+
+
+@pytest.mark.asyncio
+async def test_deliver_artifact_no_partial_commit_on_scan_failure(
+    db_session, _quiet_compute_io
+):
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="experiment-result-bundle",
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/result.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    first_page = MagicMock()
+    first_page.scalars.return_value.all.return_value = [dependent]
+    with patch("app.artifact_prerequisites._DEPENDENT_SCAN_CAP", 1), patch.object(
+        db_session,
+        "execute",
+        new=AsyncMock(side_effect=[first_page, RuntimeError("scan boom")]),
+    ):
+        await deliver_artifact_to_dependents(task, artifact, db_session, commit=True)
+
+    await db_session.refresh(dependent)
+    assert (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY) is None
 
 
 @pytest.mark.asyncio

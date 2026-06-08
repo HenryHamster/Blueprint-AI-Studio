@@ -2058,9 +2058,18 @@ async def compute_park_wake_health(
     ).scalar()
 
     oldest_fired_age_seconds = _age_seconds(now, oldest_fired_at)
+
+    # Unified stall definition: the same cycle-based counter that drives the
+    # reaper log and the operator Alert. The age-based threshold
+    # (_PARK_WAKE_DELIVERY_STALL_SECONDS) is kept for the oldest_fired_age_seconds
+    # observability field and delivery_stall_threshold_seconds; it is no longer
+    # used for the delivery_stalled boolean so all stall surfaces agree.
+    from app.reaper_sweeps import (
+        _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
+        get_wake_delivery_stall_cycles,
+    )
     delivery_stalled = (
-        oldest_fired_age_seconds is not None
-        and oldest_fired_age_seconds >= _PARK_WAKE_DELIVERY_STALL_SECONDS
+        get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
     )
 
     return {
@@ -2070,6 +2079,7 @@ async def compute_park_wake_health(
         "oldest_fired_age_seconds": oldest_fired_age_seconds,
         "delivery_stalled": delivery_stalled,
         "delivery_stall_threshold_seconds": _PARK_WAKE_DELIVERY_STALL_SECONDS,
+        "stall_cycles": get_wake_delivery_stall_cycles(),
     }
 
 

@@ -12484,3 +12484,120 @@ async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker)
     assert recovered.delivery_stalled is False
 
     reset_wake_delivery_stall_state()
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
+    """A stalled wake delivery raises a deduped operator Alert; recovery clears it.
+
+    Drives a wedged delivery path to trip the cross-cycle stall signal, then
+    exercises sweep_wake_delivery_stall_alerts to assert:
+      1. The first stalled call creates exactly one WARNING Alert row per project.
+      2. Repeat stalled calls are deduped (no second Alert row).
+      3. A recovering call (delivery_stalled=False) dismisses the open Alert.
+    """
+    import app.task_lifecycle as _tl
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.reaper_sweeps import (
+        _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
+        get_wake_delivery_stall_cycles,
+        reset_wake_delivery_stall_state,
+        sweep_deliver_task_wakes,
+        sweep_wake_delivery_stall_alerts,
+    )
+
+    reset_wake_delivery_stall_state()
+    project = await _make_project(reaper_db)
+
+    now = datetime.utcnow()
+    task = Task(
+        project_id=project.id,
+        title="park-alert-stall",
+        status=TaskStatus.PARKED,
+        parked_at=now - timedelta(minutes=1),
+        payloads=[],
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_action=WakeAction.RESUME,
+        delivery_state=WakeDeliveryState.FIRED,
+        fired_at=now - timedelta(minutes=1),
+    )
+    reaper_db.add(reg)
+    await reaper_db.commit()
+
+    real_deliver = _tl.deliver_wake
+
+    async def _wedged_deliver(session, registration, *, now=None):
+        return False  # no progress — leaves the registration FIRED
+
+    mocker.patch.object(_tl, "deliver_wake", new=_wedged_deliver)
+
+    # Drive the stall counter up to threshold so delivery_stalled trips.
+    for _ in range(_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD):
+        await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+
+    assert get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
+    stall_cycles = get_wake_delivery_stall_cycles()
+
+    # First stalled alert sweep → one WARNING Alert created per project.
+    created = await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=True, stall_cycles=stall_cycles
+    )
+    assert created == 1
+
+    alerts = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # Second call with delivery still stalled → deduped, no new Alert row.
+    created2 = await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=True, stall_cycles=stall_cycles
+    )
+    assert created2 == 0
+
+    still_one = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(still_one) == 1
+
+    # Recovery: allow delivery to proceed and verify the alert is cleared.
+    mocker.patch.object(_tl, "deliver_wake", new=real_deliver)
+    recovered = await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+    assert recovered.delivered == 1
+    assert recovered.delivery_stalled is False
+
+    await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=False, stall_cycles=0
+    )
+
+    dismissed = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_not(None),
+            )
+        )
+    ).scalars().all()
+    assert len(dismissed) == 1
+    assert dismissed[0].dismissed_at is not None
+
+    reset_wake_delivery_stall_state()

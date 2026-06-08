@@ -74,6 +74,7 @@ async def deliver_artifact_to_dependents(
     last_created_at = None
     last_id = None
     scan_failed = False
+    pending_dependents = []
     try:
         while True:
             query = (
@@ -100,20 +101,7 @@ async def deliver_artifact_to_dependents(
             for dep in dependents:
                 if task_id_str not in (dep.depends_on or []):
                     continue
-                ctx = dict(dep.context or {})
-                existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
-                prereqs = list(existing) if isinstance(existing, list) else []
-                if any(
-                    isinstance(p, dict) and p.get("artifact_id") == pointer["artifact_id"]
-                    for p in prereqs
-                ):
-                    continue
-                prereqs.append(pointer)
-                ctx[ARTIFACT_PREREQUISITES_KEY] = prereqs
-                dep.context = ctx
-                flag_modified(dep, "context")
-                session.add(dep)
-                touched += 1
+                pending_dependents.append(dep)
 
             last = dependents[-1]
             if last.created_at is None or last.id is None:
@@ -130,6 +118,25 @@ async def deliver_artifact_to_dependents(
             exc_info=True,
         )
 
+    if scan_failed:
+        return
+
+    for dep in pending_dependents:
+        ctx = dict(dep.context or {})
+        existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
+        prereqs = list(existing) if isinstance(existing, list) else []
+        if any(
+            isinstance(p, dict) and p.get("artifact_id") == pointer["artifact_id"]
+            for p in prereqs
+        ):
+            continue
+        prereqs.append(pointer)
+        ctx[ARTIFACT_PREREQUISITES_KEY] = prereqs
+        dep.context = ctx
+        flag_modified(dep, "context")
+        session.add(dep)
+        touched += 1
+
     if touched:
         if commit:
             await session.commit()
@@ -138,5 +145,3 @@ async def deliver_artifact_to_dependents(
             artifact.id,
             touched,
         )
-    elif scan_failed:
-        return

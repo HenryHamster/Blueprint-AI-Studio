@@ -4842,8 +4842,9 @@ async def test_park_wake_health_metrics_surface(db_session):
     assert pre["oldest_parked_age_seconds"] >= _PARK_STRAND_SECONDS
     assert pre["fired_undelivered_count"] == 1
     assert pre["oldest_fired_age_seconds"] >= _PARK_WAKE_DELIVERY_STALL_SECONDS
-    # The oldest FIRED registration is past the stall threshold → stalled signal.
-    assert pre["delivery_stalled"] is True
+    # delivery_stalled is now cycle-based (same counter as the reaper log/alert);
+    # the stall counter was just reset at the start of this test so it's False here.
+    assert pre["delivery_stalled"] is False
     assert (
         pre["delivery_stall_threshold_seconds"] == _PARK_WAKE_DELIVERY_STALL_SECONDS
     )

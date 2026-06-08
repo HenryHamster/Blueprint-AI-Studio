@@ -3143,6 +3143,11 @@ def reset_wake_delivery_stall_state() -> None:
     _wake_delivery_stall_cycles = 0
 
 
+def get_wake_delivery_stall_cycles() -> int:
+    """Return the current value of the cross-cycle delivery-stall counter."""
+    return _wake_delivery_stall_cycles
+
+
 class WakeSweepResult(int):
     """Per-cycle outcome of :func:`sweep_deliver_task_wakes`.
 
@@ -3478,6 +3483,71 @@ async def sweep_deliver_task_wakes(
         stall_cycles=_wake_delivery_stall_cycles,
         delivery_stalled=delivery_stalled,
     )
+
+
+async def sweep_wake_delivery_stall_alerts(
+    session,
+    *,
+    delivery_stalled: bool,
+    stall_cycles: int,
+) -> int:
+    """Raise or clear per-project wake-delivery-stall operator alerts.
+
+    When ``delivery_stalled`` is True, creates a deduplicated WARNING alert
+    for every project that currently has a FIRED (undelivered) registration.
+    When False (delivery recovering), dismisses any open stall alerts
+    fleet-wide. Returns the number of NEW alerts created.
+
+    Follows the same dedup-on-stable-title pattern as
+    :func:`sweep_migration_slot_contention`. Caller owns no commit for the
+    create path (commits inside after the loop); the resolve path commits
+    per-project inside :func:`alert_dispatch._resolve_wake_delivery_stall_alert`.
+    """
+    from app.alert_dispatch import (
+        _WAKE_DELIVERY_STALL_ALERT_TITLE,
+        _maybe_create_wake_delivery_stall_alert,
+        _resolve_wake_delivery_stall_alert,
+    )
+    from app.models import Alert, TaskWakeRegistration, WakeDeliveryState
+
+    if not delivery_stalled:
+        # Delivery has recovered — dismiss open stall alerts fleet-wide.
+        result = await session.execute(
+            select(Alert.project_id).distinct().where(
+                Alert.dismissed_at.is_(None),
+                Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+            )
+        )
+        project_ids = result.scalars().all()
+        dismissed = 0
+        for pid in project_ids:
+            dismissed += await _resolve_wake_delivery_stall_alert(session, pid)
+        if dismissed:
+            logger.info(
+                "[REAPER] resolved wake-delivery-stall alert on %d project(s)",
+                dismissed,
+            )
+        return 0
+
+    # Delivery is stalled — raise a deduped alert per project with FIRED backlog.
+    result = await session.execute(
+        select(TaskWakeRegistration.project_id).distinct().where(
+            TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED
+        )
+    )
+    project_ids = result.scalars().all()
+    created = 0
+    for pid in project_ids:
+        created += await _maybe_create_wake_delivery_stall_alert(
+            session, pid, stall_cycles=stall_cycles
+        )
+    if created:
+        await session.commit()
+        logger.info(
+            "[REAPER] raised wake-delivery-stall alert on %d project(s)",
+            created,
+        )
+    return created
 
 
 # ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────

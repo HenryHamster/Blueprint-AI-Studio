@@ -4083,6 +4083,157 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     assert persist_calls == 2
 
 
+@pytest.mark.asyncio
+async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
+    db_session, monkeypatch
+):
+    """Crash between DELIVERED commit and marker write still leaves side effects recoverable.
+
+    Under the old code, the recoverability marker was written inside
+    run_compute_wake_post_commit — so a crash between the pass-1 DELIVERED commit
+    and that function's first line would leave a DELIVERED row with NO marker,
+    causing the retry pass to skip it forever.
+
+    With the fix, deliver_wake seeds the marker atomically with the FIRED→DELIVERED
+    commit, so even a simulated crash right after the commit (before any post-commit
+    side effects run) leaves the marker in place and a subsequent sweep will
+    re-attempt and persist exactly one knowledge document.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import deliver_wake, fire_task_wakes, park_task
+    from app.task_completion import _COMPUTE_WAKE_POST_COMMIT_META_KEY
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Compute Wake Crash Before Marker Write", user_id="test-user"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: crash before marker write",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job.id}",
+    )
+    await db_session.commit()
+
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.final_cost_usd = 0.22
+    job.accrued_cost_usd = 0.22
+    db_session.add(job)
+    await fire_task_wakes(
+        db_session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+    )
+    await db_session.commit()
+
+    # Simulate the crash window: call deliver_wake and commit (FIRED→DELIVERED),
+    # but do NOT call run_compute_wake_post_commit afterward. Under the old code,
+    # the marker would be absent here. With the fix, it must already be present.
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    advanced = await deliver_wake(db_session, reg, now=_utcnow())
+    assert advanced is True
+    await db_session.commit()
+
+    # Verify the marker is present on the DELIVERED row (seeded at delivery time).
+    db_session.expire_all()
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert _COMPUTE_WAKE_POST_COMMIT_META_KEY in (reg.source_metadata or {})
+
+    # No knowledge document exists yet because run_compute_wake_post_commit was
+    # never called (simulating the crash).
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == []
+
+    # Now let the sweep run. It should find the DELIVERED row with the marker and
+    # call run_compute_wake_post_commit, persisting exactly one knowledge document.
+    monkeypatch.setattr(
+        "app.task_completion.broadcast_to_project",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=None),
+    )
+
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0  # No new FIRED rows delivered
+
+    db_session.expire_all()
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Marker cleared after successful side effects
+    assert _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {})
+    # Exactly one knowledge document persisted, no duplicates
+    assert len(docs) == 1
+    assert docs[0].source_task_id == task.id
+
+    # Third sweep: no marker, no new work — idempotent
+    third = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert third == 0
+    db_session.expire_all()
+    docs_again = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs_again) == 1  # Still exactly one, no duplicates
+
+
 def test_build_compute_result_logs_shape_metrics_and_disposition():
     """The backend COMPUTE_RESULT builder mirrors the agent artifact contract.
 
@@ -5019,6 +5170,206 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
 
     again2 = await sweep_deliver_task_wakes(db_session, _utcnow())
     assert again2 == 0
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="row-lock contention test requires PostgreSQL (SELECT … FOR UPDATE)",
+)
+@pytest.mark.asyncio
+async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
+    db_session, monkeypatch
+):
+    """Regression: backend RPCs run without pinning the compute-job row lock.
+
+    Also rechecks the terminal-before-park wake path in the same test so the
+    refactor keeps the row-lock-serialized terminal wake handoff intact.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import park_task
+    from app.time_utils import _utcnow
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # --- Lock-release proof: launch RPCs must not hold the row lock. ---------
+    project = Project(name="Compute Lock Release", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: lock release",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    await db_session.commit()
+
+    launch_entered = asyncio.Event()
+    launch_release = asyncio.Event()
+    started_at = datetime.utcnow() - timedelta(seconds=30)
+
+    class _BlockingLaunchBackend:
+        def external_id_for(self, persisted_job):
+            return f"lock-release-{persisted_job.id}"
+
+        async def launch(self, spec):
+            launch_entered.set()
+            await launch_release.wait()
+            return ComputeLaunchResult(
+                external_id=f"lock-release-{spec.job_id}",
+                started_at=started_at,
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            raise AssertionError("poll_cost should not run during launch")
+
+        async def poll_status(self, persisted_job):
+            raise AssertionError("poll_status should not run during launch")
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not run during launch")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: _BlockingLaunchBackend()
+    )
+
+    monitor_task = asyncio.create_task(
+        compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    )
+    await asyncio.wait_for(launch_entered.wait(), timeout=5)
+
+    async with session_factory() as lock_session:
+        locked = await lock_session.execute(
+            select(ComputeJob)
+            .where(ComputeJob.id == job.id)
+            .with_for_update(nowait=True)
+        )
+        locked_job = locked.scalars().one()
+        assert locked_job.status == ComputeJobStatus.STARTING
+
+    launch_release.set()
+    await monitor_task
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert job.started_at is not None
+    assert job.external_compute_id == f"lock-release-{job.id}"
+
+    # --- Race safety: terminal-before-park still fires exactly once. ---------
+    project2 = Project(name="Compute Terminal Wake", user_id="test-user")
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    task2 = Task(
+        project_id=project2.id,
+        title="compute_experiment: terminal wake",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    job2 = await compute_jobs.create_compute_job(
+        db_session,
+        task2,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    await db_session.commit()
+
+    class _TerminalBackend:
+        def external_id_for(self, persisted_job):
+            return f"terminal-wake-{persisted_job.id}"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id=f"terminal-wake-{spec.job_id}",
+                started_at=started_at,
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.21, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=datetime.utcnow(),
+                message="completed",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: _TerminalBackend()
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job2)
+    assert job2.status == ComputeJobStatus.SUCCEEDED
+    assert job2.outcome == ComputeJobOutcome.SUCCESS
+
+    await park_task(
+        db_session,
+        task2,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job2.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job2.id}",
+    )
+    await db_session.commit()
+
+    db_session.expire_all()
+    await db_session.refresh(task2)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task2)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    assert task2.status == TaskStatus.COMPLETED
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.attempt_count == 1
+
+    again = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert again == 0
 
 
 @pytest.mark.asyncio

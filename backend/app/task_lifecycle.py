@@ -4636,9 +4636,12 @@ async def _process_post_commit(
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
         all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
         executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
-        # A PARKED task is live work waiting on an external wake; it released its
-        # VM on park (vm_instance_id=None) so it is invisible to
-        # ``executable_statuses``. Without this guard a finite project could
+        # A PARKED task is live work waiting on an external wake; park_task
+        # clears vm_instance_id=None on park, so it is already invisible to
+        # ``executable_statuses``. This guard provides defence-in-depth: without
+        # it, any PARKED task that somehow retained a vm_instance_id (e.g. in a
+        # future code path that parks without calling park_task) would still be
+        # excluded. Without this guard a finite project could
         # converge COMPLETED/FAILED while a parked child is still waiting to be
         # woken — an early-converge. Treat any live PARKED child as in-flight so
         # the all-terminal guard below cannot trip while one exists.
@@ -5146,6 +5149,7 @@ async def park_task(
     task.parked_at = now
     task.park_reason = (reason or f"waiting on {wake_source_kind}")[:2000]
     task.vm_stopped_at = now
+    task.vm_instance_id = None
 
     reg = TaskWakeRegistration(
         task_id=task.id,
@@ -5283,7 +5287,10 @@ async def deliver_wake(
     ):
         from app.compute_jobs import build_compute_result_logs
         from app.models import ComputeJob
-        from app.task_completion import _handle_compute_experiment_completion
+        from app.task_completion import (
+            _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+            _handle_compute_experiment_completion,
+        )
 
         job = None
         if registration.wake_source_ref:
@@ -5331,6 +5338,15 @@ async def deliver_wake(
         await _handle_compute_experiment_completion(
             task, logs, session, owns_commit=False
         )
+        # Seed the recoverability marker atomically with the FIRED→DELIVERED commit
+        # so a crash ANYWHERE after this point still leaves a marker for the retry
+        # pass in sweep_deliver_task_wakes to pick up and re-attempt the post-commit
+        # side effects (operator broadcast + durable KnowledgeDocument).
+        _meta = dict(registration.source_metadata or {})
+        _meta[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = {}
+        registration.source_metadata = _meta
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
         return True
 
     if action == WakeAction.FINALIZE:

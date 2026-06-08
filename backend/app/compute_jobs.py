@@ -530,51 +530,14 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         jobs = result.scalars().all()
 
     for job in jobs:
-        async with session_factory() as session:
-            # Acquire the compute-job ROW lock (SELECT ... FOR UPDATE) for the
-            # whole finalize-and-fire critical section. This is the shared
-            # serialization point with the park registration's terminal recheck
-            # (task_lifecycle._maybe_fire_terminal_compute_wake): the monitor's
-            # terminal-fire and a parking task strictly serialize on this row, so
-            # a job that goes terminal before its task parks cannot lose the wake
-            # (terminal-before-park), and the park-before-terminal ordering stays
-            # idempotent. The lock is held until this session commits/rolls back.
-            live = await _lock_compute_job(session, job.id)
-            if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
-                continue
-            try:
-                await _process_single_compute_job(session, live)
-                # On any terminal transition (success, failure, deadline, budget,
-                # task-terminal cancel) link the durable artifact location as a
-                # first-class result before committing. Best-effort: never blocks
-                # the finalize commit (see _link_terminal_artifact).
-                if live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
-                    await _link_terminal_artifact(session, live)
-                # If the job reached a terminal state this tick, fire the
-                # compute-job-terminal wake for the owning parked task in the
-                # SAME transaction as the finalization commit. Exactly-once: a
-                # later tick skips an already-terminal job (above), and
-                # fire_task_wakes only flips PENDING→FIRED — so duplicate monitor
-                # ticks can never double-fire or double-finalize.
-                if (
-                    live.task_id is not None
-                    and live.status in _COMPUTE_JOB_TERMINAL_STATUSES
-                ):
-                    from app.task_lifecycle import fire_task_wakes
-
-                    await fire_task_wakes(
-                        session,
-                        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
-                        wake_source_ref=str(live.id),
-                    )
-                await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                logger.exception(
-                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                    live.id,
-                    exc,
-                )
+        try:
+            await _process_single_compute_job(job, session_factory=session_factory)
+        except Exception as exc:
+            logger.exception(
+                "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                job.id,
+                exc,
+            )
 
 
 async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None:
@@ -584,132 +547,273 @@ async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None
         await asyncio.sleep(COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
 
 
-async def _process_single_compute_job(session, job: ComputeJob) -> None:
+async def _process_single_compute_job(
+    job: ComputeJob, *, session_factory=AsyncSessionLocal
+) -> None:
     now = _utcnow()
     backend = get_compute_backend(job.backend)
 
-    task = await session.get(Task, job.task_id) if job.task_id else None
+    task = None
+    if job.task_id:
+        async with session_factory() as session:
+            task = await session.get(Task, job.task_id)
+
     if job.task_id is not None and (
         task is None or task.status in _TASK_TERMINAL_STATUSES
     ):
+        terminated = True
         if job.external_compute_id:
-            await backend.terminate(job, reason="task_terminal")
-        _finalize_terminal_job(
-            job,
-            status=ComputeJobStatus.CANCELLED,
-            outcome=ComputeJobOutcome.CANCELLED,
-            terminal_reason="owning task is terminal; compute job cancelled",
+            terminated = await backend.terminate(job, reason="task_terminal")
+        await _apply_task_terminal_cancellation(
+            session_factory,
+            job.id,
             now=now,
+            terminate_ok=terminated,
         )
         return
 
     if job.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
-        await _launch_compute_job(session, job, backend, now)
+        reserved = await _reserve_compute_job_launch(
+            session_factory, job.id, backend, now
+        )
+        if reserved is None:
+            return
+        result = await backend.launch(_build_launch_spec(reserved))
+        await _apply_launch_result(
+            session_factory,
+            job.id,
+            result,
+            now=now,
+        )
         return
 
     # ── Running: poll STATUS first, then cost. A job that finished just before
     # this tick must be billed through finished_at, not through poll time, so
     # spend-cap decisions are never made from an inflated accrual. ──
     status = await backend.poll_status(job)
-    job.poll_attempt_count = (job.poll_attempt_count or 0) + 1
-    job.last_polled_at = now
-    job.next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
+    poll_attempt_count = (job.poll_attempt_count or 0) + 1
+    next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
 
     if status.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         finished = status.finished_at or now
         cost = await backend.poll_cost(job, as_of=finished)
-        job.accrued_cost_usd = max(
+        accrued_cost_usd = max(
             float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
         )
-        # Persist any command-reported result metrics under a dedicated
-        # polling_metadata key. polling_metadata already serializes to the agent
-        # via serialize_compute_job_response, so the metrics reach the handler
-        # without a migration. Absent metrics (None) leave the key unwritten.
-        if status.metrics:
-            _set_meta(job, result_metrics=dict(status.metrics))
-        if status.command_log:
-            _set_meta(job, command_log=dict(status.command_log))
         outcome = (
             ComputeJobOutcome.SUCCESS
             if status.status == ComputeJobStatus.SUCCEEDED
             else ComputeJobOutcome.FAILURE
         )
-        _finalize_terminal_job(
-            job,
-            status=status.status,
+        await _apply_polled_compute_job_result(
+            session_factory,
+            job.id,
+            now=finished,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+            status=status,
+            accrued_cost_usd=accrued_cost_usd,
+            terminal_status=status.status,
             outcome=outcome,
             terminal_reason=status.message
             or _meta_message(job)
             or "compute job finished",
-            now=finished,
             exit_code=status.exit_code,
         )
         return
 
     # Still running: accrue cost up to now, then enforce deadline/budget.
     cost = await backend.poll_cost(job, as_of=now)
-    job.accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
+    accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
 
     if job.wall_clock_deadline is not None and job.wall_clock_deadline <= now:
         terminated = await backend.terminate(job, reason="deadline")
-        _finalize_terminal_job(
-            job,
-            status=ComputeJobStatus.TIMED_OUT,
+        await _apply_polled_compute_job_result(
+            session_factory,
+            job.id,
+            now=now,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+            status=status,
+            accrued_cost_usd=accrued_cost_usd,
+            terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
             terminal_reason="compute job terminated at deadline",
-            now=now,
             terminate_ok=terminated,
         )
         return
 
-    if job.spend_cap_usd is not None and float(job.accrued_cost_usd or 0.0) >= float(
-        job.spend_cap_usd
-    ):
+    if job.spend_cap_usd is not None and accrued_cost_usd >= float(job.spend_cap_usd):
         terminated = await backend.terminate(job, reason="budget")
-        _finalize_terminal_job(
-            job,
-            status=ComputeJobStatus.FAILED,
+        await _apply_polled_compute_job_result(
+            session_factory,
+            job.id,
+            now=now,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+            status=status,
+            accrued_cost_usd=accrued_cost_usd,
+            terminal_status=ComputeJobStatus.FAILED,
             outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
             terminal_reason="compute job terminated at spend cap",
-            now=now,
             terminate_ok=terminated,
         )
         return
 
-    job.status = ComputeJobStatus.RUNNING
-    if status.message:
-        _set_meta(job, status_message=status.message)
+    await _apply_polled_compute_job_result(
+        session_factory,
+        job.id,
+        now=now,
+        poll_attempt_count=poll_attempt_count,
+        next_poll_at=next_poll_at,
+        status=status,
+        accrued_cost_usd=accrued_cost_usd,
+    )
 
 
-async def _launch_compute_job(session, job: ComputeJob, backend, now) -> None:
-    """Launch a job, recording durable intent BEFORE the external side-effect.
+async def _reserve_compute_job_launch(
+    session_factory,
+    job_id: uuid.UUID,
+    backend,
+    now,
+) -> ComputeJob | None:
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status not in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+            return None
+        if live.status == ComputeJobStatus.QUEUED:
+            live.status = ComputeJobStatus.STARTING
+            if not live.external_compute_id:
+                live.external_compute_id = backend.external_id_for(live)
+        elif not live.external_compute_id:
+            live.external_compute_id = backend.external_id_for(live)
+        live.updated_at = now
+        await session.commit()
+        await session.refresh(live)
+        return live
 
-    A QUEUED job is transitioned to STARTING with a deterministic reserved
-    external id and committed *before* ``backend.launch`` runs. If the worker
-    dies after launch but before the RUNNING commit, the next pass re-enters with
-    the row already STARTING and re-launches against the same reserved id — the
-    backends make that idempotent (GCP adopts the existing VM), so an external
-    compute job is never launched twice and the budget is never double-spent.
-    """
-    if job.status == ComputeJobStatus.QUEUED:
-        job.status = ComputeJobStatus.STARTING
-        if not job.external_compute_id:
-            job.external_compute_id = backend.external_id_for(job)
-        job.updated_at = now
-        await session.commit()  # durable: STARTING + reserved id before side-effect
 
-    result = await backend.launch(_build_launch_spec(job))
-    if result.external_id and not job.external_compute_id:
-        job.external_compute_id = result.external_id
-    job.started_at = job.started_at or result.started_at
-    job.status = ComputeJobStatus.RUNNING
-    job.last_polled_at = now
-    job.next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
-    extra: dict[str, Any] = dict(result.metadata or {})
-    if result.cost_rate_per_second and result.cost_rate_per_second > 0:
-        extra["cost_rate_per_second"] = result.cost_rate_per_second
-    extra["status_message"] = result.message or "compute job launched"
-    _set_meta(job, **extra)
+async def _apply_launch_result(
+    session_factory,
+    job_id: uuid.UUID,
+    result,
+    *,
+    now,
+) -> bool:
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status not in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+            return False
+        if result.external_id and not live.external_compute_id:
+            live.external_compute_id = result.external_id
+        live.started_at = live.started_at or result.started_at
+        live.status = ComputeJobStatus.RUNNING
+        live.last_polled_at = now
+        live.next_poll_at = now + timedelta(
+            seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS
+        )
+        extra: dict[str, Any] = dict(result.metadata or {})
+        if result.cost_rate_per_second and result.cost_rate_per_second > 0:
+            extra["cost_rate_per_second"] = result.cost_rate_per_second
+        extra["status_message"] = result.message or "compute job launched"
+        _set_meta(live, **extra)
+        await session.commit()
+        return True
+
+
+async def _apply_polled_compute_job_result(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    now,
+    poll_attempt_count: int,
+    next_poll_at: datetime,
+    status,
+    accrued_cost_usd: float,
+    terminal_status: ComputeJobStatus | None = None,
+    outcome: ComputeJobOutcome | None = None,
+    terminal_reason: str | None = None,
+    exit_code: int | None = None,
+    terminate_ok: bool = True,
+) -> bool:
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return False
+        live.poll_attempt_count = poll_attempt_count
+        live.last_polled_at = now
+        live.next_poll_at = next_poll_at
+        live.accrued_cost_usd = accrued_cost_usd
+        # Persist any command-reported result metrics under a dedicated
+        # polling_metadata key. polling_metadata already serializes to the agent
+        # via serialize_compute_job_response, so the metrics reach the handler
+        # without a migration. Absent metrics (None) leave the key unwritten.
+        if status.metrics:
+            _set_meta(live, result_metrics=dict(status.metrics))
+        if status.command_log:
+            _set_meta(live, command_log=dict(status.command_log))
+        if terminal_status is not None and outcome is not None:
+            _finalize_terminal_job(
+                live,
+                status=terminal_status,
+                outcome=outcome,
+                terminal_reason=terminal_reason or "compute job finished",
+                now=now,
+                exit_code=exit_code,
+                terminate_ok=terminate_ok,
+            )
+            await _link_terminal_artifact(session, live)
+            if live.task_id is not None:
+                from app.task_lifecycle import fire_task_wakes
+
+                await fire_task_wakes(
+                    session,
+                    wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                    wake_source_ref=str(live.id),
+                )
+        else:
+            live.status = ComputeJobStatus.RUNNING
+            if status.message:
+                _set_meta(live, status_message=status.message)
+        await session.commit()
+        return True
+
+
+async def _apply_task_terminal_cancellation(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    now,
+    terminate_ok: bool,
+) -> bool:
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return False
+        live_task = await session.get(Task, live.task_id) if live.task_id else None
+        if live.task_id is not None and (
+            live_task is None or live_task.status not in _TASK_TERMINAL_STATUSES
+        ):
+            return False
+        _finalize_terminal_job(
+            live,
+            status=ComputeJobStatus.CANCELLED,
+            outcome=ComputeJobOutcome.CANCELLED,
+            terminal_reason="owning task is terminal; compute job cancelled",
+            now=now,
+            terminate_ok=terminate_ok,
+        )
+        await _link_terminal_artifact(session, live)
+        if live.task_id is not None:
+            from app.task_lifecycle import fire_task_wakes
+
+            await fire_task_wakes(
+                session,
+                wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                wake_source_ref=str(live.id),
+            )
+        await session.commit()
+        return True
 
 
 def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:

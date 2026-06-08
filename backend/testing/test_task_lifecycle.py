@@ -7152,6 +7152,54 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_park_task_vm_instance_id_invariant(tl_db):
+    """park_task must clear vm_instance_id=None on the task row.
+
+    Regression test for the PARKED vm_instance_id invariant:
+    - After park_task returns, task.vm_instance_id must be None.
+    - The pre-park vm_instance_id is still available to the caller for VM teardown
+      if captured before calling park_task (simulates agent_status capture pattern).
+    """
+    session, _factory = tl_db
+    project = await _make_project(session)
+    original_vm_id = f"agent-vm-{uuid.uuid4().hex}"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=original_vm_id,
+    )
+
+    # Capture before parking — mirrors the agent_status endpoint's pattern.
+    captured_vm_id = task.vm_instance_id
+    assert captured_vm_id == original_vm_id, "precondition: vm_instance_id set before park"
+
+    await park_task(
+        session,
+        task,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref="job-xyz",
+        source_metadata={"compute_job_id": "job-xyz"},
+        wake_action=WakeAction.RESUME,
+        reason="waiting on compute job",
+    )
+
+    # The invariant: park_task clears vm_instance_id so parked tasks are
+    # excluded from the executable_statuses projection in aggregation.
+    assert task.vm_instance_id is None, (
+        "park_task must clear vm_instance_id; parked task still had "
+        f"vm_instance_id={task.vm_instance_id!r}"
+    )
+    # The caller's captured copy still holds the original id for teardown.
+    assert captured_vm_id == original_vm_id, (
+        "caller-captured vm_id must be unaffected by park_task clearing the field"
+    )
+    assert task.status == TaskStatus.PARKED
+    assert task.vm_stopped_at is not None
+
+
+@pytest.mark.asyncio
 async def test_compute_wake_delivery_commit_contract_is_truthful(tl_db, mocker):
     """deliver_wake on a compute-FINALIZE registration uses the caller's single
     commit to atomically cover the FIRED→DELIVERED flip, park-marker clearing, and

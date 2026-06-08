@@ -328,7 +328,11 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     Tests an agent updating task status and creating an artifact.
     Also verifies that completing the last task completes the project.
     """
-    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    # VM deletion on task completion now uses fire_and_forget_vm_delete (a
+    # non-awaited background task) to avoid holding the DB FOR UPDATE lock
+    # through GCP I/O. Patch at the vm_lifecycle level so the assertion
+    # captures the synchronous call rather than racing a background asyncio task.
+    mock_fire_forget = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
 
     # Finite (non-autonomous) project: terminal-status aggregation only applies
     # to finite projects — live autonomous projects are never flipped to a
@@ -369,7 +373,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     await db_session.refresh(project)
     assert project.status == ProjectStatus.COMPLETED
 
-    mock_delete.assert_called_once_with("agent-vm-888")
+    mock_fire_forget.assert_called_once_with("agent-vm-888", reason="agent_completion")
 
 
 @pytest.mark.asyncio
