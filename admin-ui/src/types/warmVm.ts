@@ -207,6 +207,37 @@ export interface PoolHitRateEstimate {
   assumptions: string;
 }
 
+// Per-reason dominant warm-reuse dropout diagnostic, returned by GET
+// /api/admin/projects/{project_id}/warm-reuse-dropout. Mirrors the return value
+// of warm_backlog_reuse.compute_dominant_reuse_dropout. dominant_dropout is null
+// when no single reason clearly dominates the non-converting population (see the
+// gating constants in the backend helper); the panel renders "—" in that case.
+export interface WarmReuseDropoutDominant {
+  reason: string;
+  count: number;
+  total: number;
+  share: number;
+}
+
+export interface WarmReuseDropoutDiagnostic {
+  window_hours: number;
+  dropout_by_reason: Record<string, number>;
+  dropout_total: number;
+  dominant_dropout: WarmReuseDropoutDominant | null;
+  attribution_note: string;
+}
+
+// One persisted day-over-day bucket from GET
+// /api/admin/projects/{project_id}/warm-reuse-dropout-trend. Each bucket
+// corresponds to a daily efficiency snapshot; dominant_reason and dominant_share
+// are null when that day's snapshot had no dominant dropout.
+export interface WarmReuseDropoutTrendBucket {
+  captured_at: string | null;
+  dropout_total: number | null;
+  dominant_reason: string | null;
+  dominant_share: number | null;
+}
+
 // Per-project warm-pool TARGET sizing, read from GET /api/admin/settings. The
 // maintainer reconciles each scoped project toward its explicit per-project
 // target in `warm_pool_target_size_by_project` (keyed by project id), falling

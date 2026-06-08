@@ -648,13 +648,34 @@ async def strategic_operation(
             body["warnings"] = list(warnings)
         return body
 
-    async def _emit_updated(kind: str) -> None:
+    async def _emit_updated(
+        kind: str,
+        *,
+        changed_direction_ids: list[str] | None = None,
+        changed_count: int | None = None,
+        problem_model_changed: bool | None = None,
+        running_update_changed: bool | None = None,
+    ) -> None:
         """Post-commit refetch signal for a strategist output change.
 
         Must be awaited only AFTER the op's ``session.commit()``; the lock is
         already released by then, mirroring the established broadcast pattern.
         """
-        await emit_strategic_updated(project.id, kind)
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        await emit_strategic_updated(
+            project.id,
+            kind,
+            task_id=task.id,
+            cycle_id=cycle_id,
+            output_kind=kind,
+            op=payload.op,
+            changed_direction_ids=changed_direction_ids,
+            changed_count=changed_count,
+            problem_model_changed=problem_model_changed,
+            running_update_changed=running_update_changed,
+        )
 
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
@@ -950,7 +971,11 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[new_dir["id"]],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Created direction '{text[:60]}' "
             f"({'staged for v' + str(staged_for_version) if staged_create else 'active'}) "
@@ -1138,11 +1163,22 @@ async def strategic_operation(
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_api_called": True}
+        updated_ids = list(ctx.get("_strategic_updated_ids", []))
+        updated_ids.append(str(dir_id))
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": updated_ids,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
         return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
 
@@ -1185,7 +1221,11 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         # Advisory (non-blocking): each active direction is one parallel work-lane
         # the fleet fans out across, so retiring below the healthy floor caps max
@@ -1275,11 +1315,16 @@ async def strategic_operation(
             **ctx,
             "_strategic_dirs_staged": ctx.get("_strategic_dirs_staged", 0) + 1,
             "_strategic_staged_ids": staged_ids,
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Staged direction {dir_id} for v{staged_for_version} "
             f"(project {project.id})"
@@ -1355,11 +1400,18 @@ async def strategic_operation(
             **ctx,
             "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
             + 1,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", [])) + [dir_id],
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}"
         )
@@ -1432,6 +1484,9 @@ async def strategic_operation(
             **ctx,
             "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
             + 1,
+            "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
+            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", [])) + [dir_id],
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
@@ -1441,7 +1496,11 @@ async def strategic_operation(
             # router, and _ensure_vm_deleted is defined in main.py.
             from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
         )
@@ -1915,7 +1974,10 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_PROBLEM_MODEL)
+        await _emit_updated(
+            STRATEGIC_KIND_PROBLEM_MODEL,
+            problem_model_changed=True,
+        )
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -2001,7 +2063,10 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_RUNNING_UPDATE)
+        await _emit_updated(
+            STRATEGIC_KIND_RUNNING_UPDATE,
+            running_update_changed=True,
+        )
         if ru_rejected is not None:
             logger.info(
                 f"[STRATEGIC API] running_update: concurrent operator edit "

@@ -3,6 +3,18 @@ import type { TaskType } from '../taskCapabilities';
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
 
+export type WakeDeliveryState = 'PENDING' | 'FIRED' | 'DELIVERED' | 'EXPIRED' | 'FAILED';
+
+export interface TaskWakeRegistration {
+  wake_source_kind: string;
+  wake_source_ref?: string | null;
+  delivery_state: WakeDeliveryState;
+  deadline_at?: string | null;
+  fired_at?: string | null;
+  result_state?: string | null;
+  result_detail?: string | null;
+}
+
 export interface ResearchFinding {
   type?: string;
   title: string;
@@ -100,6 +112,7 @@ export interface Task {
   // carry null/undefined, so guard on presence before rendering.
   parked_at?: string | null;
   park_reason?: string | null;
+  wake_registration?: TaskWakeRegistration | null;
   // R3-W2 (H1): heartbeat-hot fields promoted from Task.context to dedicated
   // columns in Round 2 (B2 / F). The frontend reads from the columns; the
   // legacy `task.context.last_metrics` mirror was retired and reading it

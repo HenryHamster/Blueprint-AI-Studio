@@ -78,6 +78,8 @@ export function useAppState() {
     wsRef, wsConnected,
     pipelineThrottle,
     strategistActive,
+    cycleProgress,
+    lastCycleCompletion,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
 
@@ -622,7 +624,7 @@ export function useAppState() {
     githubAccount, connectGitHub,
     // Directions
     showDirections, setShowDirections,
-    fetchDirectionsRef, strategistActive,
+    fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

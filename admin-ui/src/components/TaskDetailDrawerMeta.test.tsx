@@ -40,6 +40,61 @@ function mergeTestArtifact(verdict: Record<string, unknown>, iteration = 1) {
   return { artifact_type: 'MERGE_TEST_RESULT', logs: JSON.stringify(verdict), iteration };
 }
 
+describe('DetailsTab — parked wake registration', () => {
+  afterEach(() => cleanup());
+
+  it('renders pending and fired wake registration details', () => {
+    const pendingTask = makeTask({
+      status: 'PARKED',
+      wake_registration: {
+        wake_source_kind: 'compute_job_terminal',
+        wake_source_ref: null,
+        delivery_state: 'PENDING',
+        deadline_at: null,
+        fired_at: null,
+        result_state: null,
+        result_detail: null,
+      },
+    });
+    const firedTask = makeTask({
+      status: 'PARKED',
+      park_reason: 'Waiting on compute job',
+      parked_at: '2026-06-01T12:00:00Z',
+      wake_registration: {
+        wake_source_kind: 'compute_job_terminal',
+        wake_source_ref: 'job-123',
+        delivery_state: 'DELIVERED',
+        deadline_at: '2026-06-01T13:00:00Z',
+        fired_at: '2026-06-01T12:10:00Z',
+        result_state: 'resumed',
+        result_detail: 'Task re-queued after compute job completed',
+      },
+    });
+
+    const { rerender } = render(<DetailsTab task={pendingTask} />);
+
+    expect(screen.getByText('compute_job_terminal')).toBeInTheDocument();
+    expect(screen.getByText('no source ref')).toBeInTheDocument();
+    expect(screen.getByText('Pending')).toBeInTheDocument();
+    expect(screen.getByText('Not yet fired')).toBeInTheDocument();
+    expect(screen.getByText('No deadline')).toBeInTheDocument();
+    expect(screen.queryByText('Result')).toBeNull();
+
+    rerender(<DetailsTab task={firedTask} />);
+
+    expect(screen.getByText('Parked')).toBeInTheDocument();
+    expect(screen.getByText('Waiting on compute job')).toBeInTheDocument();
+    expect(screen.getByText('Wake source')).toBeInTheDocument();
+    expect(screen.getByText('compute_job_terminal')).toBeInTheDocument();
+    expect(screen.getByText('job-123')).toBeInTheDocument();
+    expect(screen.getByText('Delivery')).toBeInTheDocument();
+    expect(screen.getByText('Delivered')).toBeInTheDocument();
+    expect(screen.getByText(/12:10:00 PM/)).toBeInTheDocument();
+    expect(screen.getByText(/01:00:00 PM/)).toBeInTheDocument();
+    expect(screen.getByText('resumed: Task re-queued after compute job completed')).toBeInTheDocument();
+  });
+});
+
 describe('DetailsTab — Merge Test Gate', () => {
   afterEach(() => cleanup());
 

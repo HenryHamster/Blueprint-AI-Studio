@@ -9685,6 +9685,36 @@ async def test_design_doc_update_stamps_operator_steered_when_marker_operator_or
 
 
 @pytest.mark.asyncio
+async def test_design_doc_update_start_event_includes_cycle_and_steering(
+    db_session, mocker
+):
+    steering_excerpt = "Focus the next strategy cycle on billing reliability."
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_started", new=emit)
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker_with_excerpt(
+                steering_excerpt
+            ),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_design_doc_update(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().all()[0]
+    emit.assert_awaited_once()
+    assert emit.await_args.args == (project.id, task.id, 1)
+    assert emit.await_args.kwargs["cycle_id"] == task.context["strategic_cycle_id"]
+    assert emit.await_args.kwargs["steering_origin"] == ORIGIN_OPERATOR
+    assert emit.await_args.kwargs["steering_excerpt"] == steering_excerpt
+
+
+@pytest.mark.asyncio
 async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     """A cadence (non-operator) architecture cycle carries no operator_steered flag."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -9700,6 +9730,43 @@ async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     )
     task = result.scalars().all()[0]
     assert "operator_steered" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_start_event_includes_cycle_and_steering(
+    db_session, mocker
+):
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_started", new=emit)
+    cycle_id = "sc-phase2evt"
+    steering_excerpt = "Tie the outcome to the operator steer."
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_strategic_review(
+        project,
+        db_session,
+        cycle_id=cycle_id,
+        operator_steered=True,
+        steering_excerpt=steering_excerpt,
+    ) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().all()[0]
+    emit.assert_awaited_once()
+    assert emit.await_args.args == (project.id, task.id, 2)
+    assert emit.await_args.kwargs == {
+        "cycle_id": cycle_id,
+        "steering_origin": ORIGIN_OPERATOR,
+        "steering_excerpt": steering_excerpt,
+    }
 
 
 @pytest.mark.asyncio

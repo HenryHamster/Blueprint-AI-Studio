@@ -12,7 +12,7 @@ import uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -52,6 +52,7 @@ from app.strategic_completion import (
     spawn_budget_status,
     spawn_title_is_redundant,
     _spawn_retirement_memos,
+    _strategic_event_completion_summary,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -59,7 +60,7 @@ from app.strategic_spawning import (
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Project, Task
+from app.models import Project, StrategicCycle, Task
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -94,6 +95,79 @@ def _direction(**kwargs):
     }
     base.update(kwargs)
     return base
+
+
+def test_strategic_completion_event_summary_uses_context_cycle_and_project_state():
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review"}],
+        context={
+            "_strategic_created_ids": ["d-new"],
+            "_strategic_retired_ids": ["d-old"],
+            "_strategic_staged_ids": ["d-next"],
+            "_strategic_updated_ids": ["d-live"],
+            "_strategic_dirs_created": 1,
+            "_strategic_dirs_retired": 1,
+            "_strategic_dirs_staged": 1,
+            "_strategic_dirs_updated": 1,
+            "_strategic_tasks_spawned": 2,
+            "_strategic_problem_model_set": True,
+            "_strategic_running_update_set": True,
+        },
+    )
+    task.latest_status_message = "Strategic review complete"
+    project = Project(
+        name="P",
+        user_id="u1",
+        directions=[
+            {"id": "d-new", "status": "active"},
+            {"id": "d-old", "status": "expired"},
+        ],
+    )
+    cycle = StrategicCycle(
+        id="sc-summary",
+        project_id=task.project_id,
+        outcome="completed",
+        directions_created=1,
+        directions_retired=1,
+        tasks_spawned=2,
+    )
+
+    summary = _strategic_event_completion_summary(task, project, cycle=cycle)
+
+    assert summary["status"] == "completed"
+    assert summary["created_direction_ids"] == ["d-new"]
+    assert summary["retired_direction_ids"] == ["d-old"]
+    assert summary["staged_direction_ids"] == ["d-next"]
+    assert summary["updated_direction_ids"] == ["d-live"]
+    assert summary["created_count"] == 1
+    assert summary["retired_count"] == 1
+    assert summary["staged_count"] == 1
+    assert summary["updated_count"] == 1
+    assert summary["tasks_spawned"] == 2
+    assert summary["directions_changed"] is True
+    assert summary["problem_model_changed"] is True
+    assert summary["running_update_changed"] is True
+    assert summary["active_direction_count"] == 1
+
+
+def test_strategic_completion_event_summary_uses_proposal_counters():
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review"}],
+        context={
+            "_strategic_proposals_approved": 1,
+            "_strategic_proposals_rejected": 2,
+        },
+    )
+    project = Project(name="P", user_id="u1", directions=[])
+
+    summary = _strategic_event_completion_summary(task, project)
+
+    assert summary["status"] == "completed"
+    assert summary["updated_count"] == 1
+    assert summary["retired_count"] == 2
+    assert summary["directions_changed"] is True
 
 
 # ── _check_direction_health ──────────────────────────────────────────────────
@@ -1210,7 +1284,6 @@ class TestRecordStrategicTaskFailure:
         in the function docstring. The parallel handler is incrementing
         the same counter; silently skipping is safe by design.
         """
-        from unittest.mock import AsyncMock, MagicMock
         import uuid
 
         # Build a Task without persisting it — the function reads
@@ -1345,7 +1418,7 @@ def _active_dir(**kwargs):
 class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_no_gaps_resets_counter(self, strat_fail_db, mocker):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
         # 3 active product directions, not saturated → no gaps
         project = Project(
             name="P",
@@ -1372,7 +1445,7 @@ class TestCheckDirectionStarvation:
 
     @pytest.mark.asyncio
     async def test_dirs_created_resets_counter(self, strat_fail_db, mocker):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
         project = Project(
             name="P",
             user_id="u1",
@@ -1396,7 +1469,7 @@ class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_below_minimum_increments_counter(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
         project = Project(
             name="P",
@@ -1421,7 +1494,7 @@ class TestCheckDirectionStarvation:
         self, strat_fail_db, mocker
     ):
         alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
         project = Project(
             name="P",
@@ -1445,7 +1518,7 @@ class TestCheckDirectionStarvation:
         self, strat_fail_db, mocker
     ):
         alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
         # Active directions but NONE are product → gap_type=NO_PRODUCT_DIRECTIONS
         project = Project(
@@ -1484,7 +1557,7 @@ class TestCheckDirectionStarvation:
     async def test_level_5_below_minimum_fallback_no_category(
         self, strat_fail_db, mocker
     ):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
         # 1 active product direction; product_count > 0 but active_count < 3
         project = Project(
             name="P",
@@ -1506,7 +1579,7 @@ class TestCheckDirectionStarvation:
 
     @pytest.mark.asyncio
     async def test_level_5_all_saturated_fallback(self, strat_fail_db, mocker):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
         # 3 active product directions, all saturated → gap_type=ALL_SATURATED
         project = Project(
             name="P",
@@ -1532,7 +1605,7 @@ class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_level_5_cap_reached_skips_creation(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
@@ -4440,6 +4513,73 @@ async def test_cite_memos_does_not_set_api_called(client, db_session):
         "memo-2",
     ]
     assert (task.context or {}).get("_strategic_api_called") is not True
+
+
+@pytest.mark.asyncio
+async def test_staged_only_completion_uses_api_path(db_session, mocker):
+    from unittest.mock import AsyncMock
+    from app import strategic_cycle
+    from app.models import Project, Task
+    from app.strategic_completion import _handle_strategic_completion
+
+    project = Project(
+        name="P-staged-only",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[{"id": "d-next", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "strategic_cycle_id": cycle.id,
+            "_strategic_dirs_staged": 1,
+            "_strategic_staged_ids": ["d-next"],
+        },
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.research_completion.query_findings_index",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_cycle.query_recent_memo_citations",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_completion._apply_evidence_progress_verdicts",
+        return_value=0,
+    )
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.strategic_completion.strategic_cycle.mark_phase2_completed",
+        new=AsyncMock(return_value=cycle),
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    strategic_cycle.mark_phase2_completed.assert_awaited_once()
+    emit.assert_awaited_once()
+    assert emit.await_args.kwargs["completion"]["staged_count"] == 1
+    assert emit.await_args.kwargs["completion"]["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -8951,7 +9091,10 @@ class TestDesignDocCompletionStrategistEvent:
 
         await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
 
-        emit.assert_awaited_once_with(project.id, task.id, 1)
+        emit.assert_awaited_once()
+        assert emit.await_args.args == (project.id, task.id, 1)
+        assert emit.await_args.kwargs["phase_state"] == "deferred"
+        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
 
     @pytest.mark.asyncio
     async def test_emits_completed_when_phase2_spawn_raises(self, strat_fail_db, mocker):
@@ -8976,7 +9119,11 @@ class TestDesignDocCompletionStrategistEvent:
 
         await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
 
-        emit.assert_awaited_once_with(project.id, task.id, 1)
+        emit.assert_awaited_once()
+        assert emit.await_args.args == (project.id, task.id, 1)
+        assert emit.await_args.kwargs["phase_state"] == "deferred"
+        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
+        assert "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
 
     @pytest.mark.asyncio
     async def test_no_completed_emit_when_phase2_spawns(self, strat_fail_db, mocker):

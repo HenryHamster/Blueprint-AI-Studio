@@ -8,20 +8,20 @@ These verify the event-name CONTRACT the admin UI depends on:
 """
 
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, patch
 
 import app.strategic_events as se
 from app.strategic_events import (
-    STRATEGIC_CYCLE_STARTED,
     STRATEGIC_CYCLE_COMPLETED,
-    STRATEGIC_UPDATED,
+    STRATEGIC_CYCLE_STARTED,
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
     STRATEGIC_KIND_RUNNING_UPDATE,
-    emit_strategic_cycle_started,
+    STRATEGIC_UPDATED,
     emit_strategic_cycle_completed,
+    emit_strategic_cycle_started,
     emit_strategic_updated,
 )
 
@@ -43,11 +43,14 @@ async def test_emit_cycle_started_payload():
     with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
         await emit_strategic_cycle_started(project_id, task_id, 1)
 
-    mock_bcast.assert_awaited_once_with(
+    mock_bcast.assert_awaited_once()
+    assert mock_bcast.await_args.args[:2] == (
         str(project_id),
         "strategic_cycle_started",
-        {"task_id": str(task_id), "phase": 1},
     )
+    payload = mock_bcast.await_args.args[2]
+    assert payload["task_id"] == str(task_id)
+    assert payload["phase"] == 1
 
 
 @pytest.mark.asyncio
@@ -57,11 +60,86 @@ async def test_emit_cycle_completed_payload():
     with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
         await emit_strategic_cycle_completed(project_id, task_id, 2)
 
-    mock_bcast.assert_awaited_once_with(
+    mock_bcast.assert_awaited_once()
+    assert mock_bcast.await_args.args[:2] == (
         str(project_id),
         "strategic_cycle_completed",
-        {"task_id": str(task_id), "phase": 2},
     )
+    payload = mock_bcast.await_args.args[2]
+    assert payload["task_id"] == str(task_id)
+    assert payload["phase"] == 2
+
+
+@pytest.mark.asyncio
+async def test_emit_cycle_started_payload_includes_phase_and_steering_context():
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_cycle_started(
+            project_id,
+            task_id,
+            1,
+            cycle_id="sc-live123",
+            steering_origin="operator",
+            steering_excerpt="Focus on billing reliability. " * 20,
+        )
+
+    payload = mock_bcast.await_args.args[2]
+    assert payload["task_id"] == str(task_id)
+    assert payload["phase"] == 1
+    assert payload["phase_number"] == 1
+    assert payload["phase_label"] == "Architecture review"
+    assert payload["phase_state"] == "phase1_running"
+    assert payload["cycle_id"] == "sc-live123"
+    assert payload["steering_origin"] == "operator"
+    assert payload["steering_excerpt"].startswith("Focus on billing reliability.")
+    assert len(payload["steering_excerpt"]) <= 240
+
+
+@pytest.mark.asyncio
+async def test_emit_cycle_completed_payload_includes_progress_and_outcome():
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_cycle_completed(
+            project_id,
+            task_id,
+            2,
+            cycle_id="sc-done123",
+            completion={
+                "status": "completed",
+                "created_direction_ids": ["d-new"],
+                "retired_direction_ids": ["d-old"],
+                "staged_direction_ids": ["d-next"],
+                "updated_direction_ids": ["d-live"],
+                "tasks_spawned": 3,
+                "problem_model_changed": True,
+                "running_update_changed": True,
+                "status_message": "Strategic review complete",
+            },
+        )
+
+    payload = mock_bcast.await_args.args[2]
+    assert payload["task_id"] == str(task_id)
+    assert payload["phase"] == 2
+    assert payload["phase_number"] == 2
+    assert payload["phase_label"] == "Strategic review"
+    assert payload["phase_state"] == "cycle_done"
+    assert payload["cycle_id"] == "sc-done123"
+    completion = payload["completion"]
+    assert completion["status"] == "completed"
+    assert completion["created_direction_ids"] == ["d-new"]
+    assert completion["retired_direction_ids"] == ["d-old"]
+    assert completion["staged_direction_ids"] == ["d-next"]
+    assert completion["updated_direction_ids"] == ["d-live"]
+    assert completion["created_count"] == 1
+    assert completion["retired_count"] == 1
+    assert completion["staged_count"] == 1
+    assert completion["updated_count"] == 1
+    assert completion["tasks_spawned"] == 3
+    assert completion["directions_changed"] is True
+    assert completion["problem_model_changed"] is True
+    assert completion["running_update_changed"] is True
 
 
 @pytest.mark.asyncio
@@ -86,8 +164,36 @@ async def test_emit_strategic_updated_payload(kind):
 
 
 @pytest.mark.asyncio
+async def test_emit_strategic_updated_payload_includes_compact_linkage():
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_updated(
+            project_id,
+            STRATEGIC_KIND_DIRECTIONS,
+            task_id=task_id,
+            cycle_id="sc-live123",
+            output_kind=STRATEGIC_KIND_DIRECTIONS,
+            op="update_direction",
+            changed_direction_ids=["d-live"],
+            changed_count=1,
+        )
+
+    payload = mock_bcast.await_args.args[2]
+    assert payload == {
+        "kind": "directions",
+        "task_id": str(task_id),
+        "cycle_id": "sc-live123",
+        "output_kind": "directions",
+        "op": "update_direction",
+        "changed_direction_ids": ["d-live"],
+        "changed_count": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_emit_payloads_stay_tiny_for_notify_ceiling():
-    """Payloads must encode well under the 7KB NOTIFY ceiling (they're ids only)."""
+    """Payloads must encode well under the 7KB NOTIFY ceiling."""
     import json
 
     captured = {}
@@ -100,3 +206,18 @@ async def test_emit_payloads_stay_tiny_for_notify_ceiling():
         assert len(json.dumps(captured["data"]).encode("utf-8")) < 200
         await emit_strategic_updated(uuid.uuid4(), STRATEGIC_KIND_DIRECTIONS)
         assert len(json.dumps(captured["data"]).encode("utf-8")) < 200
+        await emit_strategic_cycle_completed(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            2,
+            cycle_id="sc-size",
+            completion={
+                "status": "failed",
+                "created_direction_ids": [f"d-{i}" for i in range(100)],
+                "retired_direction_ids": [f"d-old-{i}" for i in range(100)],
+                "staged_direction_ids": [f"d-next-{i}" for i in range(100)],
+                "updated_direction_ids": [f"d-live-{i}" for i in range(100)],
+                "failure_reason": "x" * 10_000,
+            },
+        )
+        assert len(json.dumps(captured["data"]).encode("utf-8")) < 6_000

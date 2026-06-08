@@ -43,6 +43,7 @@ from app.models import (
     ProjectMessage,
     Artifact,
     ArtifactType,
+    TaskWakeRegistration,
     DeploymentState,
     DeploymentStatus,
     _utcnow,
@@ -112,6 +113,31 @@ def _fix_loop_summary(
                 }
             )
     return flagged if flagged else None
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _serialize_task_wake_registration(
+    registration: TaskWakeRegistration | None,
+) -> Dict[str, Any] | None:
+    if registration is None:
+        return None
+
+    return {
+        "wake_source_kind": registration.wake_source_kind,
+        "wake_source_ref": registration.wake_source_ref,
+        "delivery_state": _enum_value(registration.delivery_state),
+        "deadline_at": registration.deadline_at.isoformat()
+        if registration.deadline_at
+        else None,
+        "fired_at": registration.fired_at.isoformat()
+        if registration.fired_at
+        else None,
+        "result_state": registration.result_state,
+        "result_detail": registration.result_detail,
+    }
 
 
 def _build_task_evaluation_summary(
@@ -1029,6 +1055,14 @@ async def get_task(
     )
     child_task_ids = [str(row) for row in child_ids_result.scalars().all()]
 
+    wake_registration_result = await session.execute(
+        select(TaskWakeRegistration)
+        .where(TaskWakeRegistration.task_id == tid)
+        .order_by(TaskWakeRegistration.requested_at.desc())
+        .limit(1)
+    )
+    wake_registration = wake_registration_result.scalars().first()
+
     task_type = (task.first_payload).get("type", "create")
     return {
         "id": str(task.id),
@@ -1069,6 +1103,7 @@ async def get_task(
         # non-PARKED or pre-migration task; the admin UI guards on presence.
         "parked_at": task.parked_at.isoformat() if task.parked_at else None,
         "park_reason": task.park_reason,
+        "wake_registration": _serialize_task_wake_registration(wake_registration),
         "payloads": task.payloads,
         "context": {
             k: v

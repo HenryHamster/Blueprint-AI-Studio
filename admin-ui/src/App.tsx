@@ -62,13 +62,14 @@ const COLUMNS: KanbanColumn[] = [
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
   { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
   { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
+  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
   { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
 ];
 
 const SORT_KEY = 'blueprint-admin:kanban-sort';
-const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED']);
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 
 
@@ -894,6 +895,8 @@ export default function App() {
           onOpenTask={handleViewTask}
           notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
           strategistActive={s.strategistActive}
+          cycleProgress={s.cycleProgress}
+          lastCycleCompletion={s.lastCycleCompletion}
         />
       ) : s.showArchive ? (
         <ArchiveView
@@ -1287,6 +1290,7 @@ export default function App() {
           projects={s.projects}
           fetchDirectionsRef={s.fetchDirectionsRef}
           strategistActive={s.strategistActive}
+          cycleProgress={s.cycleProgress}
           onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

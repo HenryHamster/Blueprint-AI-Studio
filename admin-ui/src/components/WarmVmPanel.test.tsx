@@ -1492,3 +1492,111 @@ describe('WarmVmPanel — account-retarget callout', () => {
     expect(body).toEqual({ warm_pool_account_retarget_enabled: true });
   });
 });
+
+describe('WarmVmPanel — backlog dropout row', () => {
+  const stateWithAllowlist: WarmVmStateResponse = {
+    ...baseState,
+    pool_metrics: {
+      enabled: true,
+      target_size: 2,
+      current_size: 1,
+      idle_count: 0,
+      project_allowlist: ['proj-abc'],
+    },
+  };
+
+  const dropoutWithDominant = {
+    window_hours: 24,
+    dropout_by_reason: { grace_idle_release: 5, claim_disabled: 3 },
+    dropout_total: 8,
+    dominant_dropout: { reason: 'grace_idle_release', count: 5, total: 8, share: 0.625 },
+    attribution_note: 'note',
+  };
+
+  const dropoutNoDominant = {
+    window_hours: 24,
+    dropout_by_reason: {},
+    dropout_total: 0,
+    dominant_dropout: null,
+    attribution_note: 'note',
+  };
+
+  const emptyTrend = { buckets: [] };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 }),
+    );
+    (fetchWarmPoolTargets as ReturnType<typeof vi.fn>).mockResolvedValue({
+      warm_pool_target_size: 2,
+      warm_pool_target_size_by_project: {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('renders dominant dropout reason and share', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if ((url as string).includes('warm-reuse-dropout-trend')) {
+        return new Response(JSON.stringify(emptyTrend), { status: 200 });
+      }
+      if ((url as string).includes('warm-reuse-dropout')) {
+        return new Response(JSON.stringify(dropoutWithDominant), { status: 200 });
+      }
+      return new Response(JSON.stringify(stateWithAllowlist), { status: 200 });
+    });
+
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const reasonEl = await screen.findByTestId('backlog-dropout-reason');
+    expect(reasonEl.textContent).toBe('grace_idle_release');
+    const shareEl = await screen.findByTestId('backlog-dropout-share');
+    expect(shareEl.textContent).toBe('63%');
+  });
+
+  test('renders no-data state when dominant_dropout is null', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if ((url as string).includes('warm-reuse-dropout-trend')) {
+        return new Response(JSON.stringify(emptyTrend), { status: 200 });
+      }
+      if ((url as string).includes('warm-reuse-dropout')) {
+        return new Response(JSON.stringify(dropoutNoDominant), { status: 200 });
+      }
+      return new Response(JSON.stringify(stateWithAllowlist), { status: 200 });
+    });
+
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const row = await screen.findByTestId('backlog-dropout-row');
+    const reasonEl = row.querySelector('[data-testid="backlog-dropout-reason"]');
+    expect(reasonEl?.textContent).toBe('—');
+    expect(row.querySelector('[data-testid="backlog-dropout-share"]')).toBeNull();
+  });
+
+  test('does not render dropout row when no scoped project in allowlist', async () => {
+    const stateNoAllowlist: WarmVmStateResponse = {
+      ...baseState,
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 1,
+        idle_count: 0,
+        project_allowlist: [],
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateNoAllowlist), { status: 200 }),
+    );
+
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('backlog-dropout-row')).toBeNull();
+  });
+});

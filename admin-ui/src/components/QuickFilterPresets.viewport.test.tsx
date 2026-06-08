@@ -6,7 +6,7 @@ import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 // QuickFilterPresets has no API or router imports — no mocking needed.
 
-const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
+const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'PARKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
 
 const noopSetters = {
   setStatusFilter: () => {},

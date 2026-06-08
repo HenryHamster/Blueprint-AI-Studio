@@ -16,6 +16,12 @@ These event names are a contract with the frontend — do not rename without a
 coordinated admin-ui change.
 """
 
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 from app.broadcast import broadcast_to_project
 
 # Event-name contract shared with the admin UI.
@@ -29,26 +35,269 @@ STRATEGIC_KIND_DIRECTIONS = "directions"
 STRATEGIC_KIND_RUNNING_UPDATE = "running_update"
 STRATEGIC_KIND_PROBLEM_MODEL = "problem_model"
 
+_STEERING_EXCERPT_MAX_CHARS = 240
+_STATUS_MAX_CHARS = 160
+_ID_LIST_MAX = 25
+_NOTIFY_PAYLOAD_SOFT_LIMIT = 6_000
 
-async def emit_strategic_cycle_started(project_id, task_id, phase) -> None:
+_PHASE_LABELS = {
+    1: "Architecture review",
+    2: "Strategic review",
+}
+
+_PHASE_STATES = {
+    ("started", 1): "phase1_running",
+    ("started", 2): "phase2_running",
+    ("completed", 1): "phase1_done",
+    ("completed", 2): "cycle_done",
+}
+
+
+def _compact_str(value: Any, *, max_chars: int = _STATUS_MAX_CHARS) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1]}…"
+
+
+def _compact_ids(values: Sequence[Any] | None) -> list[str]:
+    if not values:
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _compact_str(value, max_chars=80)
+        if text and text not in seen:
+            ids.append(text)
+            seen.add(text)
+        if len(ids) >= _ID_LIST_MAX:
+            break
+    return ids
+
+
+def _as_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _phase_payload(
+    task_id: Any,
+    phase: Any,
+    *,
+    event: str,
+    cycle_id: Any = None,
+    phase_label: str | None = None,
+    phase_state: str | None = None,
+    steering_origin: str | None = None,
+    steering_excerpt: str | None = None,
+    completion: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"task_id": str(task_id), "phase": phase}
+    phase_num = _as_int(phase, default=0)
+    if cycle_id:
+        payload["cycle_id"] = str(cycle_id)
+    if phase_num:
+        payload["phase_number"] = phase_num
+        payload["phase_label"] = phase_label or _PHASE_LABELS.get(
+            phase_num, f"Phase {phase_num}"
+        )
+        state = phase_state or _PHASE_STATES.get((event, phase_num))
+        if state:
+            payload["phase_state"] = state
+    origin = _compact_str(steering_origin, max_chars=40)
+    if origin:
+        payload["steering_origin"] = origin
+    excerpt = _compact_str(steering_excerpt, max_chars=_STEERING_EXCERPT_MAX_CHARS)
+    if excerpt:
+        payload["steering_excerpt"] = excerpt
+    if completion:
+        payload["completion"] = _completion_payload(completion)
+    return _enforce_soft_limit(payload)
+
+
+def _output_payload(
+    kind: str,
+    *,
+    task_id: Any = None,
+    cycle_id: Any = None,
+    output_kind: str | None = None,
+    op: str | None = None,
+    changed_direction_ids: Sequence[Any] | None = None,
+    changed_count: int | None = None,
+    problem_model_changed: bool | None = None,
+    running_update_changed: bool | None = None,
+) -> dict[str, Any]:
+    direction_ids = _compact_ids(changed_direction_ids)
+    payload: dict[str, Any] = {"kind": kind}
+    if task_id:
+        payload["task_id"] = str(task_id)
+    if cycle_id:
+        payload["cycle_id"] = str(cycle_id)
+    if output_kind:
+        payload["output_kind"] = output_kind
+    if op:
+        payload["op"] = op
+    if direction_ids:
+        payload["changed_direction_ids"] = direction_ids
+    if changed_count is not None or direction_ids:
+        payload["changed_count"] = max(0, _as_int(changed_count))
+        if changed_count is None:
+            payload["changed_count"] = len(direction_ids)
+    if problem_model_changed is not None:
+        payload["problem_model_changed"] = bool(problem_model_changed)
+    if running_update_changed is not None:
+        payload["running_update_changed"] = bool(running_update_changed)
+    return _enforce_soft_limit(payload)
+
+
+def _completion_payload(summary: Mapping[str, Any]) -> dict[str, Any]:
+    created_ids = _compact_ids(summary.get("created_direction_ids"))
+    retired_ids = _compact_ids(summary.get("retired_direction_ids"))
+    staged_ids = _compact_ids(summary.get("staged_direction_ids"))
+    updated_ids = _compact_ids(summary.get("updated_direction_ids"))
+    directions_changed = bool(
+        summary.get("directions_changed")
+        or created_ids
+        or retired_ids
+        or staged_ids
+        or updated_ids
+        or _as_int(summary.get("created_count"))
+        or _as_int(summary.get("retired_count"))
+        or _as_int(summary.get("staged_count"))
+        or _as_int(summary.get("updated_count"))
+    )
+    payload: dict[str, Any] = {
+        "status": _compact_str(summary.get("status"), max_chars=40) or "completed",
+        "created_count": _as_int(
+            summary.get("created_count"), default=len(created_ids)
+        ),
+        "retired_count": _as_int(
+            summary.get("retired_count"), default=len(retired_ids)
+        ),
+        "staged_count": _as_int(summary.get("staged_count"), default=len(staged_ids)),
+        "updated_count": _as_int(
+            summary.get("updated_count"), default=len(updated_ids)
+        ),
+        "tasks_spawned": _as_int(summary.get("tasks_spawned")),
+        "directions_changed": directions_changed,
+        "problem_model_changed": bool(summary.get("problem_model_changed")),
+        "running_update_changed": bool(summary.get("running_update_changed")),
+    }
+    if created_ids:
+        payload["created_direction_ids"] = created_ids
+    if retired_ids:
+        payload["retired_direction_ids"] = retired_ids
+    if staged_ids:
+        payload["staged_direction_ids"] = staged_ids
+    if updated_ids:
+        payload["updated_direction_ids"] = updated_ids
+    status_message = _compact_str(summary.get("status_message"))
+    if status_message:
+        payload["status_message"] = status_message
+    failure_reason = _compact_str(summary.get("failure_reason"))
+    if failure_reason:
+        payload["failure_reason"] = failure_reason
+    return payload
+
+
+def _enforce_soft_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep websocket/NOTIFY payloads compact even when callers pass long data."""
+    encoded = json.dumps(payload, default=str).encode("utf-8")
+    if len(encoded) <= _NOTIFY_PAYLOAD_SOFT_LIMIT:
+        return payload
+    trimmed = dict(payload)
+    completion = trimmed.get("completion")
+    if isinstance(completion, dict):
+        completion = dict(completion)
+        for key in (
+            "created_direction_ids",
+            "retired_direction_ids",
+            "staged_direction_ids",
+            "updated_direction_ids",
+        ):
+            if key in completion:
+                completion[key] = completion[key][:_ID_LIST_MAX]
+        trimmed["completion"] = completion
+    if "steering_excerpt" in trimmed:
+        trimmed["steering_excerpt"] = _compact_str(
+            trimmed["steering_excerpt"], max_chars=120
+        )
+    return trimmed
+
+
+async def emit_strategic_cycle_started(
+    project_id,
+    task_id,
+    phase,
+    *,
+    cycle_id=None,
+    phase_label: str | None = None,
+    phase_state: str | None = None,
+    steering_origin: str | None = None,
+    steering_excerpt: str | None = None,
+) -> None:
     """Broadcast that a strategic cycle task became active (post-commit)."""
     await broadcast_to_project(
         str(project_id),
         STRATEGIC_CYCLE_STARTED,
-        {"task_id": str(task_id), "phase": phase},
+        _phase_payload(
+            task_id,
+            phase,
+            event="started",
+            cycle_id=cycle_id,
+            phase_label=phase_label,
+            phase_state=phase_state,
+            steering_origin=steering_origin,
+            steering_excerpt=steering_excerpt,
+        ),
     )
 
 
-async def emit_strategic_cycle_completed(project_id, task_id, phase) -> None:
+async def emit_strategic_cycle_completed(
+    project_id,
+    task_id,
+    phase,
+    *,
+    cycle_id=None,
+    phase_label: str | None = None,
+    phase_state: str | None = None,
+    completion: Mapping[str, Any] | None = None,
+) -> None:
     """Broadcast that a strategic cycle finished — success OR failure (post-commit)."""
     await broadcast_to_project(
         str(project_id),
         STRATEGIC_CYCLE_COMPLETED,
-        {"task_id": str(task_id), "phase": phase},
+        _phase_payload(
+            task_id,
+            phase,
+            event="completed",
+            cycle_id=cycle_id,
+            phase_label=phase_label,
+            phase_state=phase_state,
+            completion=completion,
+        ),
     )
 
 
-async def emit_strategic_updated(project_id, kind) -> None:
+async def emit_strategic_updated(
+    project_id,
+    kind,
+    *,
+    task_id=None,
+    cycle_id=None,
+    output_kind: str | None = None,
+    op: str | None = None,
+    changed_direction_ids: Sequence[Any] | None = None,
+    changed_count: int | None = None,
+    problem_model_changed: bool | None = None,
+    running_update_changed: bool | None = None,
+) -> None:
     """Broadcast that a strategist output changed (post-commit).
 
     ``kind`` is one of ``directions`` / ``running_update`` / ``problem_model``.
@@ -56,5 +305,15 @@ async def emit_strategic_updated(project_id, kind) -> None:
     await broadcast_to_project(
         str(project_id),
         STRATEGIC_UPDATED,
-        {"kind": kind},
+        _output_payload(
+            kind,
+            task_id=task_id,
+            cycle_id=cycle_id,
+            output_kind=output_kind,
+            op=op,
+            changed_direction_ids=changed_direction_ids,
+            changed_count=changed_count,
+            problem_model_changed=problem_model_changed,
+            running_update_changed=running_update_changed,
+        ),
     )

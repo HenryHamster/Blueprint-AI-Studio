@@ -4867,6 +4867,13 @@ async def _process_post_commit(
                 task.project_id,
                 task.id,
                 1 if _peek_strategic_type == "design_doc_update" else 2,
+                cycle_id=task.strategic_cycle_id
+                or (task.context or {}).get("strategic_cycle_id"),
+                phase_state="failed",
+                completion={
+                    "status": getattr(payload.status, "value", str(payload.status)),
+                    "status_message": task.latest_status_message,
+                },
             )
 
         return {

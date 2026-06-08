@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'luc
 import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject, fetchEfficiencyAxes } from '../api';
 import type { PoolPayoffVerdict, PoolPayoffState } from '../api';
 import { parseTimestamp, formatTimeOnly } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets, WarmReuseDropoutDiagnostic, WarmReuseDropoutTrendBucket } from '../types/warmVm';
 import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
@@ -412,6 +412,10 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
 
               {data.backlog_reuse_funnel && data.backlog_reuse_funnel.window_hours && (
                 <BacklogReuseFunnelRow funnel={data.backlog_reuse_funnel} />
+              )}
+
+              {(pool?.project_allowlist?.length ?? 0) > 0 && (
+                <BacklogDropoutRow projectId={pool!.project_allowlist![0]} />
               )}
 
               {data.chain_continuity_funnel && (
@@ -1210,6 +1214,98 @@ function BacklogReuseFunnelRow({ funnel }: { funnel: BacklogReuseFunnelSnapshot 
           <span className="font-mono text-amber-400">{scanSat}</span>
         </span>
       )}
+    </div>
+  );
+}
+
+// Per-project warm-reuse dropout diagnostic. Fetches the live dominant-dropout
+// endpoint and the day-over-day trend, then renders the single biggest loss
+// reason + share + a short trend so an operator can confirm whether a change
+// reduced the leader. Degrades silently on fetch error or when the backend
+// returns no dominant dropout (renders "—" for the reason). Gated by the caller
+// on pool.project_allowlist having at least one entry.
+function BacklogDropoutRow({ projectId }: { projectId: string }) {
+  const [diagnostic, setDiagnostic] = useState<WarmReuseDropoutDiagnostic | null>(null);
+  const [trend, setTrend] = useState<WarmReuseDropoutTrendBucket[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const base = `${API_BASE_URL}/api/admin/projects/${encodeURIComponent(projectId)}`;
+        const [diagRes, trendRes] = await Promise.all([
+          authGet(`${base}/warm-reuse-dropout`),
+          authGet(`${base}/warm-reuse-dropout-trend`),
+        ]);
+        if (!diagRes.ok || !trendRes.ok) return;
+        const [diagData, trendData] = await Promise.all([diagRes.json(), trendRes.json()]);
+        if (!cancelled) {
+          setDiagnostic(diagData as WarmReuseDropoutDiagnostic);
+          setTrend(((trendData as { buckets?: WarmReuseDropoutTrendBucket[] }).buckets ?? []));
+        }
+      } catch {
+        // Degrade silently — dropout is observability only
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!diagnostic) return null;
+
+  const dominant = diagnostic.dominant_dropout;
+  const recentBuckets = trend.slice(-3);
+
+  return (
+    <div
+      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      data-testid="backlog-dropout-row"
+    >
+      <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
+        Warm Reuse Dropout
+      </span>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        <span>
+          <span className="text-neutral-500">dominant</span>:{' '}
+          <span className="font-mono text-neutral-300" data-testid="backlog-dropout-reason">
+            {dominant ? dominant.reason : '—'}
+          </span>
+        </span>
+        {dominant && (
+          <span>
+            <span className="text-neutral-500">share</span>:{' '}
+            <span className="font-mono text-rose-400" data-testid="backlog-dropout-share">
+              {Math.round(dominant.share * 100)}%
+            </span>
+          </span>
+        )}
+        {dominant && (
+          <span>
+            <span className="text-neutral-500">count</span>:{' '}
+            <span className="font-mono text-neutral-300">{dominant.count}</span>
+            <span className="text-neutral-600">/{dominant.total}</span>
+          </span>
+        )}
+        {recentBuckets.length > 0 && (
+          <span className="flex items-center gap-1">
+            <span className="text-neutral-500">trend</span>:{' '}
+            {recentBuckets.map((b, i) => {
+              const share = b.dominant_share;
+              const prevShare = i > 0 ? recentBuckets[i - 1].dominant_share : null;
+              const arrow = share !== null && prevShare !== null
+                ? (share > prevShare ? '↑' : share < prevShare ? '↓' : null)
+                : null;
+              const arrowCls = arrow === '↑' ? 'text-red-400' : 'text-emerald-400';
+              return (
+                <span key={i} className="font-mono text-neutral-500">
+                  {i > 0 && <span className="text-neutral-700 mr-1">·</span>}
+                  {share !== null ? `${Math.round(share * 100)}%` : '—'}
+                  {arrow && <span className={arrowCls}>{arrow}</span>}
+                </span>
+              );
+            })}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

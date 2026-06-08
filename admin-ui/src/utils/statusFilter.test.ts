@@ -41,9 +41,9 @@ describe('matchesStatusFilter', () => {
 
   it('defaults the known set to the STATUS_OPTIONS values', () => {
     // Calling without an explicit `known` argument must use STATUS_OPTIONS, so a
-    // full live selection passes BLOCKED (a now-known status) and fails open for
+    // full live selection passes PARKED (a now-known status) and fails open for
     // a genuinely unknown one.
-    expect(matchesStatusFilter('BLOCKED', ALL_STATUSES)).toBe(true);
+    expect(matchesStatusFilter('PARKED', ALL_STATUSES)).toBe(true);
     expect(matchesStatusFilter('SOME_FUTURE_STATUS', ALL_STATUSES)).toBe(true);
   });
 });

@@ -281,6 +281,8 @@ const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint:
   agent_stalled: { label: 'Agent Stalled', color: 'bg-amber-500/20 text-amber-400', hint: 'Agent was alive but made no progress — wedged execution', suggestion: 'Wedged agent — retries with a fresh agent', retryLabel: 'Retry fresh' },
   BLOCKED_PRECONDITION: { label: 'Blocked — precondition', color: 'bg-sky-500/20 text-sky-400', hint: 'Agent correctly refused on an unmet precondition (e.g. upstream PR/file not yet on main) — not a code defect', suggestion: 'Resolve the upstream precondition, then retry', retryLabel: 'Retry' },
   SCOPE_EMPTY: { label: 'Scope Empty', color: 'bg-slate-500/20 text-slate-400', hint: 'Declared files were already covered by a sibling PR — agent exited cleanly, not a code defect', suggestion: 'No action needed — work was already covered elsewhere', retryLabel: 'Retry' },
+  park_wake_timeout: { label: 'Park Wake Timeout', color: 'bg-amber-500/20 text-amber-400', hint: 'Parked task wake source never fired before timeout — park/wake orchestration issue', suggestion: 'Inspect the wake source and retry after park/wake delivery is healthy', retryLabel: 'Retry' },
+  park_wake_stranded: { label: 'Park Wake Stranded', color: 'bg-orange-500/20 text-orange-400', hint: 'Parked task stayed stranded after its wake should have been delivered', suggestion: 'Inspect park/wake delivery health before retrying', retryLabel: 'Retry' },
 };
 
 export { FAILURE_CLASS_CONFIG };

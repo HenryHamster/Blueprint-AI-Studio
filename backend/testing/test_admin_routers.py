@@ -11,7 +11,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -31,11 +31,13 @@ from app.models import (
     ReleaseVersion,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
     Alert,
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
     SystemMaturity,
+    WakeDeliveryState,
     _on_task_terminal_callbacks,
 )
 from app.auth import get_current_user, require_admin
@@ -5470,10 +5472,10 @@ class TestDispatchExternalNotification:
         mock_response = mocker.MagicMock()
         mock_response.status_code = 200
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=mock_response)
 
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
@@ -5513,10 +5515,10 @@ class TestDispatchExternalNotification:
             "throttle_seconds": 0,
         }
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock()
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -5542,10 +5544,10 @@ class TestDispatchExternalNotification:
             "throttle_seconds": 0,
         }
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock()
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -5574,10 +5576,10 @@ class TestDispatchExternalNotification:
         mock_response = mocker.MagicMock()
         mock_response.status_code = 200
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=mock_response)
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -9435,6 +9437,70 @@ class TestResetIterationCap:
         assert resp.status_code == 400
 
 
+class TestGetTaskWakeRegistration:
+    @pytest.mark.asyncio
+    async def test_task_detail_returns_null_then_latest_wake_registration(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.PARKED,
+            payloads=[{"type": "create"}],
+            parked_at=datetime(2026, 6, 1, 12, 0, 0),
+            park_reason="Waiting on compute job",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["wake_registration"] is None
+
+        old_requested_at = datetime(2026, 6, 1, 12, 1, 0)
+        latest_requested_at = old_requested_at + timedelta(minutes=5)
+        db_session.add(
+            TaskWakeRegistration(
+                task_id=task.id,
+                project_id=project.id,
+                wake_source_kind="compute_job_terminal",
+                wake_source_ref="old-job",
+                requested_at=old_requested_at,
+                delivery_state=WakeDeliveryState.PENDING,
+            )
+        )
+        db_session.add(
+            TaskWakeRegistration(
+                task_id=task.id,
+                project_id=project.id,
+                wake_source_kind="compute_job_terminal",
+                wake_source_ref="job-123",
+                requested_at=latest_requested_at,
+                deadline_at=datetime(2026, 6, 1, 13, 0, 0),
+                fired_at=datetime(2026, 6, 1, 12, 10, 0),
+                delivery_state=WakeDeliveryState.DELIVERED,
+                result_state="resumed",
+                result_detail="Task re-queued after compute job completed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+
+        assert resp.status_code == 200, resp.text
+        wake_registration = resp.json()["wake_registration"]
+        assert wake_registration == {
+            "wake_source_kind": "compute_job_terminal",
+            "wake_source_ref": "job-123",
+            "delivery_state": "DELIVERED",
+            "deadline_at": "2026-06-01T13:00:00",
+            "fired_at": "2026-06-01T12:10:00",
+            "result_state": "resumed",
+            "result_detail": "Task re-queued after compute job completed",
+        }
+
+
 class TestGetAllTasksHistory:
     """GET /api/admin/tasks fetches each task's 10 most-recent TaskHistory
     entries. The fetch uses a per-task ROW_NUMBER() window, so a single
@@ -12266,6 +12332,110 @@ class TestTriggerRollup:
         )
 
 
+@pytest.mark.asyncio
+async def test_strategic_api_output_update_events_include_live_linkage(
+    client: AsyncClient, db_session, mocker
+):
+    from app import strategic_cycle
+    from app.auth import create_agent_token
+
+    emit = AsyncMock()
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=emit)
+    project = Project(
+        name="Strategic Events",
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strategic-events",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id), "vm-strategic-events", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    create_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Stabilize billing webhooks",
+                "priority": "high",
+                "rationale": "operator steering requested billing reliability",
+                "success_evidence": "Webhook retries are verified",
+                "retirement_condition": "No open webhook incidents",
+            },
+        },
+        headers=headers,
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    created_id = create_resp.json()["direction_id"]
+
+    pm_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "harden"},
+                "capabilities": [],
+                "gaps": [],
+            },
+        },
+        headers=headers,
+    )
+    assert pm_resp.status_code == 200, pm_resp.text
+
+    ru_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_running_update",
+            "data": {"markdown": "## Running update\nBilling reliability is active."},
+        },
+        headers=headers,
+    )
+    assert ru_resp.status_code == 200, ru_resp.text
+
+    assert emit.await_count == 3
+    first_call = emit.await_args_list[0]
+    assert first_call.args == (project.id, "directions")
+    assert first_call.kwargs == {
+        "task_id": task.id,
+        "cycle_id": cycle.id,
+        "output_kind": "directions",
+        "op": "create_direction",
+        "changed_direction_ids": [created_id],
+        "changed_count": 1,
+        "problem_model_changed": None,
+        "running_update_changed": None,
+    }
+    assert emit.await_args_list[1].args == (project.id, "problem_model")
+    assert emit.await_args_list[1].kwargs["cycle_id"] == cycle.id
+    assert emit.await_args_list[1].kwargs["op"] == "set_problem_model"
+    assert emit.await_args_list[1].kwargs["problem_model_changed"] is True
+    assert emit.await_args_list[2].args == (project.id, "running_update")
+    assert emit.await_args_list[2].kwargs["cycle_id"] == cycle.id
+    assert emit.await_args_list[2].kwargs["op"] == "set_running_update"
+    assert emit.await_args_list[2].kwargs["running_update_changed"] is True
+
+
 class TestTriggerSelfAudit:
     @pytest.mark.asyncio
     async def test_self_audit_409_when_audit_in_flight(
@@ -12552,9 +12722,7 @@ class TestBugReportCitationGate:
         )
         mocker.patch(
             "app.source_ref_validation._file_exists_at_head",
-            new=AsyncMock(
-                side_effect=lambda path, **_: True if "alive.py" in path else False
-            ),
+            new=AsyncMock(side_effect=lambda path, **_: "alive.py" in path),
         )
         resp = await client.post(
             "/api/admin/messages",
@@ -12692,9 +12860,7 @@ class TestBugReportCitationGate:
         )
         mocker.patch(
             "app.source_ref_validation._file_exists_at_head",
-            new=AsyncMock(
-                side_effect=lambda path, **_: True if "alive.py" in path else False
-            ),
+            new=AsyncMock(side_effect=lambda path, **_: "alive.py" in path),
         )
         resp = await client.post(
             "/api/admin/tasks",
@@ -12880,9 +13046,8 @@ class TestStrategistSpawnableRegistry:
     def test_allowlist_equals_expected_knowledge_types(self):
         from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
 
-        assert STRATEGIST_SPAWNABLE_TASK_TYPES == frozenset(
-            {"research", "plan", "web_research", "design"}
-        )
+        expected = frozenset({"research", "plan", "web_research", "design"})
+        assert expected == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_allowlist_is_derived_from_capability_flag(self):
         from app.task_capabilities import (
@@ -12900,7 +13065,7 @@ class TestStrategistSpawnableRegistry:
             for value, cap in TASK_CAPABILITY_BY_VALUE.items()
             if cap.strategist_spawnable
         )
-        assert STRATEGIST_SPAWNABLE_TASK_TYPES == derived
+        assert derived == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_no_write_type_is_strategist_spawnable(self):
         from app.task_capabilities import (

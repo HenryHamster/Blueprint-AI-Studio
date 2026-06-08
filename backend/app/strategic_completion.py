@@ -84,6 +84,96 @@ def spawn_budget_status(
     return True, None, None
 
 
+def _ctx_list(ctx: dict, key: str) -> list[str]:
+    values = ctx.get(key)
+    if not isinstance(values, list):
+        return []
+    return [str(v) for v in values if v]
+
+
+def _strategic_event_completion_summary(
+    task: Task,
+    project: Project | None,
+    *,
+    cycle=None,
+    status: str = "completed",
+    status_message: str | None = None,
+    failure_reason: str | None = None,
+    created_ids: list | None = None,
+    retired_ids: list | None = None,
+    staged_ids: list | None = None,
+    updated_ids: list | None = None,
+    problem_model_changed: bool | None = None,
+    running_update_changed: bool | None = None,
+) -> dict[str, Any]:
+    ctx = task.context or {}
+    meta = getattr(cycle, "cycle_metadata", None) or {}
+    created_source = created_ids or _ctx_list(ctx, "_strategic_created_ids")
+    retired_source = retired_ids or _ctx_list(ctx, "_strategic_retired_ids")
+    approved_count = int(ctx.get("_strategic_proposals_approved") or 0)
+    rejected_count = int(ctx.get("_strategic_proposals_rejected") or 0)
+    created = [str(v) for v in (created_source or meta.get("created_direction_ids", [])) if v]
+    retired = [str(v) for v in (retired_source or meta.get("retired_direction_ids", [])) if v]
+    staged = [str(v) for v in (staged_ids or _ctx_list(ctx, "_strategic_staged_ids")) if v]
+    updated = [str(v) for v in (updated_ids or _ctx_list(ctx, "_strategic_updated_ids")) if v]
+    created_count = int(
+        ctx.get("_strategic_dirs_created")
+        or getattr(cycle, "directions_created", 0)
+        or len(created)
+    )
+    retired_count = int(
+        ctx.get("_strategic_dirs_retired")
+        or getattr(cycle, "directions_retired", 0)
+        or len(retired)
+        or rejected_count
+    )
+    staged_count = int(ctx.get("_strategic_dirs_staged") or len(staged))
+    updated_count = int(
+        ctx.get("_strategic_dirs_updated")
+        or len(updated)
+        or approved_count
+    )
+    tasks_spawned = int(
+        ctx.get("_strategic_tasks_spawned")
+        or getattr(cycle, "tasks_spawned", 0)
+        or 0
+    )
+    pm_changed = (
+        bool(ctx.get("_strategic_problem_model_set"))
+        if problem_model_changed is None
+        else bool(problem_model_changed)
+    )
+    ru_changed = (
+        bool(ctx.get("_strategic_running_update_set"))
+        if running_update_changed is None
+        else bool(running_update_changed)
+    )
+    return {
+        "status": status,
+        "status_message": status_message or task.latest_status_message,
+        "failure_reason": failure_reason or getattr(cycle, "failure_reason", None),
+        "created_direction_ids": created,
+        "retired_direction_ids": retired,
+        "staged_direction_ids": staged,
+        "updated_direction_ids": updated,
+        "created_count": created_count,
+        "retired_count": retired_count,
+        "staged_count": staged_count,
+        "updated_count": updated_count,
+        "tasks_spawned": tasks_spawned,
+        "directions_changed": bool(
+            created_count or retired_count or staged_count or updated_count
+        ),
+        "problem_model_changed": pm_changed,
+        "running_update_changed": ru_changed,
+        "active_direction_count": sum(
+            1
+            for d in ((project.directions if project else []) or [])
+            if d.get("status") == "active"
+        ),
+    }
+
+
 def spawn_title_is_redundant(
     title: str,
     existing_titles,
@@ -2244,6 +2334,10 @@ async def _handle_strategic_completion(
         or vision_rev > spawned_vision_rev
         or (task.context or {}).get("_strategic_dirs_created", 0) > 0
         or (task.context or {}).get("_strategic_dirs_retired", 0) > 0
+        or (task.context or {}).get("_strategic_dirs_staged", 0) > 0
+        or (task.context or {}).get("_strategic_dirs_updated", 0) > 0
+        or (task.context or {}).get("_strategic_proposals_approved", 0) > 0
+        or (task.context or {}).get("_strategic_proposals_rejected", 0) > 0
         or tasks_spawned > 0
         or (task.context or {}).get("_strategic_api_called", False)
     )
@@ -2332,7 +2426,7 @@ async def _handle_strategic_completion(
                 _memos_cited = strategic_cycle.count_cited_memos(
                     _memo_citations, _cycle_reasoning
                 )
-            await strategic_cycle.mark_phase2_completed(
+            completed_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
                 summary_text=_summary,
@@ -2345,6 +2439,8 @@ async def _handle_strategic_completion(
                 memos_cited=_memos_cited,
                 extra_metadata=_extra,
             )
+        else:
+            completed_cycle = None
         # OPTIONAL refinement: persist per-direction evidence_progress verdicts
         # (advancing|stalled|met) onto active directions. Independent of cycle_id
         # — a no-op when the agent omitted the assessment, leaving the
@@ -2409,7 +2505,18 @@ async def _handle_strategic_completion(
         # `strategic_updated` events during execution; here we close the cycle.
         from app.strategic_events import emit_strategic_cycle_completed
 
-        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            2,
+            cycle_id=cycle_id,
+            completion=_strategic_event_completion_summary(
+                task,
+                project,
+                cycle=completed_cycle,
+                status="completed",
+            ),
+        )
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
         )
@@ -2436,20 +2543,37 @@ async def _handle_strategic_completion(
             )
             if cycle_id:
                 # Audit W2: failure recorded on the StrategicCycle row.
-                await strategic_cycle.mark_failure(
+                failed_cycle = await strategic_cycle.mark_failure(
                     session,
                     cycle_id,
                     phase="phase2",
                     reason="strategic_review unparseable output",
                 )
+            else:
+                failed_cycle = None
             session.add(project)
+        else:
+            failed_cycle = None
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
         await session.commit()
         # Post-commit: the cycle ended (in failure) — close it for the UI.
         from app.strategic_events import emit_strategic_cycle_completed
 
-        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            2,
+            cycle_id=cycle_id,
+            phase_state="failed",
+            completion=_strategic_event_completion_summary(
+                task,
+                project,
+                cycle=failed_cycle,
+                status="failed",
+                failure_reason="strategic_review unparseable output",
+            ),
+        )
         failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
         logger.warning(
             f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
@@ -3208,6 +3332,7 @@ async def _handle_strategic_completion(
     dirs_created = (
         creates_count if direction_ops and isinstance(direction_ops, list) else 0
     )
+    fallback_cycle = None
     if cycle_id:
         dirs_retired = retires_applied
         vision_produced = bool(new_vision and isinstance(new_vision, dict))
@@ -3232,7 +3357,7 @@ async def _handle_strategic_completion(
             _fb_critiques = parsed.get("retired_direction_critiques")
             if _fb_critiques is not None:
                 _fb_extra["retirement_critiques"] = _fb_critiques
-            await strategic_cycle.mark_phase2_completed(
+            fallback_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
                 summary_text=_summary_fb,
@@ -3243,7 +3368,7 @@ async def _handle_strategic_completion(
                 extra_metadata=_fb_extra,
             )
         else:
-            await strategic_cycle.mark_failure(
+            fallback_cycle = await strategic_cycle.mark_failure(
                 session,
                 cycle_id,
                 phase="phase2",
@@ -3455,12 +3580,56 @@ async def _handle_strategic_completion(
     )
 
     if isinstance(new_running_update, str):
-        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_RUNNING_UPDATE)
+        await emit_strategic_updated(
+            task.project_id,
+            STRATEGIC_KIND_RUNNING_UPDATE,
+            task_id=task.id,
+            cycle_id=cycle_id,
+            output_kind=STRATEGIC_KIND_RUNNING_UPDATE,
+            op="fallback_parse",
+            running_update_changed=True,
+        )
     if new_problem_model and isinstance(new_problem_model, dict):
-        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_PROBLEM_MODEL)
+        await emit_strategic_updated(
+            task.project_id,
+            STRATEGIC_KIND_PROBLEM_MODEL,
+            task_id=task.id,
+            cycle_id=cycle_id,
+            output_kind=STRATEGIC_KIND_PROBLEM_MODEL,
+            op="fallback_parse",
+            problem_model_changed=True,
+        )
     if ops_applied or retires_applied:
-        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_DIRECTIONS)
-    await emit_strategic_cycle_completed(task.project_id, task.id, 2)
+        await emit_strategic_updated(
+            task.project_id,
+            STRATEGIC_KIND_DIRECTIONS,
+            task_id=task.id,
+            cycle_id=cycle_id,
+            output_kind=STRATEGIC_KIND_DIRECTIONS,
+            op="fallback_parse",
+            changed_direction_ids=list(created_ids_fb) + list(retired_ids_fb),
+            changed_count=ops_applied + retires_applied,
+        )
+    fallback_succeeded = fallback_cycle is None or (
+        getattr(fallback_cycle, "outcome", None) == "completed"
+    )
+    await emit_strategic_cycle_completed(
+        task.project_id,
+        task.id,
+        2,
+        cycle_id=cycle_id,
+        phase_state="cycle_done" if fallback_succeeded else "failed",
+        completion=_strategic_event_completion_summary(
+            task,
+            project,
+            cycle=fallback_cycle,
+            status="completed" if fallback_succeeded else "failed",
+            created_ids=created_ids_fb,
+            retired_ids=retired_ids_fb,
+            problem_model_changed=bool(new_problem_model and isinstance(new_problem_model, dict)),
+            running_update_changed=isinstance(new_running_update, str),
+        ),
+    )
     logger.info(
         f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
     )

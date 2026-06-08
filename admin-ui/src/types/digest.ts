@@ -134,6 +134,15 @@ export interface MergeGateFleetHealth {
   project_count: number;
 }
 
+export interface ParkWakeHealth {
+  parked_task_count: number;
+  oldest_parked_age_seconds: number | null;
+  fired_undelivered_count: number;
+  oldest_fired_age_seconds: number | null;
+  delivery_stalled: boolean;
+  delivery_stall_threshold_seconds: number;
+}
+
 export interface FindingStructuralGiveUpItem {
   task_id: string;
   title: string;
@@ -457,6 +466,7 @@ export interface DigestData<DP = unknown> {
 
   // ----- operational health (catch-up) -----
   merge_gate_fleet_health?: MergeGateFleetHealth | null;
+  park_wake_health?: ParkWakeHealth | null;
   dependency_health_signals?: DependencyHealthSignals | null;
   migration_health?: {
     current_schema_revision: string | null;

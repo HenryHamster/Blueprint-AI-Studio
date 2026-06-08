@@ -52,6 +52,7 @@ import { OpenResidualCasesSection } from './OpenResidualCasesSection';
 import { RejectionPatternSummary } from './RejectionPatternSummary';
 import { RecentMergesTimeline } from './RecentMergesTimeline';
 import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
+import { ParkWakeHealthCard } from './ParkWakeHealthCard';
 import { DependencyHealthCard } from './DependencyHealthCard';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
@@ -795,6 +796,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
             <div className="mt-4">
               <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+            </div>
+          )}
+
+          {/* Park/wake delivery health (read-only) */}
+          {digest?.park_wake_health && (
+            <div className="mt-4">
+              <ParkWakeHealthCard data={digest.park_wake_health} />
             </div>
           )}
 

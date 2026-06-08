@@ -3168,6 +3168,9 @@ async def _handle_design_doc_completion(
     # never sticks on. Only a successful _spawn_strategic_review (which emits its
     # own Phase-2 started) is exempt — that keeps the cycle visibly active.
     phase2_spawned = False
+    phase1_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+        "strategic_cycle_id"
+    )
 
     if project is None:
         # Legacy / direct-caller path: acquire the lock here. Post-commit
@@ -3195,7 +3198,17 @@ async def _handle_design_doc_completion(
                 f"Design doc update failed: project not found (task {str(task.id)[:8]})",
             )
             # Phase 1 ended without chaining — close the cycle for the UI.
-            await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+            await emit_strategic_cycle_completed(
+                task.project_id,
+                task.id,
+                1,
+                cycle_id=phase1_cycle_id,
+                phase_state="failed",
+                completion={
+                    "status": "failed",
+                    "failure_reason": "project not found",
+                },
+            )
             return
         logger.warning(
             f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
@@ -3207,7 +3220,17 @@ async def _handle_design_doc_completion(
             f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred",
         )
         # Phase 1 ended without chaining — close the cycle for the UI.
-        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            1,
+            cycle_id=phase1_cycle_id,
+            phase_state="deferred",
+            completion={
+                "status": "deferred",
+                "status_message": "strategic chain deferred: project row contended",
+            },
+        )
         return
 
     doc = project.design_doc or {}
@@ -3225,7 +3248,7 @@ async def _handle_design_doc_completion(
     # Chain: spawn Phase 2 (strategic review)
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
-    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    cycle_id = phase1_cycle_id
     # Architecture-cycle operator steering: the pending refresh marker was
     # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
     # reads as operator-origin in vision. The flag was stamped on the task
@@ -3326,7 +3349,17 @@ async def _handle_design_doc_completion(
     # otherwise never paired. Emit completed so the indicator clears. A
     # successful spawn already emitted a Phase-2 started, so it is skipped.
     if not phase2_spawned:
-        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            1,
+            cycle_id=cycle_id,
+            phase_state="deferred",
+            completion={
+                "status": "deferred",
+                "status_message": task.latest_status_message,
+            },
+        )
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

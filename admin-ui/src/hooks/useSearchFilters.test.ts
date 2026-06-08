@@ -76,9 +76,18 @@ describe('useSearchFilters', () => {
     const { result } = renderHook(() => useSearchFilters());
     expect(result.current.statusFilter).toEqual(STATUS_VALUES);
     expect(result.current.statusFilter).toContain('BLOCKED');
+    expect(result.current.statusFilter).toContain('PARKED');
   });
 
-  it('preserves a deliberate partial status selection that omits BLOCKED', () => {
+  it('expands a legacy all-statuses selection (pre-PARKED) to the full current list', () => {
+    const legacy = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
+    localStorage.setItem(k('status'), JSON.stringify(legacy));
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.statusFilter).toEqual(STATUS_VALUES);
+    expect(result.current.statusFilter).toContain('PARKED');
+  });
+
+  it('preserves a deliberate partial status selection that omits BLOCKED and PARKED', () => {
     // A strict subset of the legacy set is a real user choice, not a "show
     // everything" snapshot — leave it untouched even though it predates BLOCKED.
     const partial = ['QUEUED', 'IN_PROGRESS', 'EVALUATING'];
@@ -86,15 +95,16 @@ describe('useSearchFilters', () => {
     const { result } = renderHook(() => useSearchFilters());
     expect(result.current.statusFilter).toEqual(partial);
     expect(result.current.statusFilter).not.toContain('BLOCKED');
+    expect(result.current.statusFilter).not.toContain('PARKED');
   });
 
-  it('leaves a selection that already includes BLOCKED untouched', () => {
-    // Once BLOCKED is part of the stored selection, the expansion must be a no-op
+  it('leaves a partial selection that already includes PARKED untouched', () => {
+    // Once PARKED is part of the stored selection, the expansion must be a no-op
     // so it does not fight a user who deliberately deselected other statuses.
-    const withBlocked = ['BLOCKED', 'FAILED'];
-    localStorage.setItem(k('status'), JSON.stringify(withBlocked));
+    const withParked = ['PARKED', 'FAILED'];
+    localStorage.setItem(k('status'), JSON.stringify(withParked));
     const { result } = renderHook(() => useSearchFilters());
-    expect(result.current.statusFilter).toEqual(withBlocked);
+    expect(result.current.statusFilter).toEqual(withParked);
   });
 
   it('falls back to default when a stored array value is not an array', () => {

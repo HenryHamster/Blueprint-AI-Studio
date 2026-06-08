@@ -72,6 +72,14 @@ function formatArtifactTypeLabel(artifactType: string): string {
     .join(' ');
 }
 
+function formatWakeDeliveryState(value: string): string {
+  return value
+    .toLowerCase()
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
 function DirectionsSection({ directions }: { directions: { text: string; priority?: string; status?: string }[] }) {
   const [open, setOpen] = useState(true);
   return (
@@ -812,13 +820,57 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         </>
       )}
 
-      {(task.status === 'PARKED' || task.parked_at || task.park_reason) && (
+      {(task.status === 'PARKED' || task.parked_at || task.park_reason || task.wake_registration) && (
         <>
           <SectionHeader>Parked</SectionHeader>
           {task.park_reason && (
             <DetailRow label="Reason"><span className="text-sm text-sky-200/90 break-words">{task.park_reason}</span></DetailRow>
           )}
           {task.parked_at && <DetailRow label="Parked at">{formatAbsolute(task.parked_at)}</DetailRow>}
+          {task.wake_registration && (
+            <>
+              <DetailRow label="Wake source">
+                <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
+                  <span className="font-mono text-xs text-sky-200 break-all">{task.wake_registration.wake_source_kind}</span>
+                  {task.wake_registration.wake_source_ref ? (
+                    <>
+                      <span className="text-neutral-500">/</span>
+                      <span className="font-mono text-xs text-neutral-200 break-all">{task.wake_registration.wake_source_ref}</span>
+                    </>
+                  ) : (
+                    <span className="text-xs text-neutral-500">no source ref</span>
+                  )}
+                </span>
+              </DetailRow>
+              <DetailRow label="Fired">
+                {task.wake_registration.fired_at ? (
+                  formatAbsolute(task.wake_registration.fired_at)
+                ) : (
+                  <span className="text-sm text-neutral-500">Not yet fired</span>
+                )}
+              </DetailRow>
+              <DetailRow label="Delivery">
+                <span className="text-xs uppercase tracking-wider font-mono bg-sky-500/10 text-sky-300 border border-sky-500/20 px-2 py-0.5 rounded">
+                  {formatWakeDeliveryState(task.wake_registration.delivery_state)}
+                </span>
+              </DetailRow>
+              <DetailRow label="Deadline">
+                {task.wake_registration.deadline_at ? (
+                  formatAbsolute(task.wake_registration.deadline_at)
+                ) : (
+                  <span className="text-sm text-neutral-500">No deadline</span>
+                )}
+              </DetailRow>
+              {(task.wake_registration.result_state || task.wake_registration.result_detail) && (
+                <DetailRow label="Result">
+                  <span className="text-sm text-neutral-200 break-words">
+                    {task.wake_registration.result_state || 'No result state'}
+                    {task.wake_registration.result_detail ? `: ${task.wake_registration.result_detail}` : ''}
+                  </span>
+                </DetailRow>
+              )}
+            </>
+          )}
         </>
       )}
 

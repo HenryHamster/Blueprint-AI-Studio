@@ -3172,7 +3172,10 @@ async def test_process_post_commit_emits_cycle_completed_on_terminal_strategic(
     payload = AgentStatusPayload(task_id=task.id, status=status)
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
-    emit.assert_awaited_once_with(task.project_id, task.id, expected_phase)
+    emit.assert_awaited_once()
+    assert emit.await_args.args == (task.project_id, task.id, expected_phase)
+    assert emit.await_args.kwargs["phase_state"] == "failed"
+    assert "status" in emit.await_args.kwargs["completion"]
 
 
 @pytest.mark.asyncio
