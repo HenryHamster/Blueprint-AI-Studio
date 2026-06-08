@@ -7896,6 +7896,84 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
     assert len(delta["recent_not_landed_titles"]) <= _RECON_LIST_CAP
 
 
+@pytest.mark.asyncio
+async def test_ancestry_verification_runs_with_no_open_transaction(db_session, mocker):
+    """Regression: GitHub ancestry I/O must NOT run inside an open DB transaction.
+
+    Root cause of the strategic-cycle outage: ``_build_recent_interventions``
+    made sequential, awaited GitHub calls (get_pull_request + is_ancestor_of)
+    while the read transaction on ``session`` stayed open. For a large merged
+    set the loop exceeded Postgres'
+    ``idle_in_transaction_session_timeout`` (60s), the server killed the
+    connection, and the next query raised ``InterfaceError: connection is
+    closed`` — silently swallowed, so no strategic task ever spawned.
+
+    This test asserts the fix invariant directly: at the moment EACH GitHub
+    client method is invoked, ``session.in_transaction()`` is False (the read
+    txn was committed/released before any network I/O). It also confirms the
+    verified ancestry results still flow through correctly after the connection
+    is re-acquired for the post-loop children query.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Landed fix",
+        description="merge SHA is a real ancestor",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 777},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Captured txn-state at each GitHub call site. Every entry MUST be False —
+    # any True means network I/O ran inside an open transaction (the bug).
+    txn_states: list[bool] = []
+
+    async def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        txn_states.append(db_session.in_transaction())
+        return {"merge_commit_sha": "landed-sha", "head": {"sha": "head-sha"}}
+
+    async def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        txn_states.append(db_session.in_transaction())
+        return True
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+
+    # The GitHub client was actually exercised (guards against a vacuous pass if
+    # the verification path were skipped) ...
+    assert txn_states, "expected at least one GitHub call to be made"
+    # ... and NONE of those calls happened inside an open DB transaction.
+    assert all(state is False for state in txn_states), (
+        "GitHub ancestry I/O ran while a DB transaction was open — this is the "
+        f"idle-in-transaction bug. txn states at call sites: {txn_states}"
+    )
+
+    # Behavior preserved: the verified result still lands on the merge entry.
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["on_automain"] is True
+
+
 # ── Per-project integration_branch resolution (column-based) ─────────────────
 
 

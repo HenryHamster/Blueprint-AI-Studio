@@ -5,6 +5,7 @@ strategic review cycle. Extracted from autonomous_research.py to free up
 function slots in that module.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -1178,6 +1179,14 @@ _RECON_LIST_CAP = 12
 _RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
+
+# GitHub-ancestry verification (in _build_recent_interventions) runs OUTSIDE any
+# DB transaction and is bounded so it can never approach the 60s
+# idle_in_transaction_session_timeout that previously killed the strategic cycle.
+# Concurrency keeps the wall-clock low for large merged sets; the per-call
+# timeout caps the worst case of a single hung GitHub request.
+_ANCESTRY_CONCURRENCY = 6
+_ANCESTRY_CALL_TIMEOUT_S = 15.0
 
 
 def _build_cycle_start_reconciliation(
@@ -2558,6 +2567,24 @@ async def _build_recent_interventions(
         logger.debug("[STRATEGIC] GitHub credential resolution skipped: %s", _exc_ss)
 
     if _gh_token_ss and _gh_owner_ss and _gh_repo_ss:
+        # CRITICAL: the ancestry verification below makes sequential, awaited
+        # GitHub API calls (get_pull_request + is_ancestor_of). Those calls MUST
+        # NOT run while a DB transaction is open on ``session``: a large merged
+        # set makes the loop exceed Postgres'
+        # ``idle_in_transaction_session_timeout`` (60s, set in database.py), the
+        # server kills the connection mid-flight, and the next query
+        # (children-titles, below) raises ``InterfaceError: connection is
+        # closed`` — silently swallowed upstream, so the entire strategic cycle
+        # fails and no strategic task ever spawns. To avoid that we (1) extract
+        # everything the network phase needs into plain Python below while the
+        # txn is still open, (2) commit to release the connection so it is no
+        # longer idle-in-transaction, then (3) do the GitHub I/O with NO open
+        # transaction. SQLAlchemy auto-begins a fresh transaction on the next
+        # query (the children query). This function is read-only, so committing
+        # here is equivalent to a rollback for correctness; the caller
+        # (_spawn_strategic_review) holds no pending writes at this point.
+
+        # --- (1) extract verification inputs into plain Python (txn still open) ---
         # Collect the bounded set of tasks that will actually appear in the feed:
         # top-limit merges_out entries + tasks merged since the last strategic
         # cycle (the per_direction_delta recent window).
@@ -2567,18 +2594,19 @@ async def _build_recent_interventions(
             _ts_v = _t_v.updated_at or _t_v.created_at
             if _ts_v and _ts_v >= _recent_cutoff_verify:
                 _to_verify_ids.add(_t_v.id)
-        _to_verify = [t for t in merged_tasks if t.id in _to_verify_ids]
 
-        _pr_data_cache: dict[int, dict] = {}
-
-        for _t in _to_verify:
+        # Resolve which PR each verifiable task hangs its ancestry on, and group
+        # task ids by that PR number. A rollup child task merges into the rollup
+        # staging branch, so the child PR's own merge commit lives on that branch
+        # — once the rollup PR squash-merges, the child commit is NOT an ancestor
+        # of the integration branch. The child is on automain iff the *parent's*
+        # rollup PR landed, so verify that PR instead of the child's own. Grouping
+        # by PR number preserves the original per-PR ``get_pull_request`` dedup
+        # (multiple children share one parent rollup PR) and lets us fan the
+        # per-PR ancestry checks out concurrently without redundant fetches.
+        _tasks_by_pr: dict[int, list[uuid.UUID]] = {}
+        for _t in (t for t in merged_tasks if t.id in _to_verify_ids):
             _ctx_t = _t.context or {}
-            # Resolve which PR's merge commit to verify for ancestry.
-            # A rollup child task merges into the rollup staging branch, so the
-            # child PR's own merge commit lives on that branch — once the rollup
-            # PR squash-merges, the child commit is NOT an ancestor of the
-            # integration branch. The child is on automain iff the *parent's*
-            # rollup PR landed, so verify that PR instead of the child's own.
             if _t.parent_task_id is not None:
                 _pr_num_raw = _parent_rollup_pr.get(_t.parent_task_id)
             else:
@@ -2588,61 +2616,109 @@ async def _build_recent_interventions(
                 continue
             try:
                 _pr_num = int(_pr_num_raw)
-                if _pr_num not in _pr_data_cache:
-                    _pr_data_cache[_pr_num] = await _github_ss.get_pull_request(
-                        _gh_token_ss,
-                        _gh_owner_ss,
-                        _gh_repo_ss,
+            except (TypeError, ValueError):
+                continue
+            _tasks_by_pr.setdefault(_pr_num, []).append(_t.id)
+
+        # --- (2) release the read transaction BEFORE any network I/O ---
+        # Read-only up to here, so commit() (or rollback()) is correctness-neutral;
+        # it returns the connection to the pool so the GitHub calls below run with
+        # no idle-in-transaction clock ticking.
+        await session.commit()
+
+        # --- (3) GitHub ancestry checks with NO open transaction ---
+        # Bounded-concurrency fan-out (semaphore) + per-call timeout as
+        # defense-in-depth so this verification can never again approach the 60s
+        # idle-in-transaction ceiling even if it did somehow run under a txn.
+        _ancestry_sem = asyncio.Semaphore(_ANCESTRY_CONCURRENCY)
+
+        async def _verify_pr(
+            _pr_num: int,
+        ) -> tuple[int, bool | None, bool | None]:
+            """Return (pr_num, automain_landed, on_main_landed) for one PR.
+
+            ``automain_landed``/``on_main_landed`` mirror the tri-state of
+            ``is_ancestor_of``: True = verified landed, False = verified NOT
+            landed / no merge SHA, None = unverifiable (API failure) → caller
+            leaves the task absent from the verified map and the flag fallback
+            applies. ``on_main_landed`` stays None when there is no LTS split.
+            """
+            async with _ancestry_sem:
+                try:
+                    _pr_data = await asyncio.wait_for(
+                        _github_ss.get_pull_request(
+                            _gh_token_ss,
+                            _gh_owner_ss,
+                            _gh_repo_ss,
+                            _pr_num,
+                            project_id=str(project.id),
+                        ),
+                        timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                    )
+                    _merge_sha = _pr_data.get("merge_commit_sha")
+                    if not _merge_sha:
+                        # PR has no merge SHA (not yet merged or API gap) → not landed
+                        return _pr_num, False, None
+
+                    _is_anc = await asyncio.wait_for(
+                        _github_ss.is_ancestor_of(
+                            _gh_token_ss,
+                            _gh_owner_ss,
+                            _gh_repo_ss,
+                            _merge_sha,
+                            _integration_branch_ss,
+                            project_id=str(project.id),
+                        ),
+                        timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                    )
+                    # is_ancestor_of returns True (merge commit reachable from the
+                    # integration branch), False (genuinely not reachable), or None
+                    # (compare API indeterminate). Only True confirms the change
+                    # landed; False and None are both degrade-safe NOT-landed.
+                    _automain_landed = _is_anc is True
+
+                    # Deployed signal: also test reachability from the promotion
+                    # target. on_automain=True & on_main=False is exactly "landed on
+                    # the integration branch but NOT yet promoted" — i.e. not running
+                    # live. Reuses the already-fetched merge SHA, so it adds only one
+                    # compare call per already-verified PR, and only when there is an
+                    # LTS split (otherwise the two branches are identical and
+                    # on_main == on_automain).
+                    _on_main_landed: bool | None = None
+                    if _promotion_target_ss != _integration_branch_ss:
+                        _is_anc_main = await asyncio.wait_for(
+                            _github_ss.is_ancestor_of(
+                                _gh_token_ss,
+                                _gh_owner_ss,
+                                _gh_repo_ss,
+                                _merge_sha,
+                                _promotion_target_ss,
+                                project_id=str(project.id),
+                            ),
+                            timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                        )
+                        _on_main_landed = _is_anc_main is True
+                    return _pr_num, _automain_landed, _on_main_landed
+                except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
+                    logger.debug(
+                        "[STRATEGIC] ancestry check failed for pr=%s: %s",
                         _pr_num,
-                        project_id=str(project.id),
+                        _exc_t,
                     )
-                _pr_data = _pr_data_cache[_pr_num]
-                _merge_sha = _pr_data.get("merge_commit_sha")
-                if not _merge_sha:
-                    # PR has no merge SHA (not yet merged or API gap) → not landed
-                    _automain_verified[_t.id] = False
-                    continue
+                    # None → leave the tasks absent from _automain_verified so the
+                    # flag fallback applies (verdict "unverifiable").
+                    return _pr_num, None, None
 
-                _is_anc = await _github_ss.is_ancestor_of(
-                    _gh_token_ss,
-                    _gh_owner_ss,
-                    _gh_repo_ss,
-                    _merge_sha,
-                    _integration_branch_ss,
-                    project_id=str(project.id),
-                )
-
-                # is_ancestor_of returns True (merge commit reachable from the
-                # integration branch), False (genuinely not reachable), or None
-                # (compare API indeterminate). Only True confirms the change
-                # landed; False and None are both degrade-safe NOT-landed.
-                _automain_verified[_t.id] = _is_anc is True
-
-                # Deployed signal: also test reachability from the promotion
-                # target. on_automain=True & on_main=False is exactly "landed on
-                # the integration branch but NOT yet promoted" — i.e. not running
-                # live. Reuses the already-fetched merge SHA, so it adds only one
-                # compare call per already-verified PR, and only when there is an
-                # LTS split (otherwise the two branches are identical and
-                # on_main == on_automain).
-                if _promotion_target_ss != _integration_branch_ss:
-                    _is_anc_main = await _github_ss.is_ancestor_of(
-                        _gh_token_ss,
-                        _gh_owner_ss,
-                        _gh_repo_ss,
-                        _merge_sha,
-                        _promotion_target_ss,
-                        project_id=str(project.id),
-                    )
-                    _on_main_verified[_t.id] = _is_anc_main is True
-            except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
-                logger.debug(
-                    "[STRATEGIC] ancestry check failed for task %s (pr=%s): %s",
-                    _t.id,
-                    _pr_num_raw,
-                    _exc_t,
-                )
-                # Leave _t.id absent from _automain_verified; flag fallback used below
+        if _tasks_by_pr:
+            _verify_results = await asyncio.gather(
+                *(_verify_pr(_pr_num) for _pr_num in _tasks_by_pr)
+            )
+            for _pr_num, _automain_landed, _on_main_landed in _verify_results:
+                for _tid in _tasks_by_pr[_pr_num]:
+                    if _automain_landed is not None:
+                        _automain_verified[_tid] = _automain_landed
+                    if _on_main_landed is not None:
+                        _on_main_verified[_tid] = _on_main_landed
 
     def _on_automain(task: Task) -> bool:
         # Prefer the GitHub-verified result when available.
