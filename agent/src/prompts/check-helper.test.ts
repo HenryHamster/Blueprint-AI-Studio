@@ -232,11 +232,30 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
     const script = await writeBackendPytestCheck('pytest');
     // Harness preference is probed at runtime: file exists + Docker available.
     expect(script).toContain('if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then');
+    // Both harness modes are generated as cases...
     expect(script).toContain(`run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200'`);
-    // Low-memory hosts (the harness's own guard would refuse the full suite)
-    // fall back to its sanctioned standalone mode — a genuine partial run.
     expect(script).toContain('MemAvailable');
     expect(script).toContain(`run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'`);
+  });
+
+  it('prefers the standalone partial over the full suite whenever the harness offers --standalone', async () => {
+    // Regression for the 2026-06-07 gate wart: the old probe selected the FULL
+    // suite when `MemAvailable >= 4096`, so an 8 GB agent VM (which clears 4 GB
+    // at gate-start) ran the full Docker/Postgres suite locally — the run that
+    // OOMs (exit 137) and that CI already covers. The local gate is a smoke
+    // check; when the harness advertises --standalone, that must win regardless
+    // of free memory. The `>= 4096 -> full harness` branch is now reachable only
+    // when the harness has NO standalone mode.
+    const script = await writeBackendPytestCheck('pytest');
+    const standaloneAt = script.indexOf("grep -qs -- '--standalone'");
+    const fullByMemAt = script.indexOf('-ge 4096');
+    expect(standaloneAt).toBeGreaterThan(-1);
+    expect(fullByMemAt).toBeGreaterThan(-1);
+    // The --standalone preference is evaluated BEFORE the memory-gated full run.
+    expect(standaloneAt).toBeLessThan(fullByMemAt);
+    // The full harness locally is now an explicit opt-in only (ALLOW_LOW_MEM),
+    // not an incidental consequence of free memory.
+    expect(script).toContain('if [ -n "${ALLOW_LOW_MEM:-}" ]; then');
   });
 
   it('keeps the configured command verbatim for faithful environments (mandatory gate intact)', async () => {

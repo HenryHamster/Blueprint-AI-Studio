@@ -518,12 +518,21 @@ function buildPytestGateInner(dirPrefix: string, testCmd: string, taskId: string
   const harnessProbe = harness
     ? `    if [ -f ${harness} ] && command -v docker >/dev/null 2>&1; then
       _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
-      if [ -n "\${ALLOW_LOW_MEM:-}" ] || [ "\${_AVAIL_MB:-99999}" -ge 4096 ]; then
+      if [ -n "\${ALLOW_LOW_MEM:-}" ]; then
+        # Explicit opt-in: force the full sanctioned harness regardless of memory.
         _GATE_MODE="harness"
       elif grep -qs -- '--standalone' ${harness}; then
-        # The harness's own memory guard would refuse the full suite below
-        # 4 GB available; its standalone mode is the sanctioned partial run.
+        # Default on the agent VM: the local gate is a SMOKE CHECK; the full
+        # Docker/Postgres suite is CI's job (and OOMs the 8 GB agent VM, exit
+        # 137). When the harness offers its sanctioned standalone partial, always
+        # prefer it — do NOT run the full suite just because memory happens to be
+        # free at gate-start (the old "_AVAIL_MB >= 4096 -> full" rule fired the
+        # full suite on exactly the VMs too small to survive it).
         _GATE_MODE="harness-standalone"
+      elif [ "\${_AVAIL_MB:-99999}" -ge 4096 ]; then
+        # Harness has no standalone mode — only then run the full harness, and
+        # only with memory headroom for it.
+        _GATE_MODE="harness"
       fi
     fi
 `
@@ -532,7 +541,7 @@ function buildPytestGateInner(dirPrefix: string, testCmd: string, taskId: string
     ? `      harness)
         run "${dirPrefix} test (sanctioned harness)" bash -c 'set -o pipefail; bash ${harness} 2>&1 | tail -200' ;;
       harness-standalone)
-        echo "[check] note: <4GB available — full Docker/Postgres harness left to CI; running its standalone mode"
+        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
         run "${dirPrefix} test (harness standalone)" bash -c 'set -o pipefail; bash ${harness} --standalone --no-postgres 2>&1 | tail -200' ;;
 `
     : '';

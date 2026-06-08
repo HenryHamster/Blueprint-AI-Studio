@@ -1631,3 +1631,63 @@ def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
     assert result.returncode == 0, (
         f"shellcheck errors in {path}:\n{result.stdout}\n{result.stderr}"
     )
+
+
+class TestPackerBackendDepsBake:
+    """Lock in the backend-deps bake fix.
+
+    Regression for #8687 (2026-06-07): the bake uploaded
+    backend/Dockerfile + requirements.txt to /tmp/backend-deps-ctx/ but never
+    created that directory first. packer's file provisioner does not create
+    parent dirs, so the first upload landed /tmp/backend-deps-ctx as a regular
+    FILE, the reqhash degraded to sha256("")=e3b0c44298fc1c14, `docker build`
+    got a non-directory context, and NO deps image was produced — yet the bake
+    had no ``set -e`` and ended on ``rm -rf`` (exit 0), so packer shipped green.
+    Every agent VM then missed scripts/test-backend.sh's local fast path and
+    paid the full ~20-min docker build on every ./check test gate, fleet-wide.
+
+    These are static-source assertions (no docker/packer needed) so the
+    invariant holds even on a backend-only Docker test run.
+    """
+
+    def test_deps_ctx_dir_created_before_upload(self):
+        """The bake context dir must be mkdir'd before the file uploads land
+        in it — the missing-mkdir was the entire #8687 failure."""
+        hcl = _read_packer_hcl()
+        assert "mkdir -p /tmp/backend-deps-ctx" in hcl, (
+            "agent.pkr.hcl must `mkdir -p /tmp/backend-deps-ctx` before uploading "
+            "the deps build context — packer's file provisioner does not create "
+            "parent dirs, so without it the context never materializes (#8687)."
+        )
+        mkdir_at = hcl.index("mkdir -p /tmp/backend-deps-ctx")
+        first_upload_at = hcl.index('"/tmp/backend-deps-ctx/Dockerfile"')
+        assert mkdir_at < first_upload_at, (
+            "The mkdir of /tmp/backend-deps-ctx must precede the Dockerfile "
+            "upload into it, or the upload writes the dir path as a file."
+        )
+
+    def test_deps_bake_fails_loudly(self):
+        """A bake that produces no image must abort the packer build, never
+        ship green: the #8687 silent no-op had no error gate at all."""
+        hcl = _read_packer_hcl()
+        assert "set -eu" in hcl, (
+            "agent.pkr.hcl deps bake must `set -eu` so a failed step aborts the "
+            "build (the default inline shebang carries no -e — exactly how the "
+            "#8687 broken bake passed)."
+        )
+        # The empty-input reqhash (sha256("")) must be an explicit, named abort.
+        assert "e3b0c44298fc1c14" in hcl, (
+            "agent.pkr.hcl must guard against the sha256(empty) reqhash "
+            "(e3b0c44298fc1c14) so a non-materialized bake context fails loudly."
+        )
+
+    def test_deps_bake_sentinels_preserved(self):
+        """The observability sentinels the bake emits on success must remain."""
+        hcl = _read_packer_hcl()
+        for sentinel in (
+            "PACKER_BACKEND_DEPS_IMAGE_OK",
+            "PACKER_BACKEND_DEPS_INSPECT_OK",
+        ):
+            assert sentinel in hcl, (
+                f"agent.pkr.hcl must emit {sentinel} after a successful deps bake."
+            )
