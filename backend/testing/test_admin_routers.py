@@ -8965,12 +8965,15 @@ class TestVersionLifecycleAcceptanceAggregate:
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         aggregate = {
-            "merged": 3,
+            "total": 3,
             "proven": 2,
+            "satisfied_unproven": 0,
             "declared_unsatisfied": 1,
+            "undeclared": 0,
             "merged_unverified_degraded": 0,
-            "no_declaration": 0,
+            "malformed": 0,
             "proven_rate": 0.667,
+            "satisfied_rate": 0.667,
         }
         version.last_qualification = {"status": "dry_run", "acceptance_aggregate": aggregate}
         db_session.add(version)
@@ -9050,12 +9053,15 @@ class TestVersionLifecycleAcceptanceAggregate:
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id)
         aggregate = {
-            "merged": 4,
+            "total": 4,
             "proven": 3,
+            "satisfied_unproven": 0,
             "declared_unsatisfied": 1,
+            "undeclared": 0,
             "merged_unverified_degraded": 0,
-            "no_declaration": 0,
+            "malformed": 0,
             "proven_rate": 0.75,
+            "satisfied_rate": 0.75,
         }
         verdict = QualificationVerdict(
             project_id=project.id,

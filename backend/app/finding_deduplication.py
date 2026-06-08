@@ -28,6 +28,7 @@ from app.capability_registry import compose_capability_markers
 from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
+from app.task_blocked import canonicalize_exact_task_ref, is_exact_task_ref
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,13 @@ def normalize_prerequisite(raw: object) -> Optional[dict]:
     ref, non-string fields) or an unknown kind, so callers can treat "declared a
     prerequisite" as a hard, explicit signal rather than a fuzzy guess.
 
+    A ``kind=task`` ref additionally MUST be exact — a real task UUID or a
+    canonical finding hash (:func:`app.task_blocked.is_exact_task_ref`). A
+    title-like task ref (free prose naming a desired foundation) is rejected
+    here at ingestion so it never drives an edge nor becomes durable stranded
+    "missing task" demand; a named foundation must be declared as
+    ``kind=capability`` instead.
+
     ``kind`` is lowercased; ``ref`` is whitespace-stripped but case-preserved
     (task ids / finding hashes are case-sensitive; capability matching lowercases
     at compare time).
@@ -152,6 +160,10 @@ def normalize_prerequisite(raw: object) -> Optional[dict]:
     ref = ref.strip()
     if kind not in VALID_PREREQUISITE_KINDS or not ref:
         return None
+    if kind == "task" and not is_exact_task_ref(ref):
+        return None
+    if kind == "task":
+        ref = canonicalize_exact_task_ref(ref) or ref
     return {"kind": kind, "ref": ref}
 
 
@@ -188,7 +200,10 @@ def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
     if not isinstance(ref, str):
         return False
     if kind == "task":
-        return ref == str(task.id) or ref == _task_finding_hash(task)
+        canonical_ref = canonicalize_exact_task_ref(ref)
+        if canonical_ref is None:
+            return False
+        return canonical_ref == str(task.id) or canonical_ref == _task_finding_hash(task)
     if kind == "capability":
         return ref.lower() in _task_capability_markers(task)
     return False

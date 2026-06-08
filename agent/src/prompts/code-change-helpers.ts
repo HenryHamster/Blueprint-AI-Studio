@@ -322,6 +322,19 @@ if [ -z "$REASON" ]; then
   exit 1
 fi
 
+# Shared exact-task-ref policy (mirrors backend app.task_blocked.is_exact_task_ref):
+# --needs-task is for a REAL task identifier only — a task UUID or a 16-char
+# finding hash. A title-like ref (free prose naming a desired foundation) names
+# no resolvable task, so it would only become stranded "missing task" demand.
+# Record it as a capability need instead; named foundations belong to
+# --needs-capability, not --needs-task.
+if [ "$NEED_KIND" = "task" ] && [ -n "$NEED_REF" ]; then
+  if ! printf '%s' "$NEED_REF" | grep -qiE '^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16})$'; then
+    echo "[blocked] --needs-task ref '$NEED_REF' is not a task id or finding hash; recording it as a capability need (use --needs-capability for named foundations)." >&2
+    NEED_KIND="capability"
+  fi
+fi
+
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${cfg.taskId}"

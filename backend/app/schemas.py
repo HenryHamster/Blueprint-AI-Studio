@@ -8,7 +8,13 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
-from app.task_blocked import NEED_KINDS, NEED_LABEL_MAX_LEN, NEED_REF_MAX_LEN
+from app.task_blocked import (
+    NEED_KINDS,
+    NEED_LABEL_MAX_LEN,
+    NEED_REF_MAX_LEN,
+    canonicalize_exact_task_ref,
+    is_exact_task_ref,
+)
 
 
 class DeployPayload(BaseModel):
@@ -58,6 +64,20 @@ class BlockedNeed(BaseModel):
         if v not in NEED_KINDS:
             raise ValueError(f"kind must be one of {NEED_KINDS}")
         return v
+
+    @field_validator("ref")
+    @classmethod
+    def _validate_and_normalize_ref(cls, v: str, info) -> str:
+        if not isinstance(v, str):
+            return v
+        ref = v.strip()
+        kind = info.data.get("kind") if isinstance(info.data, dict) else None
+        if kind == "task":
+            canonical = canonicalize_exact_task_ref(ref)
+            if canonical is None:
+                raise ValueError("task ref must be a real task UUID or finding hash")
+            return canonical
+        return ref
 
 
 class ReproduceVerdict(BaseModel):
@@ -178,6 +198,37 @@ class AgentStatusPayload(BaseModel):
     # task.context["reproduce_verdict"]. Absent payloads behave identically to
     # today (older agents only send no_op_reason).
     reproduce_verdict: ReproduceVerdict | None = None
+
+    @field_validator("blocked_need", mode="before")
+    @classmethod
+    def _drop_title_like_task_need(cls, v: Any) -> Any:
+        """Graceful API-boundary enforcement of the exact-task-ref policy.
+
+        A ``kind=task`` blocked-need whose ``ref`` is a title-like string (not a
+        task UUID / finding hash, per
+        :func:`app.task_blocked.is_exact_task_ref`) names no machine-resolvable
+        foundation, so it must not be persisted as durable stranded demand.
+        Rather than 422 the entire status report — which would drop the BLOCKED
+        transition the agent is trying to record — drop ONLY the malformed need
+        to ``None`` (identical to an absent ``blocked_need``, backward-compatible).
+        Named foundations must be declared as ``kind=capability`` instead. Other
+        malformed needs (unknown kind, empty ref) still raise via ``BlockedNeed``.
+        """
+        if isinstance(v, dict):
+            kind = v.get("kind")
+            ref = v.get("ref")
+            # Only intercept a NON-EMPTY title-like task ref. Empty / missing /
+            # non-string refs fall through to BlockedNeed's field validation so
+            # they still raise (preserving the malformed-input contract).
+            if (
+                isinstance(kind, str)
+                and kind.strip().lower() == "task"
+                and isinstance(ref, str)
+                and ref.strip()
+                and not is_exact_task_ref(ref)
+            ):
+                return None
+        return v
 
 
 class UploadUrlRequest(BaseModel):

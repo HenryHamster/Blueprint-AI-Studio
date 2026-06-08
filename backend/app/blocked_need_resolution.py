@@ -38,6 +38,7 @@ from app.finding_deduplication import (
 )
 from app.landed_signal import has_merge_unblock_signal
 from app.models import Task
+from app.task_blocked import canonicalize_exact_task_ref, is_exact_task_ref
 
 # Candidate statuses an in-flight foundation can be in. Kept here (not imported
 # from the sweep) so the candidate-enumeration contract lives next to the matcher
@@ -85,8 +86,19 @@ def _match_task(ref: str, candidates: List[Task]) -> Optional[Task]:
     provider (earliest by ``created_at``, id-tiebroken) is returned so the
     resume-time matcher attaches the dependent to the SAME foundation the
     spawn-time resolver would pick.
+
+    A non-exact ``ref`` (a title-like string rather than a task UUID / finding
+    hash, per :func:`app.task_blocked.is_exact_task_ref`) can never identify a
+    real task, so it short-circuits to ``None`` — the shared exact-task-ref
+    policy applied at the resolver, never a fuzzy title match.
     """
-    normalized = {"kind": "task", "ref": str(ref).strip()}
+    ref_text = str(ref).strip()
+    if not is_exact_task_ref(ref_text):
+        return None
+    normalized = {
+        "kind": "task",
+        "ref": canonicalize_exact_task_ref(ref_text) or ref_text,
+    }
     matches = [c for c in candidates if prerequisite_matches_task(normalized, c)]
     return select_canonical_provider(matches)
 

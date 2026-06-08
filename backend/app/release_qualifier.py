@@ -76,10 +76,9 @@ from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import RATE_LIMIT, classify_failure
 from app.acceptance_gate import (
-    CODE_ACCEPTANCE_VERDICT_KEY,
-    acceptance_blocks_success,
+    acceptance_counts_as_verified_context,
 )
-from app.landed_signal import landed_signal_predicate, merge_verification_status
+from app.landed_signal import landed_signal_predicate
 from app.models import (
     ArtifactType,
     Project,
@@ -1552,10 +1551,11 @@ async def _compute_acceptance_window_aggregate(
 
     Queries all COMPLETED tasks with the landed-signal predicate that completed
     at or after ``version.opened_at`` (the version window lower bound), then
-    in-Python applies the same predicate used by ``direction_outcomes.py`` for
-    ``verified_prs_merged``: a merge is acceptance-verified only when it landed,
-    is not ``unverified_degraded``, and its recorded ``code_acceptance_verdict``
-    does not block success.
+    in-Python applies the same canonical bucket predicate used by
+    ``direction_outcomes.py`` for ``verified_prs_merged``: a merge is
+    acceptance-verified only when it lands in the proven, soft-satisfied, or
+    undeclared buckets. Degraded, explicitly unsatisfied, and malformed rows do
+    not count.
 
     Returns:
       {
@@ -1565,31 +1565,6 @@ async def _compute_acceptance_window_aggregate(
       }
     """
 
-    def _task_completed_at(task: Task) -> datetime:
-        """Return the stable terminal timestamp for a task.
-
-        Uses the last status-transition entry in status_log when available;
-        falls back to created_at for legacy rows with no durable completion
-        entry. Message-only writes append to status_log too, so the cutoff must
-        ignore those audit entries.
-        """
-
-        def _strip_tz(dt: datetime) -> datetime:
-            return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-
-        for entry in reversed(task.status_log or []):
-            if not isinstance(entry, dict):
-                continue
-            msg = entry.get("msg")
-            if not isinstance(msg, str) or not msg.startswith("Status changed: "):
-                continue
-            try:
-                return _strip_tz(datetime.fromisoformat(entry["t"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        completed_at = task.created_at
-        return _strip_tz(completed_at)
-
     since = version.opened_at
     stmt = (
         select(Task)
@@ -1597,22 +1572,20 @@ async def _compute_acceptance_window_aggregate(
             Task.project_id == version.project_id,
             Task.status == TaskStatus.COMPLETED,
             landed_signal_predicate(session),
+            Task.updated_at >= since,
         )
     )
     rows = [
         task
         for task in (await session.execute(stmt)).scalars().all()
-        if _task_completed_at(task) >= since
+        if release_version._task_completed_at(task) >= since
     ]
 
     total = len(rows)
     verified = sum(
         1
         for task in rows
-        if merge_verification_status(task) != "unverified_degraded"
-        and not acceptance_blocks_success(
-            (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-        )
+        if acceptance_counts_as_verified_context(task.context or {})
     )
     fraction = (verified / total) if total > 0 else None
     return {
@@ -1976,12 +1949,17 @@ async def _finalize_qualification(
                 .where(
                     Task.project_id == version.project_id,
                     Task.status == TaskStatus.COMPLETED,
-                    Task.updated_at >= version.opened_at,
                     landed_signal_predicate(session),
+                    Task.updated_at >= version.opened_at,
                 )
-                .order_by(Task.updated_at.asc(), Task.created_at.asc())
+                .order_by(Task.created_at.asc())
             )
         ).scalars().all()
+        merged_rows = [
+            task
+            for task in merged_rows
+            if release_version._task_completed_at(task) >= version.opened_at
+        ]
         acceptance_aggregate = summarize_version_acceptance_aggregate(merged_rows)
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,

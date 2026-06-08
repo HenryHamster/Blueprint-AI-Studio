@@ -8133,18 +8133,48 @@ def test_blocked_need_schema_parses_valid_and_rejects_malformed():
     # Absent need is fine — backward compatible.
     assert AgentStatusPayload(**base).blocked_need is None
 
-    # Valid need with each recognized kind.
-    for kind, ref in (("task", "t-abc"), ("pr", "7910"), ("capability", "auth")):
+    # Valid need with each recognized kind. kind=task requires an EXACT ref (a
+    # task UUID / finding hash), so the task case uses a real id.
+    foundation_id = str(uuid.uuid4())
+    for kind, ref in (("task", foundation_id), ("pr", "7910"), ("capability", "auth")):
         parsed = AgentStatusPayload(**base, blocked_need={"kind": kind, "ref": ref})
         assert parsed.blocked_need is not None
         assert parsed.blocked_need.kind == kind
         assert parsed.blocked_need.ref == ref
 
+    # A finding-hash task ref is also exact and accepted.
+    parsed_hash = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "deadbeefcafe0001"}
+    )
+    assert parsed_hash.blocked_need.ref == "deadbeefcafe0001"
+
+    parsed_upper = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "DEADBEEFCAFE0001"}
+    )
+    assert parsed_upper.blocked_need.ref == "deadbeefcafe0001"
+
+    parsed_uuid_upper = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": foundation_id.upper()}
+    )
+    assert parsed_uuid_upper.blocked_need.ref == foundation_id
+
     # Optional human label is accepted.
     with_label = AgentStatusPayload(
-        **base, blocked_need={"kind": "task", "ref": "t-x", "label": "the foundation"}
+        **base,
+        blocked_need={"kind": "task", "ref": foundation_id, "label": "the foundation"},
     )
     assert with_label.blocked_need.label == "the foundation"
+
+    # A title-like kind=task ref is NOT an exact task ref — it is gracefully
+    # DROPPED to None (identical to an absent need), so the BLOCKED status report
+    # still succeeds rather than 422-ing the whole request. Named foundations
+    # belong to kind=capability.
+    dropped = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "Build the auth subsystem"}
+    )
+    assert dropped.blocked_need is None
+    dropped2 = AgentStatusPayload(**base, blocked_need={"kind": "task", "ref": "t-x"})
+    assert dropped2.blocked_need is None
 
     # Malformed: unrecognized kind.
     with pytest.raises(ValidationError):
@@ -8191,12 +8221,15 @@ async def test_blocker_persists_structured_need_into_context(
 
     token = create_agent_token(str(task.id), "agent-vm-blocked-need")
     headers = {"x-agent-token": token}
+    foundation_ref = str(uuid.uuid4())
     payload = {
         "task_id": str(task.id),
         "status": "FAILED",
         "failure_category": "BLOCKED_PRECONDITION",
         "logs": "BLOCKER: waiting on the shared auth foundation",
-        "blocked_need": {"kind": "task", "ref": "t-foundation-1", "label": "auth"},
+        # kind=task requires an EXACT ref (UUID / finding hash) under the shared
+        # exact-task-ref policy.
+        "blocked_need": {"kind": "task", "ref": foundation_ref, "label": "auth"},
     }
     resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
@@ -8205,7 +8238,60 @@ async def test_blocker_persists_structured_need_into_context(
     await db_session.refresh(task)
     assert task.status == TaskStatus.BLOCKED
     need = ((task.context or {}).get("blocker") or {}).get("need")
-    assert need == {"kind": "task", "ref": "t-foundation-1", "label": "auth"}
+    assert need == {"kind": "task", "ref": foundation_ref, "label": "auth"}
+
+
+@pytest.mark.asyncio
+async def test_blocker_title_like_task_need_dropped_but_still_blocks(
+    client: AsyncClient, db_session, mocker
+):
+    """A BLOCKER carrying a title-like kind=task need still transitions the task
+    into BLOCKED, but the malformed need is dropped (not persisted) rather than
+    422-ing the status report — backward-compatible with an absent need."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Title-like need", user_id="test-user-title-like")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-title-like",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-title-like")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "BLOCKED_PRECONDITION",
+        "logs": "BLOCKER: waiting on the shared auth foundation",
+        "blocked_need": {"kind": "task", "ref": "Build the auth subsystem"},
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    # The malformed title-like task need was dropped — no machine-resolvable need.
+    blocker = (task.context or {}).get("blocker") or {}
+    assert blocker.get("need") is None
+    assert not blocker.get("needs")
 
 
 @pytest.mark.asyncio

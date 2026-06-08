@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
+from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
 from app.models import QualificationVerdict, ReleaseVersion
 from app.shared_state import resolve_project_promotion_enabled
 
@@ -113,9 +114,7 @@ def _readiness_caveat(validated: dict[str, Any]) -> str:
 # declared-unsatisfied tasks the readiness signal is unaffected (additive,
 # never a hard block).
 _EMPTY_ACCEPTANCE_AGGREGATE: dict[str, int] = {
-    "proven": 0,
-    "declared_unsatisfied": 0,
-    "undeclared": 0,
+    **{bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS},
     "total": 0,
 }
 
@@ -126,11 +125,10 @@ async def _compute_acceptance_aggregate(
 ) -> dict[str, int]:
     """Resolve the open version's acceptance aggregate, fail-safe.
 
-    Returns the per-version acceptance bucket counts
-    (``proven`` / ``declared_unsatisfied`` / ``undeclared`` / ``total``) over
-    the open version's window, or all-zeros when there is no open version or the
-    query fails.  Never raises — any failure degrades to zero-counts so a
-    transient aggregate error can never lower or hard-block readiness.
+    Returns the per-version canonical acceptance bucket counts over the open
+    version's window, or all-zeros when there is no open version or the query
+    fails.  Never raises — any failure degrades to zero-counts so a transient
+    aggregate error can never lower or hard-block readiness.
     """
     try:
         version = await release_version.current_open_version(session, project_id)
@@ -140,9 +138,7 @@ async def _compute_acceptance_aggregate(
             session, project_id, since=version.opened_at
         )
         return {
-            "proven": int(agg.get("proven", 0)),
-            "declared_unsatisfied": int(agg.get("declared_unsatisfied", 0)),
-            "undeclared": int(agg.get("undeclared", 0)),
+            **{bucket: int(agg.get(bucket, 0)) for bucket in ACCEPTANCE_AGGREGATE_BUCKETS},
             "total": int(agg.get("total", 0)),
         }
     except Exception:  # noqa: BLE001 — defensive: any failure must not block readiness
@@ -158,37 +154,47 @@ async def _compute_acceptance_aggregate(
 def _acceptance_keys(aggregate: dict[str, int]) -> dict[str, Any]:
     """Additive readiness keys derived from an acceptance aggregate.
 
-    Strictly fail-safe: only ``declared_unsatisfied`` (a recorded acceptance
-    verdict that did NOT pass) ever contributes a signal. Undeclared / legacy /
-    satisfied tasks never count against readiness. The keys are advisory — they
-    augment the readiness dict but never flip ``ready`` (mirroring how
-    ``validated_precision`` augments, never replaces, the self-approval signal).
+    Strictly fail-safe: undeclared / legacy tasks never count against readiness.
+    The keys are advisory — they augment the readiness dict but never flip
+    ``ready`` (mirroring how ``validated_precision`` augments, never replaces,
+    the self-approval signal).
     """
+    satisfied_unproven = int(aggregate.get("satisfied_unproven", 0))
     declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
+    degraded = int(aggregate.get("merged_unverified_degraded", 0))
+    malformed = int(aggregate.get("malformed", 0))
     return {
         "acceptance_proven": int(aggregate.get("proven", 0)),
+        "acceptance_satisfied_unproven": satisfied_unproven,
         "acceptance_declared_unsatisfied": declared_unsatisfied,
         "acceptance_undeclared": int(aggregate.get("undeclared", 0)),
-        "acceptance_unproven_present": declared_unsatisfied > 0,
+        "acceptance_merged_unverified_degraded": degraded,
+        "acceptance_malformed": malformed,
+        "acceptance_unproven_present": (
+            satisfied_unproven + declared_unsatisfied + degraded + malformed
+        )
+        > 0,
     }
 
 
 def _acceptance_caveat(aggregate: dict[str, int]) -> str | None:
-    """Advisory caveat when the open version contains declared-but-unproven work.
+    """Advisory caveat when the open version contains unproven work.
 
-    Returns ``None`` unless one or more merged tasks recorded a declared
-    acceptance verdict that did NOT pass — in that case the version is "merely
-    delivered" for those tasks, not proven, and operators/strategist should see
-    it. Never returned for undeclared-only or satisfied-only windows.
+    Returns ``None`` for empty, proven-only, or undeclared-only windows.
     """
+    satisfied_unproven = int(aggregate.get("satisfied_unproven", 0))
     declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
-    if declared_unsatisfied <= 0:
+    degraded = int(aggregate.get("merged_unverified_degraded", 0))
+    malformed = int(aggregate.get("malformed", 0))
+    if satisfied_unproven + declared_unsatisfied + degraded + malformed <= 0:
         return None
     return (
-        f"acceptance not fully proven — {declared_unsatisfied} merged task(s) "
-        f"in this version declared acceptance evidence that did NOT pass "
-        f"(advisory: the version contains claimed-but-unproven work; does not "
-        f"hard-block promotion)"
+        "acceptance not fully proven — this version contains "
+        f"{satisfied_unproven} satisfied-but-not-machine-proven task(s), "
+        f"{declared_unsatisfied} declared-unsatisfied task(s), {degraded} "
+        f"degraded-unverified merge(s), and {malformed} malformed recorded "
+        "verdict(s) (advisory: claimed-but-not-machine-proven work does not "
+        "hard-block promotion)"
     )
 
 

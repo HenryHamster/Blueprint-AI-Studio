@@ -1178,12 +1178,13 @@ async def _cancel_blocker_as_dead(
     # (capability / sibling-task / finding-hash) as an explicit missing-foundation
     # retirement: nothing was ever built to satisfy the prerequisite, so the
     # stranded dependent is first-class demand to COMMISSION that foundation. A PR
-    # need or a foundation-died give-up does not get the flag. Purely additive.
-    if (
-        give_up_class == GIVE_UP_NEVER_SATISFIABLE
-        and isinstance(need, dict)
-        and need.get("kind") in _FOUNDATION_NEED_KINDS
-    ):
+    # need, a foundation-died give-up, or a malformed title-like ``task`` ref (not
+    # a real task id / finding hash, per the shared exact-task-ref policy) does NOT
+    # get the flag — a title-like ref names no commissionable foundation. Purely
+    # additive.
+    from app.task_blocked import is_foundation_demand_need
+
+    if give_up_class == GIVE_UP_NEVER_SATISFIABLE and is_foundation_demand_need(need):
         marker[MISSING_FOUNDATION_MARKER_KEY] = True
     ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = marker
     task.context = ctx

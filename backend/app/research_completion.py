@@ -65,6 +65,7 @@ from app.finding_deduplication import (
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
+from app.task_blocked import NEED_REF_MAX_LEN
 from app.capability_registry import (
     off_registry_capability_refs,
     registry_capability_names,
@@ -477,8 +478,33 @@ def _annotate_capability_declarations(
         _prereq = normalize_prerequisite(_prereq_raw)
         if _prereq is not None:
             _f["_prerequisite"] = _prereq
+            _f.pop("_malformed_prerequisite", None)
         else:
             _f.pop("_prerequisite", None)
+            # Retirable advisory: a declared kind=task prerequisite whose ref is
+            # title-like (not a task UUID / finding hash) is malformed — it names
+            # no machine-resolvable foundation, so normalize_prerequisite dropped
+            # it and it must NOT become durable stranded demand nor drive an edge.
+            # Record the dropped declaration (never block on it) so the strategist
+            # can see it and the agent learns a named foundation belongs to
+            # kind=capability. Purely additive, fail-open.
+            if (
+                isinstance(_prereq_raw, dict)
+                and isinstance(_prereq_raw.get("kind"), str)
+                and _prereq_raw["kind"].strip().lower() == "task"
+                and isinstance(_prereq_raw.get("ref"), str)
+                and _prereq_raw["ref"].strip()
+            ):
+                _f["_malformed_prerequisite"] = {
+                    "kind": "task",
+                    "ref": _prereq_raw["ref"].strip()[:NEED_REF_MAX_LEN],
+                    "reason": (
+                        "title-like task ref (not a task id or finding hash); "
+                        "declare a named foundation as kind=capability"
+                    ),
+                }
+            else:
+                _f.pop("_malformed_prerequisite", None)
         # An explicit capability a finding's task advertises, so a sibling
         # finding declaring {kind:capability, ref:<name>} can structurally
         # depend on it (intra-batch foundation sharing). Explicit string only.

@@ -934,14 +934,29 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     }
   });
 
-  it('emits a normalized need in the payload when --needs-task is given', async () => {
+  it('emits a normalized need in the payload when --needs-task is given an exact ref', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
-    const { exit, payload } = await runBlocked(['waiting on foundation', '--needs-task', 't-abc123']);
+    // A real task UUID is an exact ref → preserved as a kind=task need.
+    const uuidRef = '123e4567-e89b-12d3-a456-426614174000';
+    const viaUuid = await runBlocked(['waiting on foundation', '--needs-task', uuidRef]);
+    expect(viaUuid.exit).toBe(0);
+    expect(viaUuid.payload?.failure_category).toBe('BLOCKED_PRECONDITION');
+    expect(viaUuid.payload?.logs).toBe('BLOCKER: waiting on foundation');
+    expect(viaUuid.payload?.blocked_need).toEqual({ kind: 'task', ref: uuidRef });
+    // A 16-char finding hash is also exact.
+    const viaHash = await runBlocked(['waiting', '--needs-task', 'deadbeefcafe0001']);
+    expect(viaHash.payload?.blocked_need).toEqual({ kind: 'task', ref: 'deadbeefcafe0001' });
+  });
+
+  it('records a title-like --needs-task ref as a capability need (exact-task-ref policy)', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    // 't-abc123' is neither a task UUID nor a finding hash → recorded as a
+    // capability need instead of stranded "missing task" demand.
+    const { exit, payload } = await runBlocked(['waiting', '--needs-task', 't-abc123']);
     expect(exit).toBe(0);
-    expect(payload?.failure_category).toBe('BLOCKED_PRECONDITION');
-    expect(payload?.logs).toBe('BLOCKER: waiting on foundation');
-    expect(payload?.blocked_need).toEqual({ kind: 'task', ref: 't-abc123' });
+    expect(payload?.blocked_need).toEqual({ kind: 'capability', ref: 't-abc123' });
   });
 
   it('maps --needs-pr and --needs-capability to the right kind', async () => {

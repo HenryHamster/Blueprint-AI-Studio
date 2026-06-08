@@ -1178,18 +1178,42 @@ def test_deduplicate_findings_filters_archived_diagnosis_match():
 
 
 def test_normalize_prerequisite_valid_task_kind():
-    out = normalize_prerequisite({"kind": "task", "ref": "abc123"})
-    assert out == {"kind": "task", "ref": "abc123"}
+    # kind=task requires an exact ref — a 16-char finding hash here.
+    out = normalize_prerequisite({"kind": "task", "ref": "deadbeefcafe0000"})
+    assert out == {"kind": "task", "ref": "deadbeefcafe0000"}
+
+
+def test_normalize_prerequisite_valid_task_kind_uuid_ref():
+    tid = str(uuid.uuid4())
+    out = normalize_prerequisite({"kind": "task", "ref": tid})
+    assert out == {"kind": "task", "ref": tid}
+
+
+def test_normalize_prerequisite_canonicalizes_exact_task_ref():
+    tid = str(uuid.uuid4()).upper()
+    out = normalize_prerequisite({"kind": "task", "ref": tid})
+    assert out == {"kind": "task", "ref": tid.lower()}
+
+
+def test_normalize_prerequisite_rejects_title_like_task_ref():
+    # A title-like task ref (free prose, or any non-UUID/non-hash token) is NOT a
+    # machine-resolvable task and must be dropped at ingestion so it never becomes
+    # durable stranded "missing task" demand — named foundations use capability.
+    assert normalize_prerequisite({"kind": "task", "ref": "Build the auth subsystem"}) is None
+    assert normalize_prerequisite({"kind": "task", "ref": "abc123"}) is None
+    assert normalize_prerequisite({"kind": "task", "ref": "auth-subsystem"}) is None
 
 
 def test_normalize_prerequisite_valid_capability_kind():
+    # Capability refs are NOT subject to the exact-task-ref policy — a named
+    # foundation is exactly what capability kind is for.
     out = normalize_prerequisite({"kind": "capability", "ref": "auth-service"})
     assert out == {"kind": "capability", "ref": "auth-service"}
 
 
 def test_normalize_prerequisite_strips_whitespace_and_lowercases_kind():
-    out = normalize_prerequisite({"kind": "  TASK  ", "ref": "  xyz  "})
-    assert out == {"kind": "task", "ref": "xyz"}
+    out = normalize_prerequisite({"kind": "  TASK  ", "ref": "  deadbeefdeadbeef  "})
+    assert out == {"kind": "task", "ref": "deadbeefdeadbeef"}
 
 
 def test_normalize_prerequisite_unknown_kind_returns_none():
@@ -1277,15 +1301,15 @@ def test_resolve_prerequisite_task_selects_canonical_earliest_created_at():
     base = datetime(2026, 1, 1, 12, 0, 0)
     earliest = _make_task(
         status=TaskStatus.IN_PROGRESS,
-        context={"finding_hash": "shared-hash-0001"},
+        context={"finding_hash": "aaaabbbbccccdddd"},
         created_at=base,
     )
     later = _make_task(
         status=TaskStatus.QUEUED,
-        context={"finding_hash": "shared-hash-0001"},
+        context={"finding_hash": "aaaabbbbccccdddd"},
         created_at=base + timedelta(hours=2),
     )
-    prereq = {"kind": "task", "ref": "shared-hash-0001"}
+    prereq = {"kind": "task", "ref": "aaaabbbbccccdddd"}
     # `later` appears first in iteration order, but `earliest` is canonical.
     assert resolve_prerequisite_task(prereq, [later, earliest]) is earliest
     # Order-independent: the same canonical choice with the list reversed.
@@ -1315,16 +1339,16 @@ def test_resolve_prerequisite_task_created_at_tie_breaks_on_str_id():
     base = datetime(2026, 3, 1, 0, 0, 0)
     a = _make_task(
         status=TaskStatus.IN_PROGRESS,
-        context={"finding_hash": "tie-hash-0001"},
+        context={"finding_hash": "11112222ccccdddd"},
         created_at=base,
     )
     b = _make_task(
         status=TaskStatus.QUEUED,
-        context={"finding_hash": "tie-hash-0001"},
+        context={"finding_hash": "11112222ccccdddd"},
         created_at=base,
     )
     expected = min((a, b), key=lambda t: str(t.id))
-    prereq = {"kind": "task", "ref": "tie-hash-0001"}
+    prereq = {"kind": "task", "ref": "11112222ccccdddd"}
     assert resolve_prerequisite_task(prereq, [a, b]) is expected
     assert resolve_prerequisite_task(prereq, [b, a]) is expected
 
@@ -1334,25 +1358,25 @@ def test_resolve_prerequisite_task_none_created_at_sorts_as_minimum():
     # genuinely the earliest, matching the convergence path's rule. Here the
     # None-dated task wins over a real-dated one (None == minimum).
     no_date = _make_task(
-        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "nd-hash-0001"}
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "00001111ccccdddd"}
     )
     no_date.created_at = None
     dated = _make_task(
         status=TaskStatus.QUEUED,
-        context={"finding_hash": "nd-hash-0001"},
+        context={"finding_hash": "00001111ccccdddd"},
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
-    prereq = {"kind": "task", "ref": "nd-hash-0001"}
+    prereq = {"kind": "task", "ref": "00001111ccccdddd"}
     assert resolve_prerequisite_task(prereq, [dated, no_date]) is no_date
 
 
 def test_resolve_prerequisite_task_single_match_unchanged():
     # A lone match is returned as-is (no behavioral change for the common case).
     foundation = _make_task(
-        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "solo-hash-0001"}
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "5050505050505050"}
     )
     other = _make_task(status=TaskStatus.QUEUED)
-    prereq = {"kind": "task", "ref": "solo-hash-0001"}
+    prereq = {"kind": "task", "ref": "5050505050505050"}
     assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
 
 

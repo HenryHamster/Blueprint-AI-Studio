@@ -16,6 +16,7 @@ Focus areas:
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 
@@ -205,27 +206,90 @@ async def test_count_merged_since_respects_since_lower_bound(db_session):
     """A merged task updated BEFORE `since` is excluded; the same task type
     updated after is included."""
     project = await _make_project(db_session)
-    since = _utcnow() - timedelta(hours=1)
+    since = _utcnow()
+    old_completed_at = since - timedelta(hours=2)
+    fresh_completed_at = since + timedelta(hours=1)
 
-    # Updated 2h ago — before `since`.
-    await _make_task(
-        db_session,
-        project,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
-        updated_at=_utcnow() - timedelta(hours=2),
+    old_task = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=old_completed_at,
+        updated_at=old_completed_at,
     )
-    # Updated now — after `since`.
-    await _make_task(
-        db_session,
-        project,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
-        updated_at=_utcnow(),
+    db_session.add(old_task)
+    await db_session.commit()
+    with patch("app.models._utcnow", return_value=old_completed_at):
+        old_task.status = TaskStatus.COMPLETED
+        old_task.context = {"pr_merged": True}
+        await db_session.commit()
+
+    fresh_task = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=fresh_completed_at,
+        updated_at=fresh_completed_at,
     )
+    db_session.add(fresh_task)
+    await db_session.commit()
+    with patch("app.models._utcnow", return_value=fresh_completed_at):
+        fresh_task.status = TaskStatus.COMPLETED
+        fresh_task.context = {"pr_merged": True}
+        await db_session.commit()
 
     count = await rv.count_merged_since(db_session, project.id, since)
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_merged_window_ignores_post_terminal_updates(db_session):
+    """Post-terminal writes must not pull an older merge into the window."""
+    project = await _make_project(db_session)
+    since = _utcnow()
+    completed_at = since - timedelta(days=1)
+    updated_later_at = since + timedelta(days=1)
+
+    task = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=completed_at,
+        updated_at=completed_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with patch("app.models._utcnow", return_value=completed_at):
+        task.status = TaskStatus.COMPLETED
+        task.context = {"pr_merged": True}
+        await db_session.commit()
+
+    with patch("app.models._utcnow", return_value=updated_later_at):
+        task.latest_status_message = "Post-terminal context update"
+        await db_session.commit()
+
+    count = await rv.count_merged_since(db_session, project.id, since)
+    agg = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+
+    assert count == 0
+    assert agg == {
+        "proven": 0,
+        "satisfied_unproven": 0,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
+        "total": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -265,7 +329,7 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
-# compute_version_acceptance_aggregate — proven/declared-unsatisfied/undeclared
+# compute_version_acceptance_aggregate — canonical acceptance bucket
 # classification of version-window merged tasks
 # ===========================================================================
 
@@ -280,19 +344,39 @@ def _landed_ctx(extra: dict | None = None) -> dict:
 
 @pytest.mark.asyncio
 async def test_acceptance_aggregate_classifies_each_bucket(db_session):
-    """A merged task with a satisfied verdict is `proven`, an explicitly
-    unsatisfied verdict is `declared_unsatisfied`, and one with no verdict key
-    is `undeclared`."""
+    """Every canonical acceptance bucket is counted with shared key names."""
     project = await _make_project(db_session)
     since = _utcnow() - timedelta(hours=1)
 
-    # proven — verdict recorded and satisfied.
+    # proven — verdict recorded with strict machine proof.
     await _make_task(
         db_session,
         project,
         status=TaskStatus.COMPLETED,
         context=_landed_ctx(
-            {"code_acceptance_verdict": {"satisfied": True, "kind": "named_test"}}
+            {
+                "code_acceptance_verdict": {
+                    "satisfied": True,
+                    "proven": True,
+                    "kind": "named_test",
+                }
+            }
+        ),
+        updated_at=_utcnow(),
+    )
+    # satisfied_unproven — soft satisfied verdict, not machine-checked.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {
+                "code_acceptance_verdict": {
+                    "satisfied": True,
+                    "proven": False,
+                    "kind": "observable_behavior",
+                }
+            }
         ),
         updated_at=_utcnow(),
     )
@@ -314,15 +398,39 @@ async def test_acceptance_aggregate_classifies_each_bucket(db_session):
         context=_landed_ctx(),
         updated_at=_utcnow(),
     )
+    # merged_unverified_degraded — degraded verification overrides verdict state.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx(
+            {
+                "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+                "code_acceptance_verdict": {"satisfied": True, "proven": True},
+            }
+        ),
+        updated_at=_utcnow(),
+    )
+    # malformed — verdict dict recorded but neither satisfied nor unsatisfied.
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context=_landed_ctx({"code_acceptance_verdict": {"kind": "named_test"}}),
+        updated_at=_utcnow(),
+    )
 
     agg = await rv.compute_version_acceptance_aggregate(
         db_session, project.id, since=since
     )
     assert agg == {
         "proven": 1,
+        "satisfied_unproven": 1,
         "declared_unsatisfied": 1,
         "undeclared": 1,
-        "total": 3,
+        "merged_unverified_degraded": 1,
+        "malformed": 1,
+        "total": 6,
     }
 
 
@@ -363,8 +471,11 @@ async def test_acceptance_aggregate_excludes_unlanded_and_non_completed(db_sessi
     )
     assert agg == {
         "proven": 0,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 1,
         "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
         "total": 1,
     }
 
@@ -373,32 +484,54 @@ async def test_acceptance_aggregate_excludes_unlanded_and_non_completed(db_sessi
 async def test_acceptance_aggregate_respects_since_window(db_session):
     """Tasks merged before ``since`` are outside the version window and excluded."""
     project = await _make_project(db_session)
-    since = _utcnow() - timedelta(hours=1)
+    since = _utcnow()
+    old_completed_at = since - timedelta(hours=2)
+    fresh_completed_at = since + timedelta(hours=1)
 
-    # Before the window — excluded even though declared-unsatisfied.
-    await _make_task(
-        db_session,
-        project,
-        status=TaskStatus.COMPLETED,
-        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": False}}),
-        updated_at=_utcnow() - timedelta(hours=2),
+    before_window = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=old_completed_at,
+        updated_at=old_completed_at,
     )
-    # Inside the window — counted.
-    await _make_task(
-        db_session,
-        project,
-        status=TaskStatus.COMPLETED,
-        context=_landed_ctx({"code_acceptance_verdict": {"satisfied": True}}),
-        updated_at=_utcnow(),
+    db_session.add(before_window)
+    await db_session.commit()
+    with patch("app.models._utcnow", return_value=old_completed_at):
+        before_window.status = TaskStatus.COMPLETED
+        before_window.context = _landed_ctx({"code_acceptance_verdict": {"satisfied": False}})
+        await db_session.commit()
+
+    inside_window = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.QUEUED,
+        context={},
+        created_at=fresh_completed_at,
+        updated_at=fresh_completed_at,
     )
+    db_session.add(inside_window)
+    await db_session.commit()
+    with patch("app.models._utcnow", return_value=fresh_completed_at):
+        inside_window.status = TaskStatus.COMPLETED
+        inside_window.context = _landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": True, "proven": True}}
+        )
+        await db_session.commit()
 
     agg = await rv.compute_version_acceptance_aggregate(
         db_session, project.id, since=since
     )
     assert agg == {
         "proven": 1,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
         "total": 1,
     }
 
@@ -414,8 +547,11 @@ async def test_acceptance_aggregate_empty_window_zeros(db_session):
     )
     assert agg == {
         "proven": 0,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
         "total": 0,
     }
 
@@ -423,7 +559,7 @@ async def test_acceptance_aggregate_empty_window_zeros(db_session):
 @pytest.mark.asyncio
 async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
     """A recorded verdict that is neither satisfied nor explicitly unsatisfied
-    is fail-safe — bucketed as undeclared so it never lowers readiness."""
+    is fail-safe but visible in the malformed bucket."""
     project = await _make_project(db_session)
     since = _utcnow() - timedelta(hours=1)
 
@@ -440,8 +576,11 @@ async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
     )
     assert agg == {
         "proven": 0,
+        "satisfied_unproven": 0,
         "declared_unsatisfied": 0,
-        "undeclared": 1,
+        "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 1,
         "total": 1,
     }
 
@@ -923,12 +1062,15 @@ def test_to_phase_block_carries_acceptance_aggregate():
         goal="Ship proven-vs-merged surfacing",
     )
     aggregate = {
-        "merged": 5,
+        "total": 6,
         "proven": 3,
+        "satisfied_unproven": 1,
         "declared_unsatisfied": 1,
+        "undeclared": 0,
         "merged_unverified_degraded": 1,
-        "no_declaration": 1,
-        "proven_rate": 0.6,
+        "malformed": 0,
+        "proven_rate": 0.5,
+        "satisfied_rate": 0.667,
     }
     version.last_qualification = {"acceptance_aggregate": aggregate}
     block = rv.to_phase_block(version)

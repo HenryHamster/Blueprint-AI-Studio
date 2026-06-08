@@ -19,11 +19,13 @@ from app.acceptance_gate import (
     acceptance_blocks_success,
     acceptance_is_proven,
     acceptance_was_declared,
+    classify_merged_acceptance,
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
+    summarize_version_acceptance_aggregate,
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
@@ -499,6 +501,71 @@ def test_acceptance_blocks_success_only_on_explicit_unsatisfied():
     # Malformed / non-dict recorded value never blocks (additive, fail-safe).
     assert acceptance_blocks_success("garbage") is False
     assert acceptance_blocks_success({}) is False
+
+
+def test_satisfied_soft_kinds_bucket_as_satisfied_unproven_not_proven():
+    """Soft satisfied declarations are not machine-proven in release buckets."""
+    soft_task = _make_code_task(
+        acceptance_evidence={
+            "kind": "observable_behavior",
+            "description": "the dashboard shows the live serving SHA banner",
+        },
+        changed_files=["backend/app/release_readiness.py"],
+    )
+    record_code_acceptance_verdict(soft_task)
+
+    proven_task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+            "test_id": (
+                "test_satisfied_soft_kinds_bucket_as_satisfied_unproven_not_proven"
+            ),
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+    )
+    record_code_acceptance_verdict(proven_task)
+
+    assert classify_merged_acceptance(soft_task) == "satisfied_unproven"
+    assert classify_merged_acceptance(proven_task) == "proven"
+
+    aggregate = summarize_version_acceptance_aggregate([soft_task, proven_task])
+    assert aggregate == {
+        "proven": 1,
+        "satisfied_unproven": 1,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
+        "total": 2,
+        "proven_rate": 0.5,
+        "satisfied_rate": 1.0,
+    }
+
+
+def test_malformed_recorded_verdict_buckets_as_malformed():
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+            "test_id": "test_malformed_recorded_verdict_buckets_as_malformed",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+    )
+    record_code_acceptance_verdict(task)
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY].pop("satisfied")
+
+    assert classify_merged_acceptance(task) == "malformed"
+
+    aggregate = summarize_version_acceptance_aggregate([task])
+    assert aggregate["malformed"] == 1
+    assert aggregate["proven"] == 0
+    assert aggregate["satisfied_unproven"] == 0
+    assert aggregate["proven_rate"] == 0.0
+    assert aggregate["satisfied_rate"] == 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
