@@ -58,6 +58,12 @@ const MEMO_SCHEMA_HINT =
 // describing the reasoning. The backend persists that object as an Artifact
 // of type MEMO. No cloning, no edits, no child spawning.
 
+// Reasoning kinds the dispatcher synthesizer handles credential-free (i.e.
+// _synthesizeDispatcherMemo returns non-null for these values). Exported so
+// unit tests can assert every bake-smoke fixture uses a kind in this set —
+// catching a mismatch at test time instead of at Packer image build time.
+export const DISPATCHER_MEMO_SYNTHESIZER_KINDS = ['direction_retirement'] as const satisfies readonly string[];
+
 // For dispatcher-sourced memos the backend already holds the complete
 // reasoning in source_finding at spawn time. Synthesize the artifact
 // directly instead of invoking Claude to paraphrase already-known text.

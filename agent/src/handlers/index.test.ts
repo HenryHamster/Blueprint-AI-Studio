@@ -87,6 +87,7 @@ import {
   resolveTaskCapabilityContract,
   type TaskCapabilityContract,
 } from './index.js';
+import { DISPATCHER_MEMO_SYNTHESIZER_KINDS } from './memo.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -480,6 +481,36 @@ describe('strategic dispatch smoke', () => {
   });
 });
 
+// ── Memo bake-smoke dispatcher fixture kinds guard ────────────────────────────
+// Fails fast if any bake-smoke dispatcher fixture exercises a reasoning_kind
+// the synthesizer no longer handles credential-free — catching the regression
+// at unit-test time instead of at Packer image build time.
+//
+// To add a new bake-smoke dispatcher fixture, update BAKE_SMOKE_DISPATCHER_FIXTURES
+// here AND add the kind to DISPATCHER_MEMO_SYNTHESIZER_KINDS in memo.ts.
+describe('memo bake-smoke dispatcher fixture kinds guard', () => {
+  // One entry per bake-smoke file that uses the dispatcher synthesis path
+  // (source_finding present + reasoning_kind the synthesizer handles).
+  const BAKE_SMOKE_DISPATCHER_FIXTURES: Array<{ file: string; kind: string }> = [
+    // memo-bake-smoke.ts: memoTaskPayload.reasoning_kind
+    { file: 'memo-bake-smoke.ts', kind: 'direction_retirement' },
+    // memo-bake-smoke-lifecycle.ts: MEMO_TASK.payloads[0].reasoning_kind
+    { file: 'memo-bake-smoke-lifecycle.ts', kind: 'direction_retirement' },
+  ];
+
+  it.each(BAKE_SMOKE_DISPATCHER_FIXTURES)(
+    'bake-smoke dispatcher fixture kind "$kind" (from $file) is handled by the synthesizer',
+    ({ file, kind }) => {
+      expect(
+        DISPATCHER_MEMO_SYNTHESIZER_KINDS as readonly string[],
+        `bake-smoke fixture in ${file} uses reasoning_kind "${kind}" which is absent from ` +
+        `DISPATCHER_MEMO_SYNTHESIZER_KINDS — the synthesizer will not handle it credential-free ` +
+        `and the agent image bake will fail`,
+      ).toContain(kind);
+    },
+  );
+});
+
 // ── Memo bake smoke contract ──────────────────────────────────────────────────
 // Locks in the contract exercised by the image bake: handlers.memo must resolve
 // with COMPLETED when invoked through the registry with a credential-free
@@ -494,13 +525,14 @@ describe('memo bake smoke contract', () => {
     expect(typeof handlers.memo).toBe('function');
   });
 
-  it('handlers.memo completes with COMPLETED for a regression_false_positive dispatcher payload (no Claude call, credential-free)', async () => {
+  it('handlers.memo completes with COMPLETED for a direction_retirement dispatcher payload (no Claude call, credential-free)', async () => {
     const payload = {
-      reasoning_kind: 'regression_false_positive',
+      reasoning_kind: 'direction_retirement',
       source_task_id: 'task-bake-verify',
+      direction_id: 'direction-bake-verify',
       source_finding: {
-        verdict_reason: 'CPU spike is a deployment artifact, not a regression.',
-        regression_class: 'cpu_p99_spike',
+        rationale: 'Direction completed its goals and is retired.',
+        direction_text: 'CPU spike investigation direction',
       },
     };
     const task = { title: 'Bake smoke memo', description: 'Memo smoke', context: {} };
@@ -511,7 +543,7 @@ describe('memo bake smoke contract', () => {
       'bake-smoke-001',
       expect.objectContaining({
         status: 'COMPLETED',
-        logs: expect.stringContaining('CPU spike is a deployment artifact') as string,
+        logs: expect.stringContaining('Direction completed its goals and is retired.') as string,
       }),
     );
     // runClaudeCode must NOT be called — dispatcher path synthesizes directly

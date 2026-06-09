@@ -24,8 +24,8 @@ import { buildBakeSmokeCapabilityContract } from './bake-smoke-capability-contra
 
 const LIFECYCLE_SENTINEL = 'memo-lifecycle-bake-smoke-2026';
 
-// Dispatcher-path fixture: regression_false_positive with a verdict_reason
-// causes handleMemo to synthesize the memo directly without invoking Claude.
+// Dispatcher-path fixture: direction_retirement with a rationale causes
+// handleMemo to synthesize the memo directly without invoking Claude.
 const MEMO_TASK: Record<string, unknown> = {
   task_id: 'lifecycle-smoke-task-001',
   title: 'Lifecycle smoke memo',
@@ -33,12 +33,12 @@ const MEMO_TASK: Record<string, unknown> = {
   context: {},
   payloads: [{
     type: 'memo',
-    reasoning_kind: 'regression_false_positive',
+    reasoning_kind: 'direction_retirement',
     source_task_id: 'lifecycle-source',
+    direction_id: 'lifecycle-direction',
     source_finding: {
-      verdict_reason: LIFECYCLE_SENTINEL,
-      investigation_summary: 'bake smoke chain check',
-      regression_class: 'lifecycle',
+      rationale: LIFECYCLE_SENTINEL,
+      direction_text: 'lifecycle bake smoke chain check',
     },
   }],
 };
