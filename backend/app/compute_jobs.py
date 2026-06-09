@@ -886,7 +886,7 @@ async def _process_single_compute_job(
             started_at = _utcnow()
             terminate_diagnostic = None
             try:
-                terminated = await backend.terminate(job, reason="provisioning")
+                terminated = await backend.terminate(reserved, reason="provisioning")
             except Exception as exc:
                 failed_at = _utcnow()
                 logger.exception(
@@ -944,7 +944,7 @@ async def _process_single_compute_job(
             )
             terminate_diagnostic = None
             try:
-                terminated = await backend.terminate(job, reason="provisioning")
+                terminated = await backend.terminate(reserved, reason="provisioning")
             except Exception as exc:
                 failed_at = _utcnow()
                 logger.exception(
