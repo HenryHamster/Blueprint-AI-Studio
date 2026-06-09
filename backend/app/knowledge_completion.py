@@ -56,6 +56,7 @@ from app.knowledge_query import (
 from app.models import (
     Artifact,
     ComputeJob,
+    ComputeJobStatus,
     KnowledgeDocument,
     SourceKind,
     Task,
@@ -118,6 +119,13 @@ _ORIGIN_CHALLENGE_CONFIRMED = "challenger_confirmed"
 _ORIGIN_CHALLENGE_OVERTURNED = "overturned"
 _ORIGIN_CHALLENGE_INDETERMINATE = "indeterminate_fail_closed"
 _FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
+_LIVE_RELEASE_EVIDENCE_KEY = "live_release_evidence"
+_COMPUTE_JOB_TERMINAL_STATUSES = (
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+)
 _CHALLENGE_KEYS = {
     "challenged_boundary",
     "first_verdict",
@@ -1722,11 +1730,39 @@ def _incoming_mode_is_upgrade(
     )
 
 
+async def _latest_compute_live_release_evidence(
+    task: Task,
+    session: AsyncSession,
+    *,
+    job_id: uuid.UUID | None = None,
+) -> dict[str, Any] | None:
+    if job_id is not None:
+        job = await session.get(ComputeJob, job_id)
+        if job is None or job.task_id != task.id or not isinstance(job.polling_metadata, dict):
+            return None
+    else:
+        result = await session.execute(
+            select(ComputeJob)
+            .where(ComputeJob.task_id == task.id)
+            .order_by(
+                ComputeJob.status.in_(_COMPUTE_JOB_TERMINAL_STATUSES).desc(),
+                ComputeJob.created_at.desc(),
+            )
+        )
+        job = result.scalars().first()
+        if job is None or not isinstance(job.polling_metadata, dict):
+            return None
+    evidence = job.polling_metadata.get(_LIVE_RELEASE_EVIDENCE_KEY)
+    return evidence if isinstance(evidence, dict) else None
+
+
 async def _persist_compute_knowledge_document(
     task: Task,
     document: dict[str, Any],
     mode: str,
     session: AsyncSession,
+    *,
+    compute_job_id: uuid.UUID | None = None,
 ) -> KnowledgeDocument:
     """Persist one compute-experiment KnowledgeDocument, mirror a compact copy.
 
@@ -1753,6 +1789,13 @@ async def _persist_compute_knowledge_document(
 
     verdict_record = dict(document["verdict_record"])
     verdict_record.setdefault("analysis_mode", mode)
+    release_evidence = await _latest_compute_live_release_evidence(
+        task,
+        session,
+        job_id=compute_job_id,
+    )
+    if release_evidence is not None:
+        verdict_record["release_evidence"] = release_evidence
 
     # Attach citation-grounding probe detail (additive, best-effort).
     # Reuses the shared _grounding_probe_detail helper so the shape is identical
@@ -1847,6 +1890,7 @@ async def _persist_compute_knowledge_document(
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
+        "release_evidence": stored_verdict.get("release_evidence"),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -1989,7 +2033,15 @@ async def persist_compute_experiment_knowledge(
             verdict_record["fallback_reason"] = fallback_reason
             document["verdict_record"] = verdict_record
 
-    return await _persist_compute_knowledge_document(task, document, mode, session)
+    job = await _load_compute_job_from_logs(logs, session)
+    compute_job_id = job.id if job is not None else None
+    return await _persist_compute_knowledge_document(
+        task,
+        document,
+        mode,
+        session,
+        compute_job_id=compute_job_id,
+    )
 
 
 async def _handle_web_research_completion(

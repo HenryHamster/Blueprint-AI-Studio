@@ -794,6 +794,39 @@ describe('DetailsTab — Knowledge Document', () => {
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
     expect(await screen.findByText(/Detailed markdown/)).toBeInTheDocument();
   });
+
+  it('surfaces live-proof release evidence (promoted SHA + serving status) after the full-doc fetch', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      id: 'doc-1',
+      body: '# Full body',
+      release_evidence: {
+        promoted_sha: 'abcdef1234567890deadbeef',
+        aggregate_serving_status: 'serving_confirmed',
+        release_version_number: 8,
+      },
+    } as never);
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    const chip = await screen.findByTestId('release-evidence-chip');
+    expect(chip).toBeInTheDocument();
+    expect(chip.textContent).toContain('v8');
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef1234567890deadbeef');
+  });
+
+  it('shows no release-evidence chip when the document has none', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      id: 'doc-1',
+      body: '# Full body',
+      release_evidence: null,
+    } as never);
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    expect(await screen.findByText(/Full body/)).toBeInTheDocument();
+    expect(screen.queryByTestId('release-evidence-chip')).toBeNull();
+  });
 });
 
 describe('DetailsTab — Structural Gating', () => {

@@ -3,6 +3,8 @@ import { Cpu, Square, AlertTriangle, Clock, ExternalLink } from 'lucide-react';
 import { fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
+import { ReleaseEvidenceChip } from './ReleaseEvidence';
+import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -137,6 +139,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                   </div>
+                  {(() => {
+                    const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
+                    if (!evidence) return null;
+                    return (
+                      <div className="mt-1">
+                        <ReleaseEvidenceChip evidence={evidence} />
+                      </div>
+                    );
+                  })()}
                 </div>
                 <span
                   className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${statusBadgeClass(job)}`}

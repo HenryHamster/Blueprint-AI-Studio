@@ -2480,9 +2480,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
-    # Build (direction_id, title) pairs to enable direction-aware dedup thresholds
+    # Build compact active-task overlap candidates. The third tuple element is
+    # optional metadata consumed by finding_deduplication; tuple-only helper
+    # callers still use the legacy two-field shape.
     existing_tasks_with_dirs = [
-        ((t.context or {}).get("direction_id"), t.title.lower()) for t in existing_tasks
+        (
+            (t.context or {}).get("direction_id"),
+            t.title.lower(),
+            (t.first_payload or {}).get("type"),
+        )
+        for t in existing_tasks
     ]
 
     # Query recent tasks (last 90 days) for hash-based deduplication across research cycles

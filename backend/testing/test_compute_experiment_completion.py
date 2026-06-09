@@ -48,6 +48,8 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     Task,
     TaskStatus,
 )
@@ -1569,7 +1571,10 @@ async def _setup_durable_job_with_artifact(
     job.completed_at = datetime.utcnow()
     job.artifact_id = artifact.id
     job.result_reference = artifact_uri
-    job.polling_metadata = {"result_metrics": {"accuracy": accuracy}}
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {"accuracy": accuracy},
+    }
     db_session.add(job)
     await db_session.commit()
     await db_session.refresh(job)
@@ -1758,6 +1763,141 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         == "measured_only"
     )
     assert evaluate_task_outcome(fallback_task).status == "neutral"
+
+
+@pytest.mark.asyncio
+async def test_live_proof_knowledge_document_carries_release_evidence(
+    db_session, mocker, _quiet_compute_io
+):
+    from app.knowledge_query import serialize_knowledge_document
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    task.context = {
+        **(task.context or {}),
+        "live_release_proof_marker": True,
+    }
+    served_at = datetime.utcnow()
+    version = ReleaseVersion(
+        project_id=task.project_id,
+        version_number=8,
+        status="promoted",
+        promoted_sha="liveabc123",
+        promoted_at=served_at,
+        serving_status="serving_confirmed",
+        served_sha="liveabc123",
+        served_at=served_at,
+    )
+    db_session.add_all([task, version])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="backend_revision",
+                serving_status="serving_confirmed",
+                served_identifier="liveabc123",
+                served_at=served_at,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="agent_image",
+                serving_status="serving_confirmed",
+                served_identifier="liveabc123",
+                served_at=served_at,
+            ),
+        ]
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    older_release_evidence = {
+        "promoted_sha": "liveabc123",
+        "aggregate_serving_status": "serving_confirmed",
+        "release_version_number": 8,
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": older_release_evidence,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    newer_job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python rerun.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    newer_job.status = ComputeJobStatus.SUCCEEDED
+    newer_job.outcome = ComputeJobOutcome.SUCCESS
+    newer_job.accrued_cost_usd = 0.11
+    newer_job.final_cost_usd = 0.11
+    newer_job.terminal_reason = "compute job finished"
+    newer_job.completed_at = datetime.utcnow()
+    db_session.add(newer_job)
+    await db_session.commit()
+    await db_session.refresh(newer_job)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _mock_create = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    evidence = doc.forward_quality_verdict["release_evidence"]
+    assert evidence == older_release_evidence
+    assert task.plan_output["knowledge_document"]["release_evidence"] == older_release_evidence
+
+    detail = serialize_knowledge_document(doc, include_body=True)
+    assert detail["release_evidence"] == older_release_evidence
+
+
+@pytest.mark.asyncio
+async def test_ordinary_compute_knowledge_document_has_no_release_evidence(
+    db_session, _quiet_compute_io
+):
+    from app.knowledge_query import serialize_knowledge_document
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.forward_quality_verdict.get("release_evidence") is None
+    assert task.plan_output["knowledge_document"]["release_evidence"] is None
+
+    detail = serialize_knowledge_document(doc, include_body=True)
+    assert detail["release_evidence"] is None
 
 
 @pytest.mark.asyncio
@@ -2082,6 +2222,18 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
         db_session, metric="accuracy", op=">=", threshold=0.9
     )
     job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    release_evidence = {
+        "promoted_sha": "upgradeabc123",
+        "aggregate_serving_status": "serving_confirmed",
+        "release_version_number": 9,
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": release_evidence,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
 
     logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
 
@@ -2095,6 +2247,10 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
     docs_after_first = await _knowledge_docs_for(db_session, task)
     assert len(docs_after_first) == 1
     assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    assert (
+        docs_after_first[0].forward_quality_verdict["release_evidence"]
+        == release_evidence
+    )
     fallback_body = docs_after_first[0].body
     assert "Compute experiment verdict" in fallback_body
 
@@ -2123,6 +2279,7 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
     assert verdict["analysis_mode"] == "llm", (
         "persisted doc must be upgraded from fallback to llm on reentry"
     )
+    assert verdict["release_evidence"] == release_evidence
     assert artifact_uri in doc.source_citations
     assert metric_ref in doc.source_citations
     assert "analysis" in doc.body.lower()
@@ -2132,6 +2289,10 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
     # plan_output mirrors the upgraded values.
     assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
     assert task.plan_output["knowledge_document"]["citation_count"] >= 2
+    assert (
+        task.plan_output["knowledge_document"]["release_evidence"]
+        == release_evidence
+    )
 
     # The LLM was actually invoked on the second pass.
     mock_create.assert_awaited_once()

@@ -123,6 +123,33 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(await findByText('Kill')).toBeTruthy();
   });
 
+  test('shows a live-proof indicator when polling_metadata carries live_release_evidence', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        polling_metadata: {
+          live_release_evidence: {
+            release_version_number: 8,
+            promoted_sha: 'abcdef1234567890deadbeef',
+            aggregate_serving_status: 'serving_confirmed',
+          },
+        },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const chip = await findByTestId('release-evidence-chip');
+    expect(chip.textContent).toContain('Live proof of v8');
+    // Short SHA only — first 8 chars, not the full hash.
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef1234567890deadbeef');
+  });
+
+  test('shows no live-proof indicator when live_release_evidence is absent', async () => {
+    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('release-evidence-chip')).toBeNull();
+  });
+
   test('calls onNavigateToTask when task title is clicked', async () => {
     const onNavigate = vi.fn();
     fetchComputeJobs.mockResolvedValue([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]);

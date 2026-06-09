@@ -292,6 +292,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         forward_quality_verdict=doc.forward_quality_verdict,
         source_citations=doc.source_citations,
     )
+    verdict = (
+        doc.forward_quality_verdict
+        if isinstance(doc.forward_quality_verdict, dict)
+        else {}
+    )
     out = {
         "id": str(doc.id),
         "title": doc.title,
@@ -308,6 +313,7 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
+        "release_evidence": verdict.get("release_evidence"),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
         "origin_provenance": serialize_origin_provenance(doc),

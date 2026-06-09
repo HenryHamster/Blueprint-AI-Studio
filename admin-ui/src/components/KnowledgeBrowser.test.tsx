@@ -743,3 +743,101 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
     expect(lastCall[1]?.challenge_state).toBe('overturned');
   });
 });
+
+describe('KnowledgeBrowser — live proof release evidence', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  // A compute_experiment document whose launching job ran as a live-release proof:
+  // the backend surfaces the promoted serving evidence as a top-level field.
+  const liveProofDoc = {
+    ...computeDoc,
+    id: 'doc-live-proof',
+    title: 'GPU live-proof benchmark',
+    release_evidence: {
+      promoted_sha: 'abcdef1234567890deadbeef',
+      promoted_at: '2026-06-05T00:00:00Z',
+      aggregate_serving_status: 'serving_confirmed',
+      aggregate_reason_code: null,
+      release_version_id: 'rv-8',
+      release_version_number: 8,
+      required_artifacts: [
+        {
+          artifact_kind: 'backend_revision',
+          required: true,
+          serving_status: 'serving_confirmed',
+          served_identifier: 'abcdef1234567890',
+          served_at: '2026-06-05T00:00:00Z',
+          reason_code: null,
+        },
+        {
+          artifact_kind: 'agent_image',
+          required: true,
+          serving_status: 'deploy_failed',
+          served_identifier: null,
+          served_at: null,
+          reason_code: 'agent image not reachable',
+        },
+      ],
+    },
+  };
+
+  async function renderAndOpen(doc: unknown) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [doc] as never, total: 1, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({ ...(doc as object), body: '# Body' } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes((doc as { title: string }).title),
+    );
+    if (!card) throw new Error('expected document card');
+    await act(async () => { (card as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+  }
+
+  test('live-proof compute doc shows the Live Proof Context block with version, short SHA, and serving status', async () => {
+    await renderAndOpen(liveProofDoc);
+    const panel = (host as HTMLDivElement).querySelector('[data-testid="release-evidence-panel"]');
+    expect(panel).toBeTruthy();
+    const text = panel?.textContent ?? '';
+    expect(text).toContain('Live Proof Context');
+    expect(text).toContain('v8');
+    // Short SHA = first 8 chars of the promoted SHA, not the full hash.
+    expect(text).toContain('abcdef12');
+    expect(text).not.toContain('abcdef1234567890deadbeef');
+    expect(text).toContain('serving_confirmed');
+    expect(text).toContain('Required artifacts');
+    expect(text).toContain('backend_revision');
+    expect(text).toContain('agent_image');
+    expect(text).toContain('deploy_failed');
+    expect(text).toContain('agent image not reachable');
+  });
+
+  test('compute doc without release_evidence shows no Live Proof Context block', async () => {
+    const noEvidenceDoc = { ...computeDoc, id: 'doc-no-evidence', title: 'GPU no-proof benchmark', release_evidence: null };
+    await renderAndOpen(noEvidenceDoc);
+    expect((host as HTMLDivElement).querySelector('[data-testid="release-evidence-panel"]')).toBeFalsy();
+    // The document itself still renders.
+    expect((host as HTMLDivElement).textContent).toContain('GPU no-proof benchmark');
+  });
+});

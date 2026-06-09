@@ -5,7 +5,8 @@ import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob } from '../api';
+import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob, type LiveReleaseEvidence } from '../api';
+import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
@@ -404,6 +405,7 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
   } | undefined;
   const [expanded, setExpanded] = useState(false);
   const [body, setBody] = useState<string | null>(null);
+  const [releaseEvidence, setReleaseEvidence] = useState<LiveReleaseEvidence | null>(null);
   const [loading, setLoading] = useState(false);
   const projectId = task.project_id;
   const docId = doc?.id;
@@ -417,7 +419,10 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
     if (next && body === null && projectId && docId) {
       setLoading(true);
       fetchKnowledgeDocument(projectId, docId)
-        .then(full => setBody(full.body ?? ''))
+        .then(full => {
+          setBody(full.body ?? '');
+          setReleaseEvidence(full.release_evidence ?? null);
+        })
         .catch(() => setBody(''))
         .finally(() => setLoading(false));
     }
@@ -476,6 +481,7 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
           {typeof doc.citation_count === 'number' && (
             <span className="text-[11px] text-neutral-500">{doc.citation_count} citation{doc.citation_count !== 1 ? 's' : ''}</span>
           )}
+          {releaseEvidence && <ReleaseEvidenceChip evidence={releaseEvidence} />}
         </div>
         {docId && projectId && (
           <button

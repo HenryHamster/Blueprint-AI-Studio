@@ -68,6 +68,17 @@ _STOPWORDS = frozenset(
 )
 
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+_COMPUTE_EXPERIMENT_TASK_TYPE = "compute_experiment"
+_COMPUTE_EXPERIMENT_FINDING_TYPES = frozenset(
+    {_COMPUTE_EXPERIMENT_TASK_TYPE, "measurement", "benchmark"}
+)
+
+
+@dataclass(frozen=True)
+class _OverlapCandidate:
+    direction_id: Optional[str]
+    title: str
+    task_type: Optional[str] = None
 
 # Whitelisted prerequisite kinds for the machine-resolvable {kind, ref} need
 # representation a finding may declare. Conservative by design: only these two
@@ -119,7 +130,12 @@ def is_duplicate(
     (safer default).
     """
     words = set(finding_title.lower().split()) - _STOPWORDS
-    for task_dir_id, title in existing:
+    for candidate_raw in existing:
+        candidate = _coerce_overlap_candidate(candidate_raw)
+        if candidate is None:
+            continue
+        task_dir_id = candidate.direction_id
+        title = candidate.title
         overlap = words & (set(title.lower().split()) - _STOPWORDS)
         same_direction = (
             not finding_dir_id or not task_dir_id or finding_dir_id == task_dir_id
@@ -637,6 +653,7 @@ def deduplicate_findings(
         description = finding.get("description", finding.get("prompt", ""))
         fhash = finding_hash(title, description)
         finding_dir_id = finding.get("direction_id") or parent_dir_id
+        finding_task_type = _dedup_spawn_task_type(finding)
 
         if fhash in recent_finding_hashes:
             out = failed_hashes.get(fhash, "prior")
@@ -654,7 +671,7 @@ def deduplicate_findings(
             continue
 
         matched_title = _find_overlap_match(
-            title, finding_dir_id, existing_tasks_with_dirs
+            title, finding_dir_id, existing_tasks_with_dirs, finding_task_type
         )
         if matched_title is not None:
             logger.warning(
@@ -763,6 +780,7 @@ def _find_overlap_match(
     finding_title: str,
     finding_dir_id: Optional[str],
     existing: Iterable[tuple],
+    finding_task_type: Optional[str] = None,
 ) -> Optional[str]:
     """Return the first existing title that word-overlaps ``finding_title``.
 
@@ -772,7 +790,14 @@ def _find_overlap_match(
     title.
     """
     words = set(finding_title.lower().split()) - _STOPWORDS
-    for task_dir_id, title in existing:
+    for candidate_raw in existing:
+        candidate = _coerce_overlap_candidate(candidate_raw)
+        if candidate is None:
+            continue
+        if not _candidate_can_overlap(finding_task_type, candidate):
+            continue
+        task_dir_id = candidate.direction_id
+        title = candidate.title
         overlap = words & (set(title.lower().split()) - _STOPWORDS)
         same_direction = (
             not finding_dir_id or not task_dir_id or finding_dir_id == task_dir_id
@@ -781,3 +806,53 @@ def _find_overlap_match(
         if len(overlap) >= threshold:
             return title
     return None
+
+
+def _coerce_overlap_candidate(raw: object) -> Optional[_OverlapCandidate]:
+    if isinstance(raw, _OverlapCandidate):
+        return raw
+    if isinstance(raw, dict):
+        title = raw.get("title")
+        if not title:
+            return None
+        return _OverlapCandidate(
+            direction_id=_optional_str(raw.get("direction_id")),
+            title=str(title),
+            task_type=_normalize_task_type(raw.get("task_type") or raw.get("type")),
+        )
+    if isinstance(raw, tuple) and len(raw) >= 2:
+        return _OverlapCandidate(
+            direction_id=_optional_str(raw[0]),
+            title=str(raw[1]),
+            task_type=_normalize_task_type(raw[2]) if len(raw) >= 3 else None,
+        )
+    return None
+
+
+def _dedup_spawn_task_type(finding: dict) -> Optional[str]:
+    finding_type = _normalize_task_type(finding.get("type"))
+    if finding_type in _COMPUTE_EXPERIMENT_FINDING_TYPES:
+        return _COMPUTE_EXPERIMENT_TASK_TYPE
+    return finding_type
+
+
+def _candidate_can_overlap(
+    finding_task_type: Optional[str], candidate: _OverlapCandidate
+) -> bool:
+    if finding_task_type != _COMPUTE_EXPERIMENT_TASK_TYPE:
+        return True
+    # Legacy tuple callers have no task metadata, so keep the historical
+    # conservative behavior for them. Typed active research/design tasks are the
+    # false positives this gate is meant to exclude.
+    return candidate.task_type in (None, _COMPUTE_EXPERIMENT_TASK_TYPE)
+
+
+def _normalize_task_type(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _optional_str(value: object) -> Optional[str]:
+    return str(value) if value is not None else None

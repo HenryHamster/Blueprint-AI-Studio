@@ -2307,6 +2307,29 @@ export interface KnowledgeOriginProvenance {
   [key: string]: unknown;
 }
 
+/** Promoted-and-serving release evidence that authorized a live-release compute proof.
+ *  Surfaced as a top-level field on compute_experiment KnowledgeDocument responses
+ *  (backend `knowledge_query.serialize_knowledge_document`, sourced from the launching
+ *  ComputeJob's `polling_metadata.live_release_evidence`). Null/absent for non-live-proof
+ *  documents and non-compute documents. All fields optional/nullable to stay
+ *  back-compatible with evidence serialized before a field existed. */
+export interface LiveReleaseEvidence {
+  promoted_sha?: string | null;
+  promoted_at?: string | null;
+  aggregate_serving_status?: string | null;
+  aggregate_reason_code?: string | null;
+  release_version_id?: string | null;
+  release_version_number?: number | null;
+  required_artifacts?: Array<{
+    artifact_kind?: string;
+    required?: boolean;
+    serving_status?: string | null;
+    served_identifier?: string | null;
+    served_at?: string | null;
+    reason_code?: string | null;
+  }>;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -2341,6 +2364,10 @@ export interface KnowledgeDocument {
    *  allowed or rejected its dispatch. Absent on older backend responses — treat a
    *  missing object as legacy/unknown. */
   origin_provenance?: KnowledgeOriginProvenance | null;
+  /** Promoted serving release evidence that authorized a live-release compute proof.
+   *  Present (non-null) only for compute_experiment documents whose launching job ran as
+   *  a live-release proof; null/absent otherwise. */
+  release_evidence?: LiveReleaseEvidence | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }

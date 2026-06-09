@@ -5707,6 +5707,71 @@ class TestResolveComputeSpendThreshold:
 class TestComputeExperimentSpawn:
     """End-to-end spawn path: below/above-threshold dispatch + malformed defer."""
 
+    async def _run_compute_overlap_case(
+        self, db_session, mocker, *, active_type: str, title_prefix: str
+    ):
+        from test_autonomous_research import _patch_research_externals
+
+        project, direction, task = await _grader_project_and_task(
+            db_session, f"d-cx-overlap-{active_type}"
+        )
+        active_task = _Task(
+            project_id=project.id,
+            title=f"{title_prefix} measure live release proof acceptance evidence",
+            payloads=[{"type": active_type}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            context={"direction_id": direction["id"]},
+        )
+        db_session.add(active_task)
+        await db_session.commit()
+        finding = _compute_finding(
+            direction["id"],
+            title="Measure live release proof acceptance evidence",
+            spend_cap_usd=2.0,
+            deadline_seconds=3600,
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        return [
+            c
+            for c in children
+            if (c.first_payload or {}).get("type") == "compute_experiment"
+        ]
+
+    async def test_compute_experiment_word_overlap_ignores_active_research_titles(
+        self, db_session, mocker
+    ):
+        compute_children = await self._run_compute_overlap_case(
+            db_session, mocker, active_type="research", title_prefix="Research"
+        )
+        assert len(compute_children) == 1
+        assert (
+            compute_children[0].title
+            == "Measure live release proof acceptance evidence"
+        )
+
+    async def test_compute_experiment_word_overlap_blocks_active_compute_titles(
+        self, db_session, mocker
+    ):
+        compute_children = await self._run_compute_overlap_case(
+            db_session,
+            mocker,
+            active_type="compute_experiment",
+            title_prefix="Compute",
+        )
+        assert compute_children == []
+
     async def test_below_threshold_spawns_dispatched_not_held(self, db_session, mocker):
         from test_autonomous_research import _patch_research_externals
 

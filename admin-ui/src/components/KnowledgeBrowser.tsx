@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react';
 import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
+import { ReleaseEvidencePanel } from './ReleaseEvidence';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
@@ -531,6 +532,10 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 </div>
               )}
             </div>
+
+            {selected.source_kind === 'compute_experiment' && (
+              <ReleaseEvidencePanel evidence={selected.release_evidence} />
+            )}
 
             <VerdictBadge verdict={selected.forward_quality_verdict} />
             <ProbeDetail verdict={selected.forward_quality_verdict} />
