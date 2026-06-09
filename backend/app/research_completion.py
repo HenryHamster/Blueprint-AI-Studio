@@ -1530,19 +1530,50 @@ def converge_spawn_batch_foundations(
     return converged
 
 
+# Mirrors the ux_task_active_idempotency_key partial-index predicate EXACTLY
+# (models.py / alembic 0199): the statuses whose rows occupy an idempotency
+# slot. Used by the self-claim collision probe in
+# _commit_or_handle_duplicate_spawn — a status the index counts but this list
+# omits would misclassify a recoverable self-claim collision as a duplicate
+# batch and discard the spawned children. Same mirror as reaper.py's C2 guard.
+_IDEMPOTENCY_INDEX_ACTIVE_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
+)
+
+
 async def _commit_or_handle_duplicate_spawn(
     session: AsyncSession, task: Task, *, stage: str
 ) -> bool:
-    """Commit the spawn batch, treating an idempotency-key collision as benign.
+    """Commit the spawn batch, distinguishing the two idempotency-collision causes.
 
-    Returns True when the commit landed. Returns False when the commit was
-    rejected by ``ux_task_active_idempotency_key`` — the duplicate-spawn guard
-    WORKING: a peer (a concurrent post-commit retry, or a pipelined duplicate
-    research cycle) already holds the colliding key in an active status, so
-    this batch is a duplicate and its rollback loses nothing. Without the
-    rollback here the poisoned session cascaded PendingRollbackError through
-    the rest of the request (prod burst 2026-06-07 00:56). Any other
-    IntegrityError re-raises into the generic handler-failure recovery.
+    Returns True when the commit landed (directly, or after self-claim
+    recovery below). Returns False when the commit was rejected by
+    ``ux_task_active_idempotency_key`` for a genuinely duplicate batch — a
+    peer (a concurrent post-commit retry, or a pipelined duplicate research
+    cycle) already holds the colliding key in an active status, so this
+    batch's rollback loses nothing. Without the rollback here the poisoned
+    session cascaded PendingRollbackError through the rest of the request
+    (prod burst 2026-06-07 00:56). Any other IntegrityError re-raises into
+    the generic handler-failure recovery.
+
+    SELF-CLAIM RECOVERY: the colliding key can also be this task's OWN
+    direction-claim key (research_direction_claim_key) rather than a
+    duplicate child batch. The agent-reported terminal commit briefly parks
+    the parent COMPLETED, which releases the claim (the partial index only
+    covers active statuses); if the autonomous loop re-claims the direction
+    with a fresh research spawn inside that window, the EVALUATING flip in
+    THIS commit re-enters the index with the same key and collides — but the
+    child tasks are unique, undispatched work, not duplicates (prod
+    2026-06-09: task 5ac5c8c1's whole 2-finding batch was discarded and the
+    direction re-researched from scratch). Detected by probing whether a
+    DIFFERENT task now actively holds this task's key; recovered by releasing
+    this task's claim (the new peer legitimately owns the direction now),
+    re-applying the batch, and committing again.
 
     On the False path the session has been rolled back — which expires every
     loaded ORM instance even with expire_on_commit=False — and ``task`` has
@@ -1552,18 +1583,22 @@ async def _commit_or_handle_duplicate_spawn(
     """
     _task_pk = task.id
     _task_id_str = str(_task_pk)
+    # Snapshot BEFORE the commit attempt: rollback() expunges pending INSERTs
+    # and expires every loaded attribute, so this state is unrecoverable
+    # afterwards. __dict__ reads only (never attribute access) — no lazy IO.
+    _pending_objects = list(session.new)
+    _parent_state = {
+        attr: task.__dict__[attr]
+        for attr in ("status", "context", "latest_status_message")
+        if attr in task.__dict__
+    }
+    _own_key = task.__dict__.get("idempotency_key")
     try:
         await session.commit()
     except IntegrityError as _dup_exc:
         if "ux_task_active_idempotency_key" not in str(_dup_exc):
             raise
         await session.rollback()
-        logger.warning(
-            f"[RESEARCH] Task {_task_id_str}: {stage} commit hit "
-            f"ux_task_active_idempotency_key (a peer already spawned this work "
-            f"— duplicate-spawn guard working). Rolled back this duplicate "
-            f"batch; the peer owns the post-spawn state: {str(_dup_exc)[:200]}"
-        )
         # ``populate_existing`` (not refresh()) so any rolled-back in-memory
         # task mutation is discarded rather than re-flushed; ``no_autoflush``
         # so the re-load itself cannot autoflush it and re-raise.
@@ -1573,6 +1608,70 @@ async def _commit_or_handle_duplicate_spawn(
                 .where(Task.id == _task_pk)
                 .execution_options(populate_existing=True)
             )
+        # Self-claim probe: does a DIFFERENT task actively hold THIS task's
+        # key? If so the flip back into the active set is what collided (or
+        # is guaranteed to collide on retry), and the batch is unique work.
+        # In the true-duplicate case the key holder is this task itself
+        # (Task.id != excludes it), so the probe stays empty and the
+        # duplicate disposition below is unchanged.
+        _peer_id = None
+        if _own_key:
+            with contextlib.suppress(Exception):
+                _peer_id = (
+                    await session.execute(
+                        select(Task.id).where(
+                            Task.idempotency_key == _own_key,
+                            Task.id != _task_pk,
+                            Task.status.in_(_IDEMPOTENCY_INDEX_ACTIVE_STATUSES),
+                        )
+                    )
+                ).scalars().first()
+        if _peer_id is not None:
+            # Release this task's claim — the peer legitimately re-claimed the
+            # direction while this task sat terminal — and re-apply the batch:
+            # re-add the (now-transient, attribute-state-intact) pending rows
+            # and restore the parent's spawn-commit mutations on top of the
+            # re-populated DB state. Mutations on OTHER persistent rows in the
+            # original commit are not replayed — same loss as the prior
+            # all-batch rollback; the children and the EVALUATING flip are the
+            # durable state that must not be lost.
+            task.idempotency_key = None
+            for attr, value in _parent_state.items():
+                setattr(task, attr, value)
+            if "context" in _parent_state:
+                flag_modified(task, "context")
+            for _obj in _pending_objects:
+                session.add(_obj)
+            session.add(task)
+            try:
+                await session.commit()
+            except IntegrityError as _retry_exc:
+                if "ux_task_active_idempotency_key" not in str(_retry_exc):
+                    raise
+                # Still colliding: some other key in the batch is genuinely
+                # duplicated — fall through to the duplicate disposition.
+                await session.rollback()
+                with contextlib.suppress(Exception), session.no_autoflush:
+                    await session.execute(
+                        select(Task)
+                        .where(Task.id == _task_pk)
+                        .execution_options(populate_existing=True)
+                    )
+            else:
+                logger.warning(
+                    f"[RESEARCH] Task {_task_id_str}: {stage} commit collided on "
+                    f"its OWN direction-claim key — peer {_peer_id} re-claimed "
+                    f"the direction while this task sat terminal. Released this "
+                    f"task's claim and re-committed the batch "
+                    f"({len(_pending_objects)} pending row(s) preserved)."
+                )
+                return True
+        logger.warning(
+            f"[RESEARCH] Task {_task_id_str}: {stage} commit hit "
+            f"ux_task_active_idempotency_key (a peer already spawned this work "
+            f"— duplicate-spawn guard working). Rolled back this duplicate "
+            f"batch; the peer owns the post-spawn state: {str(_dup_exc)[:200]}"
+        )
         return False
     return True
 

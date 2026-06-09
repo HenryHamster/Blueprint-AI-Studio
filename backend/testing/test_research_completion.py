@@ -8379,3 +8379,157 @@ async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
     assert source_hashes == grader_hashes, (
         "Source and grader _adversarial_challenged_hashes must be identical"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _commit_or_handle_duplicate_spawn — self-claim collision recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSelfClaimCollisionRecovery:
+    """A spawn-commit collision on the parent's OWN direction-claim key must
+    preserve the child batch (release the claim, re-commit) instead of
+    discarding it as a duplicate.
+
+    Prod 2026-06-09 (task 5ac5c8c1): the agent-terminal commit parked the
+    parent COMPLETED, releasing its direction claim from the partial unique
+    index; the autonomous loop re-claimed the direction with a fresh research
+    6s before the spawn commit; the parent's EVALUATING flip then collided on
+    its own key and the duplicate-spawn guard rolled back the entire
+    2-finding child batch, discarding unique work.
+    """
+
+    async def _terminal_parent_with_claim(self, db_session, direction_id):
+        from app.autonomous_research import research_direction_claim_key
+
+        project, _direction, parent = await _grader_project_and_task(
+            db_session, direction_id
+        )
+        claim_key = research_direction_claim_key(project.id, direction_id)
+        parent.idempotency_key = claim_key
+        # Agent-terminal commit: parent parked COMPLETED → the partial index
+        # no longer counts it, so the claim is released.
+        parent.status = TaskStatus.COMPLETED
+        db_session.add(parent)
+        await db_session.commit()
+        return project, parent, claim_key
+
+    def _peer(self, project, claim_key):
+        return _Task(
+            project_id=project.id,
+            title="Research: fresh re-claim of the direction",
+            payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            idempotency_key=claim_key,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+
+    def _child(self, project, parent, *, idempotency_key=None):
+        return _Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            title="spawned finding child",
+            payloads=[{"type": "create", "prompt": "do x", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            idempotency_key=idempotency_key,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+
+    @_pytest.mark.asyncio
+    async def test_self_claim_collision_preserves_children(self, db_session):
+        from app.research_completion import _commit_or_handle_duplicate_spawn
+
+        project, parent, claim_key = await self._terminal_parent_with_claim(
+            db_session, "d-claim01"
+        )
+        # The autonomous loop legally re-claims the direction in the window
+        # where the parent sits terminal.
+        peer = self._peer(project, claim_key)
+        db_session.add(peer)
+        await db_session.commit()
+        await db_session.refresh(peer)
+
+        # The parent's spawn commit: child INSERT + EVALUATING flip. The flip
+        # re-enters the partial index with the same key → UniqueViolation.
+        child = self._child(project, parent)
+        db_session.add(child)
+        parent.status = TaskStatus.EVALUATING
+        parent.context = {
+            **(parent.context or {}),
+            "research_branch": "research/d-claim01",
+        }
+        parent.latest_status_message = "Research created 1 tasks from 1 findings"
+        db_session.add(parent)
+
+        committed = await _commit_or_handle_duplicate_spawn(
+            db_session, parent, stage="child-task spawn"
+        )
+
+        assert committed is True
+        await db_session.refresh(parent)
+        # The batch survived: EVALUATING flip + spawn-commit mutations durable.
+        assert parent.status == TaskStatus.EVALUATING
+        assert (parent.context or {}).get("research_branch") == "research/d-claim01"
+        assert parent.latest_status_message == (
+            "Research created 1 tasks from 1 findings"
+        )
+        # The claim was released to the peer, not duplicated.
+        assert parent.idempotency_key is None
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == parent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        await db_session.refresh(peer)
+        assert peer.idempotency_key == claim_key
+        assert peer.status == TaskStatus.QUEUED
+
+    @_pytest.mark.asyncio
+    async def test_true_duplicate_batch_still_discarded(self, db_session):
+        """A collision NOT on the parent's own key keeps today's duplicate
+        disposition: the batch rolls back and the function returns False."""
+        from app.research_completion import _commit_or_handle_duplicate_spawn
+
+        project, _direction, parent = await _grader_project_and_task(
+            db_session, "d-claim02"
+        )
+        parent.status = TaskStatus.COMPLETED
+        parent.idempotency_key = None
+        db_session.add(parent)
+        await db_session.commit()
+
+        duplicated_key = "research-direction:dup-claim02:pipelined"
+        peer = self._peer(project, duplicated_key)
+        db_session.add(peer)
+        await db_session.commit()
+
+        # The batch itself carries the colliding key (a true duplicate spawn).
+        dup_child = self._child(project, parent, idempotency_key=duplicated_key)
+        db_session.add(dup_child)
+        parent.status = TaskStatus.EVALUATING
+        db_session.add(parent)
+
+        committed = await _commit_or_handle_duplicate_spawn(
+            db_session, parent, stage="child-task spawn"
+        )
+
+        assert committed is False
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == parent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert children == []
+        # Parent re-populated from its DB row: the rolled-back flip is gone.
+        assert parent.status == TaskStatus.COMPLETED

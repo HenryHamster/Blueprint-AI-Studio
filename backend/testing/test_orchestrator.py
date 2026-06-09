@@ -1226,16 +1226,25 @@ class TestResearchCompletion:
     async def test_duplicate_active_claim_during_post_spawn_is_benign(
         self, db_session, mocker
     ):
-        """Regression for prod burst 2026-06-07 00:56: a research task reported
-        COMPLETED (its idempotency claim left the active-status index), a
-        pipelined duplicate research cycle then claimed the same key, and
-        apply_post_spawn_state's COMPLETED→EVALUATING flip violated
+        """Two stacked regressions on the same collision.
+
+        Prod burst 2026-06-07 00:56: a research task reported COMPLETED (its
+        idempotency claim left the active-status index), a peer research cycle
+        then claimed the same key, and the COMPLETED→EVALUATING flip violated
         ux_task_active_idempotency_key at session.commit(). Pre-fix the
         IntegrityError escaped with the session in pending-rollback, the
         handler-failure recovery itself died on PendingRollbackError, and the
-        request 500'd live agents. The duplicate-spawn guard firing is benign:
-        the handler must catch it, roll back, keep the task in its committed
-        terminal state, keep the spawned children, and complete cleanly."""
+        request 500'd live agents. The handler must catch the collision and
+        complete cleanly (the final commit below is that regression guard).
+
+        Prod 2026-06-09 (task 5ac5c8c1): the guard then OVER-corrected —
+        treating the self-claim collision as a duplicate batch and rolling
+        back the children too, discarding unique undispatched findings while
+        the peer re-researched the direction from scratch. The contract now:
+        the children and the EVALUATING flip survive (self-claim recovery
+        re-commits them), and THIS task's claim is released — the peer
+        legitimately owns the direction claim; its own spawn-time finding
+        dedup suppresses any duplicate children when it completes."""
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch(
             "app.task_completion.get_github_token_for_task",
@@ -1301,20 +1310,13 @@ class TestResearchCompletion:
         await _handle_research_completion(research_task, logs, db_session)
 
         await db_session.refresh(research_task)
-        # Not corrupted: the task keeps its committed terminal status — the
-        # EVALUATING flip was correctly blocked by the duplicate-spawn guard.
-        assert research_task.status == TaskStatus.COMPLETED
-        # The EVALUATING flip now lands ATOMICALLY with the child-spawn commit, so a
-        # contention kill between spawn and flip can no longer strand the parent
-        # COMPLETED-with-children (see
-        # test_research_completion.test_evaluating_flip_is_atomic_with_child_spawn).
-        # Consequence here: when the idempotency collision blocks that commit, the
-        # WHOLE duplicate batch (children + flip) rolls back together, so the original
-        # spawns NO children and defers entirely to the peer holding the active claim —
-        # exactly _commit_or_handle_duplicate_spawn's contract ("the peer owns the
-        # post-spawn state; its rollback loses nothing"). Cleaner than the prior
-        # behavior, which left the original's children orphaned under a COMPLETED
-        # parent (duplicated by the peer's own spawn, and never rolled up).
+        # Self-claim recovery: the children and the (atomic, #9013) EVALUATING
+        # flip survive the collision — the batch is unique work, not a
+        # duplicate of the peer's.
+        assert research_task.status == TaskStatus.EVALUATING
+        # The claim was released to the peer, which legitimately owns the
+        # direction now — re-committing WITH the key would just collide again.
+        assert research_task.idempotency_key is None
         from sqlmodel import select as sql_select
 
         children = (
@@ -1326,9 +1328,13 @@ class TestResearchCompletion:
             .scalars()
             .all()
         )
-        assert len(children) == 0, (
-            "the duplicate batch must roll back atomically — the peer owns the spawn"
+        assert len(children) == 1, (
+            "the spawned batch must survive the self-claim collision"
         )
+        # The peer's claim is untouched.
+        await db_session.refresh(peer_task)
+        assert peer_task.idempotency_key == claim_key
+        assert peer_task.status == TaskStatus.QUEUED
         # The session is clean — a follow-up commit must not raise
         # PendingRollbackError (the actual prod-incident regression guard).
         await db_session.commit()
