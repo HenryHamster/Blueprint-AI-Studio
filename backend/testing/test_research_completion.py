@@ -3482,6 +3482,71 @@ async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
 
 
 @_pytest.mark.asyncio
+async def test_evaluating_flip_is_atomic_with_child_spawn(db_session, mocker):
+    """A failure in the post-spawn wiring (AFTER the child-spawn commit) must leave
+    the parent EVALUATING-with-children, never COMPLETED-with-children.
+
+    Regression for the false-complete strand (task 98249c8a, 2026-06-09): the
+    EVALUATING flip used to run in a SEPARATE, later commit (apply_post_spawn_state
+    -> _apply_terminal_transition); a contention/timeout between the child-spawn
+    commit and that flip stranded the parent frozen at the agent-reported COMPLETED
+    with live children, and _check_and_trigger_rollup early-returns unless the parent
+    is EVALUATING — so the whole subtree stranded. The flip now lands atomically with
+    the child-spawn commit, so this fault leaves a recoverable EVALUATING parent.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-atom1")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    task.plan_output = [_make_finding(direction_id=direction["id"])]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        QUALITY_GRADER_VERDICT_KEY: {"passed": True, "reason": "well-grounded"},
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # Fault-inject the contention class AFTER the child-spawn commit: the later
+    # terminal-transition lived inside apply_post_spawn_state, so raising here is
+    # exactly the window that used to strand the parent at COMPLETED.
+    mocker.patch(
+        "app.research_completion.apply_post_spawn_state",
+        side_effect=RuntimeError("simulated post-spawn contention"),
+    )
+
+    with _pytest.raises(RuntimeError, match="simulated post-spawn contention"):
+        await _handle_research_completion(task, "", db_session)
+
+    # Despite the wiring failure, the child-spawn commit already flipped the parent
+    # to EVALUATING atomically with the children — never COMPLETED-with-children.
+    await db_session.rollback()
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "children must be durably spawned"
+    refreshed = (
+        (await db_session.execute(_select(_Task).where(_Task.id == task.id)))
+        .scalars()
+        .first()
+    )
+    assert refreshed.status == TaskStatus.EVALUATING, (
+        "parent must be EVALUATING-with-children after a post-spawn fault, never "
+        f"frozen COMPLETED; got {refreshed.status}"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, mocker):
     """Proportional gate: pure-observation findings never escalate to a grader."""
     from test_autonomous_research import _patch_research_externals

@@ -1304,24 +1304,33 @@ class TestResearchCompletion:
         # Not corrupted: the task keeps its committed terminal status — the
         # EVALUATING flip was correctly blocked by the duplicate-spawn guard.
         assert research_task.status == TaskStatus.COMPLETED
-        # The spawned child survived (it committed before the blocked flip).
+        # The EVALUATING flip now lands ATOMICALLY with the child-spawn commit, so a
+        # contention kill between spawn and flip can no longer strand the parent
+        # COMPLETED-with-children (see
+        # test_research_completion.test_evaluating_flip_is_atomic_with_child_spawn).
+        # Consequence here: when the idempotency collision blocks that commit, the
+        # WHOLE duplicate batch (children + flip) rolls back together, so the original
+        # spawns NO children and defers entirely to the peer holding the active claim —
+        # exactly _commit_or_handle_duplicate_spawn's contract ("the peer owns the
+        # post-spawn state; its rollback loses nothing"). Cleaner than the prior
+        # behavior, which left the original's children orphaned under a COMPLETED
+        # parent (duplicated by the peer's own spawn, and never rolled up).
         from sqlmodel import select as sql_select
 
         children = (
             (
                 await db_session.execute(
-                    sql_select(Task).where(
-                        Task.parent_task_id == research_task.id,
-                        Task.status == TaskStatus.QUEUED,
-                    )
+                    sql_select(Task).where(Task.parent_task_id == research_task.id)
                 )
             )
             .scalars()
             .all()
         )
-        assert len(children) == 1
+        assert len(children) == 0, (
+            "the duplicate batch must roll back atomically — the peer owns the spawn"
+        )
         # The session is clean — a follow-up commit must not raise
-        # PendingRollbackError.
+        # PendingRollbackError (the actual prod-incident regression guard).
         await db_session.commit()
 
     # ── Knowledge findings route to web_research/design task types ───────────
