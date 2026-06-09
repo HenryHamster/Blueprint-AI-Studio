@@ -2669,15 +2669,24 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
 
   /**
    * Drives handleStrategic through the strategic two-pass flow and returns the
-   * executor (pass-2) prompt — the SECOND runClaudeCode invocation. The first
-   * is the thinker; we make the thinker exit 0 and report both handoff files
-   * present so runThinkerWithGate passes and the executor runs. The executor's
+   * executor (pass-2) prompt — the THIRD runClaudeCode invocation. The first
+   * is the thinker; the second is the adversarial strategic challenge pass;
+   * the third is the executor. We make the thinker exit 0 with parseable
+   * problem-model JSON (so runThinkerWithGate's repair path is skipped) and
+   * report both handoff files present so the gate passes. The executor's
    * allOutput carries the three required ./strategic markers so neither
-   * post-check fires a retry — keeping the executor at call index 1.
+   * post-check fires a retry — keeping the executor at call index 2.
    */
   async function captureExecutorPrompt(): Promise<string> {
+    // Thinker must return parseable JSON with "intent" so repairStructuredOutput
+    // in runThinkerWithGate is NOT triggered (an extra runClaudeCode call would
+    // shift the challenge and executor to unexpected indices).
+    const THINKER_JSON = '{"intent":{"purpose":"thinker","current_focus":"test"}}';
     vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'thinker analysis', lastResultText: 'analysis text' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_JSON, lastResultText: THINKER_JSON })
+      // Strategic challenge pass (adversarial second opinion) — empty output gives
+      // an invalid/blocked record, which is fine; the executor still runs.
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
       .mockResolvedValueOnce({
         exitCode: 0,
         allOutput:
@@ -2693,8 +2702,8 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     );
 
     const calls = vi.mocked(runClaudeCode).mock.calls;
-    expect(calls.length).toBeGreaterThanOrEqual(2);
-    return calls[1][0];
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    return calls[2][0];
   }
 
   beforeEach(() => {
@@ -2809,6 +2818,12 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
   // makes an extra runClaudeCode call that shifts the mock sequence).
   const THINKER_OUTPUT = '{"intent":{"purpose":"test","current_focus":"test"}}';
 
+  // Challenge mock: empty output → invalid/blocked record, gate fails closed.
+  // The executor still runs; nothing is pre-approved. Inserting this mock is
+  // required because handleStrategic now runs runStrategicChallenge (adversarial
+  // second opinion) between the thinker and executor passes.
+  const CHALLENGE_MOCK = { exitCode: 0, allOutput: '', lastResultText: '' };
+
   // Executor output that satisfies the three required-call post-checks AND carries
   // the legacy inline markers in prose (so buildStrategicCompletionLogs sets a
   // warning) but contains no parseable JSON object.
@@ -2836,6 +2851,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
   it('re-asks exactly once and COMPLETES with the recovered inline strategic JSON', async () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce(CHALLENGE_MOCK)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
       .mockResolvedValueOnce({ exitCode: 0, allOutput: REPAIRED_STRATEGIC_JSON, lastResultText: REPAIRED_STRATEGIC_JSON });
 
@@ -2843,8 +2859,8 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    // thinker + executor + exactly one bounded re-ask = 3 invocations.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    // thinker + challenge + executor + exactly one bounded re-ask = 4 invocations.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
     expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
@@ -2858,6 +2874,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
   it('does NOT record repair success when the re-ask still yields no inline JSON', async () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce(CHALLENGE_MOCK)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'fallback summary' })
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still no parseable json here', lastResultText: '' });
 
@@ -2865,7 +2882,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
     expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
@@ -2883,6 +2900,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
 
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce(CHALLENGE_MOCK)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
       .mockResolvedValueOnce({ exitCode: 0, allOutput: STREAM_RAW, lastResultText: CLEAN_JSON });
 
@@ -2890,7 +2908,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
     expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
     const posted = lastPostedStatus();
     expect(posted.status).toBe('COMPLETED');
@@ -2901,6 +2919,7 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
   it('does NOT re-ask a command-based run that emits no inline strategic JSON (no warning gate)', async () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce(CHALLENGE_MOCK)
       .mockResolvedValueOnce({
         exitCode: 0,
         allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 40.',
@@ -2911,8 +2930,8 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    // Only thinker + executor — no re-ask, no format telemetry.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    // Only thinker + challenge + executor — no re-ask, no format telemetry.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
     expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
     expect(lastPostedStatus().status).toBe('COMPLETED');
