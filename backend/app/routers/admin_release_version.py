@@ -880,8 +880,9 @@ async def clear_deploy_failed(
     """Acknowledge and clear a stale post-promotion ``deploy_failed`` serving state.
 
     Admin-gated (matching the deploy operator levers). Targets the latest
-    ``promoted`` version whose ``serving_status`` is ``deploy_failed`` for the
-    project, under a per-version ``with_for_update`` row lock.
+    ``promoted`` version whose scalar or aggregate serving state is
+    ``deploy_failed`` for the project, under a per-version ``with_for_update``
+    row lock.
 
     Behavior:
 
@@ -911,23 +912,31 @@ async def clear_deploy_failed(
     )
     from app.time_utils import _utcnow  # noqa: PLC0415
 
-    version = (
-        (
+    version = None
+    promoted_versions = (
+        await session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.promoted_at.desc())
+        )
+    ).scalars().all()
+    for candidate in promoted_versions:
+        aggregate, _ = _version_serving_summary(candidate)
+        if (
+            candidate.serving_status == "deploy_failed"
+            or aggregate["serving_status"] == "deploy_failed"
+        ):
             await session.execute(
                 select(ReleaseVersion)
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "promoted",
-                    ReleaseVersion.serving_status == "deploy_failed",
-                )
-                .order_by(ReleaseVersion.promoted_at.desc())
-                .limit(1)
+                .where(ReleaseVersion.id == candidate.id)
                 .with_for_update()
             )
-        )
-        .scalars()
-        .first()
-    )
+            version = candidate
+            break
     if version is None:
         raise HTTPException(
             status_code=404,
