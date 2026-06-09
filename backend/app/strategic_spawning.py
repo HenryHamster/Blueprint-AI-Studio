@@ -3760,6 +3760,13 @@ async def _spawn_strategic_review(
         _rec_mode = d.get("recommended_mode")
         if _rec_mode and _rec_mode != "ship":
             stat_entry["recommended_mode"] = _rec_mode
+        # Research spawn-gate effectiveness (distinct from strategic self-challenge).
+        # Only emitted when the direction has actual spawn-gate activity recorded.
+        from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+        _sgm = compute_spawn_gate_aggregate(history)
+        if _sgm is not None:
+            stat_entry["spawn_gate_metrics"] = _sgm
         direction_stats.append(stat_entry)
 
     mode_hint_lines = []

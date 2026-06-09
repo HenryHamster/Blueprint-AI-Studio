@@ -679,7 +679,18 @@ export function buildDirSummaryText(
       failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
     }
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
+    let spawnGateSection = '';
+    const sgm = d.spawn_gate_metrics as Record<string, unknown> | undefined;
+    if (sgm && typeof sgm === 'object') {
+      const challenged = Number(sgm.challenged ?? 0);
+      const refuted = Number(sgm.refuted ?? 0);
+      const survived = Number(sgm.survived ?? 0);
+      const cmr = sgm.challenged_merge_rate != null ? `${Math.round(Number(sgm.challenged_merge_rate) * 100)}%` : 'n/a';
+      const umr = sgm.unchallenged_merge_rate != null ? `${Math.round(Number(sgm.unchallenged_merge_rate) * 100)}%` : 'n/a';
+      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged (${refuted} refuted, ${survived} survived) — merge rate: ${cmr} challenged vs ${umr} unchallenged`;
+    }
+
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer

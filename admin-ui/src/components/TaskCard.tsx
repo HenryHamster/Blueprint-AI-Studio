@@ -8,6 +8,7 @@ import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { useTaskCapabilities } from '../taskCapabilities';
 import type { FixLoopSummary } from '../types/task';
+import { deriveSpawnGateState } from '../types/task';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
 function formatCompact(seconds: number): string {
@@ -30,8 +31,9 @@ function SpawnSignalBadges({ task }: { task: Task }) {
   const lowConfidence = ctx?.low_confidence_spawn === true;
   const autoDecomposed = ctx?.auto_decomposed === true;
   const mediumExploration = ctx?.medium_exploration === true;
+  const spawnGate = deriveSpawnGateState(task.context);
 
-  if (!lowConfidence && !autoDecomposed && !mediumExploration) return null;
+  if (!lowConfidence && !autoDecomposed && !mediumExploration && spawnGate.kind !== 'fail-open-pass' && spawnGate.kind !== 'challenged-pass') return null;
 
   const rate = ctx?.low_confidence_spawn_rate;
   const ratePct = typeof rate === 'number' ? Math.round(rate * 100) : null;
@@ -64,6 +66,22 @@ function SpawnSignalBadges({ task }: { task: Task }) {
           className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
         >
           explore
+        </span>
+      )}
+      {spawnGate.kind === 'fail-open-pass' && (
+        <span
+          title={spawnGate.reason ?? 'Passed by fail-open — no challenger verdict was returned for this finding'}
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
+        >
+          fail-open
+        </span>
+      )}
+      {spawnGate.kind === 'challenged-pass' && (
+        <span
+          title={spawnGate.reason ?? 'Challenger confirmed this finding as actionable'}
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+        >
+          gate ✓
         </span>
       )}
     </>

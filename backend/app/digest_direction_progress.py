@@ -39,6 +39,47 @@ def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
     )
 
 
+def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Aggregate research spawn-gate counters from a direction's research_history.
+
+    Returns a compact 5-field dict (challenged, refuted, survived,
+    challenged_merge_rate, unchallenged_merge_rate) or None when all counters
+    are zero (no spawn-gate activity recorded).
+    """
+    challenged = 0
+    refuted = 0
+    survived = 0
+    challenged_spawned = 0
+    challenged_merged = 0
+    unchallenged_spawned = 0
+    unchallenged_merged = 0
+    for entry in history or []:
+        challenged += entry.get("research_spawn_gate_challenged_count") or 0
+        refuted += entry.get("research_spawn_gate_refuted_count") or 0
+        survived += entry.get("research_spawn_gate_survived_count") or 0
+        challenged_spawned += entry.get("research_spawn_gate_challenged_spawned") or 0
+        challenged_merged += entry.get("research_spawn_gate_challenged_merged") or 0
+        unchallenged_spawned += entry.get("research_spawn_gate_unchallenged_spawned") or 0
+        unchallenged_merged += entry.get("research_spawn_gate_unchallenged_merged") or 0
+    if not any([challenged, refuted, survived, challenged_spawned, unchallenged_spawned]):
+        return None
+    challenged_merge_rate = (
+        round(challenged_merged / challenged_spawned, 3) if challenged_spawned > 0 else None
+    )
+    unchallenged_merge_rate = (
+        round(unchallenged_merged / unchallenged_spawned, 3)
+        if unchallenged_spawned > 0
+        else None
+    )
+    return {
+        "challenged": challenged,
+        "refuted": refuted,
+        "survived": survived,
+        "challenged_merge_rate": challenged_merge_rate,
+        "unchallenged_merge_rate": unchallenged_merge_rate,
+    }
+
+
 async def compute_direction_progress(
     session: AsyncSession,
     *,

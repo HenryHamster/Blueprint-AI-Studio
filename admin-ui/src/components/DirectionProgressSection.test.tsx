@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 
 import { DirectionProgressSection, type DirectionProgress } from './DirectionProgressSection';
 
@@ -131,5 +131,88 @@ describe('DirectionProgressSection retirement eligible', () => {
     );
 
     expect(screen.queryByText('retirement eligible')).not.toBeInTheDocument();
+  });
+});
+
+describe('DirectionProgressSection spawn gate', () => {
+  function expand() {
+    const btn = screen.getByRole('button', { name: /Improve proof visibility/ });
+    fireEvent.click(btn);
+  }
+
+  it('renders_research_spawn_gate_comparison — shows challenged/refuted/survived counts and merge rate comparison', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({
+          research_spawn_gate: {
+            challenged_count: 5,
+            refuted_count: 2,
+            survived_count: 3,
+            challenged_spawned: 3,
+            challenged_merged: 2,
+            challenged_merge_rate: 0.67,
+            unchallenged_spawned: 10,
+            unchallenged_merged: 4,
+            unchallenged_merge_rate: 0.40,
+          },
+        })]}
+      />,
+    );
+    expand();
+
+    const row = screen.getByText(/Spawn gate:/);
+    expect(row).toBeInTheDocument();
+    expect(row.textContent).toContain('5 challenged');
+    expect(row.textContent).toContain('2 refuted');
+    expect(row.textContent).toContain('3 survived');
+    expect(row.textContent).toContain('67% challenged');
+    expect(row.textContent).toContain('40% unchallenged');
+  });
+
+  it('omits spawn gate block when research_spawn_gate is null', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ research_spawn_gate: null })]}
+      />,
+    );
+    expand();
+
+    expect(screen.queryByText(/Spawn gate:/)).not.toBeInTheDocument();
+  });
+
+  it('omits spawn gate block when research_spawn_gate field is absent (legacy payload)', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection()]}
+      />,
+    );
+    expand();
+
+    expect(screen.queryByText(/Spawn gate:/)).not.toBeInTheDocument();
+  });
+
+  it('renders em-dash for null merge rates when no spawned tasks exist yet', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({
+          research_spawn_gate: {
+            challenged_count: 3,
+            refuted_count: 1,
+            survived_count: 2,
+            challenged_spawned: 2,
+            challenged_merged: 0,
+            challenged_merge_rate: null,
+            unchallenged_spawned: 5,
+            unchallenged_merged: 0,
+            unchallenged_merge_rate: null,
+          },
+        })]}
+      />,
+    );
+    expand();
+
+    const row = screen.getByText(/Spawn gate:/);
+    expect(row.textContent).toContain('— challenged');
+    expect(row.textContent).toContain('— unchallenged');
   });
 });

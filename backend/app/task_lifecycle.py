@@ -410,18 +410,25 @@ async def _resolve_quality_grader_completion(
 
     ctx = dict(source.context or {})
     if is_adversarial:
-        # Derive finding hashes from stored plan_output so the fail-open default
-        # covers all known findings without requiring the caller to pass them.
-        stored_findings = source.plan_output or []
-        if isinstance(stored_findings, dict):
-            stored_findings = stored_findings.get("findings") or []
         from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
 
-        all_hashes = [
-            _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
-            for f in stored_findings
-            if isinstance(f, dict)
-        ]
+        # Prefer hashes persisted at park time: these include prior_deferred
+        # findings that were prepended AFTER plan_output was written. Without
+        # this, a verdict for a recovered deferred finding is silently ignored
+        # (unknown hash) and that finding gets a fail-open pass on re-entry.
+        _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
+        if isinstance(_stored_hashes, list) and _stored_hashes:
+            all_hashes = [h for h in _stored_hashes if isinstance(h, str)]
+        else:
+            # Fallback for tasks parked before this fix.
+            stored_findings = source.plan_output or []
+            if isinstance(stored_findings, dict):
+                stored_findings = stored_findings.get("findings") or []
+            all_hashes = [
+                _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
+                for f in stored_findings
+                if isinstance(f, dict)
+            ]
         finding_verdicts = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )

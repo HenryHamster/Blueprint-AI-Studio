@@ -1,5 +1,6 @@
 """Unit tests for research_completion.py pre-spawn scope-budget gate, low_actionability decay, grade normalization, source ref validation, and findings index."""
 
+import json
 import logging
 import uuid
 from datetime import timedelta
@@ -6443,6 +6444,104 @@ def _high_stakes_finding(direction_id: str, title: str = "Big risky change") -> 
 
 
 @_pytest.mark.asyncio
+async def test_prior_deferred_high_stakes_finding_is_challenged_before_spawn(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: a recovered deferred high-stakes finding is included in the
+    adversarial challenge on the next cycle and cannot spawn until the challenger returns.
+
+    Scenario: A previous cycle deferred a high-stakes finding (batch_cap reason).
+    On the next research cycle, the fresh log output has no findings.
+    The deferred finding must be recovered, included in the adversarial gate
+    challenge payload, and the task must park EVALUATING — it must NOT spawn.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-defer-adv01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    deferred_hs = _high_stakes_finding(direction["id"], "Batch-cap deferred high-stakes finding")
+    deferred_hs["deferred_reason"] = "batch_cap"
+    deferred_hs["deferred_count"] = 1
+
+    # Inject the deferred finding as if the previous cycle stored it.
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [deferred_hs],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # Fresh research log returns a low-stakes finding — the recovered deferred
+    # finding is high-stakes and must trigger the adversarial gate.
+    from test_autonomous_research import _make_finding
+
+    low_fresh = _make_finding(direction_id=direction["id"])
+    low_fresh["title"] = "Routine low-stakes finding"
+    low_fresh["risk"] = "low"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[low_fresh],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The task must be parked EVALUATING, not have spawned the deferred finding.
+    assert task.status == TaskStatus.EVALUATING, (
+        "Recovered deferred high-stakes finding must park the task awaiting adversarial verdict"
+    )
+    assert task.context.get("awaiting_adversarial_grader"), (
+        "awaiting_adversarial_grader flag must be set"
+    )
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Recovered deferred high-stakes finding must not spawn before adversarial verdict"
+    )
+
+    # An adversarial grader must have been spawned.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1, "Exactly one adversarial grader must be spawned"
+    grader = others[0]
+    assert (grader.context or {}).get("adversarial_grader") is True
+
+    # The grader payload must contain the deferred finding with its hash.
+    prompt = (grader.first_payload or {}).get("prompt") or ""
+    fhash = _finding_hash(
+        deferred_hs["title"],
+        deferred_hs.get("description", "") or deferred_hs.get("prompt", ""),
+    )
+    assert '"hash"' in prompt, "Grader payload must include hash field"
+    assert fhash in prompt, (
+        "The deferred finding's hash must appear in the adversarial grader payload"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_adversarial_gate_parks_source_with_high_stakes_findings(
     db_session, mocker
 ):
@@ -6569,9 +6668,13 @@ async def test_adversarial_gate_disabled_by_flag(db_session, mocker):
 
 
 @_pytest.mark.asyncio
-async def test_adversarial_reentry_failed_finding_is_deferred(db_session, mocker):
-    """Re-entry after adversarial verdict: a failed finding is DEFERRED, not dropped."""
+async def test_adversarial_grader_completion_parses_real_output_and_defers_failed_finding(
+    db_session, mocker
+):
+    """Live adversarial prompt uses hash and a real fail verdict defers the finding."""
     from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
     from test_autonomous_research import _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-adv04")
@@ -6585,27 +6688,47 @@ async def test_adversarial_reentry_failed_finding_is_deferred(db_session, mocker
     hs = _high_stakes_finding(direction["id"], "Risky deferred finding")
     fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
 
-    # Simulate the adversarial grader having already returned a FAIL verdict.
-    task.plan_output = [hs]
-    task.status = TaskStatus.COMPLETED
-    task.context = {
-        **(task.context or {}),
-        ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {
-                fhash: {"passed": False, "reason": "premise wrong", "explicit": True}
-            },
-            "grader_task_id": "test-grader-001",
-        },
-    }
-    db_session.add(task)
-    await db_session.commit()
-
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[hs],
     )
 
     await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+    grader = graders[0]
+    prompt = (grader.first_payload or {}).get("prompt") or ""
+    assert "_adversarial_hash" not in prompt
+    assert '"hash"' in prompt
+    _, _, findings_block = prompt.partition("-----8<----- FINDINGS START -----8<-----")
+    findings_json, _, _ = findings_block.partition("-----8<----- FINDINGS END -----8<-----")
+    parsed_findings = json.loads(findings_json.strip())
+    assert parsed_findings == [{**hs, "hash": fhash}]
+
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            '[{"hash": "' + fhash + '", "verdict": "fail", '
+            '"reason": "premise wrong"}]'
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
     await db_session.refresh(task)
 
     # No implementation children — deferred, not spawned.
@@ -6628,6 +6751,121 @@ async def test_adversarial_reentry_failed_finding_is_deferred(db_session, mocker
     # _adversarial_verdict must be stripped from the deferred entry.
     for d in deferred:
         assert "_adversarial_verdict" not in d, "_adversarial_verdict must be cleared on deferral"
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_defers_recovered_deferred_finding_on_fail_verdict(
+    db_session, mocker
+):
+    """Adversarial fail verdict for a recovered prior_deferred finding defers it, not spawns.
+
+    Regression test for the bug where plan_output is written before prior_deferred
+    recovery, so _resolve_quality_grader_completion's all_hashes list (built from
+    plan_output) omits the recovered finding's hash.  That caused the verdict to be
+    silently ignored (unknown hash) and the finding to get a fail-open pass on re-entry.
+
+    With the fix the challenged hashes are persisted in task.context before parking,
+    so the verdict is correctly matched and a fail verdict defers the finding.
+    """
+    from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-deferred01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    # A high-stakes finding deferred from the previous cycle.
+    deferred_hs = _high_stakes_finding(direction["id"], "Prior-deferred high-stakes finding")
+    deferred_hs["deferred_reason"] = "batch_cap"
+    deferred_hs["deferred_count"] = 1
+    fhash = _finding_hash(
+        deferred_hs["title"],
+        deferred_hs.get("description", "") or deferred_hs.get("prompt", ""),
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [deferred_hs],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # Current cycle returns only a low-stakes fresh finding (not high-stakes).
+    low_fresh = _make_finding(direction_id=direction["id"])
+    low_fresh["title"] = "Low-stakes fresh finding"
+    low_fresh["risk"] = "low"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[low_fresh],
+    )
+    mocker.patch(
+        "app.research_completion.validate_source_refs",
+        new=AsyncMock(side_effect=lambda sources, **kwargs: sources),
+    )
+
+    # Phase 1: completion handler parks the task, spawning an adversarial grader.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.EVALUATING, "task must park awaiting adversarial verdict"
+    # The fix: challenged hashes must include the deferred finding's hash.
+    assert fhash in (task.context or {}).get("_adversarial_challenged_hashes", []), (
+        "_adversarial_challenged_hashes must include the recovered deferred finding's hash"
+    )
+
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+    grader = graders[0]
+
+    # Phase 2: grader completes with a FAIL verdict for the deferred finding's hash.
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            '[{"hash": "' + fhash + '", "verdict": "fail", '
+            '"reason": "premise wrong — cited code absent on HEAD"}]'
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
+    await db_session.refresh(task)
+
+    # The deferred finding must NOT have spawned a child task.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    spawned_titles = [c.title for c in children]
+    assert deferred_hs["title"] not in spawned_titles, (
+        "adversarial-failed recovered deferred finding must not spawn"
+    )
+    # The failed finding must be re-deferred for the next cycle.
+    all_deferred = (task.context or {}).get("deferred_findings", [])
+    assert any(d.get("title") == deferred_hs["title"] for d in all_deferred), (
+        "adversarial-failed recovered deferred finding must appear in deferred_findings"
+    )
 
 
 @_pytest.mark.asyncio

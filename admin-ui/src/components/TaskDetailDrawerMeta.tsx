@@ -12,6 +12,7 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
+import { deriveSpawnGateState } from '../types/task';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import {
   parseMergeTestVerdict,
@@ -310,6 +311,9 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
     ? parentResearchTask.research_findings[findingIndex]
     : undefined;
   if (!researchTaskId) return null;
+
+  const spawnGate = deriveSpawnGateState(task.context);
+
   return (
     <>
       <SectionHeader>Research Origin</SectionHeader>
@@ -328,6 +332,25 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
         </DetailRow>
       )}
       {originFinding?.direction_id && <DetailRow label="Direction"><span className="font-mono text-xs text-neutral-400">{originFinding.direction_id}</span></DetailRow>}
+      {spawnGate.kind !== 'no-gate' && (
+        <DetailRow label="Spawn Gate">
+          {spawnGate.kind === 'unchallenged' && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-400">unchallenged</span>
+          )}
+          {spawnGate.kind === 'challenged-pass' && (
+            <span className="inline-flex flex-col gap-1 min-w-0">
+              <span className="text-xs px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 self-start">challenged — pass</span>
+              {spawnGate.reason && <span className="text-xs text-neutral-500 break-words">{spawnGate.reason}</span>}
+            </span>
+          )}
+          {spawnGate.kind === 'fail-open-pass' && (
+            <span className="inline-flex flex-col gap-1 min-w-0">
+              <span className="text-xs px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 self-start">fail-open pass</span>
+              {spawnGate.reason && <span className="text-xs text-neutral-500 break-words">{spawnGate.reason}</span>}
+            </span>
+          )}
+        </DetailRow>
+      )}
     </>
   );
 }

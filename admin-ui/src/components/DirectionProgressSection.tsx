@@ -87,6 +87,17 @@ export interface DirectionProgress {
     batch_cap?: number;
     tasks_created?: number;
   } | null;
+  research_spawn_gate?: {
+    challenged_count?: number;
+    refuted_count?: number;
+    survived_count?: number;
+    challenged_spawned?: number;
+    challenged_merged?: number;
+    challenged_merge_rate?: number | null;
+    unchallenged_spawned?: number;
+    unchallenged_merged?: number;
+    unchallenged_merge_rate?: number | null;
+  } | null;
   prompt_quality_hint?: string | null;
   decomposition_summary?: {
     plans_assessed?: number;
@@ -546,6 +557,26 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     )}
                   </div>
                 )}
+                {(() => {
+                  const sg = dp.research_spawn_gate;
+                  if (!sg) return null;
+                  const challenged = sg.challenged_count ?? 0;
+                  const refuted = sg.refuted_count ?? 0;
+                  const survived = sg.survived_count ?? 0;
+                  if (!challenged && !refuted && !survived) return null;
+                  const fmtRate = (r: number | null | undefined) =>
+                    typeof r === 'number' ? `${Math.round(r * 100)}%` : '—';
+                  const challengedRate = fmtRate(sg.challenged_merge_rate);
+                  const unchallengedRate = fmtRate(sg.unchallenged_merge_rate);
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Spawn gate: {challenged} challenged · {refuted} refuted · {survived} survived
+                      {(sg.challenged_spawned ?? 0) > 0 || (sg.unchallenged_spawned ?? 0) > 0
+                        ? ` · merge rate: ${challengedRate} challenged vs ${unchallengedRate} unchallenged`
+                        : ''}
+                    </span>
+                  );
+                })()}
                 {dp.prompt_quality_hint && (
                   <span className="text-[10px] text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
                     Prompt quality: {dp.prompt_quality_hint}

@@ -951,6 +951,81 @@ describe('DetailsTab — Structural Gating', () => {
   });
 });
 
+describe('DetailsTab — Research Origin Spawn Gate', () => {
+  afterEach(() => cleanup());
+
+  function makeResearchChildTask(spawnGateCtx: Record<string, unknown> = {}): Task {
+    return makeTask({
+      context: {
+        research_task_id: 'research-task-1',
+        finding_index: 0,
+        ...spawnGateCtx,
+      },
+    });
+  }
+
+  it('renders no Spawn Gate row for a non-research-derived task', () => {
+    render(<DetailsTab task={makeTask()} />);
+    expect(screen.queryByText('Spawn Gate')).toBeNull();
+  });
+
+  it('renders unchallenged badge when gate did not run on the finding', () => {
+    const task = makeResearchChildTask({ research_spawn_gate_challenged: false });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Spawn Gate')).toBeInTheDocument();
+    expect(screen.getByText('unchallenged')).toBeInTheDocument();
+  });
+
+  it('renders challenged-pass badge with bounded reason', () => {
+    const task = makeResearchChildTask({
+      research_spawn_gate_challenged: true,
+      research_spawn_gate_verdict: 'pass',
+      research_spawn_gate_explicit: true,
+      research_spawn_gate_reason: 'Challenger confirmed actionability',
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('challenged — pass')).toBeInTheDocument();
+    expect(screen.getByText('Challenger confirmed actionability')).toBeInTheDocument();
+    // Challenged-pass badge should be emerald (green)
+    expect(screen.getByText('challenged — pass').className).toContain('emerald');
+  });
+
+  it('renders fail-open-pass badge with amber styling when explicit is false', () => {
+    const task = makeResearchChildTask({
+      research_spawn_gate_challenged: true,
+      research_spawn_gate_verdict: 'pass',
+      research_spawn_gate_explicit: false,
+      research_spawn_gate_reason: 'fail-open: no verdict returned for this finding',
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('fail-open pass')).toBeInTheDocument();
+    expect(screen.getByText(/fail-open: no verdict returned/)).toBeInTheDocument();
+    // Fail-open badge should be amber (risky)
+    expect(screen.getByText('fail-open pass').className).toContain('amber');
+  });
+
+  it('renders Spawn Gate row without reason when reason is null', () => {
+    const task = makeResearchChildTask({
+      research_spawn_gate_challenged: true,
+      research_spawn_gate_verdict: 'pass',
+      research_spawn_gate_explicit: true,
+      research_spawn_gate_reason: null,
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('challenged — pass')).toBeInTheDocument();
+    // No reason text should appear
+    expect(screen.queryByText(/Challenger confirmed/)).toBeNull();
+  });
+
+  it('renders unchallenged badge when research_spawn_gate_challenged is absent', () => {
+    // No spawn gate keys at all — task was spawned from research but gate didn't run
+    const task = makeResearchChildTask({});
+    render(<DetailsTab task={task} />);
+    // research_spawn_gate_challenged is absent/falsy → unchallenged
+    expect(screen.getByText('unchallenged')).toBeInTheDocument();
+  });
+});
+
 describe('DetailsTab — Liveness signals', () => {
   afterEach(() => cleanup());
 

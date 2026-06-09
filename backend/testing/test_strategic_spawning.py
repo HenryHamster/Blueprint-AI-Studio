@@ -1786,6 +1786,85 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
 
 
 @pytest.mark.asyncio
+async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
+    """spawn_gate_metrics appears in direction stats when direction has spawn-gate activity."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg01",
+                "status": "active",
+                "text": "Direction with spawn-gate history",
+                "priority": "medium",
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "research_spawn_gate_challenged_count": 5,
+                        "research_spawn_gate_refuted_count": 2,
+                        "research_spawn_gate_survived_count": 3,
+                        "research_spawn_gate_challenged_spawned": 3,
+                        "research_spawn_gate_challenged_merged": 2,
+                        "research_spawn_gate_unchallenged_spawned": 4,
+                        "research_spawn_gate_unchallenged_merged": 3,
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg01")
+
+    assert "spawn_gate_metrics" in d_stat, "spawn_gate_metrics should be present for direction with spawn-gate activity"
+    sgm = d_stat["spawn_gate_metrics"]
+    assert sgm["challenged"] == 5
+    assert sgm["refuted"] == 2
+    assert sgm["survived"] == 3
+    assert sgm["challenged_merge_rate"] == round(2 / 3, 3)
+    assert sgm["unchallenged_merge_rate"] == round(3 / 4, 3)
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_metrics_absent_when_no_activity(db_session):
+    """spawn_gate_metrics is absent from direction stats when no spawn-gate counters are set."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg02",
+                "status": "active",
+                "text": "Direction without spawn-gate history",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg02")
+
+    assert "spawn_gate_metrics" not in d_stat, "spawn_gate_metrics should be absent when no spawn-gate activity"
+
+
+@pytest.mark.asyncio
 async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
     """Strategic review prompt suffix should spell out mode-specific guidance per direction."""
     project = _make_project(

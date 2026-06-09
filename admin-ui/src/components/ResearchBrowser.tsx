@@ -5,7 +5,8 @@ import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
-import type { Task, TaskEvaluationSummary } from '../types/task';
+import type { Task, TaskEvaluationSummary, SpawnGateState } from '../types/task';
+import { deriveSpawnGateState } from '../types/task';
 
 interface Direction {
   id: string;
@@ -21,7 +22,7 @@ interface EnrichedFinding {
   taskCreatedAt: string;
   findingIndex: number;
   /** Info about the child task that implemented this finding, if any. */
-  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null };
+  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null; spawnGateState?: SpawnGateState };
 }
 
 /** Findings grouped under a direction (or "undirected"). */
@@ -278,7 +279,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   // Build the map of finding key -> child task info from the project-wide feed when available.
   const implementedFindings = useMemo(() => {
     const outcomeFeed = researchFeed ?? tasks;
-    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null }>();
+    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null; spawnGateState?: SpawnGateState }>();
     for (const task of outcomeFeed) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
@@ -290,7 +291,31 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           prUrl: task.pr_url,
           failureClass: task.failure_class ?? undefined,
           evaluationSummary: task.evaluation_summary ?? undefined,
+          spawnGateState: deriveSpawnGateState(task.context),
         });
+      }
+    }
+    return map;
+  }, [tasks, researchFeed]);
+
+  // Build a lookup of adversarially-deferred findings by (researchTaskId:titleLower).
+  const adversarialDeferredByKey = useMemo(() => {
+    const feedTasks = researchFeed ?? tasks;
+    const map = new Map<string, { adversarial_gate_reason: string | null }>();
+    for (const task of feedTasks) {
+      if (task.task_type !== 'research') continue;
+      const deferred = task.context?.deferred_findings;
+      if (!Array.isArray(deferred)) continue;
+      for (const df of deferred) {
+        if ((df as Record<string, unknown>).deferred_reason === 'adversarial_gate') {
+          const title = (df as Record<string, unknown>).title as string | undefined;
+          if (title) {
+            const key = `${task.id}:${title.toLowerCase()}`;
+            map.set(key, {
+              adversarial_gate_reason: ((df as Record<string, unknown>).adversarial_gate_reason as string | null | undefined) ?? null,
+            });
+          }
+        }
       }
     }
     return map;
@@ -644,6 +669,35 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 ⚠ {ef.finding._provenance_warnings.broken_source_ref_count} broken refs
                               </span>
                             )}
+                            {ef.outcome?.spawnGateState?.kind === 'fail-open-pass' && (
+                              <span
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-[10px]"
+                                title={ef.outcome.spawnGateState.reason ?? 'Passed by fail-open — no challenger verdict was returned'}
+                              >
+                                fail-open
+                              </span>
+                            )}
+                            {ef.outcome?.spawnGateState?.kind === 'challenged-pass' && (
+                              <span
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 text-[10px]"
+                                title={ef.outcome.spawnGateState.reason ?? 'Challenger confirmed this finding as actionable'}
+                              >
+                                gate ✓
+                              </span>
+                            )}
+                            {!ef.outcome && (() => {
+                              const deferredKey = `${ef.taskId}:${ef.finding.title.toLowerCase()}`;
+                              const deferred = adversarialDeferredByKey.get(deferredKey);
+                              if (!deferred) return null;
+                              return (
+                                <span
+                                  className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-red-900/40 text-red-400 text-[10px]"
+                                  title={deferred.adversarial_gate_reason ?? 'Refuted by adversarial gate'}
+                                >
+                                  refuted
+                                </span>
+                              );
+                            })()}
                             <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
                           </div>
                           {isDetailOpen && (

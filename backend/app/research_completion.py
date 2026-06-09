@@ -1847,101 +1847,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             return
 
-    # Adversarial spawn-gate (DEFAULT ON). When enabled and no adversarial
-    # verdict has been written yet, select the high-stakes findings and spawn a
-    # refute-first per-finding adversarial challenger. The source parks
-    # EVALUATING until the challenger returns, then re-enters this handler with
-    # ADVERSARIAL_GATE_VERDICT_KEY in context. On re-entry the per-finding
-    # verdicts are stamped onto findings below, and the spawn loop defers any
-    # finding marked failed (not dropped — deferred to the next cycle).
-    # FAIL-OPEN: a crashed or absent grader writes no failing verdicts, so the
-    # gate never blocks spawning on infrastructure failure. Low-stakes findings
-    # keep the cheap synchronous path and are never escalated.
-    if _adversarial_verdict_raw is None and _runtime_config.get(
-        "adversarial_spawn_gate_enabled", True
-    ):
-        _high_stakes = [f for f in findings if _is_high_stakes_finding(f)]
-        if _high_stakes:
-            # Build a compact payload for the adversarial grader: include hash
-            # identifiers so the per-finding verdict response can be matched back.
-            from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
-
-            _hs_with_hash = []
-            for _f in _high_stakes:
-                _h = _fh(str(_f.get("title", "")), str(_f.get("description", "") or _f.get("prompt", "")))
-                _hs_with_hash.append({**_f, "_adversarial_hash": _h})
-            adv_grader = await spawn_forward_quality_grader(
-                task,
-                json.dumps(_hs_with_hash),
-                session,
-                adversarial_mode=True,
-            )
-            if adv_grader is not None:
-                logger.info(
-                    "[RESEARCH] Task %s parked awaiting adversarial challenge "
-                    "(grader %s, %d high-stakes finding(s))",
-                    task.id,
-                    adv_grader.id,
-                    len(_high_stakes),
-                )
-                return
-
-    # Adversarial re-entry: stamp per-finding verdicts so the spawn loop can
-    # skip challenged-and-failed findings. The gate is fail-open: any finding
-    # whose hash is absent from the verdict dict was passed by default.
-    _spawn_gate_challenged_count = 0
-    _spawn_gate_refuted_count = 0
-    _spawn_gate_survived_count = 0
-    if _adversarial_verdict_raw is not None:
-        _adv_verdicts: dict[str, dict] = (
-            _adversarial_verdict_raw.get("finding_verdicts") or {}
-        )
-        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
-
-        for _f in findings:
-            _fhash = _fh(
-                str(_f.get("title", "")),
-                str(_f.get("description", "") or _f.get("prompt", "")),
-            )
-            _verdict_obj = _adv_verdicts.get(_fhash)
-            if _verdict_obj is None:
-                # Hash absent from grader output: fail-open pass, not an explicit verdict.
-                _passed = True
-                _reason = "fail-open: no verdict returned for this finding"
-                _explicit = False
-            elif isinstance(_verdict_obj, bool):
-                # Normalise legacy bool verdicts so old stored context still works.
-                _passed = _verdict_obj
-                _reason = ""
-                _explicit = True
-            else:
-                _passed = bool(_verdict_obj.get("passed", True))
-                _reason = str(_verdict_obj.get("reason") or "")
-                _explicit = bool(_verdict_obj.get("explicit", True))
-            if not _passed:
-                _f["_adversarial_verdict"] = "fail"
-            _f["_adversarial_verdict_reason"] = _reason
-            _f["_adversarial_verdict_explicit"] = _explicit
-        _spawn_gate_challenged_count = sum(
-            1 for _f in findings if _is_high_stakes_finding(_f)
-        )
-        _spawn_gate_refuted_count = sum(
-            1 for _f in findings if _f.get("_adversarial_verdict") == "fail"
-        )
-        _spawn_gate_survived_count = (
-            _spawn_gate_challenged_count - _spawn_gate_refuted_count
-        )
-
-    # Separate direction proposals and notes from actionable findings — these are processed
-    # separately and must not enter the hash-based deduplication loop (they never create tasks,
-    # so their hashes would never be stored, allowing identical entries to accumulate).
-    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
-    direction_notes = [f for f in findings if f.get("type") == "direction_note"]
-    findings = [
-        f
-        for f in findings
-        if f.get("type") not in ("direction_proposal", "direction_note")
-    ]
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
@@ -2156,6 +2061,115 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             findings = prior_actionable + findings
 
+    # Adversarial spawn-gate (DEFAULT ON). When enabled and no adversarial
+    # verdict has been written yet, select the high-stakes findings and spawn a
+    # refute-first per-finding adversarial challenger. The source parks
+    # EVALUATING until the challenger returns, then re-enters this handler with
+    # ADVERSARIAL_GATE_VERDICT_KEY in context. On re-entry the per-finding
+    # verdicts are stamped onto findings below, and the spawn loop defers any
+    # finding marked failed (not dropped — deferred to the next cycle).
+    # FAIL-OPEN: a crashed or absent grader writes no failing verdicts, so the
+    # gate never blocks spawning on infrastructure failure. Low-stakes findings
+    # keep the cheap synchronous path and are never escalated.
+    if _adversarial_verdict_raw is None and _runtime_config.get(
+        "adversarial_spawn_gate_enabled", True
+    ):
+        _high_stakes = [f for f in findings if _is_high_stakes_finding(f)]
+        if _high_stakes:
+            # Build a compact payload for the adversarial grader: include hash
+            # identifiers so the per-finding verdict response can be matched back.
+            from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+            _hs_with_hash = []
+            for _f in _high_stakes:
+                _h = _fh(str(_f.get("title", "")), str(_f.get("description", "") or _f.get("prompt", "")))
+                _hs_with_hash.append({**_f, "hash": _h})
+            adv_grader = await spawn_forward_quality_grader(
+                task,
+                json.dumps(_hs_with_hash),
+                session,
+                adversarial_mode=True,
+            )
+            if adv_grader is not None:
+                # Persist the challenged hashes before parking so
+                # _resolve_quality_grader_completion can build all_hashes
+                # from these — which include prior_deferred findings prepended
+                # after plan_output was written — rather than from plan_output
+                # alone. Without this, verdicts for recovered deferred findings
+                # are ignored (unknown hash) and those findings get fail-open pass.
+                _ctx = dict(task.context or {})
+                _ctx["_adversarial_challenged_hashes"] = [
+                    f["hash"] for f in _hs_with_hash
+                ]
+                task.context = _ctx
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                logger.info(
+                    "[RESEARCH] Task %s parked awaiting adversarial challenge "
+                    "(grader %s, %d high-stakes finding(s))",
+                    task.id,
+                    adv_grader.id,
+                    len(_high_stakes),
+                )
+                return
+
+    # Adversarial re-entry: stamp per-finding verdicts so the spawn loop can
+    # skip challenged-and-failed findings. The gate is fail-open: any finding
+    # whose hash is absent from the verdict dict was passed by default.
+    _spawn_gate_challenged_count = 0
+    _spawn_gate_refuted_count = 0
+    _spawn_gate_survived_count = 0
+    if _adversarial_verdict_raw is not None:
+        _adv_verdicts: dict[str, dict] = (
+            _adversarial_verdict_raw.get("finding_verdicts") or {}
+        )
+        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+        for _f in findings:
+            _fhash = _fh(
+                str(_f.get("title", "")),
+                str(_f.get("description", "") or _f.get("prompt", "")),
+            )
+            _verdict_obj = _adv_verdicts.get(_fhash)
+            if _verdict_obj is None:
+                # Hash absent from grader output: fail-open pass, not an explicit verdict.
+                _passed = True
+                _reason = "fail-open: no verdict returned for this finding"
+                _explicit = False
+            elif isinstance(_verdict_obj, bool):
+                # Normalise legacy bool verdicts so old stored context still works.
+                _passed = _verdict_obj
+                _reason = ""
+                _explicit = True
+            else:
+                _passed = bool(_verdict_obj.get("passed", True))
+                _reason = str(_verdict_obj.get("reason") or "")
+                _explicit = bool(_verdict_obj.get("explicit", True))
+            if not _passed:
+                _f["_adversarial_verdict"] = "fail"
+            _f["_adversarial_verdict_reason"] = _reason
+            _f["_adversarial_verdict_explicit"] = _explicit
+        _spawn_gate_challenged_count = sum(
+            1 for _f in findings if _is_high_stakes_finding(_f)
+        )
+        _spawn_gate_refuted_count = sum(
+            1 for _f in findings if _f.get("_adversarial_verdict") == "fail"
+        )
+        _spawn_gate_survived_count = (
+            _spawn_gate_challenged_count - _spawn_gate_refuted_count
+        )
+
+    # Separate direction proposals and notes from actionable findings — these are processed
+    # separately and must not enter the hash-based deduplication loop (they never create tasks,
+    # so their hashes would never be stored, allowing identical entries to accumulate).
+    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
+    direction_notes = [f for f in findings if f.get("type") == "direction_note"]
+    findings = [
+        f
+        for f in findings
+        if f.get("type") not in ("direction_proposal", "direction_note")
+    ]
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
     from app import shared_state as _ss  # noqa: PLC0415
     from app import max_plan_pool as _pool_mod  # noqa: PLC0415
