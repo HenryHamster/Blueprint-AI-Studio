@@ -782,11 +782,29 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # _strategic_failures breaker is bypassed for operator intent.
     from app.strategic_trigger import (
         ORIGIN_OPERATOR as _ORIGIN_OPERATOR,
+        refresh_breaker_applies,
+        strategic_refresh_due,
         strategic_refresh_origin as _strategic_refresh_origin,
     )
 
     if _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR:
         force_strategic = True
+    elif not force_strategic:
+        _refresh_min_interval = _runtime_config.get(
+            "strategic_refresh_min_interval_seconds", 120
+        )
+        # Operator steering bypasses the _strategic_failures breaker — an
+        # explicit human request is exactly when an operator needs to
+        # intervene (and exactly when the breaker is likely tripped).
+        # Automated qualification refreshes still park under the breaker.
+        _breaker_gate_ok = (
+            not refresh_breaker_applies(project.vision)
+            or strategic_failures < 3
+        )
+        if _breaker_gate_ok and strategic_refresh_due(
+            project.vision, now, min_interval_seconds=_refresh_min_interval
+        ):
+            force_strategic = True
     # Wall-clock backstop: must drive force_strategic so it bypasses the
     # `not active_directions` early return below. Without this promotion, when
     # every active direction has an in-flight child (busy_direction_ids),
@@ -1181,18 +1199,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # guards against. Gated by the _strategic_failures breaker (< 3)
                 # and a min-interval floor, so a broken request that keeps
                 # failing stops bypassing instead of looping.
-                from app.strategic_trigger import (
-                    refresh_breaker_applies,
-                    strategic_refresh_due,
-                )
-
                 _refresh_min_interval = _runtime_config.get(
                     "strategic_refresh_min_interval_seconds", 120
                 )
-                # Operator steering bypasses the _strategic_failures breaker — an
-                # explicit human request is exactly when an operator needs to
-                # intervene (and exactly when the breaker is likely tripped).
-                # Automated qualification refreshes still park under the breaker.
                 _breaker_gate_ok = (
                     not refresh_breaker_applies(project.vision)
                     or strategic_failures < 3

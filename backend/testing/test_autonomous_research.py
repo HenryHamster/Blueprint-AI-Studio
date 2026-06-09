@@ -12561,6 +12561,177 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Qualification-origin refresh must force a strategic tick when due
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_idle(
+    db_session, mocker
+):
+    """A due qualification-origin refresh must promote the tick into the
+    strategic path even when the modulo cadence would not fire."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Qualification refresh forces strategic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-qualforce1", "Active research lane")],
+        vision={
+            "purpose": "test",
+            "_research_spawn_count": 1,  # 1 % 6 != 0, so modulo stays idle
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "Due qualification-origin refresh must force a strategic tick even when "
+        "the modulo cadence is idle"
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_parks_at_breaker_threshold(
+    db_session, mocker
+):
+    """A qualification-origin refresh must still park when the breaker is tripped."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Qualification refresh parks at breaker",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_research_spawn_count": 1,
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not strategic_review_mock.called, (
+        "Qualification-origin refresh must stay parked when the failure breaker is tripped"
+    )
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") is not None
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session, mocker):
+    """Operator-origin refreshes must keep bypassing the breaker when due."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Operator refresh forces strategic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_research_spawn_count": 1,
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "Operator-origin refresh must continue to bypass the breaker when due"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Missing-foundation demand injected into the research spawn payload
 # ─────────────────────────────────────────────────────────────────────────────
 
