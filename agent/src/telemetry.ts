@@ -89,7 +89,10 @@ export function resetLlmTelemetry(): void {
 
 /** Reason class for an unparseable final output. The extraction layer's miss
  *  reasons plus `malformed_json` for a thrown JsonExtractionError. */
-export type FormatMissReason = JsonExtractionMissReason | 'malformed_json';
+export type FormatMissReason =
+  | JsonExtractionMissReason
+  | 'malformed_json'
+  | 'parsed_object_schema_mismatch';
 
 /** Bounded vocabulary for the output-schema dimension of format-compliance
  *  telemetry. Keeping this a literal union prevents unbounded telemetry keys

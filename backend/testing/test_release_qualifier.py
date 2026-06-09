@@ -2561,8 +2561,13 @@ class TestRefutedSeverityMatrixReconcile:
         assert refuted[0]["severity"] == finding_sev
 
 
-class TestReconcileAuditSubsetSummarySameSeverity:
-    """Subset-summary refutation must not misbind to the wrong same-severity finding."""
+class TestReconcileRefutedJustificationGate:
+    """Backend reason-substantiveness gate for refuted_false_positive verdicts.
+
+    A refuted_false_positive verdict without a substantive reason (< 20
+    non-whitespace characters) must fail closed with audit_challenge_uncertain,
+    mirroring the agent-side normalizeChallengeOutput contract.
+    """
 
     SHA = "cafebabe"
 
@@ -2575,6 +2580,117 @@ class TestReconcileAuditSubsetSummarySameSeverity:
             "summary": summary,
             "verification_note": "confirmed via full repo scan with supporting evidence",
         }
+
+    def test_refuted_challenge_without_reason_cannot_cancel_finding(self):
+        """A refuted_false_positive with no reason key must not remove the finding."""
+        finding = self._verified("high", "Unvalidated redirect allows open redirect attack")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Unvalidated redirect allows open redirect attack",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_uncertain"
+        assert modified is None
+        assert refuted == []
+
+    def test_refuted_missing_reason_fails_closed(self):
+        """A matched refuted_false_positive with no reason key returns audit_challenge_uncertain."""
+        finding = self._verified("medium", "SQL injection risk in query builder")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "medium",
+                    "summary": "SQL injection risk in query builder",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_uncertain"
+        assert modified is None
+        assert refuted == []
+
+    def test_refuted_short_reason_fails_closed(self):
+        """A reason with 19 non-whitespace chars is below the threshold and fails closed."""
+        # "short: ok ok ok ok" → s(1)h(1)o(1)r(1)t(1):(1)o(1)k(1)o(1)k(1)o(1)k(1)o(1)k(1) = 14; pad to 19
+        reason_19 = "a b c d e f g h i j k l m n o p q r s"  # 19 letters
+        assert sum(1 for c in reason_19 if not c.isspace()) == 19
+        finding = self._verified("high", "Hardcoded API key exposed in source")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Hardcoded API key exposed in source",
+                    "reason": reason_19,
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_uncertain"
+        assert modified is None
+        assert refuted == []
+
+    def test_refuted_exactly_20_nw_chars_accepted(self):
+        """A reason with exactly 20 non-whitespace chars meets the threshold and is accepted."""
+        reason_20 = "a b c d e f g h i j k l m n o p q r s t"  # 20 letters
+        assert sum(1 for c in reason_20 if not c.isspace()) == 20
+        finding = self._verified("medium", "Missing CSRF token on state-changing endpoint")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "medium",
+                    "summary": "Missing CSRF token on state-changing endpoint",
+                    "reason": reason_20,
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold is None
+        assert modified is not None
+        assert modified["findings"] == []
+        assert len(refuted) == 1
+
+    def test_refuted_substantive_reason_accepted(self):
+        """A refuted_false_positive with a clearly substantive reason removes the finding."""
+        finding = self._verified("high", "Path traversal in file upload handler")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Path traversal in file upload handler",
+                    "reason": "all file paths are validated against an allowlist before use",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold is None
+        assert modified is not None
+        assert modified["findings"] == []
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "Path traversal in file upload handler"
 
     def test_refuted_false_positive_subset_summary_does_not_misbind_same_severity_finding(
         self,

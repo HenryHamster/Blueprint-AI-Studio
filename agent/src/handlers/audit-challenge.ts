@@ -76,6 +76,52 @@ export interface ChallengeArtifact {
 
 type PrimaryFinding = { severity: string; summary: string; file: string };
 
+type ChallengeArtifactShapeValidationResult =
+  | { ok: true }
+  | { ok: false; reason: 'parsed_object_schema_mismatch'; detail: string };
+
+function validateChallengeArtifactShape(raw: unknown): ChallengeArtifactShapeValidationResult {
+  const hasOwn = (key: string): boolean =>
+    Object.prototype.hasOwnProperty.call(raw as object, key);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'release audit challenge output was not a JSON object',
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  if (!hasOwn('challenged_candidate_sha')) {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'release audit challenge output missed challenged_candidate_sha',
+    };
+  }
+  if (typeof obj.challenged_candidate_sha !== 'string' || obj.challenged_candidate_sha.trim() === '') {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'release audit challenge output had an invalid challenged_candidate_sha',
+    };
+  }
+  if (!hasOwn('verdicts')) {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'release audit challenge output missed verdicts',
+    };
+  }
+  if (!Array.isArray(obj.verdicts)) {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'release audit challenge output had a non-list verdicts field',
+    };
+  }
+  return { ok: true };
+}
+
 function nonWhitespaceLen(s: string): number {
   let n = 0;
   for (const c of s) {
@@ -349,7 +395,7 @@ Rules:
 
   let logs = '';
   let challengeUnparseable = false;
-  if (handlerOutput !== null) {
+  if (handlerOutput !== null && validateChallengeArtifactShape(handlerOutput).ok) {
     logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha)));
   } else {
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
@@ -365,6 +411,7 @@ Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with
       disallowedTools,
       retryStatus: 'Repairing release audit challenge JSON...',
       schemaLabel: 'audit_challenge',
+      validateParsedValue: validateChallengeArtifactShape,
     });
     if (repaired.value !== null) {
       logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha)));

@@ -1374,6 +1374,9 @@ def _reconcile_audit_with_challenge(
         if verdict_val == "confirmed":
             pass
         elif verdict_val == "refuted_false_positive":
+            reason = str(matched.get("reason") or "")
+            if sum(1 for c in reason if not c.isspace()) < 20:
+                return "audit_challenge_uncertain", None, []
             remove_idxs.add(idx)
             sev = str(f.get("severity") or f.get("level") or "").lower()
             summary = str(

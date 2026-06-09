@@ -2443,60 +2443,116 @@ class TestReproduceOnHeadGate:
         assert "Second opinion: agrees" in reasoning
 
     @_pytest.mark.asyncio
-    async def test_indeterminate_absent_second_opinion_keeps_finding(
+    async def test_failed_reproduce_absent_challenge_preserves_absent_drop(
         self, db_session, mocker
     ):
-        """A challenge record that does not confirm absence keeps the finding
-        and routes it to the child task instead of terminally dropping it."""
+        """Failed or indeterminate second opinions keep the original absent drop.
+
+        The reproduce-absent gate only keeps a finding when the side-car
+        explicitly establishes a present target; failed, empty, unparseable, and
+        genuinely indeterminate results must still fall through to the terminal
+        absent-drop memo path.
+        """
+        from app.task_evaluators import parse_finding_challenge_verdict
         from test_autonomous_research import _make_finding
 
         mocker.patch.dict(
             "app.shared_state.runtime_config",
             {"research_finding_challenge_enabled": True},
         )
-        finding = _make_finding(
-            title="Moved semantic target indeterminate", direction_id="d-repro-chal03"
-        )
-        finding["sources"] = [{"type": "file", "ref": "backend/app/old_place.py"}]
 
         async def _validate(sources, **kw):
             return [{**s, "valid": False} for s in sources]
 
-        task, titles = await self._run(
-            db_session,
-            mocker,
-            direction_id="d-repro-chal03",
-            parsed_findings=[finding],
-            task_context={
-                FINDING_CHALLENGE_VERDICT_KEY: {
-                    "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
-                    "first_verdict": "absent",
-                    "second_opinion_verdict": "indeterminate",
-                    "agreement": "agrees",
-                    "reason": "sidecar failed before confirming the semantic target",
-                    "sidecar_task_id": "sidecar-indeterminate",
-                },
-            },
-            validate=_validate,
-        )
-        assert "Moved semantic target indeterminate" in titles
-        assert (task.context or {}).get("research_reproduce_rejected") is None
-        assert (task.context or {}).get("spawned_memo_ids") is None
-        child = (
+        cases = [
             (
-                await db_session.execute(
-                    _select(_Task).where(
-                        _Task.parent_task_id == task.id,
-                        _Task.title == "Moved semantic target indeterminate",
+                "failed",
+                parse_finding_challenge_verdict(
+                    "ignored logs",
+                    "absent",
+                    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "sidecar-failed",
+                    completed=False,
+                ),
+            ),
+            (
+                "empty",
+                parse_finding_challenge_verdict(
+                    "",
+                    "absent",
+                    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "sidecar-empty",
+                ),
+            ),
+            (
+                "unparseable",
+                parse_finding_challenge_verdict(
+                    "no machine verdict here",
+                    "absent",
+                    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "sidecar-unparseable",
+                ),
+            ),
+            (
+                "indeterminate",
+                parse_finding_challenge_verdict(
+                    '{"verdict": "indeterminate", "agreement": "indeterminate", '
+                    '"reasoning": "semantic target still cannot be established"}',
+                    "absent",
+                    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "sidecar-indeterminate",
+                ),
+            ),
+        ]
+
+        for label, challenge_record in cases:
+            direction_id = f"d-repro-chal03-{label}"
+            finding_title = f"Moved semantic target {label}"
+            finding = _make_finding(title=finding_title, direction_id=direction_id)
+            finding["sources"] = [{"type": "file", "ref": "backend/app/old_place.py"}]
+
+            task, titles = await self._run(
+                db_session,
+                mocker,
+                direction_id=direction_id,
+                parsed_findings=[finding],
+                task_context={
+                    FINDING_CHALLENGE_VERDICT_KEY: challenge_record.to_context(),
+                },
+                validate=_validate,
+            )
+
+            assert finding_title not in titles
+            assert (task.context or {}).get("research_reproduce_rejected") == 1
+            assert (task.context or {}).get("spawned_memo_ids")
+
+            children = (
+                (
+                    await db_session.execute(
+                        _select(_Task).where(_Task.parent_task_id == task.id)
                     )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .one()
-        )
-        record = (child.context or {}).get("finding_challenge")
-        assert record["second_opinion_verdict"] == "indeterminate"
-        assert (child.context or {}).get("target_defect_reproduction") == "indeterminate"
+            memos = [
+                c
+                for c in children
+                if (c.context or {}).get("memo_drop_reason")
+                == "reproduce_on_head_absent"
+            ]
+            assert len(memos) == 1
+            memo = memos[0]
+            source_finding = memo.first_payload.get("source_finding") or {}
+            record = source_finding.get("finding_challenge") or {}
+            assert record["challenged_boundary"] == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+            assert record["first_verdict"] == "absent"
+            assert (record.get("agreement") or "").lower() == "indeterminate"
+            assert (record.get("second_opinion_verdict") or "").lower() in (
+                "",
+                "indeterminate",
+            )
+            assert (task.context or {}).get("spawned_memo_ids") == [str(memo.id)]
 
     @_pytest.mark.asyncio
     async def test_reproduce_absent_challenge_flag_off_uses_legacy_drop_without_sidecar(

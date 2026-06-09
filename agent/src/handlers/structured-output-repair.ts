@@ -61,7 +61,15 @@ export interface RepairStructuredOutputOptions {
    *  provided, format misses, repair attempts, and successes are also counted
    *  in the schema-dimensioned maps inside format-compliance telemetry. */
   schemaLabel?: SchemaLabel;
+  /** Optional parsed-value validation hook. When provided, a parseable value
+   *  that fails schema validation is treated like a format miss and reopened
+   *  once, using the returned miss reason. */
+  validateParsedValue?: (value: unknown) => ParsedValueValidationResult;
 }
+
+export type ParsedValueValidationResult =
+  | { ok: true }
+  | { ok: false; reason: FormatMissReason; detail: string };
 
 export interface RepairStructuredOutputResult<T> {
   /** Parsed value (from the first attempt or the repaired retry), or null. */
@@ -98,6 +106,9 @@ function buildMissAwarePrompt(
     case 'parsed_object_missing_key':
     case 'parsed_array_missing_key':
       preamble = `Your previous response was missing required keys: ${requiredKeys.map(k => `"${k}"`).join(', ')} — include all required keys.`;
+      break;
+    case 'parsed_object_schema_mismatch':
+      preamble = 'Your previous response parsed as JSON, but the top-level object shape did not match the required schema — fix the object shape and include all required keys.';
       break;
     default:
       return callerPrompt;
@@ -166,11 +177,19 @@ export async function repairStructuredOutput<T = unknown>(
   const {
     mode, requiredKeys, first, reopenPrompt,
     ws, statusRef, model, effort, disallowedTools, retryStatus, schemaLabel,
+    validateParsedValue,
   } = opts;
 
-  const firstAttempt = tryExtract(
+  let firstAttempt = tryExtract(
     mode, requiredKeys, buildSources(first.lastResultText, first.allOutput), ws,
   );
+  if (firstAttempt.value !== null && validateParsedValue) {
+    const validation = validateParsedValue(firstAttempt.value);
+    if (!validation.ok) {
+      sendLog(ws, `[WARNING] Structured ${mode} parsed output failed schema validation: ${validation.detail}\n`);
+      firstAttempt = { value: null, missReason: validation.reason };
+    }
+  }
   let value = firstAttempt.value as T | null;
   let retry: RunResult | null = null;
 
@@ -197,6 +216,14 @@ export async function repairStructuredOutput<T = unknown>(
     const retryAttempt = tryExtract(
       mode, requiredKeys, buildSources(retryRun.lastResultText, retryRun.allOutput), ws,
     );
+    if (retryAttempt.value !== null && validateParsedValue) {
+      const validation = validateParsedValue(retryAttempt.value);
+      if (!validation.ok) {
+        sendLog(ws, `[WARNING] Structured ${mode} retry parsed output failed schema validation: ${validation.detail}\n`);
+        retryAttempt.value = null;
+        retryAttempt.missReason = validation.reason;
+      }
+    }
     value = retryAttempt.value as T | null;
     if (value !== null) recordFormatRepairSuccess(schemaLabel);
   }

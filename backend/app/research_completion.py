@@ -3032,6 +3032,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     )
                     return
             if _challenge_enabled:
+                second = _challenge_second_verdict(_record)
                 if _challenge_confirms_verdict(_record, "absent"):
                     _reproduce_rejected.append(finding)
                     logger.warning(
@@ -3041,19 +3042,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         task.id,
                     )
                     continue
-                second = _challenge_second_verdict(_record)
-                finding["_reproduce_on_head"] = (
-                    CITATION_STATE_PRESENT
-                    if second == CITATION_STATE_PRESENT
-                    else CITATION_STATE_INDETERMINATE
-                )
-                _reconcile_reproduce_provenance_state(finding, finding["_reproduce_on_head"])
-                logger.info(
-                    "[RESEARCH] Keeping finding %r after reproduce-absent "
-                    "challenge did not confirm absence: %s",
-                    finding.get("title") or finding.get("description", "")[:60],
-                    (_record or {}).get("reason"),
-                )
+                if _challenge_disagrees(_record) and second == CITATION_STATE_PRESENT:
+                    finding["_reproduce_on_head"] = CITATION_STATE_PRESENT
+                    _reconcile_reproduce_provenance_state(
+                        finding, finding["_reproduce_on_head"]
+                    )
+                    logger.info(
+                        "[RESEARCH] Keeping finding %r after reproduce-absent "
+                        "challenge established the target still exists: %s",
+                        finding.get("title") or finding.get("description", "")[:60],
+                        (_record or {}).get("reason"),
+                    )
+                else:
+                    logger.info(
+                        "[RESEARCH] Reproduce-absent challenge for finding %r did not "
+                        "establish a non-absent target; preserving original absent "
+                        "verdict",
+                        finding.get("title")
+                        or finding.get("description", "")[:60],
+                    )
+                    _reproduce_rejected.append(finding)
+                    logger.warning(
+                        "[RESEARCH] Rejecting finding %r (task %s): cited code is absent on "
+                        "HEAD (does not reproduce); not spawning.",
+                        finding.get("title") or finding.get("description", "")[:60],
+                        task.id,
+                    )
+                    continue
             else:
                 if _record is not None and not _challenge_agrees(_record):
                     logger.info(
