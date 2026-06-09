@@ -3,6 +3,27 @@ import type { TaskType } from '../taskCapabilities';
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
 
+export type WakeDeliveryState = 'PENDING' | 'FIRED' | 'DELIVERED' | 'EXPIRED' | 'FAILED';
+
+export interface TaskWakeRegistration {
+  wake_source_kind: string;
+  wake_source_ref?: string | null;
+  delivery_state: WakeDeliveryState;
+  deadline_at?: string | null;
+  fired_at?: string | null;
+  result_state?: string | null;
+  result_detail?: string | null;
+}
+
+export interface FindingChallenge {
+  challenged_boundary?: string;
+  first_verdict?: string;
+  second_opinion_verdict?: string;
+  agreement?: 'agrees' | 'disagrees' | 'indeterminate' | string;
+  reason?: string;
+  sidecar_task_id?: string;
+}
+
 export interface ResearchFinding {
   type?: string;
   title: string;
@@ -16,6 +37,8 @@ export interface ResearchFinding {
   claims?: string[];
   sources?: Array<{ type?: string; ref: string; excerpt?: string }>;
   _provenance_warnings?: { broken_source_ref_count: number; broken_refs: string[] };
+  finding_hash?: string;
+  finding_challenge?: FindingChallenge;
 }
 
 export interface TaskEvaluationSummaryItem {
@@ -100,6 +123,7 @@ export interface Task {
   // carry null/undefined, so guard on presence before rendering.
   parked_at?: string | null;
   park_reason?: string | null;
+  wake_registration?: TaskWakeRegistration | null;
   // R3-W2 (H1): heartbeat-hot fields promoted from Task.context to dedicated
   // columns in Round 2 (B2 / F). The frontend reads from the columns; the
   // legacy `task.context.last_metrics` mirror was retired and reading it
@@ -137,6 +161,32 @@ export interface Task {
       vm_instance_id: string;
       zone?: string | null;
     };
+    // Spawn-gate provenance — set on research-derived child tasks by research_completion.py
+    research_task_id?: string;
+    finding_index?: number;
+    research_spawn_gate_challenged?: boolean;
+    research_spawn_gate_verdict?: 'pass' | null;
+    research_spawn_gate_explicit?: boolean | null;
+    research_spawn_gate_reason?: string | null;
+    finding_hash?: string;
+    finding_challenge?: {
+      challenged_boundary?: string;
+      first_verdict?: string | null;
+      second_opinion_verdict?: string | null;
+      agreement?: string | null;
+      reason?: string | null;
+      sidecar_task_id?: string | null;
+    };
+    // Aggregate gate counts and deferred findings — set on the PARENT research task
+    deferred_findings?: Array<{
+      finding_hash?: string;
+      title?: string;
+      deferred_reason?: string;
+      adversarial_gate_reason?: string | null;
+    }>;
+    research_spawn_gate_challenged_count?: number;
+    research_spawn_gate_refuted_count?: number;
+    research_spawn_gate_survived_count?: number;
     [key: string]: unknown;
   };
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
@@ -177,6 +227,22 @@ export interface FixLoopAttempt {
   source?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
+}
+
+/** Discriminated union of spawn-gate outcomes for a research-derived child task. */
+export type SpawnGateState =
+  | { kind: 'no-gate' }
+  | { kind: 'unchallenged' }
+  | { kind: 'challenged-pass'; reason: string | null }
+  | { kind: 'fail-open-pass'; reason: string | null };
+
+/** Derive the spawn-gate state for a (possibly research-derived) task from its context. */
+export function deriveSpawnGateState(context: Task['context']): SpawnGateState {
+  if (!context?.research_task_id) return { kind: 'no-gate' };
+  if (!context.research_spawn_gate_challenged) return { kind: 'unchallenged' };
+  const reason = (context.research_spawn_gate_reason as string | null | undefined) ?? null;
+  if (context.research_spawn_gate_explicit === true) return { kind: 'challenged-pass', reason };
+  return { kind: 'fail-open-pass', reason };
 }
 
 export interface SerialConsoleResponse {

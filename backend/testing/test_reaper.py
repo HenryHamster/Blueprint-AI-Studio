@@ -12086,6 +12086,178 @@ async def test_knowledge_completion_path_unblocks_waiter_end_to_end(
 
 
 @pytest.mark.asyncio
+async def test_knowledge_completion_unblocks_waiter_with_document_pointer(
+    reaper_db, mocker
+):
+    """A BLOCKED dependent task that lists the producer in its depends_on receives
+    a knowledge_prerequisites pointer AND transitions to QUEUED after
+    _deliver_knowledge_to_dependents fires.
+
+    This validates both halves of the fix:
+    1. The SQL filter Task.depends_on.contains([task_id_str]) correctly identifies
+       the BLOCKED waiter (not just QUEUED tasks).
+    2. event_driven_unblock_on_knowledge resumes the waiter with the pointer already
+       stamped so it launches with the produced knowledge.
+    """
+    from app.models import KnowledgeDocument
+    from app.knowledge_completion import (
+        _deliver_knowledge_to_dependents,
+        KNOWLEDGE_PREREQUISITES_KEY,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Producing task that just completed a web_research document.
+    producer = Task(
+        project_id=project.id,
+        title="producer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "web_research"}],
+        context={"finding_hash": "deadbeef12345678"},
+        status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_kind="web_research",
+        title="pointer doc",
+        summary="pointer summary",
+        body="pointer body",
+        topic="pointer-topic",
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    # BLOCKED waiter that explicitly depends on the producer and has a knowledge
+    # need satisfied by the producer's finding_hash.
+    waiter = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on knowledge from producer",
+        depends_on=[str(producer.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "deadbeef12345678",
+                "reason": "BLOCKER: waiting on knowledge from producer",
+                "need": {"kind": "task", "ref": "deadbeef12345678"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    await _deliver_knowledge_to_dependents(
+        producer, doc, {"title": "pointer doc", "summary": "pointer summary"}, reaper_db
+    )
+
+    await reaper_db.refresh(waiter)
+
+    # The pointer must be stamped on the waiter's context before resume.
+    prereqs = (waiter.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY, [])
+    assert any(
+        isinstance(p, dict) and p.get("doc_id") == str(doc.id) for p in prereqs
+    ), f"knowledge_prerequisites pointer missing; got {prereqs}"
+
+    # The event-driven unblock should have resumed the waiter.
+    assert waiter.status == TaskStatus.QUEUED
+    assert "blocker" not in (waiter.context or {})
+
+
+@pytest.mark.asyncio
+async def test_hollow_compute_doc_leaves_waiter_blocked(
+    reaper_db, mocker
+):
+    """A hollow compute KnowledgeDocument must not event-unblock a waiting task.
+
+    The durable compute predicate rejects the doc, so the BLOCKED waiter stays
+    blocked and no knowledge-prerequisite pointer is stamped.
+    """
+    from app.models import KnowledgeDocument
+    from app.reaper_sweeps import event_driven_unblock_on_knowledge
+    from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    producer = Task(
+        project_id=project.id,
+        title="compute producer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "compute_experiment"}],
+        context={"finding_hash": "compute-hollow-need"},
+        status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_kind="compute_experiment",
+        title="hollow compute doc",
+        summary="hollow compute doc",
+        body="hollow compute doc",
+        topic="compute-hollow-need",
+        source_citations=[],
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "citation_grounding_miss": True,
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 0,
+                    "unresolved": ["https://signed.example.com/jobs/result.json"],
+                }
+            },
+        },
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    waiter = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on compute knowledge",
+        depends_on=[str(producer.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "compute-hollow-need",
+                "reason": "BLOCKER: waiting on compute knowledge",
+                "need": {"kind": "task", "ref": "compute-hollow-need"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(waiter)
+    assert waiter.status == TaskStatus.BLOCKED
+    assert (waiter.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monkeypatch):
     """If the event-driven unblock raises, the knowledge-completion chokepoint
     swallows it — document delivery must never break the producing task."""
@@ -12482,5 +12654,122 @@ async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker)
     assert recovered.fired_undelivered == 0
     assert recovered.stall_cycles == 0
     assert recovered.delivery_stalled is False
+
+    reset_wake_delivery_stall_state()
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
+    """A stalled wake delivery raises a deduped operator Alert; recovery clears it.
+
+    Drives a wedged delivery path to trip the cross-cycle stall signal, then
+    exercises sweep_wake_delivery_stall_alerts to assert:
+      1. The first stalled call creates exactly one WARNING Alert row per project.
+      2. Repeat stalled calls are deduped (no second Alert row).
+      3. A recovering call (delivery_stalled=False) dismisses the open Alert.
+    """
+    import app.task_lifecycle as _tl
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.reaper_sweeps import (
+        _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
+        get_wake_delivery_stall_cycles,
+        reset_wake_delivery_stall_state,
+        sweep_deliver_task_wakes,
+        sweep_wake_delivery_stall_alerts,
+    )
+
+    reset_wake_delivery_stall_state()
+    project = await _make_project(reaper_db)
+
+    now = datetime.utcnow()
+    task = Task(
+        project_id=project.id,
+        title="park-alert-stall",
+        status=TaskStatus.PARKED,
+        parked_at=now - timedelta(minutes=1),
+        payloads=[],
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_action=WakeAction.RESUME,
+        delivery_state=WakeDeliveryState.FIRED,
+        fired_at=now - timedelta(minutes=1),
+    )
+    reaper_db.add(reg)
+    await reaper_db.commit()
+
+    real_deliver = _tl.deliver_wake
+
+    async def _wedged_deliver(session, registration, *, now=None):
+        return False  # no progress — leaves the registration FIRED
+
+    mocker.patch.object(_tl, "deliver_wake", new=_wedged_deliver)
+
+    # Drive the stall counter up to threshold so delivery_stalled trips.
+    for _ in range(_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD):
+        await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+
+    assert get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
+    stall_cycles = get_wake_delivery_stall_cycles()
+
+    # First stalled alert sweep → one WARNING Alert created per project.
+    created = await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=True, stall_cycles=stall_cycles
+    )
+    assert created == 1
+
+    alerts = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # Second call with delivery still stalled → deduped, no new Alert row.
+    created2 = await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=True, stall_cycles=stall_cycles
+    )
+    assert created2 == 0
+
+    still_one = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(still_one) == 1
+
+    # Recovery: allow delivery to proceed and verify the alert is cleared.
+    mocker.patch.object(_tl, "deliver_wake", new=real_deliver)
+    recovered = await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+    assert recovered.delivered == 1
+    assert recovered.delivery_stalled is False
+
+    await sweep_wake_delivery_stall_alerts(
+        reaper_db, delivery_stalled=False, stall_cycles=0
+    )
+
+    dismissed = (
+        await reaper_db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.dismissed_at.is_not(None),
+            )
+        )
+    ).scalars().all()
+    assert len(dismissed) == 1
+    assert dismissed[0].dismissed_at is not None
 
     reset_wake_delivery_stall_state()

@@ -374,6 +374,14 @@ async def get_version_lifecycle(
 
     promotion_readiness = await compute_promotion_readiness(session, project_id)
 
+    from app.release_readiness import (  # noqa: PLC0415
+        get_challenged_vs_unchallenged_telemetry,
+    )
+
+    challenged_vs_unchallenged = await get_challenged_vs_unchallenged_telemetry(
+        session, project_id
+    )
+
     return {
         "current_version": current_version_out,
         "recent_versions": [
@@ -402,6 +410,7 @@ async def get_version_lifecycle(
         "staged_directions": (
             _build_staged_directions_summary(project_row) if project_row else []
         ),
+        "challenged_vs_unchallenged": challenged_vs_unchallenged,
     }
 
 
@@ -880,8 +889,9 @@ async def clear_deploy_failed(
     """Acknowledge and clear a stale post-promotion ``deploy_failed`` serving state.
 
     Admin-gated (matching the deploy operator levers). Targets the latest
-    ``promoted`` version whose ``serving_status`` is ``deploy_failed`` for the
-    project, under a per-version ``with_for_update`` row lock.
+    ``promoted`` version whose scalar or aggregate serving state is
+    ``deploy_failed`` for the project, under a per-version ``with_for_update``
+    row lock.
 
     Behavior:
 
@@ -911,23 +921,31 @@ async def clear_deploy_failed(
     )
     from app.time_utils import _utcnow  # noqa: PLC0415
 
-    version = (
-        (
+    version = None
+    promoted_versions = (
+        await session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.promoted_at.desc())
+        )
+    ).scalars().all()
+    for candidate in promoted_versions:
+        aggregate, _ = _version_serving_summary(candidate)
+        if (
+            candidate.serving_status == "deploy_failed"
+            or aggregate["serving_status"] == "deploy_failed"
+        ):
             await session.execute(
                 select(ReleaseVersion)
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "promoted",
-                    ReleaseVersion.serving_status == "deploy_failed",
-                )
-                .order_by(ReleaseVersion.promoted_at.desc())
-                .limit(1)
+                .where(ReleaseVersion.id == candidate.id)
                 .with_for_update()
             )
-        )
-        .scalars()
-        .first()
-    )
+            version = candidate
+            break
     if version is None:
         raise HTTPException(
             status_code=404,
@@ -977,8 +995,35 @@ async def clear_deploy_failed(
         clear_mode = "verified"
         attestation_reason = None
     else:
-        # Live serving SHA is unobservable or does not yet match — refuse unless
-        # the operator explicitly overrides AND records a reason.
+        # Force override is ONLY valid when the failure reason is
+        # serving_sha_unobservable: a revision went STABLE but the live SHA
+        # could not be read, so the deploy may be genuinely live.  For all
+        # other reasons (sha_mismatch, rolled_back, halted, no_new_revision)
+        # the deploy is known to have failed and cannot be force-attested.
+        #
+        # Use backend_artifact.reason_code (freshly rechecked by
+        # _refresh_release_artifact_rows) rather than the stale aggregate scalar
+        # version.deploy_failure_reason, which may not reflect a backend reason
+        # that transitioned after the latch.  Fall back to the scalar only when no
+        # backend artifact row exists.
+        effective_failure_reason = (
+            backend_artifact.reason_code
+            if backend_artifact is not None
+            else version.deploy_failure_reason
+        )
+        if effective_failure_reason != "serving_sha_unobservable":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"force override is not permitted for deploy_failure_reason "
+                    f"'{effective_failure_reason}': the force path only "
+                    "applies when the serving SHA is unobservable "
+                    "(serving_sha_unobservable). A confirmed deployment failure "
+                    "cannot be force-cleared."
+                ),
+            )
+        # Live serving SHA is unobservable — refuse unless the operator
+        # explicitly overrides AND records a reason.
         if not payload.force:
             raise HTTPException(
                 status_code=409,

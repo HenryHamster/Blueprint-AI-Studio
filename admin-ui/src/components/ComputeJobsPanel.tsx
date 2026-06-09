@@ -6,6 +6,7 @@ import { ResolvedReferenceLink } from './TaskCard';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
+  computeJobRpcDiagnostic,
   computeJobSpent,
   fmtUsd,
   fmtCountdown,
@@ -205,6 +206,39 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                         <span className="text-neutral-500">{k}:</span> {String(v)}
                       </span>
                     ))}
+                  </div>
+                );
+              })()}
+              {(() => {
+                const diag = computeJobRpcDiagnostic(job);
+                if (!diag) return null;
+                // Retry context: prefer a live countdown to next_retry_at, fall
+                // back to the bounded retry_after_seconds the backend recorded.
+                let retryText: string | null = null;
+                if (diag.next_retry_at) {
+                  retryText = `retry in ${fmtCountdown(diag.next_retry_at, nowMs)}`;
+                } else if (typeof diag.retry_after_seconds === 'number') {
+                  retryText = `retry after ${Math.max(0, Math.round(diag.retry_after_seconds))}s`;
+                }
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    data-testid="compute-rpc-diagnostic"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <div className="font-semibold break-words">
+                          Backend RPC issue: {diag.operation}
+                          {' · '}
+                          attempt {diag.attempt_count}
+                          {retryText ? ` · ${retryText}` : ''}
+                        </div>
+                        <div className="mt-0.5 font-mono text-amber-300/90 break-words">
+                          {diag.error_type}: {diag.error_message}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 );
               })()}

@@ -57,6 +57,52 @@ function unwrapJobData(res: unknown): JobResponse | null {
   return null;
 }
 
+function parseJsonFromErrorMessage(message: string): Record<string, unknown> | null {
+  const start = message.indexOf('{');
+  if (start < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(message.slice(start));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function extractLiveProofPreconditionFailure(error: unknown): Record<string, unknown> | null {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes('failed (412)')) return null;
+  const parsed = parseJsonFromErrorMessage(message);
+  const detail = parsed?.detail
+    ?? (parsed?.error && typeof parsed.error === 'object'
+      ? (parsed.error as Record<string, unknown>).message
+      : null);
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return null;
+  const detailObj = detail as Record<string, unknown>;
+  if (detailObj.error !== 'live_release_precondition_failed') return null;
+  return detailObj;
+}
+
+function liveProofBlockerLog(detail: Record<string, unknown>): string {
+  const message = strVal(detail.message) || 'live-release precondition not satisfied';
+  const reason = strVal(detail.reason);
+  const evidence = detail.live_release_evidence && typeof detail.live_release_evidence === 'object'
+    ? detail.live_release_evidence as Record<string, unknown>
+    : null;
+  const versionValue = evidence?.release_version_number;
+  const version = typeof versionValue === 'number' || typeof versionValue === 'string'
+    ? String(versionValue)
+    : '';
+  const aggregate = evidence ? strVal(evidence.aggregate_serving_status) : '';
+  const parts = [`BLOCKER: ${message}`];
+  if (reason) parts.push(`reason=${reason}`);
+  if (version) parts.push(`release_version=${version}`);
+  if (aggregate) parts.push(`aggregate=${aggregate}`);
+  return parts.join(' ');
+}
+
 function buildLaunchBody(payload: Record<string, unknown>): Record<string, unknown> {
   const body: Record<string, unknown> = {
     command: strVal(payload.command),
@@ -79,6 +125,13 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   // (no accelerator) keep their exact existing launch body.
   const accelerator = strVal(payload.accelerator);
   if (accelerator) body.accelerator = accelerator;
+  if (payload.live_proof !== undefined) body.live_proof = payload.live_proof;
+  const liveProofMarker = strVal(payload.live_proof_marker);
+  if (liveProofMarker) body.live_proof_marker = liveProofMarker;
+  if (payload.live_release_proof !== undefined) body.live_proof = payload.live_release_proof;
+  const liveReleaseProofMarker = strVal(payload.live_release_proof_marker);
+  if (liveReleaseProofMarker) body.live_proof_marker = liveReleaseProofMarker;
+  if (payload.requires_live_release !== undefined) body.live_proof = payload.requires_live_release;
   return body;
 }
 
@@ -121,6 +174,19 @@ export async function handleComputeExperiment(
     const res = await apiPost('/api/agent/compute-jobs', buildLaunchBody(payload));
     job = unwrapJobData(res);
   } catch (e) {
+    const precondition = extractLiveProofPreconditionFailure(e);
+    if (precondition) {
+      const logLine = liveProofBlockerLog(precondition);
+      sendLog(ws, `[BLOCKED] ${logLine}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        failure_category: 'BLOCKED_PRECONDITION',
+        logs: sanitize(JSON.stringify({ error: logLine, detail: precondition, experiment })),
+      });
+      return;
+    }
     const msg = `Compute job launch failed: ${e instanceof Error ? e.message : String(e)}`;
     sendLog(ws, `[ERROR] ${msg}\n`);
     await persistAndPostStatus(taskId, {

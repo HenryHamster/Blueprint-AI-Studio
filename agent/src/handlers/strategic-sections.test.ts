@@ -777,6 +777,60 @@ describe('buildDirSummaryText', () => {
     const idx2 = result.indexOf('second');
     expect(idx1).toBeLessThan(idx2);
   });
+
+  it('renders research spawn-gate line when spawn_gate_metrics is present', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-sg',
+      text: 'direction with gate',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      spawn_gate_metrics: {
+        challenged: 5,
+        refuted: 2,
+        survived: 3,
+        challenged_merge_rate: 0.667,
+        unchallenged_merge_rate: 0.75,
+      },
+    }]);
+    expect(result).toContain('Research spawn-gate');
+    expect(result).toContain('5 challenged');
+    expect(result).toContain('2 refuted');
+    expect(result).toContain('3 survived');
+    expect(result).toContain('67% challenged');
+    expect(result).toContain('75% unchallenged');
+  });
+
+  it('omits research spawn-gate line when spawn_gate_metrics is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-nosg',
+      text: 'direction without gate',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+    }]);
+    expect(result).not.toContain('Research spawn-gate');
+    expect(result).not.toContain('challenged');
+  });
+
+  it('renders n/a merge rates when challenged_merge_rate is null', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-sg-null',
+      text: 'direction with partial gate data',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      spawn_gate_metrics: {
+        challenged: 3,
+        refuted: 3,
+        survived: 0,
+        challenged_merge_rate: null,
+        unchallenged_merge_rate: null,
+      },
+    }]);
+    expect(result).toContain('Research spawn-gate');
+    expect(result).toContain('n/a challenged vs n/a unchallenged');
+  });
 });
 
 describe('buildDirHealthSummary', () => {

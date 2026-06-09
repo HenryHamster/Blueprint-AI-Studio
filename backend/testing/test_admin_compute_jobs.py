@@ -7,6 +7,7 @@ test seeds the role it exercises.
 """
 
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -103,6 +104,36 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Kill RPC Failure")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job(db_session, project)
+    job.external_compute_id = "admin-kill-rpc-failure"
+    db_session.add(job)
+    await db_session.commit()
+
+    class FakeBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert reason == "operator"
+            raise RuntimeError("terminate backend unavailable")
+
+    with patch("app.compute_jobs.get_compute_backend", lambda _name: FakeBackend()):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["status"] == ComputeJobStatus.RUNNING.value
+    assert body["outcome"] is None
+    diagnostic = body["compute_rpc_diagnostic"]
+    assert diagnostic["operation"] == "terminate"
+    assert diagnostic["reason"] == "operator"
+    assert "terminate backend unavailable" in diagnostic["error_message"]
+    assert body["polling_metadata"]["compute_rpc_diagnostic"] == diagnostic
+
+
+@pytest.mark.asyncio
 async def test_kill_compute_job_viewer_forbidden(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Viewer Only")
     await _add_member(db_session, project.id, "viewer")
@@ -129,3 +160,32 @@ async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_session):
+    """When a peer drives the job terminal during the lock-free RPC window,
+    kill_compute_job returns None. The router must re-fetch and return the
+    terminal job rather than blowing up with a 500."""
+    project = await _make_project(db_session, name="Peer Terminal")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job(db_session, project)
+
+    # Simulate the peer-terminal race: kill_compute_job returns None (peer won),
+    # but the job in DB is already CANCELLED.
+    job.status = ComputeJobStatus.CANCELLED
+    job.outcome = ComputeJobOutcome.CANCELLED
+    job.terminal_reason = "killed by peer"
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.routers.admin_compute_jobs.kill_compute_job",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["status"] == ComputeJobStatus.CANCELLED.value
+    assert body["outcome"] == ComputeJobOutcome.CANCELLED.value

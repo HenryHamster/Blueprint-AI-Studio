@@ -1516,7 +1516,7 @@ async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
     )
     memo = scaffolding_memos[0]
     assert memo.context.get("memo_source_direction_id") == direction["id"]
-    assert memo.status == TaskStatus.QUEUED
+    assert memo.status == TaskStatus.COMPLETED
     assert (memo.payloads[0].get("topic") or "").startswith("Outcome-less scaffolding:")
 
 
@@ -1573,6 +1573,98 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
     ]
     assert len(scaffolding_memos) == 1, (
         f"expected exactly 1 memo (no re-spawn), got {len(scaffolding_memos)}"
+    )
+    assert scaffolding_memos[0].status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
+    """Outcome-scaffolding memo is immediately COMPLETED at spawn (no VM dispatch).
+
+    The memo task must:
+    - be in status COMPLETED (not QUEUED)
+    - have exactly one MEMO Artifact row
+    - have plan_output['memo']['summary'] containing substantive scaffolding context
+    - carry citations with 'direction:<id>' and tags with 'outcome-scaffolding'
+    """
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    did = direction["id"]
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scaffolding_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "outcome_scaffolding"
+    ]
+    assert len(scaffolding_memos) == 1
+    memo = scaffolding_memos[0]
+
+    # Task must be COMPLETED immediately — no VM dispatch
+    assert memo.status == TaskStatus.COMPLETED, (
+        f"memo task should be COMPLETED at spawn, got {memo.status}"
+    )
+
+    # Exactly one MEMO Artifact row must exist
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == memo.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    memo_artifacts = [a for a in artifacts if a.artifact_type == ArtifactType.MEMO]
+    assert len(memo_artifacts) == 1, (
+        f"expected 1 MEMO artifact, got {len(memo_artifacts)}"
+    )
+
+    # plan_output['memo']['summary'] must contain substantive content
+    plan_output = memo.plan_output or {}
+    memo_body = plan_output.get("memo", {})
+    summary = memo_body.get("summary", "")
+    assert summary, "memo summary must be non-empty"
+    assert len(summary) > 20, f"memo summary too short: {summary!r}"
+
+    # Citations must include direction reference
+    citations = memo_body.get("citations", [])
+    assert any(f"direction:{did}" in c for c in citations), (
+        f"citations must include 'direction:{did}', got {citations}"
+    )
+
+    # Tags must include outcome-scaffolding
+    tags = memo_body.get("tags", [])
+    assert "outcome-scaffolding" in tags, (
+        f"tags must include 'outcome-scaffolding', got {tags}"
     )
 
 

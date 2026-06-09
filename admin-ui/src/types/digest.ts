@@ -68,6 +68,24 @@ export interface RecentCompletion {
   unverified_merge_reason?: string | null;
 }
 
+// Compact, websocket-safe rollup of a strategic-judgment challenge. Mirrors the
+// backend `strategic_challenge_summary` (strategic_completion.py): only the four
+// scalar fields travel into completion receipts, recent-cycle summaries, and
+// digest cards — the full bounded item list stays in durable cycle_metadata.
+// All fields optional so a partial/legacy payload degrades gracefully; the field
+// is OMITTED entirely for cycles that carried no challenge, so absence never
+// reads as a failure.
+export interface StrategicChallengeSummary {
+  // The record's own status.
+  mode?: 'ok' | 'blocked' | 'invalid';
+  // Rolled-up overall verdict across challenged judgments.
+  verdict?: 'approved' | 'warned' | 'blocked';
+  // Challenged judgments the challenger could not confirm (uncertain).
+  warned_count?: number;
+  // Challenged judgments the challenger disputed (rejected).
+  blocked_count?: number;
+}
+
 interface LatestCycle {
   cycle_id?: string | null;
   // Required (non-null) so `completed_at ?? started_at` stays `string` for
@@ -82,6 +100,9 @@ interface LatestCycle {
   summary_text?: string | null;
   memos_available?: number | null;
   memos_cited?: number | null;
+  // Present only when this cycle carried a strategic-judgment challenge record;
+  // omitted for legacy cycles so absence is not rendered as a warning state.
+  strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
 export interface RecentFailure {
@@ -113,6 +134,13 @@ export interface DirectionPortfolio {
   composition: DirectionPortfolioCompositionEntry[];
 }
 
+export interface DirectionFindingChallengeSummary {
+  challenged_findings: number;
+  agreement_distribution: { agrees?: number; disagrees?: number; indeterminate?: number };
+  boundary_distribution: { reproduce_absent?: number; low_actionability_decay?: number; reproduce_indeterminate_dispatch?: number };
+  fail_closed_unparseable?: number;
+}
+
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
 
 /**
@@ -132,6 +160,15 @@ export interface MergeGateFleetHealth {
   most_common_reason: string | null;
   degraded_project_count: number;
   project_count: number;
+}
+
+export interface ParkWakeHealth {
+  parked_task_count: number;
+  oldest_parked_age_seconds: number | null;
+  fired_undelivered_count: number;
+  oldest_fired_age_seconds: number | null;
+  delivery_stalled: boolean;
+  delivery_stall_threshold_seconds: number;
 }
 
 export interface FindingStructuralGiveUpItem {
@@ -457,6 +494,7 @@ export interface DigestData<DP = unknown> {
 
   // ----- operational health (catch-up) -----
   merge_gate_fleet_health?: MergeGateFleetHealth | null;
+  park_wake_health?: ParkWakeHealth | null;
   dependency_health_signals?: DependencyHealthSignals | null;
   migration_health?: {
     current_schema_revision: string | null;

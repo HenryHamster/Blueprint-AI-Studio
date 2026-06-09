@@ -69,6 +69,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "investigate": "forward-quality",
         "self_audit": "forward-quality",
         "release_audit": "forward-quality",
+        "release_audit_challenge": "none",
         "memo": "forward-quality",
         "verify_tests": "none",
         "compute_experiment": "metric",
@@ -597,3 +598,373 @@ def test_grader_prompt_adds_relevance_lens_with_question():
     assert "5. RELEVANCE" in prompt
     assert "state of quantum computing" in prompt
     assert "REQUEST START" in prompt
+
+
+# ── parse_safeguard_challenge_outcome ─────────────────────────────────────────
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_when_not_completed():
+    """completed=False forces 'confirmed' regardless of log content (fail-closed)."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome(
+        '{"outcome": "rejected", "reasoning": "false positive"}', completed=False
+    )
+    assert result["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_on_none_logs():
+    """None logs → fail-closed 'confirmed'."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    assert parse_safeguard_challenge_outcome(None)["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_on_empty_logs():
+    """Empty string logs → fail-closed 'confirmed'."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    assert parse_safeguard_challenge_outcome("")["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_on_whitespace_logs():
+    """Whitespace-only logs → fail-closed 'confirmed'."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    assert parse_safeguard_challenge_outcome("   \n  ")["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_parses_confirmed():
+    """Valid JSON with outcome='confirmed' is parsed correctly."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome(
+        '{"outcome": "confirmed", "reasoning": "real vulnerability"}'
+    )
+    assert result == {"outcome": "confirmed", "reasoning": "real vulnerability"}
+
+
+def test_parse_safeguard_challenge_outcome_parses_rejected():
+    """Valid JSON with outcome='rejected' is parsed and reasoning preserved."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome(
+        '{"outcome": "rejected", "reasoning": "false positive, no such function"}'
+    )
+    assert result["outcome"] == "rejected"
+    assert result["reasoning"] == "false positive, no such function"
+
+
+def test_parse_safeguard_challenge_outcome_parses_downgraded():
+    """Valid JSON with outcome='downgraded' is parsed correctly."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome(
+        '{"outcome": "downgraded", "reasoning": "severity is medium at most"}'
+    )
+    assert result["outcome"] == "downgraded"
+    assert result["reasoning"] == "severity is medium at most"
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_on_invalid_outcome_value():
+    """An unrecognised outcome value (not confirmed/rejected/downgraded) → fail-closed."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome('{"outcome": "maybe", "reasoning": "unsure"}')
+    assert result["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_fail_closed_on_no_outcome_key():
+    """JSON with no 'outcome' key → fail-closed 'confirmed'."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    result = parse_safeguard_challenge_outcome('{"verdict": "rejected", "reasoning": "fp"}')
+    assert result["outcome"] == "confirmed"
+
+
+def test_parse_safeguard_challenge_outcome_truncates_reasoning():
+    """reasoning is capped at 480 characters."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    long_reasoning = "x" * 600
+    result = parse_safeguard_challenge_outcome(
+        json.dumps({"outcome": "rejected", "reasoning": long_reasoning})
+    )
+    assert result["outcome"] == "rejected"
+    assert len(result["reasoning"]) == 480
+
+
+def test_parse_safeguard_challenge_outcome_keyword_fallback_rejected():
+    """Keyword fallback: anchored 'outcome': 'rejected' found in non-JSON text."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    # The brace-scan loop finds {... "outcome": "rejected" ...} with invalid JSON.
+    # Then the keyword fallback detects the anchored pattern.
+    text = 'Analysis complete. "outcome": "rejected" — the finding is a false positive.'
+    result = parse_safeguard_challenge_outcome(text)
+    assert result["outcome"] == "rejected"
+    assert result["reasoning"] == "outcome keyword found (anchored)"
+
+
+def test_parse_safeguard_challenge_outcome_embedded_json_in_prose():
+    """Extracts outcome from a JSON object embedded in surrounding prose."""
+    from app.task_evaluators import parse_safeguard_challenge_outcome
+
+    text = (
+        "After careful review I have concluded the following:\n\n"
+        '{"outcome": "downgraded", "reasoning": "only medium severity"}\n\n'
+        "No further action is needed."
+    )
+    result = parse_safeguard_challenge_outcome(text)
+    assert result["outcome"] == "downgraded"
+    assert result["reasoning"] == "only medium severity"
+
+
+# ── per-finding challenge: prompt builder (read-only, single finding) ─────────
+
+
+def test_finding_challenge_prompt_is_single_finding_and_ends_with_one_json():
+    """build_finding_challenge_prompt frames ONE finding read-only and ends with
+    exactly one JSON object (reusing the grader's end-with-one-JSON convention)."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    finding = {"title": "Stale ref to foo()", "prompt": "fix foo"}
+    prompt = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, finding, "absent"
+    )
+    assert "SINGLE research finding" in prompt
+    assert "read-only" in prompt
+    # The first verdict being challenged is named.
+    assert "'absent'" in prompt
+    # The finding body is embedded.
+    assert "Stale ref to foo()" in prompt
+    # Ends with exactly one JSON verdict object the parser can read back.
+    assert prompt.rstrip().endswith("}")
+    assert '"agreement"' in prompt
+    assert prompt.count("FINDING START") == 1
+
+
+def test_finding_challenge_prompt_boundary_specific_framing():
+    """Each boundary selects its own framing language."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    absent = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, {"title": "x"}, "absent"
+    )
+    assert "MOVED or RENAMED" in absent
+    decay = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, {"title": "x"}, "LOW"
+    )
+    assert "LOW actionability" in decay
+
+
+def test_finding_challenge_prompt_includes_question_when_supplied():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    prompt = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        {"title": "x"},
+        "absent",
+        question="is the reaper sweep correct",
+    )
+    assert "is the reaper sweep correct" in prompt
+    assert "REQUEST START" in prompt
+
+
+# ── per-finding challenge: verdict parser (fail-closed) ──────────────────────
+
+
+def test_parse_finding_challenge_disagrees():
+    """A structured 'disagrees' second opinion is recorded with all six fields."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FindingChallengeRecord,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = (
+        "I checked git log; foo() moved to bar.py.\n"
+        '{"verdict": "present", "agreement": "disagrees", '
+        '"reasoning": "code was renamed, not deleted"}'
+    )
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "sidecar-1"
+    )
+    assert isinstance(rec, FindingChallengeRecord)
+    assert rec.challenged_boundary == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    assert rec.first_verdict == "absent"
+    assert rec.second_opinion_verdict == "present"
+    assert rec.agreement == "disagrees"
+    assert "renamed" in rec.reason
+    assert rec.sidecar_task_id == "sidecar-1"
+
+
+def test_parse_finding_challenge_agrees():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "absent", "agreement": "agrees", "reasoning": "truly gone"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s2"
+    )
+    assert rec.agreement == "agrees"
+    assert rec.second_opinion_verdict == "absent"
+
+
+def test_parse_finding_challenge_not_completed_is_indeterminate():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        parse_finding_challenge_verdict,
+    )
+
+    rec = parse_finding_challenge_verdict(
+        "anything", "LOW", CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, "s3",
+        completed=False,
+    )
+    assert rec.agreement == "indeterminate"
+    assert rec.sidecar_task_id == "s3"
+
+
+def test_parse_finding_challenge_unparseable_and_empty_are_indeterminate():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    for logs in ("no machine verdict here", ""):
+        rec = parse_finding_challenge_verdict(
+            logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s4"
+        )
+        assert rec.agreement == "indeterminate", logs
+        assert rec.first_verdict == "absent"
+
+
+def test_parse_finding_challenge_unknown_agreement_collapses_to_indeterminate():
+    """A parsed agreement outside the recognized set fails closed."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "present", "agreement": "maybe", "reasoning": "unsure"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s5"
+    )
+    assert rec.agreement == "indeterminate"
+
+
+# ── FindingChallengeRecord: schema version and provenance ────────────────────
+
+
+def test_finding_challenge_record_schema_version_default():
+    """Newly constructed records carry schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        FindingChallengeRecord,
+    )
+
+    rec = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="code was renamed",
+        sidecar_task_id="sc-1",
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.schema_version == 1
+    assert rec.source_task_id is None
+    assert rec.produced_by == "challenge_sidecar"
+
+
+def test_finding_challenge_record_to_context_includes_version_and_provenance():
+    """to_context() emits schema_version, source_task_id, and produced_by."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        FindingChallengeRecord,
+    )
+
+    rec = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="code was renamed",
+        sidecar_task_id="sc-1",
+        source_task_id="src-task-abc",
+    )
+    ctx = rec.to_context()
+    assert ctx["schema_version"] == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert ctx["source_task_id"] == "src-task-abc"
+    assert ctx["produced_by"] == "challenge_sidecar"
+    # Existing fields preserved.
+    assert ctx["challenged_boundary"] == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    assert ctx["first_verdict"] == "absent"
+    assert ctx["agreement"] == "disagrees"
+    assert ctx["sidecar_task_id"] == "sc-1"
+
+
+def test_parse_finding_challenge_stamps_versioned_record():
+    """parse_finding_challenge_verdict stamps schema_version and source_task_id
+    on a successfully parsed (merged) record so downstream consumers can
+    distinguish versioned first-class output from legacy fallback records."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = (
+        'I checked git log; foo() moved to bar.py.\n'
+        '{"verdict": "present", "agreement": "disagrees", '
+        '"reasoning": "code was renamed, not deleted"}'
+    )
+    rec = parse_finding_challenge_verdict(
+        logs,
+        "absent",
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        "sidecar-99",
+        completed=True,
+        source_task_id="research-task-xyz",
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id == "research-task-xyz"
+    assert rec.produced_by == "challenge_sidecar"
+    assert rec.agreement == "disagrees"
+    # Verify to_context() carries the versioned fields through.
+    ctx = rec.to_context()
+    assert ctx["schema_version"] == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert ctx["source_task_id"] == "research-task-xyz"
+    assert ctx["produced_by"] == "challenge_sidecar"
+
+
+def test_parse_finding_challenge_backward_compat_no_source_task_id():
+    """Callers that omit source_task_id still produce a valid versioned record
+    with source_task_id=None — existing call sites are unaffected."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "actionable", "agreement": "disagrees", "reasoning": "finding is specific"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "LOW", CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, "sc-legacy"
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id is None
+    assert rec.produced_by == "challenge_sidecar"

@@ -37,6 +37,14 @@ from app.research_context import (
     extract_diagnosis_from_context,
 )
 from app.shared_state import DEFAULT_TASK_SCOPE
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.time_utils import _utcnow
 
@@ -50,6 +58,55 @@ RETIRED_DIRECTION_STATUSES = frozenset(
 _EVICTED_FINDINGS_CAP = 50
 _ARCHIVED_DIAGNOSES_CAP = 50
 _DIAGNOSIS_MAX_CHARS = 500
+_CHALLENGE_BOUNDARY_BUCKETS = (
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+)
+_CHALLENGE_AGREEMENT_BUCKETS = (
+    CHALLENGE_AGREES,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
+
+
+def _empty_finding_challenge_summary() -> dict:
+    return {
+        "challenged_findings": 0,
+        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
+        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "fail_closed_unparseable": 0,
+    }
+
+
+def _summarize_finding_challenge(record: dict) -> dict:
+    summary = _empty_finding_challenge_summary()
+    summary["challenged_findings"] = 1
+    agreement = record.get("agreement")
+    if agreement not in _CHALLENGE_AGREEMENT_BUCKETS:
+        agreement = CHALLENGE_INDETERMINATE
+    summary["agreement_distribution"][agreement] += 1
+    boundary = record.get("challenged_boundary")
+    if boundary in _CHALLENGE_BOUNDARY_BUCKETS:
+        summary["boundary_distribution"][boundary] += 1
+    if agreement == CHALLENGE_INDETERMINATE and not record.get(
+        "second_opinion_verdict"
+    ):
+        summary["fail_closed_unparseable"] += 1
+    return summary
+
+
+def _merge_finding_challenge_summary(target: dict, source: dict) -> None:
+    target["challenged_findings"] += source.get("challenged_findings") or 0
+    target["fail_closed_unparseable"] += source.get("fail_closed_unparseable") or 0
+    for key in _CHALLENGE_AGREEMENT_BUCKETS:
+        target["agreement_distribution"][key] += (
+            (source.get("agreement_distribution") or {}).get(key) or 0
+        )
+    for key in _CHALLENGE_BOUNDARY_BUCKETS:
+        target["boundary_distribution"][key] += (
+            (source.get("boundary_distribution") or {}).get(key) or 0
+        )
 
 
 def _append_evicted_findings(direction: dict, new_entries: list) -> None:
@@ -289,6 +346,7 @@ async def apply_post_spawn_state(
             findings_produced_by_dir: dict = {}
             grade_dist_by_dir: dict = {}
             basis_dist_by_dir: dict = {}
+            challenge_summary_by_dir: dict = {}
             _valid_bases = (
                 "code_verified",
                 "path_verified",
@@ -321,6 +379,14 @@ async def apply_post_spawn_state(
                         },
                     )
                     _bd[_vb] = _bd.get(_vb, 0) + 1
+                    _challenge = _f.get("finding_challenge")
+                    if isinstance(_challenge, dict):
+                        _summary = challenge_summary_by_dir.setdefault(
+                            _did, _empty_finding_challenge_summary()
+                        )
+                        _merge_finding_challenge_summary(
+                            _summary, _summarize_finding_challenge(_challenge)
+                        )
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -336,6 +402,7 @@ async def apply_post_spawn_state(
                     descriptions = finding_descriptions_by_dir.get(did, [])[:3]
                     _dir_grade_dist = grade_dist_by_dir.get(did)
                     _dir_basis_dist = basis_dist_by_dir.get(did)
+                    _dir_challenge_summary = challenge_summary_by_dir.get(did)
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
@@ -355,6 +422,12 @@ async def apply_post_spawn_state(
                         **(
                             {"verification_basis_distribution": _dir_basis_dist}
                             if _dir_basis_dist
+                            else {}
+                        ),
+                        **(
+                            {"finding_challenge_summary": _dir_challenge_summary}
+                            if _dir_challenge_summary
+                            and _dir_challenge_summary.get("challenged_findings")
                             else {}
                         ),
                         "filter_breakdown": {

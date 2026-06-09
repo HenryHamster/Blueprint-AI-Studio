@@ -2337,6 +2337,111 @@ describe('runFreshReviewerPass merge logic', () => {
   });
 });
 
+// ── Backend self-merge POST (persist reviewer output to _self_review_outcome) ──
+describe('runFreshReviewerPass backend self-merge POST', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    vi.mocked(fsModule.writeFileSync).mockImplementation(() => undefined);
+    vi.mocked(fsModule.readFileSync).mockImplementation(() => {
+      throw new Error('File not found');
+    });
+  });
+
+  async function runWithFindings(
+    args: Parameters<typeof runFreshReviewerPass>,
+    findingsJson = '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Logic bug"}]}',
+    exitCode = 0,
+  ) {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode,
+      allOutput: '',
+      lastResultText: findingsJson,
+    });
+    await runFreshReviewerPass(...args);
+    return idx;
+  }
+
+  it('does NOT POST when no originalTaskId is supplied (review-fix path unchanged)', async () => {
+    const idx = await runWithFindings([
+      'no-merge', 'Title', 'Desc', [], null, { value: '' },
+    ]);
+    expect(vi.mocked(idx.apiPost)).not.toHaveBeenCalled();
+  });
+
+  it('self-merges to the current task with no recovery origin for the enabled path', async () => {
+    // enabled path: originalTaskId == taskId, no recovery flags.
+    const idx = await runWithFindings([
+      'task-enabled', 'Title', 'Desc', [], null, { value: '' },
+      undefined, undefined, undefined, undefined, undefined, 'task-enabled',
+    ]);
+    expect(vi.mocked(idx.apiPost)).toHaveBeenCalledTimes(1);
+    const [url, body] = vi.mocked(idx.apiPost).mock.calls[0];
+    expect(url).toBe('/api/agent/tasks/task-enabled/reviewer-merge');
+    const merge = body as Record<string, unknown>;
+    expect(Array.isArray(merge.reviewer_findings)).toBe(true);
+    expect((merge.reviewer_findings as unknown[]).length).toBe(1);
+    expect('reviewer_recovery_origin' in merge).toBe(false);
+  });
+
+  it('self-merges with lone_checker_recovery origin for the lone-checker path', async () => {
+    const idx = await runWithFindings([
+      'task-lc', 'Title', 'Desc', [], null, { value: '' },
+      undefined, undefined, false, true, undefined, 'task-lc',
+    ]);
+    expect(vi.mocked(idx.apiPost)).toHaveBeenCalledTimes(1);
+    const [url, body] = vi.mocked(idx.apiPost).mock.calls[0];
+    expect(url).toBe('/api/agent/tasks/task-lc/reviewer-merge');
+    expect((body as Record<string, unknown>).reviewer_recovery_origin).toBe('lone_checker_recovery');
+  });
+
+  it('self-merges with reviewer_recovery_after_incomplete_sr origin for the incomplete-SR path', async () => {
+    const idx = await runWithFindings([
+      'task-isr', 'Title', 'Desc', [], null, { value: '' },
+      undefined, undefined, true, undefined, undefined, 'task-isr',
+    ]);
+    expect(vi.mocked(idx.apiPost)).toHaveBeenCalledTimes(1);
+    const [, body] = vi.mocked(idx.apiPost).mock.calls[0];
+    expect((body as Record<string, unknown>).reviewer_recovery_origin).toBe('reviewer_recovery_after_incomplete_sr');
+  });
+
+  it('operator-requested path posts to the original task with operator_requested_recovery', async () => {
+    const idx = await runWithFindings([
+      'reviewer-task', 'Title', 'Desc', [], null, { value: '' },
+      undefined, undefined, false, false, true, 'original-task-id',
+    ]);
+    expect(vi.mocked(idx.apiPost)).toHaveBeenCalledTimes(1);
+    const [url, body] = vi.mocked(idx.apiPost).mock.calls[0];
+    expect(url).toBe('/api/agent/tasks/original-task-id/reviewer-merge');
+    expect((body as Record<string, unknown>).reviewer_recovery_origin).toBe('operator_requested_recovery');
+  });
+
+  it('does NOT POST when the reviewer session crashed (exitCode != 0)', async () => {
+    const idx = await runWithFindings(
+      ['task-crash', 'Title', 'Desc', [], null, { value: '' },
+        undefined, undefined, false, true, undefined, 'task-crash'],
+      '',
+      1,
+    );
+    expect(vi.mocked(idx.apiPost)).not.toHaveBeenCalled();
+  });
+
+  it('does NOT POST when reviewer output is unparseable', async () => {
+    const idx = await runWithFindings(
+      ['task-unparse', 'Title', 'Desc', [], null, { value: '' },
+        undefined, undefined, false, true, undefined, 'task-unparse'],
+      'not json at all',
+      0,
+    );
+    expect(vi.mocked(idx.apiPost)).not.toHaveBeenCalled();
+  });
+});
+
 // ── Reviewer edges enumeration + merge ────────────────────────────────────────
 describe('runFreshReviewerPass reviewer_edges_considered', () => {
   const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');

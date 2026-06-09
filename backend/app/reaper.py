@@ -903,6 +903,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
     sweep_deliver_task_wakes,
+    sweep_wake_delivery_stall_alerts,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3874,6 +3875,7 @@ async def reaper_service():
                 # whose registered wake source has fired (exactly once), expire
                 # timed-out registrations, and strand-guard orphaned parked tasks.
                 _mark_reaper_progress()
+                _wake_result = None
                 try:
                     _wake_result = await sweep_deliver_task_wakes(session, now)
                     # Per-cycle wake-delivery health: this return value used to be
@@ -3903,6 +3905,29 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Task-wake delivery sweep error: {e}", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12b: Alert — raise or clear per-project wake-delivery-stall
+                # operator alerts based on the cycle counter from the sweep above.
+                # Runs in its own try/except so an alert failure never aborts the
+                # reaper cycle or masks the underlying delivery signal.
+                _mark_reaper_progress()
+                try:
+                    await sweep_wake_delivery_stall_alerts(
+                        session,
+                        delivery_stalled=(
+                            _wake_result.delivery_stalled if _wake_result else False
+                        ),
+                        stall_cycles=(
+                            _wake_result.stall_cycles if _wake_result else 0
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Wake-delivery stall alert sweep error: {e}",
+                        exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

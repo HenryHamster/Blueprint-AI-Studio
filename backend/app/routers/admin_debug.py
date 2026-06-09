@@ -520,9 +520,7 @@ def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
             "summarized_capabilities_count": _floor_count(
                 floor.get("summarized_capabilities")
             ),
-            "summarized_friction_count": _floor_count(
-                floor.get("summarized_friction")
-            ),
+            "summarized_friction_count": _floor_count(floor.get("summarized_friction")),
             "still_over_floor": bool(floor.get("still_over_floor")),
         }
     if dropped_entry is not None and dropped_entry.get("reason"):
@@ -903,16 +901,20 @@ async def get_strategic_debug(
     # problem_model in full or a summarized / floored / dropped view — the success-case
     # complement to the payload_bloat_skip (cap-exceeded skip) signal below.
     latest_strategic = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(1)
             )
-            .order_by(Task.created_at.desc())
-            .limit(1)
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     problem_model_trim: Optional[dict] = None
     if latest_strategic is not None:
         problem_model_trim = _build_problem_model_trim_verdict(
@@ -1658,6 +1660,15 @@ async def list_knowledge_documents(
     source_kind: str | None = Query(
         default=None, description="Exact source-kind filter (design / web_research)"
     ),
+    origin_state: str | None = Query(
+        default=None, description="Exact origin provenance state filter"
+    ),
+    challenge_state: str | None = Query(
+        default=None, description="Exact origin challenge state filter"
+    ),
+    finding_hash: str | None = Query(
+        default=None, description="Exact originating research finding hash filter"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -1683,6 +1694,9 @@ async def list_knowledge_documents(
         tag=tag,
         direction=direction,
         source_kind=source_kind,
+        origin_state=origin_state,
+        challenge_state=challenge_state,
+        finding_hash=finding_hash,
         limit=limit,
         offset=offset,
     )

@@ -39,8 +39,38 @@ vi.mock('../prompt.js', () => ({
   writeMessagesHelper: vi.fn(),
 }));
 
+// Default challenge record the mocked runStrategicChallenge resolves with. Tests
+// that care about the challenge override it per-case via mockResolvedValueOnce.
+// Hoisted so it is initialized before the (hoisted) vi.mock factory references it.
+const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
+  DEFAULT_CHALLENGE_RECORD: {
+    challenge_version: 1,
+    status: 'ok' as const,
+    evidence_progress: [] as Array<{ direction_id: string; status: string; verdict: string; rationale: string }>,
+    retirement_critique_quality: { verdict: 'solid', rationale: '' },
+    portfolio_shape_risk: { verdict: 'low', rationale: '' },
+  },
+}));
+
 vi.mock('./strategic-helpers.js', () => ({
   writeStrategicHelpers: vi.fn(),
+  // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
+  // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
+  // existing executor-prompt assertions.
+  runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
+  // Echo the record's status + approved pairs so wiring tests can assert the
+  // section is built from the record runStrategicChallenge returned and is
+  // threaded into the executor prompt.
+  buildStrategicChallengeExecutorSection: (record: {
+    status: string;
+    evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
+  }) => {
+    const approved = record.evidence_progress
+      .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
+      .map(e => `${e.direction_id}:${e.status}`)
+      .join(',');
+    return `CHALLENGE_SECTION(status=${record.status};approved=${approved})`;
+  },
 }));
 
 vi.mock('../utils/time.js', () => ({
@@ -133,8 +163,10 @@ import {
   renderDesignDocIndexOverview,
   handleStrategic,
 } from './strategic.js';
-import { runClaudeCode } from '../index.js';
+import { runClaudeCode, apiPost } from '../index.js';
+import { VmConfigMissingError } from '../providers/runners.js';
 import { runThinkerWithGate } from '../prompts/thinker.js';
+import { runStrategicChallenge } from './strategic-helpers.js';
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {
@@ -364,6 +396,134 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
 
     const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
+  });
+});
+
+describe('handleStrategic strategic challenge gate', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(apiPost).mockClear();
+    vi.mocked(runStrategicChallenge).mockReset();
+    vi.mocked(runStrategicChallenge).mockResolvedValue(
+      DEFAULT_CHALLENGE_RECORD as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
+    );
+  });
+
+  it('handleStrategic runs and persists a challenge before executor', async () => {
+    // The challenge pass runs over the thinker analysis, the record is persisted
+    // via the set_strategic_challenge op BEFORE the executor runs, and the
+    // record's challenge-approved evidence-progress pairs reach the executor
+    // prompt with the gate instruction.
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'ANALYSIS_UNDER_CHALLENGE',
+    } as unknown as { ok: boolean; analysisText: string });
+
+    const challengeRecord = {
+      challenge_version: 1,
+      status: 'ok' as const,
+      evidence_progress: [
+        { direction_id: 'd-7', status: 'advancing', verdict: 'approved', rationale: 'real evidence' },
+        { direction_id: 'd-9', status: 'met', verdict: 'rejected', rationale: 'thin' },
+      ],
+      retirement_critique_quality: { verdict: 'solid', rationale: 'names the pattern' },
+      portfolio_shape_risk: { verdict: 'elevated', rationale: 'concentrated' },
+    };
+    vi.mocked(runStrategicChallenge).mockResolvedValueOnce(
+      challengeRecord as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
+    );
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-challenge', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+
+    // The challenge ran over the thinker's analysis output.
+    expect(vi.mocked(runStrategicChallenge)).toHaveBeenCalledTimes(1);
+    const challengeArgs = vi.mocked(runStrategicChallenge).mock.calls[0][0];
+    expect(challengeArgs.analysisText).toBe('ANALYSIS_UNDER_CHALLENGE');
+
+    // The record was persisted via the new store op with the verbatim record.
+    const storeCallIdx = vi.mocked(apiPost).mock.calls.findIndex(
+      c => c[0] === '/api/agent/strategic'
+        && (c[1] as { op?: string }).op === 'set_strategic_challenge',
+    );
+    expect(storeCallIdx).toBeGreaterThanOrEqual(0);
+    const storeBody = vi.mocked(apiPost).mock.calls[storeCallIdx][1] as {
+      task_id: string; op: string; data: unknown;
+    };
+    expect(storeBody.task_id).toBe('task-challenge');
+    expect(storeBody.data).toBe(challengeRecord);
+
+    // Persist happened BEFORE the executor's first runClaudeCode invocation.
+    const storeOrder = vi.mocked(apiPost).mock.invocationCallOrder[storeCallIdx];
+    const executorOrder = vi.mocked(runClaudeCode).mock.invocationCallOrder[0];
+    expect(storeOrder).toBeLessThan(executorOrder);
+
+    // The executor prompt carries the challenge section (only the APPROVED
+    // advancing/met pair, d-7) plus the evidence-progress gate instruction.
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=d-7:advancing)');
+    expect(executorPrompt).toContain('Challenge gate');
+    expect(executorPrompt).toContain('the independent challenge APPROVED');
+  });
+
+  it('persists a blocked/invalid challenge record (no approvals) and still reaches the executor', async () => {
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+
+    const blockedRecord = {
+      challenge_version: 1,
+      status: 'blocked' as const,
+      evidence_progress: [],
+      retirement_critique_quality: { verdict: 'not_assessed', rationale: 'challenge exited 1' },
+      portfolio_shape_risk: { verdict: 'not_assessed', rationale: 'challenge exited 1' },
+    };
+    vi.mocked(runStrategicChallenge).mockResolvedValueOnce(
+      blockedRecord as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
+    );
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-blocked', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+
+    const storeCall = vi.mocked(apiPost).mock.calls.find(
+      c => (c[1] as { op?: string }).op === 'set_strategic_challenge',
+    );
+    expect(storeCall).toBeDefined();
+    const storeData = (storeCall?.[1] as { data: typeof blockedRecord } | undefined)?.data;
+    expect(storeData?.status).toBe('blocked');
+
+    // A blocked challenge approves nothing — the executor prompt must say so and
+    // list no approved pairs.
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=blocked;approved=)');
+  });
+
+  it('fails closed when challenge persistence fails before executor', async () => {
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+
+    vi.mocked(runStrategicChallenge).mockResolvedValueOnce(
+      DEFAULT_CHALLENGE_RECORD as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
+    );
+    vi.mocked(apiPost).mockRejectedValueOnce(new Error('challenge store failed'));
+
+    const statusRef = { value: '' };
+    await expect(
+      handleStrategic(
+        'task-challenge-fail', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
+      ),
+    ).rejects.toThrow('Failed to persist strategic challenge record: Error: challenge store failed');
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 });
 
@@ -691,5 +851,36 @@ describe('handleStrategic prompt_suffix wiring', () => {
       'task-4', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
     );
     expect(capturedThinkerParams?.availableCapabilitiesSection).toBe('');
+  });
+});
+
+describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
+  it('propagates a vm_config_missing death from the required-calls retry instead of swallowing it', async () => {
+    // The swallowing retry-catch previously turned a vm_config_missing death into a
+    // [WARNING] + a misclassified COMPLETED/claude_code_failed status — the warm VM
+    // then stranded into vm_unresponsive. The fix rethrows VmConfigMissingError so it
+    // reaches runRoleOnce's classifier for a clean PROVISION_FAILURE requeue.
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    // Executor (call 0) returns exit 0 with no required-call evidence → triggers the
+    // required-calls retry (call 1), which dies vm_config_missing.
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockRejectedValueOnce(
+        new VmConfigMissingError(
+          'provider config file missing on VM (boot/retarget materialization lost)',
+        ),
+      );
+
+    const statusRef = { value: '' };
+    await expect(
+      handleStrategic('task-vmcm', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef),
+    ).rejects.toBeInstanceOf(VmConfigMissingError);
+
+    // Restore the shared default so later tests are unaffected.
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   });
 });

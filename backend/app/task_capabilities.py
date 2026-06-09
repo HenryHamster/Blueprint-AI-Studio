@@ -34,6 +34,7 @@ class TaskType(str, Enum):
     investigate = "investigate"
     self_audit = "self_audit"
     release_audit = "release_audit"
+    release_audit_challenge = "release_audit_challenge"
     memo = "memo"
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
@@ -118,6 +119,7 @@ class TaskCapability:
     agent_mode: AgentMode
     default_category: str | None = None
     user_launchable: bool = False
+    operator_contract_launchable: bool = False
     provider_configurable: bool = True
     filter_visible: bool = True
     description: str = ""
@@ -496,6 +498,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation="forward-quality",
     ),
     TaskCapability(
+        TaskType.release_audit_challenge,
+        "Release Audit Challenge",
+        "read_only",
+        description=(
+            "Binding, independent challenger pass over a release-audit "
+            "candidate: re-examines the same pinned candidate/diff and emits "
+            "structured verdicts over higher-severity primary findings."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        # No forward gate: the deterministic release qualifier consumes the
+        # challenge artifact directly instead of grading it through a generic
+        # terminal-artifact forward-quality check here.
+        evaluation="none",
+    ),
+    TaskCapability(
         TaskType.memo,
         "Memo",
         "read_only",
@@ -539,6 +559,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="ops",
         user_launchable=False,
+        operator_contract_launchable=True,
         plan_knowledge_prereq_eligible=True,
         # No LLM provider runs — the handler is a programmatic launch+poll loop,
         # so it never selects a model/account.
@@ -885,6 +906,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "default_category": capability.default_category,
         "description": capability.description,
         "user_launchable": capability.user_launchable,
+        "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
         "filter_visible": capability.filter_visible,
         "delivers_product": capability.delivers_product,
@@ -938,6 +960,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "agent_mode": capability.agent_mode,
         "default_category": capability.default_category,
         "user_launchable": capability.user_launchable,
+        "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
         "filter_visible": capability.filter_visible,
         "run_shape": capability.run_shape,

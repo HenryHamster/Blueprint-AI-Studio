@@ -1,17 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useTaskModal } from './useTaskModal';
-import { authGet, fetchTaskTypeCatalog, type TaskTypeCatalogEntry } from '../api';
+import { authGet, fetchTaskTypeCatalog, createComputeExperiment, type TaskTypeCatalogEntry } from '../api';
 
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
   authGet: vi.fn(),
   fetchTaskTypeCatalog: vi.fn(),
+  createComputeExperiment: vi.fn(),
   API_BASE_URL: '',
 }));
 
 const mockAuthGet = vi.mocked(authGet);
 const mockFetchTaskTypeCatalog = vi.mocked(fetchTaskTypeCatalog);
+const mockCreateComputeExperiment = vi.mocked(createComputeExperiment);
 
 function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string }): TaskTypeCatalogEntry {
   return {
@@ -21,6 +23,7 @@ function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string })
     agent_mode: 'write',
     default_category: null,
     user_launchable: true,
+    operator_contract_launchable: false,
     provider_configurable: true,
     filter_visible: true,
     output_kind: 'pr',
@@ -59,6 +62,8 @@ describe('useTaskModal', () => {
     });
     // Default: catalog fetch returns nothing — keeps the static fallback options.
     mockFetchTaskTypeCatalog.mockResolvedValue([]);
+    // Default: the dedicated compute_experiment launch resolves to a created task.
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'task-ce-1' });
   });
 
   afterEach(() => {
@@ -829,5 +834,146 @@ describe('useTaskModal', () => {
       useTaskModal('research', vi.fn(), { current: vi.fn() }),
     );
     expect(result.current.getDefaultEffortForType('research')).toBe('high');
+  });
+
+  // --- compute_experiment dedicated launch contract ---
+
+  it('surfaces compute_experiment as launchable from an operator_contract_launchable catalog entry', async () => {
+    mockFetchTaskTypeCatalog.mockResolvedValue([
+      catalogEntry({ id: 'create', label: 'Create', description: 'Write code, open PR' }),
+      catalogEntry({
+        id: 'compute_experiment',
+        label: 'Compute Experiment',
+        description: 'Run a bounded experiment',
+        user_launchable: false,
+        operator_contract_launchable: true,
+      }),
+    ]);
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    await act(async () => {
+      result.current.openNewTaskModal();
+    });
+    await waitFor(() => {
+      const values = result.current.launchableTaskTypeOptions.map(o => o.value);
+      expect(values).toContain('compute_experiment');
+    });
+  });
+
+  it('handleCreateTask routes a compute_experiment to the dedicated endpoint with the contract body', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        accelerator: 'T4',
+        machineType: 'n1-standard-4',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        hypothesis: 'accuracy improves',
+        successMetric: 'accuracy',
+        successOperator: '>=',
+        successThreshold: '0.9',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    // The generic task endpoint must NOT be hit for compute_experiment.
+    expect(fetchSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/tasks'),
+      expect.anything(),
+    );
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).toMatchObject({
+      github_repo: 'owner/repo',
+      base_branch: 'main',
+      command: 'python train.py',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      accelerator: 'T4',
+      machine_type: 'n1-standard-4',
+      hypothesis: 'accuracy improves',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    });
+    expect(addToast).toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateTask rejects a compute_experiment with an empty command', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: '   ', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Command is required for compute experiments', 'error');
+    expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
+  });
+
+  it('handleCreateTask rejects a compute_experiment with a non-positive spend cap', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python x.py', spendCapUsd: '0', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Spend cap must be a positive number (USD)', 'error');
+    expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
+  });
+
+  it('handleCreateTask rejects a compute_experiment with a non-positive deadline', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python x.py', spendCapUsd: '5', deadlineSeconds: '-1' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Deadline must be a positive integer (seconds)', 'error');
+    expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
+  });
+
+  it('handleCreateTask surfaces a backend rejection from the dedicated compute endpoint', async () => {
+    mockCreateComputeExperiment.mockRejectedValue(new Error('spend cap exceeds approval threshold'));
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python x.py', spendCapUsd: '500', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('spend cap exceeds approval threshold'),
+      'error',
+    );
   });
 });

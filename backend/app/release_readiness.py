@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import release_version
 from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
 from app.models import QualificationVerdict, ReleaseVersion
+from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
 from app.shared_state import resolve_project_promotion_enabled
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,10 @@ async def _compute_acceptance_aggregate(
             session, project_id, since=version.opened_at
         )
         return {
-            **{bucket: int(agg.get(bucket, 0)) for bucket in ACCEPTANCE_AGGREGATE_BUCKETS},
+            **{
+                bucket: int(agg.get(bucket, 0))
+                for bucket in ACCEPTANCE_AGGREGATE_BUCKETS
+            },
             "total": int(agg.get("total", 0)),
         }
     except Exception:  # noqa: BLE001 — defensive: any failure must not block readiness
@@ -234,6 +238,7 @@ async def _compute_validated_precision(
         "ground_truth_validated": sample >= _READINESS_MIN_RESOLVED_OUTCOMES,
     }
 
+
 # The readiness window is hardcoded to DRY-RUN-regime verdicts (promotion_enabled
 # is False) — sensible pre-go-live calibration, but stale once promotion goes
 # live, because live promote/promotion-failed verdicts are recorded with
@@ -286,6 +291,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "migration_apply_safety_detail": qual.get("migration_apply_safety_detail"),
         "audit_findings": qual.get("audit_findings"),
         "excluded_audit_findings": qual.get("excluded_audit_findings"),
+        "challenger_refuted_audit_findings": qual.get("challenger_refuted_audit_findings"),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
         "audit_reconciliation": qual.get("audit_reconciliation"),
@@ -353,6 +359,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "migration_apply_safety_detail": verdict.migration_apply_safety_detail,
         "audit_findings": verdict.audit_findings,
         "excluded_audit_findings": verdict.excluded_audit_findings,
+        "challenger_refuted_audit_findings": verdict.challenger_refuted_audit_findings,
         "test_erosion_detail": verdict.test_erosion_detail,
         "smoketest_detail": verdict.smoketest_detail,
         "audit_reconciliation": verdict.audit_reconciliation,
@@ -425,6 +432,39 @@ def _empty_readiness(
         "regime": "pre_go_live_calibration",
         "is_current_readiness": True,
     }
+
+
+async def get_challenged_vs_unchallenged_telemetry(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window: int = 100,
+) -> dict[str, Any]:
+    """Query QualificationVerdict history and compare challenged vs unchallenged audits.
+
+    Fetches the most recent ``window`` verdicts for the project and delegates
+    to :func:`compute_challenged_vs_unchallenged_telemetry` (pure, no I/O) to
+    partition them into challenged vs unchallenged cohorts and compute the
+    comparison.  Advisory and read-only — no effect on scoring or promotion.
+    """
+    stmt = (
+        select(QualificationVerdict)
+        .where(QualificationVerdict.project_id == project_id)
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(window)
+    )
+    verdicts = list((await session.execute(stmt)).scalars().all())
+    verdict_dicts = [
+        {
+            "audit_reconciliation": v.audit_reconciliation,
+            "would_promote": v.would_promote,
+            "terminal_status": v.terminal_status,
+            "post_promotion_outcome": v.post_promotion_outcome,
+            "excluded_audit_findings": v.excluded_audit_findings,
+        }
+        for v in verdicts
+    ]
+    return compute_challenged_vs_unchallenged_telemetry(verdict_dicts)
 
 
 async def compute_promotion_readiness(

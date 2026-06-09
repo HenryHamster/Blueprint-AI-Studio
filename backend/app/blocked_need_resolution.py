@@ -357,6 +357,16 @@ def knowledge_substance_satisfies_need(
     falsely satisfied. ``substance_index`` is a pre-fetched list of
     ``KnowledgeSubstance`` records (or any objects with ``.finding_hash`` and
     ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``.
+
+    For ``compute_experiment`` records the gate is the durable-grounding predicate
+    (durable citation present, no grounding miss, grounded > 0 when the probe ran) —
+    NOT the stricter acceptance-evidence gate (``classify_knowledge_acceptance``,
+    which further requires ``analysis_mode=='llm'``). Using the acceptance gate would
+    permanently starve dependents whenever LLM analysis is unavailable (no
+    ANTHROPIC_API_KEY or LLM disabled), since every compute document becomes a
+    fallback in that environment. A grounded measured-only (``analysis_mode=fallback``)
+    document therefore still satisfies a prerequisite need; it only fails the
+    task-success scoring gate, not the dependency-unblock gate.
     """
     if not isinstance(need, dict):
         return False
@@ -366,7 +376,14 @@ def knowledge_substance_satisfies_need(
     if not ref:
         return False
     ref = str(ref).strip()
+    from app.knowledge_query import knowledge_substance_has_durable_compute_grounding
+
     for record in substance_index:
+        source_kind = getattr(record, "source_kind", None)
+        if source_kind == "compute_experiment" and (
+            not knowledge_substance_has_durable_compute_grounding(record)
+        ):
+            continue
         if record.finding_hash and record.finding_hash == ref:
             return True
         if record.topic and record.topic == ref:

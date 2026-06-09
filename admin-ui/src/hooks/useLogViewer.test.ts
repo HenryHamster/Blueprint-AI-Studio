@@ -155,4 +155,94 @@ describe('useLogViewer strategist events', () => {
     expect(fetchDirections).not.toHaveBeenCalled();
     expect(result.current.lv.strategistActive).toBe(false);
   });
+
+  it('test_tracks_strategic_cycle_progress_and_completion_outcome', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+
+    // Emit a cycle-started event with the enriched payload the backend now sends.
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: {
+          task_id: 'task-1',
+          cycle_id: 'cycle-42',
+          phase: 2,
+          phase_number: 2,
+          phase_label: 'Strategic review',
+          phase_state: 'phase2_running',
+          steering_origin: 'operator',
+          steering_excerpt: 'Focus on improving test coverage',
+        },
+      });
+    });
+
+    // strategistActive must be set and cycleProgress must capture phase details.
+    expect(result.current.lv.strategistActive).toBe(true);
+    expect(result.current.lv.cycleProgress).toMatchObject({
+      task_id: 'task-1',
+      cycle_id: 'cycle-42',
+      phase_number: 2,
+      phase_label: 'Strategic review',
+      phase_state: 'phase2_running',
+      steering_origin: 'operator',
+      steering_excerpt: 'Focus on improving test coverage',
+    });
+    // No completion yet.
+    expect(result.current.lv.lastCycleCompletion).toBeNull();
+
+    // Emit completion with an outcome summary.
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          task_id: 'task-1',
+          cycle_id: 'cycle-42',
+          phase: 2,
+          completion: {
+            status: 'completed',
+            created_count: 2,
+            retired_count: 1,
+            staged_count: 0,
+            updated_count: 1,
+            tasks_spawned: 3,
+            directions_changed: true,
+            problem_model_changed: false,
+            running_update_changed: true,
+            // Compact strategic-judgment-challenge summary rides the completion
+            // sub-object verbatim and must be captured for the receipt chip.
+            strategic_judgment_challenge: {
+              mode: 'ok',
+              verdict: 'warned',
+              warned_count: 1,
+              blocked_count: 0,
+            },
+          },
+        },
+      });
+    });
+
+    // After completion: active flag cleared, progress cleared, outcome captured.
+    expect(result.current.lv.strategistActive).toBe(false);
+    expect(result.current.lv.cycleProgress).toBeNull();
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      status: 'completed',
+      created_count: 2,
+      retired_count: 1,
+      tasks_spawned: 3,
+      directions_changed: true,
+      running_update_changed: true,
+      strategic_judgment_challenge: {
+        mode: 'ok',
+        verdict: 'warned',
+        warned_count: 1,
+        blocked_count: 0,
+      },
+    });
+
+    // Directions refetch must have been debounced and fired.
+    const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchDirections).toHaveBeenCalledTimes(1);
+  });
 });

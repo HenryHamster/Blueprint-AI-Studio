@@ -260,6 +260,41 @@ describe('repairStructuredOutput', () => {
     expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('missing_required_key');
   });
 
+  // ── schemaLabel threading ─────────────────────────────────────────────────────
+
+  it('passes schemaLabel to all three telemetry calls when provided', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'prose without any valid JSON object emitted', lastResultText: '' })),
+      schemaLabel: 'design',
+    });
+
+    expect(vi.mocked(recordFormatMiss).mock.calls[0]).toEqual(['missing_required_key', 'design']);
+    expect(vi.mocked(recordFormatRepairAttempt).mock.calls[0]).toEqual(['design']);
+    expect(vi.mocked(recordFormatRepairSuccess).mock.calls[0]).toEqual(['design']);
+  });
+
+  it('omits schemaLabel from telemetry calls when not provided', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'prose without any valid JSON object emitted', lastResultText: '' })),
+    );
+
+    // schemaLabel is undefined — telemetry functions receive it but their
+    // internal guard (`if (schemaLabel !== undefined)`) skips the per-schema bucket.
+    expect(vi.mocked(recordFormatMiss).mock.calls[0]).toEqual(['missing_required_key', undefined]);
+    expect(vi.mocked(recordFormatRepairAttempt).mock.calls[0]).toEqual([undefined]);
+    expect(vi.mocked(recordFormatRepairSuccess).mock.calls[0]).toEqual([undefined]);
+  });
+
   it('malformed_json: preamble tells agent the JSON was incomplete or malformed', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,

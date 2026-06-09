@@ -494,6 +494,11 @@ describe('runThinkerWithGate', () => {
     mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     mockPersistAndPostStatus.mockResolvedValue(undefined);
     mockExistsSync.mockImplementation((path: string) => fsMockState.presentFiles.has(path));
+    // resetAllMocks also clears the writeFileSync implementation from vi.mock().
+    // Restore it so that thinker.ts writing the problem_model file is reflected in presentFiles.
+    vi.mocked(fs.writeFileSync as (path: string, data: unknown) => void).mockImplementation(
+      (path: string) => { if (typeof path === 'string') fsMockState.presentFiles.add(path); },
+    );
   });
 
   it('(a) thinker exits 0 + both files present → returns ok with analysisText, executor eligible', async () => {

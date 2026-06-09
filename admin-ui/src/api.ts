@@ -145,6 +145,10 @@ export interface TaskTypeCatalogEntry {
   agent_mode: 'write' | 'read_only';
   default_category: string | null;
   user_launchable: boolean;
+  // True for a non-user-launchable type that still has a dedicated structured
+  // launch-contract path (compute_experiment → POST /api/admin/tasks/compute-experiment).
+  // Optional so an older catalog payload that omits the flag still type-checks.
+  operator_contract_launchable?: boolean;
   provider_configurable: boolean;
   filter_visible: boolean;
   run_shape: 'single_agent' | 'workflow' | 'experiment_loop';
@@ -168,6 +172,74 @@ export async function fetchTaskTypeCatalog(
   if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
+/** The closed set of comparison operators a compute success criterion may use.
+ * Mirrors the backend `ComputeSuccessCriterion.operator` Literal verbatim. */
+export type ComputeSuccessOperator = '>=' | '<=' | '>' | '<' | '==' | '!=';
+
+/** A cheap, machine-checkable acceptance criterion for a compute_experiment.
+ * Mirrors backend `ComputeSuccessCriterion` ({metric, operator, threshold}). */
+export interface ComputeSuccessCriterion {
+  metric: string;
+  operator: ComputeSuccessOperator;
+  threshold: number;
+}
+
+/**
+ * Operator-supplied launch contract for the dedicated compute_experiment path
+ * (POST /api/admin/tasks/compute-experiment). The backend validates the launch
+ * rules (non-empty command, positive spend cap + deadline) and the spend-approval
+ * threshold before creating the task. Field names mirror the backend launch
+ * contract / `ComputeExperimentPayload`; optional fields are omitted when blank.
+ */
+export interface ComputeExperimentLaunchRequest {
+  github_repo: string;
+  base_branch: string;
+  title: string;
+  prompt: string;
+  command: string;
+  spend_cap_usd: number;
+  deadline_seconds: number;
+  accelerator?: string;
+  machine_type?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  experiment?: string;
+  benchmark?: string;
+  hypothesis?: string;
+  metric?: string;
+  success_criterion?: ComputeSuccessCriterion;
+  model?: string;
+  effort?: string;
+}
+
+/** Response from the dedicated compute_experiment launch endpoint — the created
+ * task. Kept loose (only `id` is relied on) so additive backend fields don't
+ * force a frontend change. */
+export interface ComputeExperimentLaunchResponse {
+  id: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Launch a bounded compute_experiment through its dedicated contract endpoint.
+ * Throws an Error carrying the backend message (error.message / detail) on a
+ * non-2xx response so callers can surface a precise inline error.
+ */
+export async function createComputeExperiment(
+  body: ComputeExperimentLaunchRequest,
+): Promise<ComputeExperimentLaunchResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
 }
 
 export interface TaskTypeCostAdherenceEntry {
@@ -1115,6 +1187,12 @@ export interface AuditFinding {
   summary: string;
 }
 
+export interface ChallengerRefutedFinding {
+  severity: string;
+  summary: string;
+  challenger_reason: string;
+}
+
 export interface LatestAudit {
   audit_task_id: string;
   task_status: string;
@@ -1149,6 +1227,8 @@ export interface VersionQualification {
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
+  challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
   migration_safety_detail?: string | null;
   migration_apply_safety?: string | null;
@@ -1331,6 +1411,23 @@ export interface StagedDirection {
   staged_age_days: number | null;
 }
 
+export interface ChallengedVsUnchallengedCohort {
+  sample_size: number;
+  insufficient_sample: boolean;
+  exclusion_rate?: number;
+  exclusion_count?: number;
+  disagreement_rate?: number;
+  disagreement_count?: number;
+  wrong_decision_rate?: number | null;
+  wrong_decision_resolved_sample?: number;
+}
+
+export interface ChallengedVsUnchallengedTelemetry {
+  challenged: ChallengedVsUnchallengedCohort;
+  unchallenged: ChallengedVsUnchallengedCohort;
+  total_verdicts: number;
+}
+
 export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
@@ -1343,6 +1440,8 @@ export interface VersionLifecycleResponse {
   promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
   staged_directions?: StagedDirection[];
+  /** Challenged-vs-unchallenged decision-quality cohort comparison. Advisory/display only. */
+  challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;
 }
 
 export interface SetPromotionEnabledResponse {
@@ -1522,6 +1621,8 @@ export interface QualificationVerdictRecord {
   audit_missing_reason: string | null;
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
+  challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
   migration_safety_detail?: string | null;
   migration_apply_safety?: string | null;
@@ -1621,6 +1722,13 @@ export async function fetchRecentFindings(
   return res.json();
 }
 
+export interface ChallengeSummary {
+  challenged_boundary: string | null;
+  agreement: 'agrees' | 'disagrees' | 'indeterminate';
+  second_opinion_verdict: string | null;
+  reason: string;
+}
+
 export interface ProjectFinding {
   task_id: string;
   direction_id: string | null;
@@ -1631,6 +1739,7 @@ export interface ProjectFinding {
   actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
   claims: string[];
   sources: Array<{ ref: string; type?: string | null; excerpt?: string | null }>;
+  challenge_summary?: ChallengeSummary | null;
 }
 
 export interface ProjectFindingsResponse {
@@ -2007,6 +2116,23 @@ export async function fetchSrReviewerDisagreementTasks(
 
 // ── Compute jobs ────────────────────────────────────────────────────────────
 
+/** Bounded diagnostic recorded by the backend when a compute backend RPC
+ *  (launch / poll / cost / termination) fails in the monitor or kill path.
+ *  Mirrors `_build_compute_rpc_diagnostic` in backend/app/compute_jobs.py. */
+export interface ComputeRpcDiagnostic {
+  operation: string;
+  error_type: string;
+  error_message: string;
+  started_at: string | null;
+  failed_at: string | null;
+  duration_ms: number;
+  attempt_count: number;
+  job_status: string;
+  next_retry_at: string | null;
+  retry_after_seconds: number | null;
+  reason?: string | null;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -2030,6 +2156,9 @@ export interface ComputeJob {
   accelerator_type: string | null;
   accelerator_count: number | null;
   polling_metadata?: Record<string, unknown>;
+  // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
+  // (or once it resolves). Older responses may carry it under polling_metadata.
+  compute_rpc_diagnostic?: ComputeRpcDiagnostic | null;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;
@@ -2122,6 +2251,58 @@ export interface KnowledgeCitationRecord {
 
 export type KnowledgeCitation = string | KnowledgeCitationRecord;
 
+/** Origin provenance state for a knowledge document's producing task (backend
+ *  `serialize_origin_provenance`). `research_finding` documents were spawned from a
+ *  research finding (and may carry a challenge); `not_research_finding_derived`
+ *  documents came from a non-finding source; `legacy_unknown` documents predate the
+ *  provenance contract. `string` keeps it forward-compatible. */
+export type KnowledgeOriginState =
+  | 'research_finding'
+  | 'not_research_finding_derived'
+  | 'legacy_unknown'
+  | string;
+
+/** Second-opinion decision on the originating research finding (backend
+ *  `_challenge_state`). `challenger_confirmed` / `overturned` /
+ *  `indeterminate_fail_closed` describe the resolved challenge; `unchallenged` means
+ *  a finding origin with no challenge; `not_applicable` / `legacy_unknown` mean the
+ *  challenge axis does not apply. */
+export type KnowledgeChallengeState =
+  | 'unchallenged'
+  | 'challenger_confirmed'
+  | 'overturned'
+  | 'indeterminate_fail_closed'
+  | 'not_applicable'
+  | 'legacy_unknown'
+  | string;
+
+/** Bounded second-opinion decision record for the originating research finding. */
+export interface KnowledgeFindingChallenge {
+  challenged_boundary?: string | null;
+  first_verdict?: string | null;
+  second_opinion_verdict?: string | null;
+  agreement?: 'agrees' | 'disagrees' | 'indeterminate' | string | null;
+  reason?: string | null;
+  sidecar_task_id?: string | null;
+  [key: string]: unknown;
+}
+
+/** Durable, bounded origin provenance attached by the backend to design /
+ *  web_research knowledge documents. All fields optional/nullable so legacy
+ *  documents and older backend responses (where the object is absent) render
+ *  cleanly. */
+export interface KnowledgeOriginProvenance {
+  origin_state?: KnowledgeOriginState;
+  research_task_id?: string | null;
+  parent_research_task_id?: string | null;
+  finding_index?: number | null;
+  finding_hash?: string | null;
+  direction_id?: string | null;
+  challenge_state?: KnowledgeChallengeState | null;
+  finding_challenge?: KnowledgeFindingChallenge | null;
+  [key: string]: unknown;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -2139,6 +2320,23 @@ export interface KnowledgeDocument {
   created_at: string | null;
   updated_at: string | null;
   forward_quality_verdict: KnowledgeForwardQualityVerdict | null;
+  // Backend-classified acceptance signal (app.knowledge_query.classify_knowledge_acceptance,
+  // the single source of truth). For compute_experiment documents the backend grades
+  // LLM-grounded, artifact-cited analyses as 'acceptance' and deterministic fallback /
+  // grounding-miss / unresolved-citation documents as 'measured_only'; non-compute docs
+  // grade as null (they cleared their own forward-quality gate). `knowledge_acceptance_evidence`
+  // is the boolean strict-acceptance flag, and `compute_acceptance_reason` carries the
+  // classifier's reason code (e.g. 'llm_artifact_cited', 'analysis_mode_not_llm',
+  // 'citation_grounding_miss'). All optional/nullable to stay back-compatible with docs
+  // serialized before the fields existed.
+  knowledge_acceptance_evidence?: boolean;
+  compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
+  compute_acceptance_reason?: string;
+  /** Durable origin provenance (backend `serialize_origin_provenance`): whether the
+   *  producing task came from a research finding, and the second-opinion decision that
+   *  allowed or rejected its dispatch. Absent on older backend responses — treat a
+   *  missing object as legacy/unknown. */
+  origin_provenance?: KnowledgeOriginProvenance | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -2153,7 +2351,7 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
@@ -2161,6 +2359,9 @@ export async function fetchKnowledgeDocuments(
   if (params?.tag) sp.set('tag', params.tag);
   if (params?.direction) sp.set('direction', params.direction);
   if (params?.source_kind) sp.set('source_kind', params.source_kind);
+  if (params?.origin_state) sp.set('origin_state', params.origin_state);
+  if (params?.challenge_state) sp.set('challenge_state', params.challenge_state);
+  if (params?.finding_hash) sp.set('finding_hash', params.finding_hash);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();

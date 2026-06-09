@@ -15,10 +15,13 @@ Focus areas:
 
 from __future__ import annotations
 
+import contextlib
+import uuid
 from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
 from app.models import Project, ReleaseVersion, Task, TaskStatus
@@ -2082,3 +2085,171 @@ async def test_abandon_concurrent_race_guard_independent_of_idempotency(db_sessi
     )
 
     assert abandoned is None and new_version is None
+
+
+# ===========================================================================
+# refresh_open_version_goal_if_auto_derived
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_refresh_auto_derived_goal_updates_when_focus_changes(db_session):
+    """Auto-derived goal (goal_editor_info null) is rewritten to new current_focus."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="old focus"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal_editor_info is None
+
+    updated = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "new focus for v2"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert updated is not None
+    assert version.goal == "new focus for v2"
+    assert version.goal_updated_at is not None
+    assert version.goal_editor_info is None  # still auto-derived
+
+
+@pytest.mark.asyncio
+async def test_refresh_operator_edited_goal_is_not_clobbered(db_session):
+    """An operator-edited goal (goal_editor_info non-null) is never overwritten."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="old auto focus"
+    )
+    await db_session.commit()
+
+    rv.set_version_goal(version, "operator goal", editor_id="op@example.com")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+    updated = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "strategic new focus"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert updated is None
+    assert version.goal == "operator goal"
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_op_when_focus_already_matches(db_session):
+    """No update when current_focus already matches the stored goal."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="same focus"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    original_updated_at = version.goal_updated_at
+
+    updated = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "same focus"
+    )
+    await db_session.commit()
+
+    assert updated is None
+    await db_session.refresh(version)
+    assert version.goal == "same focus"
+    assert version.goal_updated_at == original_updated_at
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_op_when_no_open_version(db_session):
+    """Returns None without error when no open version exists."""
+    project = await _make_project(db_session)
+    # No open version — just confirm no error is raised.
+    result = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "some focus"
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_op_when_focus_is_blank(db_session):
+    """Blank or None current_focus is treated as a no-op."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="existing goal"
+    )
+    await db_session.commit()
+
+    result_none = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, None
+    )
+    result_blank = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "   "
+    )
+    assert result_none is None
+    assert result_blank is None
+    await db_session.refresh(version)
+    assert version.goal == "existing goal"
+
+
+@pytest.mark.asyncio
+async def test_refresh_savepoint_keeps_outer_transaction_usable(db_session):
+    """A DB failure during the refresh must not poison the caller's transaction."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="old focus"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    original_execute = db_session.execute
+    poisoned = False
+
+    async def _poison_then_fail(statement, *args, **kwargs):
+        nonlocal poisoned
+        if not poisoned:
+            poisoned = True
+            dup_id = uuid.uuid4()
+            db_session.add(
+                Task(
+                    id=dup_id,
+                    project_id=project.id,
+                    title="poison-refresh",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                )
+            )
+            db_session.add(
+                Task(
+                    id=dup_id,
+                    project_id=project.id,
+                    title="poison-refresh",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                )
+            )
+            with contextlib.suppress(IntegrityError):
+                await db_session.flush()
+        return await original_execute(statement, *args, **kwargs)
+
+    with patch.object(db_session, "execute", new=_poison_then_fail):
+        updated = await rv.refresh_open_version_goal_if_auto_derived(
+            db_session, project.id, "new focus"
+        )
+
+    assert updated is None
+    await db_session.refresh(version)
+    assert version.goal == "old focus"
+
+    project.name = "still-usable"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert project.name == "still-usable"

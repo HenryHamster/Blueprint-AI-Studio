@@ -14,13 +14,124 @@ omits the (potentially large) markdown body; only get-by-id returns it.
 """
 
 import uuid
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from sqlalchemy import String, cast, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import KnowledgeDocument
+from app.models import KnowledgeDocument, SourceKind
+
+
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_MEASURED_ONLY = "measured_only"
+COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY = "compute_acceptance_grade"
+KNOWLEDGE_ACCEPTANCE_EVIDENCE_KEY = "knowledge_acceptance_evidence"
+ORIGIN_STATE_LEGACY_UNKNOWN = "legacy_unknown"
+ORIGIN_STATE_RESEARCH_FINDING = "research_finding"
+ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED = "not_research_finding_derived"
+ORIGIN_CHALLENGE_UNCHALLENGED = "unchallenged"
+ORIGIN_CHALLENGE_NOT_APPLICABLE = "not_applicable"
+_LEGACY_UNKNOWN_SOURCE_KINDS = {
+    SourceKind.DESIGN.value,
+    SourceKind.WEB_RESEARCH.value,
+    SourceKind.UNKNOWN.value,
+}
+
+
+def _stored_origin_state(doc: KnowledgeDocument) -> str:
+    if doc.origin_state:
+        return str(doc.origin_state)
+    if doc.source_kind in _LEGACY_UNKNOWN_SOURCE_KINDS:
+        return ORIGIN_STATE_LEGACY_UNKNOWN
+    return ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+
+
+def _stored_challenge_state(doc: KnowledgeDocument, origin_state: str) -> str:
+    if origin_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+        return ORIGIN_STATE_LEGACY_UNKNOWN
+    if origin_state != ORIGIN_STATE_RESEARCH_FINDING:
+        return ORIGIN_CHALLENGE_NOT_APPLICABLE
+    return str(doc.origin_challenge_state or ORIGIN_CHALLENGE_UNCHALLENGED)
+
+
+def serialize_origin_provenance(doc: KnowledgeDocument) -> dict[str, Any]:
+    """Return compact, bounded origin provenance for list/get/index surfaces."""
+    origin_state = _stored_origin_state(doc)
+    challenge_state = _stored_challenge_state(doc, origin_state)
+    return {
+        "origin_state": origin_state,
+        "research_task_id": doc.origin_research_task_id,
+        "parent_research_task_id": doc.origin_parent_research_task_id,
+        "finding_index": doc.origin_finding_index,
+        "finding_hash": doc.origin_finding_hash,
+        "direction_id": doc.direction_id,
+        "challenge_state": challenge_state,
+        "finding_challenge": (
+            doc.origin_challenge_record
+            if isinstance(doc.origin_challenge_record, dict)
+            else None
+        ),
+    }
+
+
+def classify_knowledge_acceptance(
+    *,
+    source_kind: str | None,
+    forward_quality_verdict: dict[str, Any] | None,
+    source_citations: list[Any] | None,
+) -> dict[str, Any]:
+    """Return the canonical acceptance signal for a KnowledgeDocument.
+
+    Non-compute knowledge documents already passed their forward-quality gate, so
+    they remain acceptable for strict knowledge-substance consumers. Compute
+    knowledge is stricter: only the cited LLM analysis path, with a grounding
+    probe resolving at least one citation and no grounding-miss flag, qualifies
+    as acceptance evidence. Deterministic fallback and unresolved-citation
+    documents remain durable measured knowledge, but classify as measured-only.
+    """
+    if source_kind != "compute_experiment":
+        return {
+            "knowledge_acceptance_evidence": True,
+            "compute_acceptance_grade": None,
+            "compute_acceptance_reason": "non_compute_forward_quality_gate",
+        }
+
+    verdict = (
+        forward_quality_verdict if isinstance(forward_quality_verdict, dict) else {}
+    )
+    citations = source_citations if isinstance(source_citations, list) else []
+    reason = None
+    if str(verdict.get("analysis_mode") or "").strip().lower() != "llm":
+        reason = "analysis_mode_not_llm"
+    elif verdict.get("citation_grounding_miss") is True:
+        reason = "citation_grounding_miss"
+    elif not any(isinstance(c, str) and c.strip() for c in citations):
+        reason = "no_source_citations"
+    else:
+        probes = (
+            verdict.get("probes") if isinstance(verdict.get("probes"), dict) else {}
+        )
+        grounding = (
+            probes.get("grounding")
+            if isinstance(probes.get("grounding"), dict)
+            else None
+        )
+        if grounding is None:
+            reason = "missing_grounding_probe"
+        elif int(grounding.get("grounded") or 0) <= 0:
+            reason = "no_grounded_artifact_citation"
+
+    accepted = reason is None
+    return {
+        "knowledge_acceptance_evidence": accepted,
+        "compute_acceptance_grade": (
+            COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE
+            if accepted
+            else COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_MEASURED_ONLY
+        ),
+        "compute_acceptance_reason": reason or "llm_artifact_cited",
+    }
 
 
 class KnowledgeSubstance(NamedTuple):
@@ -33,6 +144,90 @@ class KnowledgeSubstance(NamedTuple):
 
     finding_hash: str | None
     topic: str | None
+    source_kind: str | None = None
+    source_citations: tuple[str, ...] | None = None
+    forward_quality_verdict: dict[str, Any] | None = None
+
+
+def _is_durable_compute_citation(value: str) -> bool:
+    """True when value is a durable storage URI or path-like reference.
+
+    Rejects bare http(s):// URLs — ephemeral signed download URLs and bare result
+    URLs are transient and cannot serve as durable grounding evidence. Accepts
+    gs://, s3://, az://, file: URIs, path-like references (containing '/'), and
+    metric fragment references of the form gs://...#metric:name=value anchored to
+    a durable storage URI.
+    """
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in value
+
+
+def _has_durable_compute_citation(citations: tuple[str, ...] | None) -> bool:
+    """True when at least one compute citation is durably resolvable."""
+    for citation in citations or ():
+        if not isinstance(citation, str):
+            continue
+        text = citation.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered.startswith(("http://", "https://")):
+            continue
+        if lowered.startswith(("gs://", "s3://", "az://", "file:")) or "/" in text:
+            return True
+    return False
+
+
+def knowledge_substance_has_durable_compute_grounding(
+    substance: KnowledgeSubstance,
+) -> bool:
+    """True when a compute_experiment substance carries durable grounded evidence.
+
+    Fails closed: the write-time grounding probe is the ONLY positive proof. When
+    the probe is absent — no forward_quality_verdict, no probes dict, no grounding
+    sub-probe, or grounded count absent or zero — returns False. Additionally, at
+    least one citation must be a durable reference (gs://, s3://, az://, file:, or
+    path-like); bare http(s):// ephemeral/signed URLs are rejected even when the
+    probe is present and grounded > 0.
+
+    This is a consumer-side predicate over stored knowledge-document signals. It
+    does not re-derive artifact durability; it only inspects the persisted
+    compute-experiment fields that write-time already stamped.
+    """
+    if substance.source_kind != SourceKind.COMPUTE_EXPERIMENT.value:
+        return False
+
+    citations = [
+        c
+        for c in (substance.source_citations or ())
+        if isinstance(c, str) and c.strip()
+    ]
+    if not citations or not _has_durable_compute_citation(tuple(citations)):
+        return False
+
+    # At least one citation must be a durable reference, not merely non-empty.
+    if not any(_is_durable_compute_citation(c) for c in citations):
+        return False
+
+    verdict = substance.forward_quality_verdict
+    if not isinstance(verdict, dict):
+        return False
+    if verdict.get("citation_grounding_miss"):
+        return False
+    probes = verdict.get("probes")
+    if not isinstance(probes, dict):
+        return False
+    grounding = probes.get("grounding")
+    if not isinstance(grounding, dict):
+        return False
+    try:
+        return int(grounding.get("grounded") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def fetch_knowledge_substance_index(
@@ -54,18 +249,31 @@ async def fetch_knowledge_substance_index(
 
     rows = (
         await session.execute(
-            select(KnowledgeDocument.topic, Task.context)
+            select(
+                KnowledgeDocument.topic,
+                Task.context,
+                KnowledgeDocument.source_kind,
+                KnowledgeDocument.source_citations,
+                KnowledgeDocument.forward_quality_verdict,
+            )
             .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
             .where(KnowledgeDocument.project_id == project_id)
         )
     ).all()
     result: list[KnowledgeSubstance] = []
-    for topic, context in rows:
+    for topic, context, source_kind, source_citations, verdict in rows:
         fh = (context or {}).get("finding_hash") if context is not None else None
         result.append(
             KnowledgeSubstance(
                 finding_hash=str(fh).strip() if fh else None,
                 topic=str(topic).strip() if topic else None,
+                source_kind=str(source_kind).strip() if source_kind else None,
+                source_citations=tuple(
+                    c.strip()
+                    for c in (source_citations or [])
+                    if isinstance(c, str) and c.strip()
+                ),
+                forward_quality_verdict=verdict if isinstance(verdict, dict) else None,
             )
         )
     return result
@@ -79,6 +287,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
     source_task_id, created_at, updated_at, forward_quality_verdict (plus
     body only when ``include_body``).
     """
+    acceptance = classify_knowledge_acceptance(
+        source_kind=doc.source_kind,
+        forward_quality_verdict=doc.forward_quality_verdict,
+        source_citations=doc.source_citations,
+    )
     out = {
         "id": str(doc.id),
         "title": doc.title,
@@ -92,8 +305,12 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
         "forward_quality_verdict": doc.forward_quality_verdict,
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
+        "origin_provenance": serialize_origin_provenance(doc),
     }
     if include_body:
         out["body"] = doc.body
@@ -108,6 +325,9 @@ def build_knowledge_documents_stmt(
     tag: str | None = None,
     direction: str | None = None,
     source_kind: str | None = None,
+    origin_state: str | None = None,
+    challenge_state: str | None = None,
+    finding_hash: str | None = None,
 ):
     """Build the project-scoped ``select`` for knowledge documents.
 
@@ -116,15 +336,53 @@ def build_knowledge_documents_stmt(
     cast-to-text scan of the tag list. Ordering / pagination are applied by the
     caller (or by ``list_knowledge_documents``).
     """
-    stmt = select(KnowledgeDocument).where(
-        KnowledgeDocument.project_id == project_id
-    )
+    stmt = select(KnowledgeDocument).where(KnowledgeDocument.project_id == project_id)
     if topic:
         stmt = stmt.where(KnowledgeDocument.topic == topic)
     if source_kind:
         stmt = stmt.where(KnowledgeDocument.source_kind == source_kind)
     if direction:
         stmt = stmt.where(KnowledgeDocument.direction_id == direction)
+    if origin_state:
+        if origin_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_state.is_(None),
+                KnowledgeDocument.source_kind.in_(_LEGACY_UNKNOWN_SOURCE_KINDS),
+            )
+        elif origin_state == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED:
+            stmt = stmt.where(
+                or_(
+                    KnowledgeDocument.origin_state
+                    == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
+                    KnowledgeDocument.source_kind.not_in(
+                        _LEGACY_UNKNOWN_SOURCE_KINDS
+                    ),
+                )
+            )
+        else:
+            stmt = stmt.where(KnowledgeDocument.origin_state == origin_state)
+    if challenge_state:
+        if challenge_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_state.is_(None),
+                KnowledgeDocument.source_kind.in_(_LEGACY_UNKNOWN_SOURCE_KINDS),
+            )
+        elif challenge_state == ORIGIN_CHALLENGE_NOT_APPLICABLE:
+            stmt = stmt.where(
+                or_(
+                    KnowledgeDocument.origin_state
+                    == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
+                    KnowledgeDocument.source_kind.not_in(
+                        _LEGACY_UNKNOWN_SOURCE_KINDS
+                    ),
+                )
+            )
+        else:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_challenge_state == challenge_state
+            )
+    if finding_hash:
+        stmt = stmt.where(KnowledgeDocument.origin_finding_hash == finding_hash)
     if tag:
         # tags is a JSON list; match the exact element via a cast-to-text scan
         # so it works on both Postgres (JSONB) and the SQLite test backend.
@@ -152,6 +410,9 @@ async def list_knowledge_documents(
     tag: str | None = None,
     direction: str | None = None,
     source_kind: str | None = None,
+    origin_state: str | None = None,
+    challenge_state: str | None = None,
+    finding_hash: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -167,6 +428,9 @@ async def list_knowledge_documents(
         tag=tag,
         direction=direction,
         source_kind=source_kind,
+        origin_state=origin_state,
+        challenge_state=challenge_state,
+        finding_hash=finding_hash,
     )
 
     total = (
@@ -217,6 +481,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
     collapsed = " ".join(summary.split())
     if len(collapsed) > summary_chars:
         collapsed = collapsed[: summary_chars - 1].rstrip() + "…"
+    acceptance = classify_knowledge_acceptance(
+        source_kind=doc.source_kind,
+        forward_quality_verdict=doc.forward_quality_verdict,
+        source_citations=doc.source_citations,
+    )
     return {
         "id": str(doc.id),
         "title": doc.title,
@@ -224,6 +493,9 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "topic": doc.topic,
         "direction_id": doc.direction_id,
         "source_kind": doc.source_kind,
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
 

@@ -18,12 +18,64 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.models import Project, Task, TaskStatus
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
 # Task types that never open a PR. These are excluded from the
 # conversion_rate denominator so the metric means the same thing on every
 # surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
 PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
+_CHALLENGE_BOUNDARY_BUCKETS = (
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+)
+_CHALLENGE_AGREEMENT_BUCKETS = (
+    CHALLENGE_AGREES,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
+
+
+def _empty_finding_challenge_summary() -> dict[str, Any]:
+    return {
+        "challenged_findings": 0,
+        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
+        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "fail_closed_unparseable": 0,
+    }
+
+
+def _add_count(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    target["challenged_findings"] += _add_count(source.get("challenged_findings"))
+    target["fail_closed_unparseable"] += _add_count(
+        source.get("fail_closed_unparseable")
+    )
+    source_agreements = source.get("agreement_distribution") or {}
+    if isinstance(source_agreements, dict):
+        for key in _CHALLENGE_AGREEMENT_BUCKETS:
+            target["agreement_distribution"][key] += _add_count(
+                source_agreements.get(key)
+            )
+    source_boundaries = source.get("boundary_distribution") or {}
+    if isinstance(source_boundaries, dict):
+        for key in _CHALLENGE_BOUNDARY_BUCKETS:
+            target["boundary_distribution"][key] += _add_count(
+                source_boundaries.get(key)
+            )
 
 
 def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
@@ -37,6 +89,47 @@ def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
         (type_breakdown.get(ttype) or {}).get("created", 0) or 0
         for ttype in PR_INELIGIBLE_TASK_TYPES
     )
+
+
+def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Aggregate research spawn-gate counters from a direction's research_history.
+
+    Returns a compact 5-field dict (challenged, refuted, survived,
+    challenged_merge_rate, unchallenged_merge_rate) or None when all counters
+    are zero (no spawn-gate activity recorded).
+    """
+    challenged = 0
+    refuted = 0
+    survived = 0
+    challenged_spawned = 0
+    challenged_merged = 0
+    unchallenged_spawned = 0
+    unchallenged_merged = 0
+    for entry in history or []:
+        challenged += entry.get("research_spawn_gate_challenged_count") or 0
+        refuted += entry.get("research_spawn_gate_refuted_count") or 0
+        survived += entry.get("research_spawn_gate_survived_count") or 0
+        challenged_spawned += entry.get("research_spawn_gate_challenged_spawned") or 0
+        challenged_merged += entry.get("research_spawn_gate_challenged_merged") or 0
+        unchallenged_spawned += entry.get("research_spawn_gate_unchallenged_spawned") or 0
+        unchallenged_merged += entry.get("research_spawn_gate_unchallenged_merged") or 0
+    if not any([challenged, refuted, survived, challenged_spawned, unchallenged_spawned]):
+        return None
+    challenged_merge_rate = (
+        round(challenged_merged / challenged_spawned, 3) if challenged_spawned > 0 else None
+    )
+    unchallenged_merge_rate = (
+        round(unchallenged_merged / unchallenged_spawned, 3)
+        if unchallenged_spawned > 0
+        else None
+    )
+    return {
+        "challenged": challenged,
+        "refuted": refuted,
+        "survived": survived,
+        "challenged_merge_rate": challenged_merge_rate,
+        "unchallenged_merge_rate": unchallenged_merge_rate,
+    }
 
 
 async def compute_direction_progress(
@@ -173,6 +266,7 @@ async def compute_direction_progress(
         dir_findings_produced = 0
         dir_batch_cap_applied = 0
         dir_filter_breakdown_agg: Dict[str, int] = {}
+        dir_challenge_summary = _empty_finding_challenge_summary()
         dq_plans = 0
         dq_merge_rate_sum = 0.0
         dq_merge_rate_count = 0
@@ -181,6 +275,13 @@ async def compute_direction_progress(
         dir_reviews_dismissed = 0
         dir_reviews_overridden = 0
         dir_user_issues_caught = 0
+        spawn_gate_challenged_count = 0
+        spawn_gate_refuted_count = 0
+        spawn_gate_survived_count = 0
+        spawn_gate_challenged_spawned = 0
+        spawn_gate_challenged_merged = 0
+        spawn_gate_unchallenged_spawned = 0
+        spawn_gate_unchallenged_merged = 0
         for entry in d.get("research_history") or []:
             try:
                 entry_ts = _coerce_naive_utc(
@@ -224,6 +325,9 @@ async def compute_direction_progress(
                     dir_filter_breakdown_agg[_fk] = dir_filter_breakdown_agg.get(
                         _fk, 0
                     ) + (_fv or 0)
+                _merge_finding_challenge_summary(
+                    dir_challenge_summary, entry.get("finding_challenge_summary")
+                )
                 atm = entry.get("avg_time_to_merge_hours")
                 if atm is not None:
                     merge_time_values.append(float(atm))
@@ -324,6 +428,27 @@ async def compute_direction_progress(
                     title = (fd or {}).get("title")
                     if title:
                         recent_failed_titles.append(title)
+                spawn_gate_challenged_count += (
+                    entry.get("research_spawn_gate_challenged_count") or 0
+                )
+                spawn_gate_refuted_count += (
+                    entry.get("research_spawn_gate_refuted_count") or 0
+                )
+                spawn_gate_survived_count += (
+                    entry.get("research_spawn_gate_survived_count") or 0
+                )
+                spawn_gate_challenged_spawned += (
+                    entry.get("research_spawn_gate_challenged_spawned") or 0
+                )
+                spawn_gate_challenged_merged += (
+                    entry.get("research_spawn_gate_challenged_merged") or 0
+                )
+                spawn_gate_unchallenged_spawned += (
+                    entry.get("research_spawn_gate_unchallenged_spawned") or 0
+                )
+                spawn_gate_unchallenged_merged += (
+                    entry.get("research_spawn_gate_unchallenged_merged") or 0
+                )
             elif entry_ts >= prev_window_start:
                 for scope, stats in (entry.get("scope_breakdown") or {}).items():
                     agg = prev_dir_scope_agg.setdefault(
@@ -605,6 +730,12 @@ async def compute_direction_progress(
                 "tasks_created": findings_tasks_created,
             }
 
+        finding_challenge_summary = (
+            dir_challenge_summary
+            if dir_challenge_summary["challenged_findings"] > 0
+            else None
+        )
+
         for _sk, _agg in dir_scope_agg.items():
             for _field in (
                 "avg_expansion_ratio_merged",
@@ -646,6 +777,31 @@ async def compute_direction_progress(
         _dir_fc = compute_format_compliance_metrics(tasks_for_dir)["overall"]
         dir_format_compliance_rate = _dir_fc["format_compliance_rate"]
         dir_self_repair_success_rate = _dir_fc["self_repair_success_rate"]
+        spawn_gate_challenged_merge_rate = (
+            round(spawn_gate_challenged_merged / spawn_gate_challenged_spawned, 3)
+            if spawn_gate_challenged_spawned > 0
+            else None
+        )
+        spawn_gate_unchallenged_merge_rate = (
+            round(
+                spawn_gate_unchallenged_merged / spawn_gate_unchallenged_spawned, 3
+            )
+            if spawn_gate_unchallenged_spawned > 0
+            else None
+        )
+        research_spawn_gate = {
+            "challenged_count": spawn_gate_challenged_count,
+            "refuted_count": spawn_gate_refuted_count,
+            "survived_count": spawn_gate_survived_count,
+            "challenged_spawned": spawn_gate_challenged_spawned,
+            "challenged_merged": spawn_gate_challenged_merged,
+            "challenged_merge_rate": spawn_gate_challenged_merge_rate,
+            "unchallenged_spawned": spawn_gate_unchallenged_spawned,
+            "unchallenged_merged": spawn_gate_unchallenged_merged,
+            "unchallenged_merge_rate": spawn_gate_unchallenged_merge_rate,
+        }
+        if not any(research_spawn_gate.values()):
+            research_spawn_gate = None
 
         cost_budget_usd = d.get("cost_budget_usd")
         budget_utilization_pct = None
@@ -736,11 +892,13 @@ async def compute_direction_progress(
                     "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
                     "filter_funnel": filter_funnel,
+                    "finding_challenge_summary": finding_challenge_summary,
                     "decomposition_summary": decomposition_summary,
                     "first_attempt_success_rate": dir_fa_rate,
                     "first_attempt_sample_size": dir_fa_sample_size,
                     "format_compliance_rate": dir_format_compliance_rate,
                     "self_repair_success_rate": dir_self_repair_success_rate,
+                    "research_spawn_gate": research_spawn_gate,
                     "quality_score": round(_compute_direction_quality_score(d), 3),
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,

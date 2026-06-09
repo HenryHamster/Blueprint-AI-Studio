@@ -1372,6 +1372,106 @@ async def _maybe_create_cascade_cancel_alert(
     )
 
 
+# Stable title for the per-project wake-delivery-stall alert. Kept CONSTANT
+# (the drifting stall_cycles count lives in the message) so a persistent stall
+# dedups to exactly ONE alert per project across reaper ticks.
+_WAKE_DELIVERY_STALL_ALERT_TITLE = (
+    "Wake delivery stalled — parked tasks not waking"
+)
+
+
+async def _maybe_create_wake_delivery_stall_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    stall_cycles: int,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> int:
+    """Raise a deduplicated alert when wake delivery is stalled.
+
+    A stalled wake-delivery sweep means PARKED tasks whose registered wake
+    sources have fired are silently never advanced. Deduplicated on a STABLE
+    title so a sustained stall raises exactly ONE alert per project; the
+    drifting stall_cycles count lives in the message so a moving counter
+    never defeats dedup. Caller owns the commit.
+
+    Returns 1 when a NEW alert was created, else 0.
+    """
+    title = _WAKE_DELIVERY_STALL_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return 0
+
+    msg = (
+        f"The wake-delivery sweep has made no progress against the FIRED "
+        f"registration backlog for {stall_cycles} consecutive reaper cycles. "
+        f"Parked tasks whose wake sources have fired are not being advanced — "
+        f"check for a wedged or crashed delivery path."
+    )[:1000]
+
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=msg,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return 1
+
+
+async def _resolve_wake_delivery_stall_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+) -> int:
+    """Dismiss any open wake-delivery-stall alert for a project.
+
+    The companion to :func:`_maybe_create_wake_delivery_stall_alert`. Called
+    when the wake-delivery sweep recovers (delivery_stalled=False) to stamp
+    dismissed_at on any open stall alert so the operator UI drops it. Commits
+    its own rows and broadcasts alert_dismissed per dismissed alert.
+
+    Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    title = _WAKE_DELIVERY_STALL_ALERT_TITLE
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

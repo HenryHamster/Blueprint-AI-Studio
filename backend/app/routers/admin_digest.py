@@ -39,6 +39,7 @@ from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
+from app.strategic_completion import strategic_challenge_summary
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
     _compute_first_attempt_breakdowns,
@@ -51,6 +52,7 @@ from app.digest_metrics import (
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
@@ -1214,6 +1216,19 @@ async def _compute_digest(
                         latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
                             CYCLE_META_MEMOS_CITED
                         ]
+                        # Compact strategic-judgment-challenge summary when this
+                        # cycle carried a challenge record; omit entirely for
+                        # legacy cycles so absence never reads as a failure.
+                        _challenge_record = (_sc_row.cycle_metadata or {}).get(
+                            "strategic_judgment_challenge"
+                        )
+                        _challenge_summary = strategic_challenge_summary(
+                            _challenge_record
+                        )
+                        if _challenge_summary is not None:
+                            latest_cycle["strategic_judgment_challenge"] = (
+                                _challenge_summary
+                            )
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -1311,6 +1326,14 @@ async def _compute_digest(
     # foundations) — read-only signals so the two otherwise-invisible failure
     # modes the foundation-resolution work prevents become measurable. ---
     dependency_health_signals = await compute_dependency_health_signals(
+        session, project_id
+    )
+
+    # --- Compute-wake post-commit stuck-marker count (read-only) — surfaces
+    # DELIVERED compute_job_terminal registrations still carrying the durable
+    # post-commit marker, i.e., rows whose knowledge-persistence side effects
+    # have not yet completed. A non-zero count is actionable for operators. ---
+    compute_wake_post_commit_health = await compute_wake_post_commit_health_signals(
         session, project_id
     )
 
@@ -1470,6 +1493,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
+        "compute_wake_post_commit_health": compute_wake_post_commit_health,
         "park_wake_health": park_wake_health,
         "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,

@@ -31,7 +31,17 @@ from app.services import (
     _supersede_long_queued_pipeline_tasks,
 )
 from app.rollup_management import _check_and_trigger_rollup
-from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
+from app.task_lifecycle import park_task
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    Alert,
+    AlertSeverity,
+    TaskWakeRegistration,
+    WakeAction,
+    WakeDeliveryState,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -44,6 +54,36 @@ def _naive_utc_ago(**kwargs) -> datetime:
     must also be naive for the arithmetic to work without a TypeError.
     """
     return (datetime.now(timezone.utc) - timedelta(**kwargs)).replace(tzinfo=None)
+
+
+async def _parked_child(
+    session, project_id, parent_id, *, wake_ref: str
+) -> tuple[Task, TaskWakeRegistration]:
+    """Create a PARKED child via the real park_task primitive."""
+    child = Task(
+        project_id=project_id,
+        payloads=[{"type": "compute_experiment", "prompt": "parked child"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent_id,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+    reg = await park_task(
+        session,
+        child,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=wake_ref,
+        source_metadata={"compute_job_id": wake_ref},
+        wake_action=WakeAction.RESUME,
+        reason=f"waiting on compute job {wake_ref}",
+    )
+    await session.commit()
+    await session.refresh(child)
+    await session.refresh(reg)
+    return child, reg
 
 
 # ── Shared fixture ────────────────────────────────────────────────────────────
@@ -133,6 +173,138 @@ async def test_evaluating_all_children_terminal_triggers_rollup(eval_db, mocker)
 
 
 @pytest.mark.asyncio
+async def test_evaluating_all_parked_children_triggers_rollup(eval_db, mocker):
+    """Parked children must count as settled for missed-rollup recovery."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_rollup = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+
+    project = Project(name="Eval Parked Rollup Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parked parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _parked_child(
+        eval_db,
+        project.id,
+        parent.id,
+        wake_ref=f"job-{uuid.uuid4().hex}",
+    )
+
+    await _check_evaluating_timeouts()
+
+    mock_rollup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_evaluating_timeout_treats_parked_children_as_terminal_for_now(
+    eval_db, mocker
+):
+    """PARKED children must survive both EVALUATING timeout branches.
+
+    The CI-backstop and hard-timeout paths should both treat PARKED the same
+    way they already treat BLOCKED: counted as settled for parent timeout
+    accounting, but never cascade-cancelled just because the parent aged out.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    async def _seed_parent(*, ci_waiting: bool) -> tuple[Task, Task, TaskWakeRegistration]:
+        project = Project(name="Parked Timeout Guard", user_id="user1")
+        eval_db.add(project)
+        await eval_db.commit()
+        await eval_db.refresh(project)
+
+        parent = Task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "parent"}],
+            status=TaskStatus.EVALUATING,
+            status_log=[
+                {
+                    "t": _naive_utc_ago(hours=7).isoformat(),
+                    "msg": "Status changed: IN_PROGRESS → EVALUATING",
+                }
+            ],
+            context={
+                "review_loop": {
+                    "ci_waiting": ci_waiting,
+                    "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+                    "pr_number": 88011 if ci_waiting else 88012,
+                    "original_task_id": "parked-timeout",
+                }
+            },
+        )
+        eval_db.add(parent)
+        await eval_db.commit()
+        await eval_db.refresh(parent)
+
+        parked_child, reg = await _parked_child(
+            eval_db,
+            project.id,
+            parent.id,
+            wake_ref=f"job-{uuid.uuid4().hex}",
+        )
+        eval_db.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "active child"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                parent_task_id=parent.id,
+            )
+        )
+        await eval_db.commit()
+        return parent, parked_child, reg
+
+    ci_parent, ci_parked_child, ci_reg = await _seed_parent(ci_waiting=True)
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(ci_parent)
+    await eval_db.refresh(ci_parked_child)
+    await eval_db.refresh(ci_reg)
+
+    assert ci_parent.status == TaskStatus.FAILED
+    assert ci_parked_child.status == TaskStatus.PARKED
+    assert ci_parked_child.parked_at is not None
+    assert ci_parked_child.vm_instance_id is None
+    assert ci_parked_child.park_reason is not None
+    assert ci_parked_child.latest_status_message is None
+    assert ci_reg.delivery_state == WakeDeliveryState.PENDING
+    assert ci_reg.wake_source_kind == "compute_job_terminal"
+    assert ci_reg.wake_action == WakeAction.RESUME
+
+    hard_parent, hard_parked_child, hard_reg = await _seed_parent(ci_waiting=False)
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(hard_parent)
+    await eval_db.refresh(hard_parked_child)
+    await eval_db.refresh(hard_reg)
+
+    assert hard_parent.status == TaskStatus.FAILED
+    assert hard_parked_child.status == TaskStatus.PARKED
+    assert hard_parked_child.parked_at is not None
+    assert hard_parked_child.vm_instance_id is None
+    assert hard_parked_child.park_reason is not None
+    assert hard_parked_child.latest_status_message is None
+    assert hard_reg.delivery_state == WakeDeliveryState.PENDING
+    assert hard_reg.wake_source_kind == "compute_job_terminal"
+    assert hard_reg.wake_action == WakeAction.RESUME
+
+
+@pytest.mark.asyncio
 async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     """A task that has been EVALUATING for >6 hours with non-terminal children
     should be marked FAILED with an appropriate status message."""
@@ -189,6 +361,77 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     )
     assert "timeout" in (parent.latest_status_message or "").lower(), (
         f"Expected 'timeout' in status message but got: {parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluating_hard_timeout_preserves_parked_child(eval_db, mocker):
+    """Regression: a PARKED child of a hard-timed-out EVALUATING parent must NOT be
+    cascade-CANCELLED. PARKED is a durable non-terminal state (in-flight wake
+    registration / compute-job result) and belongs in the sweep's TERMINAL preserve
+    set alongside BLOCKED. An IN_PROGRESS sibling drives the hard-timeout cascade so
+    we can assert the parked child survives while the active one is cancelled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    project = Project(name="Parked Preserve Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-running task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # An IN_PROGRESS sibling keeps not-all-children-settled so the hard-timeout
+    # cascade path runs (rather than missed-rollup recovery).
+    active_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    parked_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "compute_experiment", "prompt": "parked on compute wake"}],
+        status=TaskStatus.PARKED,
+    )
+    eval_db.add_all([active_child, parked_child])
+    await eval_db.commit()
+    await eval_db.refresh(active_child)
+    await eval_db.refresh(parked_child)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    await eval_db.refresh(active_child)
+    await eval_db.refresh(parked_child)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected parent FAILED but got {parent.status}"
+    )
+    assert active_child.status == TaskStatus.CANCELLED, (
+        f"Expected IN_PROGRESS sibling CANCELLED but got {active_child.status}"
+    )
+    assert parked_child.status == TaskStatus.PARKED, (
+        f"PARKED child must be preserved from cascade-cancel, got {parked_child.status}"
     )
 
 

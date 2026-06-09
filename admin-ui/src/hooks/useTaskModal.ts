@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type React from 'react';
-import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog } from '../api';
+import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
 import type { TaskCapabilityContract } from '../types/settings';
@@ -9,6 +10,46 @@ import type { Task } from '../types/task';
 interface RepoOption {
   full_name: string;
   default_branch: string;
+}
+
+// The dedicated compute_experiment launch type. Submitting it routes to the
+// contract endpoint instead of the generic POST /api/admin/tasks.
+export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
+
+// Operator-facing form state for the compute_experiment launch contract. Held
+// as strings (raw input) and validated/coerced at submit time, mirroring how
+// the PR-number field is kept as a string. The success-criterion sub-fields are
+// all-or-nothing: leave them blank to launch without a machine-checkable goal.
+export interface ComputeExperimentForm {
+  command: string;
+  accelerator: string;
+  machineType: string;
+  spendCapUsd: string;
+  deadlineSeconds: string;
+  experiment: string;
+  benchmark: string;
+  hypothesis: string;
+  metric: string;
+  successMetric: string;
+  successOperator: ComputeSuccessOperator;
+  successThreshold: string;
+}
+
+export function defaultComputeExperimentForm(): ComputeExperimentForm {
+  return {
+    command: '',
+    accelerator: '',
+    machineType: '',
+    spendCapUsd: '',
+    deadlineSeconds: '',
+    experiment: '',
+    benchmark: '',
+    hypothesis: '',
+    metric: '',
+    successMetric: '',
+    successOperator: '>=',
+    successThreshold: '',
+  };
 }
 
 export function useTaskModal(
@@ -47,6 +88,11 @@ export function useTaskModal(
   const [newTaskModel, setNewTaskModel] = useState('');
   const [newTaskEffort, setNewTaskEffort] = useState('');
 
+  // compute_experiment launch-contract form state. Only consumed when
+  // newTaskType === 'compute_experiment'; otherwise inert.
+  const [computeExperiment, setComputeExperiment] =
+    useState<ComputeExperimentForm>(defaultComputeExperimentForm);
+
   // GitHub repo/branch dropdown state
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
   const [repoLoading, setRepoLoading] = useState(false);
@@ -67,8 +113,11 @@ export function useTaskModal(
   const fetchLaunchableTaskTypeOptions = async () => {
     try {
       const catalog = await fetchTaskTypeCatalog();
+      // Surface both freely-launchable types and those that expose a dedicated
+      // structured launch-contract path (compute_experiment) so the latter
+      // appears in the launcher even though user_launchable stays false.
       const launchable = catalog
-        .filter(entry => entry.user_launchable)
+        .filter(entry => entry.user_launchable || entry.operator_contract_launchable)
         .map(entry => ({ value: entry.id, label: entry.label, description: entry.description }));
       // Only adopt the catalog when it yields options; an empty/garbled
       // response must not blank the dropdown — keep the static fallback.
@@ -215,6 +264,7 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+    setComputeExperiment(defaultComputeExperimentForm());
     restoreDraft();
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
@@ -230,8 +280,91 @@ export function useTaskModal(
     }
   };
 
+  // Build + validate the compute_experiment launch contract and POST it to the
+  // dedicated endpoint. Mirrors the backend launch-contract rules client-side
+  // (non-empty command, positive spend cap + deadline) so the operator gets an
+  // immediate inline error instead of a round-trip rejection. Returns nothing;
+  // surfaces all outcomes through addToast.
+  const handleCreateComputeExperiment = async () => {
+    const command = computeExperiment.command.trim();
+    if (!command) {
+      addToast('Command is required for compute experiments', 'error');
+      return;
+    }
+    const spendCap = Number(computeExperiment.spendCapUsd);
+    if (!Number.isFinite(spendCap) || spendCap <= 0) {
+      addToast('Spend cap must be a positive number (USD)', 'error');
+      return;
+    }
+    const deadline = Number(computeExperiment.deadlineSeconds);
+    if (!Number.isInteger(deadline) || deadline <= 0) {
+      addToast('Deadline must be a positive integer (seconds)', 'error');
+      return;
+    }
+    // success_criterion is optional but all-or-nothing: a metric name without a
+    // numeric threshold (or vice-versa) is a misconfiguration, not a partial.
+    let successCriterion: ComputeSuccessCriterion | undefined;
+    const successMetric = computeExperiment.successMetric.trim();
+    const successThresholdRaw = computeExperiment.successThreshold.trim();
+    if (successMetric || successThresholdRaw) {
+      const threshold = Number(successThresholdRaw);
+      if (!successMetric || !successThresholdRaw || !Number.isFinite(threshold)) {
+        addToast('Success criterion needs a metric name and a numeric threshold', 'error');
+        return;
+      }
+      successCriterion = {
+        metric: successMetric,
+        operator: computeExperiment.successOperator,
+        threshold,
+      };
+    }
+    const accelerator = computeExperiment.accelerator.trim();
+    const machineType = computeExperiment.machineType.trim();
+    const experiment = computeExperiment.experiment.trim();
+    const benchmark = computeExperiment.benchmark.trim();
+    const hypothesis = computeExperiment.hypothesis.trim();
+    const metric = computeExperiment.metric.trim();
+    const title = newTaskTitle.trim() || `Compute experiment: ${command.slice(0, 60)}`;
+    const prompt = newTaskPrompt.trim() || hypothesis || `Run compute experiment: ${command}`;
+    const body: ComputeExperimentLaunchRequest = {
+      github_repo: newTaskRepo,
+      base_branch: newTaskBranch,
+      title,
+      prompt,
+      command,
+      spend_cap_usd: spendCap,
+      deadline_seconds: deadline,
+      ...(accelerator ? { accelerator } : {}),
+      ...(machineType ? { machine_type: machineType } : {}),
+      ...(experiment ? { experiment } : {}),
+      ...(benchmark ? { benchmark } : {}),
+      ...(hypothesis ? { hypothesis } : {}),
+      ...(metric ? { metric } : {}),
+      ...(successCriterion ? { success_criterion: successCriterion } : {}),
+      ...(newTaskModel ? { model: newTaskModel } : {}),
+      ...(newTaskEffort ? { effort: newTaskEffort } : {}),
+    };
+    try {
+      await createComputeExperiment(body);
+      setShowNewTaskModal(false);
+      setNewTaskTitle('');
+      setNewTaskPrompt('');
+      setComputeExperiment(defaultComputeExperimentForm());
+      clearDraft();
+      addToast('Compute experiment launched', 'success');
+      fetchTasksRef.current();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      addToast(`Failed to launch compute experiment: ${message}`, 'error');
+    }
+  };
+
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (newTaskType === COMPUTE_EXPERIMENT_TASK_TYPE) {
+      await handleCreateComputeExperiment();
+      return;
+    }
     const normalizedPrBranch = newTaskPrBranch.trim();
     if (newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') {
       const prNum = parseInt(newTaskPrNumber, 10);
@@ -381,6 +514,7 @@ export function useTaskModal(
     newTaskPrNumber, newTaskPrBranch, newTaskModel, newTaskEffort,
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
+    computeExperiment, setComputeExperiment,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,

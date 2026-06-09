@@ -2058,10 +2058,58 @@ async def compute_park_wake_health(
     ).scalar()
 
     oldest_fired_age_seconds = _age_seconds(now, oldest_fired_at)
-    delivery_stalled = (
-        oldest_fired_age_seconds is not None
-        and oldest_fired_age_seconds >= _PARK_WAKE_DELIVERY_STALL_SECONDS
+
+    # Unified stall definition: the same cycle-based counter that drives the
+    # reaper log and the operator Alert. The age-based threshold
+    # (_PARK_WAKE_DELIVERY_STALL_SECONDS) is kept for the oldest_fired_age_seconds
+    # observability field and delivery_stall_threshold_seconds; it is no longer
+    # used for the delivery_stalled boolean so all stall surfaces agree.
+    from app.reaper_sweeps import (
+        _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
+        get_wake_delivery_stall_cycles,
     )
+    delivery_stalled = (
+        get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
+    )
+
+    # Historical breakdown of park_wake_timeout outcomes by cause over the last 7 days.
+    # Buckets: wake_lost (delivery bug), provisioning_starved (job never reached
+    # running state), ran_out_of_time (job started but did not complete in time),
+    # unknown (no failure_detail on pre-enrichment failures).
+    _timeout_window_start = now - timedelta(days=7)
+    _timeout_task_filters = [
+        Task.status == TaskStatus.FAILED,
+        Task.updated_at >= _timeout_window_start,
+    ]
+    if project_id is not None:
+        _timeout_task_filters.append(Task.project_id == project_id)
+    _timeout_ctxs = (
+        await session.execute(
+            select(Task.context)
+            .where(*_timeout_task_filters)
+            .limit(500)
+        )
+    ).scalars().all()
+
+    timeout_by_cause: Dict[str, int] = {}
+    for _ctx in _timeout_ctxs:
+        if not isinstance(_ctx, dict):
+            continue
+        if _ctx.get("failure_class") != "park_wake_timeout":
+            continue
+        detail = _ctx.get("failure_detail") or "unknown"
+        if detail == "compute_job_terminal_job_not_terminal_by_deadline":
+            diag = _ctx.get("park_wake_timeout_diagnostics") or {}
+            if "job_started_at" not in diag:
+                # Pre-enrichment failure — sub-cause not recorded; group by detail.
+                cause = detail
+            elif diag.get("job_started_at") is None:
+                cause = "provisioning_starved"
+            else:
+                cause = "ran_out_of_time"
+        else:
+            cause = detail
+        timeout_by_cause[cause] = timeout_by_cause.get(cause, 0) + 1
 
     return {
         "parked_task_count": int(parked_task_count),
@@ -2070,6 +2118,9 @@ async def compute_park_wake_health(
         "oldest_fired_age_seconds": oldest_fired_age_seconds,
         "delivery_stalled": delivery_stalled,
         "delivery_stall_threshold_seconds": _PARK_WAKE_DELIVERY_STALL_SECONDS,
+        "stall_cycles": get_wake_delivery_stall_cycles(),
+        "timeout_by_cause": timeout_by_cause,
+        "timeout_cause_window_days": 7,
     }
 
 
@@ -2252,6 +2303,52 @@ async def compute_dependency_health_signals(
             session, project_id
         ),
     }
+
+
+async def compute_wake_post_commit_health_signals(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Count DELIVERED compute_job_terminal registrations still carrying the
+    post-commit stuck marker.
+
+    A non-zero ``stuck_count`` means these rows are waiting for their
+    ``run_compute_wake_post_commit`` side effects to complete. Rows with an
+    active backoff window are included because they are still stuck — they
+    simply have a scheduled retry time. Scoped to ``project_id`` when
+    provided, else fleet-wide.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.models import TaskWakeRegistration, WakeDeliveryState
+    from app.task_completion import _COMPUTE_WAKE_POST_COMMIT_META_KEY
+
+    if resolve_dialect_name(session) == "sqlite":
+        marker_predicate = func.json_extract(
+            TaskWakeRegistration.source_metadata,
+            f"$.{_COMPUTE_WAKE_POST_COMMIT_META_KEY}",
+        ).is_not(None)
+    else:
+        marker_predicate = TaskWakeRegistration.source_metadata.has_key(
+            _COMPUTE_WAKE_POST_COMMIT_META_KEY
+        )
+
+    filters = [
+        TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
+        TaskWakeRegistration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        marker_predicate,
+    ]
+    if project_id is not None:
+        filters.append(TaskWakeRegistration.project_id == project_id)
+
+    stuck_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(TaskWakeRegistration)
+            .where(*filters)
+        )
+    ).scalar() or 0
+
+    return {"stuck_count": int(stuck_count)}
 
 
 def _coerce_count(value: Any) -> "int | None":
@@ -3599,6 +3696,37 @@ def compute_narrative_summary(
         elif completed_delta < 0:
             shipped += f" (down from {prev_completed_count} last period)"
         narrative_parts.append(shipped + ".")
+
+    if direction_progress_list:
+        gate_challenged_spawned = 0
+        gate_challenged_merged = 0
+        gate_unchallenged_spawned = 0
+        gate_unchallenged_merged = 0
+        gate_refuted_count = 0
+        for dp in direction_progress_list:
+            gate = dp.get("research_spawn_gate") or {}
+            gate_challenged_spawned += int(gate.get("challenged_spawned") or 0)
+            gate_challenged_merged += int(gate.get("challenged_merged") or 0)
+            gate_unchallenged_spawned += int(gate.get("unchallenged_spawned") or 0)
+            gate_unchallenged_merged += int(gate.get("unchallenged_merged") or 0)
+            gate_refuted_count += int(gate.get("refuted_count") or 0)
+        challenged_rate = (
+            round(gate_challenged_merged / gate_challenged_spawned, 3)
+            if gate_challenged_spawned > 0
+            else None
+        )
+        unchallenged_rate = (
+            round(gate_unchallenged_merged / gate_unchallenged_spawned, 3)
+            if gate_unchallenged_spawned > 0
+            else None
+        )
+        if challenged_rate is not None and unchallenged_rate is not None:
+            narrative_parts.append(
+                "Before/after, research spawn gate: challenged-and-survived spawns "
+                f"merged at {challenged_rate:.1%} versus {unchallenged_rate:.1%} "
+                f"for unchallenged spawns; {gate_refuted_count} refuted finding"
+                f"{'s' if gate_refuted_count != 1 else ''} were prevented from spawning."
+            )
 
     if project_id and direction_progress_list:
         _dir_tax_hints = {

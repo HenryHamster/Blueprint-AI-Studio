@@ -23,6 +23,7 @@ import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
+import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
@@ -80,6 +81,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   design_doc_update: handleDesignDocUpdate,
   strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
+  release_audit_challenge: handleReleaseAuditChallenge,
   memo: handleMemo,
   verify_tests: handleVerifyTests,
   compute_experiment: handleComputeExperiment,
@@ -124,7 +126,7 @@ export function resolveHandler(
     reason:
       `Unknown task type "${taskType}" with no generic runner for run_shape=${contract.run_shape}, ` +
       `agent_mode=${contract.agent_mode}, output_kind=${contract.output_kind}. ` +
-      `Generic dispatch supports single_agent read_only→knowledge/none/verdict ` +
+      `Generic dispatch supports single_agent read_only→knowledge/none ` +
       `and workflow write→pr. Bespoke handlers: ${supported}`,
   };
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react';
 import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import {
@@ -71,6 +71,211 @@ function SourceKindBadge({ kind }: { kind?: string }) {
       <Icon className="w-2.5 h-2.5 shrink-0" />
       {label}
     </span>
+  );
+}
+
+/**
+ * Human-readable tooltip for each compute acceptance-grade reason code emitted by
+ * the backend classifier (app.knowledge_query.classify_knowledge_acceptance). The
+ * codes distinguish the strict acceptance path (`llm_artifact_cited`) from the
+ * measured-only causes — a deterministic fallback summary, a grounding miss, or a
+ * citation that never resolved to a durable artifact.
+ */
+const ACCEPTANCE_REASON_LABELS: Record<string, string> = {
+  llm_artifact_cited: 'LLM-grounded, artifact-cited analysis — qualifies as acceptance evidence',
+  analysis_mode_not_llm: 'Deterministic fallback summary (analysis mode is not LLM) — measured only',
+  citation_grounding_miss: 'Citation grounding miss — measured only',
+  no_source_citations: 'No source citations — measured only',
+  missing_grounding_probe: 'No grounding probe recorded — measured only',
+  no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
+};
+
+/**
+ * Acceptance-grade badge for compute_experiment knowledge documents. The backend
+ * (classify_knowledge_acceptance) is the single source of truth: it grades a
+ * compute KnowledgeDocument as 'acceptance' (LLM-grounded, artifact-cited analysis
+ * that clears the grounding probe) or 'measured_only' (deterministic fallback,
+ * grounding miss, or unresolved citations). Operators need to tell the two apart
+ * because only the acceptance grade qualifies as strict non-code acceptance
+ * evidence. Renders nothing for non-compute documents (grade is null) or older
+ * docs persisted before the grade existed, so measured-only/fallback docs stay
+ * visible in normal search and source-kind filtering — this only labels them.
+ */
+function AcceptanceGradeBadge({ doc }: { doc: Pick<KnowledgeDocument, 'source_kind' | 'compute_acceptance_grade' | 'compute_acceptance_reason'> }) {
+  if (doc.source_kind !== 'compute_experiment') return null;
+  const grade = doc.compute_acceptance_grade;
+  if (grade !== 'acceptance' && grade !== 'measured_only') return null;
+  const isAcceptance = grade === 'acceptance';
+  const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
+  const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
+    ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
+  const label = isAcceptance ? 'Acceptance' : 'Measured only';
+  const cls = isAcceptance
+    ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
+    : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
+  return (
+    <span
+      className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+      title={tooltip}
+    >
+      {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
+      {label}
+    </span>
+  );
+}
+
+/**
+ * Origin-challenge badge for a knowledge document spawned from a research finding.
+ * The backend (app.knowledge_query.serialize_origin_provenance) records whether the
+ * producing design / web_research task came from a research finding and the
+ * second-opinion decision that allowed or rejected its dispatch. We surface the
+ * resolved challenge outcome — confirmed, overturned, indeterminate/fail-closed, or
+ * unchallenged — so an operator can tell at a glance whether a finding-derived
+ * document survived an independent adversarial pass.
+ *
+ * Renders nothing for documents that are not research-finding-derived
+ * (`not_research_finding_derived` / `legacy_unknown`) or whose backend response
+ * predates the provenance contract (`origin_provenance` absent), so legacy documents
+ * stay clean in the list. The detail view still surfaces those states via
+ * OriginProvenanceDetail below.
+ */
+const CHALLENGE_STATE_STYLES: Record<string, { bg: string; text: string; icon: typeof Shield; label: string; tooltip: string }> = {
+  unchallenged: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-300', icon: Shield, label: 'Unchallenged', tooltip: 'Spawned from a research finding that was not independently challenged.' },
+  challenger_confirmed: { bg: 'bg-emerald-500/10 border-emerald-500/20', text: 'text-emerald-300', icon: ShieldCheck, label: 'Confirmed', tooltip: 'An independent second opinion agreed with the originating research finding.' },
+  overturned: { bg: 'bg-red-500/10 border-red-500/20', text: 'text-red-300', icon: ShieldAlert, label: 'Overturned', tooltip: 'An independent second opinion disagreed with the originating research finding.' },
+  indeterminate_fail_closed: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-300', icon: AlertTriangle, label: 'Indeterminate', tooltip: 'The second opinion was indeterminate; dispatch was allowed fail-closed.' },
+};
+
+/** Selectable challenge states for the bounded filter control (order matters). */
+const CHALLENGE_STATE_OPTIONS = ['unchallenged', 'challenger_confirmed', 'overturned', 'indeterminate_fail_closed'] as const;
+
+/** Human-readable labels for the origin-state axis surfaced in the detail block. */
+const ORIGIN_STATE_LABELS: Record<string, string> = {
+  research_finding: 'Research finding',
+  not_research_finding_derived: 'Not research-finding derived',
+  legacy_unknown: 'Legacy / unknown (predates provenance tracking)',
+};
+
+function OriginBadge({ doc }: { doc: Pick<KnowledgeDocument, 'origin_provenance'> }) {
+  const prov = doc.origin_provenance;
+  if (!prov || prov.origin_state !== 'research_finding') return null;
+  const state = typeof prov.challenge_state === 'string' ? prov.challenge_state : 'unchallenged';
+  const style = CHALLENGE_STATE_STYLES[state] ?? CHALLENGE_STATE_STYLES.unchallenged;
+  const Icon = style.icon;
+  return (
+    <span
+      className={`${style.bg} ${style.text} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+      title={style.tooltip}
+    >
+      <Icon className="w-2.5 h-2.5 shrink-0" />
+      {style.label}
+    </span>
+  );
+}
+
+/**
+ * Detail-view block exposing the source research task / finding identity and the
+ * second-opinion decision record for a knowledge document, derived from the backend
+ * origin provenance. Renders whenever `origin_provenance` is present (so legacy /
+ * not-finding-derived documents surface their state explicitly), and degrades to a
+ * single state line when no finding identity or challenge record was recorded.
+ * Renders nothing when the backend response omits provenance entirely (older
+ * backends), keeping the existing detail view intact.
+ */
+function OriginProvenanceDetail({
+  doc,
+  onNavigateToTask,
+}: {
+  doc: Pick<KnowledgeDocument, 'origin_provenance'>;
+  onNavigateToTask?: (taskId: string) => void;
+}) {
+  const prov = doc.origin_provenance;
+  if (!prov) return null;
+  const originState = typeof prov.origin_state === 'string' ? prov.origin_state : undefined;
+  const stateLabel = (originState ? ORIGIN_STATE_LABELS[originState] : undefined) ?? originState ?? 'Unknown';
+  const researchTaskId = typeof prov.research_task_id === 'string' ? prov.research_task_id : null;
+  const parentTaskId = typeof prov.parent_research_task_id === 'string' ? prov.parent_research_task_id : null;
+  const findingHash = typeof prov.finding_hash === 'string' ? prov.finding_hash : null;
+  const findingIndex = typeof prov.finding_index === 'number' ? prov.finding_index : null;
+  const challenge = prov.finding_challenge && typeof prov.finding_challenge === 'object' ? prov.finding_challenge : null;
+  const hasIdentity = !!(researchTaskId || parentTaskId || findingHash || findingIndex !== null);
+  const sidecarTaskId = challenge && typeof challenge.sidecar_task_id === 'string' ? challenge.sidecar_task_id : null;
+
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-[11px] space-y-1.5">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Finding origin</div>
+        <OriginBadge doc={doc} />
+      </div>
+      <div className="text-neutral-300">
+        <span className="text-neutral-500">State:</span> {stateLabel}
+      </div>
+      {hasIdentity && (
+        <div className="space-y-0.5">
+          {researchTaskId && (
+            onNavigateToTask ? (
+              // reason: research-task provenance link in compact detail block; text-[11px] inline control
+              <button
+                data-viewport-allow-small-target
+                onClick={() => onNavigateToTask(researchTaskId)}
+                className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                <ExternalLink className="w-3 h-3" /> research task
+                <span className="font-mono text-[10px] text-neutral-500">{researchTaskId.slice(0, 8)}…</span>
+              </button>
+            ) : (
+              <div className="text-neutral-400 break-all"><span className="text-neutral-500">Research task:</span> <span className="font-mono">{researchTaskId}</span></div>
+            )
+          )}
+          {parentTaskId && parentTaskId !== researchTaskId && (
+            <div className="text-neutral-400 break-all"><span className="text-neutral-500">Parent research task:</span> <span className="font-mono">{parentTaskId}</span></div>
+          )}
+          {findingIndex !== null && (
+            <div className="text-neutral-400"><span className="text-neutral-500">Finding index:</span> <span className="font-mono">#{findingIndex}</span></div>
+          )}
+          {findingHash && (
+            <div className="text-neutral-400 break-all"><span className="text-neutral-500">Finding hash:</span> <span className="font-mono">{findingHash}</span></div>
+          )}
+        </div>
+      )}
+      {challenge && (
+        <div className="border-t border-neutral-800/70 pt-1.5 space-y-0.5">
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Second opinion</div>
+          {typeof challenge.challenged_boundary === 'string' && challenge.challenged_boundary && (
+            <div className="text-neutral-400 break-all"><span className="text-neutral-500">Boundary:</span> {challenge.challenged_boundary}</div>
+          )}
+          {(typeof challenge.first_verdict === 'string' || typeof challenge.second_opinion_verdict === 'string') && (
+            <div className="text-neutral-400">
+              <span className="text-neutral-500">Verdict:</span>{' '}
+              <span className="font-mono">{typeof challenge.first_verdict === 'string' ? challenge.first_verdict : '—'}</span>
+              {' → '}
+              <span className="font-mono">{typeof challenge.second_opinion_verdict === 'string' ? challenge.second_opinion_verdict : '—'}</span>
+            </div>
+          )}
+          {typeof challenge.agreement === 'string' && challenge.agreement && (
+            <div className="text-neutral-400"><span className="text-neutral-500">Agreement:</span> {challenge.agreement}</div>
+          )}
+          {typeof challenge.reason === 'string' && challenge.reason && (
+            <p className="text-neutral-400 leading-snug break-words">{challenge.reason}</p>
+          )}
+          {sidecarTaskId && (
+            onNavigateToTask ? (
+              // reason: challenge-task provenance link in compact detail block; text-[11px] inline control
+              <button
+                data-viewport-allow-small-target
+                onClick={() => onNavigateToTask(sidecarTaskId)}
+                className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                <ExternalLink className="w-3 h-3" /> challenge task
+                <span className="font-mono text-[10px] text-neutral-500">{sidecarTaskId.slice(0, 8)}…</span>
+              </button>
+            ) : (
+              <div className="text-neutral-400 break-all"><span className="text-neutral-500">Challenge task:</span> <span className="font-mono">{sidecarTaskId}</span></div>
+            )
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -179,9 +384,10 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
     tagFilter: null as string | null,
     directionFilter: null as string | null,
     sourceKindFilter: null as string | null,
+    challengeStateFilter: null as string | null,
     offset: 0,
   });
-  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, offset } = query;
+  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset } = query;
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -189,7 +395,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
-  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter'>(
+  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter'>(
     key: K,
     value: typeof query[K],
   ) => {
@@ -213,6 +419,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         tag: tagFilter ?? undefined,
         direction: directionFilter ?? undefined,
         source_kind: sourceKindFilter ?? undefined,
+        challenge_state: challengeStateFilter ?? undefined,
         limit: PAGE_SIZE,
         offset,
       })
@@ -229,7 +436,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(handle); };
-  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, offset]);
+  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset]);
 
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
@@ -283,6 +490,8 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-500">
                 <CopyableId id={selected.id} />
                 <SourceKindBadge kind={selected.source_kind} />
+                <AcceptanceGradeBadge doc={selected} />
+                <OriginBadge doc={selected} />
                 {selected.authoring_branch && selected.head_sha && (
                   <span className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-mono">
                     {selected.authoring_branch}@{selected.head_sha}
@@ -325,6 +534,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
 
             <VerdictBadge verdict={selected.forward_quality_verdict} />
             <ProbeDetail verdict={selected.forward_quality_verdict} />
+            <OriginProvenanceDetail doc={selected} onNavigateToTask={onNavigateToTask} />
 
             {selected.summary &&<p className="text-xs text-neutral-400 leading-relaxed italic">{selected.summary}</p>}
 
@@ -432,6 +642,34 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                   );
                 })}
               </div>
+              {/* Challenge-state filter — scope to a research-finding origin's second-opinion outcome. */}
+              <div className="flex items-center gap-1 flex-wrap">
+                <span className="text-[9px] uppercase tracking-wide text-neutral-600 mr-0.5">challenge</span>
+                {/* reason: challenge filter segment; text-[9px] inline control matching card chip density */}
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => setFilter('challengeStateFilter', null)}
+                  className={`text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${challengeStateFilter === null ? 'bg-neutral-700 border-neutral-600 text-neutral-100' : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                >All</button>
+                {CHALLENGE_STATE_OPTIONS.map(state => {
+                  const style = CHALLENGE_STATE_STYLES[state];
+                  const active = challengeStateFilter === state;
+                  const Icon = style.icon;
+                  return (
+                    // reason: challenge filter segment; text-[9px] inline control matching card chip density
+                    <button
+                      data-viewport-allow-small-target
+                      key={state}
+                      onClick={() => setFilter('challengeStateFilter', active ? null : state)}
+                      className={`text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                      title={style.tooltip}
+                    >
+                      <Icon className="w-2.5 h-2.5 shrink-0" />
+                      {style.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-2">
@@ -475,6 +713,8 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                   {doc.summary && <p className="text-[11px] text-neutral-500 mt-1 line-clamp-2 leading-snug">{doc.summary}</p>}
                   <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
                     <SourceKindBadge kind={doc.source_kind} />
+                    <AcceptanceGradeBadge doc={doc} />
+                    <OriginBadge doc={doc} />
                     {doc.direction_id && (
                       // reason: direction filter chip in compact card footer; text-[9px] inline control
                       <button

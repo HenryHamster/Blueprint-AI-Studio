@@ -586,9 +586,11 @@ describe('FAILURE_CLASS_CONFIG', () => {
     'agent_stalled',
     'BLOCKED_PRECONDITION',
     'SCOPE_EMPTY',
+    'park_wake_timeout',
+    'park_wake_stranded',
   ];
 
-  it('covers exactly the 11 canonical failure classes (incl. lowercase agent_stalled)', () => {
+  it('covers exactly the 13 canonical failure classes (incl. lowercase agent_stalled and park/wake)', () => {
     expect(Object.keys(FAILURE_CLASS_CONFIG).sort()).toEqual([...CANONICAL_FAILURE_CLASSES].sort());
   });
 
@@ -613,6 +615,8 @@ describe('FAILURE_CLASS_CONFIG', () => {
     expect(FAILURE_CLASS_CONFIG.agent_stalled.label).toBe('Agent Stalled');
     expect(FAILURE_CLASS_CONFIG.BLOCKED_PRECONDITION.label).toBe('Blocked — precondition');
     expect(FAILURE_CLASS_CONFIG.SCOPE_EMPTY.label).toBe('Scope Empty');
+    expect(FAILURE_CLASS_CONFIG.park_wake_timeout.label).toBe('Park Wake Timeout');
+    expect(FAILURE_CLASS_CONFIG.park_wake_stranded.label).toBe('Park Wake Stranded');
   });
 
   it('renders the badge and suggestion for a task that failed with agent_stalled', () => {

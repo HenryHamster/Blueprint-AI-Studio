@@ -601,7 +601,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "set_strategic_challenge"
     data: Any = {}
 
 
@@ -648,13 +648,34 @@ async def strategic_operation(
             body["warnings"] = list(warnings)
         return body
 
-    async def _emit_updated(kind: str) -> None:
+    async def _emit_updated(
+        kind: str,
+        *,
+        changed_direction_ids: list[str] | None = None,
+        changed_count: int | None = None,
+        problem_model_changed: bool | None = None,
+        running_update_changed: bool | None = None,
+    ) -> None:
         """Post-commit refetch signal for a strategist output change.
 
         Must be awaited only AFTER the op's ``session.commit()``; the lock is
         already released by then, mirroring the established broadcast pattern.
         """
-        await emit_strategic_updated(project.id, kind)
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        await emit_strategic_updated(
+            project.id,
+            kind,
+            task_id=task.id,
+            cycle_id=cycle_id,
+            output_kind=kind,
+            op=payload.op,
+            changed_direction_ids=changed_direction_ids,
+            changed_count=changed_count,
+            problem_model_changed=problem_model_changed,
+            running_update_changed=running_update_changed,
+        )
 
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
@@ -950,7 +971,11 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[new_dir["id"]],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Created direction '{text[:60]}' "
             f"({'staged for v' + str(staged_for_version) if staged_create else 'active'}) "
@@ -1138,11 +1163,22 @@ async def strategic_operation(
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_api_called": True}
+        updated_ids = list(ctx.get("_strategic_updated_ids", []))
+        updated_ids.append(str(dir_id))
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": updated_ids,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
         return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
 
@@ -1185,7 +1221,11 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         # Advisory (non-blocking): each active direction is one parallel work-lane
         # the fleet fans out across, so retiring below the healthy floor caps max
@@ -1275,11 +1315,16 @@ async def strategic_operation(
             **ctx,
             "_strategic_dirs_staged": ctx.get("_strategic_dirs_staged", 0) + 1,
             "_strategic_staged_ids": staged_ids,
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Staged direction {dir_id} for v{staged_for_version} "
             f"(project {project.id})"
@@ -1355,11 +1400,18 @@ async def strategic_operation(
             **ctx,
             "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
             + 1,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", [])) + [dir_id],
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}"
         )
@@ -1432,6 +1484,9 @@ async def strategic_operation(
             **ctx,
             "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
             + 1,
+            "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
+            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", [])) + [dir_id],
+            "_strategic_api_called": True,
         }
         flag_modified(task, "context")
         session.add(task)
@@ -1441,7 +1496,11 @@ async def strategic_operation(
             # router, and _ensure_vm_deleted is defined in main.py.
             from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
-        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
         logger.info(
             f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
         )
@@ -1915,7 +1974,29 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_PROBLEM_MODEL)
+        # Refresh the open version goal if it is still auto-derived so the
+        # operator-facing Version Lifecycle Goal follows the new strategic focus.
+        # Best-effort: runs after the commit so a failure cannot roll back the
+        # problem_model write.  Uses its own mini-transaction (BEGIN … COMMIT)
+        # via the session's autobegin semantics.
+        try:
+            from app import release_version as _rv
+
+            _new_focus = (new_pm_raw.get("intent") or {}).get("current_focus")
+            await _rv.refresh_open_version_goal_if_auto_derived(
+                session, project.id, _new_focus
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "[STRATEGIC API] Failed to refresh open version goal after "
+                "problem_model update (non-fatal)"
+            )
+            await session.rollback()
+        await _emit_updated(
+            STRATEGIC_KIND_PROBLEM_MODEL,
+            problem_model_changed=True,
+        )
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -2001,7 +2082,10 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        await _emit_updated(STRATEGIC_KIND_RUNNING_UPDATE)
+        await _emit_updated(
+            STRATEGIC_KIND_RUNNING_UPDATE,
+            running_update_changed=True,
+        )
         if ru_rejected is not None:
             logger.info(
                 f"[STRATEGIC API] running_update: concurrent operator edit "
@@ -2249,6 +2333,66 @@ async def strategic_operation(
             f"[STRATEGIC API] Stored {len(cited_ids)} cited memo id(s) for task {task.id}"
         )
         return _resp({"status": "ok", "op": "cite_memos", "count": len(cited_ids)})
+
+    elif payload.op == "set_strategic_challenge":
+        # Store the independent adversarial SECOND OPINION over the strategist's
+        # own self-produced judgments (evidence_progress ratings, retirement
+        # critiques, portfolio-shape decisions). The record is sanitized to a
+        # bounded, versioned shape and stashed on task.context for the completion
+        # handler to copy into StrategicCycle.cycle_metadata and for the first
+        # hard gate (_evidence_progress_suppresses_scaffolding) to consult.
+        #
+        # NOTE: deliberately do NOT set _strategic_api_called here. A challenge is
+        # a review of the agent's own judgments, NOT an executor mutation of
+        # strategic state — flagging api-usage would let a challenge-only cycle
+        # masquerade as a successful strategic mutation and suppress the no-op /
+        # failure circuit-breaker. Mirrors the cite_memos rationale above.
+        from app.strategic_completion import (
+            STRATEGIC_CHALLENGE_CONTEXT_KEY,
+            sanitize_strategic_challenge_record,
+        )
+
+        record = sanitize_strategic_challenge_record(data)
+        if record is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "set_strategic_challenge: data must be an object with optional "
+                    "evidence_progress / retirement_critiques / portfolio_shape lists"
+                ),
+            )
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            STRATEGIC_CHALLENGE_CONTEXT_KEY: record,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        ep_n = len(record.get("evidence_progress", []))
+        rc_n = 1 if "retirement_critique_quality" in record else 0
+        ps_n = 1 if "portfolio_shape_risk" in record else 0
+        logger.info(
+            "[STRATEGIC API] Stored strategic judgment challenge for task %s "
+            "(evidence_progress=%d, retirement_critique_quality=%d, portfolio_shape_risk=%d)",
+            task.id,
+            ep_n,
+            rc_n,
+            ps_n,
+        )
+        version = record.get("challenge_version", record.get("version"))
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_strategic_challenge",
+                "version": version,
+                "challenge_version": version,
+                "challenge_status": record.get("status"),
+                "evidence_progress_count": ep_n,
+                "retirement_critique_quality_count": rc_n,
+                "portfolio_shape_risk_count": ps_n,
+            }
+        )
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

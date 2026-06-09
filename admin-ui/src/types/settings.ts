@@ -17,6 +17,12 @@ export interface TaskCapabilityContractEntry {
   default_category?: string | null;
   description?: string;
   user_launchable?: boolean;
+  // True when the type is NOT freely operator-launchable (user_launchable=false)
+  // but DOES expose a dedicated structured launch-contract path (e.g.
+  // compute_experiment, launched through POST /api/admin/tasks/compute-experiment).
+  // Additive/optional so an older backend that omits it still type-checks; the
+  // resolver defaults it to false.
+  operator_contract_launchable?: boolean;
   provider_configurable?: boolean;
   filter_visible?: boolean;
   delivers_product?: boolean;

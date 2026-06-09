@@ -10,11 +10,12 @@ Covers:
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 - _record_remediation_outcome / _record_remediation_if_terminal: remediation
   outcome propagation
-- _synthesize_memo_from_source_finding, build_blueprint_pr_* helpers
+- build_blueprint_pr_* helpers
 """
 
 import json
 import os
+import uuid as _uuid_mod
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,7 +41,8 @@ from app.task_completion import (
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
-    _synthesize_memo_from_source_finding,
+    reconcile_review_second_opinion,
+    _parse_panel_review_output,
 )
 from app.models import PoolVmState, Task, TaskStatus
 from testing.factories import make_project, make_task
@@ -2248,68 +2250,6 @@ class TestReleasePoolMemberIfTerminal:
             shared_state.runtime_config["warm_pool_enabled"] = prev
 
 
-# ── _synthesize_memo_from_source_finding ────────────────────────────────────
-
-
-class TestSynthesizeMemoFromSourceFinding:
-    """Pure-function tests for the backend-side memo synthesis helper."""
-
-    def test_regression_false_positive_full_data(self):
-        sf = {
-            "verdict_reason": "design_doc says this is intentional",
-            "investigation_summary": "trace confirms the behavior",
-            "regression_class": "sr_catch_rate:correctness",
-        }
-        result = _synthesize_memo_from_source_finding(
-            "regression_false_positive", sf, "task-1"
-        )
-        assert result is not None
-        assert "design_doc" in result["summary"]
-        assert "trace confirms" in result["reasoning"]
-        assert "task:task-1" in result["citations"]
-        assert "regression-false-positive" in result["tags"]
-        assert "sr_catch_rate:correctness" in result["tags"]
-
-    def test_regression_false_positive_missing_verdict_reason_returns_none(self):
-        assert (
-            _synthesize_memo_from_source_finding("regression_false_positive", {}, "t")
-            is None
-        )
-
-    def test_investigation_unactionable_with_root_cause(self):
-        sf = {
-            "root_cause": "workers acquire locks in opposite order",
-            "summary": "deadlock in rollup coordinator",
-            "recommended_fix": "fix lock order",
-            "outcome": "structural",
-        }
-        result = _synthesize_memo_from_source_finding(
-            "investigation_unactionable", sf, "task-2"
-        )
-        assert result is not None
-        assert "workers acquire locks" in result["reasoning"]
-        assert "fix lock order" in result["reasoning"]
-        assert "investigation-unactionable" in result["tags"]
-        assert "structural" in result["tags"]
-        assert "task:task-2" in result["citations"]
-
-    def test_investigation_unactionable_missing_root_cause_and_summary_returns_none(
-        self,
-    ):
-        assert (
-            _synthesize_memo_from_source_finding(
-                "investigation_unactionable", {"outcome": "x"}, "t"
-            )
-            is None
-        )
-
-    def test_unknown_reasoning_kind_returns_none(self):
-        assert (
-            _synthesize_memo_from_source_finding("deferred_finding", {"body": "x"}, "t")
-            is None
-        )
-
-
 # ── _handle_plan_completion — scope-aware subtask effort ──────────────────────
 
 
@@ -3045,3 +2985,411 @@ class TestConfirmAppliedPlaybookEntries:
 # ── cross-layer remediation prompt ──────────────────────────────────────────
 
 
+# ── safeguard merge-gate challenge ─────────────────────────────────────────
+
+
+class TestSafeguardMergeGateChallenge:
+    """_maybe_release_safeguard_gate respects a second-opinion challenge verdict.
+
+    When ``safeguard_challenge_enabled`` is True and a safeguard audit returns
+    critical/high findings, the gate decision is not immediately finalised —
+    an independent challenge task is spawned.  If the challenger rejects the
+    finding as a false positive or downgrades it below blocking severity, the
+    gate is released.  If the challenger confirms the finding, the gate is
+    maintained.  If the flag is off, today's behavior (block unconditionally)
+    is preserved.
+    """
+
+    async def _make_safeguard_pair(self, db_session):
+        """Return (orig_task, safeguard_task) linked by safeguard_for_task_id.
+
+        orig is EVALUATING (review approved, safeguard pending) so the gate
+        release follows the ci_waiting path rather than the fire-merge path —
+        no GitHub API calls needed.
+        """
+        from testing.factories import make_project, make_task
+
+        project = make_project(name="SafeguardChallengeProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        orig = make_task(
+            project_id=project.id,
+            title="create: cross-cutting PR",
+            status=TaskStatus.EVALUATING,
+            requires_approval=True,
+            payloads=[{"type": "create", "prompt": "add feature", "base_branch": "main"}],
+        )
+        db_session.add(orig)
+        await db_session.commit()
+        await db_session.refresh(orig)
+
+        safeguard = make_task(
+            project_id=project.id,
+            title="security_audit: cross-cutting safeguard",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "base_branch": "main"}],
+            context={
+                "safeguard_for_task_id": str(orig.id),
+                "safeguard_pr_number": "42",
+            },
+        )
+        db_session.add(safeguard)
+        await db_session.commit()
+        await db_session.refresh(safeguard)
+        return orig, safeguard
+
+    @pytest.mark.asyncio
+    async def test_safeguard_merge_gate_releases_on_challenge_rejected_high(
+        self, db_session
+    ):
+        """A high finding rejected by the challenge releases the merge gate."""
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+
+        # Simulate: challenge already returned verdict "rejected" (false positive)
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "rejected",
+                "reasoning": "cited file does not contain the described vulnerability",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        findings = [
+            {
+                "severity": "high",
+                "title": "Missing auth check",
+                "description": "Endpoint lacks @require_role.",
+                "fix_prompt": "Add @require_role('admin').",
+                "file_path": "app/routers/admin.py",
+                "line_number": 7,
+            }
+        ]
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        assert orig.requires_approval is False, (
+            "Gate should be released when challenge rejects the finding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safeguard_gate_maintained_when_challenge_confirms(
+        self, db_session
+    ):
+        """A finding confirmed by the challenge keeps the gate closed."""
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "confirmed",
+                "reasoning": "vulnerability is real and exploitable",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        findings = [
+            {
+                "severity": "critical",
+                "title": "SQL injection",
+                "description": "Raw query.",
+                "fix_prompt": "Parameterize.",
+                "file_path": "app/db.py",
+                "line_number": 10,
+            }
+        ]
+
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        assert orig.requires_approval is True, (
+            "Gate should remain closed when challenge confirms the finding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safeguard_gate_maintained_when_flag_disabled(
+        self, db_session
+    ):
+        """With safeguard_challenge_enabled=False, gate is maintained unconditionally."""
+        from app.task_completion import _maybe_release_safeguard_gate
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+
+        findings = [
+            {
+                "severity": "high",
+                "title": "Missing auth",
+                "description": "desc",
+                "fix_prompt": "fix it",
+                "file_path": "app/routers/admin.py",
+                "line_number": 1,
+            }
+        ]
+
+        # Flag OFF (default) — no challenge spawned, gate maintained.
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        assert orig.requires_approval is True, (
+            "Gate should stay closed when safeguard_challenge_enabled is False"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safeguard_gate_released_on_downgraded(
+        self, db_session
+    ):
+        """A finding downgraded below critical/high by the challenge releases the gate."""
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "downgraded",
+                "reasoning": "severity is medium at most",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        findings = [
+            {
+                "severity": "high",
+                "title": "Minor info leak",
+                "description": "desc",
+                "fix_prompt": "fix it",
+                "file_path": "app/x.py",
+                "line_number": 5,
+            }
+        ]
+
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        assert orig.requires_approval is False, (
+            "Gate should be released when challenge downgrades the finding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enabled(
+        self, db_session
+    ):
+        """When safeguard_challenge_enabled=True and no verdict exists, a challenge
+        task is created, the safeguard is parked EVALUATING with
+        awaiting_safeguard_challenge set, and the gate remains held."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+        from sqlmodel import select
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "high",
+                "title": "Missing auth",
+                "description": "Endpoint lacks @require_role.",
+                "fix_prompt": "Add decorator.",
+                "file_path": "app/routers/admin.py",
+                "line_number": 3,
+            }
+        ]
+
+        shared_state.runtime_config["safeguard_challenge_enabled"] = True
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        # Gate must NOT be released while challenge is pending
+        assert orig.requires_approval is True, (
+            "Gate must not be released while challenge verdict is pending"
+        )
+        # Safeguard is parked in EVALUATING
+        assert safeguard.status == TaskStatus.EVALUATING
+        # awaiting_safeguard_challenge is set (True initially, then the challenge UUID)
+        assert (safeguard.context or {}).get("awaiting_safeguard_challenge"), (
+            "awaiting_safeguard_challenge must be set after spawn"
+        )
+
+        # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY pointing to the
+        # safeguard must have been created in the DB.
+        all_tasks = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == safeguard.project_id)
+            )
+        ).scalars().all()
+        challenge_tasks = [
+            t for t in all_tasks
+            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
+        ]
+        assert challenge_tasks, "A challenge task pointing to the safeguard must have been created"
+
+    @pytest.mark.asyncio
+    async def test_spawn_safeguard_challenge_returns_none_when_verdict_exists(
+        self, db_session
+    ):
+        """spawn_safeguard_challenge returns None (single-shot guard) when a
+        challenge verdict already exists in the safeguard's context."""
+        from app.task_evaluators import (
+            spawn_safeguard_challenge,
+            SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        )
+
+        project = make_project(name="SpawnGuardVerdictProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        safeguard = make_task(
+            project_id=project.id,
+            payloads=[{"type": "security_audit", "base_branch": "main"}],
+            context={
+                SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                    "outcome": "confirmed",
+                    "reasoning": "pre-existing verdict",
+                    "challenge_task_id": str(_uuid_mod.uuid4()),
+                },
+            },
+        )
+        db_session.add(safeguard)
+        await db_session.commit()
+        await db_session.refresh(safeguard)
+
+        result = await spawn_safeguard_challenge(safeguard, "some findings", db_session)
+        assert result is None, "spawn must return None when a verdict already exists"
+
+    @pytest.mark.asyncio
+    async def test_spawn_safeguard_challenge_returns_none_when_already_in_flight(
+        self, db_session
+    ):
+        """spawn_safeguard_challenge returns None (single-shot guard) when a
+        challenge is already in flight (awaiting_safeguard_challenge is set)."""
+        from app.task_evaluators import spawn_safeguard_challenge
+
+        project = make_project(name="SpawnGuardInflightProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        safeguard = make_task(
+            project_id=project.id,
+            payloads=[{"type": "security_audit", "base_branch": "main"}],
+            context={"awaiting_safeguard_challenge": str(_uuid_mod.uuid4())},
+        )
+        db_session.add(safeguard)
+        await db_session.commit()
+        await db_session.refresh(safeguard)
+
+        result = await spawn_safeguard_challenge(safeguard, "some findings", db_session)
+        assert result is None, "spawn must return None when a challenge is already in flight"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Review second-opinion reconciliation (reconcile_review_second_opinion)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _panel_verdict(overall, *, issues=None, lens_verdict=None, summary="ok"):
+    """Build a normalized-ready panel-review verdict object with all 4 lenses."""
+    lv = lens_verdict or overall
+    return {
+        "overall_verdict": overall,
+        "summary": summary,
+        "issues": list(issues or []),
+        "lenses": {
+            "correctness": {"verdict": lv, "summary": "c", "issues": []},
+            "security": {"verdict": lv, "summary": "s", "issues": []},
+            "code_quality": {"verdict": lv, "summary": "q", "issues": []},
+            "test_coverage": {"verdict": lv, "summary": "t", "issues": []},
+        },
+    }
+
+
+def test_reconcile_confirmed_approve():
+    """Both APPROVE → challenged_confirmed, reconciled APPROVE, no surviving issues."""
+    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
+    rec = reconcile_review_second_opinion("APPROVE", [], panel)
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["surviving_issues"] == []
+    assert rec["challenge_verdict"] == "APPROVE"
+
+
+def test_reconcile_rejected_approve_overturned():
+    """Primary APPROVE, challenge REQUEST_CHANGES → challenged_rejected, must not approve."""
+    chal_issues = [{"description": "real bug", "severity": "critical"}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
+    )
+    rec = reconcile_review_second_opinion("APPROVE", [], panel)
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == chal_issues
+
+
+def test_reconcile_rejected_request_changes_overturned():
+    """Primary REQUEST_CHANGES, challenge APPROVE → challenged_rejected, must not spawn fix."""
+    primary_issues = [{"description": "maybe a bug", "severity": "major"}]
+    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["surviving_issues"] == []
+
+
+def test_reconcile_confirmed_request_changes_same_issues():
+    """Both REQUEST_CHANGES with identical issue set → challenged_confirmed."""
+    issues = [{"description": "SQL injection", "file": "a.py", "line": 5}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=issues))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", issues, panel)
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == issues
+
+
+def test_reconcile_revised_request_changes_changed_issues():
+    """Both REQUEST_CHANGES but surviving issue set changed → challenged_revised.
+
+    The challenge upholds only one of the two primary issues; the surviving set
+    is the agreed intersection.
+    """
+    agreed = {"description": "SQL injection", "file": "a.py", "line": 5}
+    only_primary = {"description": "nit naming", "file": "b.py", "line": 9}
+    primary_issues = [agreed, only_primary]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=[agreed]))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_revised"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == [agreed]
+    assert only_primary not in rec["surviving_issues"]
+
+
+def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
+    """Disjoint issue sets → revised, surviving falls back to the challenge's set."""
+    primary_issues = [{"description": "primary only", "file": "p.py", "line": 1}]
+    chal_issues = [{"description": "challenge only", "file": "c.py", "line": 2}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_revised"
+    assert rec["surviving_issues"] == chal_issues

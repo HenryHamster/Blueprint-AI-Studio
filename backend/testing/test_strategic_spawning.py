@@ -50,6 +50,14 @@ from app.strategic_spawning import (
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 
 
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
@@ -593,6 +601,9 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "direction_id",
         "source_kind",
         "created_at",
+        "knowledge_acceptance_evidence",
+        "compute_acceptance_grade",
+        "origin_provenance",
     }
 
 
@@ -778,6 +789,100 @@ async def test_success_evidence_present_in_direction_stats(db_session):
     assert d_stat["retirement_condition"] == "retire when X happens", (
         "retirement_condition should be stripped and surfaced"
     )
+
+
+@pytest.mark.asyncio
+async def test_recent_challenge_summary_present_in_direction_stats(db_session):
+    """Strategic direction stats include bounded recent challenge telemetry."""
+    old_summary = {
+        "challenged_findings": 99,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 99,
+            CHALLENGE_DISAGREES: 99,
+            CHALLENGE_INDETERMINATE: 99,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 99,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 99,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 99,
+        },
+        "fail_closed_unparseable": 99,
+    }
+    recent_summary = {
+        "challenged_findings": 2,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 1,
+            CHALLENGE_DISAGREES: 0,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 0,
+        },
+        "fail_closed_unparseable": 1,
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-challenge",
+                "status": "active",
+                "text": "Direction with challenge telemetry",
+                "priority": "medium",
+                "research_history": [
+                    {"finding_challenge_summary": old_summary},
+                    {},
+                    {"finding_challenge_summary": recent_summary},
+                    {},
+                    {},
+                    {
+                        "finding_challenge_summary": {
+                            "challenged_findings": 1,
+                            "agreement_distribution": {
+                                CHALLENGE_AGREES: 0,
+                                CHALLENGE_DISAGREES: 1,
+                                CHALLENGE_INDETERMINATE: 0,
+                            },
+                            "boundary_distribution": {
+                                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 0,
+                                CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 0,
+                                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+                            },
+                            "fail_closed_unparseable": 0,
+                        }
+                    },
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-challenge"
+    )
+    assert d_stat["recent_findings_challenge_summary"] == {
+        "challenged_findings": 3,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 1,
+            CHALLENGE_DISAGREES: 1,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+        },
+        "fail_closed_unparseable": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -1781,6 +1886,85 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
     assert d_stat.get("recommended_mode") == "pause", (
         "Expected recommended_mode='pause' in direction stats for pause-mode direction"
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
+    """spawn_gate_metrics appears in direction stats when direction has spawn-gate activity."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg01",
+                "status": "active",
+                "text": "Direction with spawn-gate history",
+                "priority": "medium",
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "research_spawn_gate_challenged_count": 5,
+                        "research_spawn_gate_refuted_count": 2,
+                        "research_spawn_gate_survived_count": 3,
+                        "research_spawn_gate_challenged_spawned": 3,
+                        "research_spawn_gate_challenged_merged": 2,
+                        "research_spawn_gate_unchallenged_spawned": 4,
+                        "research_spawn_gate_unchallenged_merged": 3,
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg01")
+
+    assert "spawn_gate_metrics" in d_stat, "spawn_gate_metrics should be present for direction with spawn-gate activity"
+    sgm = d_stat["spawn_gate_metrics"]
+    assert sgm["challenged"] == 5
+    assert sgm["refuted"] == 2
+    assert sgm["survived"] == 3
+    assert sgm["challenged_merge_rate"] == round(2 / 3, 3)
+    assert sgm["unchallenged_merge_rate"] == round(3 / 4, 3)
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_metrics_absent_when_no_activity(db_session):
+    """spawn_gate_metrics is absent from direction stats when no spawn-gate counters are set."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg02",
+                "status": "active",
+                "text": "Direction without spawn-gate history",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg02")
+
+    assert "spawn_gate_metrics" not in d_stat, "spawn_gate_metrics should be absent when no spawn-gate activity"
 
 
 @pytest.mark.asyncio
@@ -6043,6 +6227,62 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
 
 
 @pytest.mark.asyncio
+async def test_post_promote_handoff_unknown_serving_status_is_not_live(
+    db_session, mocker, _lts_split_active
+):
+    """If the prior promoted record cannot be read, the handoff must fail
+    closed instead of implying the previous version is live."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+            goal="carry-over promotion narrative",
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.release_version.recent_closed_versions",
+        side_effect=RuntimeError("lookup failed"),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "Version handoff" in suffix
+    assert "is now live" not in suffix
+    assert "serving evidence is unknown or unreadable" in suffix
+    assert "Verify lifecycle/deploy state before treating the previous version as live" in suffix
+    assert "serving_confirmed" in suffix
+
+
+@pytest.mark.asyncio
 async def test_failed_deploy_directive_renders_after_next_version_qualification_started(
     db_session, mocker, _lts_split_active
 ):
@@ -9685,6 +9925,36 @@ async def test_design_doc_update_stamps_operator_steered_when_marker_operator_or
 
 
 @pytest.mark.asyncio
+async def test_design_doc_update_start_event_includes_cycle_and_steering(
+    db_session, mocker
+):
+    steering_excerpt = "Focus the next strategy cycle on billing reliability."
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_started", new=emit)
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker_with_excerpt(
+                steering_excerpt
+            ),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_design_doc_update(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().all()[0]
+    emit.assert_awaited_once()
+    assert emit.await_args.args == (project.id, task.id, 1)
+    assert emit.await_args.kwargs["cycle_id"] == task.context["strategic_cycle_id"]
+    assert emit.await_args.kwargs["steering_origin"] == ORIGIN_OPERATOR
+    assert emit.await_args.kwargs["steering_excerpt"] == steering_excerpt
+
+
+@pytest.mark.asyncio
 async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     """A cadence (non-operator) architecture cycle carries no operator_steered flag."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -9700,6 +9970,43 @@ async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     )
     task = result.scalars().all()[0]
     assert "operator_steered" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_start_event_includes_cycle_and_steering(
+    db_session, mocker
+):
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_started", new=emit)
+    cycle_id = "sc-phase2evt"
+    steering_excerpt = "Tie the outcome to the operator steer."
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_strategic_review(
+        project,
+        db_session,
+        cycle_id=cycle_id,
+        operator_steered=True,
+        steering_excerpt=steering_excerpt,
+    ) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().all()[0]
+    emit.assert_awaited_once()
+    assert emit.await_args.args == (project.id, task.id, 2)
+    assert emit.await_args.kwargs == {
+        "cycle_id": cycle_id,
+        "steering_origin": ORIGIN_OPERATOR,
+        "steering_excerpt": steering_excerpt,
+    }
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
+import type { DirectionFindingChallengeSummary } from '../types/digest';
 import {
   hasNonCodeMergeOutcomes,
   healthRateColorClass,
@@ -86,6 +87,18 @@ export interface DirectionProgress {
     empty_prompt?: number;
     batch_cap?: number;
     tasks_created?: number;
+  } | null;
+  finding_challenge_summary?: DirectionFindingChallengeSummary | null;
+  research_spawn_gate?: {
+    challenged_count?: number;
+    refuted_count?: number;
+    survived_count?: number;
+    challenged_spawned?: number;
+    challenged_merged?: number;
+    challenged_merge_rate?: number | null;
+    unchallenged_spawned?: number;
+    unchallenged_merged?: number;
+    unchallenged_merge_rate?: number | null;
   } | null;
   prompt_quality_hint?: string | null;
   decomposition_summary?: {
@@ -505,6 +518,22 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   );
                 })()}
                 {(() => {
+                  const ch = dp.finding_challenge_summary;
+                  if (!ch) return null;
+                  const challenged = ch.challenged_findings ?? 0;
+                  const agrees = ch.agreement_distribution?.agrees ?? 0;
+                  const disagrees = ch.agreement_distribution?.disagrees ?? 0;
+                  const indeterminate = ch.agreement_distribution?.indeterminate ?? 0;
+                  const boundaries: { name: string; count: number }[] = [
+                    { name: 'reproduce_absent', count: ch.boundary_distribution?.reproduce_absent ?? 0 },
+                    { name: 'low_actionability_decay', count: ch.boundary_distribution?.low_actionability_decay ?? 0 },
+                    { name: 'reproduce_indeterminate_dispatch', count: ch.boundary_distribution?.reproduce_indeterminate_dispatch ?? 0 },
+                  ].filter(boundary => boundary.count > 0);
+                  const failClosed = ch.fail_closed_unparseable ?? 0;
+                  if (!challenged && !agrees && !disagrees && !indeterminate && boundaries.length === 0 && !failClosed) return null;
+                  return <span className="text-[9px] text-neutral-500">Challenge: {challenged} findings{boundaries.length > 0 ? ` · boundaries: ${boundaries.map(boundary => `${boundary.name} ${boundary.count}`).join(' · ')}` : ''}{` · confirmed/not-confirmed/indeterminate: ${agrees}/${disagrees}/${indeterminate}`}{failClosed > 0 ? ` · fail-closed ${failClosed}` : ''}</span>;
+                })()}
+                {(() => {
                   const ff = dp.filter_funnel;
                   if (!ff) return null;
                   const produced = ff.findings_produced ?? 0;
@@ -546,6 +575,26 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     )}
                   </div>
                 )}
+                {(() => {
+                  const sg = dp.research_spawn_gate;
+                  if (!sg) return null;
+                  const challenged = sg.challenged_count ?? 0;
+                  const refuted = sg.refuted_count ?? 0;
+                  const survived = sg.survived_count ?? 0;
+                  if (!challenged && !refuted && !survived) return null;
+                  const fmtRate = (r: number | null | undefined) =>
+                    typeof r === 'number' ? `${Math.round(r * 100)}%` : '—';
+                  const challengedRate = fmtRate(sg.challenged_merge_rate);
+                  const unchallengedRate = fmtRate(sg.unchallenged_merge_rate);
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Spawn gate: {challenged} challenged · {refuted} refuted · {survived} survived
+                      {(sg.challenged_spawned ?? 0) > 0 || (sg.unchallenged_spawned ?? 0) > 0
+                        ? ` · merge rate: ${challengedRate} challenged vs ${unchallengedRate} unchallenged`
+                        : ''}
+                    </span>
+                  );
+                })()}
                 {dp.prompt_quality_hint && (
                   <span className="text-[10px] text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
                     Prompt quality: {dp.prompt_quality_hint}

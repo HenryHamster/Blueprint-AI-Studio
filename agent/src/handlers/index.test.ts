@@ -37,6 +37,7 @@ vi.mock('./audits.js', () => ({
   handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
   handleSelfAudit: vi.fn().mockResolvedValue(undefined),
   handleReleaseAudit: vi.fn().mockResolvedValue(undefined),
+  handleReleaseAuditChallenge: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock fs and child_process so handler files that import them at module level
@@ -86,6 +87,7 @@ import {
   resolveTaskCapabilityContract,
   type TaskCapabilityContract,
 } from './index.js';
+import { DISPATCHER_MEMO_SYNTHESIZER_KINDS } from './memo.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -93,13 +95,13 @@ import { expectCalledWith } from '../utils/typed-mock-call.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 25 BESPOKE handlers are hand-registered today. This is no longer the
+  // 26 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 25 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(25);
+  it('has exactly 26 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(26);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -256,11 +258,24 @@ describe('contract-driven generic dispatch', () => {
     });
   });
 
-  it('treats output_kind in {none, verdict} as generic knowledge too', () => {
-    for (const output_kind of ['none', 'verdict']) {
-      const task = { task_capability: { ...knowledgeContract, output_kind } };
-      const resolution = resolveHandler('probe_' + output_kind, task, { type: 'probe_' + output_kind, prompt: 'x' });
-      expect(resolution.handler, `output_kind=${output_kind} should route to generic knowledge`).toBe(handlers.investigate);
+  it('treats output_kind=none as generic knowledge too', () => {
+    const task = { task_capability: { ...knowledgeContract, output_kind: 'none' } };
+    const resolution = resolveHandler('probe_none', task, { type: 'probe_none', prompt: 'x' });
+    expect(resolution.handler, 'output_kind=none should route to generic knowledge').toBe(handlers.investigate);
+  });
+
+  it('rejects_generic_read_only_verdict_without_explicit_runner', () => {
+    const task = { task_capability: { ...knowledgeContract, output_kind: 'verdict' } };
+    const resolution = resolveHandler('merge_test_verdict_probe', task, {
+      type: 'merge_test_verdict_probe',
+      prompt: 'produce a real merge-test verdict',
+    });
+    expect(resolution.handler).toBeNull();
+    if (resolution.handler === null) {
+      expect(resolution.dispatch).toBe('none');
+      expect(resolution.reason).toContain('merge_test_verdict_probe');
+      expect(resolution.reason).toContain('output_kind=verdict');
+      expect(resolution.reason).toContain('Generic dispatch supports single_agent read_only→knowledge/none');
     }
   });
 
@@ -271,6 +286,16 @@ describe('contract-driven generic dispatch', () => {
     const resolution = resolveHandler('create', task, { type: 'create', prompt: 'x' });
     expect(resolution.dispatch).toBe('bespoke');
     expect(resolution.handler).toBe(handlers.create);
+  });
+
+  it('a BESPOKE verdict handler still wins over a verdict contract', () => {
+    const task = { task_capability: { ...knowledgeContract, id: 'verify_tests', output_kind: 'verdict' } };
+    const resolution = resolveHandler('verify_tests', task, {
+      type: 'verify_tests',
+      prompt: 'produce a real merge-test verdict',
+    });
+    expect(resolution.dispatch).toBe('bespoke');
+    expect(resolution.handler).toBe(handlers.verify_tests);
   });
 
   it('fails LOUDLY (clear message, no silent wrong work) for a run-shape with no generic runner yet', () => {
@@ -359,12 +384,13 @@ const TASK_CLASS_MAP = {
   docs:              'code-change',
   qa:                'code-change',
   deps:              'code-change',
-  // Read-only / investigative (10): analysis only, must not push code
+  // Read-only / investigative (12): analysis only, must not push code
   review:            'read-only',
   panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
+  release_audit_challenge: 'read-only',
   smoketest:         'read-only',
   debug:             'read-only',
   perf:              'read-only',
@@ -395,11 +421,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 11 read-only + 7 research = 25 total', () => {
+  it('class distribution is 7 code-change + 12 read-only + 7 research = 26 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(11);
+    expect(counts['read-only']).toBe(12);
     expect(counts['research']).toBe(7);
   });
 
@@ -455,6 +481,36 @@ describe('strategic dispatch smoke', () => {
   });
 });
 
+// ── Memo bake-smoke dispatcher fixture kinds guard ────────────────────────────
+// Fails fast if any bake-smoke dispatcher fixture exercises a reasoning_kind
+// the synthesizer no longer handles credential-free — catching the regression
+// at unit-test time instead of at Packer image build time.
+//
+// To add a new bake-smoke dispatcher fixture, update BAKE_SMOKE_DISPATCHER_FIXTURES
+// here AND add the kind to DISPATCHER_MEMO_SYNTHESIZER_KINDS in memo.ts.
+describe('memo bake-smoke dispatcher fixture kinds guard', () => {
+  // One entry per bake-smoke file that uses the dispatcher synthesis path
+  // (source_finding present + reasoning_kind the synthesizer handles).
+  const BAKE_SMOKE_DISPATCHER_FIXTURES: Array<{ file: string; kind: string }> = [
+    // memo-bake-smoke.ts: memoTaskPayload.reasoning_kind
+    { file: 'memo-bake-smoke.ts', kind: 'direction_retirement' },
+    // memo-bake-smoke-lifecycle.ts: MEMO_TASK.payloads[0].reasoning_kind
+    { file: 'memo-bake-smoke-lifecycle.ts', kind: 'direction_retirement' },
+  ];
+
+  it.each(BAKE_SMOKE_DISPATCHER_FIXTURES)(
+    'bake-smoke dispatcher fixture kind "$kind" (from $file) is handled by the synthesizer',
+    ({ file, kind }) => {
+      expect(
+        DISPATCHER_MEMO_SYNTHESIZER_KINDS as readonly string[],
+        `bake-smoke fixture in ${file} uses reasoning_kind "${kind}" which is absent from ` +
+        `DISPATCHER_MEMO_SYNTHESIZER_KINDS — the synthesizer will not handle it credential-free ` +
+        `and the agent image bake will fail`,
+      ).toContain(kind);
+    },
+  );
+});
+
 // ── Memo bake smoke contract ──────────────────────────────────────────────────
 // Locks in the contract exercised by the image bake: handlers.memo must resolve
 // with COMPLETED when invoked through the registry with a credential-free
@@ -469,13 +525,14 @@ describe('memo bake smoke contract', () => {
     expect(typeof handlers.memo).toBe('function');
   });
 
-  it('handlers.memo completes with COMPLETED for a regression_false_positive dispatcher payload (no Claude call, credential-free)', async () => {
+  it('handlers.memo completes with COMPLETED for a direction_retirement dispatcher payload (no Claude call, credential-free)', async () => {
     const payload = {
-      reasoning_kind: 'regression_false_positive',
+      reasoning_kind: 'direction_retirement',
       source_task_id: 'task-bake-verify',
+      direction_id: 'direction-bake-verify',
       source_finding: {
-        verdict_reason: 'CPU spike is a deployment artifact, not a regression.',
-        regression_class: 'cpu_p99_spike',
+        rationale: 'Direction completed its goals and is retired.',
+        direction_text: 'CPU spike investigation direction',
       },
     };
     const task = { title: 'Bake smoke memo', description: 'Memo smoke', context: {} };
@@ -486,7 +543,7 @@ describe('memo bake smoke contract', () => {
       'bake-smoke-001',
       expect.objectContaining({
         status: 'COMPLETED',
-        logs: expect.stringContaining('CPU spike is a deployment artifact') as string,
+        logs: expect.stringContaining('Direction completed its goals and is retired.') as string,
       }),
     );
     // runClaudeCode must NOT be called — dispatcher path synthesizes directly

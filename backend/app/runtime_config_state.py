@@ -59,6 +59,14 @@ runtime_config: Dict = {
     # update so the queue and the agent fix path never double-fire. Genuine
     # dirty conflicts outlive the window and use the agent path unchanged.
     "rollup_merge_queue_enabled": True,
+    # Default-on second-opinion gate for high-stakes ordinary review verdicts.
+    # When True, an APPROVE→merge or REQUEST_CHANGES→fix from an ordinary
+    # ``review`` task does not commit until an independent panel_review challenge
+    # has been recorded and reconciled against the primary verdict. Disabling it
+    # restores today's synchronous review-finalization behavior WITHOUT removing
+    # the panel_review task type (it stays available as a user-launchable
+    # advisory workflow); reconciliation records then read ``unchallenged``.
+    "review_second_opinion_gate_enabled": True,
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
@@ -103,6 +111,53 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Independent challenge of a safeguard merge-gate blocker: when True, a
+    # safeguard audit's critical/high finding is independently challenged before
+    # the merge gate is held, and a challenger verdict of "rejected" or
+    # "downgraded" automatically releases the gate with an auditable record.
+    # Ships DARK (default OFF) — OFF preserves today's behavior of blocking on
+    # any raw critical/high finding. Fail-closed: if the challenge errors or
+    # times out the gate stays closed.
+    "safeguard_challenge_enabled": os.getenv(
+        "SAFEGUARD_CHALLENGE_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Per-finding second-opinion challenge for high-stakes research-finding
+    # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
+    # 'absent' hard-drop or a low-actionability decay) is independently re-examined
+    # by a bounded read-only `investigate` side-car
+    # (task_evaluators.spawn_finding_challenge) BEFORE the finding is dropped or
+    # dispatched: the source research task parks EVALUATING, the side-car emits a
+    # structured second-opinion verdict, and the recorded FindingChallengeRecord
+    # routes back into research completion. Distinct from the batch
+    # research_quality_grader_enabled gate (which grades the WHOLE artifact); this
+    # challenges ONE finding's verdict. Ships DARK (default OFF) — OFF preserves
+    # the legacy single-pass drop/dispatch behavior exactly.
+    "research_finding_challenge_enabled": os.getenv(
+        "RESEARCH_FINDING_CHALLENGE_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Narrow pilot for the optional third research-finding challenge boundary:
+    # an indeterminate reproduce-on-HEAD verdict that would otherwise dispatch a
+    # defect finding unverified. Kept separate from
+    # research_finding_challenge_enabled so enabling absent/decay hardening cannot
+    # fan out into broad pre-dispatch challenge traffic.
+    "research_finding_challenge_indeterminate_dispatch_enabled": os.getenv(
+        "RESEARCH_FINDING_CHALLENGE_INDETERMINATE_DISPATCH_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # DEFAULT-ON per-finding adversarial challenge gate for high-stakes research
+    # findings. When True (default), each finding that carries large blast radius
+    # (scope=large, risk=high) OR a partial-staleness / over-claim signal
+    # (downgraded verification_basis, broken_refs, ungrounded_refs,
+    # needs_revalidation) is independently challenged by a refute-first grader
+    # before it spawns. A challenged finding that fails is DEFERRED (not dropped)
+    # so strategic review sees it. Low-stakes findings are never escalated.
+    # Set to False to disable (settable via PATCH /api/admin/settings, no deploy).
+    "adversarial_spawn_gate_enabled": os.getenv(
+        "ADVERSARIAL_SPAWN_GATE_ENABLED", "true"
+    ).lower()
+    not in ("0", "false", "no"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -1043,10 +1098,20 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "rollup_merge_queue_enabled",
                         bool(config_json["rollup_merge_queue_enabled"]),
                     )
+                if "review_second_opinion_gate_enabled" in config_json:
+                    _set(
+                        "review_second_opinion_gate_enabled",
+                        bool(config_json["review_second_opinion_gate_enabled"]),
+                    )
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
                         bool(config_json["cochange_decomposition_enabled"]),
+                    )
+                if "adversarial_spawn_gate_enabled" in config_json:
+                    _set(
+                        "adversarial_spawn_gate_enabled",
+                        bool(config_json["adversarial_spawn_gate_enabled"]),
                     )
                 if "warm_retarget_enabled" in config_json:
                     _set(

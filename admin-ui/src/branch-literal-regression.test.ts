@@ -64,7 +64,7 @@ interface AllowEntry {
 const ALLOWLIST: AllowEntry[] = [
   {
     path: 'components/NewTaskModal.tsx',
-    line: 216,
+    line: 244,
     pattern: 'fallback-main',
     rationale:
       "<input placeholder={integrationBranch || 'main'}> — the resolved " +

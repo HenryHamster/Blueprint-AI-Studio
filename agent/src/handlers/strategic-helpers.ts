@@ -1,5 +1,8 @@
 import fs from 'fs';
-import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted } from '../prompt.js';
+import type WebSocket from 'ws';
+import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { extractJsonObject } from '../json-extract.js';
+import { VmConfigMissingError } from '../providers/runners.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -272,6 +275,288 @@ Available verbs in this workspace:
 ${lines}
 
 `;
+}
+
+// ── Strategic judgment challenge (independent adversarial second opinion) ────
+//
+// The strategic loop's self-produced judgments — evidence_progress ratings
+// ("this direction is advancing/met"), retirement-critique quality, and the
+// resulting portfolio shape — are self-serving by construction. This module
+// runs a FRESH, independent adversarial pass over the thinker's analysis that
+// re-judges those three classes BEFORE the executor commits them, and produces
+// a bounded, versioned record.
+//
+// The record GATES the executor: an `advancing`/`met` evidence_progress verdict
+// may be submitted only for a (direction_id, status) pair the challenge
+// APPROVED; `stalled` verdicts stay advisory and are never gated. A blocked
+// (challenger could not run / exited non-zero) or invalid (unparseable) outcome
+// is persisted as a bounded record that approves NOTHING — it is NOT retried as
+// missing executor work, so a challenge-only cycle never masquerades as a
+// successful strategic mutation.
+
+export const STRATEGIC_CHALLENGE_VERSION = 1;
+
+const _VALID_EV_STATUS = new Set(['advancing', 'stalled', 'met']);
+const _VALID_EV_VERDICT = new Set(['approved', 'rejected']);
+// Bound the record so it can never bloat the executor prompt or the JSONB column.
+const _MAX_EV_VERDICTS = 50;
+const _RATIONALE_MAX = 500;
+const _NOTES_MAX = 1000;
+
+export type ChallengeEvidenceStatus = 'advancing' | 'stalled' | 'met';
+export type ChallengeEvidenceVerdict = 'approved' | 'rejected';
+
+export interface ChallengeEvidenceProgressVerdict {
+  direction_id: string;
+  status: ChallengeEvidenceStatus;
+  verdict: ChallengeEvidenceVerdict;
+  rationale: string;
+}
+
+export interface StrategicChallengeRecord {
+  challenge_version: number;
+  status: 'ok' | 'blocked' | 'invalid';
+  evidence_progress: ChallengeEvidenceProgressVerdict[];
+  retirement_critique_quality: { verdict: string; rationale: string };
+  portfolio_shape_risk: { verdict: string; rationale: string };
+  notes?: string;
+}
+
+type RunClaudeCodeFn = (
+  prompt: string,
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  model?: string,
+  effort?: string,
+  disallowedTools?: string[],
+) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
+
+type SendLogFn = (ws: WebSocket | null, message: string) => void;
+
+// A bounded record that approves nothing — used for the blocked (non-zero exit /
+// runner error) and invalid (unparseable output) paths so the gate fails closed.
+function emptyChallengeRecord(
+  status: 'blocked' | 'invalid',
+  note: string,
+): StrategicChallengeRecord {
+  return {
+    challenge_version: STRATEGIC_CHALLENGE_VERSION,
+    status,
+    evidence_progress: [],
+    retirement_critique_quality: { verdict: 'not_assessed', rationale: note.slice(0, _RATIONALE_MAX) },
+    portfolio_shape_risk: { verdict: 'not_assessed', rationale: note.slice(0, _RATIONALE_MAX) },
+    notes: note.slice(0, _NOTES_MAX),
+  };
+}
+
+// Only treat genuine strings as strings — never stringify a nested object (which
+// would yield "[object Object]"). Mirrors index.ts:strVal without the import.
+function _safeStr(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+function coerceVerdictBlock(v: unknown): { verdict: string; rationale: string } {
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    const o = v as Record<string, unknown>;
+    const verdict = (_safeStr(o.verdict) || _safeStr(o.assessment) || 'unspecified').trim().slice(0, 64);
+    const rationale = (_safeStr(o.rationale) || _safeStr(o.reason)).trim().slice(0, _RATIONALE_MAX);
+    return { verdict: verdict || 'unspecified', rationale };
+  }
+  return { verdict: 'unspecified', rationale: '' };
+}
+
+function normalizeEvidenceProgress(raw: unknown): ChallengeEvidenceProgressVerdict[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChallengeEvidenceProgressVerdict[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const direction_id = _safeStr(o.direction_id).trim().slice(0, 64);
+    const status = _safeStr(o.status).trim().toLowerCase();
+    let verdict = _safeStr(o.verdict).trim().toLowerCase();
+    if (!direction_id) continue;
+    if (!_VALID_EV_STATUS.has(status)) continue;
+    // Fail closed: any verdict that is not an explicit "approved" is treated as
+    // a rejection, so a malformed/omitted verdict never auto-approves progress.
+    if (!_VALID_EV_VERDICT.has(verdict)) verdict = 'rejected';
+    out.push({
+      direction_id,
+      status: status as ChallengeEvidenceStatus,
+      verdict: verdict as ChallengeEvidenceVerdict,
+      rationale: _safeStr(o.rationale).trim().slice(0, _RATIONALE_MAX),
+    });
+    if (out.length >= _MAX_EV_VERDICTS) break;
+  }
+  return out;
+}
+
+// Parse the challenger's raw output into a bounded record. Returns an `invalid`
+// record (approving nothing) when no well-formed JSON object can be extracted.
+export function parseStrategicChallengeRecord(rawText: string): StrategicChallengeRecord {
+  let obj: Record<string, unknown> | null = null;
+  try {
+    // portfolio_shape_risk is a REQUIRED key the challenger always emits, so it
+    // is a reliable anchor for locating the verdict object in noisy output.
+    obj = extractJsonObject(rawText || '', 'portfolio_shape_risk');
+  } catch {
+    obj = null;
+  }
+  if (!obj) {
+    return emptyChallengeRecord('invalid', 'challenge output was not parseable JSON');
+  }
+  // Fail closed: only an explicit 'ok' is treated as approved. A missing, empty,
+  // or unrecognized status (e.g. 'invalid', 'error') must NOT default to 'ok' —
+  // a malformed challenger response must never silently carry evidence_progress
+  // through an implicitly-approved channel.
+  const declaredStatus = _safeStr(obj.status).trim().toLowerCase();
+  const isOk = declaredStatus === 'ok';
+  // Both retirement_critique_quality and portfolio_shape_risk are REQUIRED keys.
+  // If either is absent or is not an object, the response is malformed and the
+  // gate must fail closed rather than display missing sections as clean.
+  const hasRetirementSection = obj.retirement_critique_quality !== null
+    && typeof obj.retirement_critique_quality === 'object'
+    && !Array.isArray(obj.retirement_critique_quality);
+  if (!hasRetirementSection) {
+    return emptyChallengeRecord('invalid', 'challenge output missing required section: retirement_critique_quality');
+  }
+  const hasPortfolioSection = obj.portfolio_shape_risk !== null
+    && typeof obj.portfolio_shape_risk === 'object'
+    && !Array.isArray(obj.portfolio_shape_risk);
+  if (!hasPortfolioSection) {
+    return emptyChallengeRecord('invalid', 'challenge output missing required section: portfolio_shape_risk');
+  }
+  const record: StrategicChallengeRecord = {
+    challenge_version: STRATEGIC_CHALLENGE_VERSION,
+    status: isOk ? 'ok' : 'blocked',
+    // Only an explicitly-ok challenge may carry evidence_progress through.
+    evidence_progress: isOk ? normalizeEvidenceProgress(obj.evidence_progress) : [],
+    retirement_critique_quality: coerceVerdictBlock(obj.retirement_critique_quality),
+    portfolio_shape_risk: coerceVerdictBlock(obj.portfolio_shape_risk),
+  };
+  const notes = _safeStr(obj.notes).trim().slice(0, _NOTES_MAX);
+  if (notes) record.notes = notes;
+  return record;
+}
+
+// Build the adversarial challenge prompt. The challenger reads the thinker's
+// analysis plus the directions/portfolio context the thinker saw, and emits
+// ONLY the strict verdict JSON.
+export function buildStrategicChallengePrompt(opts: {
+  analysisText: string;
+  dirSummaryText: string;
+  pastRetirementCritiquesSection: string;
+  portfolioCompositionText: string;
+}): string {
+  const analysis = (opts.analysisText || '').slice(0, 40_000);
+  const ctxBlocks = [
+    opts.dirSummaryText ? `## Existing directions (what the thinker saw)\n${opts.dirSummaryText}` : '',
+    opts.portfolioCompositionText ? `## Portfolio composition\n${opts.portfolioCompositionText}` : '',
+    opts.pastRetirementCritiquesSection || '',
+  ].filter(Boolean).join('\n\n');
+  return `# Role: independent strategic challenge (adversarial second opinion)
+
+You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produced a strategic analysis containing self-assessed judgments. Your job is to CHALLENGE — not rubber-stamp — three classes of those self-produced judgments BEFORE they are committed:
+
+1. **evidence_progress** — the thinker's claims that a long-running direction is "advancing" or "met". These are self-serving by construction. APPROVE an advancing/met claim ONLY when the analysis presents concrete, observable evidence that the direction's own success_evidence is actually being met. If the evidence is thin, assumed, or absent, REJECT (a stalled reality must not be dressed up as progress). When in doubt, REJECT — approving a false "advancing" is the costly error.
+2. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
+3. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
+
+You do NOT commit anything. You ONLY emit a verdict record. Be terse and skeptical.
+
+## The thinker's analysis to challenge
+${analysis}
+
+${ctxBlocks}
+
+# Output (STRICT)
+Output ONLY a single JSON object — no markdown, no code fences, no preamble — with EXACTLY this shape:
+{
+  "status": "ok",
+  "evidence_progress": [
+    {"direction_id": "d-xxx", "status": "advancing|stalled|met", "verdict": "approved|rejected", "rationale": "one line"}
+  ],
+  "retirement_critique_quality": {"verdict": "solid|shallow|not_assessed", "rationale": "one line"},
+  "portfolio_shape_risk": {"verdict": "low|elevated|high", "rationale": "one line"}
+}
+Rules:
+- Add an evidence_progress entry for EVERY direction the thinker rated advancing or met (verdict "approved" only with concrete evidence, otherwise "rejected"). Directions the thinker called stalled need no entry — stalled is advisory and never gated. If the thinker rated none, emit an empty array.
+- "retirement_critique_quality" and "portfolio_shape_risk" are REQUIRED keys even when there is little to say.
+- Output the JSON object and nothing else.`;
+}
+
+// Run the challenge pass and return a bounded record. runClaudeCode/sendLog are
+// injected so the caller's module-scoped test mocks are honoured (mirrors
+// attemptStructuredRepair). A vm_config_missing infra death propagates so the
+// orchestrator gets a clean PROVISION_FAILURE requeue; any other runner error
+// or a non-zero exit degrades to a blocked record (gate fails closed).
+export async function runStrategicChallenge(opts: {
+  analysisText: string;
+  dirSummaryText: string;
+  pastRetirementCritiquesSection: string;
+  portfolioCompositionText: string;
+  ws: WebSocket | null;
+  statusRef: { value: string };
+  model?: string;
+  effort?: string;
+  disallowedTools: string[];
+  runClaudeCode: RunClaudeCodeFn;
+  sendLog: SendLogFn;
+}): Promise<StrategicChallengeRecord> {
+  const { ws, statusRef, model, effort, disallowedTools, runClaudeCode, sendLog } = opts;
+  const prompt = `${buildStrategicChallengePrompt(opts)}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  statusRef.value = 'Running strategic challenge (independent adversarial second opinion)...';
+  let result: { exitCode: number; allOutput: string; lastResultText: string };
+  try {
+    result = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);
+  } catch (e) {
+    if (e instanceof VmConfigMissingError) throw e;
+    sendLog(ws, `[WARNING] Strategic challenge pass errored (recording blocked record): ${String(e)}\n`);
+    return emptyChallengeRecord('blocked', `challenge pass errored: ${String(e)}`);
+  }
+  if (result.exitCode !== 0) {
+    sendLog(ws, `[WARNING] Strategic challenge pass exited ${result.exitCode} (recording blocked record).\n`);
+    return emptyChallengeRecord('blocked', `challenge pass exited ${result.exitCode}`);
+  }
+  const record = parseStrategicChallengeRecord(result.lastResultText || result.allOutput);
+  if (record.status === 'invalid') {
+    sendLog(ws, `[WARNING] Strategic challenge produced unparseable output (recording invalid record; no evidence approvals).\n`);
+  } else {
+    sendLog(ws, `[INFO] Strategic challenge complete (status=${record.status}, evidence_verdicts=${record.evidence_progress.length}).\n`);
+  }
+  return record;
+}
+
+// Render the challenge record + the evidence-progress gate for the executor
+// prompt. The executor may submit an advancing/met verdict only for a
+// challenge-approved (direction_id, status) pair listed here.
+export function buildStrategicChallengeExecutorSection(record: StrategicChallengeRecord): string {
+  // Only ok-status records can approve advancing/met pairs; blocked/invalid
+  // records must present an empty approval list to the executor.
+  const approved = record.status === 'ok'
+    ? record.evidence_progress.filter(
+        e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'),
+      )
+    : [];
+  const approvedList = approved.length > 0
+    ? approved.map(e => `  - ${e.direction_id} → ${e.status}`).join('\n')
+    : '  - (none — no advancing/met evidence_progress verdict was approved this cycle)';
+  const json = JSON.stringify(record);
+  const boundedJson = json.length > 8000 ? `${json.slice(0, 8000)}…` : json;
+  const statusCaveat = record.status !== 'ok'
+    ? `\n_The challenge was **${record.status}** — treat it as approving NOTHING. Do NOT submit any advancing/met evidence_progress this cycle._`
+    : '';
+  return [
+    '# Independent strategic challenge (adversarial second opinion — advisory gate)',
+    "An independent challenge pass re-judged the thinker's self-produced judgments BEFORE you commit them. Its bounded verdict record:",
+    '```json',
+    boundedJson,
+    '```' + statusCaveat,
+    '',
+    '## Evidence-progress gate (REQUIRED before `set-evidence-progress`)',
+    'You may pass an `advancing` or `met` status to `./strategic set-evidence-progress` ONLY for a (direction_id, status) pair the challenge APPROVED below. For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid (no approvals) — do NOT submit advancing/met for it: submit `stalled` (always allowed, advisory) or omit it. This gate refines evidence_progress only; it does NOT change retirement critiques, direction caps, staging, version_phase/qualify handling, or operator-wins semantics.',
+    'Challenge-approved advancing/met pairs:',
+    approvedList,
+  ].join('\n');
 }
 
 export function writeStrategicHelpers(taskId: string, projectId: string, workspace: string): void {

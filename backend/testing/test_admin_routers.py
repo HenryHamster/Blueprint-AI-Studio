@@ -11,7 +11,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -31,11 +31,13 @@ from app.models import (
     ReleaseVersion,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
     Alert,
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
     SystemMaturity,
+    WakeDeliveryState,
     _on_task_terminal_callbacks,
 )
 from app.auth import get_current_user, require_admin
@@ -4898,6 +4900,37 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_review_second_opinion_gate_enabled(self, client: AsyncClient):
+        """review_second_opinion_gate_enabled accepts booleans, rejects
+        non-booleans, and round-trips on GET (operator rollback for the
+        default-on second-opinion gate). Guards all four wiring points."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_second_opinion_gate_enabled"] is False
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": True},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_second_opinion_gate_enabled"] is True
+
+        bad = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": "false"},
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"review_second_opinion_gate_enabled": 0}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_pool_project_allowlist_round_trip(
         self, client: AsyncClient
     ):
@@ -5470,10 +5503,10 @@ class TestDispatchExternalNotification:
         mock_response = mocker.MagicMock()
         mock_response.status_code = 200
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=mock_response)
 
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
@@ -5513,10 +5546,10 @@ class TestDispatchExternalNotification:
             "throttle_seconds": 0,
         }
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock()
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -5542,10 +5575,10 @@ class TestDispatchExternalNotification:
             "throttle_seconds": 0,
         }
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock()
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -5574,10 +5607,10 @@ class TestDispatchExternalNotification:
         mock_response = mocker.MagicMock()
         mock_response.status_code = 200
 
-        mock_client = mocker.AsyncMock()
-        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
-        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=mock_response)
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
         )
@@ -7448,7 +7481,12 @@ class TestClearDeployFailed:
 
     @staticmethod
     async def _make_deploy_failed_version(
-        session, project_id, *, promoted_sha="promotedsha123", version_number=1
+        session,
+        project_id,
+        *,
+        promoted_sha="promotedsha123",
+        version_number=1,
+        deploy_failure_reason="no_new_revision",
     ):
         from datetime import datetime, timezone
 
@@ -7463,7 +7501,7 @@ class TestClearDeployFailed:
             promoted_at=promoted_at,
             promoted_sha=promoted_sha,
             serving_status="deploy_failed",
-            deploy_failure_reason="no_new_revision",
+            deploy_failure_reason=deploy_failure_reason,
             deploy_confirm_deadline=datetime(
                 2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
             ),
@@ -7649,13 +7687,103 @@ class TestClearDeployFailed:
         assert version.deploy_failure_reason == "no_new_revision"
 
     @pytest.mark.asyncio
+    async def test_aggregate_only_deploy_failed_is_selected_for_clear(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Aggregate-only deploy_failed versions are found even when the backend
+        scalar is already serving_confirmed."""
+        from datetime import datetime, timezone
+
+        from app import release_artifacts as artifact_registry
+        from app.models import DeploymentState, DeploymentStatus, ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            promoted_sha="liveserving999",
+        )
+        version.serving_status = "serving_confirmed"
+        version.served_sha = "liveserving999"
+        version.deploy_failure_reason = None
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            )
+        )
+        db_session.add(
+            DeploymentState(
+                current_sha="liveserving999",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "required non-backend artifact" in resp.text
+        assert "synthetic_deadline_elapsed" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.deploy_failure_reason is None
+
+    @pytest.mark.asyncio
     async def test_force_refused_without_override(
         self, client: AsyncClient, db_session
     ):
-        """Unobservable serving SHA + no force → 409, version stays deploy_failed."""
+        """serving_sha_unobservable + no force → 409, version stays deploy_failed."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
         project = await _make_project(db_session)
-        version = await self._make_deploy_failed_version(db_session, project.id)
-        # No DeploymentState → serving SHA cannot be independently observed.
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # A STABLE revision booted after promotion but serving SHA is unobservable
+        # (current_sha="") — re-check must still classify as serving_sha_unobservable.
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -7725,9 +7853,25 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_force_requires_reason(self, client: AsyncClient, db_session):
-        """force=true without a reason → 400."""
+        """force=true without a reason → 400 (only for serving_sha_unobservable)."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
         project = await _make_project(db_session)
-        await self._make_deploy_failed_version(db_session, project.id)
+        await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -7739,12 +7883,29 @@ class TestClearDeployFailed:
     async def test_force_path_clears_and_records_attestation(
         self, client: AsyncClient, db_session
     ):
-        """force=true + reason clears, resolves the alert, flips the verdict."""
-        from app.models import QualificationVerdict
+        """force=true + reason clears for serving_sha_unobservable, resolves alert."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
         from app.release_stall_alerts import _deploy_failed_alert_title
 
         project = await _make_project(db_session)
-        version = await self._make_deploy_failed_version(db_session, project.id)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # A STABLE revision booted after promotion but serving SHA is unobservable
+        # (current_sha="") — re-check must still classify as serving_sha_unobservable
+        # so the force path remains permitted.
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         # Seed the open deploy-failed operator alert that must be resolved.
         alert = Alert(
@@ -7789,6 +7950,124 @@ class TestClearDeployFailed:
             )
         ).scalar_one()
         assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure_reason",
+        ["sha_mismatch", "rolled_back", "halted", "no_new_revision"],
+    )
+    async def test_force_rejected_for_genuine_failure_reason(
+        self, client: AsyncClient, db_session, failure_reason
+    ):
+        """force=true is rejected for known-bad failure reasons that are not
+        serving_sha_unobservable — the deployment genuinely failed and cannot
+        be force-attested as serving."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason=failure_reason,
+        )
+
+        # Seed a DeploymentState that drives _check_backend_revision_serving
+        # to recheck to the intended failure reason.  Without this, ds=None +
+        # now>=deadline always produces "no_new_revision", causing the
+        # assertion on the parametrized reason_code to fail for the other three.
+        after_promotion = datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc)
+        if failure_reason == "sha_mismatch":
+            # STABLE revision booted after promotion, serving a mismatched SHA.
+            db_session.add(
+                DeploymentState(
+                    current_sha="different_sha_456",
+                    status=DeploymentStatus.STABLE,
+                    deployed_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        elif failure_reason == "rolled_back":
+            db_session.add(
+                DeploymentState(
+                    current_sha="",
+                    status=DeploymentStatus.ROLLED_BACK,
+                    deployed_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        elif failure_reason == "halted":
+            db_session.add(
+                DeploymentState(
+                    current_sha="",
+                    status=DeploymentStatus.HALTED,
+                    deployed_at=after_promotion,
+                    halted_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        # no_new_revision: leave ds=None; deadline already past → no_new_revision
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "I think it worked"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "serving_sha_unobservable" in resp.text
+        assert failure_reason in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == failure_reason
+
+    @pytest.mark.asyncio
+    async def test_force_blocked_when_backend_reason_transitions_to_hard_failure(
+        self, client: AsyncClient, db_session
+    ):
+        """Regression: version scalar latched serving_sha_unobservable but the
+        backend artifact's freshly-rechecked reason_code is sha_mismatch (a hard
+        failure that arose after the latch).  The force path must be rejected even
+        though version.deploy_failure_reason still says serving_sha_unobservable.
+
+        Old code checked the stale version scalar → wrongly allowed attestation.
+        New code checks backend_artifact.reason_code from _refresh_release_artifact_rows
+        → correctly rejects."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
+        project = await _make_project(db_session)
+        # Stale version scalar: latched as serving_sha_unobservable.
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            promoted_sha="promotedsha123",
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # Fresh backend state: a STABLE revision booted after promotion but is
+        # serving a *different* SHA → sha_mismatch (hard failure).
+        db_session.add(
+            DeploymentState(
+                current_sha="different_sha_456",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "I think it worked"},
+        )
+        # Must be rejected: fresh backend reason is sha_mismatch, not
+        # serving_sha_unobservable — force attestation is not permitted.
+        assert resp.status_code == 409, resp.text
+        assert "serving_sha_unobservable" in resp.text
+        assert "sha_mismatch" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
 
 
 class TestVersionLifecycleInfraFailureFields:
@@ -9087,6 +9366,143 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert verdicts[0]["candidate_sha"] == "aggsha789"
 
 
+class TestVersionLifecycleChallengedVsUnchallenged:
+    """GET /version-lifecycle exposes the challenged-vs-unchallenged telemetry
+    field derived from real QualificationVerdict history."""
+
+    @pytest.mark.asyncio
+    async def test_challenged_vs_unchallenged_present_and_has_expected_shape(
+        self, client: AsyncClient, db_session
+    ):
+        """The endpoint always returns challenged_vs_unchallenged with the three
+        required keys; an empty history produces an insufficient_sample state."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "challenged_vs_unchallenged" in body
+        tel = body["challenged_vs_unchallenged"]
+        assert "challenged" in tel
+        assert "unchallenged" in tel
+        assert "total_verdicts" in tel
+        # No verdicts seeded — both cohorts are insufficient_sample.
+        assert tel["total_verdicts"] == 0
+        assert tel["challenged"]["insufficient_sample"] is True
+        assert tel["unchallenged"]["insufficient_sample"] is True
+
+    @pytest.mark.asyncio
+    async def test_challenged_vs_unchallenged_populated_from_verdict_history(
+        self, client: AsyncClient, db_session
+    ):
+        """Seeding verdicts with and without audit_reconciliation.audit_challenge
+        produces cohort stats (not insufficient_sample) for the large-enough cohort."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+
+        # Seed 4 challenged verdicts (audit_reconciliation.audit_challenge available)
+        for i in range(4):
+            v = QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=f"chal{i:04d}",
+                confidence=0.91,
+                would_promote=True,
+                promotion_enabled=False,
+                terminal_status="dry_run",
+                threshold=0.90,
+                audit_reconciliation={
+                    "audit_challenge": {
+                        "status": "available",
+                        "reported_agreement": "agree",
+                        "confirmed_count": 1,
+                        "refuted_count": 0,
+                        "uncertain_count": 0,
+                    },
+                    "excluded_findings_count": 0,
+                },
+            )
+            db_session.add(v)
+
+        # Seed 4 unchallenged verdicts (no audit_challenge)
+        for i in range(4):
+            v = QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=f"unch{i:04d}",
+                confidence=0.85,
+                would_promote=False,
+                promotion_enabled=False,
+                terminal_status="not_promoted",
+                threshold=0.90,
+            )
+            db_session.add(v)
+
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        tel = resp.json()["challenged_vs_unchallenged"]
+        assert tel["total_verdicts"] == 8
+        # Both cohorts have 4 verdicts >= _MIN_TELEMETRY_SAMPLE (3).
+        assert tel["challenged"]["insufficient_sample"] is False
+        assert tel["challenged"]["sample_size"] == 4
+        assert "exclusion_rate" in tel["challenged"]
+        assert "disagreement_rate" in tel["challenged"]
+        assert tel["unchallenged"]["insufficient_sample"] is False
+        assert tel["unchallenged"]["sample_size"] == 4
+        assert "exclusion_rate" in tel["unchallenged"]
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 
@@ -9433,6 +9849,70 @@ class TestResetIterationCap:
 
         resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
         assert resp.status_code == 400
+
+
+class TestGetTaskWakeRegistration:
+    @pytest.mark.asyncio
+    async def test_task_detail_returns_null_then_latest_wake_registration(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.PARKED,
+            payloads=[{"type": "create"}],
+            parked_at=datetime(2026, 6, 1, 12, 0, 0),
+            park_reason="Waiting on compute job",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["wake_registration"] is None
+
+        old_requested_at = datetime(2026, 6, 1, 12, 1, 0)
+        latest_requested_at = old_requested_at + timedelta(minutes=5)
+        db_session.add(
+            TaskWakeRegistration(
+                task_id=task.id,
+                project_id=project.id,
+                wake_source_kind="compute_job_terminal",
+                wake_source_ref="old-job",
+                requested_at=old_requested_at,
+                delivery_state=WakeDeliveryState.PENDING,
+            )
+        )
+        db_session.add(
+            TaskWakeRegistration(
+                task_id=task.id,
+                project_id=project.id,
+                wake_source_kind="compute_job_terminal",
+                wake_source_ref="job-123",
+                requested_at=latest_requested_at,
+                deadline_at=datetime(2026, 6, 1, 13, 0, 0),
+                fired_at=datetime(2026, 6, 1, 12, 10, 0),
+                delivery_state=WakeDeliveryState.DELIVERED,
+                result_state="resumed",
+                result_detail="Task re-queued after compute job completed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+
+        assert resp.status_code == 200, resp.text
+        wake_registration = resp.json()["wake_registration"]
+        assert wake_registration == {
+            "wake_source_kind": "compute_job_terminal",
+            "wake_source_ref": "job-123",
+            "delivery_state": "DELIVERED",
+            "deadline_at": "2026-06-01T13:00:00",
+            "fired_at": "2026-06-01T12:10:00",
+            "result_state": "resumed",
+            "result_detail": "Task re-queued after compute job completed",
+        }
 
 
 class TestGetAllTasksHistory:
@@ -12266,6 +12746,110 @@ class TestTriggerRollup:
         )
 
 
+@pytest.mark.asyncio
+async def test_strategic_api_output_update_events_include_live_linkage(
+    client: AsyncClient, db_session, mocker
+):
+    from app import strategic_cycle
+    from app.auth import create_agent_token
+
+    emit = AsyncMock()
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=emit)
+    project = Project(
+        name="Strategic Events",
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strategic-events",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id), "vm-strategic-events", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    create_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Stabilize billing webhooks",
+                "priority": "high",
+                "rationale": "operator steering requested billing reliability",
+                "success_evidence": "Webhook retries are verified",
+                "retirement_condition": "No open webhook incidents",
+            },
+        },
+        headers=headers,
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    created_id = create_resp.json()["direction_id"]
+
+    pm_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "harden"},
+                "capabilities": [],
+                "gaps": [],
+            },
+        },
+        headers=headers,
+    )
+    assert pm_resp.status_code == 200, pm_resp.text
+
+    ru_resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_running_update",
+            "data": {"markdown": "## Running update\nBilling reliability is active."},
+        },
+        headers=headers,
+    )
+    assert ru_resp.status_code == 200, ru_resp.text
+
+    assert emit.await_count == 3
+    first_call = emit.await_args_list[0]
+    assert first_call.args == (project.id, "directions")
+    assert first_call.kwargs == {
+        "task_id": task.id,
+        "cycle_id": cycle.id,
+        "output_kind": "directions",
+        "op": "create_direction",
+        "changed_direction_ids": [created_id],
+        "changed_count": 1,
+        "problem_model_changed": None,
+        "running_update_changed": None,
+    }
+    assert emit.await_args_list[1].args == (project.id, "problem_model")
+    assert emit.await_args_list[1].kwargs["cycle_id"] == cycle.id
+    assert emit.await_args_list[1].kwargs["op"] == "set_problem_model"
+    assert emit.await_args_list[1].kwargs["problem_model_changed"] is True
+    assert emit.await_args_list[2].args == (project.id, "running_update")
+    assert emit.await_args_list[2].kwargs["cycle_id"] == cycle.id
+    assert emit.await_args_list[2].kwargs["op"] == "set_running_update"
+    assert emit.await_args_list[2].kwargs["running_update_changed"] is True
+
+
 class TestTriggerSelfAudit:
     @pytest.mark.asyncio
     async def test_self_audit_409_when_audit_in_flight(
@@ -12443,6 +13027,189 @@ class TestGetProjectFindings:
         assert resp.status_code == 404
 
 
+class TestComputeExperimentTaskLaunch:
+    async def _project_with_repo(self, session, repo="compute"):
+        project = Project(
+            name=f"acme/{repo}",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await session.commit()
+        return project
+
+    def _valid_payload(self, repo="compute", **overrides):
+        payload = {
+            "github_repo": f"acme/{repo}",
+            "title": "Measure GPU throughput",
+            "prompt": "Run the throughput benchmark and persist the result.",
+            "base_branch": "automain",
+            "command": "python bench.py --json result.json",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 900,
+            "accelerator": "L4",
+            "machine_type": "g2-standard-4",
+            "cwd": "/workspace",
+            "env": {"BENCHMARK_MODE": "smoke"},
+            "experiment": "gpu-throughput",
+            "benchmark": "tokens-per-second",
+            "hypothesis": "L4 throughput exceeds the acceptance floor.",
+            "metric": "tokens_per_second",
+            "success_criterion": {
+                "metric": "tokens_per_second",
+                "operator": ">=",
+                "threshold": 100.0,
+            },
+        }
+        payload.update(overrides)
+        return payload
+
+    @pytest.mark.asyncio
+    async def test_valid_launch_persists_compute_experiment_contract(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(idempotency_key="gpu-smoke"),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is False
+        task = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert task.status == TaskStatus.QUEUED
+        assert task.requires_approval is False
+        payload = task.payloads[0]
+        assert payload["type"] == "compute_experiment"
+        assert payload["command"] == "python bench.py --json result.json"
+        assert payload["spend_cap_usd"] == 5.0
+        assert payload["deadline_seconds"] == 900
+        assert payload["accelerator"] == "L4"
+        assert payload["machine_type"] == "g2-standard-4"
+        assert payload["cwd"] == "/workspace"
+        assert payload["env"] == {"BENCHMARK_MODE": "smoke"}
+        assert payload["experiment"] == "gpu-throughput"
+        assert payload["benchmark"] == "tokens-per-second"
+        assert payload["hypothesis"] == "L4 throughput exceeds the acceptance floor."
+        assert payload["metric"] == "tokens_per_second"
+        assert payload["success_criterion"] == {
+            "metric": "tokens_per_second",
+            "operator": ">=",
+            "threshold": 100.0,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("override", "expected_detail"),
+        [
+            ({"command": None}, "command"),
+            ({"spend_cap_usd": 0}, "spend_cap_usd must be positive"),
+            ({"deadline_seconds": 0}, "deadline_seconds must be positive"),
+        ],
+    )
+    async def test_malformed_contract_is_rejected_without_task(
+        self, client: AsyncClient, db_session, override, expected_detail
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 422, resp.text
+        assert expected_detail in resp.text
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_spend_above_threshold_requires_approval_with_status_message(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.01, deadline_seconds=1200),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is True
+        assert task.context["approval_hold_reason"] == "spend_budget"
+        assert task.latest_status_message == (
+            "Held for operator approval: compute_experiment proposes "
+            "$5.01 spend cap / 1200s deadline, exceeding "
+            "the $5.00 approval threshold."
+        )
+
+    @pytest.mark.asyncio
+    async def test_spend_at_threshold_is_runnable(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.0),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is False
+        assert task.latest_status_message is None
+
+
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.
 
@@ -12552,9 +13319,7 @@ class TestBugReportCitationGate:
         )
         mocker.patch(
             "app.source_ref_validation._file_exists_at_head",
-            new=AsyncMock(
-                side_effect=lambda path, **_: True if "alive.py" in path else False
-            ),
+            new=AsyncMock(side_effect=lambda path, **_: "alive.py" in path),
         )
         resp = await client.post(
             "/api/admin/messages",
@@ -12692,9 +13457,7 @@ class TestBugReportCitationGate:
         )
         mocker.patch(
             "app.source_ref_validation._file_exists_at_head",
-            new=AsyncMock(
-                side_effect=lambda path, **_: True if "alive.py" in path else False
-            ),
+            new=AsyncMock(side_effect=lambda path, **_: "alive.py" in path),
         )
         resp = await client.post(
             "/api/admin/tasks",
@@ -12880,9 +13643,8 @@ class TestStrategistSpawnableRegistry:
     def test_allowlist_equals_expected_knowledge_types(self):
         from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
 
-        assert STRATEGIST_SPAWNABLE_TASK_TYPES == frozenset(
-            {"research", "plan", "web_research", "design"}
-        )
+        expected = frozenset({"research", "plan", "web_research", "design"})
+        assert expected == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_allowlist_is_derived_from_capability_flag(self):
         from app.task_capabilities import (
@@ -12900,7 +13662,7 @@ class TestStrategistSpawnableRegistry:
             for value, cap in TASK_CAPABILITY_BY_VALUE.items()
             if cap.strategist_spawnable
         )
-        assert STRATEGIST_SPAWNABLE_TASK_TYPES == derived
+        assert derived == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_no_write_type_is_strategist_spawnable(self):
         from app.task_capabilities import (

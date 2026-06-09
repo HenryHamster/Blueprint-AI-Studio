@@ -2971,12 +2971,20 @@ def test_counts_as_failure_excludes_cascade_cancelled():
     assert _counts_as_failure(t)
 
 
-def _compute_experiment_task(outcome, *, status=TaskStatus.COMPLETED):
+def _compute_experiment_task(
+    outcome, *, status=TaskStatus.COMPLETED, acceptance_grade=None
+):
     plan_output = (
         {"compute_result": {"outcome": outcome, "final_cost_usd": 1.0}}
         if outcome is not None
         else None
     )
+    if isinstance(plan_output, dict) and acceptance_grade is not None:
+        plan_output["knowledge_document"] = {
+            "source_kind": "compute_experiment",
+            "knowledge_acceptance_evidence": acceptance_grade == "acceptance",
+            "compute_acceptance_grade": acceptance_grade,
+        }
     return Task(
         project_id=uuid.uuid4(),
         title="compute",
@@ -2989,13 +2997,19 @@ def _compute_experiment_task(outcome, *, status=TaskStatus.COMPLETED):
 
 
 def test_compute_experiment_outcome_feeds_success_predicate():
-    """A SUCCESS compute_experiment is a successful outcome; budget/deadline
-    terminations are neutral (not successes, not failures)."""
+    """Only acceptance-grade SUCCESS compute knowledge is a successful outcome;
+    budget/deadline terminations and measured-only results are neutral."""
     from app.task_outcomes import evaluate_task_outcome, is_successful_outcome
 
-    success = _compute_experiment_task("SUCCESS")
+    success = _compute_experiment_task("SUCCESS", acceptance_grade="acceptance")
     assert is_successful_outcome(success) is True
     assert evaluate_task_outcome(success).status == "success"
+
+    measured_only = _compute_experiment_task(
+        "SUCCESS", acceptance_grade="measured_only"
+    )
+    assert is_successful_outcome(measured_only) is False
+    assert evaluate_task_outcome(measured_only).status == "neutral"
 
     spend_cap = _compute_experiment_task("SPEND_CAP_EXCEEDED")
     assert is_successful_outcome(spend_cap) is False
@@ -5379,3 +5393,68 @@ async def test_per_direction_format_metrics_have_a_consumer_or_are_retired(
     assert entry["format_compliance_rate"] == 0.5
     # 1 repair attempt, 1 success → 100% repair success rate.
     assert entry["self_repair_success_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_counts_and_rates_are_recorded(db_session: AsyncSession):
+    """research_history records challenged/refuted/survived counts and merge rates."""
+    direction_id = "d-spawn-gate"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 2,
+        "research_spawn_gate_refuted_count": 1,
+        "research_spawn_gate_survived_count": 1,
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+            "research_spawn_gate_verdict": "pass",
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-open",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+            "research_spawn_gate_verdict": None,
+        },
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["research_spawn_gate_challenged_count"] == 2
+    assert entry["research_spawn_gate_refuted_count"] == 1
+    assert entry["research_spawn_gate_survived_count"] == 1
+    assert entry["research_spawn_gate_challenged_spawned"] == 1
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 1.0
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1
+    assert entry["research_spawn_gate_unchallenged_merged"] == 0
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 0.0

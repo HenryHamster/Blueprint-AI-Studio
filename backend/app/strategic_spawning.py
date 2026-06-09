@@ -63,6 +63,14 @@ from app.strategic_trigger import (
     strategic_refresh_origin,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -73,6 +81,51 @@ from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
+
+_CHALLENGE_BOUNDARY_BUCKETS = (
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+)
+_CHALLENGE_AGREEMENT_BUCKETS = (
+    CHALLENGE_AGREES,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
+
+
+def _empty_finding_challenge_summary() -> dict[str, Any]:
+    return {
+        "challenged_findings": 0,
+        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
+        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "fail_closed_unparseable": 0,
+    }
+
+
+def _positive_int(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    target["challenged_findings"] += _positive_int(source.get("challenged_findings"))
+    target["fail_closed_unparseable"] += _positive_int(
+        source.get("fail_closed_unparseable")
+    )
+    source_agreements = source.get("agreement_distribution") or {}
+    if isinstance(source_agreements, dict):
+        for key in _CHALLENGE_AGREEMENT_BUCKETS:
+            target["agreement_distribution"][key] += _positive_int(
+                source_agreements.get(key)
+            )
+    source_boundaries = source.get("boundary_distribution") or {}
+    if isinstance(source_boundaries, dict):
+        for key in _CHALLENGE_BOUNDARY_BUCKETS:
+            target["boundary_distribution"][key] += _positive_int(
+                source_boundaries.get(key)
+            )
 
 
 def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -3446,7 +3499,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
     from app.strategic_events import emit_strategic_cycle_started
 
-    await emit_strategic_cycle_started(project.id, new_task.id, 1)
+    await emit_strategic_cycle_started(
+        project.id,
+        new_task.id,
+        1,
+        cycle_id=cycle_id,
+        steering_origin=ORIGIN_OPERATOR if operator_steered else None,
+        steering_excerpt=task_context.get("steering_excerpt"),
+    )
     logger.info(
         f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})"
     )
@@ -3624,6 +3684,7 @@ async def _spawn_strategic_review(
             "pattern_inferred": 0,
             "deduced": 0,
         }
+        _agg_challenge = _empty_finding_challenge_summary()
         for h in recent_history:
             for desc in h.get("key_finding_descriptions") or []:
                 if desc and desc not in recent_findings:
@@ -3637,6 +3698,9 @@ async def _spawn_strategic_review(
             for _bk, _bv in (h.get("verification_basis_distribution") or {}).items():
                 if _bk in _agg_basis:
                     _agg_basis[_bk] = _agg_basis.get(_bk, 0) + int(_bv or 0)
+            _merge_finding_challenge_summary(
+                _agg_challenge, h.get("finding_challenge_summary")
+            )
         total_prs = total_merged + total_rejected
         operator_rejection_rate = (
             round(total_rejected / total_prs, 2) if total_prs > 0 else None
@@ -3725,6 +3789,8 @@ async def _spawn_strategic_review(
             stat_entry["recent_findings_grade_distribution"] = _agg_grade
         if any(_agg_basis.values()):
             stat_entry["recent_findings_verification_basis"] = _agg_basis
+        if _agg_challenge["challenged_findings"] > 0:
+            stat_entry["recent_findings_challenge_summary"] = _agg_challenge
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
         # Surface cumulative confirmed-finding count and trend from
@@ -3753,6 +3819,13 @@ async def _spawn_strategic_review(
         _rec_mode = d.get("recommended_mode")
         if _rec_mode and _rec_mode != "ship":
             stat_entry["recommended_mode"] = _rec_mode
+        # Research spawn-gate effectiveness (distinct from strategic self-challenge).
+        # Only emitted when the direction has actual spawn-gate activity recorded.
+        from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+        _sgm = compute_spawn_gate_aggregate(history)
+        if _sgm is not None:
+            stat_entry["spawn_gate_metrics"] = _sgm
         direction_stats.append(stat_entry)
 
     mode_hint_lines = []
@@ -4478,6 +4551,12 @@ async def _spawn_strategic_review(
         _prior_serving_status: str | None = None
         _prior_deploy_reason: str | None = None
         _prior_artifact_gap: str | None = None
+        # When the prior-version record genuinely cannot be READ (the lookup
+        # raised), fail closed below: do NOT imply the previous version is live.
+        # A lookup that simply finds no matching promoted record is a different,
+        # optimistic case — version_number > 1 is only reachable via a
+        # promotion, so the positive "it promoted" framing still holds there.
+        _prior_lookup_failed = False
         try:
             from app.release_version import recent_closed_versions as _rcv
 
@@ -4501,10 +4580,28 @@ async def _spawn_strategic_review(
                     )
                     break
         except Exception:
+            _prior_lookup_failed = True
             logger.exception(
                 "[STRATEGIC] post-promote prior-version lookup failed; continuing"
             )
-        if _prior_serving_status == "deploy_failed":
+        if _prior_lookup_failed:
+            # Fail closed: the prior promoted record is unreadable, so we cannot
+            # assert it is serving. Do NOT imply it is live.
+            _status_txt = (
+                f" serving_status={_prior_serving_status!r}"
+                if _prior_serving_status is not None
+                else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
+                f"to {_target}{_promoted_when}{_verdict_txt}, but its prior "
+                f"serving evidence is unknown or unreadable{_status_txt}. Do "
+                f"NOT treat v{_prior_n} as live yet. Verify lifecycle/deploy "
+                f"state before treating the previous version as live, and only "
+                f"treat it as shipped once aggregate serving evidence is "
+                f"explicitly `serving_confirmed`."
+            )
+        elif _prior_serving_status == "deploy_failed":
             # The prior promotion MERGED but never shipped — do NOT advance focus
             # as if it succeeded.  This is the focus-advancement gate honoring the
             # serving signal: the strategist must treat the milestone as NOT
@@ -5296,7 +5393,14 @@ async def _spawn_strategic_review(
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
 
-    await emit_strategic_cycle_started(project.id, new_task.id, 2)
+    await emit_strategic_cycle_started(
+        project.id,
+        new_task.id,
+        2,
+        cycle_id=cycle_id,
+        steering_origin=ORIGIN_OPERATOR if operator_steered else None,
+        steering_excerpt=steering_excerpt,
+    )
     logger.info(
         f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}"
     )

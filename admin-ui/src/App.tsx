@@ -62,13 +62,14 @@ const COLUMNS: KanbanColumn[] = [
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
   { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
   { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
+  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
   { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
 ];
 
 const SORT_KEY = 'blueprint-admin:kanban-sort';
-const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED']);
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 
 
@@ -756,6 +757,16 @@ export default function App() {
         userRole={s.userRole}
         onNewProject={() => setShowNewProjectModal(true)}
         onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
+        onNavigateToTask={(taskId) => {
+          const target = s.tasks.find(t => t.id === taskId);
+          if (target) {
+            s.handleViewLogs(target);
+          } else {
+            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+              s.addToast('Could not load task — it may have been deleted', 'error');
+            });
+          }
+        }}
         onProjectDeleted={(projectId) => {
           if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
           void s.fetchProjects(true);
@@ -894,6 +905,8 @@ export default function App() {
           onOpenTask={handleViewTask}
           notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
           strategistActive={s.strategistActive}
+          cycleProgress={s.cycleProgress}
+          lastCycleCompletion={s.lastCycleCompletion}
         />
       ) : s.showArchive ? (
         <ArchiveView
@@ -1146,6 +1159,8 @@ export default function App() {
           newTaskEffort={s.newTaskEffort}
           setNewTaskModel={s.setNewTaskModel}
           setNewTaskEffort={s.setNewTaskEffort}
+          computeExperiment={s.computeExperiment}
+          setComputeExperiment={s.setComputeExperiment}
           getDefaultModelForType={s.getDefaultModelForType}
           getDefaultEffortForType={s.getDefaultEffortForType}
           repoOptions={s.repoOptions}
@@ -1287,6 +1302,7 @@ export default function App() {
           projects={s.projects}
           fetchDirectionsRef={s.fetchDirectionsRef}
           strategistActive={s.strategistActive}
+          cycleProgress={s.cycleProgress}
           onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

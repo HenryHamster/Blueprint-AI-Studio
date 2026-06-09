@@ -20,18 +20,13 @@ const STATUS_VALUES = STATUS_OPTIONS.map(o => o.value);
 
 const DEFAULT_STATUS_FILTER: string[] = [...STATUS_VALUES];
 
-// The full status set as it existed *before* BLOCKED was added (backend #7436).
-// A persisted 'filter:status' array equal to this set was a "show everything"
-// selection at the time it was saved — the user never chose to exclude BLOCKED,
-// because BLOCKED did not exist yet. Without migration it would now read as a
-// deliberate 7-of-8 subset: it would keep BLOCKED tasks hidden in every view AND
-// (because the count is below STATUS_OPTIONS.length) start sending a server-side
-// &status= param per status that omits BLOCKED entirely. We detect that exact
-// legacy-complete selection and expand it to the current full list so "everything"
-// stays "everything". Deliberate partial selections (any strict subset of the
-// legacy set, or one that already includes BLOCKED) are left untouched.
-const LEGACY_STATUS_VALUES: readonly string[] = [
-  'QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED',
+// Persisted "show everything" selections from before newer statuses existed.
+// Those users never chose to exclude the newly introduced status, so expand
+// exact legacy-complete sets to the current full list. Deliberate partial
+// selections are left untouched.
+const LEGACY_COMPLETE_STATUS_VALUE_SETS: readonly string[][] = [
+  ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'],
+  ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'FAILED', 'CANCELLED', 'COMPLETED'],
 ];
 
 // Keep only values present in `valid`, preserving a legitimately-empty selection.
@@ -49,13 +44,11 @@ function sameSet(a: readonly string[], b: readonly string[]): boolean {
 }
 
 // Sanitize a persisted status selection, then apply the legacy-complete → full
-// expansion described on LEGACY_STATUS_VALUES. The expansion is a no-op once the
-// stored value already includes the new status (so it doesn't fight a user who
-// later deselects BLOCKED) and a no-op for any selection that isn't exactly the
-// legacy "everything" set.
+// expansion described on LEGACY_COMPLETE_STATUS_VALUE_SETS. The expansion is a
+// no-op for any selection that isn't exactly a legacy "everything" set.
 function sanitizeStatusFilter(parsed: unknown): string[] {
   const sanitized = sanitizeStringArray(parsed, STATUS_VALUES, DEFAULT_STATUS_FILTER);
-  if (sameSet(sanitized, LEGACY_STATUS_VALUES)) return [...STATUS_VALUES];
+  if (LEGACY_COMPLETE_STATUS_VALUE_SETS.some(legacy => sameSet(sanitized, legacy))) return [...STATUS_VALUES];
   return sanitized;
 }
 

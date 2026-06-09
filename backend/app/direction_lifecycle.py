@@ -211,6 +211,49 @@ async def _compute_direction_error_fingerprint(
     return best_fp if best_count >= _FINGERPRINT_MIN_RECURRENCE else None
 
 
+def _synthesize_outcome_scaffolding_memo(
+    direction_id: str,
+    direction_topic: str,
+    scaffolding_ev: dict,
+) -> dict:
+    """Build a memo dict from scaffolding evidence available at spawn time.
+
+    All fields come from structured evidence the backend already holds,
+    so no model call is needed — the result is substantive and citable.
+    """
+    total_cycles = scaffolding_ev.get("total_cycles", 0)
+    lifetime_merged = scaffolding_ev.get("lifetime_merged", 0)
+    merge_rate = scaffolding_ev.get("lifetime_merge_rate", 0.0)
+    stall_cycles = scaffolding_ev.get("stall_run_cycles", 0)
+
+    summary = (
+        f"Direction '{direction_topic[:120]}' has shipped {lifetime_merged} merged PRs "
+        f"across {total_cycles} research cycles ({merge_rate:.0%} merge rate) but its "
+        f"outcome signal has stalled for {stall_cycles} consecutive cycles."
+    )
+    parts = [
+        f"Direction: {direction_topic}",
+        (
+            f"Scaffolding evidence: {total_cycles} total cycles, "
+            f"{lifetime_merged} lifetime merged PRs, "
+            f"{merge_rate:.1%} lifetime merge rate, "
+            f"{stall_cycles} consecutive stall cycles without outcome advancement."
+        ),
+        (
+            "Assessment: The direction is generating consistent engineering activity "
+            "(merges) but not advancing its declared success evidence. "
+            "This indicates outcome-less scaffolding — work that builds structure "
+            "without demonstrating measurable progress toward the stated goal."
+        ),
+    ]
+    return {
+        "summary": summary[:500],
+        "reasoning": "\n\n".join(parts),
+        "citations": [f"direction:{direction_id}"],
+        "tags": ["outcome-scaffolding"],
+    }
+
+
 async def _process_direction_lifecycle(
     project: Project,
     session: AsyncSession,
@@ -1015,6 +1058,7 @@ async def _process_direction_lifecycle_locked(
                 # The flag already gates first-detection only so no dedup query needed.
                 try:
                     from app.plan_completion import TASK_PRIORITY_MAP  # noqa: PLC0415
+                    from app.task_completion import _apply_synthesized_memo  # noqa: PLC0415
 
                     _scaffolding_topic = (d.get("text") or "")[
                         :120
@@ -1039,18 +1083,25 @@ async def _process_direction_lifecycle_locked(
                             "memo_source_direction_id": did,
                             "outcome_scaffolding_evidence": scaffolding_ev,
                         },
-                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                         status=TaskStatus.QUEUED,
                         created_by="ORCHESTRATOR",
                         priority=TASK_PRIORITY_MAP.get("low", 0),
                     )
                     session.add(_scaffolding_memo)
+                    _synth_memo = _synthesize_outcome_scaffolding_memo(
+                        did, _scaffolding_topic, scaffolding_ev
+                    )
+                    _apply_synthesized_memo(_scaffolding_memo, _synth_memo, session)
                     logger.info(
                         "[AUTONOMOUS] Spawned outcome-scaffolding memo task %s for direction %s",
                         _scaffolding_memo.id,
                         did,
                     )
                 except Exception:
+                    try:
+                        _scaffolding_memo.status = TaskStatus.FAILED
+                    except Exception:
+                        pass
                     logger.warning(
                         f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
                         exc_info=True,

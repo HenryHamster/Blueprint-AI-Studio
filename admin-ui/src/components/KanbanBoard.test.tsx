@@ -42,6 +42,7 @@ const testColumns: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED'] },
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'PROVISIONING'] },
   { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
+  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
 ];
@@ -103,6 +104,7 @@ describe('KanbanBoard', () => {
     expect(screen.getAllByText('Queued').length).toBeGreaterThan(0);
     expect(screen.getAllByText('In Progress').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Blocked').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Parked').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Completed').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Failed').length).toBeGreaterThan(0);
   });
@@ -119,6 +121,13 @@ describe('KanbanBoard', () => {
     const task = makeTask({ id: 'b1', title: 'Blocked Task', status: 'BLOCKED' });
     render(<KanbanBoard {...makeProps({ tasks: [task] })} />);
     expect(screen.queryByTitle('Archive all Blocked tasks')).not.toBeInTheDocument();
+  });
+
+  it('renders PARKED tasks in the Parked column without a column-archive button', () => {
+    const task = makeTask({ id: 'p1', title: 'Parked Task', status: 'PARKED' });
+    render(<KanbanBoard {...makeProps({ tasks: [task] })} />);
+    expect(screen.getAllByText('Parked Task').length).toBeGreaterThan(0);
+    expect(screen.queryByTitle('Archive all Parked tasks')).not.toBeInTheDocument();
   });
 
   it('renders tasks with their titles', () => {

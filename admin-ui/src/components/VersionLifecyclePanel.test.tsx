@@ -1107,7 +1107,7 @@ describe('VersionLifecyclePanel', () => {
 
       const evidence = screen.getByTestId('durable-qualification-evidence');
       expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
-      expect(within(evidence).getByText(/1 excluded finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
       expect(within(evidence).getByText(/migration block/)).toBeInTheDocument();
       expect(within(evidence).getByText(/apply warn/)).toBeInTheDocument();
       expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
@@ -1163,11 +1163,113 @@ describe('VersionLifecyclePanel', () => {
       const history = await screen.findByTestId('verdict-history');
       const evidence = within(history).getByTestId('durable-qualification-evidence');
       expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
       expect(within(evidence).getByText(/migration pass/)).toBeInTheDocument();
       expect(within(evidence).getByText(/apply pass/)).toBeInTheDocument();
       expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
+    });
+
+    it('renders challenger-refuted false positives with reason in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v2',
+            release_version_id: 'rv2',
+            candidate_sha: 'aabbcc112233',
+            confidence: 0.92,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            audit_findings: [{ severity: 'high', summary: 'confirmed finding' }],
+            excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+            challenger_refuted_audit_findings: [
+              { severity: 'high', summary: 'false alarm finding', challenger_reason: 'already fixed in HEAD' },
+              { severity: 'medium', summary: 'another false positive', challenger_reason: 'out of scope' },
+            ],
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-03T00:00:00Z',
+            created_at: '2026-01-03T00:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      const evidence = within(history).getByTestId('durable-qualification-evidence');
+      // Challenger-refuted chip shows count and is distinct from excluded-audit-findings chip
+      expect(within(evidence).getByTestId('challenger-refuted-findings')).toBeInTheDocument();
+      expect(within(evidence).getByText(/2 challenger false positives/)).toBeInTheDocument();
+      // Tooltip includes severity, summary, and reason for each refuted finding
+      expect(within(evidence).getByTitle('high: false alarm finding — already fixed in HEAD | medium: another false positive — out of scope')).toBeInTheDocument();
+      // The existing excluded-audit-findings chip still renders distinctly
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
+      expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBe(
+        within(evidence).queryByText(/1 excluded audit finding/),
+      );
+    });
+
+    it('renders challenger-refuted false positives with reason on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'high', summary: 'confirmed finding' }],
+                excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+                challenger_refuted_audit_findings: [
+                  { severity: 'high', summary: 'false alarm', challenger_reason: 'fixed upstream' },
+                ],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByTestId('challenger-refuted-findings')).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 challenger false positive/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('high: false alarm — fixed upstream')).toBeInTheDocument();
+
+      // Excluded audit finding chip still renders separately
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
+    });
+
+    it('does not render challenger chips when challenger_refuted_audit_findings is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'high', summary: 'some finding' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBeInTheDocument();
     });
   });
 
@@ -2283,6 +2385,110 @@ describe('VersionLifecyclePanel', () => {
         expect(screen.getByText(/operator-attested/)).toBeInTheDocument();
       });
       promptSpy.mockRestore();
+    });
+  });
+
+  describe('ChallengedVsUnchallengedSummary', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders nothing when challenged_vs_unchallenged is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('challenged-vs-unchallenged')).not.toBeInTheDocument();
+    });
+
+    it('renders insufficient-sample state when both cohorts lack data', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: { sample_size: 1, insufficient_sample: true },
+              unchallenged: { sample_size: 2, insufficient_sample: true },
+              total_verdicts: 3,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('challenged-vs-unchallenged')).toBeInTheDocument();
+      expect(screen.getByText(/not enough data yet/)).toBeInTheDocument();
+    });
+
+    it('renders cohort stats with exclusion and disagreement rates', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 10,
+                insufficient_sample: false,
+                exclusion_rate: 0.3,
+                exclusion_count: 3,
+                disagreement_rate: 0.25,
+                disagreement_count: 2,
+                wrong_decision_rate: 0.1,
+                wrong_decision_resolved_sample: 10,
+              },
+              unchallenged: {
+                sample_size: 15,
+                insufficient_sample: false,
+                exclusion_rate: 0.2,
+                exclusion_count: 3,
+                wrong_decision_rate: 0.4,
+                wrong_decision_resolved_sample: 5,
+              },
+              total_verdicts: 25,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      expect(panel).toBeInTheDocument();
+      expect(panel).toHaveTextContent('25 verdicts');
+      expect(panel).toHaveTextContent('challenged (10)');
+      expect(panel).toHaveTextContent('excl 30%');
+      expect(panel).toHaveTextContent('disagree 25%');
+      expect(panel).toHaveTextContent('unchallenged (15)');
+      expect(panel).toHaveTextContent('excl 20%');
+    });
+
+    it('renders wrong_decision_rate as zero-rate emerald when no wrong decisions', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 5,
+                insufficient_sample: false,
+                exclusion_rate: 0.0,
+                disagreement_rate: 0.0,
+                wrong_decision_rate: 0.0,
+                wrong_decision_resolved_sample: 5,
+              },
+              unchallenged: { sample_size: 1, insufficient_sample: true },
+              total_verdicts: 6,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      expect(panel).toHaveTextContent('wrong 0%');
     });
   });
 });

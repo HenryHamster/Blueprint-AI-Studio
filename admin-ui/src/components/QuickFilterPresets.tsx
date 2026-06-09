@@ -27,7 +27,7 @@ interface QuickFilterPresetsProps {
 
 // Must stay length-aligned with STATUS_OPTIONS in ../constants — preset
 // active-state detection compares statusFilter.length === ALL_STATUSES.length.
-const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
+const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'PARKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
 
 export function QuickFilterPresets({
   statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, stuckCount1h, stuckMinSeconds, searchQuery,
@@ -40,6 +40,7 @@ export function QuickFilterPresets({
   const isStuckHour = stuckFilter && stuckMinSeconds === 3600 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
   const isNeedsReview = requiresApproval && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
   const isBlocked = blockedFilter && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && !requiresApproval && searchQuery === '';
+  const isParked = statusFilter.length === 1 && statusFilter[0] === 'PARKED' && dateRange === 'all' && !requiresApproval && !blockedFilter && !stuckFilter && searchQuery === '' && failureClassFilter.length === 0;
   const isStuck = stuckFilter && stuckMinSeconds === 0 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
 
   const clearAll = () => {
@@ -117,6 +118,23 @@ export function QuickFilterPresets({
         setRequiresApproval(false);
         setStuckFilter(false);
         setSearchQuery('');
+      },
+    },
+    {
+      label: 'Parked',
+      active: isParked,
+      danger: false,
+      apply: () => {
+        if (isParked) { clearAll(); return; }
+        setStatusFilter(['PARKED']);
+        setTaskTypeFilter([...filterIds]);
+        setDateRange('all');
+        setRequiresApproval(false);
+        setBlockedFilter(false);
+        setStuckFilter(false);
+        setStuckMinSeconds(0);
+        setSearchQuery('');
+        setFailureClassFilter?.([]);
       },
     },
     {

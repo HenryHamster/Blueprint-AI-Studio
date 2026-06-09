@@ -938,6 +938,17 @@ async def update_agent_status(
         if not check_task:
             raise HTTPException(status_code=404, detail="Task not found")
         if check_task.vm_instance_id != token.get("vm_instance_id"):
+            # park_task clears vm_instance_id when a task transitions to PARKED.
+            # A stale or duplicate agent callback arrives with the original token
+            # (carrying the pre-park vm_instance_id) but finds vm_instance_id=None
+            # in the DB. Return "parked" so the agent gets an accurate status
+            # instead of a misleading 404.
+            if check_task.status == TaskStatus.PARKED and check_task.vm_instance_id is None:
+                logger.info(
+                    f"[AGENT STATUS] Stale callback on PARKED task {check_task.id} "
+                    f"(vm_instance_id cleared by park); returning parked no-op"
+                )
+                return {"status": "parked", "task_id": str(check_task.id)}
             raise HTTPException(status_code=404, detail="Task not found for this VM")
         # Row exists but is locked. If the task is already terminal, the
         # in-flight lock holder is post-commit processing for a prior POST —
@@ -1121,6 +1132,7 @@ async def update_agent_status(
             if pr.deadline_seconds
             else None
         )
+        _park_vm_id = task.vm_instance_id  # capture before park_task clears it
         await park_task(
             session,
             task,
@@ -1138,7 +1150,7 @@ async def update_agent_status(
             "task_updated",
             {"task_id": str(task.id), "status": TaskStatus.PARKED},
         )
-        await _ensure_vm_deleted(task.vm_instance_id, reason="task_parked")
+        await _ensure_vm_deleted(_park_vm_id, reason="task_parked")
         logger.info(
             f"[AGENT STATUS] Task {task.id} PARKED on {pr.wake_source_kind} "
             f"(action={pr.wake_action}) — released slot/VM"

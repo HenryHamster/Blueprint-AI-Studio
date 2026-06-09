@@ -3069,9 +3069,38 @@ export async function main() {
       await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID);
       captureBootCredentialSnapshot();
     }
+    let firstRole = true;
     for (;;) {
       let claimResult: RunRoleOnceResult;
       try {
+        if (firstRole) {
+          firstRole = false;
+          // Re-materialize the current account's provider config (incl.
+          // ~/.claude.json for anthropic) from the boot snapshot before the FIRST
+          // handler runs. A warm/pool VM can lose the boot-materialized config
+          // between boot and its first claim; warm roles 2+ already re-materialize
+          // in continueWarmContinuation, but the first role relied on the boot file
+          // surviving — the gap behind the recurring vm_config_missing warm deaths
+          // (e.g. task 7b5c176d / VM cb152cca). Idempotent rewrite on a healthy VM;
+          // the self-heal on a poisoned one. If the config genuinely cannot be
+          // restored (snapshot itself lacks it) it raises vm_config_missing — report
+          // that synchronously so the orchestrator does a clean PROVISION_FAILURE
+          // requeue instead of waiting out a vm_unresponsive timeout. A missing boot
+          // snapshot is non-fatal here (an account without claude_config_json never
+          // promised the file); the existing per-claim guards still apply.
+          try {
+            materializeClaimCredentialState(undefined, 'first-role');
+          } catch (matErr) {
+            const cat = (matErr as { failureCategory?: unknown } | null)?.failureCategory;
+            if (cat === 'vm_config_missing') {
+              reportPreClaimFailure(
+                `vm_config_missing: ${matErr instanceof Error ? matErr.message : String(matErr)}`,
+              );
+              throw matErr;
+            }
+            log(`[first-role] credential re-materialize skipped: ${matErr instanceof Error ? matErr.message : String(matErr)}`);
+          }
+        }
         claimResult = await runRoleOnce({ reportPreClaimFailure });
       } catch (roleErr) {
         // GracefulShutdownSignal is a benign "task went terminal / reassigned"

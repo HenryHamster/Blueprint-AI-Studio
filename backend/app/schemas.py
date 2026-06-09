@@ -378,12 +378,20 @@ class ComputeJobResponse(BaseModel):
     result_reference: str | None = None
     artifact_id: uuid.UUID | None = None
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
+    compute_rpc_diagnostic: Dict[str, Any] | None = None
 
 
 def serialize_compute_job_response(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response payload."""
 
-    return ComputeJobResponse.model_validate(job).model_dump(mode="json")
+    data = ComputeJobResponse.model_validate(job).model_dump(mode="json")
+    if data.get("compute_rpc_diagnostic") is None:
+        diagnostic = (data.get("polling_metadata") or {}).get(
+            "compute_rpc_diagnostic"
+        )
+        if isinstance(diagnostic, dict):
+            data["compute_rpc_diagnostic"] = diagnostic
+    return data
 
 
 class SpawnTaskRequest(BaseModel):

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
+import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
@@ -19,6 +20,7 @@ import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messa
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
+import { StrategicChallengeChip } from './StrategicChallengeChip';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -26,6 +28,50 @@ const DEFAULT_VIEW_ID = '__default__';
 // messages that grow without bound, and blocking stale receipts from resurfacing after
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
+
+function getCompletionReceiptTone(status?: string | null): {
+  banner: string;
+  dot: string;
+  text: string;
+  message: string;
+  label: string;
+} {
+  const normalizedStatus = (status || 'completed').toLowerCase();
+  if (normalizedStatus === 'deferred') {
+    return {
+      banner: 'bg-amber-950/30',
+      dot: 'bg-amber-400',
+      text: 'text-amber-300',
+      message: 'text-amber-400/80',
+      label: 'Cycle deferred',
+    };
+  }
+  if (normalizedStatus === 'failed') {
+    return {
+      banner: 'bg-red-950/30',
+      dot: 'bg-red-400',
+      text: 'text-red-300',
+      message: 'text-red-400/80',
+      label: 'Cycle failed',
+    };
+  }
+  if (normalizedStatus === 'cancelled') {
+    return {
+      banner: 'bg-red-950/30',
+      dot: 'bg-red-400',
+      text: 'text-red-300',
+      message: 'text-red-400/80',
+      label: 'Cycle cancelled',
+    };
+  }
+  return {
+    banner: 'bg-emerald-950/30',
+    dot: 'bg-emerald-400',
+    text: 'text-emerald-300',
+    message: 'text-emerald-400/80',
+    label: 'Cycle complete',
+  };
+}
 
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
@@ -69,6 +115,10 @@ interface MessagesPanelProps {
   notifyOnHighSignalMessage?: boolean;
   /** Live signal: whether a strategic cycle is currently running for this project. */
   strategistActive?: boolean;
+  /** Phase-level detail about the currently running cycle, if any. */
+  cycleProgress?: StrategicCycleProgress | null;
+  /** Outcome receipt from the most recently completed cycle, shown until the next cycle begins. */
+  lastCycleCompletion?: StrategicCycleCompletion | null;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -142,7 +192,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive, cycleProgress, lastCycleCompletion }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -212,6 +262,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // operator steering arms a cycle, cleared backend-side once the autonomous loop
   // consumes it. Drives the "strategic cycle pending" badge until then.
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
+  const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
@@ -1157,12 +1208,64 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       )}
 
       {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
-          WS events, mirroring the DirectionsPanel affordance. Gives the operator
-          at-a-glance context that a steer composed now will queue for the next cycle. */}
+          WS events. Shows phase label and steering excerpt when the enriched event payload
+          is available, otherwise falls back to the minimal "working" text. */}
       {strategistActive && (
-        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
-          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" aria-hidden="true" />
-          <span className="text-xs text-indigo-300 font-medium">Strategist working…</span>
+        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
+          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
+          <span className="text-xs text-indigo-300 font-medium min-w-0">
+            {cycleProgress?.phase_label ? `Strategist: ${cycleProgress.phase_label}…` : 'Strategist working…'}
+            {cycleProgress?.steering_excerpt && (
+              <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
+                "{cycleProgress.steering_excerpt.slice(0, 100)}{cycleProgress.steering_excerpt.length > 100 ? '…' : ''}"
+              </span>
+            )}
+          </span>
+        </div>
+      )}
+
+      {/* Cycle completion receipt — shown after a cycle finishes until the next one begins.
+          Summarises what changed: direction counts, running-update, problem-model. */}
+      {lastCycleCompletion && !strategistActive && (
+        <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
+          <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
+          <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>
+            <span className="font-medium">
+              {completionReceiptTone?.label ?? 'Cycle complete'}
+            </span>
+            {lastCycleCompletion.failure_reason && (
+              <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
+            )}
+            {(lastCycleCompletion.created_count ?? 0) > 0 && (
+              <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
+            )}
+            {(lastCycleCompletion.retired_count ?? 0) > 0 && (
+              <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
+            )}
+            {(lastCycleCompletion.staged_count ?? 0) > 0 && (
+              <span className="ml-1.5">· {lastCycleCompletion.staged_count} direction{lastCycleCompletion.staged_count !== 1 ? 's' : ''} staged</span>
+            )}
+            {(lastCycleCompletion.updated_count ?? 0) > 0 && (
+              <span className="ml-1.5">· {lastCycleCompletion.updated_count} updated</span>
+            )}
+            {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+              <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
+            )}
+            {lastCycleCompletion.running_update_changed && (
+              <span className="ml-1.5">· running update written</span>
+            )}
+            {lastCycleCompletion.problem_model_changed && (
+              <span className="ml-1.5">· problem model updated</span>
+            )}
+            {lastCycleCompletion.status_message && (
+              <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'} italic`}>{lastCycleCompletion.status_message.slice(0, 80)}</span>
+            )}
+            {lastCycleCompletion.strategic_judgment_challenge && (
+              <span className="ml-1.5 align-middle">
+                <StrategicChallengeChip summary={lastCycleCompletion.strategic_judgment_challenge} />
+              </span>
+            )}
+          </span>
         </div>
       )}
 

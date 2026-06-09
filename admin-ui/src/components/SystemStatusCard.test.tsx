@@ -87,4 +87,29 @@ describe('SystemStatusCard', () => {
     expect(screen.queryByLabelText('Review/fix convergence verdict')).not.toBeInTheDocument();
     expect(screen.getByText('Pipeline is healthy. Two directions advanced.')).toBeInTheDocument();
   });
+
+  it('renders the strategic challenge chip on the latest-cycle line when present', () => {
+    const base = createMockDigest().latest_cycle ?? { started_at: new Date().toISOString() };
+    const digest = createMockDigest({
+      latest_cycle: {
+        ...base,
+        strategic_judgment_challenge: {
+          mode: 'blocked',
+          verdict: 'blocked',
+          warned_count: 0,
+          blocked_count: 2,
+        },
+      },
+    });
+    render(<SystemStatusCard digest={digest} loading={false} />);
+    const chip = screen.getByLabelText(/strategic judgment challenge/i);
+    expect(chip).toHaveTextContent('challenge: blocked · blocked');
+    expect(chip).toHaveTextContent('2 blocked');
+  });
+
+  it('renders no challenge chip when the latest cycle carries no summary', () => {
+    const digest = createMockDigest();
+    render(<SystemStatusCard digest={digest} loading={false} />);
+    expect(screen.queryByLabelText(/strategic judgment challenge/i)).not.toBeInTheDocument();
+  });
 });

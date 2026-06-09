@@ -91,41 +91,76 @@ export function resetLlmTelemetry(): void {
  *  reasons plus `malformed_json` for a thrown JsonExtractionError. */
 export type FormatMissReason = JsonExtractionMissReason | 'malformed_json';
 
+/** Bounded vocabulary for the output-schema dimension of format-compliance
+ *  telemetry. Keeping this a literal union prevents unbounded telemetry keys
+ *  from leaking in via task-prompt text. */
+export type SchemaLabel =
+  | 'memo'
+  | 'audit'
+  | 'audit_challenge'
+  | 'design'
+  | 'research_plan'
+  | 'web_research'
+  | 'specialized_findings'
+  | 'specialized_result'
+  | 'thinker'
+  | 'review_verdict'
+  | 'unknown';
+
 let _formatMissByReason: Record<string, number> = {};
 let _formatErrorTotal = 0;
 let _formatRepairAttempts = 0;
 let _formatRepairSuccesses = 0;
+let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {};
+let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {};
+let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {};
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
- *  reason class. Bumps the per-reason count and the format-error total. */
-export function recordFormatMiss(reason: FormatMissReason): void {
+ *  reason class and, when provided, by the bounded schema label. Bumps the
+ *  per-reason count and the format-error total. */
+export function recordFormatMiss(reason: FormatMissReason, schemaLabel?: SchemaLabel): void {
   _formatMissByReason[reason] = (_formatMissByReason[reason] ?? 0) + 1;
   _formatErrorTotal += 1;
+  if (schemaLabel !== undefined) {
+    _formatMissBySchema[schemaLabel] = (_formatMissBySchema[schemaLabel] ?? 0) + 1;
+  }
 }
 
 /** Record that a handler attempted a self-repair re-ask after a format miss. */
-export function recordFormatRepairAttempt(): void {
+export function recordFormatRepairAttempt(schemaLabel?: SchemaLabel): void {
   _formatRepairAttempts += 1;
+  if (schemaLabel !== undefined) {
+    _formatRepairAttemptsBySchema[schemaLabel] = (_formatRepairAttemptsBySchema[schemaLabel] ?? 0) + 1;
+  }
 }
 
 /** Record that a self-repair re-ask then produced a parseable final output. */
-export function recordFormatRepairSuccess(): void {
+export function recordFormatRepairSuccess(schemaLabel?: SchemaLabel): void {
   _formatRepairSuccesses += 1;
+  if (schemaLabel !== undefined) {
+    _formatRepairSuccessesBySchema[schemaLabel] = (_formatRepairSuccessesBySchema[schemaLabel] ?? 0) + 1;
+  }
 }
 
 /** Snapshot the cumulative format-compliance telemetry for heartbeat / status
- *  posts. Returns a plain dict (fresh copy of the per-reason map). */
+ *  posts. Returns a plain dict (fresh copies of all per-reason and per-schema maps). */
 export function getFormatComplianceTelemetry(): {
   format_miss_by_reason: Record<string, number>;
   format_error_total: number;
   format_repair_attempts: number;
   format_repair_successes: number;
+  format_miss_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_attempts_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_successes_by_schema: Partial<Record<SchemaLabel, number>>;
 } {
   return {
     format_miss_by_reason: { ..._formatMissByReason },
     format_error_total: _formatErrorTotal,
     format_repair_attempts: _formatRepairAttempts,
     format_repair_successes: _formatRepairSuccesses,
+    format_miss_by_schema: { ..._formatMissBySchema },
+    format_repair_attempts_by_schema: { ..._formatRepairAttemptsBySchema },
+    format_repair_successes_by_schema: { ..._formatRepairSuccessesBySchema },
   };
 }
 
@@ -135,6 +170,9 @@ export function resetFormatComplianceTelemetry(): void {
   _formatErrorTotal = 0;
   _formatRepairAttempts = 0;
   _formatRepairSuccesses = 0;
+  _formatMissBySchema = {};
+  _formatRepairAttemptsBySchema = {};
+  _formatRepairSuccessesBySchema = {};
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).

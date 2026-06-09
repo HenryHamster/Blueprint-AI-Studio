@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -10,7 +10,13 @@ import {
   PLAN_FETCH_VERBS,
   DESIGN_DOC_FETCH_VERBS,
   STRATEGIC_FETCH_VERBS,
+  parseStrategicChallengeRecord,
+  buildStrategicChallengePrompt,
+  buildStrategicChallengeExecutorSection,
+  runStrategicChallenge,
+  STRATEGIC_CHALLENGE_VERSION,
 } from './strategic-helpers.js';
+import { VmConfigMissingError } from '../providers/runners.js';
 
 // Use the OS temp dir (not a hardcoded /tmp) so this suite runs on Windows too.
 const testWorkspace = path.join(os.tmpdir(), 'test-strategic-helpers-workspace');
@@ -423,5 +429,213 @@ describe('buildFetchGuidance', () => {
 
   it('returns empty string when no verbs are granted', () => {
     expect(buildFetchGuidance([])).toBe('');
+  });
+});
+
+describe('parseStrategicChallengeRecord', () => {
+  it('parses a well-formed ok record and normalizes evidence verdicts', () => {
+    const raw = `Here is my verdict:
+{
+  "status": "ok",
+  "evidence_progress": [
+    {"direction_id": "d-1", "status": "advancing", "verdict": "approved", "rationale": "concrete CI evidence"},
+    {"direction_id": "d-2", "status": "met", "verdict": "rejected", "rationale": "no proof"}
+  ],
+  "retirement_critique_quality": {"verdict": "solid", "rationale": "names the pattern"},
+  "portfolio_shape_risk": {"verdict": "elevated", "rationale": "concentrated in release"}
+}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('ok');
+    expect(rec.challenge_version).toBe(STRATEGIC_CHALLENGE_VERSION);
+    expect(rec.evidence_progress).toHaveLength(2);
+    expect(rec.evidence_progress[0]).toEqual({
+      direction_id: 'd-1', status: 'advancing', verdict: 'approved', rationale: 'concrete CI evidence',
+    });
+    expect(rec.portfolio_shape_risk.verdict).toBe('elevated');
+    expect(rec.retirement_critique_quality.verdict).toBe('solid');
+  });
+
+  it('fails closed: unknown/absent verdict on an evidence entry becomes "rejected"', () => {
+    const raw = `{"status":"ok","evidence_progress":[
+      {"direction_id":"d-3","status":"advancing","rationale":"maybe"},
+      {"direction_id":"d-4","status":"met","verdict":"maybe-ish"}
+    ],"retirement_critique_quality":{},"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.evidence_progress.map(e => e.verdict)).toEqual(['rejected', 'rejected']);
+  });
+
+  it('drops evidence entries with no direction_id or an invalid status', () => {
+    const raw = `{"status":"ok","evidence_progress":[
+      {"status":"advancing","verdict":"approved"},
+      {"direction_id":"d-5","status":"bogus","verdict":"approved"},
+      {"direction_id":"d-6","status":"stalled","verdict":"rejected","rationale":"ok"}
+    ],"retirement_critique_quality":{},"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.evidence_progress).toHaveLength(1);
+    expect(rec.evidence_progress[0].direction_id).toBe('d-6');
+  });
+
+  it('a self-declared blocked record approves nothing even if it carried verdicts', () => {
+    const raw = `{"status":"blocked","evidence_progress":[
+      {"direction_id":"d-7","status":"advancing","verdict":"approved"}
+    ],"retirement_critique_quality":{},"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('blocked');
+    expect(rec.evidence_progress).toEqual([]);
+  });
+
+  it('returns an invalid record (no approvals) when output is not parseable JSON', () => {
+    const rec = parseStrategicChallengeRecord('the challenger refused to answer');
+    expect(rec.status).toBe('invalid');
+    expect(rec.evidence_progress).toEqual([]);
+    expect(rec.notes).toContain('not parseable');
+  });
+
+  it('fails closed: missing status is NOT treated as ok — evidence_progress is dropped', () => {
+    // A response with no status field must not default to 'ok' and allow evidence through.
+    const raw = `{"evidence_progress":[
+      {"direction_id":"d-1","status":"advancing","verdict":"approved","rationale":"r"}
+    ],"retirement_critique_quality":{"verdict":"solid"},"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('blocked');
+    expect(rec.evidence_progress).toEqual([]);
+  });
+
+  it('fails closed: unknown status value is NOT treated as ok — evidence_progress is dropped', () => {
+    // An unrecognized status like 'error' or 'invalid' must not silently become 'ok'.
+    const raw = `{"status":"error","evidence_progress":[
+      {"direction_id":"d-2","status":"advancing","verdict":"approved","rationale":"r"}
+    ],"retirement_critique_quality":{"verdict":"solid"},"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('blocked');
+    expect(rec.evidence_progress).toEqual([]);
+  });
+
+  it('fails closed: missing retirement_critique_quality returns invalid record', () => {
+    // A missing required section means the challenge cannot be trusted — fail closed.
+    const raw = `{"status":"ok","evidence_progress":[
+      {"direction_id":"d-3","status":"advancing","verdict":"approved","rationale":"r"}
+    ],"portfolio_shape_risk":{"verdict":"low"}}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('invalid');
+    expect(rec.evidence_progress).toEqual([]);
+    expect(rec.notes).toContain('retirement_critique_quality');
+  });
+
+  it('fails closed: non-object portfolio_shape_risk returns invalid record', () => {
+    // A present-but-non-object portfolio_shape_risk must NOT be treated as clean —
+    // coerceVerdictBlock would map it to {verdict:'unspecified'} which the backend
+    // treats as clean, so we must reject it before it reaches that path.
+    const raw = `{"status":"ok","evidence_progress":[
+      {"direction_id":"d-3","status":"advancing","verdict":"approved","rationale":"r"}
+    ],"retirement_critique_quality":{"verdict":"solid"},"portfolio_shape_risk":"high"}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('invalid');
+    expect(rec.evidence_progress).toEqual([]);
+    expect(rec.notes).toContain('portfolio_shape_risk');
+  });
+});
+
+describe('buildStrategicChallengeExecutorSection', () => {
+  const base = {
+    challenge_version: 1,
+    retirement_critique_quality: { verdict: 'solid', rationale: '' },
+    portfolio_shape_risk: { verdict: 'low', rationale: '' },
+  };
+
+  it('lists only challenge-approved advancing/met pairs as the gate', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'ok',
+      evidence_progress: [
+        { direction_id: 'd-1', status: 'advancing', verdict: 'approved', rationale: '' },
+        { direction_id: 'd-2', status: 'met', verdict: 'rejected', rationale: '' },
+        { direction_id: 'd-3', status: 'stalled', verdict: 'approved', rationale: '' },
+      ],
+    });
+    expect(section).toContain('d-1 → advancing');
+    // Rejected (d-2) and stalled (d-3) are not gated approvals — they may appear
+    // verbatim in the embedded record JSON, but never as an approved "→" pair.
+    expect(section).not.toContain('d-2 → met');
+    expect(section).not.toContain('d-3 → stalled');
+    expect(section).toContain('Evidence-progress gate (REQUIRED');
+  });
+
+  it('a blocked record approves nothing and says so', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'blocked',
+      evidence_progress: [],
+    });
+    expect(section).toContain('approving NOTHING');
+    expect(section).toContain('(none —');
+  });
+});
+
+describe('runStrategicChallenge', () => {
+  const baseOpts = {
+    analysisText: 'analysis',
+    dirSummaryText: 'dirs',
+    pastRetirementCritiquesSection: '',
+    portfolioCompositionText: 'portfolio',
+    ws: null,
+    statusRef: { value: '' },
+    disallowedTools: [] as string[],
+    sendLog: vi.fn(),
+  };
+
+  it('returns a parsed ok record when the challenge pass exits 0 with valid JSON', async () => {
+    const runClaudeCode = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"status":"ok","evidence_progress":[{"direction_id":"d-1","status":"advancing","verdict":"approved"}],"retirement_critique_quality":{"verdict":"solid"},"portfolio_shape_risk":{"verdict":"low"}}',
+    });
+    const rec = await runStrategicChallenge({ ...baseOpts, runClaudeCode });
+    expect(rec.status).toBe('ok');
+    expect(rec.evidence_progress).toHaveLength(1);
+    // The prompt the challenger received carries the thinker analysis verbatim.
+    expect(String(runClaudeCode.mock.calls[0][0])).toContain('analysis');
+  });
+
+  it('records a blocked record (no approvals) when the pass exits non-zero', async () => {
+    const runClaudeCode = vi.fn().mockResolvedValue({ exitCode: 1, allOutput: 'boom', lastResultText: '' });
+    const rec = await runStrategicChallenge({ ...baseOpts, runClaudeCode });
+    expect(rec.status).toBe('blocked');
+    expect(rec.evidence_progress).toEqual([]);
+  });
+
+  it('records a blocked record when the runner throws a generic error', async () => {
+    const runClaudeCode = vi.fn().mockRejectedValue(new Error('network down'));
+    const rec = await runStrategicChallenge({ ...baseOpts, runClaudeCode });
+    expect(rec.status).toBe('blocked');
+  });
+
+  it('propagates a VmConfigMissingError instead of swallowing it as blocked', async () => {
+    const runClaudeCode = vi.fn().mockRejectedValue(new VmConfigMissingError('provider config missing'));
+    await expect(runStrategicChallenge({ ...baseOpts, runClaudeCode })).rejects.toBeInstanceOf(
+      VmConfigMissingError,
+    );
+  });
+
+  it('records an invalid record when the pass exits 0 but output is unparseable', async () => {
+    const runClaudeCode = vi.fn().mockResolvedValue({ exitCode: 0, allOutput: 'no json here', lastResultText: 'nope' });
+    const rec = await runStrategicChallenge({ ...baseOpts, runClaudeCode });
+    expect(rec.status).toBe('invalid');
+    expect(rec.evidence_progress).toEqual([]);
+  });
+});
+
+describe('buildStrategicChallengePrompt', () => {
+  it('embeds the analysis and demands a strict JSON verdict object', () => {
+    const prompt = buildStrategicChallengePrompt({
+      analysisText: 'THINKER_SAID_THIS',
+      dirSummaryText: 'D-LIST',
+      pastRetirementCritiquesSection: 'CRITIQUES',
+      portfolioCompositionText: 'PORTFOLIO',
+    });
+    expect(prompt).toContain('THINKER_SAID_THIS');
+    expect(prompt).toContain('D-LIST');
+    expect(prompt).toContain('portfolio_shape_risk');
+    expect(prompt).toContain('Output ONLY a single JSON object');
   });
 });

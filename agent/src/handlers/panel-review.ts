@@ -186,6 +186,11 @@ function synthesizePanelReviewVerdict(
   };
 }
 
+type ChallengeContext = {
+  primaryVerdict: string;
+  primaryIssues: unknown[];
+};
+
 type PanelReviewLensBodyArgs = {
   lens: (typeof PANEL_REVIEW_LENSES)[number];
   taskId: string;
@@ -201,7 +206,28 @@ type PanelReviewLensBodyArgs = {
   // Read-only ./fetch guidance block (or '' when project_id is absent). Gated so
   // a prompt never advertises a helper that wasn't written into the workspace.
   fetchGuidance: string;
+  // When present, this panel_review is acting as an independent challenger for
+  // a primary verdict. Absent → standalone advisory workflow (backward compatible).
+  challengeContext?: ChallengeContext;
 };
+
+function formatPrimaryIssues(issues: unknown[]): string {
+  if (issues.length === 0) return '(none)';
+  return issues.map((issue, i) => {
+    if (issue && typeof issue === 'object') {
+      const iss = issue as Record<string, unknown>;
+      const parts: string[] = [`${i + 1}.`];
+      const severity = typeof iss.severity === 'string' ? iss.severity : '';
+      if (severity) parts.push(`[${severity}]`);
+      const file = typeof iss.file === 'string' ? iss.file : '';
+      if (file) parts.push(`[${file}${typeof iss.line === 'number' ? `:${iss.line}` : ''}]`);
+      const description = typeof iss.description === 'string' ? iss.description : '';
+      if (description) parts.push(description);
+      return parts.join(' ');
+    }
+    return `${i + 1}. (non-object issue)`;
+  }).join('\n');
+}
 
 /**
  * The per-lens review instructions, independent of any prompt prefix. Shared by
@@ -225,8 +251,12 @@ function buildPanelReviewLensBody(args: PanelReviewLensBodyArgs): string {
     prBody,
     buildConfig,
     fetchGuidance,
+    challengeContext,
   } = args;
   const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
+  const challengeSection = challengeContext
+    ? `\n## Challenge Mode: Second-Opinion Pass\n\nThis \`panel_review\` task is acting as an **INDEPENDENT CHALLENGER** for a primary review verdict. You are a second opinion — not a blank-slate review.\n\n**Primary verdict: ${challengeContext.primaryVerdict}**\n\n**Primary issues (${challengeContext.primaryIssues.length} total) — evaluate those within your \`${lens.id}\` lens scope:**\n${formatPrimaryIssues(challengeContext.primaryIssues)}\n\nFor each primary issue that falls within your lens scope:\n- State **CONFIRM** if you independently investigated and found the same or an equivalent defect.\n- State **DISPUTE** if you investigated and found the issue is factually incorrect, mislocated, or not present in the diff.\n\nAlso report any NEW issues you found within your lens scope that the primary reviewer missed.\nEmbed CONFIRM/DISPUTE notes (e.g. "CONFIRM: ...") in the relevant \`description\` fields of your output.\n\n`
+    : '';
   return `${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 This is ONE independent pass of the fixed \`panel_review\` multi-agent workflow.
@@ -235,7 +265,7 @@ SEPARATE agent passes — do NOT review outside your lens, and do NOT try to pro
 an overall panel verdict. Judge this PR solely through your lens.
 
 Your lens focus: ${lens.focus}
-
+${challengeSection}
 ${originalPrompt ? `Original task prompt: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
@@ -460,6 +490,24 @@ export async function handlePanelReview(
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);
 
+  // Detect challenge mode: the backend sets is_challenge === true and passes
+  // primary_verdict + primary_issues when this panel_review is acting as a
+  // second-opinion challenger for a primary verdict. Absent → standalone
+  // advisory workflow (backward compatible; no change to existing behavior).
+  const isChallenge = payload.is_challenge === true;
+  const challengeContext: ChallengeContext | undefined = isChallenge
+    ? {
+        primaryVerdict: strVal(
+          (payload.primary_verdict !== undefined ? payload.primary_verdict : taskContext?.primary_verdict) as string | undefined,
+        ),
+        primaryIssues: Array.isArray(payload.primary_issues)
+          ? payload.primary_issues
+          : Array.isArray(taskContext?.primary_issues)
+            ? taskContext.primary_issues as unknown[]
+            : [],
+      }
+    : undefined;
+
   // Per-lens review brief, shared by both execution paths. Bounded to exactly
   // the four declared lenses (no unbounded recursion, no per-lens sub-fan-out).
   const lensArgs: PanelReviewLensBodyArgs[] = PANEL_REVIEW_LENSES.map(lens => ({
@@ -475,6 +523,7 @@ export async function handlePanelReview(
     prBody,
     buildConfig,
     fetchGuidance: panelFetchGuidance,
+    challengeContext,
   }));
   const projectContextSection = projectContext ? `${projectContext}\n\n` : '';
 

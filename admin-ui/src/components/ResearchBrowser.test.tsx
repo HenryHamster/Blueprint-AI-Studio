@@ -365,6 +365,124 @@ describe('ResearchBrowser research quality card', () => {
   });
 });
 
+describe('ResearchBrowser spawn-gate provenance', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('shows challenged-pass badge for a finding with an explicit challenger pass', () => {
+    const impl = makeImplementationTask({
+      context: {
+        research_task_id: 'research-1',
+        finding_index: 0,
+        research_spawn_gate_challenged: true,
+        research_spawn_gate_verdict: 'pass' as const,
+        research_spawn_gate_explicit: true,
+        research_spawn_gate_reason: 'Challenger confirmed actionability',
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Gate Finding' })]), impl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByTitle(/Challenger confirmed actionability/);
+    expect(badge).toBeInTheDocument();
+    expect(badge.textContent).toBe('gate ✓');
+    expect(badge.className).toContain('emerald');
+  });
+
+  it('shows fail-open badge with amber styling for a fail-open pass', () => {
+    const impl = makeImplementationTask({
+      context: {
+        research_task_id: 'research-1',
+        finding_index: 0,
+        research_spawn_gate_challenged: true,
+        research_spawn_gate_verdict: 'pass' as const,
+        research_spawn_gate_explicit: false,
+        research_spawn_gate_reason: 'fail-open: no verdict returned for this finding',
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Fail-Open Finding' })]), impl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByText('fail-open');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toContain('amber');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('no verdict returned'));
+  });
+
+  it('shows refuted badge for a finding deferred by the adversarial gate on the parent task', () => {
+    const researchTask = {
+      ...makeResearchTask([makeFinding({ title: 'Refuted Finding' })]),
+      context: {
+        deferred_findings: [{
+          title: 'Refuted Finding',
+          deferred_reason: 'adversarial_gate',
+          adversarial_gate_reason: 'Finding lacks reproduce-on-HEAD evidence',
+        }],
+      },
+    };
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByText('refuted');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toContain('red');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('reproduce-on-HEAD'));
+  });
+
+  it('does not show a gate badge for an unchallenged finding (no gate context)', () => {
+    const impl = makeImplementationTask({
+      context: {
+        research_task_id: 'research-1',
+        finding_index: 0,
+        // no research_spawn_gate_challenged key
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Unchallenged Finding' })]), impl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByText('gate ✓')).not.toBeInTheDocument();
+    expect(screen.queryByText('fail-open')).not.toBeInTheDocument();
+    expect(screen.queryByText('refuted')).not.toBeInTheDocument();
+  });
+
+  it('does not show refuted badge for a finding deferred for a non-gate reason', () => {
+    const researchTask = {
+      ...makeResearchTask([makeFinding({ title: 'Low Actionability Finding' })]),
+      context: {
+        deferred_findings: [{
+          title: 'Low Actionability Finding',
+          deferred_reason: 'low_actionability',
+          adversarial_gate_reason: null,
+        }],
+      },
+    };
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    // Only adversarial_gate deferrals show the refuted badge
+    expect(screen.queryByText('refuted')).not.toBeInTheDocument();
+  });
+});
+
 describe('ResearchBrowser researchFeed prop', () => {
   it('uses researchFeed findings instead of tasks prop when provided', () => {
     const taskFinding = makeFinding({ title: 'From tasks prop' });

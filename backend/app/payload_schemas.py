@@ -497,6 +497,23 @@ class ReleaseAuditPayload(_SystemPopulated):
     prompt: str | None = None
 
 
+class ReleaseAuditChallengePayload(_SystemPopulated):
+    """Payload for the binding release-audit challenger pass.
+
+    Like :class:`ReleaseAuditPayload` the task scores ONE pinned candidate
+    commit (``candidate_sha``) against ``base_branch``. It may additionally
+    receive primary findings to re-judge when the caller already has them.
+    Fields remain optional here because BasePayload is extra-field tolerant
+    (``extra='allow'``) and the agent handler fails loud at runtime when the
+    candidate SHA is missing/invalid — the schema does not need to re-enforce it.
+    """
+
+    diff_range: str | None = None
+    prompt: str | None = None
+    candidate_sha: str | None = None
+    primary_audit_report: dict | None = None
+
+
 class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
@@ -641,7 +658,7 @@ def parse_acceptance_evidence(raw: Any) -> dict | None:
     return result
 
 
-class ComputeExperimentPayload(_SystemPopulated):
+class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     """Reference compute-heavy task (benchmark/evaluation style).
 
     The agent forwards the launch fields below to ``POST /api/agent/compute-jobs``
@@ -665,6 +682,11 @@ class ComputeExperimentPayload(_SystemPopulated):
     env: dict[str, str] | None = None
     backend_name: str | None = None
     provisioning_model: str | None = None
+    # Optional live-release proof marker. When present/truthy, compute-job launch
+    # is held until the latest promoted release has aggregate required deploy
+    # artifacts serving_confirmed; ordinary compute omits this and is unchanged.
+    live_proof: bool | str | dict[str, Any] | None = None
+    live_proof_marker: str | None = None
     # Optional single-GPU accelerator (canonical short name "T4"/"L4"/"V100").
     # Absent ⇒ a CPU job, unchanged. When set it must be paired with a matching
     # GPU machine_type; the backend rejects A100/over-quota and mismatches loudly.
@@ -673,6 +695,7 @@ class ComputeExperimentPayload(_SystemPopulated):
     # artifact so operators can correlate a job with the experiment that ran it.
     experiment: str | None = None
     benchmark: str | None = None
+    hypothesis: str | None = None
     metric: str | None = None
     # Optional goal-level acceptance criterion. When declared, the metric gate
     # checks the reported result against it at completion (a compute artifact
@@ -742,6 +765,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
+    TaskType.release_audit_challenge: ReleaseAuditChallengePayload,
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
     TaskType.compute_experiment: ComputeExperimentPayload,
@@ -1093,12 +1117,15 @@ def pack_under_budget(
             continue
         included = False
         candidate = floors.get(key)
-        if candidate is not None and candidate.get("source") == "summarized":
-            if candidate["size"] <= remaining:
-                packed[key] = candidate["value"]
-                used += candidate["size"]
-                trimmed.append(candidate["meta"])
-                included = True
+        if (
+            candidate is not None
+            and candidate.get("source") == "summarized"
+            and candidate["size"] <= remaining
+        ):
+            packed[key] = candidate["value"]
+            used += candidate["size"]
+            trimmed.append(candidate["meta"])
+            included = True
         if not included:
             summarized = _compute_summarized_candidate(p)
             if summarized is not None and summarized["size"] <= remaining:

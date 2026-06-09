@@ -1,6 +1,9 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes, Cpu } from 'lucide-react';
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
+import type { ComputeExperimentForm } from '../hooks/useTaskModal';
+import { COMPUTE_EXPERIMENT_TASK_TYPE } from '../hooks/useTaskModal';
+import type { ComputeSuccessOperator } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -11,7 +14,10 @@ const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   panel_review: CheckSquare,
   fix: AlertCircle,
   migrate: ArrowUpDown,
+  compute_experiment: Cpu,
 };
+
+const SUCCESS_OPERATORS: ComputeSuccessOperator[] = ['>=', '<=', '>', '<', '==', '!='];
 
 // Fallback icon for backend-registered launchable types that have no bespoke
 // frontend icon — keeps a dynamically-registered type renderable with no edit.
@@ -36,6 +42,8 @@ interface NewTaskModalProps {
   newTaskEffort: string;
   setNewTaskModel: (value: string) => void;
   setNewTaskEffort: (value: string) => void;
+  computeExperiment: ComputeExperimentForm;
+  setComputeExperiment: React.Dispatch<React.SetStateAction<ComputeExperimentForm>>;
   getDefaultModelForType: (taskType: string) => string;
   getDefaultEffortForType: (taskType: string) => string;
   repoOptions: Array<{ full_name: string; default_branch: string }>;
@@ -78,6 +86,8 @@ export function NewTaskModal({
   newTaskEffort,
   setNewTaskModel,
   setNewTaskEffort,
+  computeExperiment,
+  setComputeExperiment,
   getDefaultModelForType,
   getDefaultEffortForType,
   repoOptions,
@@ -114,6 +124,20 @@ export function NewTaskModal({
 
   const isPrNumberValid = (value: string) => /^[1-9]\d*$/.test(value);
 
+  const isComputeExperiment = newTaskType === COMPUTE_EXPERIMENT_TASK_TYPE;
+  const updateCompute = (field: keyof ComputeExperimentForm, value: string) =>
+    // The cast is safe: every text field holds a string, and `successOperator`
+    // is only ever set from the operator <select> whose options are the closed
+    // ComputeSuccessOperator set.
+    setComputeExperiment(f => ({ ...f, [field]: value }) as ComputeExperimentForm);
+  // Client-side mirror of the backend launch-contract rules (non-empty command,
+  // positive spend cap + deadline). Surfaced inline once a submit is attempted.
+  const computeCommandInvalid = !computeExperiment.command.trim();
+  const computeSpendCap = Number(computeExperiment.spendCapUsd);
+  const computeSpendInvalid = !(Number.isFinite(computeSpendCap) && computeSpendCap > 0);
+  const computeDeadline = Number(computeExperiment.deadlineSeconds);
+  const computeDeadlineInvalid = !(Number.isInteger(computeDeadline) && computeDeadline > 0);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitAttempted(true);
@@ -122,6 +146,10 @@ export function NewTaskModal({
     if ((newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
       setPrNumberError(true);
       prNumberRef.current?.focus();
+      return;
+    }
+    if (isComputeExperiment && (computeCommandInvalid || computeSpendInvalid || computeDeadlineInvalid)) {
+      // Inline errors render via submitAttempted; don't round-trip a doomed launch.
       return;
     }
     setSubmitting(true);
@@ -284,13 +312,146 @@ export function NewTaskModal({
               </div>
             </div>
           </div>
+          {isComputeExperiment && (
+            <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+              <div className="flex items-center gap-1.5 mb-3 text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                <Cpu className="w-3.5 h-3.5 text-neutral-500" />
+                Compute Experiment Contract
+              </div>
+              <div className="mb-3">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
+                <textarea
+                  value={computeExperiment.command}
+                  onChange={e => updateCompute('command', e.target.value)}
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                  placeholder="python train.py --epochs 3"
+                />
+                {submitAttempted && computeCommandInvalid && <p className="text-[10px] text-red-500 mt-1">Command is required.</p>}
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Accelerator <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <select
+                    value={computeExperiment.accelerator}
+                    onChange={e => updateCompute('accelerator', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  >
+                    <option value="">CPU (none)</option>
+                    <option value="T4">T4</option>
+                    <option value="L4">L4</option>
+                    <option value="V100">V100</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.machineType}
+                    onChange={e => updateCompute('machineType', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="n1-standard-4"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Spend Cap (USD)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={computeExperiment.spendCapUsd}
+                    onChange={e => updateCompute('spendCapUsd', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeSpendInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="e.g., 5.00"
+                  />
+                  {submitAttempted && computeSpendInvalid && <p className="text-[10px] text-red-500 mt-1">Spend cap must be positive.</p>}
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Deadline (seconds)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={computeExperiment.deadlineSeconds}
+                    onChange={e => updateCompute('deadlineSeconds', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeDeadlineInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="e.g., 1800"
+                  />
+                  {submitAttempted && computeDeadlineInvalid && <p className="text-[10px] text-red-500 mt-1">Deadline must be a positive integer.</p>}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Experiment <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.experiment}
+                    onChange={e => updateCompute('experiment', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="e.g., lora-sweep"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Benchmark <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.benchmark}
+                    onChange={e => updateCompute('benchmark', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="e.g., mmlu"
+                  />
+                </div>
+              </div>
+              <div className="mb-3">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Hypothesis <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <input
+                  type="text"
+                  value={computeExperiment.hypothesis}
+                  onChange={e => updateCompute('hypothesis', e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  placeholder="What measurable outcome do you expect?"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Success Criterion <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <div className="grid grid-cols-[1fr_auto_1fr] gap-2 items-center">
+                  <input
+                    type="text"
+                    value={computeExperiment.successMetric}
+                    onChange={e => updateCompute('successMetric', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="metric (e.g., accuracy)"
+                  />
+                  <select
+                    value={computeExperiment.successOperator}
+                    onChange={e => updateCompute('successOperator', e.target.value)}
+                    className="bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  >
+                    {SUCCESS_OPERATORS.map(op => (
+                      <option key={op} value={op}>{op}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    step="any"
+                    value={computeExperiment.successThreshold}
+                    onChange={e => updateCompute('successThreshold', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="threshold"
+                  />
+                </div>
+                <p className="text-[10px] text-neutral-600 mt-1">Leave blank to launch without a machine-checkable goal.</p>
+              </div>
+            </div>
+          )}
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
               Task Title{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional)</span>}
             </label>
             <input
               type="text"
-              required={newTaskType !== 'panel_review'}
+              required={newTaskType !== 'panel_review' && !isComputeExperiment}
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
@@ -304,7 +465,7 @@ export function NewTaskModal({
             </label>
             <div className="relative">
               <textarea
-                required={newTaskType !== 'panel_review'}
+                required={newTaskType !== 'panel_review' && !isComputeExperiment}
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
                 className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"

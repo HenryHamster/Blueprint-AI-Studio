@@ -1,11 +1,13 @@
 import { useState, useMemo, useEffect } from 'react';
-import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2 } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2, GitBranch } from 'lucide-react';
 import type { ResearchFinding } from './TaskCard';
+import type { FindingChallenge } from '../types/task';
 import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
-import type { Task, TaskEvaluationSummary } from '../types/task';
+import type { Task, TaskEvaluationSummary, SpawnGateState } from '../types/task';
+import { deriveSpawnGateState } from '../types/task';
 
 interface Direction {
   id: string;
@@ -21,7 +23,7 @@ interface EnrichedFinding {
   taskCreatedAt: string;
   findingIndex: number;
   /** Info about the child task that implemented this finding, if any. */
-  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null };
+  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null; spawnGateState?: SpawnGateState };
 }
 
 /** Findings grouped under a direction (or "undirected"). */
@@ -120,6 +122,53 @@ function classifySourceRef(ref: string, repoUrl: string | null): SourceLink {
     }
   }
   return { kind: 'text', label: ref };
+}
+
+const AGREEMENT_STYLES: Record<string, { label: string; cls: string }> = {
+  agrees: { label: 'Confirmed', cls: 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40' },
+  disagrees: { label: 'Challenged', cls: 'bg-red-900/40 text-red-400 border-red-700/40' },
+  indeterminate: { label: 'Indeterminate', cls: 'bg-neutral-800 text-neutral-400 border-neutral-700/40' },
+};
+
+function ChallengePanel({ challenge, onNavigateToTask }: { challenge: FindingChallenge; onNavigateToTask?: (id: string) => void }) {
+  const agreement = challenge.agreement ?? 'indeterminate';
+  const style = AGREEMENT_STYLES[agreement] ?? AGREEMENT_STYLES.indeterminate;
+  return (
+    <div className="mt-1.5 border border-neutral-800 rounded p-2 space-y-1 bg-neutral-900/40">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <GitBranch className="w-3 h-3 text-neutral-500 shrink-0" />
+        <span className="text-[10px] uppercase tracking-wide text-neutral-500">Second opinion</span>
+        <span className={`text-[10px] border px-1.5 py-0.5 rounded font-medium ${style.cls}`}>{style.label}</span>
+        {challenge.challenged_boundary && (
+          <span className="text-[10px] text-neutral-500">on <span className="font-mono text-neutral-400">{challenge.challenged_boundary}</span></span>
+        )}
+      </div>
+      {challenge.second_opinion_verdict && (
+        <div className="text-[10px] text-neutral-400">
+          <span className="text-neutral-600">Second verdict:</span> {challenge.second_opinion_verdict}
+        </div>
+      )}
+      {challenge.reason && (
+        <div className="text-[10px] text-neutral-400 leading-relaxed">{challenge.reason}</div>
+      )}
+      {challenge.sidecar_task_id && (
+        <div className="text-[10px] text-neutral-500 flex items-center gap-1">
+          <span>Challenger task:</span>
+          {onNavigateToTask ? (
+            <button
+              data-viewport-allow-small-target
+              onClick={e => { e.stopPropagation(); onNavigateToTask(challenge.sidecar_task_id ?? ''); }}
+              className="font-mono text-cyan-500 hover:text-cyan-300 transition-colors"
+            >
+              {challenge.sidecar_task_id.slice(0, 8)}…
+            </button>
+          ) : (
+            <span className="font-mono">{challenge.sidecar_task_id.slice(0, 8)}…</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl: string | null }) {
@@ -278,7 +327,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   // Build the map of finding key -> child task info from the project-wide feed when available.
   const implementedFindings = useMemo(() => {
     const outcomeFeed = researchFeed ?? tasks;
-    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null }>();
+    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null; spawnGateState?: SpawnGateState }>();
     for (const task of outcomeFeed) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
@@ -290,7 +339,31 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           prUrl: task.pr_url,
           failureClass: task.failure_class ?? undefined,
           evaluationSummary: task.evaluation_summary ?? undefined,
+          spawnGateState: deriveSpawnGateState(task.context),
         });
+      }
+    }
+    return map;
+  }, [tasks, researchFeed]);
+
+  // Build a lookup of adversarially-deferred findings by (researchTaskId:titleLower).
+  const adversarialDeferredByKey = useMemo(() => {
+    const feedTasks = researchFeed ?? tasks;
+    const map = new Map<string, { adversarial_gate_reason: string | null }>();
+    for (const task of feedTasks) {
+      if (task.task_type !== 'research') continue;
+      const deferred = task.context?.deferred_findings;
+      if (!Array.isArray(deferred)) continue;
+      for (const df of deferred) {
+        if ((df as Record<string, unknown>).deferred_reason === 'adversarial_gate') {
+          const title = (df as Record<string, unknown>).title as string | undefined;
+          if (title) {
+            const key = `${task.id}:${title.toLowerCase()}`;
+            map.set(key, {
+              adversarial_gate_reason: ((df as Record<string, unknown>).adversarial_gate_reason as string | null | undefined) ?? null,
+            });
+          }
+        }
       }
     }
     return map;
@@ -644,6 +717,35 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 ⚠ {ef.finding._provenance_warnings.broken_source_ref_count} broken refs
                               </span>
                             )}
+                            {ef.outcome?.spawnGateState?.kind === 'fail-open-pass' && (
+                              <span
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-[10px]"
+                                title={ef.outcome.spawnGateState.reason ?? 'Passed by fail-open — no challenger verdict was returned'}
+                              >
+                                fail-open
+                              </span>
+                            )}
+                            {ef.outcome?.spawnGateState?.kind === 'challenged-pass' && (
+                              <span
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 text-[10px]"
+                                title={ef.outcome.spawnGateState.reason ?? 'Challenger confirmed this finding as actionable'}
+                              >
+                                gate ✓
+                              </span>
+                            )}
+                            {!ef.outcome && (() => {
+                              const deferredKey = `${ef.taskId}:${ef.finding.title.toLowerCase()}`;
+                              const deferred = adversarialDeferredByKey.get(deferredKey);
+                              if (!deferred) return null;
+                              return (
+                                <span
+                                  className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-red-900/40 text-red-400 text-[10px]"
+                                  title={deferred.adversarial_gate_reason ?? 'Refuted by adversarial gate'}
+                                >
+                                  refuted
+                                </span>
+                              );
+                            })()}
                             <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
                           </div>
                           {isDetailOpen && (
@@ -692,6 +794,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 <OutcomeSummaryPills summary={ef.outcome.evaluationSummary} />
                               )}
                               <EvidencePanel finding={ef.finding} repoUrl={repoUrl} />
+                              {ef.finding.finding_challenge && (
+                                <ChallengePanel challenge={ef.finding.finding_challenge} onNavigateToTask={onNavigateToTask} />
+                              )}
                               {/* Downstream task chain */}
                               {ef.outcome && (
                                 <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">

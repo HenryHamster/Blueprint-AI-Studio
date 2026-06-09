@@ -76,6 +76,7 @@ const COLUMNS: KanbanColumn[] = [
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
   { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
   { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
+  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
   { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },

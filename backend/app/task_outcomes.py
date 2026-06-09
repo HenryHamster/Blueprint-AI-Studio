@@ -54,6 +54,11 @@ from app.ci_resolution import (
     classify_merge_test_verdict,
 )
 from app.direction_outcomes import _counts_as_failure
+from app.knowledge_query import (
+    COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE,
+    COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY,
+    KNOWLEDGE_ACCEPTANCE_EVIDENCE_KEY,
+)
 from app.landed_signal import (
     is_merged_completion,
     merge_verification_status,
@@ -326,24 +331,41 @@ def _compute_result(task: Task) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
+def _compute_acceptance_grade(task: Task) -> str | None:
+    """Best-effort read of the compute KnowledgeDocument acceptance mirror."""
+    mirror = _knowledge_document(task)
+    if mirror is None:
+        return None
+    if mirror.get(KNOWLEDGE_ACCEPTANCE_EVIDENCE_KEY) is True:
+        return COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE
+    grade = mirror.get(COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY)
+    return str(grade).strip() if grade else None
+
+
 def _evaluate_compute_experiment(task: Task) -> TaskOutcome:
     """Outcome for a compute_experiment task — judged on its terminal job outcome.
 
-    The honest terminal signal is the compute job's ``outcome`` stored in
-    ``plan_output['compute_result']`` by the completion gate. ``SUCCESS`` is a
-    ``success``; ``FAILURE`` is a ``failure``; the intentional terminations
-    (``SPEND_CAP_EXCEEDED`` budget kill, ``TIMED_OUT`` deadline kill,
-    ``CANCELLED`` operator kill) are ``neutral`` — they cleared the gate as
-    deliberate terminal outcomes, not crashes. When no ``compute_result`` is
-    present (e.g. the gate failed the task and it never stored one), fall back
-    to the direction-metrics failure notion: ``failure`` if it counts as a
-    genuine failure, else ``neutral``.
+    The terminal job's ``outcome`` is stored in
+    ``plan_output['compute_result']`` by the completion gate. ``SUCCESS`` only
+    counts as a non-code success when the mirrored KnowledgeDocument is
+    acceptance-grade; measured-only/fallback results are neutral. ``FAILURE`` is
+    a ``failure``; intentional terminations (``SPEND_CAP_EXCEEDED`` budget kill,
+    ``TIMED_OUT`` deadline kill, ``CANCELLED`` operator kill) are ``neutral`` —
+    they cleared the gate as deliberate terminal outcomes, not crashes. When no
+    ``compute_result`` is present (e.g. the gate failed the task and it never
+    stored one), fall back to the direction-metrics failure notion: ``failure``
+    if it counts as a genuine failure, else ``neutral``.
     """
     result = _compute_result(task)
     if result is not None:
         outcome = str(result.get("outcome") or "").strip().upper()
         if outcome == "SUCCESS":
-            return TaskOutcome("success", KIND_COMPUTE_RESULT)
+            if (
+                _compute_acceptance_grade(task)
+                == COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE
+            ):
+                return TaskOutcome("success", KIND_COMPUTE_RESULT)
+            return TaskOutcome("neutral", KIND_COMPUTE_RESULT)
         if outcome == "FAILURE":
             return TaskOutcome("failure", KIND_COMPUTE_RESULT)
         if outcome in _COMPUTE_NEUTRAL_OUTCOMES:

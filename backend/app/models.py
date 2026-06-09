@@ -91,9 +91,9 @@ def _coerce_provider_context_values(raw: object) -> list[str]:
     if isinstance(raw, str) and raw.strip():
         values.append(raw.strip())
     elif isinstance(raw, (list, tuple, set)):
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                values.append(item.strip())
+        values.extend(
+            item.strip() for item in raw if isinstance(item, str) and item.strip()
+        )
     return values
 
 
@@ -219,6 +219,14 @@ class ArtifactType(str, Enum):
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
+    # Binding second-opinion verdict from the release_audit_challenge handler:
+    # an independent adversarial re-judgement of the primary release_audit's
+    # higher-severity findings (confirmed / refuted_false_positive / uncertain).
+    # Used as a fail-closed gate in _finalize_qualification — verified findings
+    # must be challenger-confirmed to deduct; missing/uncertain verdicts HOLD.
+    # Like MERGE_TEST_RESULT, the column is a plain String so no migration is
+    # needed.
+    RELEASE_AUDIT_CHALLENGE = "RELEASE_AUDIT_CHALLENGE"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
@@ -3101,6 +3109,32 @@ class KnowledgeDocument(SQLModel, table=True):
     )
     head_sha: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
+    # Origin provenance for design/web_research documents spawned from research
+    # findings. Nullable so legacy rows remain readable; read paths derive the
+    # legacy/unknown state when older rows have no stamp.
+    origin_state: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_research_task_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_parent_research_task_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_finding_index: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    origin_finding_hash: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    origin_challenge_state: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_challenge_record: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3135,6 +3169,9 @@ class KnowledgeDocument(SQLModel, table=True):
         ),
         Index("ix_knowledge_document_topic", "topic"),
         Index("ix_knowledge_document_direction", "direction_id"),
+        Index("ix_knowledge_document_origin_state", "origin_state"),
+        Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
+        Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
     )
 
 
@@ -3859,6 +3896,14 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
     excluded_audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    # Challenger-confirmed false positives: findings the independent challenger
+    # marked refuted_false_positive with auditable reasons.  DISTINCT from
+    # excluded_audit_findings (which captures the unverified-primary gap).
+    # Each entry: {severity, summary, file, challenger_reason}.
+    challenger_refuted_audit_findings: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

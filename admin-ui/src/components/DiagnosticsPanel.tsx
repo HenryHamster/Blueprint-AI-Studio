@@ -29,7 +29,7 @@ interface ConfirmDialogConfig {
 }
 
 const RETRYABLE_STATUSES = new Set(['FAILED']);
-const CANCELLABLE_STATUSES = new Set(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED']);
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'PARKED']);
 
 export function DiagnosticsPanel({ diagnostics, onViewTask, handleRetry, handleCancel, setConfirmDialog }: DiagnosticsPanelProps) {
   const [collapsed, setCollapsed] = useState(() => {

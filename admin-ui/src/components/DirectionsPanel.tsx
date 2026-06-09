@@ -187,7 +187,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean }) {
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null }) {
   // Active tab
   const [activeTab, setActiveTab] = useState<DirectionsTab>('directions');
 
@@ -243,11 +243,18 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           triggerCycle={data.triggerCycle}
         />
 
-        {/* Live strategist activity indicator — driven by strategic_cycle_started/completed WS events */}
+        {/* Live strategist activity indicator — shows phase label when enriched event is available */}
         {strategistActive && (
-          <div className="px-5 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
-            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" aria-hidden="true" />
-            <span className="text-xs text-indigo-300 font-medium">Strategist working…</span>
+          <div className="px-5 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
+            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
+            <span className="text-xs text-indigo-300 font-medium min-w-0">
+              {cycleProgress?.phase_label ? `Strategist: ${cycleProgress.phase_label}…` : 'Strategist working…'}
+              {cycleProgress?.steering_excerpt && (
+                <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
+                  "{cycleProgress.steering_excerpt.slice(0, 80)}{cycleProgress.steering_excerpt.length > 80 ? '…' : ''}"
+                </span>
+              )}
+            </span>
           </div>
         )}
 

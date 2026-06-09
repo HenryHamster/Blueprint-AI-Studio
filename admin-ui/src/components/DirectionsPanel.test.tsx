@@ -371,6 +371,28 @@ describe('DirectionsPanel', () => {
     expect(screen.queryByText('Strategist working…')).toBeNull();
   });
 
+  it('shows generic "Strategist working…" when strategistActive=true and no cycleProgress (minimal event backward-compat)', async () => {
+    mockFetch(baseResponses);
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={null} />);
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.getByText('Strategist working…')).toBeInTheDocument();
+  });
+
+  it('shows phase label from enriched cycleProgress event', async () => {
+    mockFetch(baseResponses);
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Reviewing directions' }} />);
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.getByText('Strategist: Reviewing directions…')).toBeInTheDocument();
+  });
+
+  it('shows steering excerpt under the phase label in directions panel', async () => {
+    mockFetch(baseResponses);
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.getByText('Strategist: Evaluating…')).toBeInTheDocument();
+    expect(screen.getByText(/"Focus on reliability"/)).toBeInTheDocument();
+  });
+
   it('clicking the close backdrop fires onClose', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();

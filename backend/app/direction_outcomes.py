@@ -614,6 +614,33 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "prompt_telemetry": {
         "consumer": "synthesize_prompt_quality_patterns (this module) -> digest_direction_progress.py, routers/agent.py"
     },
+    "research_spawn_gate_challenged_count": {
+        "consumer": "digest_direction_progress.py, routers/agent.py (research spawn-gate cycle telemetry)"
+    },
+    "research_spawn_gate_refuted_count": {
+        "consumer": "digest_direction_progress.py, routers/agent.py (research spawn-gate cycle telemetry)"
+    },
+    "research_spawn_gate_survived_count": {
+        "consumer": "digest_direction_progress.py, routers/agent.py (research spawn-gate cycle telemetry)"
+    },
+    "research_spawn_gate_challenged_spawned": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
+    "research_spawn_gate_challenged_merged": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
+    "research_spawn_gate_challenged_merge_rate": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
+    "research_spawn_gate_unchallenged_spawned": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
+    "research_spawn_gate_unchallenged_merged": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
+    "research_spawn_gate_unchallenged_merge_rate": {
+        "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
+    },
     "decomposition_quality": {
         "consumer": "digest_direction_progress.py, playbook_learning.py, spawn_calibration.py"
     },
@@ -701,6 +728,12 @@ async def _update_direction_research_outcomes(
         research_task_uuid = uuid.UUID(entry.get("task_id", ""))
     except (ValueError, AttributeError):
         return
+    research_task = await session.get(Task, research_task_uuid)
+    research_task_ctx = (
+        research_task.context or {}
+        if research_task is not None
+        else {}
+    )
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
     if not child_tasks_rows:
@@ -764,6 +797,17 @@ async def _update_direction_research_outcomes(
             k: round(v, 4) for k, v in cost_by_provider_model.items()
         }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
+
+    spawn_gate_challenged_count = int(
+        research_task_ctx.get("research_spawn_gate_challenged_count")
+        or 0
+    )
+    spawn_gate_refuted_count = int(
+        research_task_ctx.get("research_spawn_gate_refuted_count") or 0
+    )
+    spawn_gate_survived_count = int(
+        research_task_ctx.get("research_spawn_gate_survived_count") or 0
+    )
 
     entry["tasks_completed"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
@@ -924,6 +968,39 @@ async def _update_direction_research_outcomes(
     )
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
+    )
+    challenged_children = [
+        ct for ct in child_tasks_rows if (ct.context or {}).get(
+            "research_spawn_gate_challenged"
+        ) is True
+    ]
+    unchallenged_children = [
+        ct for ct in child_tasks_rows if not (ct.context or {}).get(
+            "research_spawn_gate_challenged"
+        )
+    ]
+    challenged_spawned = len(challenged_children)
+    unchallenged_spawned = len(unchallenged_children)
+    challenged_merged = sum(1 for ct in challenged_children if is_merged_completion(ct))
+    unchallenged_merged = sum(
+        1 for ct in unchallenged_children if is_merged_completion(ct)
+    )
+    entry["research_spawn_gate_challenged_count"] = spawn_gate_challenged_count
+    entry["research_spawn_gate_refuted_count"] = spawn_gate_refuted_count
+    entry["research_spawn_gate_survived_count"] = spawn_gate_survived_count
+    entry["research_spawn_gate_challenged_spawned"] = challenged_spawned
+    entry["research_spawn_gate_challenged_merged"] = challenged_merged
+    entry["research_spawn_gate_challenged_merge_rate"] = (
+        round(challenged_merged / challenged_spawned, 3)
+        if challenged_spawned > 0
+        else None
+    )
+    entry["research_spawn_gate_unchallenged_spawned"] = unchallenged_spawned
+    entry["research_spawn_gate_unchallenged_merged"] = unchallenged_merged
+    entry["research_spawn_gate_unchallenged_merge_rate"] = (
+        round(unchallenged_merged / unchallenged_spawned, 3)
+        if unchallenged_spawned > 0
+        else None
     )
     # remediation_tasks_{created,merged,failed} retired 2026-06-05 —
     # see RESEARCH_HISTORY_METRIC_MANIFEST.

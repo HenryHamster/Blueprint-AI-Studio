@@ -1,4 +1,4 @@
-import type { ComputeJob } from '../api';
+import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 import { parseTimestamp } from '../utils/time';
 
 const ACTIVE_STATUSES: ReadonlySet<ComputeJob['status']> = new Set([
@@ -48,6 +48,19 @@ export function fmtCountdown(deadlineIso: string | null, nowMs: number): string 
   if (remaining < 60) return `${remaining}s`;
   if (remaining < 3600) return `${Math.floor(remaining / 60)}m ${remaining % 60}s`;
   return `${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m`;
+}
+
+/** Backend RPC failure diagnostic for a job, reading the dedicated field and
+ *  falling back to the legacy `polling_metadata.compute_rpc_diagnostic` shape so
+ *  older API responses still surface the warning. Returns null when absent. */
+export function computeJobRpcDiagnostic(job: ComputeJob): ComputeRpcDiagnostic | null {
+  const direct = job.compute_rpc_diagnostic;
+  if (direct && typeof direct === 'object') return direct;
+  const legacy = (job.polling_metadata as Record<string, unknown> | undefined)?.[
+    'compute_rpc_diagnostic'
+  ];
+  if (legacy && typeof legacy === 'object') return legacy as ComputeRpcDiagnostic;
+  return null;
 }
 
 /** Spend used so far for a job — accrued while active, final once terminal. */

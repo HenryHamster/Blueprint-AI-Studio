@@ -450,12 +450,20 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
   }
   sr.reviewer_findings = findings;
   sr.check_results = checkResults;
+  // Recovery-origin flavor for this pass. Mirrors the per-finding origin tagging
+  // above and is sent to the backend merge endpoint so the durable
+  // `_self_review_outcome` matches the in-VM `/tmp` merge. Undefined for the
+  // enabled (non-recovery) path — the backend then stamps a plain reviewer origin.
+  let reviewerRecoveryOrigin: string | undefined;
   if (incompleteSrRecovery) {
-    sr.reviewer_recovery_origin = 'reviewer_recovery_after_incomplete_sr';
+    reviewerRecoveryOrigin = 'reviewer_recovery_after_incomplete_sr';
   } else if (loneCheckerRecovery) {
-    sr.reviewer_recovery_origin = 'lone_checker_recovery';
+    reviewerRecoveryOrigin = 'lone_checker_recovery';
   } else if (operatorRequestedRecovery) {
-    sr.reviewer_recovery_origin = 'operator_requested_recovery';
+    reviewerRecoveryOrigin = 'operator_requested_recovery';
+  }
+  if (reviewerRecoveryOrigin) {
+    sr.reviewer_recovery_origin = reviewerRecoveryOrigin;
   }
 
   // Merge reviewer-enumerated edges. Filter defensively to entries with a
@@ -554,15 +562,27 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     sendLog(ws, `[FreshReview] Failed to write self-review: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 
+  // Persist the merged reviewer output to the backend task's durable
+  // `_self_review_outcome`. The operator-requested path passes the original
+  // task id; the automatic in-VM paths (enabled / lone-checker / incomplete-SR
+  // recovery) pass the current task id (`taskId`) so the self-merge fires —
+  // their terminal status was already posted, so without this POST the reviewer
+  // mutations would only ever live in `/tmp` and be lost. Callers that pass no
+  // target (e.g. the review-fix handler) intentionally skip the backend merge.
+  // Fail-soft: a POST failure is logged and never fails task completion.
   if (originalTaskId) {
+    const mergeBody: Record<string, unknown> = {
+      reviewer_findings: groundedFindings,
+      reviewer_edges_considered: Array.isArray(parsed.reviewer_edges_considered) ? parsed.reviewer_edges_considered as Record<string, unknown>[] : [],
+    };
+    if (reviewerRecoveryOrigin) {
+      mergeBody.reviewer_recovery_origin = reviewerRecoveryOrigin;
+    }
     try {
-      await apiPost(`/api/agent/tasks/${originalTaskId}/reviewer-merge`, {
-        reviewer_findings: groundedFindings,
-        reviewer_edges_considered: Array.isArray(parsed.reviewer_edges_considered) ? parsed.reviewer_edges_considered as Record<string, unknown>[] : [],
-      });
-      sendLog(ws, '[FreshReview] Findings posted to original task.\n');
+      await apiPost(`/api/agent/tasks/${originalTaskId}/reviewer-merge`, mergeBody);
+      sendLog(ws, '[FreshReview] Findings persisted to backend self-review outcome.\n');
     } catch (e) {
-      sendLog(ws, `[FreshReview] Failed to post findings to original task: ${e instanceof Error ? e.message : String(e)}\n`);
+      sendLog(ws, `[FreshReview] Failed to persist findings to backend: ${e instanceof Error ? e.message : String(e)}\n`);
     }
   }
 }

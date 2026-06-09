@@ -98,6 +98,29 @@ describe('resolveTaskCapabilities (contract-driven)', () => {
     expect(resolved.getLabel('unknown_type')).toBe('unknown_type');
   });
 
+  it('surfaces an operator_contract_launchable type in the launcher even when user_launchable is false', () => {
+    const contract: TaskCapabilityContract = {
+      create: { type: 'create', label: 'Create', user_launchable: true, provider_configurable: true, filter_visible: true },
+      compute_experiment: {
+        type: 'compute_experiment',
+        label: 'Compute Experiment',
+        description: 'Run a bounded CPU/GPU experiment.',
+        user_launchable: false,
+        operator_contract_launchable: true,
+        provider_configurable: true,
+        filter_visible: true,
+      },
+    };
+    const resolved = resolveTaskCapabilities(contract);
+    const launchable = resolved.userLaunchableOptions.map(o => o.value);
+    // The dedicated-contract type joins the launchable options...
+    expect(launchable).toContain('compute_experiment');
+    expect(launchable).toContain('create');
+    // ...and the resolved capability records the flag.
+    expect(resolved.byId.compute_experiment?.operatorContractLaunchable).toBe(true);
+    expect(resolved.byId.compute_experiment?.userLaunchable).toBe(false);
+  });
+
   it('overlays UI-only synthetic types the backend never publishes (rollup)', () => {
     const contract: TaskCapabilityContract = {
       create: { type: 'create', label: 'Create', user_launchable: true, provider_configurable: true, filter_visible: true },

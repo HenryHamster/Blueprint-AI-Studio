@@ -61,6 +61,251 @@ QUALITY_GRADER_SOURCE_KEY = "quality_grader_for_task_id"
 # re-spawning a grader on the re-entrant pass.
 QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 
+# Context key written on the SOURCE task when the adversarial per-finding grader
+# returns. Value is {"finding_verdicts": {hash: bool}, "grader_task_id": "..."}.
+# True = finding passed adversarial challenge; False = failed (finding deferred).
+# Absent hash → pass (fail-open: a crashed grader never blocks spawning).
+ADVERSARIAL_GATE_VERDICT_KEY = "adversarial_gate"
+
+# Context key written on a spawned safeguard-challenge task, pointing at the
+# safeguard audit task whose merge-gate decision it challenges.
+# ``task_lifecycle._process_post_commit`` watches for this key to route the
+# challenge's completion back to the parked safeguard task.
+SAFEGUARD_CHALLENGE_SOURCE_KEY = "safeguard_challenge_for_task_id"
+
+# Context key written on the SAFEGUARD task once its challenge returns.  The
+# value is a dict with keys ``outcome`` ("confirmed" | "rejected" | "downgraded")
+# and ``reasoning``.  ``_maybe_release_safeguard_gate`` reads it on re-entry to
+# decide whether the merge gate is released or held.
+SAFEGUARD_CHALLENGE_VERDICT_KEY = "safeguard_challenge_verdict"
+
+
+# ---------------------------------------------------------------------------
+# Per-finding second-opinion CHALLENGE seam.
+#
+# Distinct from the batch QUALITY_GRADER above (which grades the WHOLE research
+# artifact before any finding spawns work), this seam challenges ONE high-stakes
+# per-finding verdict before it is dropped or dispatched: a reproduce-on-HEAD
+# 'absent' hard-drop, a low-actionability decay, or (room reserved) an
+# indeterminate reproduce verdict that would otherwise dispatch unverified.
+#
+# The challenge runs as a bounded, read-only ``investigate`` side-car carrying
+# FINDING_CHALLENGE_SOURCE_KEY; its completion routes back through the re-entrant
+# completion path (task_lifecycle._resolve_finding_challenge_completion) to the
+# parked source, which records a FindingChallengeRecord under
+# FINDING_CHALLENGE_VERDICT_KEY and re-dispatches its completion handler.
+# ---------------------------------------------------------------------------
+
+# The high-stakes per-finding boundaries a challenge can re-examine.
+CHALLENGE_BOUNDARY_REPRODUCE_ABSENT = "reproduce_absent"
+CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY = "low_actionability_decay"
+# Reserved: an indeterminate reproduce verdict that would dispatch unverified.
+CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH = (
+    "reproduce_indeterminate_dispatch"
+)
+
+_CHALLENGE_BOUNDARIES: frozenset[str] = frozenset(
+    {
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    }
+)
+
+# Context key written on a spawned challenge side-car, pointing at the source
+# research task whose finding it challenges. ``task_lifecycle._process_post_commit``
+# watches for this key (mirroring QUALITY_GRADER_SOURCE_KEY) to route the
+# side-car's completion back to the parked source.
+FINDING_CHALLENGE_SOURCE_KEY = "finding_challenge_for_task_id"
+
+# Context key written on the SOURCE task once its challenge side-car returns.
+# Presence means the challenged finding got its second opinion; the source
+# completion handler reads the recorded FindingChallengeRecord to decide whether
+# to drop or dispatch the finding, and to avoid re-spawning a challenge.
+FINDING_CHALLENGE_VERDICT_KEY = "finding_challenge"
+
+# Agreement of the second opinion with the first verdict being challenged.
+CHALLENGE_AGREES = "agrees"
+CHALLENGE_DISAGREES = "disagrees"
+CHALLENGE_INDETERMINATE = "indeterminate"
+
+# Schema version stamped on every FindingChallengeRecord.  Increment when the
+# record shape changes in a way that would break a consumer expecting the old
+# layout.  Version 1 is the first versioned shape; legacy records (missing the
+# key) pre-date versioning and should be treated as version 0 by consumers.
+FINDING_CHALLENGE_RECORD_SCHEMA_VERSION = 1
+
+# ── Review second-opinion gate (default-on adversarial challenge) ──────────
+# Context key written on the spawned panel_review CHALLENGER task, pointing at
+# the ordinary ``review`` task whose verdict it challenges. ``_process_post_commit``
+# watches for this key to route the challenger's completion back to the parked
+# review task (re-entrant resolution, exactly like the forward-quality grader).
+REVIEW_SECOND_OPINION_SOURCE_KEY = "review_second_opinion_for_task_id"
+
+# Context key set on the parked REVIEW task while a challenge is in flight.
+# Presence (single-shot guard) means a challenger has already been spawned and
+# the primary verdict must not act until the challenge resolves.
+REVIEW_SECOND_OPINION_AWAITING_KEY = "awaiting_review_second_opinion"
+
+# Context key on the parked REVIEW task holding the primary verdict + issue set
+# captured at park time, so the re-entrant resolution can reconcile against it
+# without re-parsing the original agent output.
+REVIEW_SECOND_OPINION_PARKED_KEY = "review_second_opinion_parked"
+
+
+def review_is_high_stakes(
+    verdict: str,
+    issues: list | None,
+    investigated_files: list | None,
+    review_task: Task,
+) -> bool:
+    """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
+
+    Default-broad and fail-safe (the gate is meant to catch single-pass
+    mistakes, so it errs toward challenging):
+
+    * an APPROVE always qualifies — it hands the PR straight to the auto-merge
+      decision tree, the highest-stakes review outcome;
+    * a REQUEST_CHANGES qualifies when it carries at least one concrete defect
+      (an issue with a description) — verification-only rejections have already
+      been downgraded to APPROVE upstream, so a REQUEST_CHANGES reaching here is
+      a genuine change request — or when the reviewed change touched
+      security-critical files.
+
+    Kept as a single function so operators can narrow it (e.g. gate only
+    cross-module or critical-file PRs) without touching the lifecycle wiring.
+    """
+    if verdict == "APPROVE":
+        return True
+    if verdict == "REQUEST_CHANGES":
+        if any(
+            isinstance(i, dict) and str(i.get("description") or "").strip()
+            for i in (issues or [])
+        ):
+            return True
+        if (review_task.context or {}).get("touched_critical"):
+            return True
+    return False
+
+
+async def spawn_review_second_opinion(
+    review_task: Task,
+    session: AsyncSession,
+    *,
+    verdict: str,
+    issues: list | None,
+    feedback: str,
+    pr_number,
+    branch: str,
+    base_branch: str,
+    original_task_id: str,
+    original_prompt: str,
+    investigated_files: list | None,
+) -> Task | None:
+    """Spawn an independent ``panel_review`` challenger and park the review task.
+
+    Mirrors :func:`spawn_forward_quality_grader`: parks ``review_task`` in
+    EVALUATING with a single-shot guard, captures the primary verdict + issue
+    set under ``REVIEW_SECOND_OPINION_PARKED_KEY``, and spawns a side-car
+    ``panel_review`` task (NOT a rollup child) carrying a back-reference under
+    ``REVIEW_SECOND_OPINION_SOURCE_KEY``. The challenger's completion returns
+    through the re-entrant path (``_resolve_review_second_opinion``).
+
+    Returns the challenger ``Task``, or ``None`` when a challenge is already in
+    flight or has already resolved (single-shot — never double-spawn, and the
+    challenger itself never re-triggers the gate because its completion routes
+    to the resolver, not the review-finalization branch).
+    """
+    # Lazy import to avoid a module-level cycle with task_completion.
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    ctx = dict(review_task.context or {})
+    if (
+        ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY)
+        or ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY) is not None
+    ):
+        # Challenge already in flight or already reconciled — never double-spawn.
+        return None
+
+    challenger = Task(
+        project_id=review_task.project_id,
+        title=f"[CHALLENGE] second-opinion panel review for PR #{pr_number}",
+        description=(
+            "Independent multi-lens panel review challenging a primary "
+            "code-review verdict before it commits to merge or fix."
+        ),
+        # Side-car, not a rollup child (mirrors the grader): the back-reference
+        # lives in context, so the challenger never entangles the review task's
+        # parent-rollup accounting.
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+                "original_prompt": original_prompt,
+                "is_challenge": True,
+                "primary_verdict": verdict,
+                "primary_issues": list(issues or []),
+            }
+        ],
+        context={
+            REVIEW_SECOND_OPINION_SOURCE_KEY: str(review_task.id),
+            "pr_number": pr_number,
+            "branch": branch,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=review_task.priority,
+    )
+    session.add(challenger)
+
+    # Park the review task awaiting the challenge verdict. Overrides the
+    # COMPLETED status the orchestrator set pre-handler — the verdict is NOT
+    # final until reconciled.
+    review_task.status = TaskStatus.EVALUATING
+    review_task.latest_status_message = (
+        f"Awaiting independent second-opinion panel review before committing "
+        f"{verdict} verdict on PR #{pr_number}"
+    )[:500]
+    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = True
+    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
+        "verdict": verdict,
+        "issues": list(issues or []),
+        "feedback": (feedback or "")[:5000],
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": original_task_id,
+        "original_prompt": original_prompt,
+        "investigated_files": list(investigated_files or []),
+    }
+    review_task.context = ctx
+    flag_modified(review_task, "context")
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(challenger)
+
+    # Record the concrete challenger id for observability.
+    ctx2 = dict(review_task.context or {})
+    ctx2[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(challenger.id)
+    review_task.context = ctx2
+    flag_modified(review_task, "context")
+    session.add(review_task)
+    await session.commit()
+
+    logger.info(
+        "[REVIEW SECOND-OPINION] Spawned challenger %s for review task %s "
+        "(PR #%s, primary verdict %s); review parked EVALUATING",
+        challenger.id,
+        review_task.id,
+        pr_number,
+        verdict,
+    )
+    return challenger
+
 
 @dataclass(frozen=True)
 class EvaluationVerdict:
@@ -631,6 +876,85 @@ def _extract_verdict_object_any(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def build_adversarial_finding_prompt(high_stakes_findings_json: str) -> str:
+    """Build a refute-first per-finding adversarial challenge prompt.
+
+    Instructs a fresh agent to actively try to REFUTE each finding before it
+    spawns implementation work. Fail-open semantics: absent findings in the
+    output default to pass so a truncated or crashed grader never blocks work.
+    """
+    return (
+        "You are an ADVERSARIAL CHALLENGER. Each of the following research "
+        "findings is about to SPAWN implementation work (PRs, plans). Your job "
+        "is to actively try to REFUTE each finding — not to confirm it. Default "
+        "to skeptical: if you cannot confidently confirm all three criteria, "
+        "mark the finding as failing.\n\n"
+        "For each finding, judge:\n"
+        "  1. PREMISE — Is the finding's core premise still true at HEAD? "
+        "(The cited code/behavior exists AND has the claimed problem.)\n"
+        "  2. EVIDENCE — Are the citations real and do they actually support "
+        "the conclusion, not just tangentially related?\n"
+        "  3. SCOPE — Does the finding overstate its blast radius, severity, "
+        "or impact beyond what the cited evidence actually shows?\n\n"
+        "FAIL when uncertain. Only PASS a finding when all three criteria "
+        "clearly hold at HEAD.\n\n"
+        "Findings to challenge (JSON array, each has a 'hash' identifier):\n"
+        "-----8<----- FINDINGS START -----8<-----\n"
+        f"{high_stakes_findings_json[:20000]}\n"
+        "-----8<----- FINDINGS END -----8<-----\n\n"
+        "End your response with EXACTLY ONE JSON array, one object per finding "
+        "in the SAME ORDER as the input, and nothing after it:\n"
+        '[{"hash": "<finding_hash from input>", "verdict": "pass" | "fail", '
+        '"reason": "<one-sentence justification>"}]'
+    )
+
+
+def parse_adversarial_finding_verdicts(
+    logs: str | None,
+    finding_hashes: list[str],
+    completed: bool = True,
+) -> dict[str, dict]:
+    """Parse per-finding pass/fail verdicts from adversarial grader output.
+
+    Returns a dict mapping finding_hash → {passed: bool, reason: str, explicit: bool}.
+    FAIL-OPEN: any finding whose hash is absent from the output defaults to
+    passed=True with explicit=False so a crashed or truncated adversarial grader
+    never blocks spawning. ``explicit=False`` distinguishes a fail-open bypass
+    from a clean challenger pass (``explicit=True``).
+    """
+    _fail_open: dict = {
+        "passed": True,
+        "reason": "fail-open: no verdict returned for this finding",
+        "explicit": False,
+    }
+    result: dict[str, dict] = {h: dict(_fail_open) for h in finding_hashes}
+    if not completed or not logs:
+        return result
+    from app.task_completion import _extract_json_array  # noqa: PLC0415
+
+    text = (logs or "").strip()
+    json_str = _extract_json_array(text, "hash", "verdict")
+    if json_str:
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    h = str(item.get("hash") or "").strip()
+                    if h not in result:
+                        continue
+                    v = str(item.get("verdict") or "").strip().lower()
+                    reason = str(item.get("reason") or "")[:480]
+                    if v in ("pass", "passed", "approve", "approved"):
+                        result[h] = {"passed": True, "reason": reason, "explicit": True}
+                    elif v in ("fail", "failed", "reject", "rejected"):
+                        result[h] = {"passed": False, "reason": reason, "explicit": True}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return result
+
+
 def build_forward_quality_grader_prompt(
     task_type: str, artifact_text: str, *, question: str | None = None
 ) -> str:
@@ -693,6 +1017,7 @@ async def spawn_forward_quality_grader(
     *,
     rubric: str | None = None,
     question: str | None = None,
+    adversarial_mode: bool = False,
 ) -> Task | None:
     """Spawn an independent grader task for ``source_task`` and park the source.
 
@@ -701,30 +1026,62 @@ async def spawn_forward_quality_grader(
     at most once; this is the convergence control, analogous to the review
     pipeline's per-chain iteration cap).
 
+    When ``adversarial_mode=True``, the grader uses a refute-first per-finding
+    challenge prompt and writes ``ADVERSARIAL_GATE_VERDICT_KEY`` on the source
+    rather than ``QUALITY_GRADER_VERDICT_KEY``. The two gates are independent
+    and use separate awaiting/verdict keys so they can both run on a single
+    research task without interfering.
+
     The source task is moved to EVALUATING and will NOT complete or spawn
     children until the grader's verdict returns via the re-entrant completion
     path (``task_lifecycle._resolve_quality_grader_completion``).
     """
     ctx = dict(source_task.context or {})
-    if ctx.get(QUALITY_GRADER_VERDICT_KEY) is not None or ctx.get(
-        "awaiting_quality_grader"
-    ):
-        # Already graded, or a grader is already in flight — never double-spawn.
-        return None
+    if adversarial_mode:
+        if ctx.get(ADVERSARIAL_GATE_VERDICT_KEY) is not None or ctx.get(
+            "awaiting_adversarial_grader"
+        ):
+            return None
+    else:
+        if ctx.get(QUALITY_GRADER_VERDICT_KEY) is not None or ctx.get(
+            "awaiting_quality_grader"
+        ):
+            # Already graded, or a grader is already in flight — never double-spawn.
+            return None
 
     task_type = _task_type_of(source_task)
-    prompt = rubric or build_forward_quality_grader_prompt(
-        task_type, artifact_text, question=question
-    )
+    if adversarial_mode:
+        prompt = rubric or build_adversarial_finding_prompt(artifact_text)
+        _awaiting_key = "awaiting_adversarial_grader"
+        _title_suffix = "adversarial-challenge"
+        _description = (
+            "Independent adversarial challenge of high-stakes research findings "
+            "before they are allowed to spawn downstream implementation work."
+        )
+        _status_message = (
+            "Awaiting adversarial challenge verdict before spawning "
+            "high-stakes implementation tasks"
+        )
+    else:
+        prompt = rubric or build_forward_quality_grader_prompt(
+            task_type, artifact_text, question=question
+        )
+        _awaiting_key = "awaiting_quality_grader"
+        _title_suffix = "forward-quality grade"
+        _description = (
+            "Independent forward-quality grade of an upstream artifact before "
+            "it is allowed to spawn downstream implementation work."
+        )
+        _status_message = (
+            "Awaiting independent forward-quality grade before spawning "
+            "implementation tasks"
+        )
     base_branch = (source_task.first_payload or {}).get("base_branch", "main")
 
     grader = Task(
         project_id=source_task.project_id,
-        title=f"[GRADE] forward-quality grade for {task_type} {str(source_task.id)[:8]}",
-        description=(
-            "Independent forward-quality grade of an upstream artifact before "
-            "it is allowed to spawn downstream implementation work."
-        ),
+        title=f"[GRADE] {_title_suffix} for {task_type} {str(source_task.id)[:8]}",
+        description=_description,
         # Deliberately NOT parent_task_id=source: the grader is a side-car, not
         # a rollup child. Linking it as a child would entangle it in the
         # source's parent-rollup accounting. The back-reference lives in
@@ -742,6 +1099,7 @@ async def spawn_forward_quality_grader(
             QUALITY_GRADER_SOURCE_KEY: str(source_task.id),
             "scope": "small",
             "graded_task_type": task_type,
+            **({"adversarial_grader": True} if adversarial_mode else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -753,11 +1111,8 @@ async def spawn_forward_quality_grader(
     # Park the source awaiting the verdict. Overrides the COMPLETED status the
     # orchestrator set pre-handler — the source is NOT done until graded.
     source_task.status = TaskStatus.EVALUATING
-    source_task.latest_status_message = (
-        "Awaiting independent forward-quality grade before spawning "
-        "implementation tasks"
-    )[:500]
-    ctx["awaiting_quality_grader"] = True
+    source_task.latest_status_message = _status_message[:500]
+    ctx[_awaiting_key] = True
     source_task.context = ctx
     flag_modified(source_task, "context")
     session.add(source_task)
@@ -766,20 +1121,118 @@ async def spawn_forward_quality_grader(
 
     # Record the concrete grader id for observability now that it exists.
     ctx2 = dict(source_task.context or {})
-    ctx2["awaiting_quality_grader"] = str(grader.id)
+    ctx2[_awaiting_key] = str(grader.id)
     source_task.context = ctx2
     flag_modified(source_task, "context")
     session.add(source_task)
     await session.commit()
 
     logger.info(
-        "[EVAL] Spawned forward-quality grader %s for %s task %s; source parked "
+        "[EVAL] Spawned %s grader %s for %s task %s; source parked "
         "EVALUATING awaiting verdict",
+        "adversarial" if adversarial_mode else "forward-quality",
         grader.id,
         task_type,
         source_task.id,
     )
     return grader
+
+
+async def spawn_safeguard_challenge(
+    safeguard_task: Task,
+    findings_text: str,
+    session: AsyncSession,
+) -> Task | None:
+    """Spawn an independent challenge task for a safeguard security-audit finding.
+
+    Returns the spawned challenge ``Task``, or ``None`` when a challenge is
+    already in flight or already resolved (single-shot guard).
+
+    The safeguard task is moved to EVALUATING and will NOT finalize the
+    merge-gate decision until the challenger's verdict returns via
+    ``task_lifecycle._resolve_safeguard_challenge_completion``.
+    """
+    ctx = dict(safeguard_task.context or {})
+    if ctx.get(SAFEGUARD_CHALLENGE_VERDICT_KEY) is not None or ctx.get(
+        "awaiting_safeguard_challenge"
+    ):
+        return None
+
+    base_branch = (safeguard_task.first_payload or {}).get("base_branch", "main")
+    prompt = (
+        "You are an independent security reviewer. A security audit has flagged "
+        "the following finding(s) as critical or high severity, and the project's "
+        "merge gate is held pending your independent assessment.\n\n"
+        "Your task: read each finding carefully and determine whether it "
+        "constitutes a genuine critical or high severity vulnerability in the "
+        "codebase, or whether it is a false positive / over-stated severity.\n\n"
+        "-----8<----- FINDING(S) START -----8<-----\n"
+        f"{findings_text[:20000]}\n"
+        "-----8<----- FINDING(S) END -----8<-----\n\n"
+        "End your response with EXACTLY ONE JSON object on its own line, and "
+        "nothing after it:\n"
+        '{"outcome": "confirmed" | "rejected" | "downgraded", '
+        '"reasoning": "<one-sentence justification>"}\n'
+        "Where:\n"
+        "  confirmed  — the finding is a genuine critical/high severity issue\n"
+        "  rejected   — the finding is a false positive\n"
+        "  downgraded — the finding is real but severity is below critical/high\n"
+    )
+
+    challenge = Task(
+        project_id=safeguard_task.project_id,
+        title=(
+            f"[CHALLENGE] safeguard gate for {str(safeguard_task.id)[:8]}"
+        ),
+        description=(
+            "Independent challenge of a safeguard security-audit finding before "
+            "the merge gate is maintained."
+        ),
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": base_branch,
+                "scope": "small",
+            }
+        ],
+        context={
+            SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard_task.id),
+            "scope": "small",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=safeguard_task.priority,
+    )
+    session.add(challenge)
+
+    safeguard_task.status = TaskStatus.EVALUATING
+    safeguard_task.latest_status_message = (
+        "Awaiting independent challenge verdict before finalizing merge gate decision"
+    )[:500]
+    ctx["awaiting_safeguard_challenge"] = True
+    safeguard_task.context = ctx
+    flag_modified(safeguard_task, "context")
+    session.add(safeguard_task)
+    await session.commit()
+    await session.refresh(challenge)
+
+    ctx2 = dict(safeguard_task.context or {})
+    ctx2["awaiting_safeguard_challenge"] = str(challenge.id)
+    safeguard_task.context = ctx2
+    flag_modified(safeguard_task, "context")
+    session.add(safeguard_task)
+    await session.commit()
+
+    logger.info(
+        "[SAFEGUARD] Spawned challenge %s for safeguard %s; gate decision "
+        "parked EVALUATING awaiting verdict",
+        challenge.id,
+        safeguard_task.id,
+    )
+    return challenge
 
 
 def _extract_verdict_object(text: str) -> dict | None:
@@ -856,4 +1309,381 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
         )
     return EvaluationVerdict(
         False, "grader verdict unparseable; failing closed", "forward-quality"
+    )
+
+
+
+def parse_safeguard_challenge_outcome(
+    logs: str | None, completed: bool = True
+) -> dict:
+    """Parse an independent safeguard-challenge outcome from its output.
+
+    Returns a dict with keys ``outcome`` and ``reasoning``.  FAIL-CLOSED on
+    every ambiguous case: a challenger that did not complete, emitted nothing,
+    or produced unparseable output yields ``outcome="confirmed"`` so the gate
+    is maintained rather than accidentally released on a bad response.
+    """
+    _fail_closed = {"outcome": "confirmed", "reasoning": "challenge did not resolve; gate maintained"}
+
+    if not completed:
+        return _fail_closed
+
+    text = (logs or "").strip()
+    if not text:
+        return _fail_closed
+
+    # Try to extract a JSON object with an "outcome" key.
+    idx = text.find("{")
+    while idx != -1:
+        depth = 0
+        for j in range(idx, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[idx : j + 1])
+                    if "outcome" in obj:
+                        outcome = str(obj.get("outcome", "")).strip().lower()
+                        reasoning = str(obj.get("reasoning") or "")[:480]
+                        if outcome in ("confirmed", "rejected", "downgraded"):
+                            return {"outcome": outcome, "reasoning": reasoning}
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+        idx = text.find("{", idx + 1)
+
+    # Fallback: anchored keyword scan.
+    low = text.lower()
+    for keyword in ("rejected", "downgraded", "confirmed"):
+        if f'"outcome": "{keyword}"' in low or f'"outcome":"{keyword}"' in low:
+            return {"outcome": keyword, "reasoning": "outcome keyword found (anchored)"}
+
+    return _fail_closed
+
+
+# ---------------------------------------------------------------------------
+# Per-finding second-opinion CHALLENGE implementation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FindingChallengeRecord:
+    """Structured record of an independent second opinion on ONE finding verdict.
+
+    ``challenged_boundary`` is the high-stakes verdict being re-examined (one of
+    the ``CHALLENGE_BOUNDARY_*`` constants). ``first_verdict`` is the original
+    single-pass classification being challenged (e.g. ``"absent"`` / ``"LOW"``).
+    ``second_opinion_verdict`` is the independent re-classification the side-car
+    produced. ``agreement`` is one of ``agrees`` / ``disagrees`` /
+    ``indeterminate`` — and is ``indeterminate`` whenever the side-car's output
+    cannot be parsed or the side-car did not complete (fail-closed, so an
+    ambiguous second opinion never overturns the original verdict). ``reason`` is
+    a human-readable justification; ``sidecar_task_id`` is the challenge task's
+    id for observability and audit.
+
+    ``schema_version`` is the record schema version (always
+    ``FINDING_CHALLENGE_RECORD_SCHEMA_VERSION`` for newly created records; absent
+    on legacy records pre-dating versioning). ``source_task_id`` is the id of the
+    research task whose finding was challenged; ``produced_by`` identifies the
+    pipeline stage that created this record (always ``"challenge_sidecar"`` for
+    records created through the normal challenge path).
+    """
+
+    challenged_boundary: str
+    first_verdict: str
+    second_opinion_verdict: str
+    agreement: str
+    reason: str
+    sidecar_task_id: str | None
+    schema_version: int = FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    source_task_id: str | None = None
+    produced_by: str = "challenge_sidecar"
+
+    def to_context(self) -> dict[str, Any]:
+        """Plain-dict form for stamping under ``FINDING_CHALLENGE_VERDICT_KEY``."""
+        return {
+            "challenged_boundary": self.challenged_boundary,
+            "first_verdict": self.first_verdict,
+            "second_opinion_verdict": self.second_opinion_verdict,
+            "agreement": self.agreement,
+            "reason": self.reason,
+            "sidecar_task_id": self.sidecar_task_id,
+            "schema_version": self.schema_version,
+            "source_task_id": self.source_task_id,
+            "produced_by": self.produced_by,
+        }
+
+
+def build_finding_challenge_prompt(
+    boundary: str,
+    finding: dict[str, Any],
+    first_verdict: str,
+    *,
+    question: str | None = None,
+) -> str:
+    """Build a read-only rubric prompt challenging ONE finding's verdict.
+
+    The challenger runs as a fresh, read-only agent with no stake in the
+    original verdict. It re-examines a SINGLE finding (not the whole artifact)
+    against ``first_verdict`` and must end its output with exactly one JSON
+    object so ``parse_finding_challenge_verdict`` can read it back
+    deterministically (reusing the grader's end-with-one-JSON convention).
+
+    ``boundary`` selects the framing: ``reproduce_absent`` asks whether the cited
+    code is truly gone vs. merely moved/renamed; ``low_actionability_decay`` asks
+    whether the finding is truly too vague to act on. When ``question`` (the
+    research task's topic) is supplied the challenger is told what was originally
+    asked so it can judge on-topic-ness.
+    """
+    if boundary == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT:
+        framing = (
+            "The first pass judged this finding's cited code ABSENT on HEAD and "
+            "is about to HARD-DROP it (the finding would be rejected forever). "
+            "But an 'absent' verdict is derived purely from whether cited file "
+            "PATHS and SYMBOL references still resolve at HEAD — code that was "
+            "MOVED or RENAMED rather than deleted reads as 'absent' too. "
+            "Independently decide: is the cited code TRULY gone, or merely "
+            "relocated/renamed (in which case the finding should NOT be dropped)?"
+        )
+    elif boundary == CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY:
+        framing = (
+            "The first pass decayed this finding to LOW actionability and is "
+            "about to drop it as too vague to spawn work. Independently decide: "
+            "is the finding genuinely unactionable, or is it specific and scoped "
+            "enough that an implementer could act on it (in which case the decay "
+            "is wrong and the finding should be dispatched)?"
+        )
+    elif boundary == CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH:
+        framing = (
+            "The first pass could not determine whether this finding reproduces "
+            "on HEAD and is about to DISPATCH it unverified. Independently "
+            "decide: does the finding actually reproduce against the codebase at "
+            "HEAD, or is it stale/already-fixed (in which case it should NOT be "
+            "dispatched)?"
+        )
+    else:
+        framing = (
+            "Independently re-examine the first-pass verdict on this finding and "
+            "decide whether it holds up."
+        )
+
+    asked = (question or "").strip()
+    relevance_block = ""
+    if asked:
+        relevance_block = (
+            "\nFor context, the research task was asked:\n"
+            "-----8<----- REQUEST START -----8<-----\n"
+            f"{asked[:2000]}\n"
+            "-----8<----- REQUEST END -----8<-----\n"
+        )
+
+    try:
+        finding_json = json.dumps(finding, indent=2, default=str)[:8000]
+    except (TypeError, ValueError):
+        finding_json = str(finding)[:8000]
+
+    return (
+        "You are an INDEPENDENT second opinion on a SINGLE research finding. A "
+        "prior agent reached a high-stakes verdict on this finding, and that "
+        "verdict is about to be final. Your job is to challenge it — read-only, "
+        "with no stake in the original call.\n\n"
+        f"{framing}\n"
+        f"\nThe first-pass verdict being challenged is: {first_verdict!r}.\n"
+        f"{relevance_block}"
+        "\nFinding under challenge:\n"
+        "-----8<----- FINDING START -----8<-----\n"
+        f"{finding_json}\n"
+        "-----8<----- FINDING END -----8<-----\n\n"
+        "Investigate the actual codebase at HEAD as needed. Be specific about "
+        "what you checked. If you cannot reach a confident conclusion, say so "
+        "(verdict 'indeterminate') rather than guessing — an indeterminate "
+        "second opinion preserves the original verdict.\n\n"
+        "End your response with EXACTLY ONE JSON object on its own line, and "
+        "nothing after it:\n"
+        '{"verdict": "<your independent classification>", '
+        '"agreement": "agrees" | "disagrees" | "indeterminate", '
+        '"reasoning": "<one-sentence justification>"}'
+    )
+
+
+async def spawn_finding_challenge(
+    source_task: Task,
+    finding: dict[str, Any],
+    boundary: str,
+    first_verdict: str,
+    session: AsyncSession,
+    *,
+    question: str | None = None,
+) -> Task | None:
+    """Spawn a single read-only challenge side-car and park the source EVALUATING.
+
+    Returns the spawned challenge ``Task``, or ``None`` when a challenge is
+    already in flight or already resolved (single-shot guard — a finding verdict
+    is challenged at most once). The source is moved to EVALUATING and will NOT
+    complete or spawn children until the second opinion returns via the
+    re-entrant completion path
+    (``task_lifecycle._resolve_finding_challenge_completion``).
+
+    An unrecognized ``boundary`` is rejected (returns ``None``) so a caller can
+    never park a source on a challenge framing the prompt builder cannot express.
+    """
+    if boundary not in _CHALLENGE_BOUNDARIES:
+        logger.warning(
+            "[CHALLENGE] Unknown challenge boundary %r for task %s — not spawning",
+            boundary,
+            source_task.id,
+        )
+        return None
+
+    ctx = dict(source_task.context or {})
+    if ctx.get(FINDING_CHALLENGE_VERDICT_KEY) is not None or ctx.get(
+        "awaiting_finding_challenge"
+    ):
+        # Already challenged, or a challenge is already in flight — never
+        # double-spawn (mirrors spawn_forward_quality_grader's single-shot guard).
+        return None
+
+    prompt = build_finding_challenge_prompt(
+        boundary, finding, first_verdict, question=question
+    )
+    base_branch = (source_task.first_payload or {}).get("base_branch", "main")
+
+    challenge = Task(
+        project_id=source_task.project_id,
+        title=(
+            f"[CHALLENGE] {boundary} second opinion for research "
+            f"{str(source_task.id)[:8]}"
+        ),
+        description=(
+            "Independent per-finding second opinion on a high-stakes research "
+            "verdict before the finding is dropped or dispatched."
+        ),
+        # Deliberately NOT parent_task_id=source: the challenge is a side-car, not
+        # a rollup child. The back-reference lives in context instead.
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": base_branch,
+                "scope": "small",
+            }
+        ],
+        context={
+            FINDING_CHALLENGE_SOURCE_KEY: str(source_task.id),
+            "scope": "small",
+            "challenged_boundary": boundary,
+            "challenged_first_verdict": first_verdict,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=source_task.priority,
+    )
+    session.add(challenge)
+
+    # Park the source awaiting the second opinion. Overrides the COMPLETED status
+    # the orchestrator set pre-handler — the source is NOT done until challenged.
+    source_task.status = TaskStatus.EVALUATING
+    source_task.latest_status_message = (
+        f"Awaiting independent second opinion on a {boundary} verdict before "
+        "dropping/dispatching the finding"
+    )[:500]
+    ctx["awaiting_finding_challenge"] = True
+    source_task.context = ctx
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+    await session.refresh(challenge)
+
+    # Record the concrete side-car id for observability now that it exists.
+    ctx2 = dict(source_task.context or {})
+    ctx2["awaiting_finding_challenge"] = str(challenge.id)
+    source_task.context = ctx2
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+
+    logger.info(
+        "[CHALLENGE] Spawned %s challenge %s for research task %s; source parked "
+        "EVALUATING awaiting second opinion",
+        boundary,
+        challenge.id,
+        source_task.id,
+    )
+    return challenge
+
+
+def parse_finding_challenge_verdict(
+    logs: str | None,
+    first_verdict: str,
+    boundary: str,
+    sidecar_task_id: str | None,
+    completed: bool = True,
+    *,
+    source_task_id: str | None = None,
+) -> FindingChallengeRecord:
+    """Parse a challenge side-car's second opinion into a FindingChallengeRecord.
+
+    FAIL-CLOSED on every ambiguous case: a side-car that did not complete,
+    emitted nothing, or produced output we cannot parse yields
+    ``agreement="indeterminate"`` with a recorded reason, so an unparseable or
+    incomplete second opinion never overturns the original verdict. A parsed
+    ``agreement`` outside the recognized set also collapses to indeterminate.
+
+    ``source_task_id`` is the id of the research task whose finding was
+    challenged; it is stamped onto the returned record for provenance.
+    """
+    if not completed:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge side-car did not complete; verdict unchallenged",
+            sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
+        )
+
+    text = (logs or "").strip()
+    if not text:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge side-car produced no output",
+            sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
+        )
+
+    obj = _extract_verdict_object(text)
+    if obj is None:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge verdict unparseable; failing closed",
+            sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
+        )
+
+    second = str(obj.get("verdict") or "").strip()
+    reason = str(obj.get("reasoning") or obj.get("reason") or "")[:480]
+    agreement = str(obj.get("agreement") or "").strip().lower()
+    if agreement not in (CHALLENGE_AGREES, CHALLENGE_DISAGREES, CHALLENGE_INDETERMINATE):
+        agreement = CHALLENGE_INDETERMINATE
+        if not reason:
+            reason = "challenge omitted a recognized agreement; failing closed"
+    return FindingChallengeRecord(
+        challenged_boundary=boundary,
+        first_verdict=first_verdict,
+        second_opinion_verdict=second,
+        agreement=agreement,
+        reason=reason or f"second opinion {agreement} with the {boundary} verdict",
+        sidecar_task_id=sidecar_task_id,
+        source_task_id=source_task_id,
     )

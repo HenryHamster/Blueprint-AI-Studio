@@ -47,10 +47,11 @@ export interface GenericRunner {
   label: string;
 }
 
-// Read-only output kinds that the generic single-agent knowledge runner handles.
-// These all persist their declared output via the status/artifact path so the
-// registry-driven forward-quality evaluator grades them like `investigate`.
-const KNOWLEDGE_OUTPUT_KINDS = new Set(['knowledge', 'none', 'verdict']);
+// Read-only output kinds that the generic single-agent investigation runner can
+// safely handle. Verdict outputs need an explicit handler or schema-specific
+// runner because the generic investigation-report schema is not consumable by
+// structured-verdict backends.
+const GENERIC_INVESTIGATION_OUTPUT_KINDS = new Set(['knowledge', 'none']);
 
 function asString(v: unknown, fallback = ''): string {
   return typeof v === 'string' && v ? v : fallback;
@@ -126,7 +127,7 @@ export function resolveGenericRunner(contract: TaskCapabilityContract): GenericR
   if (
     contract.run_shape === 'single_agent' &&
     contract.agent_mode === 'read_only' &&
-    KNOWLEDGE_OUTPUT_KINDS.has(contract.output_kind)
+    GENERIC_INVESTIGATION_OUTPUT_KINDS.has(contract.output_kind)
   ) {
     return { handler: handleInvestigate, label: 'single-agent read-only knowledge' };
   }

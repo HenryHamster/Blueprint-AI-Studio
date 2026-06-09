@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
+import type { StrategicChallengeSummary } from '../types/digest';
 import { API_BASE_URL, authHeaders, fetchTask } from '../api';
 
 interface UseLogViewerDeps {
@@ -8,6 +9,38 @@ interface UseLogViewerDeps {
   setDeployState: (ds: DeployState) => void;
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
+}
+
+/** Live state captured from a strategic_cycle_started event. */
+export interface StrategicCycleProgress {
+  task_id: string;
+  cycle_id?: string;
+  phase_number?: number;
+  phase_label?: string;
+  phase_state?: string;
+  steering_origin?: string;
+  steering_excerpt?: string;
+}
+
+/** Outcome captured from a strategic_cycle_completed event's completion sub-object. */
+export interface StrategicCycleCompletion {
+  status?: string;
+  created_count?: number;
+  retired_count?: number;
+  staged_count?: number;
+  updated_count?: number;
+  tasks_spawned?: number;
+  directions_changed?: boolean;
+  problem_model_changed?: boolean;
+  running_update_changed?: boolean;
+  created_direction_ids?: string[];
+  retired_direction_ids?: string[];
+  status_message?: string;
+  failure_reason?: string;
+  // Compact strategic-judgment-challenge summary; present only when the cycle
+  // carried a challenge record (the backend omits it otherwise). The handler
+  // passes msg.data.completion verbatim, so no handler change is needed.
+  strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
 let _trackLogIdCounter = 0;
@@ -22,6 +55,10 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
   const [pipelineThrottle, setPipelineThrottle] = useState<{ reason: string; detail: string; recovery_seconds: number | null } | null>(null);
   // Lightweight "strategist is working" indicator, toggled by strategic_cycle_started/completed events.
   const [strategistActive, setStrategistActive] = useState(false);
+  // Phase-level progress from the current running cycle (null when idle).
+  const [cycleProgress, setCycleProgress] = useState<StrategicCycleProgress | null>(null);
+  // Outcome receipt from the most recently completed cycle (null until first completion).
+  const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsReconnectAttemptRef = useRef<number>(0);
@@ -56,10 +93,12 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
 
   // Client-side safety net: strategistActive is hook-global (not per-project),
   // so a stale "working" state from a previous project must not bleed onto the
-  // newly-selected project's directions panel. Reset it whenever the selected
-  // project changes; the project's own strategic_cycle_started will re-arm it.
+  // newly-selected project's directions panel. Reset all cycle state whenever
+  // the selected project changes; the project's own strategic_cycle_started will re-arm it.
   useEffect(() => {
     setStrategistActive(false);
+    setCycleProgress(null);
+    setLastCycleCompletion(null);
   }, [selectedProjectId]);
 
   // Clean up WebSocket and timers on unmount
@@ -196,8 +235,22 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
         refetchDirections();
       } else if (msg.event === 'strategic_cycle_started') {
         setStrategistActive(true);
+        setLastCycleCompletion(null); // clear previous receipt when new cycle begins
+        setCycleProgress({
+          task_id: msg.data?.task_id ?? '',
+          cycle_id: msg.data?.cycle_id,
+          phase_number: msg.data?.phase_number,
+          phase_label: msg.data?.phase_label,
+          phase_state: msg.data?.phase_state,
+          steering_origin: msg.data?.steering_origin,
+          steering_excerpt: msg.data?.steering_excerpt,
+        });
       } else if (msg.event === 'strategic_cycle_completed') {
         setStrategistActive(false);
+        setCycleProgress(null);
+        if (msg.data?.completion && typeof msg.data.completion === 'object') {
+          setLastCycleCompletion(msg.data.completion as StrategicCycleCompletion);
+        }
         refetchDirections();
       }
     } catch {
@@ -237,6 +290,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
         // was down, the indicator would otherwise stick on; a fresh cycle will
         // re-emit strategic_cycle_started.
         setStrategistActive(false);
+        setCycleProgress(null);
         // Add system log for all tracked tasks
         for (const tid of trackedTaskIdsRef.current) {
           appendTrackLog(tid, 'system', 'Stream connected');
@@ -440,6 +494,8 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
     wsRef, wsConnected,
     pipelineThrottle,
     strategistActive,
+    cycleProgress,
+    lastCycleCompletion,
     // Tracking
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   };

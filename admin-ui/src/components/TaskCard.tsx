@@ -8,6 +8,7 @@ import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { useTaskCapabilities } from '../taskCapabilities';
 import type { FixLoopSummary } from '../types/task';
+import { deriveSpawnGateState } from '../types/task';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
 function formatCompact(seconds: number): string {
@@ -30,8 +31,9 @@ function SpawnSignalBadges({ task }: { task: Task }) {
   const lowConfidence = ctx?.low_confidence_spawn === true;
   const autoDecomposed = ctx?.auto_decomposed === true;
   const mediumExploration = ctx?.medium_exploration === true;
+  const spawnGate = deriveSpawnGateState(task.context);
 
-  if (!lowConfidence && !autoDecomposed && !mediumExploration) return null;
+  if (!lowConfidence && !autoDecomposed && !mediumExploration && spawnGate.kind !== 'fail-open-pass' && spawnGate.kind !== 'challenged-pass') return null;
 
   const rate = ctx?.low_confidence_spawn_rate;
   const ratePct = typeof rate === 'number' ? Math.round(rate * 100) : null;
@@ -64,6 +66,22 @@ function SpawnSignalBadges({ task }: { task: Task }) {
           className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
         >
           explore
+        </span>
+      )}
+      {spawnGate.kind === 'fail-open-pass' && (
+        <span
+          title={spawnGate.reason ?? 'Passed by fail-open — no challenger verdict was returned for this finding'}
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
+        >
+          fail-open
+        </span>
+      )}
+      {spawnGate.kind === 'challenged-pass' && (
+        <span
+          title={spawnGate.reason ?? 'Challenger confirmed this finding as actionable'}
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+        >
+          gate ✓
         </span>
       )}
     </>
@@ -281,6 +299,8 @@ const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint:
   agent_stalled: { label: 'Agent Stalled', color: 'bg-amber-500/20 text-amber-400', hint: 'Agent was alive but made no progress — wedged execution', suggestion: 'Wedged agent — retries with a fresh agent', retryLabel: 'Retry fresh' },
   BLOCKED_PRECONDITION: { label: 'Blocked — precondition', color: 'bg-sky-500/20 text-sky-400', hint: 'Agent correctly refused on an unmet precondition (e.g. upstream PR/file not yet on main) — not a code defect', suggestion: 'Resolve the upstream precondition, then retry', retryLabel: 'Retry' },
   SCOPE_EMPTY: { label: 'Scope Empty', color: 'bg-slate-500/20 text-slate-400', hint: 'Declared files were already covered by a sibling PR — agent exited cleanly, not a code defect', suggestion: 'No action needed — work was already covered elsewhere', retryLabel: 'Retry' },
+  park_wake_timeout: { label: 'Park Wake Timeout', color: 'bg-amber-500/20 text-amber-400', hint: 'Parked task wake source never fired before timeout — park/wake orchestration issue', suggestion: 'Inspect the wake source and retry after park/wake delivery is healthy', retryLabel: 'Retry' },
+  park_wake_stranded: { label: 'Park Wake Stranded', color: 'bg-orange-500/20 text-orange-400', hint: 'Parked task stayed stranded after its wake should have been delivered', suggestion: 'Inspect park/wake delivery health before retrying', retryLabel: 'Retry' },
 };
 
 export { FAILURE_CLASS_CONFIG };
@@ -429,6 +449,17 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
         {items.map((f, i) => (
           <div key={i} className="text-neutral-300">
             <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+            {f.finding_challenge && (
+              <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 border ${
+                f.finding_challenge.agreement === 'agrees' ? 'bg-emerald-900/30 text-emerald-500 border-emerald-700/30' :
+                f.finding_challenge.agreement === 'disagrees' ? 'bg-red-900/30 text-red-400 border-red-700/30' :
+                'bg-neutral-800 text-neutral-500 border-neutral-700/30'
+              }`} title={f.finding_challenge.reason}>
+                {f.finding_challenge.agreement === 'agrees' ? '✓ confirmed' :
+                 f.finding_challenge.agreement === 'disagrees' ? '✗ challenged' :
+                 '? indeterminate'}
+              </span>
+            )}
             {f.title}
             {expanded && f.description ? (
               <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>

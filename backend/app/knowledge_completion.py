@@ -48,6 +48,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.knowledge_query import (
+    KnowledgeSubstance,
+    classify_knowledge_acceptance,
+    knowledge_substance_has_durable_compute_grounding,
+)
 from app.models import (
     Artifact,
     ComputeJob,
@@ -106,6 +111,114 @@ def _source_kind(kind: str) -> str:
         return SourceKind.UNKNOWN.value
 
 
+_ORIGIN_STATE_RESEARCH_FINDING = "research_finding"
+_ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED = "not_research_finding_derived"
+_ORIGIN_CHALLENGE_UNCHALLENGED = "unchallenged"
+_ORIGIN_CHALLENGE_CONFIRMED = "challenger_confirmed"
+_ORIGIN_CHALLENGE_OVERTURNED = "overturned"
+_ORIGIN_CHALLENGE_INDETERMINATE = "indeterminate_fail_closed"
+_FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
+_CHALLENGE_KEYS = {
+    "challenged_boundary",
+    "first_verdict",
+    "second_opinion_verdict",
+    "agreement",
+    "reason",
+    "sidecar_task_id",
+}
+
+
+def _bounded_context_str(value: Any, *, limit: int = 128) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
+def _bounded_finding_index(value: Any) -> int | None:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
+def _bounded_challenge_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    record: dict[str, Any] = {}
+    for key in _CHALLENGE_KEYS:
+        item = value.get(key)
+        if item is None:
+            continue
+        if key == "reason":
+            record[key] = str(item)[:1000]
+        else:
+            record[key] = str(item)[:200]
+    return record or None
+
+
+def _challenge_state(record: dict[str, Any] | None) -> str:
+    if not record:
+        return _ORIGIN_CHALLENGE_UNCHALLENGED
+    agreement = str(record.get("agreement") or "").strip().lower()
+    second = str(record.get("second_opinion_verdict") or "").strip().lower()
+    if agreement == "disagrees":
+        return _ORIGIN_CHALLENGE_OVERTURNED
+    if agreement == "agrees" and second not in {"", "unknown", "indeterminate"}:
+        return _ORIGIN_CHALLENGE_CONFIRMED
+    return _ORIGIN_CHALLENGE_INDETERMINATE
+
+
+def _derive_origin_provenance(
+    task: Task,
+    *,
+    source_kind: str,
+) -> dict[str, Any]:
+    """Derive durable, bounded research-finding origin from producer context."""
+    ctx = task.context if isinstance(task.context, dict) else {}
+    research_task_id = _bounded_context_str(
+        ctx.get("research_task_id") or ctx.get("parent_research_task_id"), limit=64
+    )
+    parent_research_task_id = _bounded_context_str(
+        ctx.get("parent_research_task_id") or ctx.get("research_task_id"), limit=64
+    )
+    finding_hash = _bounded_context_str(ctx.get("finding_hash"), limit=128)
+    finding_index = _bounded_finding_index(ctx.get("finding_index"))
+    has_research_origin = bool(
+        research_task_id
+        or parent_research_task_id
+        or finding_hash
+        or finding_index is not None
+    )
+    if source_kind not in {
+        SourceKind.DESIGN.value,
+        SourceKind.WEB_RESEARCH.value,
+    }:
+        origin_state = _ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+    else:
+        origin_state = (
+            _ORIGIN_STATE_RESEARCH_FINDING
+            if has_research_origin
+            else _ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+        )
+    challenge_record = _bounded_challenge_record(ctx.get(_FINDING_CHALLENGE_RECORD_KEY))
+    challenge_state = (
+        _challenge_state(challenge_record)
+        if origin_state == _ORIGIN_STATE_RESEARCH_FINDING
+        else None
+    )
+    return {
+        "origin_state": origin_state,
+        "origin_research_task_id": research_task_id,
+        "origin_parent_research_task_id": parent_research_task_id,
+        "origin_finding_index": finding_index,
+        "origin_finding_hash": finding_hash,
+        "origin_challenge_state": challenge_state,
+        "origin_challenge_record": challenge_record,
+    }
+
+
 def _citation_hint(kind: str) -> str:
     meta = _KIND_META.get(kind)
     return (
@@ -113,6 +226,7 @@ def _citation_hint(kind: str) -> str:
         if meta
         else "at least one web URL or file reference is required"
     )
+
 
 # Required structural keys for a knowledge document. tags / topic are optional
 # and normalized to safe defaults. At least one *usable* source citation is
@@ -142,6 +256,29 @@ def _is_usable_citation(value: Any) -> bool:
     return "/" in text
 
 
+def _is_durable_citation(value: Any) -> bool:
+    """True only for citations that are durably resolvable storage URIs or file refs.
+
+    Rejects bare ``http://``/``https://`` URLs — signed download URLs and bare
+    result URLs are transient; they cannot serve as durable acceptance evidence.
+    Accepts cloud-storage URIs (``gs://``, ``s3://``, ``az://``), ``file:`` URIs,
+    and path-like references (containing ``/``). Metric fragment references of
+    the form ``gs://...#metric:name=value`` are accepted because they are
+    anchored to a durable storage URI. Empty / non-string inputs are rejected.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in text
+
+
 def _usable_citations(obj: dict[str, Any]) -> list[str]:
     """Return the stripped, usable citation strings from a parsed document."""
     raw = obj.get("citations") or obj.get("source_citations") or []
@@ -162,13 +299,55 @@ def _usable_citations(obj: dict[str, Any]) -> list[str]:
 # Common words carry no topical signal; drop them before measuring overlap.
 _PROBE_STOPWORDS = frozenset(
     {
-        "about", "above", "across", "after", "against", "research", "current",
-        "state", "their", "these", "those", "which", "while", "would", "could",
-        "should", "there", "where", "what", "when", "with", "from", "that",
-        "this", "into", "over", "under", "between", "your", "have", "been",
-        "being", "does", "using", "used", "make", "made", "such", "than",
-        "then", "they", "them", "will", "shall", "topic", "prompt", "report",
-        "document", "summary",
+        "about",
+        "above",
+        "across",
+        "after",
+        "against",
+        "research",
+        "current",
+        "state",
+        "their",
+        "these",
+        "those",
+        "which",
+        "while",
+        "would",
+        "could",
+        "should",
+        "there",
+        "where",
+        "what",
+        "when",
+        "with",
+        "from",
+        "that",
+        "this",
+        "into",
+        "over",
+        "under",
+        "between",
+        "your",
+        "have",
+        "been",
+        "being",
+        "does",
+        "using",
+        "used",
+        "make",
+        "made",
+        "such",
+        "than",
+        "then",
+        "they",
+        "them",
+        "will",
+        "shall",
+        "topic",
+        "prompt",
+        "report",
+        "document",
+        "summary",
     }
 )
 
@@ -479,13 +658,18 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
         "topic": str(topic)[:200] if topic is not None else None,
         "tags": tags,
         "source_citations": citations[:100],
-        "authoring_branch": str(authoring_branch)[:255] if authoring_branch is not None else None,
+        "authoring_branch": str(authoring_branch)[:255]
+        if authoring_branch is not None
+        else None,
         "head_sha": str(head_sha)[:40] if head_sha is not None else None,
     }
 
 
 async def _fail_gate(
-    task: Task, verdict: EvaluationVerdict, session: AsyncSession, kind: str = "web_research"
+    task: Task,
+    verdict: EvaluationVerdict,
+    session: AsyncSession,
+    kind: str = "web_research",
 ):
     """Mark ``task`` FAILED on a failing forward-quality verdict and broadcast."""
     record_failed_gate(task, verdict)
@@ -542,13 +726,28 @@ async def _deliver_knowledge_to_dependents(
     is swallowed so delivery can never break the producing task's completion.
     """
     task_id_str = str(task.id)
+    if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value:
+        substance = KnowledgeSubstance(
+            finding_hash=(task.context or {}).get("finding_hash"),
+            topic=doc.topic,
+            source_kind=doc.source_kind,
+            source_citations=tuple(doc.source_citations or ()),
+            forward_quality_verdict=doc.forward_quality_verdict,
+        )
+        if not knowledge_substance_has_durable_compute_grounding(substance):
+            logger.info(
+                "[%s] Skipping dependent delivery for hollow compute document %s",
+                _kind_tag(doc.source_kind),
+                doc.id,
+            )
+            return
     try:
         dependents = (
             (
                 await session.execute(
                     select(Task)
                     .where(
-                        Task.status == TaskStatus.QUEUED,
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.BLOCKED]),
                         Task.project_id == task.project_id,
                         Task.depends_on.isnot(None),
                     )
@@ -644,12 +843,14 @@ async def _persist_document(
     # is stored — and lets a direction's accumulated knowledge be discovered.
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
+    source_kind = _source_kind(kind)
+    origin = _derive_origin_provenance(task, source_kind=source_kind)
 
     doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
         direction_id=direction_id,
-        source_kind=_source_kind(kind),
+        source_kind=source_kind,
         title=normalized["title"],
         summary=normalized["summary"],
         body=normalized["body"],
@@ -659,6 +860,7 @@ async def _persist_document(
         forward_quality_verdict=verdict_record,
         authoring_branch=normalized.get("authoring_branch"),
         head_sha=normalized.get("head_sha"),
+        **origin,
     )
     session.add(doc)
 
@@ -678,6 +880,16 @@ async def _persist_document(
         "direction_id": direction_id,
         "citation_count": len(normalized["source_citations"]),
         "forward_quality_verdict": verdict_record,
+        "origin_provenance": {
+            "origin_state": origin["origin_state"],
+            "research_task_id": origin["origin_research_task_id"],
+            "parent_research_task_id": origin["origin_parent_research_task_id"],
+            "finding_index": origin["origin_finding_index"],
+            "finding_hash": origin["origin_finding_hash"],
+            "direction_id": direction_id,
+            "challenge_state": origin["origin_challenge_state"],
+            "finding_challenge": origin["origin_challenge_record"],
+        },
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -814,8 +1026,7 @@ async def _handle_knowledge_document_completion(
             task,
             EvaluationVerdict(
                 False,
-                f"{kind} output has no usable source citation "
-                f"({_citation_hint(kind)})",
+                f"{kind} output has no usable source citation ({_citation_hint(kind)})",
                 "forward-quality",
             ),
             session,
@@ -834,9 +1045,7 @@ async def _handle_knowledge_document_completion(
         if grounding_miss is not None:
             await _fail_gate(
                 task,
-                EvaluationVerdict(
-                    False, f"{kind} {grounding_miss}", "forward-quality"
-                ),
+                EvaluationVerdict(False, f"{kind} {grounding_miss}", "forward-quality"),
                 session,
                 kind,
             )
@@ -851,9 +1060,7 @@ async def _handle_knowledge_document_completion(
         if grounding_miss is not None:
             await _fail_gate(
                 task,
-                EvaluationVerdict(
-                    False, f"{kind} {grounding_miss}", "forward-quality"
-                ),
+                EvaluationVerdict(False, f"{kind} {grounding_miss}", "forward-quality"),
                 session,
                 kind,
             )
@@ -980,8 +1187,7 @@ def _build_compute_experiment_document(
         value = criterion.get("value")
         if crit_met is True:
             summary_parts.append(
-                f"Success criterion MET: {metric}={value} "
-                f"(required {op} {threshold})."
+                f"Success criterion MET: {metric}={value} (required {op} {threshold})."
             )
         elif criterion.get("measurable"):
             summary_parts.append(
@@ -1027,7 +1233,7 @@ def _build_compute_experiment_document(
 
     citations = (
         [result_reference]
-        if result_reference and _is_usable_citation(result_reference)
+        if result_reference and _is_durable_citation(result_reference)
         else []
     )
 
@@ -1105,7 +1311,14 @@ async def _compute_citation_grounding_stamp(
         try:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None:
-                grounded = 1
+                # Require the result_reference to actually match the artifact's
+                # durable storage URI — bare artifact-row presence is not enough.
+                storage_prefix = (artifact.storage_uri or "").rstrip("/")
+                ref = (result_reference or "").rstrip("/")
+                if storage_prefix and (
+                    ref == storage_prefix or ref.startswith(storage_prefix + "/")
+                ):
+                    grounded = 1
         except Exception:  # noqa: BLE001 — best-effort, never breaks completion
             pass
 
@@ -1182,7 +1395,7 @@ async def _gather_compute_evidence(
     # location at all (empty / failed job) ⇒ nothing to analyse; fall back.
     job_reference = (job.result_reference or "").strip() or None
     artifact_uri = artifact_uri or job_reference or storage_uri
-    if artifact_uri is None or not _is_usable_citation(artifact_uri):
+    if artifact_uri is None or not _is_durable_citation(artifact_uri):
         return None
     if file_count <= 0 and not metrics:
         # No durable files survived AND no preserved metric — nothing the LLM can
@@ -1191,25 +1404,35 @@ async def _gather_compute_evidence(
 
     # Candidate citations the analysis is allowed to cite. Membership is enforced
     # after the LLM responds so the document can only cite real, durable evidence.
+    # real_evidence: durable storage URIs / metric refs the LLM MUST cite at least
+    # one of to pass the gate. supplementary: transient helpers (e.g. signed URLs)
+    # included in the prompt for LLM convenience but excluded from the gate check.
     real_evidence: list[str] = []
+    supplementary: list[str] = []
     seen: set[str] = set()
 
     def _add_real(value: str | None) -> None:
-        if value and _is_usable_citation(value) and value not in seen:
+        if value and _is_durable_citation(value) and value not in seen:
             seen.add(value)
             real_evidence.append(value)
+
+    def _add_supplementary(value: str | None) -> None:
+        if value and _is_usable_citation(value) and value not in seen:
+            seen.add(value)
+            supplementary.append(value)
 
     _add_real(artifact_uri)
     if storage_uri and storage_uri != artifact_uri:
         _add_real(storage_uri)
 
-    # Best-effort signed download URL for the artifact bundle — a directly usable
-    # http(s) pointer. Never blocks: any storage/credential error is swallowed.
+    # Signed download URLs are transient (they expire); include them in the LLM
+    # prompt as supplementary context but NOT in real_evidence so a signed URL
+    # alone cannot satisfy the durable-artifact citation gate.
     try:
         from app import storage as _storage
 
         signed = await _storage.generate_download_signed_url(artifact_uri)
-        _add_real(signed)
+        _add_supplementary(signed)
     except Exception:  # noqa: BLE001, S110 — signing is optional, nothing to log
         pass
 
@@ -1226,8 +1449,12 @@ async def _gather_compute_evidence(
     if not real_evidence:
         return None
 
-    citations = list(real_evidence)
-    if result_reference and _is_usable_citation(result_reference) and result_reference not in seen:
+    citations = list(real_evidence) + supplementary
+    if (
+        result_reference
+        and _is_usable_citation(result_reference)
+        and result_reference not in seen
+    ):
         citations.append(result_reference)
 
     log_excerpt = (logs or "")[:_COMPUTE_LOG_TEXT_CAP]
@@ -1265,7 +1492,9 @@ def _build_compute_analysis_prompt(
         or "  (no command-reported numeric metrics)"
     )
     criterion_line = (
-        json.dumps(criterion, sort_keys=True) if criterion is not None else "(none declared)"
+        json.dumps(criterion, sort_keys=True)
+        if criterion is not None
+        else "(none declared)"
     )
     return (
         "You are analysing the durable outputs of a finished compute experiment. "
@@ -1313,7 +1542,9 @@ def _parse_compute_analysis_json(raw: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-async def _call_compute_analysis_llm(api_key: str, prompt: str) -> dict[str, Any] | None:
+async def _call_compute_analysis_llm(
+    api_key: str, prompt: str
+) -> dict[str, Any] | None:
     """Call the Anthropic API for the analysis, with a single JSON-parse retry.
 
     Returns the parsed JSON object on success, or ``None`` on a persistent parse
@@ -1340,9 +1571,7 @@ async def _call_compute_analysis_llm(api_key: str, prompt: str) -> dict[str, Any
             return data
         except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
             if attempt == 0:
-                logger.info(
-                    "[COMPUTE] analysis parse error %s, retrying once", exc
-                )
+                logger.info("[COMPUTE] analysis parse error %s, retrying once", exc)
                 continue
             logger.info(
                 "[COMPUTE] analysis parse error on retry, using deterministic fallback"
@@ -1367,22 +1596,30 @@ async def _analyze_compute_experiment_with_llm(
     logs: str | None,
     session: AsyncSession,
     fallback: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Produce a cited LLM analysis over the durable artifacts, or ``None``.
+) -> tuple[dict[str, Any] | None, str]:
+    """Produce a cited LLM analysis over the durable artifacts, or ``(None, reason)``.
 
-    Returns ``None`` — signalling the caller to persist the deterministic
+    Returns ``(None, reason)`` — signalling the caller to persist the deterministic
     fallback — when the analysis is opted out, the API key is absent, there are
     no usable durable artifacts, the LLM call fails/times out, the output is
     unparseable, or the produced document does not clear the SAME citation gate
     the web_research/design lanes use (``_usable_citations``) AND ground itself in
     at least one real artifact/metric citation rather than only the bare result
-    reference.
+    reference. ``reason`` is a compact machine-readable token identifying WHY the
+    fallback was chosen (e.g. ``"analysis-disabled"``, ``"precondition-not-met"``,
+    ``"no-evidence"``, ``"llm-error"``, ``"citations-ungrounded"``).
     """
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
-        return None
+        logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
+        return None, "analysis-disabled"
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        return None
+        logger.info(
+            "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
+            "(precondition-not-met); fallback document will be persisted",
+            task.id,
+        )
+        return None, "precondition-not-met"
 
     evidence = await _gather_compute_evidence(
         task,
@@ -1392,7 +1629,7 @@ async def _analyze_compute_experiment_with_llm(
         session=session,
     )
     if evidence is None:
-        return None
+        return None, "no-evidence"
 
     prompt = _build_compute_analysis_prompt(
         task,
@@ -1404,7 +1641,7 @@ async def _analyze_compute_experiment_with_llm(
     )
     document = await _call_compute_analysis_llm(api_key, prompt)
     if document is None:
-        return None
+        return None, "llm-error"
 
     # Citation grounding: keep only citations that are members of the durable
     # candidate set (the LLM cannot fabricate evidence), then run them through the
@@ -1413,11 +1650,9 @@ async def _analyze_compute_experiment_with_llm(
     real_evidence = set(evidence["real_evidence"])
     raw_citations = document.get("source_citations")
     if not isinstance(raw_citations, list):
-        return None
+        return None, "llm-error"
     grounded = [
-        c.strip()
-        for c in raw_citations
-        if isinstance(c, str) and c.strip() in allowed
+        c.strip() for c in raw_citations if isinstance(c, str) and c.strip() in allowed
     ]
     usable = [c for c in grounded if _is_usable_citation(c)]
     # Defence-in-depth: require at least one usable citation AND that at least one
@@ -1428,16 +1663,14 @@ async def _analyze_compute_experiment_with_llm(
             "using deterministic fallback",
             task.id,
         )
-        return None
+        return None, "citations-ungrounded"
 
     summary = str(document.get("summary") or "")
     body = str(document.get("body") or "")
     if not summary.strip() or not body.strip():
-        return None
+        return None, "llm-error"
     title = (
-        str(document.get("title"))[:500]
-        if document.get("title")
-        else fallback["title"]
+        str(document.get("title"))[:500] if document.get("title") else fallback["title"]
     )
 
     verdict_record = dict(fallback["verdict_record"])
@@ -1462,10 +1695,31 @@ async def _analyze_compute_experiment_with_llm(
         "body": body,
         "topic": fallback["topic"],
         "tags": fallback["tags"],
-        "citations": usable[:_COMPUTE_MAX_CITATIONS],
+        # Only persist durable citations (real_evidence); supplementary signed
+        # URLs are prompt helpers that must not survive into source_citations.
+        "citations": [c for c in usable if c in real_evidence][:_COMPUTE_MAX_CITATIONS],
         "verdict_record": verdict_record,
         "_citation_grounding": grounding_stamp,
-    }
+    }, ""
+
+
+_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "llm": 1}
+
+
+def _incoming_mode_is_upgrade(
+    existing_doc: KnowledgeDocument, incoming_mode: str
+) -> bool:
+    """True when ``incoming_mode`` is strictly stronger than the existing doc's mode.
+
+    Reads ``analysis_mode`` from the existing doc's ``forward_quality_verdict``
+    JSON, defaulting to ``"fallback"`` if absent. A strictly higher
+    ``_ANALYSIS_STRENGTH`` value is an upgrade; equal or lower is not.
+    """
+    existing_verdict = existing_doc.forward_quality_verdict or {}
+    existing_mode = str(existing_verdict.get("analysis_mode") or "fallback")
+    return _ANALYSIS_STRENGTH.get(incoming_mode, 0) > _ANALYSIS_STRENGTH.get(
+        existing_mode, 0
+    )
 
 
 async def _persist_compute_knowledge_document(
@@ -1481,6 +1735,12 @@ async def _persist_compute_knowledge_document(
     on the verdict and the mirrored plan_output so consumers can tell which path
     produced the document. NEVER mutates ``task.status``,
     ``latest_status_message``, or ``plan_output['compute_result']``.
+
+    Idempotent on same-strength retries: a second call with the same (or weaker)
+    mode returns the existing row unchanged. An incoming ``mode`` that is strictly
+    STRONGER (e.g. ``"llm"`` over an existing ``"fallback"``) upgrades the stored
+    document's content and verdict in-place so the best available analysis always
+    wins, while a downgrade (``"fallback"`` over ``"llm"``) is a no-op.
     """
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
@@ -1508,6 +1768,18 @@ async def _persist_compute_knowledge_document(
     # artifacts not found in the durable store). Additive — never blocks completion.
     if _compute_grounding_miss(document) is not None:
         verdict_record["citation_grounding_miss"] = True
+    acceptance = classify_knowledge_acceptance(
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        forward_quality_verdict=verdict_record,
+        source_citations=citations,
+    )
+    verdict_record["knowledge_acceptance_evidence"] = acceptance[
+        "knowledge_acceptance_evidence"
+    ]
+    verdict_record["compute_acceptance_grade"] = acceptance["compute_acceptance_grade"]
+    verdict_record["compute_acceptance_reason"] = acceptance[
+        "compute_acceptance_reason"
+    ]
 
     existing = (
         (
@@ -1540,21 +1812,41 @@ async def _persist_compute_knowledge_document(
         session.add(doc)
     else:
         doc = existing
+        if _incoming_mode_is_upgrade(existing, mode):
+            # Upgrade the stored document to the stronger analysis in-place.
+            # Never downgrades (fallback over llm is a no-op above).
+            doc.title = title
+            doc.summary = summary
+            doc.body = document["body"]
+            doc.topic = topic
+            doc.tags = tags
+            doc.source_citations = citations
+            doc.forward_quality_verdict = verdict_record
+            flag_modified(doc, "tags")
+            flag_modified(doc, "source_citations")
+            flag_modified(doc, "forward_quality_verdict")
+            session.add(doc)
 
     # Mirror a compact copy into plan_output for admin visibility WITHOUT
     # touching the compute_result the compute handler already wrote there.
+    # Always reflect the stored doc's actual (post-upgrade) values so the
+    # mirror is consistent with what was written to the database.
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
+    stored_verdict = doc.forward_quality_verdict or verdict_record
     plan_output["knowledge_document"] = {
         "id": str(doc.id),
-        "title": title,
-        "summary": summary,
-        "topic": topic,
-        "tags": tags,
+        "title": doc.title or title,
+        "summary": doc.summary or summary,
+        "topic": doc.topic if doc.topic is not None else topic,
+        "tags": doc.tags if doc.tags is not None else tags,
         "direction_id": direction_id,
-        "citation_count": len(citations),
+        "citation_count": len(doc.source_citations or citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
-        "analysis_mode": verdict_record.get("analysis_mode", mode),
+        "analysis_mode": stored_verdict.get("analysis_mode", mode),
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
+        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -1634,8 +1926,9 @@ async def persist_compute_experiment_knowledge(
 
     document = fallback
     mode = "fallback"
+    fallback_reason: str | None = None
     try:
-        analysis = await _analyze_compute_experiment_with_llm(
+        analysis, _reason = await _analyze_compute_experiment_with_llm(
             task,
             outcome=outcome,
             cost=cost,
@@ -1653,10 +1946,18 @@ async def persist_compute_experiment_knowledge(
             exc_info=True,
         )
         analysis = None
+        _reason = "llm-error"
     if analysis is not None:
         document = analysis
         mode = "llm"
     else:
+        fallback_reason = _reason or "unknown"
+        logger.info(
+            "[COMPUTE] task %s persisting fallback KnowledgeDocument "
+            "(analysis_mode=fallback, reason=%s)",
+            task.id,
+            fallback_reason,
+        )
         # Fallback path: stamp citation grounding based on whether result_reference
         # resolves to a real Artifact row via the ComputeJob. Best-effort — any
         # error here is swallowed; the fallback document persists either way.
@@ -1666,6 +1967,13 @@ async def persist_compute_experiment_knowledge(
             )
             document = dict(document)
             document["_citation_grounding"] = grounding_stamp
+            # Strip citations that have no backing Artifact row: a storage URI with
+            # no resolved artifact is not durable evidence. When grounded == 0 the
+            # fallback citations are cleared so the document is not treated as
+            # acceptance-grade cited evidence. (_is_durable_citation already
+            # excluded transient http(s):// URLs; this removes unresolved gs:// etc.)
+            if grounding_stamp.get("grounded", 0) == 0 and document.get("citations"):
+                document["citations"] = []
         except Exception:  # noqa: BLE001 — grounding stamp must never break completion
             logger.warning(
                 "[COMPUTE] citation grounding stamp failed for task %s; "
@@ -1673,6 +1981,13 @@ async def persist_compute_experiment_knowledge(
                 task.id,
                 exc_info=True,
             )
+        # Stamp the reason the LLM path was skipped so operators can diagnose
+        # misconfigured backends (e.g. missing ANTHROPIC_API_KEY).
+        if fallback_reason:
+            document = dict(document)
+            verdict_record = dict(document.get("verdict_record") or {})
+            verdict_record["fallback_reason"] = fallback_reason
+            document["verdict_record"] = verdict_record
 
     return await _persist_compute_knowledge_document(task, document, mode, session)
 

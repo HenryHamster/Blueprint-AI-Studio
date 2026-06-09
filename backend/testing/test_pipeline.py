@@ -4105,7 +4105,11 @@ async def test_strategic_op_emits_strategic_updated(strategic_db, mocker):
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1, "expected one strategic_updated broadcast"
     assert events[0][0] == str(project.id)
-    assert events[0][2] == {"kind": "running_update"}
+    assert events[0][2]["kind"] == "running_update"
+    assert events[0][2]["task_id"] == task_id
+    assert events[0][2]["output_kind"] == "running_update"
+    assert events[0][2]["op"] == "set_running_update"
+    assert events[0][2]["running_update_changed"] is True
 
 
 @pytest.mark.asyncio

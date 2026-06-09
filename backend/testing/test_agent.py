@@ -26,6 +26,8 @@ from app.models import (
     MaxPlanAccount,
     Project,
     ProjectStatus,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -267,6 +269,150 @@ async def test_agent_claim_surfaces_reserved_migration_revision(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
+    client: AsyncClient, db_session
+):
+    """A fix task inherits the create task's reservation in the real spawn topology.
+
+    Regression for the sibling-topology bug: review/fix tasks are spawned with
+    ``parent_task_id`` set to the create task's plan/research parent (so they are
+    SIBLINGS of the create task, not its children). The parent-walk therefore
+    never reaches the create task that holds the MigrationReservation; inheritance
+    must come from ``payload.original_task_id``. This exercises the full claim
+    handler end to end so a regression in the seeding logic is caught.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Fix Inherit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Plan/research parent that both the create and fix task hang off of.
+    plan_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    # The original create task: child of the plan, holds the reservation.
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=plan_task.id,
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=create_task.id,
+        provisional_revision="0207",
+        provisional_down_revision="0205",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    # The fix task: SIBLING of the create task (parent is the plan, NOT the
+    # create task), carrying original_task_id pointing at the create task.
+    fix_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 42,
+                "original_task_id": str(create_task.id),
+            }
+        ],
+        parent_task_id=plan_task.id,
+        vm_instance_id="agent-vm-fix-inherit",
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    # Sanity: the parent walk alone never reaches the reservation holder, and the
+    # fix task has no reservation of its own.
+    assert fix_task.parent_task_id == plan_task.id
+    assert fix_task.parent_task_id != create_task.id
+
+    token = create_agent_token(str(fix_task.id), "agent-vm-fix-inherit")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0207",
+        "provisional_down_revision": "0205",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_review_task_inherits_reservation_via_review_loop_context(
+    client: AsyncClient, db_session
+):
+    """A review task inherits the reservation via context.review_loop.original_task_id.
+
+    Complements the fix-task test: the original_task_id is carried in
+    ``context['review_loop']`` (as review_pipeline propagates it) rather than the
+    payload, and the review task is again a sibling of the create task.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Review Inherit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = Task(project_id=project.id, payloads=[{"type": "plan"}])
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=plan_task.id,
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=create_task.id,
+        provisional_revision="0211",
+        provisional_down_revision="0209",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 7}],
+        context={"review_loop": {"original_task_id": str(create_task.id)}},
+        parent_task_id=plan_task.id,
+        vm_instance_id="agent-vm-review-inherit",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    token = create_agent_token(str(review_task.id), "agent-vm-review-inherit")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0211",
+        "provisional_down_revision": "0209",
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_session):
     """A task with no reservation omits the key (backward-compatible claim)."""
     project = Project(name="Agent Claim No Reservation", user_id="test-user-123")
@@ -328,7 +474,11 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     Tests an agent updating task status and creating an artifact.
     Also verifies that completing the last task completes the project.
     """
-    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    # VM deletion on task completion now uses fire_and_forget_vm_delete (a
+    # non-awaited background task) to avoid holding the DB FOR UPDATE lock
+    # through GCP I/O. Patch at the vm_lifecycle level so the assertion
+    # captures the synchronous call rather than racing a background asyncio task.
+    mock_fire_forget = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
 
     # Finite (non-autonomous) project: terminal-status aggregation only applies
     # to finite projects — live autonomous projects are never flipped to a
@@ -369,7 +519,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     await db_session.refresh(project)
     assert project.status == ProjectStatus.COMPLETED
 
-    mock_delete.assert_called_once_with("agent-vm-888")
+    mock_fire_forget.assert_called_once_with("agent-vm-888", reason="agent_completion")
 
 
 @pytest.mark.asyncio
@@ -519,6 +669,92 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     assert first.json()["data"]["id"] == second.json()["data"]["id"]
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact_status", "reason_code", "expected_aggregate", "expected_message"),
+    [
+        ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
+        ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
+        (None, None, "serving_confirmed", "waiting on required artifacts"),
+    ],
+)
+async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
+    client: AsyncClient,
+    db_session,
+    artifact_status,
+    reason_code,
+    expected_aggregate,
+    expected_message,
+):
+    project = Project(name="Agent Compute Live Proof Gate", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="backend_revision",
+                serving_status="serving_confirmed",
+                served_identifier="abc123",
+                served_at=datetime.utcnow(),
+            ),
+        ]
+    )
+    if artifact_status is not None:
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="agent_image",
+                serving_status=artifact_status,
+                reason_code=reason_code,
+            )
+        )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-live-proof",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-live-proof")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 412
+    detail = resp.json()["error"]["message"]
+    assert detail["error"] == "live_release_precondition_failed"
+    assert detail["reason"] == "release_not_serving_confirmed"
+    assert expected_message in detail["message"]
+    assert "agent_image" in detail["message"]
+    evidence = detail["live_release_evidence"]
+    assert evidence["release_version_number"] == 3
+    assert evidence["aggregate_serving_status"] == expected_aggregate
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
 
 
 @pytest.mark.asyncio
@@ -16617,6 +16853,13 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    # Keep this test focused on the back-merge commit contract; the new
+    # default-on second-opinion gate would otherwise park the review before the
+    # merge path under test runs.
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
 
     # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
     # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
@@ -19336,3 +19579,228 @@ async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
     )
     assert len(regs_after_stale) == 1, "stale callback must not create or remove registrations"
     assert regs_after_stale[0].delivery_state == reg_state_after_park
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /api/agent/tasks/{original_task_id}/reviewer-merge — self-merge path
+#
+# Automatic fresh-reviewer passes (enabled / lone-checker / incomplete-SR
+# recovery) run AFTER the primary code-change session posted its terminal
+# status. They self-merge their reviewer output back into the SAME task's
+# durable _self_review_outcome (token sub == original_task_id). See
+# agent/src/handlers/{standard,fresh-reviewer}.ts and
+# merge_operator_reviewer_findings in app/routers/agent.py.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _make_reviewer_merge_project(db_session) -> Project:
+    project = Project(name="Reviewer Merge Test", user_id="test-user-rm")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_session):
+    """A task self-merging its automatic fresh-reviewer output is authorized and
+    persists the supplied recovery origin onto _self_review_outcome and the
+    per-category check_results origin tags."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-self-merge",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Token subject == the task itself → self-merge authorization.
+    token = create_agent_token(str(task.id), "agent-vm-self-merge")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "description": "missed null check",
+                    "severity": "HIGH",
+                }
+            ],
+            "reviewer_edges_considered": [
+                {"case": "empty list", "handled": False}
+            ],
+            "reviewer_recovery_origin": "lone_checker_recovery",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["finding_count"] == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    sr = task.context["_self_review_outcome"]
+    assert len(sr["reviewer_findings"]) == 1
+    # Supplied recovery origin is stamped (not the operator default).
+    assert sr["reviewer_recovery_origin"] == "lone_checker_recovery"
+    assert sr["reviewer_edges_considered"] == [
+        {"case": "empty list", "handled": False}
+    ]
+    # The previously-passing self-attestation is overridden and tagged with the
+    # same recovery origin.
+    assert sr["check_results"]["correctness"]["passed"] is False
+    assert sr["check_results"]["correctness"]["origin"] == "lone_checker_recovery"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_self_merge_no_origin_uses_plain_reviewer(
+    client, db_session
+):
+    """A self-merge that supplies NO recovery origin (enabled path) tags findings
+    with a plain reviewer origin and leaves reviewer_recovery_origin unset — the
+    operator default must NOT leak into the self-merge path."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-self-enabled",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"security": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-self-enabled")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "security",
+                    "description": "unvalidated input",
+                    "severity": "MEDIUM",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    sr = task.context["_self_review_outcome"]
+    # No recovery origin recorded for the plain enabled path.
+    assert "reviewer_recovery_origin" not in sr
+    # A category that previously PASSED self-review → reviewer_disagreement.
+    assert sr["check_results"]["security"]["passed"] is False
+    assert sr["check_results"]["security"]["origin"] == "reviewer_disagreement"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_operator_path_no_origin_defaults_to_operator(
+    client, db_session
+):
+    """The legacy operator-requested request shape (no reviewer_recovery_origin
+    field) is byte-for-byte unchanged: it still defaults to
+    operator_requested_recovery."""
+    project = await _make_reviewer_merge_project(db_session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-orig",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    reviewer = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "review"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-op-rev",
+        context={"operator_requested_review_for": str(original.id)},
+    )
+    db_session.add(reviewer)
+    await db_session.commit()
+    await db_session.refresh(reviewer)
+
+    token = create_agent_token(str(reviewer.id), "agent-vm-op-rev")
+    resp = await client.post(
+        f"/api/agent/tasks/{original.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "description": "missed edge case",
+                    "severity": "HIGH",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    db_session.expire_all()
+    await db_session.refresh(original)
+    sr = original.context["_self_review_outcome"]
+    assert sr["reviewer_recovery_origin"] == "operator_requested_recovery"
+    assert (
+        sr["check_results"]["correctness"]["origin"]
+        == "operator_requested_recovery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
+    """A requesting task that is neither the target itself nor an operator-scoped
+    reviewer for it is rejected with 403."""
+    project = await _make_reviewer_merge_project(db_session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-target",
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    other = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "unrelated"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-unrelated",
+        context={"operator_requested_review_for": str(uuid.uuid4())},
+    )
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    token = create_agent_token(str(other.id), "agent-vm-unrelated")
+    resp = await client.post(
+        f"/api/agent/tasks/{original.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [],
+            "reviewer_recovery_origin": "lone_checker_recovery",
+        },
+    )
+    assert resp.status_code == 403

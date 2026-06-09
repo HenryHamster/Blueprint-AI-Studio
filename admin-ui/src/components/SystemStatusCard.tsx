@@ -2,6 +2,7 @@ import { AlertTriangle, CheckCircle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { timeAgo } from '../utils/time';
 import { splitConvergenceVerdict } from '../utils/convergenceVerdict';
+import { StrategicChallengeChip } from './StrategicChallengeChip';
 import type { DigestData } from './DashboardHome';
 
 export interface LatestCycle {
@@ -70,6 +71,9 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
                     <span className="text-violet-400" title="memos available / cited in last cycle">
                       {cycle.memos_available ?? 0} memo{(cycle.memos_available ?? 0) !== 1 ? 's' : ''} avail, {cycle.memos_cited ?? 0} cited
                     </span>
+                  )}
+                  {cycle.strategic_judgment_challenge && (
+                    <StrategicChallengeChip summary={cycle.strategic_judgment_challenge} />
                   )}
                 </div>
                 {cycle.summary_text && (

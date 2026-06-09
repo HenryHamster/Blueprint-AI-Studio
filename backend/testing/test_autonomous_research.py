@@ -130,6 +130,12 @@ def _patch_research_externals(mocker):
         "app.research_completion._apply_structural_actionability_downgrade",
         return_value=0,
     )
+    # Disable the adversarial spawn-gate (default-on) so existing tests that
+    # incidentally use high-risk findings are not parked awaiting the grader.
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        return_value=False,
+    )
 
 
 def _make_finding(
@@ -580,6 +586,61 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(db_session
 
     assert design_doc_mock.called or strategic_review_mock.called, (
         "backstop must spawn a strategic cycle even when all directions are paused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocker):
+    """Regression (strategic double-spawn): when a peer orchestrator instance holds
+    the per-project research-spawn advisory lock, the strategic-spawn path must be
+    skipped this tick rather than racing a second strategic cycle. Two instances
+    both passing the unlocked has_active_strategic check double-spawned strategic
+    reviews ~30s apart (and tripped the phase backstop into false failures); the
+    cross-instance lock guard closes that window. Complements
+    test_all_paused_directions_still_get_strategic_via_backstop, which proves the
+    same setup DOES spawn when the lock is free (its default in the test harness)."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    # Simulate a peer instance already holding the per-project spawn lock.
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=False),
+    )
+    project = Project(
+        name="Lock Held — No Double Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction("d-paused03", "Paused A"), "recommended_mode": "pause"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A stale strategic task makes the wall-clock backstop due (force_strategic).
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=200),
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not design_doc_mock.called and not strategic_review_mock.called, (
+        "strategic spawn must be skipped while a peer holds the research-spawn lock"
     )
 
 
@@ -3564,6 +3625,83 @@ async def test_child_task_has_research_task_as_parent(db_session, mocker):
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
     assert child_tasks[0].parent_task_id == task.id
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_finding_propagates_live_proof_contract(
+    db_session, mocker
+):
+    """Research-authored live-proof compute_experiment findings keep their markers.
+
+    The child payload must preserve the proof fields so the agent launcher can
+    enforce the live-release precondition instead of treating the job as
+    ordinary compute.
+    """
+    from app.shared_state import runtime_config
+
+    direction = _active_direction("d-liveproof1", "Live-proof direction")
+    project = Project(
+        name="Live Proof Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    prev_threshold = runtime_config.get("compute_experiment_spend_threshold_usd")
+    runtime_config["compute_experiment_spend_threshold_usd"] = 10.0
+    try:
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[
+                {
+                    **_make_finding(
+                        title="Prove the release is serving",
+                        direction_id=direction["id"],
+                        finding_type="benchmark",
+                    ),
+                    "command": "python live_proof.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "live_proof": True,
+                    "live_proof_marker": "research-live-proof",
+                    "live_release_proof": {
+                        "enabled": True,
+                        "marker": "research-live-proof",
+                    },
+                    "live_release_proof_marker": "research-live-proof",
+                    "requires_live_release": True,
+                }
+            ],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if prev_threshold is None:
+            runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+        else:
+            runtime_config["compute_experiment_spend_threshold_usd"] = prev_threshold
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    payload = child_tasks[0].first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload["live_proof"] is True
+    assert payload["live_proof_marker"] == "research-live-proof"
+    assert payload["live_release_proof"] == {
+        "enabled": True,
+        "marker": "research-live-proof",
+    }
+    assert payload["live_release_proof_marker"] == "research-live-proof"
+    assert payload["requires_live_release"] is True
 
 
 @pytest.mark.asyncio

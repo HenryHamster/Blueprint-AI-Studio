@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 
 import { DirectionProgressSection, type DirectionProgress } from './DirectionProgressSection';
 
@@ -37,6 +37,19 @@ describe('DirectionProgressSection proof split', () => {
 
     expect(screen.queryByText('0 proven')).not.toBeInTheDocument();
     expect(screen.queryByText('0 consumed')).not.toBeInTheDocument();
+  });
+});
+
+describe('DirectionProgressSection challenge telemetry', () => {
+  it('renders bounded challenge telemetry and hides empty/absent payloads', () => {
+    const { rerender } = render(<DirectionProgressSection directions={[makeDirection({ finding_challenge_summary: { challenged_findings: 3, agreement_distribution: { agrees: 1, disagrees: 1, indeterminate: 1 }, boundary_distribution: { reproduce_absent: 2, low_actionability_decay: 1, reproduce_indeterminate_dispatch: 0 }, fail_closed_unparseable: 1 } })]} />);
+    fireEvent.click(screen.getByRole('button', { name: /improve proof visibility/i }));
+    expect(screen.getByText(/Challenge: 3 findings/)).toBeInTheDocument();
+    expect(screen.getByText(/boundaries: reproduce_absent 2 · low_actionability_decay 1/)).toBeInTheDocument();
+    expect(screen.getByText(/confirmed\/not-confirmed\/indeterminate: 1\/1\/1/)).toBeInTheDocument();
+    expect(screen.getByText(/fail-closed 1/)).toBeInTheDocument();
+    rerender(<DirectionProgressSection directions={[makeDirection({ finding_challenge_summary: null }), makeDirection({ direction_id: 'dir-2', finding_challenge_summary: { challenged_findings: 0, agreement_distribution: { agrees: 0, disagrees: 0, indeterminate: 0 }, boundary_distribution: { reproduce_absent: 0, low_actionability_decay: 0, reproduce_indeterminate_dispatch: 0 }, fail_closed_unparseable: 0 } })]} />);
+    expect(screen.queryByText(/Challenge:/)).toBeNull();
   });
 });
 
@@ -131,5 +144,88 @@ describe('DirectionProgressSection retirement eligible', () => {
     );
 
     expect(screen.queryByText('retirement eligible')).not.toBeInTheDocument();
+  });
+});
+
+describe('DirectionProgressSection spawn gate', () => {
+  function expand() {
+    const btn = screen.getByRole('button', { name: /Improve proof visibility/ });
+    fireEvent.click(btn);
+  }
+
+  it('renders_research_spawn_gate_comparison — shows challenged/refuted/survived counts and merge rate comparison', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({
+          research_spawn_gate: {
+            challenged_count: 5,
+            refuted_count: 2,
+            survived_count: 3,
+            challenged_spawned: 3,
+            challenged_merged: 2,
+            challenged_merge_rate: 0.67,
+            unchallenged_spawned: 10,
+            unchallenged_merged: 4,
+            unchallenged_merge_rate: 0.40,
+          },
+        })]}
+      />,
+    );
+    expand();
+
+    const row = screen.getByText(/Spawn gate:/);
+    expect(row).toBeInTheDocument();
+    expect(row.textContent).toContain('5 challenged');
+    expect(row.textContent).toContain('2 refuted');
+    expect(row.textContent).toContain('3 survived');
+    expect(row.textContent).toContain('67% challenged');
+    expect(row.textContent).toContain('40% unchallenged');
+  });
+
+  it('omits spawn gate block when research_spawn_gate is null', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({ research_spawn_gate: null })]}
+      />,
+    );
+    expand();
+
+    expect(screen.queryByText(/Spawn gate:/)).not.toBeInTheDocument();
+  });
+
+  it('omits spawn gate block when research_spawn_gate field is absent (legacy payload)', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection()]}
+      />,
+    );
+    expand();
+
+    expect(screen.queryByText(/Spawn gate:/)).not.toBeInTheDocument();
+  });
+
+  it('renders em-dash for null merge rates when no spawned tasks exist yet', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({
+          research_spawn_gate: {
+            challenged_count: 3,
+            refuted_count: 1,
+            survived_count: 2,
+            challenged_spawned: 2,
+            challenged_merged: 0,
+            challenged_merge_rate: null,
+            unchallenged_spawned: 5,
+            unchallenged_merged: 0,
+            unchallenged_merge_rate: null,
+          },
+        })]}
+      />,
+    );
+    expand();
+
+    const row = screen.getByText(/Spawn gate:/);
+    expect(row.textContent).toContain('— challenged');
+    expect(row.textContent).toContain('— unchallenged');
   });
 });

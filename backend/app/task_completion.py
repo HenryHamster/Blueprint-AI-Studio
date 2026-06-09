@@ -15,6 +15,7 @@ import logging
 import random
 import re
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -85,6 +86,8 @@ logger = logging.getLogger(__name__)
 
 
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
+_COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
+_COMPUTE_WAKE_MAX_ATTEMPTS = 12
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -1299,6 +1302,11 @@ async def _maybe_release_safeguard_gate(
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
+    from app.task_evaluators import (
+        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        spawn_safeguard_challenge,
+    )
+
     safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
     if not safeguard_for_id:
         return
@@ -1315,10 +1323,47 @@ async def _maybe_release_safeguard_gate(
         )
         return
     if has_blocker:
-        logger.info(
-            f"[SAFEGUARD] Gate maintained on {safeguard_for_id[:8]} — critical/high findings"
-        )
-        return
+        _challenge_verdict = (safeguard_task.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+        if _challenge_verdict is not None:
+            outcome = (_challenge_verdict.get("outcome") or "confirmed").lower()
+            if outcome in ("rejected", "downgraded"):
+                # Challenge overrides the blocker — fall through to gate release.
+                logger.info(
+                    "[SAFEGUARD] Gate released on %s — challenge %s the finding: %s",
+                    safeguard_for_id[:8],
+                    outcome,
+                    _challenge_verdict.get("reasoning", ""),
+                )
+            else:
+                logger.info(
+                    "[SAFEGUARD] Gate maintained on %s — challenge confirmed critical/high finding",
+                    safeguard_for_id[:8],
+                )
+                return
+        elif _runtime_config.get("safeguard_challenge_enabled", False):
+            challenge = await spawn_safeguard_challenge(
+                safeguard_task, json.dumps(findings), session
+            )
+            if challenge is not None:
+                logger.info(
+                    "[SAFEGUARD] Gate decision parked for %s — challenge %s spawned",
+                    safeguard_for_id[:8],
+                    challenge.id,
+                )
+                return
+            # spawn returned None (already in flight) — maintain gate
+            logger.info(
+                "[SAFEGUARD] Gate maintained on %s — critical/high findings "
+                "(challenge already in flight)",
+                safeguard_for_id[:8],
+            )
+            return
+        else:
+            logger.info(
+                "[SAFEGUARD] Gate maintained on %s — critical/high findings",
+                safeguard_for_id[:8],
+            )
+            return
     orig.requires_approval = False
     pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
     orig_ctx = dict(orig.context or {})
@@ -2078,6 +2123,31 @@ async def _finalize_compute_experiment(
     )
 
 
+async def _clear_post_commit_marker(session: AsyncSession, registration) -> None:
+    """Remove post-commit retry keys from source_metadata and commit."""
+    marker = dict(registration.source_metadata or {})
+    marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+    marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
+    registration.source_metadata = marker
+    flag_modified(registration, "source_metadata")
+    session.add(registration)
+    await session.commit()
+
+
+async def _schedule_post_commit_backoff(
+    session: AsyncSession, registration, attempts: int
+) -> None:
+    """Write a next_retry_after backoff timestamp into source_metadata and commit."""
+    backoff_delta = timedelta(seconds=min(60 * 2 ** (attempts - 1), 3600))
+    next_retry_after = (_utcnow() + backoff_delta).isoformat()
+    marker = dict(registration.source_metadata or {})
+    marker[_COMPUTE_WAKE_NEXT_RETRY_KEY] = next_retry_after
+    registration.source_metadata = marker
+    flag_modified(registration, "source_metadata")
+    session.add(registration)
+    await session.commit()
+
+
 async def run_compute_wake_post_commit(session: AsyncSession, registration) -> bool:
     """Post-commit broadcast + durable knowledge for a wake-finalized compute task.
 
@@ -2090,7 +2160,11 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
 
     Strictly best-effort and fully self-contained: a no-op for any non-compute
     wake kind, and any failure is reported back as ``False`` so the sweep can
-    retry a delivered registration carrying the durable marker.
+    retry a delivered registration carrying the durable marker. Transient
+    failures write a ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` backoff timestamp so the
+    retry sub-pass skips this row until the window expires, preventing a failing
+    batch from starving newer marked rows. After ``_COMPUTE_WAKE_MAX_ATTEMPTS``
+    the marker is cleared and a WARNING is emitted.
     """
     from app.compute_jobs import (
         COMPUTE_JOB_TERMINAL_WAKE_KIND,
@@ -2103,14 +2177,30 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
     try:
         task = await session.get(Task, registration.task_id)
         if task is None:
+            # Permanent failure: task is gone; clear the marker so the row is
+            # not retried indefinitely.
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
             return False
         marker = dict(registration.source_metadata or {})
         marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
-        marker_meta["attempts"] = int(marker_meta.get("attempts", 0) or 0) + 1
+        attempts = int(marker_meta.get("attempts", 0) or 0) + 1
+        if attempts >= _COMPUTE_WAKE_MAX_ATTEMPTS:
+            logger.warning(
+                "[COMPUTE] Post-commit wake max attempts (%d) reached for task %s; clearing marker",
+                _COMPUTE_WAKE_MAX_ATTEMPTS,
+                registration.task_id,
+            )
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
+            return False
+        marker_meta["attempts"] = attempts
         marker_meta["updated_at"] = _utcnow().isoformat()
         if "started_at" not in marker_meta:
             marker_meta["started_at"] = marker_meta["updated_at"]
         marker[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = marker_meta
+        # Clear any stale next_retry_after now that we are actively attempting.
+        marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
         registration.source_metadata = marker
         flag_modified(registration, "source_metadata")
         session.add(registration)
@@ -2127,6 +2217,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
                     ComputeJob, uuid.UUID(str(registration.wake_source_ref))
                 )
         if job is None:
+            # Permanent failure: job is gone; clear the marker.
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
             return False
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
@@ -2134,9 +2227,13 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             task, logs, criterion, session
         )
         if not persisted:
+            # Transient failure: schedule a backoff retry.
+            with contextlib.suppress(Exception):
+                await _schedule_post_commit_backoff(session, registration, attempts)
             return False
         marker = dict(registration.source_metadata or {})
         marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+        marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
         registration.source_metadata = marker
         flag_modified(registration, "source_metadata")
         session.add(registration)
@@ -2148,6 +2245,14 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             getattr(registration, "task_id", None),
             exc_info=True,
         )
+        # Best-effort: rollback and schedule a backoff retry so the row is not
+        # retried every cycle, which would starve newer marked rows.
+        with contextlib.suppress(Exception):
+            await session.rollback()
+            marker = dict(registration.source_metadata or {})
+            marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
+            attempts = int(marker_meta.get("attempts", 0) or 0)
+            await _schedule_post_commit_backoff(session, registration, attempts)
         return False
 
 
@@ -2499,6 +2604,94 @@ def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ── Review second-opinion reconciliation ──────────────────────────────────
+# Context key on the REVIEW task holding the durable reconciliation record of a
+# primary verdict against its independent panel-review challenge. Exactly one of
+# four states (see ``reconcile_review_second_opinion``):
+#   unchallenged          gate off / not high-stakes (recorded inline, never here)
+#   challenged_confirmed  challenge upholds the verdict AND the surviving issues
+#   challenged_revised    same verdict direction, surviving issue set changed
+#   challenged_rejected   challenge overturns the verdict direction
+REVIEW_SECOND_OPINION_RECONCILIATION_KEY = "review_second_opinion"
+
+
+def _review_issue_signature(issue: Any) -> str:
+    """Stable identity for a review issue, for set comparison across reviewers."""
+    if not isinstance(issue, dict):
+        return str(issue).strip().lower()
+    desc = str(issue.get("description") or "").strip().lower()
+    file = str(issue.get("file") or "").strip().lower()
+    line = str(issue.get("line") or "").strip()
+    return f"{file}:{line}:{desc}"
+
+
+def reconcile_review_second_opinion(
+    primary_verdict: str,
+    primary_issues: List[Dict[str, Any]] | None,
+    panel: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reconcile a primary review verdict against a normalized panel challenge.
+
+    ``panel`` is the output of :func:`_parse_panel_review_output` (already
+    validated to carry ``overall_verdict`` ∈ {APPROVE, REQUEST_CHANGES}).
+
+    Returns a record with exactly one of three challenge states
+    (``challenged_confirmed`` / ``challenged_revised`` / ``challenged_rejected``
+    — the fourth, ``unchallenged``, is recorded inline by the gate and never
+    reaches this function) plus the reconciled verdict and the surviving /
+    agreed issue set downstream consumers act on.
+    """
+    primary_verdict = (
+        primary_verdict if primary_verdict in ("APPROVE", "REQUEST_CHANGES") else "REQUEST_CHANGES"
+    )
+    challenge_verdict = panel.get("overall_verdict")
+    if challenge_verdict not in ("APPROVE", "REQUEST_CHANGES"):
+        # Defensive: parser guarantees one of the two, but fail toward
+        # confirming the primary rather than inventing an overturn.
+        challenge_verdict = primary_verdict
+    challenge_issues = panel.get("issues")
+    challenge_issues = challenge_issues if isinstance(challenge_issues, list) else []
+
+    if challenge_verdict != primary_verdict:
+        # Challenge overturns the verdict direction.
+        state = "challenged_rejected"
+        reconciled_verdict = challenge_verdict
+        surviving = challenge_issues if challenge_verdict == "REQUEST_CHANGES" else []
+    elif primary_verdict == "APPROVE":
+        # Both APPROVE — no blocking issue set to compare.
+        state = "challenged_confirmed"
+        reconciled_verdict = "APPROVE"
+        surviving = []
+    else:
+        # Both REQUEST_CHANGES — compare the surviving issue set.
+        primary_sigs = {_review_issue_signature(i) for i in (primary_issues or [])}
+        challenge_sigs = {_review_issue_signature(i) for i in challenge_issues}
+        reconciled_verdict = "REQUEST_CHANGES"
+        if primary_sigs and primary_sigs == challenge_sigs:
+            state = "challenged_confirmed"
+            surviving = list(primary_issues or [])
+        else:
+            # Surviving set changed: keep the primary issues the challenge still
+            # upholds (intersection); fall back to the challenge's own set, then
+            # the primary's, so the fix is never spawned with an empty issue set.
+            agreed = [
+                i
+                for i in (primary_issues or [])
+                if _review_issue_signature(i) in challenge_sigs
+            ]
+            surviving = agreed or challenge_issues or list(primary_issues or [])
+            state = "challenged_revised"
+
+    return {
+        "state": state,
+        "primary_verdict": primary_verdict,
+        "challenge_verdict": challenge_verdict,
+        "reconciled_verdict": reconciled_verdict,
+        "surviving_issues": surviving,
+        "challenge_summary": str(panel.get("summary") or "")[:2000],
+    }
+
+
 async def _handle_panel_review_completion(
     task: Task, logs: str, session: AsyncSession
 ):
@@ -2815,53 +3008,6 @@ def _normalize_memo(obj: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _synthesize_memo_from_source_finding(
-    reasoning_kind: str,
-    sf: Dict[str, Any],
-    source_task_id: str,
-) -> Optional[Dict[str, Any]]:
-    """Synthesize a memo dict from dispatcher-provided source_finding without a model call.
-
-    Mirrors the agent-side _synthesizeDispatcherMemo logic. Returns None if
-    there is insufficient data to synthesize (falls back to VM path).
-    """
-    cite = [f"task:{source_task_id}"] if source_task_id else []
-    if reasoning_kind == "regression_false_positive":
-        vr = str(sf.get("verdict_reason") or "")
-        if not vr:
-            return None
-        parts = [f"Verdict reason: {vr}"]
-        inv = str(sf.get("investigation_summary") or "")
-        if inv:
-            parts.append(f"Investigation summary: {inv}")
-        rc = str(sf.get("regression_class") or "")
-        return {
-            "summary": vr[:200],
-            "reasoning": "\n\n".join(parts),
-            "citations": cite,
-            "tags": ["regression-false-positive"] + ([rc] if rc else []),
-        }
-    if reasoning_kind == "investigation_unactionable":
-        rc = str(sf.get("root_cause") or "")
-        sm = str(sf.get("summary") or "")
-        if not rc and not sm:
-            return None
-        parts = [f"Root cause: {rc}"] if rc else []
-        fx = str(sf.get("recommended_fix") or "")
-        if fx:
-            parts.append(f"Recommended fix: {fx}")
-        oc = str(sf.get("outcome") or "")
-        if oc:
-            parts.append(f"Outcome: {oc}")
-        return {
-            "summary": sm[:200] or f"Investigation concluded: {oc}",
-            "reasoning": "\n\n".join(parts),
-            "citations": cite,
-            "tags": ["investigation-unactionable"] + ([oc] if oc else []),
-        }
-    return None
-
-
 def _apply_synthesized_memo(
     memo_task: Task,
     memo: Dict[str, Any],
@@ -2886,6 +3032,8 @@ def _apply_synthesized_memo(
     po["memo"] = normalized
     memo_task.plan_output = po
     flag_modified(memo_task, "plan_output")
+    memo_task.vm_instance_id = None
+    memo_task.vm_provisioned_at = None
     memo_task.status = TaskStatus.COMPLETED
     memo_task.latest_status_message = (
         f"Memo recorded ({len(normalized['citations'])} citation(s), "
@@ -3168,6 +3316,9 @@ async def _handle_design_doc_completion(
     # never sticks on. Only a successful _spawn_strategic_review (which emits its
     # own Phase-2 started) is exempt — that keeps the cycle visibly active.
     phase2_spawned = False
+    phase1_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+        "strategic_cycle_id"
+    )
 
     if project is None:
         # Legacy / direct-caller path: acquire the lock here. Post-commit
@@ -3195,7 +3346,17 @@ async def _handle_design_doc_completion(
                 f"Design doc update failed: project not found (task {str(task.id)[:8]})",
             )
             # Phase 1 ended without chaining — close the cycle for the UI.
-            await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+            await emit_strategic_cycle_completed(
+                task.project_id,
+                task.id,
+                1,
+                cycle_id=phase1_cycle_id,
+                phase_state="failed",
+                completion={
+                    "status": "failed",
+                    "failure_reason": "project not found",
+                },
+            )
             return
         logger.warning(
             f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
@@ -3207,7 +3368,17 @@ async def _handle_design_doc_completion(
             f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred",
         )
         # Phase 1 ended without chaining — close the cycle for the UI.
-        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            1,
+            cycle_id=phase1_cycle_id,
+            phase_state="deferred",
+            completion={
+                "status": "deferred",
+                "status_message": "strategic chain deferred: project row contended",
+            },
+        )
         return
 
     doc = project.design_doc or {}
@@ -3225,7 +3396,7 @@ async def _handle_design_doc_completion(
     # Chain: spawn Phase 2 (strategic review)
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
-    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    cycle_id = phase1_cycle_id
     # Architecture-cycle operator steering: the pending refresh marker was
     # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
     # reads as operator-origin in vision. The flag was stamped on the task
@@ -3326,7 +3497,17 @@ async def _handle_design_doc_completion(
     # otherwise never paired. Emit completed so the indicator clears. A
     # successful spawn already emitted a Phase-2 started, so it is skipped.
     if not phase2_spawned:
-        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
+        await emit_strategic_cycle_completed(
+            task.project_id,
+            task.id,
+            1,
+            cycle_id=cycle_id,
+            phase_state="deferred",
+            completion={
+                "status": "deferred",
+                "status_message": task.latest_status_message,
+            },
+        )
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

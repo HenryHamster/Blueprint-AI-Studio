@@ -49,7 +49,7 @@ from app.task_capabilities import (
     strategic_phase_for,
 )
 import app.shared_state as _shared_state
-from app.broadcast import broadcast_to_project  # noqa: F401 — re-exported for test patching
+from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
@@ -357,10 +357,19 @@ async def _resolve_quality_grader_completion(
     through the re-entrant completion path. Resolves BOTH a COMPLETED and a
     FAILED grader (a FAILED grader fails closed) so the source never strands
     EVALUATING.
+
+    Adversarial mode: when the grader has ``adversarial_grader=True`` in its
+    context, the grader produced per-finding verdicts (not an artifact-level
+    pass/fail). The per-finding dict is written under ``ADVERSARIAL_GATE_VERDICT_KEY``
+    and the source is re-dispatched normally (the spawn loop will defer findings
+    whose hash maps to False in the verdict dict). Fail-open: absent hashes default
+    to pass so a crashed adversarial grader never blocks spawning.
     """
     from app.task_evaluators import (
+        ADVERSARIAL_GATE_VERDICT_KEY,
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
+        parse_adversarial_finding_verdicts,
         parse_grader_verdict,
     )
     from app.research_completion import _handle_research_completion
@@ -370,14 +379,9 @@ async def _resolve_quality_grader_completion(
         _handle_web_research_completion,
     )
 
+    is_adversarial = bool((grader.context or {}).get("adversarial_grader"))
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
-    verdict = parse_grader_verdict(grader_logs, completed=completed)
-    grader.latest_status_message = (
-        f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
-        f"{verdict.reason}"
-    )[:500]
-    session.add(grader)
 
     source_id = (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY)
     try:
@@ -405,13 +409,53 @@ async def _resolve_quality_grader_completion(
         return
 
     ctx = dict(source.context or {})
-    ctx[QUALITY_GRADER_VERDICT_KEY] = {
-        "passed": verdict.passed,
-        "reason": verdict.reason,
-        "grader_task_id": str(grader.id),
-        "strategy": "forward-quality",
-    }
-    ctx.pop("awaiting_quality_grader", None)
+    if is_adversarial:
+        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+        # Prefer hashes persisted at park time: these include prior_deferred
+        # findings that were prepended AFTER plan_output was written. Without
+        # this, a verdict for a recovered deferred finding is silently ignored
+        # (unknown hash) and that finding gets a fail-open pass on re-entry.
+        _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
+        if isinstance(_stored_hashes, list) and _stored_hashes:
+            all_hashes = [h for h in _stored_hashes if isinstance(h, str)]
+        else:
+            # Fallback for tasks parked before this fix.
+            stored_findings = source.plan_output or []
+            if isinstance(stored_findings, dict):
+                stored_findings = stored_findings.get("findings") or []
+            all_hashes = [
+                _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
+                for f in stored_findings
+                if isinstance(f, dict)
+            ]
+        finding_verdicts = parse_adversarial_finding_verdicts(
+            grader_logs, all_hashes, completed=completed
+        )
+        failed_count = sum(1 for v in finding_verdicts.values() if not v["passed"])
+        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
+            "finding_verdicts": finding_verdicts,
+            "grader_task_id": str(grader.id),
+        }
+        ctx.pop("awaiting_adversarial_grader", None)
+        grader.latest_status_message = (
+            f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "
+            f"finding(s) failed"
+        )[:500]
+    else:
+        verdict = parse_grader_verdict(grader_logs, completed=completed)
+        grader.latest_status_message = (
+            f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
+            f"{verdict.reason}"
+        )[:500]
+        ctx[QUALITY_GRADER_VERDICT_KEY] = {
+            "passed": verdict.passed,
+            "reason": verdict.reason,
+            "grader_task_id": str(grader.id),
+            "strategy": "forward-quality",
+        }
+        ctx.pop("awaiting_quality_grader", None)
+    session.add(grader)
     source.context = ctx
     flag_modified(source, "context")
     # Re-establish the terminal status the source originally reported before it
@@ -488,6 +532,381 @@ async def _resolve_quality_grader_completion(
         logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
 
 
+async def _resolve_safeguard_challenge_completion(
+    challenge: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Route a safeguard-challenge verdict back to the parked safeguard task.
+
+    The challenge (spawned by ``task_evaluators.spawn_safeguard_challenge``)
+    assessed a safeguard audit's critical/high finding.  Here we parse the
+    outcome ("confirmed" | "rejected" | "downgraded"), write it onto the
+    safeguard task's context as ``SAFEGUARD_CHALLENGE_VERDICT_KEY``, restore
+    the safeguard to COMPLETED, and re-invoke ``_maybe_release_safeguard_gate``
+    so the gate decision reflects the challenger's verdict.
+
+    Resolves BOTH a COMPLETED and a FAILED challenger (a failed challenge
+    fails closed: outcome="confirmed") so the safeguard never strands EVALUATING.
+    """
+    from app.task_evaluators import (
+        SAFEGUARD_CHALLENGE_SOURCE_KEY,
+        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        parse_safeguard_challenge_outcome,
+    )
+    from app.task_completion import _maybe_release_safeguard_gate
+
+    completed = payload.status == TaskStatus.COMPLETED
+    challenge_logs = payload.logs or challenge.latest_status_message or ""
+    verdict = parse_safeguard_challenge_outcome(challenge_logs, completed=completed)
+
+    challenge.latest_status_message = (
+        f"Safeguard challenge: {verdict['outcome']} — {verdict['reasoning']}"
+    )[:500]
+    session.add(challenge)
+
+    source_id = (challenge.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    safeguard = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if safeguard is None:
+        await session.commit()
+        logger.warning(
+            "[SAFEGUARD] Safeguard task %s for challenge %s is gone; verdict dropped",
+            source_id,
+            challenge.id,
+        )
+        return
+
+    ctx = dict(safeguard.context or {})
+    ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY] = {
+        "outcome": verdict["outcome"],
+        "reasoning": verdict["reasoning"],
+        "challenge_task_id": str(challenge.id),
+    }
+    ctx.pop("awaiting_safeguard_challenge", None)
+    safeguard.context = ctx
+    flag_modified(safeguard, "context")
+    # Restore terminal status so _maybe_release_safeguard_gate sees a resolved task.
+    safeguard.status = TaskStatus.COMPLETED
+    session.add(safeguard)
+    await session.commit()
+
+    # Re-read findings from the stored plan_output and re-invoke the gate function.
+    _plan_output = safeguard.plan_output
+    if isinstance(_plan_output, dict) and isinstance(_plan_output.get("findings"), list):
+        findings = _plan_output["findings"]
+    elif isinstance(_plan_output, list):
+        findings = _plan_output
+    else:
+        findings = None
+
+    await _maybe_release_safeguard_gate(safeguard, findings, session)
+
+    logger.info(
+        "[SAFEGUARD] Challenge %s resolved safeguard %s with outcome=%s",
+        challenge.id,
+        safeguard.id,
+        verdict["outcome"],
+    )
+
+
+async def _resolve_review_second_opinion(
+    challenger: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Resolve an independent panel-review challenge and reconcile it.
+
+    The challenger (spawned by
+    ``task_evaluators.spawn_review_second_opinion``) ran an independent
+    multi-lens panel review of the same PR. Here we parse its verdict,
+    reconcile it against the parked primary verdict, persist a durable
+    reconciliation record on the review task's context, and re-dispatch the
+    review task through the normal finalization path with the reconciled
+    verdict. Fail-closed: if the challenge FAILED or its output is
+    unparseable, do NOT merge or spawn.
+    """
+    from app.task_evaluators import (
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_AWAITING_KEY,
+        REVIEW_SECOND_OPINION_PARKED_KEY,
+    )
+    from app.task_completion import (
+        _parse_panel_review_output,
+        reconcile_review_second_opinion,
+        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    )
+    from app.broadcast import broadcast_to_project
+
+    source_id = (challenger.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    review = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if review is None:
+        await session.commit()
+        logger.warning(
+            "[REVIEW SECOND-OPINION] Review task %s for challenger %s is gone; verdict dropped",
+            source_id,
+            challenger.id,
+        )
+        return
+
+    parked = (review.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
+    primary_verdict = parked.get("verdict") or "REQUEST_CHANGES"
+    primary_issues = parked.get("issues") or []
+
+    completed = payload.status == TaskStatus.COMPLETED
+    panel = (
+        _parse_panel_review_output(
+            payload.logs or challenger.latest_status_message or ""
+        )
+        if completed
+        else None
+    )
+
+    if panel is None:
+        original_task_id = parked.get("original_task_id") or ""
+        ctx = dict(review.context or {})
+        ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+        ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
+            "state": "unchallenged",
+            "escalated": True,
+            "reason": (
+                "second-opinion challenge failed or produced an unparseable "
+                "verdict — escalated to manual review"
+            ),
+            "primary_verdict": primary_verdict,
+            "challenger_task_id": str(challenger.id),
+        }
+        ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
+        review.context = ctx
+        flag_modified(review, "context")
+        review.status = TaskStatus.COMPLETED
+        review.latest_status_message = (
+            "Second-opinion challenge unresolved — manual review required; "
+            "no merge or fix spawned"
+        )[:500]
+        session.add(review)
+        challenger.latest_status_message = (
+            "Second-opinion panel review failed/unparseable — review escalated"
+        )[:500]
+        session.add(challenger)
+        if original_task_id:
+            try:
+                orig = await session.get(Task, uuid.UUID(original_task_id))
+                if orig:
+                    orig.requires_approval = True
+                    orig.latest_status_message = (
+                        "Second-opinion review challenge unresolved — manual "
+                        "review required"
+                    )[:500]
+                    session.add(orig)
+            except (ValueError, TypeError):
+                pass
+        await session.commit()
+        logger.warning(
+            "[REVIEW SECOND-OPINION] Challenge %s for review %s failed/unparseable — fail-closed escalation, no action taken",
+            challenger.id,
+            review.id,
+        )
+        try:
+            await broadcast_to_project(
+                str(review.project_id),
+                "task_updated",
+                {"task_id": str(review.id), "status": review.status},
+            )
+        except Exception:
+            logger.debug(
+                "[REVIEW SECOND-OPINION] broadcast after escalation failed",
+                exc_info=True,
+            )
+        return
+
+    record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
+    record["challenger_task_id"] = str(challenger.id)
+
+    ctx = dict(review.context or {})
+    ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
+    ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+    review.context = ctx
+    flag_modified(review, "context")
+    review.status = TaskStatus.COMPLETED
+    session.add(review)
+    challenger.latest_status_message = (
+        f"Second-opinion panel: {record['state']} "
+        f"→ {record['reconciled_verdict']}"
+    )[:500]
+    session.add(challenger)
+    await session.commit()
+
+    reconstructed = AgentStatusPayload(
+        task_id=review.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json=json.dumps(
+            {
+                "verdict": record["reconciled_verdict"],
+                "issues": record.get("surviving_issues", []),
+                "feedback": parked.get("feedback", ""),
+                "investigated_files": parked.get("investigated_files", []),
+            }
+        ),
+    )
+    logger.info(
+        "[REVIEW SECOND-OPINION] Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        challenger.id,
+        review.id,
+        record["state"],
+        primary_verdict,
+        record["reconciled_verdict"],
+    )
+    await _process_post_commit(review.id, reconstructed)
+
+
+async def _resolve_finding_challenge_completion(
+    challenge: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Route a per-finding challenge side-car's second opinion back to its source.
+
+    The side-car (spawned by ``task_evaluators.spawn_finding_challenge``) gave an
+    independent second opinion on a single high-stakes research-finding verdict.
+    Here we parse that opinion into a ``FindingChallengeRecord`` (fail-closed:
+    unparseable/incomplete → ``agreement="indeterminate"``, which preserves the
+    original verdict), write it onto the parked source under
+    ``FINDING_CHALLENGE_VERDICT_KEY``, restore the source's terminal status, and
+    re-dispatch the source to its registry completion handler so the
+    drop/dispatch decision runs with the second opinion in hand. Resolves BOTH a
+    COMPLETED and a FAILED side-car so the source never strands EVALUATING.
+    """
+    from app.task_evaluators import (
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
+        parse_finding_challenge_verdict,
+    )
+    from app.research_completion import _handle_research_completion
+
+    completed = payload.status == TaskStatus.COMPLETED
+    challenge_logs = payload.logs or challenge.latest_status_message or ""
+    cctx = challenge.context or {}
+    boundary = str(cctx.get("challenged_boundary") or "")
+    first_verdict = str(cctx.get("challenged_first_verdict") or "")
+    source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
+    record = parse_finding_challenge_verdict(
+        challenge_logs,
+        first_verdict,
+        boundary,
+        str(challenge.id),
+        completed=completed,
+        source_task_id=str(source_id) if source_id else None,
+    )
+    challenge.latest_status_message = (
+        f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
+    )[:500]
+    session.add(challenge)
+
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    source = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if source is None:
+        await session.commit()
+        logger.warning(
+            "[CHALLENGE] Source task %s for challenge %s is gone; verdict dropped",
+            source_id,
+            challenge.id,
+        )
+        return
+
+    ctx = dict(source.context or {})
+    ctx[FINDING_CHALLENGE_VERDICT_KEY] = record.to_context()
+    ctx.pop("awaiting_finding_challenge", None)
+    source.context = ctx
+    flag_modified(source, "context")
+    source.status = TaskStatus.COMPLETED
+    session.add(source)
+    await session.commit()
+
+    _resume_handlers = {
+        "research": _handle_research_completion,
+    }
+    source_type = (source.first_payload or {}).get("type")
+    cap = get_task_capability(source_type)
+    handler = (
+        _resume_handlers.get(cap.completion_handler)
+        if cap and cap.completion_handler
+        else None
+    )
+    if handler is not None:
+        if isinstance(source.plan_output, list):
+            resume_logs = json.dumps(source.plan_output)
+        elif isinstance(source.plan_output, dict) and isinstance(
+            source.plan_output.get("findings"), list
+        ):
+            resume_logs = json.dumps(source.plan_output["findings"])
+        else:
+            resume_logs = source.latest_status_message or ""
+        await handler(source, resume_logs, session)
+    else:
+        logger.warning(
+            "[CHALLENGE] No resume handler for source type %r (task %s); verdict recorded but source not re-dispatched",
+            source_type,
+            source.id,
+        )
+    await session.commit()
+
+    _source_id_str = str(source.id)
+    _source_project_id_str = str(source.project_id)
+    _source_status = source.status
+    if source.parent_task_id:
+        try:
+            await _check_and_trigger_rollup(source, session)
+        except Exception:
+            logger.error(
+                "[CHALLENGE] rollup after challenge failed for %s",
+                _source_id_str,
+                exc_info=True,
+            )
+            await session.rollback()
+    try:
+        await broadcast_to_project(
+            _source_project_id_str,
+            "task_updated",
+            {"task_id": _source_id_str, "status": _source_status},
+        )
+    except Exception:
+        logger.debug("[CHALLENGE] broadcast after challenge failed", exc_info=True)
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -500,7 +919,7 @@ async def _process_post_commit(
     _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
     from app.time_utils import _utcnow
-    from app.broadcast import broadcast_to_project  # noqa: F811
+    from app.broadcast import broadcast_to_project
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
     from app.github import (
@@ -707,6 +1126,19 @@ async def _process_post_commit(
             flag_modified(task, "context")
             session.add(task)
 
+        # Safeguard-challenge side-car: an independent challenger spawned by
+        # ``_maybe_release_safeguard_gate`` carries SAFEGUARD_CHALLENGE_SOURCE_KEY
+        # pointing at the safeguard task whose gate decision it challenges.
+        # Handled BEFORE the quality-grader check so a challenge task is never
+        # mis-routed as a quality-grader completion, and before the
+        # COMPLETED-gated pipeline so even a FAILED challenger resolves
+        # fail-closed rather than stranding the safeguard EVALUATING forever.
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+
+        if (task.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY):
+            await _resolve_safeguard_challenge_completion(task, payload, session)
+            return {"status": "accepted"}
+
         # Forward-quality grader side-car: an independent grader spawned by the
         # forward-quality escalation carries QUALITY_GRADER_SOURCE_KEY pointing
         # at the source task it grades. Its completion does NOT flow through the
@@ -714,10 +1146,37 @@ async def _process_post_commit(
         # and route it back to the parked source, then return. Handled here —
         # before the COMPLETED-gated pipeline — so even a FAILED grader resolves
         # the source (fail-closed) rather than stranding it EVALUATING forever.
-        from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+        from app.task_evaluators import (
+            FINDING_CHALLENGE_SOURCE_KEY,
+            QUALITY_GRADER_SOURCE_KEY,
+        )
 
         if (task.context or {}).get(QUALITY_GRADER_SOURCE_KEY):
             await _resolve_quality_grader_completion(task, payload, session)
+            return {"status": "accepted"}
+
+        # Per-finding challenge side-car: an independent second opinion spawned by
+        # task_evaluators.spawn_finding_challenge carries FINDING_CHALLENGE_SOURCE_KEY
+        # pointing at the source research task. Resolve it the same way (before the
+        # COMPLETED-gated pipeline) so even a FAILED side-car resolves the source
+        # fail-closed rather than stranding it EVALUATING forever.
+        if (task.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY):
+            await _resolve_finding_challenge_completion(task, payload, session)
+            return {"status": "accepted"}
+
+        # Review second-opinion challenger side-car: a panel_review task spawned
+        # by the second-opinion gate carries REVIEW_SECOND_OPINION_SOURCE_KEY
+        # pointing at the parked ordinary review task. Its completion resolves
+        # the challenge and re-dispatches the review with the reconciled verdict
+        # — it does NOT flow through the panel_review completion handler, and
+        # (critically) it never re-enters the review-finalization branch, so the
+        # challenger can never recursively re-trigger the gate. Handled before
+        # the COMPLETED-gated pipeline so a FAILED challenger fails closed
+        # (escalates) rather than stranding the review EVALUATING.
+        from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
+
+        if (task.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY):
+            await _resolve_review_second_opinion(task, payload, session)
             return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
@@ -1218,7 +1677,7 @@ async def _process_post_commit(
                                             ),
                                             project_id=str(task.project_id),
                                         )
-                                    except Exception as _mf_exc:  # noqa: BLE001
+                                    except Exception as _mf_exc:
                                         logger.warning(
                                             "[PIPELINE] Migration finalization attempt "
                                             "failed for PR #%s: %s",
@@ -1228,7 +1687,7 @@ async def _process_post_commit(
                                         )
                                         _finalization = None
                                     if _finalization is not None:
-                                        from app.task_completion import (  # noqa: PLC0415
+                                        from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
 
@@ -1318,7 +1777,7 @@ async def _process_post_commit(
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
                             try:
-                                from app.task_completion import (  # noqa: PLC0415
+                                from app.task_completion import (
                                     _finalize_migration_reservation_after_merge,
                                 )
 
@@ -1327,7 +1786,7 @@ async def _process_post_commit(
                                     session,
                                     terminal_merge=not is_intermediate,
                                 )
-                            except Exception as _mr_exc:  # noqa: BLE001
+                            except Exception as _mr_exc:
                                 logger.warning(
                                     "[MIGRATION] Failed to finalize reservation for "
                                     "merged task %s: %r",
@@ -1361,7 +1820,7 @@ async def _process_post_commit(
                             if _record_pr_merged:
                                 await _mark_dependents_warm_claimable(task)
                                 try:
-                                    from app.reaper_sweeps import (  # noqa: PLC0415
+                                    from app.reaper_sweeps import (
                                         event_driven_unblock_dependents,
                                     )
 
@@ -2078,6 +2537,106 @@ async def _process_post_commit(
                                 exc_info=True,
                             )
 
+                # ── Default-on second-opinion gate ──────────────────────────
+                # Before a high-stakes ordinary review verdict commits (an
+                # APPROVE→merge or a REQUEST_CHANGES→fix), require an independent
+                # panel_review challenge and reconcile it against this primary
+                # verdict. Default-on; operator rollback via the
+                # ``review_second_opinion_gate_enabled`` runtime flag restores
+                # today's synchronous behavior and records ``unchallenged``.
+                #
+                # Re-entry: once the challenge has reconciled, the review task
+                # carries the reconciliation record. That record (a) overrides
+                # ``verdict``/``issues`` with the reconciled, surviving set and
+                # (b) suppresses re-spawning the gate (single-shot), so the rest
+                # of this branch runs exactly once more with the reconciled
+                # verdict and every downstream gate unchanged.
+                from app.task_completion import (
+                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+                )
+                from app.task_evaluators import (
+                    review_is_high_stakes,
+                    spawn_review_second_opinion,
+                )
+
+                _recon_record = (task.context or {}).get(
+                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+                )
+                if _recon_record is not None:
+                    # Re-entrant pass after reconciliation: adopt the reconciled
+                    # verdict + surviving issue set, then fall through to the
+                    # normal action branches without re-evaluating the gate.
+                    _reconciled = _recon_record.get("reconciled_verdict")
+                    if _reconciled in ("APPROVE", "REQUEST_CHANGES"):
+                        verdict = _reconciled
+                    _surviving = _recon_record.get("surviving_issues")
+                    if isinstance(_surviving, list):
+                        issues = _surviving
+                elif not verdict_unparseable and _runtime_config.get(
+                    "review_second_opinion_gate_enabled", True
+                ):
+                    if review_is_high_stakes(
+                        verdict, issues, investigated_files, task
+                    ):
+                        _challenger = await spawn_review_second_opinion(
+                            task,
+                            session,
+                            verdict=verdict,
+                            issues=issues,
+                            feedback=feedback,
+                            pr_number=pr_number,
+                            branch=branch,
+                            base_branch=base_branch,
+                            original_task_id=original_task_id,
+                            original_prompt=original_prompt,
+                            investigated_files=investigated_files,
+                        )
+                        if _challenger is not None:
+                            logger.info(
+                                "[REVIEW PIPELINE] PR #%s: parked review %s "
+                                "awaiting second-opinion challenge %s "
+                                "(primary verdict=%s) — not acting yet",
+                                pr_number,
+                                task.id,
+                                _challenger.id,
+                                verdict,
+                            )
+                            return {"status": "accepted"}
+                        # spawn refused: a challenge is already in flight. Stay
+                        # parked rather than act on the unreconciled verdict.
+                        if (task.context or {}).get(
+                            "awaiting_review_second_opinion"
+                        ):
+                            return {"status": "accepted"}
+                    else:
+                        # Gate on but verdict not high-stakes — proceed
+                        # synchronously and record the unchallenged outcome.
+                        task.context = {
+                            **(task.context or {}),
+                            REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                                "state": "unchallenged",
+                                "reason": "verdict not high-stakes",
+                                "primary_verdict": verdict,
+                                "reconciled_verdict": verdict,
+                                "surviving_issues": issues,
+                            },
+                        }
+                        session.add(task)
+                elif not verdict_unparseable:
+                    # Gate disabled — preserve today's synchronous behavior and
+                    # record the unchallenged outcome.
+                    task.context = {
+                        **(task.context or {}),
+                        REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                            "state": "unchallenged",
+                            "reason": "second-opinion gate disabled",
+                            "primary_verdict": verdict,
+                            "reconciled_verdict": verdict,
+                            "surviving_issues": issues,
+                        },
+                    }
+                    session.add(task)
+
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(
@@ -2670,7 +3229,7 @@ async def _process_post_commit(
                                                 project_id=str(task.project_id),
                                             )
                                         )
-                                    except Exception as _mf_exc:  # noqa: BLE001
+                                    except Exception as _mf_exc:
                                         logger.warning(
                                             "[CI] Migration finalization attempt failed "
                                             "for PR #%s: %s",
@@ -2680,7 +3239,7 @@ async def _process_post_commit(
                                         )
                                         _finalization = None
                                     if _finalization is not None:
-                                        from app.task_completion import (  # noqa: PLC0415
+                                        from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
 
@@ -2861,7 +3420,7 @@ async def _process_post_commit(
                                                 ),
                                             )
                                         try:
-                                            from app.task_completion import (  # noqa: PLC0415
+                                            from app.task_completion import (
                                                 _finalize_migration_reservation_after_merge,
                                             )
 
@@ -2871,7 +3430,7 @@ async def _process_post_commit(
                                                 source_task=task,
                                                 terminal_merge=_terminal_rollup_merge,
                                             )
-                                        except Exception as _mr_exc:  # noqa: BLE001
+                                        except Exception as _mr_exc:
                                             logger.warning(
                                                 "[MIGRATION] Failed to finalize "
                                                 "reservation for merged task %s: %r",
@@ -3045,7 +3604,7 @@ async def _process_post_commit(
                                         if _record_pr_merged:
                                             await _mark_dependents_warm_claimable(orig)
                                             try:
-                                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                                from app.reaper_sweeps import (
                                                     event_driven_unblock_dependents,
                                                 )
 
@@ -3744,7 +4303,7 @@ async def _process_post_commit(
                             )
                         if _orig_to_refresh is not None:
                             try:
-                                from app.reaper_sweeps import (  # noqa: PLC0415
+                                from app.reaper_sweeps import (
                                     event_driven_unblock_dependents,
                                 )
 
@@ -4517,7 +5076,7 @@ async def _process_post_commit(
             if task is None:
                 return {"status": "accepted"}
         try:
-            from app.task_completion import (  # noqa: PLC0415
+            from app.task_completion import (
                 _expire_migration_reservation_if_terminal,
             )
 
@@ -4632,9 +5191,12 @@ async def _process_post_commit(
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
         all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
         executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
-        # A PARKED task is live work waiting on an external wake; it released its
-        # VM on park (vm_instance_id=None) so it is invisible to
-        # ``executable_statuses``. Without this guard a finite project could
+        # A PARKED task is live work waiting on an external wake; park_task
+        # clears vm_instance_id=None on park, so it is already invisible to
+        # ``executable_statuses``. This guard provides defence-in-depth: without
+        # it, any PARKED task that somehow retained a vm_instance_id (e.g. in a
+        # future code path that parks without calling park_task) would still be
+        # excluded. Without this guard a finite project could
         # converge COMPLETED/FAILED while a parked child is still waiting to be
         # woken — an early-converge. Treat any live PARKED child as in-flight so
         # the all-terminal guard below cannot trip while one exists.
@@ -4768,12 +5330,26 @@ async def _process_post_commit(
                 from app import strategic_cycle
 
                 cycle_row = await strategic_cycle.get(session, cycle_id)
-                if (
-                    cycle_row is not None
-                    and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES
-                ):
-                    task_type = task.first_payload.get("type", "")
-                    failed_phase = strategic_phase_for(task_type) or "phase2"
+                task_type = task.first_payload.get("type", "")
+                failed_phase = strategic_phase_for(task_type) or "phase2"
+                # Only backstop when the cycle is still stuck in THIS task's OWN
+                # phase — i.e. the completion handler genuinely failed to advance
+                # it. A successful phase-1 (design_doc_update) chains phase-2 and
+                # leaves the cycle in phase2_running; that is success, not a stall,
+                # and must NOT be marked failed_phase1. Marking it failed inflated
+                # _strategic_failures toward the circuit breaker and polluted the
+                # success metric — the source of the false "strategic review
+                # complete … but FAILED" reports. (The genuine catch — a task that
+                # went terminal while its OWN phase's running outcome never
+                # advanced — is preserved.)
+                _stuck_outcomes = {
+                    "phase1": {
+                        strategic_cycle.OUTCOME_IN_PROGRESS,
+                        strategic_cycle.OUTCOME_PHASE1_RUNNING,
+                    },
+                    "phase2": {strategic_cycle.OUTCOME_PHASE2_RUNNING},
+                }.get(failed_phase, frozenset())
+                if cycle_row is not None and cycle_row.outcome in _stuck_outcomes:
                     logger.warning(
                         f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
                         f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"
@@ -4860,6 +5436,13 @@ async def _process_post_commit(
                 task.project_id,
                 task.id,
                 1 if _peek_strategic_type == "design_doc_update" else 2,
+                cycle_id=task.strategic_cycle_id
+                or (task.context or {}).get("strategic_cycle_id"),
+                phase_state="failed",
+                completion={
+                    "status": getattr(payload.status, "value", str(payload.status)),
+                    "status_message": task.latest_status_message,
+                },
             )
 
         return {
@@ -5142,6 +5725,7 @@ async def park_task(
     task.parked_at = now
     task.park_reason = (reason or f"waiting on {wake_source_kind}")[:2000]
     task.vm_stopped_at = now
+    task.vm_instance_id = None
 
     reg = TaskWakeRegistration(
         task_id=task.id,
@@ -5279,7 +5863,10 @@ async def deliver_wake(
     ):
         from app.compute_jobs import build_compute_result_logs
         from app.models import ComputeJob
-        from app.task_completion import _handle_compute_experiment_completion
+        from app.task_completion import (
+            _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+            _handle_compute_experiment_completion,
+        )
 
         job = None
         if registration.wake_source_ref:
@@ -5327,6 +5914,15 @@ async def deliver_wake(
         await _handle_compute_experiment_completion(
             task, logs, session, owns_commit=False
         )
+        # Seed the recoverability marker atomically with the FIRED→DELIVERED commit
+        # so a crash ANYWHERE after this point still leaves a marker for the retry
+        # pass in sweep_deliver_task_wakes to pick up and re-attempt the post-commit
+        # side effects (operator broadcast + durable KnowledgeDocument).
+        _meta = dict(registration.source_metadata or {})
+        _meta[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = {}
+        registration.source_metadata = _meta
+        flag_modified(registration, "source_metadata")
+        session.add(registration)
         return True
 
     if action == WakeAction.FINALIZE:
@@ -5401,18 +5997,112 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
     registration.result_state = "expired"
     registration.delivered_at = now
     if task is not None and task.status == TaskStatus.PARKED:
+        from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+
+        failure_detail = None
+        diagnostics = None
+        if registration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND:
+            from app.models import ComputeJob
+
+            job = None
+            if registration.wake_source_ref:
+                with contextlib.suppress(ValueError, TypeError):
+                    job = await session.get(
+                        ComputeJob, uuid.UUID(registration.wake_source_ref)
+                    )
+            deadline_at = registration.deadline_at
+            job_completed_at = job.completed_at if job is not None else None
+            job_started_at = job.started_at if job is not None else None
+            job_created_at = job.created_at if job is not None else None
+            job_status = getattr(job.status, "value", job.status) if job else None
+            job_terminal_by_deadline = bool(
+                job is not None
+                and job_completed_at is not None
+                and deadline_at is not None
+                and job_completed_at <= deadline_at
+            )
+            # Provisioning vs execution split: how much of the deadline was spent
+            # waiting for the job to start (provisioning) vs actually running.
+            # Clamped to 0 to guard against clock-skew or backdated test fixtures.
+            provisioning_seconds: float | None = None
+            execution_seconds: float | None = None
+            if job_created_at is not None and deadline_at is not None:
+                if job_started_at is not None:
+                    provisioning_seconds = max(
+                        0.0,
+                        round((job_started_at - job_created_at).total_seconds(), 1),
+                    )
+                    execution_seconds = max(
+                        0.0,
+                        round((deadline_at - job_started_at).total_seconds(), 1),
+                    )
+                else:
+                    # Job never reached running state — all budget went to provisioning.
+                    provisioning_seconds = max(
+                        0.0,
+                        round((deadline_at - job_created_at).total_seconds(), 1),
+                    )
+            diagnostics = {
+                "wake_source_kind": registration.wake_source_kind,
+                "wake_source_ref": registration.wake_source_ref,
+                "requested_at": registration.requested_at.isoformat(),
+                "claimed_at": (
+                    registration.claimed_at.isoformat()
+                    if registration.claimed_at
+                    else None
+                ),
+                "fired_at": (
+                    registration.fired_at.isoformat() if registration.fired_at else None
+                ),
+                "deadline_at": deadline_at.isoformat() if deadline_at else None,
+                "job_status": job_status,
+                "job_created_at": job_created_at.isoformat() if job_created_at else None,
+                "job_started_at": job_started_at.isoformat() if job_started_at else None,
+                "job_completed_at": (
+                    job_completed_at.isoformat() if job_completed_at else None
+                ),
+                "job_terminal_by_deadline": job_terminal_by_deadline,
+                "provisioning_seconds": provisioning_seconds,
+                "execution_seconds": execution_seconds,
+            }
+            if job_terminal_by_deadline:
+                failure_detail = "compute_job_terminal_wake_lost_after_job_completed"
+                task.latest_status_message = (
+                    "Park wake on compute_job_terminal expired after the job "
+                    "completed, but the wake never fired before the deadline "
+                    f"(job_completed_at={diagnostics['job_completed_at']}, "
+                    f"deadline_at={diagnostics['deadline_at']}, "
+                    f"requested_at={diagnostics['requested_at']}, "
+                    f"fired_at={diagnostics['fired_at']})"
+                )[:500]
+            else:
+                failure_detail = "compute_job_terminal_job_not_terminal_by_deadline"
+                task.latest_status_message = (
+                    "Park wake on compute_job_terminal expired before the job "
+                    "reached terminal state "
+                    f"(job_status={diagnostics['job_status']}, "
+                    f"job_completed_at={diagnostics['job_completed_at']}, "
+                    f"deadline_at={diagnostics['deadline_at']}, "
+                    f"requested_at={diagnostics['requested_at']}, "
+                    f"fired_at={diagnostics['fired_at']})"
+                )[:500]
+        else:
+            task.latest_status_message = (
+                f"Park wake on {registration.wake_source_kind} timed out at deadline"
+            )[:500]
         task.status = TaskStatus.FAILED
         task.parked_at = None
         # Clear park_reason too so an expired task carries no stale "Parked …"
         # marker on operator surfaces — the task is now FAILED, not parked.
         task.park_reason = None
-        task.latest_status_message = (
-            f"Park wake on {registration.wake_source_kind} timed out at deadline"
-        )[:500]
         ctx = dict(task.context or {})
         ctx["failure_category"] = "park_wake_timeout"
         ctx["failure_class"] = "park_wake_timeout"
+        if failure_detail is not None:
+            ctx["failure_detail"] = failure_detail
+            ctx["park_wake_timeout_diagnostics"] = diagnostics
         task.context = ctx
+        registration.result_detail = task.latest_status_message
         with contextlib.suppress(Exception):
             from app.jwt_revocation import emit_task_terminated_notify
 

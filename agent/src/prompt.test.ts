@@ -4174,6 +4174,11 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — cross-system-contract category', () =>
 
 // ── TASK_TYPE_HINTS dispatch parity ───────────────────────────────────────
 describe('TASK_TYPE_HINTS dispatch parity', () => {
+  it('keeps release_audit_challenge opted out of generic hints', () => {
+    expect(TASK_TYPES_WITHOUT_HINT.has('release_audit_challenge')).toBe(true);
+    expect(TASK_TYPE_HINTS).not.toHaveProperty('release_audit_challenge');
+  });
+
   it('ensures every handler dispatch key is either in TASK_TYPE_HINTS or in TASK_TYPES_WITHOUT_HINT', () => {
     const dispatchKeys = Object.keys(handlers).sort();
     const hintsKeys = Object.keys(TASK_TYPE_HINTS);

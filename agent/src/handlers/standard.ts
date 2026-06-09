@@ -650,7 +650,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       statusRef,
       model,
       task.project_context as Record<string, unknown> | undefined,
-      undefined, undefined, undefined, undefined,
+      // Self-merge: persist the enabled-path reviewer output into THIS task's
+      // backend _self_review_outcome (originalTaskId = taskId). No recovery flavor.
+      undefined, undefined, undefined, taskId,
       sensitivePathsFromMetadata(projectMeta),
     );
   }
@@ -675,7 +677,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       await runFreshReviewerPass(
         taskId, taskTitle, rawPrompt, loneCheckerRelatedFiles, ws, statusRef, model,
         task.project_context as Record<string, unknown> | undefined,
-        false, true, undefined, undefined,
+        // Self-merge: persist lone-checker recovery output into THIS task's
+        // backend _self_review_outcome (originalTaskId = taskId).
+        false, true, undefined, taskId,
         sensitivePathsFromMetadata(projectMeta),
       );
     }
@@ -711,7 +715,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         statusRef,
         model,
         task.project_context as Record<string, unknown> | undefined,
-        true, undefined, undefined, undefined,
+        // Self-merge: persist incomplete-SR recovery output into THIS task's
+        // backend _self_review_outcome (originalTaskId = taskId).
+        true, undefined, undefined, taskId,
         sensitivePathsFromMetadata(projectMeta),
       );
     }

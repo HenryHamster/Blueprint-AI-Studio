@@ -330,6 +330,9 @@ async def _record_qualification_verdict(
             ),
             audit_findings=base_record.get("audit_findings"),
             excluded_audit_findings=base_record.get("excluded_audit_findings"),
+            challenger_refuted_audit_findings=base_record.get(
+                "challenger_refuted_audit_findings"
+            ),
             test_erosion_detail=base_record.get("test_erosion_detail"),
             smoketest_detail=base_record.get("smoketest_detail"),
             audit_reconciliation=base_record.get("audit_reconciliation"),

@@ -127,6 +127,91 @@ async def _spawn_release_audit_task(
     return task
 
 
+async def _spawn_release_audit_challenge_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    base_branch: str,
+    diff_range: str,
+    candidate_sha: str,
+    primary_audit_task_id: str | None = None,
+) -> Task:
+    """Create + queue a challenge task for the release-audit flow.
+
+    The spawned task remains pinned to the same candidate/diff range.  When
+    ``primary_audit_task_id`` is available, it is recorded for consumers that
+    still expect audit/challenge task linkage; the binding challenge gate treats
+    it as best-effort metadata.
+    """
+    payload: dict[str, Any] = {
+        "type": "release_audit_challenge",
+        "base_branch": base_branch,
+        "diff_range": diff_range,
+        "candidate_sha": candidate_sha,
+    }
+    if primary_audit_task_id is not None:
+        payload["primary_audit_task_id"] = primary_audit_task_id
+        payload["primary_audit_report"] = None
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        "release_audit_challenge"
+    )
+    if type_model:
+        payload["model"] = type_model
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        "release_audit_challenge"
+    )
+    if type_effort:
+        payload["effort"] = type_effort
+    try:
+        payload = validate_internal_payload(
+            payload, "release_qualifier:release_audit_challenge"
+        )
+    except PayloadTooLargeError:
+        # Challenger payloads are tiny; a too-large error here is a real bug.
+        raise
+
+    task = Task(
+        project_id=project_id,
+        title=f"Release audit challenge: {base_branch}...{candidate_sha[:8]} diff",
+        description=(
+            f"Independent adversarial re-judgement of the release_audit findings "
+            f"for {diff_range} (binding second opinion for the release qualifier)"
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+            "scope": "medium",
+        },
+    )
+    if primary_audit_task_id is not None:
+        task.context["primary_audit_task_id"] = primary_audit_task_id
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "release_audit_challenge",
+                "diff_range": diff_range,
+                "release_version_id": str(version_id),
+                **(
+                    {"primary_audit_task_id": primary_audit_task_id}
+                    if primary_audit_task_id is not None
+                    else {}
+                ),
+            },
+        )
+    )
+    return task
+
+
 async def _spawn_qualifier_smoketest_task(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -276,6 +361,63 @@ async def get_latest_release_audit_report(
     }
 
 
+async def get_latest_release_audit_challenge(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    candidate_sha: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the latest ``release_audit_challenge`` task's parsed verdict.
+
+    Mirrors :func:`get_latest_release_audit_report` but scoped to the advisory
+    challenge child and its ``RELEASE_AUDIT_CHALLENGE`` artifact.  When
+    ``candidate_sha`` is provided, the lookup is restricted to challenge tasks
+    that evaluated that exact candidate so a fresh version never inherits an
+    older candidate's challenge verdicts.  Returns ``None`` when no candidate is
+    supplied or no matching challenge exists (the consumer treats a missing
+    challenge as "no second opinion available", never as a confirmation).
+    """
+    if not candidate_sha:
+        return None
+    challenge_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.payloads[0]["type"].as_string()
+                    == "release_audit_challenge",
+                    Task.context["candidate_sha"].as_string() == candidate_sha,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if challenge_task is None:
+        return None
+    verdict = await _latest_artifact_logs(
+        session, challenge_task.id, ArtifactType.RELEASE_AUDIT_CHALLENGE
+    )
+    ctx = challenge_task.context or {}
+    status_val = (
+        challenge_task.status.value
+        if hasattr(challenge_task.status, "value")
+        else str(challenge_task.status)
+    )
+    return {
+        "challenge_task_id": str(challenge_task.id),
+        "task_status": status_val,
+        "candidate_sha": ctx.get("candidate_sha"),
+        "created_at": challenge_task.created_at.isoformat()
+        if challenge_task.created_at
+        else None,
+        "verdict": verdict,
+    }
+
+
 async def _audit_report_for_task(
     session: AsyncSession,
     task: Task,
@@ -406,6 +548,8 @@ async def _handle_infra_failure(
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": qual.get("audit_task_id"),
+        "audit_challenge_task_id": qual.get("audit_challenge_task_id"),
+        "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
     }
     version.last_qualification = record

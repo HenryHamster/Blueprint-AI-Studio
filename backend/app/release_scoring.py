@@ -14,6 +14,7 @@ keep working unchanged.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
@@ -326,7 +327,14 @@ def _finding_subject_is_authorized_divergence(f: dict) -> bool:
         return False
     text = " ".join(
         str(f.get(k, ""))
-        for k in ("summary", "description", "title", "text", "file", "verification_note")
+        for k in (
+            "summary",
+            "description",
+            "title",
+            "text",
+            "file",
+            "verification_note",
+        )
     ).lower()
     if not text:
         return False
@@ -596,6 +604,10 @@ def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
 # pack budget while still giving the agent enough to target the audit sub-score.
 _MAX_CARRIED_FINDINGS = 12
 _FINDING_SUMMARY_MAX = 280
+# Minimum fraction of shared significant tokens (length >= 3) required for a
+# fuzzy summary match between an audit finding and a challenge verdict when the
+# challenger derives findings independently (no primary_findings in payload).
+_FINDING_MATCH_TOKEN_THRESHOLD = 0.6
 # Lower number sorts first (most severe). Unknown severities sort last.
 # Order must match _AUDIT_DEDUCTIONS severity weighting:
 # - critical/blocker (0.30 deduction) = rank 0
@@ -612,6 +624,246 @@ _SEVERITY_RANK = {
     "low": 3,
     "info": 3,
 }
+
+_CHALLENGE_FINDING_MAX = 12
+_CHALLENGE_ASSESSMENT_MAX = 600
+_CHALLENGE_SEVERITIES: frozenset[str] = frozenset({"low", "medium", "high"})
+_CHALLENGE_AGREEMENTS: frozenset[str] = frozenset(
+    {"agree", "partial", "disagree"}
+)
+
+
+def _raw_audit_findings(report: dict[str, Any] | None) -> list[Any]:
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("findings")
+    if not isinstance(raw, list) or not raw:
+        raw = report.get("issues")
+    return raw if isinstance(raw, list) else []
+
+
+def _compact_challenge_finding(finding: Any) -> dict[str, str] | None:
+    if isinstance(finding, dict):
+        sev = str(finding.get("severity") or finding.get("level") or "unknown").lower()
+        summary = (
+            finding.get("summary")
+            or finding.get("description")
+            or finding.get("title")
+            or finding.get("text")
+            or ""
+        )
+        file_path = str(finding.get("file") or finding.get("path") or "").strip()
+        note = str(finding.get("verification_note") or "").strip()
+        origin = str(finding.get("origin") or "").strip()
+    else:
+        sev = "unknown"
+        summary = str(finding)
+        file_path = ""
+        note = ""
+        origin = ""
+
+    summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
+    if not summary:
+        return None
+
+    compact = {"severity": sev, "summary": summary}
+    if file_path:
+        compact["file"] = file_path[:_DETAIL_NAME_MAX]
+    if note:
+        compact["verification_note"] = note[:_FINDING_SUMMARY_MAX]
+    if origin:
+        compact["origin"] = origin[:80]
+    return compact
+
+
+def _compact_challenge_findings(findings: list[Any]) -> list[dict[str, str]]:
+    compacted = [
+        compact
+        for finding in findings
+        if (compact := _compact_challenge_finding(finding)) is not None
+    ]
+    compacted.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
+    return compacted[:_CHALLENGE_FINDING_MAX]
+
+
+def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
+    return (
+        str(finding.get("file") or "").strip().lower(),
+        str(finding.get("summary") or "").strip().lower(),
+    )
+
+
+def _compute_audit_challenge_synthesis(
+    primary_report: dict[str, Any] | None,
+    challenge_report: dict[str, Any] | None,
+    *,
+    challenge_reason: str | None = None,
+) -> dict[str, Any]:
+    """Compute non-gating release-audit challenge synthesis."""
+    if challenge_reason:
+        return {
+            "status": "unavailable",
+            "reason": challenge_reason,
+            "reported_agreement": None,
+            "agreement_assessment": None,
+            "challenge_severity": None,
+            "agreement": {"findings_both_flagged": [], "count": 0},
+            "disagreement": {
+                "primary_only": [],
+                "challenger_only": [],
+                "overstated_findings": [],
+            },
+            "counts": {
+                "primary_findings": len(_compact_challenge_findings(_raw_audit_findings(primary_report))),
+                "challenger_missing": 0,
+                "challenger_overstated": 0,
+            },
+        }
+    if not isinstance(challenge_report, dict):
+        return _compute_audit_challenge_synthesis(
+            primary_report, None, challenge_reason="challenge_absent"
+        )
+
+    primary_findings = _compact_challenge_findings(_raw_audit_findings(primary_report))
+    missing_raw = challenge_report.get("missing_findings")
+    overstated_raw = challenge_report.get("overstated_findings")
+    missing_findings = _compact_challenge_findings(
+        missing_raw if isinstance(missing_raw, list) else []
+    )
+    overstated_findings = _compact_challenge_findings(
+        overstated_raw if isinstance(overstated_raw, list) else []
+    )
+
+    primary_keys = {_finding_match_key(finding) for finding in primary_findings}
+    missing_keys = {_finding_match_key(finding) for finding in missing_findings}
+    overstated_keys = {_finding_match_key(finding) for finding in overstated_findings}
+
+    reported_agreement_raw = str(challenge_report.get("agreement") or "").lower()
+    reported_agreement = (
+        reported_agreement_raw
+        if reported_agreement_raw in _CHALLENGE_AGREEMENTS
+        else None
+    )
+    severity_raw = str(challenge_report.get("challenge_severity") or "").lower()
+    challenge_severity = (
+        severity_raw if severity_raw in _CHALLENGE_SEVERITIES else "low"
+    )
+    assessment_raw = challenge_report.get("agreement_assessment")
+    agreement_assessment = (
+        str(assessment_raw).strip()[:_CHALLENGE_ASSESSMENT_MAX]
+        if assessment_raw is not None
+        else ""
+    )
+
+    if reported_agreement == "agree" and not missing_findings and not overstated_findings:
+        both_flagged = primary_findings
+        primary_only: list[dict[str, str]] = []
+    else:
+        both_flagged = [
+            finding
+            for finding in primary_findings
+            if _finding_match_key(finding) in missing_keys
+        ]
+        primary_only = [
+            finding
+            for finding in primary_findings
+            if _finding_match_key(finding) not in missing_keys | overstated_keys
+        ]
+
+    challenger_only = [
+        finding
+        for finding in missing_findings
+        if _finding_match_key(finding) not in primary_keys
+    ]
+
+    return {
+        "status": "available",
+        "reason": None,
+        "reported_agreement": reported_agreement,
+        "agreement_assessment": agreement_assessment,
+        "challenge_severity": challenge_severity,
+        "agreement": {
+            "findings_both_flagged": both_flagged,
+            "count": len(both_flagged),
+        },
+        "disagreement": {
+            "primary_only": primary_only,
+            "challenger_only": challenger_only,
+            "overstated_findings": overstated_findings,
+        },
+        "counts": {
+            "primary_findings": len(primary_findings),
+            "challenger_missing": len(missing_findings),
+            "challenger_overstated": len(overstated_findings),
+        },
+    }
+
+
+def _compute_challenge_synthesis_from_binding_verdicts(
+    primary_report: dict[str, Any] | None,
+    challenge_verdicts: dict[str, Any] | None,
+    *,
+    challenge_reason: str | None = None,
+) -> dict[str, Any]:
+    """Compute audit-challenge synthesis from the binding RELEASE_AUDIT_CHALLENGE artifact.
+
+    Unlike _compute_audit_challenge_synthesis (advisory format), this function
+    derives its synthesis from the binding verdict artifact emitted by the live
+    audit-challenge handler (challenged_candidate_sha + verdicts[]).
+    """
+    if challenge_reason or not isinstance(challenge_verdicts, dict):
+        return {
+            "status": "unavailable",
+            "reason": challenge_reason or "challenge_absent",
+            "binding": True,
+            "confirmed_count": 0,
+            "refuted_count": 0,
+            "uncertain_count": 0,
+            "reported_agreement": None,
+        }
+    verdicts_list = challenge_verdicts.get("verdicts")
+    if not isinstance(verdicts_list, list):
+        return {
+            "status": "unavailable",
+            "reason": "challenge_absent",
+            "binding": True,
+            "confirmed_count": 0,
+            "refuted_count": 0,
+            "uncertain_count": 0,
+            "reported_agreement": None,
+        }
+    confirmed = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict) and str(v.get("verdict") or "").lower() == "confirmed"
+    )
+    refuted = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict)
+        and str(v.get("verdict") or "").lower() == "refuted_false_positive"
+    )
+    uncertain = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict) and str(v.get("verdict") or "").lower() == "uncertain"
+    )
+    total = confirmed + refuted + uncertain
+    if total == 0 or refuted == 0:
+        reported_agreement = "agree"
+    elif refuted > total / 2:
+        reported_agreement = "disagree"
+    else:
+        reported_agreement = "partial"
+    return {
+        "status": "available",
+        "binding": True,
+        "reason": None,
+        "confirmed_count": confirmed,
+        "refuted_count": refuted,
+        "uncertain_count": uncertain,
+        "reported_agreement": reported_agreement,
+    }
 
 
 def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -734,7 +986,9 @@ _MAX_FAILED_SMOKE_TESTS = 8
 _DETAIL_NAME_MAX = 200
 
 
-def _extract_test_erosion_detail(report: dict[str, Any] | None) -> dict[str, Any] | None:
+def _extract_test_erosion_detail(
+    report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     """Pull a compact test-erosion detail from a RELEASE_AUDIT_REPORT.
 
     ``_score_audit`` knows which test files were deleted and the net test /
@@ -754,8 +1008,10 @@ def _extract_test_erosion_detail(report: dict[str, Any] | None) -> dict[str, Any
         return None
 
     computed_erosion = report.get("computed_test_erosion")
-    erosion = computed_erosion if isinstance(computed_erosion, dict) else report.get(
-        "test_erosion"
+    erosion = (
+        computed_erosion
+        if isinstance(computed_erosion, dict)
+        else report.get("test_erosion")
     )
     if not isinstance(erosion, dict):
         return None
@@ -764,15 +1020,25 @@ def _extract_test_erosion_detail(report: dict[str, Any] | None) -> dict[str, Any
 
     raw_deleted = erosion.get("deleted_test_files")
     if isinstance(raw_deleted, list):
-        deleted = [str(p).strip()[:_DETAIL_NAME_MAX] for p in raw_deleted if str(p).strip()]
+        deleted = [
+            str(p).strip()[:_DETAIL_NAME_MAX] for p in raw_deleted if str(p).strip()
+        ]
         if deleted:
             detail["deleted_test_files"] = deleted[:_MAX_DELETED_TEST_FILES]
             if len(deleted) > _MAX_DELETED_TEST_FILES:
-                detail["deleted_test_files_truncated"] = len(deleted) - _MAX_DELETED_TEST_FILES
+                detail["deleted_test_files_truncated"] = (
+                    len(deleted) - _MAX_DELETED_TEST_FILES
+                )
 
     test_delta = erosion.get("test_count_delta")
-    if isinstance(test_delta, (int, float)) and not isinstance(test_delta, bool) and test_delta < 0:
-        detail["test_count_delta"] = int(test_delta) if float(test_delta).is_integer() else test_delta
+    if (
+        isinstance(test_delta, (int, float))
+        and not isinstance(test_delta, bool)
+        and test_delta < 0
+    ):
+        detail["test_count_delta"] = (
+            int(test_delta) if float(test_delta).is_integer() else test_delta
+        )
 
     assertion_delta = erosion.get("assertion_delta")
     if (
@@ -781,7 +1047,9 @@ def _extract_test_erosion_detail(report: dict[str, Any] | None) -> dict[str, Any
         and assertion_delta < 0
     ):
         detail["assertion_delta"] = (
-            int(assertion_delta) if float(assertion_delta).is_integer() else assertion_delta
+            int(assertion_delta)
+            if float(assertion_delta).is_integer()
+            else assertion_delta
         )
 
     return detail or None
@@ -822,7 +1090,9 @@ def _extract_smoketest_detail(result: dict[str, Any] | None) -> dict[str, Any] |
         failed = [
             str(t.get("name") or "").strip()[:_DETAIL_NAME_MAX]
             for t in tests
-            if isinstance(t, dict) and t.get("status") == "fail" and str(t.get("name") or "").strip()
+            if isinstance(t, dict)
+            and t.get("status") == "fail"
+            and str(t.get("name") or "").strip()
         ]
         total = len(tests)
         passed = sum(
@@ -894,3 +1164,315 @@ def _fmt_sub_scores(
     if smoketest_enabled:
         parts.append(f"smoke {float(sub_scores.get('smoketest', 0.0)):.2f}")
     return " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Challenge-verdict reconciliation — fail-closed audit challenge gate.
+# ---------------------------------------------------------------------------
+
+
+def _finding_summary_tokens(text: str) -> frozenset[str]:
+    """Return significant lowercase word tokens (length >= 3) from a summary.
+
+    Used as the fallback for fuzzy matching between independently-derived audit
+    findings and challenge verdicts whose free-text summaries differ in wording
+    while describing the same issue.
+    """
+    return frozenset(tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 3)
+
+
+def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | None:
+    """Score a candidate verdict against an audit finding, or None if no match.
+
+    The scale is intentionally two-tiered:
+
+    * **2.0** — exact summary text match.  This tier beats any fuzzy score so
+      that best-match assignment always prefers an exact match over a fuzzy one
+      when a verdict could plausibly match multiple findings.
+    * **(0.0, 1.0]** — token-overlap fuzzy match using the significant-token
+      min-denominator (original behaviour, unchanged threshold).  Covers the
+      common case where the challenge runs in parallel without
+      ``primary_findings`` and independently re-describes the same issue.
+    * ``None`` — no match (file-path conflict or similarity below threshold).
+
+    Severity is deliberately NOT used for scoring: the primary audit and the
+    challenger may independently re-bucket the same issue at different severities,
+    so content must win even when the labels drift.
+    """
+    if not isinstance(verdict_entry, dict):
+        return None
+    f_summary = str(
+        finding.get("summary")
+        or finding.get("description")
+        or finding.get("title")
+        or finding.get("text")
+        or ""
+    ).strip()
+    f_file = str(finding.get("file") or "").strip()
+    cv_summary = str(verdict_entry.get("summary") or "").strip()
+    cv_file = str(verdict_entry.get("file") or "").strip()
+
+    if f_file and cv_file and f_file != cv_file:
+        return None
+
+    # Tier-1: exact summary match always beats any fuzzy score.
+    if cv_summary == f_summary:
+        return 2.0
+
+    # Tier-2: significant-token fuzzy match (min-denominator, threshold 0.6).
+    f_tokens = _finding_summary_tokens(f_summary)
+    cv_tokens = _finding_summary_tokens(cv_summary)
+    if f_tokens and cv_tokens:
+        overlap = len(f_tokens & cv_tokens)
+        min_size = min(len(f_tokens), len(cv_tokens))
+        if min_size > 0 and overlap / min_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
+            return overlap / min_size
+
+    return None
+
+
+def _match_finding_to_challenge(
+    finding: dict,
+    challenge_verdicts_list: list,
+) -> dict | None:
+    """Return the best-scoring challenge verdict that matches this finding, or None.
+
+    Matching is by summary + file; severity is advisory metadata and is not
+    used for binding.  The primary audit and the challenger may independently
+    bucket the same issue at different severities, so content must win even
+    when the labels drift.  (file is optional — two empty file fields are
+    treated as equal so challenge verdicts without a ``file`` key match audit
+    findings that also omit it).
+
+    Summary matching uses two passes:
+    1. Exact text match (fast path — covers the case where the challenger was
+       given ``primary_findings`` and echoed back the exact text).  Scores 2.0
+       to ensure it always beats any fuzzy match in best-match assignment.
+    2. Token-overlap fuzzy match — covers the common case where the challenge
+       runs in parallel without ``primary_findings`` and independently derives
+       the same findings with different free-text wording.  Both sides must
+       share at least ``_FINDING_MATCH_TOKEN_THRESHOLD`` fraction of the
+       shorter token set (min-denominator) for a match to fire.  Scores ≤ 1.0.
+
+    Returns the highest-scoring match rather than the first, so that when
+    multiple verdicts could match a finding the most-similar one wins.
+    """
+    best_score: float = -1.0
+    best_verdict: dict | None = None
+    for cv in challenge_verdicts_list:
+        score = _score_finding_to_challenge(finding, cv)
+        if score is not None and score > best_score:
+            best_score = score
+            best_verdict = cv
+    return best_verdict
+
+
+def _reconcile_audit_with_challenge(
+    report: dict[str, Any] | None,
+    challenge_envelope: dict[str, Any] | None,
+    candidate_sha: str | None,
+) -> tuple[str | None, dict[str, Any] | None, list[dict[str, Any]]]:
+    """Reconcile verified audit findings with challenge verdicts (fail-closed)."""
+    if not isinstance(report, dict):
+        return None, report, []
+
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("issues")
+    if not isinstance(findings, list):
+        return None, report, []
+
+    deductible: list[tuple[int, dict]] = []
+    for idx, f in enumerate(findings):
+        if not isinstance(f, dict):
+            continue
+        sev = str(f.get("severity") or f.get("level") or "").lower()
+        if sev not in _SEVERITIES_REQUIRING_VERIFICATION:
+            continue
+        if not _finding_is_verified(f, sev):
+            continue
+        if _finding_subject_is_authorized_divergence(f):
+            continue
+        deductible.append((idx, f))
+
+    if not deductible:
+        return None, report, []
+
+    challenge_verdicts_list: list = []
+    sha_matched = False
+    if isinstance(challenge_envelope, dict):
+        challenged_sha = str(
+            challenge_envelope.get("challenged_candidate_sha") or ""
+        ).strip()
+        if candidate_sha and challenged_sha == candidate_sha:
+            sha_matched = True
+            raw = challenge_envelope.get("verdicts")
+            if isinstance(raw, list):
+                challenge_verdicts_list = raw
+
+    if not sha_matched or not challenge_verdicts_list:
+        hold_code = (
+            "audit_challenge_sha_mismatch"
+            if (
+                isinstance(challenge_envelope, dict)
+                and challenge_envelope.get("challenged_candidate_sha")
+            )
+            else "audit_challenge_missing"
+        )
+        return hold_code, None, []
+
+    challenger_refuted: list[dict[str, Any]] = []
+    remove_idxs: set[int] = set()
+    available_verdicts = list(challenge_verdicts_list)
+
+    # Precompute (score, fi, vi) pairs for all deductible findings x available verdicts.
+    # fi indexes into deductible; vi indexes into available_verdicts.
+    scored_pairs: list[tuple[float, int, int]] = []
+    for fi, (idx, f) in enumerate(deductible):
+        for vi, cv in enumerate(available_verdicts):
+            score = _score_finding_to_challenge(f, cv)
+            if score is not None:
+                scored_pairs.append((score, fi, vi))
+
+    # Sort descending so the best matches are assigned first.
+    scored_pairs.sort(key=lambda x: -x[0])
+
+    # Greedy 1-to-1 assignment: each finding and each verdict used at most once.
+    fi_assigned: set[int] = set()
+    vi_assigned: set[int] = set()
+    assignment: dict[int, int] = {}  # fi -> vi
+
+    for score, fi, vi in scored_pairs:
+        if fi not in fi_assigned and vi not in vi_assigned:
+            assignment[fi] = vi
+            fi_assigned.add(fi)
+            vi_assigned.add(vi)
+
+    # All deductible findings must have exactly one verdict (fail-closed).
+    if len(assignment) < len(deductible):
+        return "audit_challenge_missing", None, []
+
+    for fi, (idx, f) in enumerate(deductible):
+        matched = available_verdicts[assignment[fi]]
+        verdict_val = str(matched.get("verdict") or "").lower().strip()
+        if verdict_val == "confirmed":
+            pass
+        elif verdict_val == "refuted_false_positive":
+            remove_idxs.add(idx)
+            sev = str(f.get("severity") or f.get("level") or "").lower()
+            summary = str(
+                f.get("summary")
+                or f.get("description")
+                or f.get("title")
+                or f.get("text")
+                or ""
+            ).strip()[:_FINDING_SUMMARY_MAX]
+            challenger_refuted.append(
+                {
+                    "severity": sev,
+                    "summary": summary,
+                    "file": str(f.get("file") or "").strip(),
+                    "challenger_reason": str(matched.get("reason") or "").strip()[
+                        :_FINDING_SUMMARY_MAX
+                    ],
+                }
+            )
+        else:
+            return "audit_challenge_uncertain", None, []
+
+    if not remove_idxs:
+        return None, report, []
+
+    modified_findings = [f for i, f in enumerate(findings) if i not in remove_idxs]
+    modified_report = dict(report)
+    key = "findings" if isinstance(report.get("findings"), list) else "issues"
+    modified_report[key] = modified_findings
+    return None, modified_report, challenger_refuted
+
+
+# Minimum sample size for each cohort before telemetry rates are computed.
+# Below this the cohort is marked insufficient_sample to avoid misleading zeros.
+_MIN_TELEMETRY_SAMPLE = 3
+
+
+def compute_challenged_vs_unchallenged_telemetry(
+    verdicts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare challenged vs unchallenged release-audit cohorts using durable signals."""
+    challenged: list[dict[str, Any]] = []
+    unchallenged: list[dict[str, Any]] = []
+
+    for v in verdicts:
+        if not isinstance(v, dict):
+            unchallenged.append(v)
+            continue
+        recon = v.get("audit_reconciliation")
+        challenge = recon.get("audit_challenge") if isinstance(recon, dict) else None
+        if isinstance(challenge, dict) and challenge.get("status") == "available":
+            challenged.append(v)
+        else:
+            unchallenged.append(v)
+
+    def _cohort_stats(
+        cohort: list[dict[str, Any]], *, include_disagreement: bool
+    ) -> dict[str, Any]:
+        n = len(cohort)
+        if n < _MIN_TELEMETRY_SAMPLE:
+            return {"sample_size": n, "insufficient_sample": True}
+
+        exclusion_count = sum(
+            1
+            for v in cohort
+            if isinstance(v.get("audit_reconciliation"), dict)
+            and int(v["audit_reconciliation"].get("excluded_findings_count") or 0) > 0
+        )
+        exclusion_rate = round(exclusion_count / n, 4)
+
+        resolved = [
+            v
+            for v in cohort
+            if v.get("terminal_status") == "promoted"
+            and v.get("post_promotion_outcome") in ("serving_confirmed", "deploy_failed")
+        ]
+        resolved_sample = len(resolved)
+        wrong_decision_count = sum(
+            1 for v in resolved if v.get("post_promotion_outcome") == "deploy_failed"
+        )
+        wrong_decision_rate = (
+            round(wrong_decision_count / resolved_sample, 4)
+            if resolved_sample > 0
+            else None
+        )
+
+        stats: dict[str, Any] = {
+            "sample_size": n,
+            "insufficient_sample": False,
+            "exclusion_rate": exclusion_rate,
+            "exclusion_count": exclusion_count,
+            "wrong_decision_rate": wrong_decision_rate,
+            "wrong_decision_resolved_sample": resolved_sample,
+        }
+
+        if include_disagreement:
+            disagree_count = sum(
+                1
+                for v in cohort
+                if isinstance(v.get("audit_reconciliation"), dict)
+                and isinstance(
+                    v["audit_reconciliation"].get("audit_challenge"), dict
+                )
+                and v["audit_reconciliation"]["audit_challenge"].get(
+                    "reported_agreement"
+                )
+                != "agree"
+            )
+            stats["disagreement_rate"] = round(disagree_count / n, 4)
+            stats["disagreement_count"] = disagree_count
+
+        return stats
+
+    return {
+        "challenged": _cohort_stats(challenged, include_disagreement=True),
+        "unchallenged": _cohort_stats(unchallenged, include_disagreement=False),
+        "total_verdicts": len(verdicts),
+    }

@@ -95,6 +95,139 @@ const failedTaskWithForensics: Task = {
   },
 };
 
+const parkWakeWakeLostTask: Task = {
+  id: 'task-park-wake-lost',
+  title: 'Park Wake Timeout — wake lost after job completed',
+  description: '',
+  status: 'FAILED',
+  task_type: 'compute_experiment',
+  created_at: '2024-01-01T00:00:00Z',
+  created_by: 'USER',
+  requires_approval: false,
+  failure_class: 'park_wake_timeout',
+  context: {
+    failure_class: 'park_wake_timeout',
+    failure_detail: 'compute_job_terminal_wake_lost_after_job_completed',
+    park_wake_timeout_diagnostics: {
+      job_status: 'SUCCEEDED',
+      job_created_at: '2024-01-01T00:00:00Z',
+      job_started_at: null,
+      job_completed_at: '2024-01-01T00:05:00Z',
+      provisioning_seconds: 300.0,
+      execution_seconds: null,
+      job_terminal_by_deadline: true,
+    },
+  },
+};
+
+const parkWakeProvisioningStarvedTask: Task = {
+  id: 'task-park-wake-prov-starved',
+  title: 'Park Wake Timeout — provisioning starved run',
+  description: '',
+  status: 'FAILED',
+  task_type: 'compute_experiment',
+  created_at: '2024-01-01T00:00:00Z',
+  created_by: 'USER',
+  requires_approval: false,
+  failure_class: 'park_wake_timeout',
+  context: {
+    failure_class: 'park_wake_timeout',
+    failure_detail: 'compute_job_terminal_job_not_terminal_by_deadline',
+    park_wake_timeout_diagnostics: {
+      job_status: 'QUEUED',
+      job_created_at: '2024-01-01T00:00:00Z',
+      job_started_at: null,
+      job_completed_at: null,
+      provisioning_seconds: 300.0,
+      execution_seconds: null,
+      job_terminal_by_deadline: false,
+    },
+  },
+};
+
+const parkWakeRanOutTask: Task = {
+  id: 'task-park-wake-ran-out',
+  title: 'Park Wake Timeout — ran out of time',
+  description: '',
+  status: 'FAILED',
+  task_type: 'compute_experiment',
+  created_at: '2024-01-01T00:00:00Z',
+  created_by: 'USER',
+  requires_approval: false,
+  failure_class: 'park_wake_timeout',
+  context: {
+    failure_class: 'park_wake_timeout',
+    failure_detail: 'compute_job_terminal_job_not_terminal_by_deadline',
+    park_wake_timeout_diagnostics: {
+      job_status: 'RUNNING',
+      job_created_at: '2024-01-01T00:00:00Z',
+      job_started_at: '2024-01-01T00:05:00Z',
+      job_completed_at: null,
+      provisioning_seconds: 300.0,
+      execution_seconds: 900.0,
+      job_terminal_by_deadline: false,
+    },
+  },
+};
+
+describe('TaskDetailDrawerFailureDetail FailureDetailPanel — park_wake_timeout', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => { r.unmount(); }); root = null; }
+    if (host) { host.remove(); host = null; }
+  });
+
+  test('wake-lost shows delivery-bug subtype and suggestion', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<FailureDetailPanel task={parkWakeWakeLostTask} />); });
+    const content = host.textContent ?? '';
+    expect(content).toContain('Park Wake Timeout');
+    expect(content).toContain('wake lost after job completed');
+    expect(content).toContain('wake signal was never delivered');
+  });
+
+  test('provisioning-starved shows correct subtype and suggestion', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<FailureDetailPanel task={parkWakeProvisioningStarvedTask} />); });
+    const content = host.textContent ?? '';
+    expect(content).toContain('provisioning starved run');
+    expect(content).toContain('provisioning');
+    // Should not claim job started
+    expect(content).toContain('no (provisioning starved)');
+  });
+
+  test('ran-out-of-time shows correct subtype and execution time', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<FailureDetailPanel task={parkWakeRanOutTask} />); });
+    const content = host.textContent ?? '';
+    expect(content).toContain('ran out of time');
+    // Job did start running
+    expect(content).toContain('yes');
+  });
+
+  test('does not overflow at 375px with park_wake diagnostics', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<FailureDetailPanel task={parkWakeProvisioningStarvedTask} />); });
+    });
+  });
+});
+
 describe('TaskDetailDrawerFailureDetail TeardownForensicsPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

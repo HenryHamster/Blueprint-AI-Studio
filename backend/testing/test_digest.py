@@ -6803,6 +6803,64 @@ async def test_digest_pipeline_autonomy_legacy_fallback(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_exposes_spawn_gate_block(
+    client: AsyncClient, db_session
+):
+    """Digest direction_progress includes the research spawn-gate comparison block."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-spawn-gate",
+                "text": "Spawn gate direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-1",
+                        "tasks_created": 1,
+                        "research_spawn_gate_challenged_count": 2,
+                        "research_spawn_gate_refuted_count": 1,
+                        "research_spawn_gate_survived_count": 1,
+                        "research_spawn_gate_challenged_spawned": 2,
+                        "research_spawn_gate_challenged_merged": 1,
+                        "research_spawn_gate_challenged_merge_rate": 0.5,
+                        "research_spawn_gate_unchallenged_spawned": 3,
+                        "research_spawn_gate_unchallenged_merged": 1,
+                        "research_spawn_gate_unchallenged_merge_rate": 0.333,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-spawn-gate"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-spawn-gate")
+    gate = dp["research_spawn_gate"]
+    assert gate["challenged_count"] == 2
+    assert gate["refuted_count"] == 1
+    assert gate["survived_count"] == 1
+    assert gate["challenged_merge_rate"] == 0.5
+    assert gate["unchallenged_merge_rate"] == 0.333
+
+
+@pytest.mark.asyncio
 async def test_digest_active_tasks_ordered_oldest_first(
     client: AsyncClient, db_session
 ):
@@ -7990,6 +8048,115 @@ async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_s
     assert lc is not None
     assert lc["memos_available"] == 4
     assert lc["memos_cited"] == 1
+
+
+async def _wire_cycle_into_vision(db_session, project, cycle):
+    """Wire a completed cycle into project.vision._strategic_cycle_history so the
+    digest's legacy-JSONB latest_cycle path can find it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await db_session.refresh(cycle)
+    vision = dict(project.vision or {})
+    vision["_strategic_cycle_history"] = [
+        {
+            "cycle_id": cycle.id,
+            "started_at": cycle.phase1_started_at.isoformat()
+            if cycle.phase1_started_at
+            else None,
+            "phase2_completed_at": cycle.phase2_completed_at.isoformat()
+            if cycle.phase2_completed_at
+            else None,
+            "outcome": cycle.outcome,
+            "directions_created": 0,
+            "directions_retired": 0,
+            "vision_updated": False,
+        }
+    ]
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_includes_compact_challenge_summary(
+    client: AsyncClient, db_session
+):
+    """A cycle carrying a strategic_judgment_challenge record surfaces the compact
+    {mode, verdict, warned_count, blocked_count} summary in latest_cycle —
+    never the full bounded item list."""
+    from app import strategic_cycle as _sc
+    from app.strategic_completion import sanitize_strategic_challenge_record
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    record = sanitize_strategic_challenge_record(
+        {
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "approved"},
+                {"direction_id": "d-2", "status": "met", "verdict": "rejected"},
+            ],
+            "retirement_critique_quality": {"verdict": "uncertain"},
+            "portfolio_shape_risk": {"verdict": "solid"},
+        }
+    )
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        extra_metadata={"strategic_judgment_challenge": record},
+    )
+    await db_session.commit()
+    await _wire_cycle_into_vision(db_session, project, cycle)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is not None
+    challenge = lc["strategic_judgment_challenge"]
+    assert challenge == {
+        "mode": "ok",
+        "verdict": "blocked",  # one rejected evidence item
+        "warned_count": 1,  # one uncertain section verdict
+        "blocked_count": 1,
+    }
+    # The bounded item list never travels on the digest summary.
+    assert "evidence_progress" not in challenge
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_omits_challenge_for_legacy_cycle(
+    client: AsyncClient, db_session
+):
+    """Cycles with no challenge record omit the key entirely so absence does not
+    read as a failure."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _wire_cycle_into_vision(db_session, project, cycle)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is not None
+    assert "strategic_judgment_challenge" not in lc
 
 
 @pytest.mark.asyncio

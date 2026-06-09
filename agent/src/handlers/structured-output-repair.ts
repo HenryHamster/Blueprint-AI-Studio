@@ -6,7 +6,7 @@ import {
 } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  type FormatMissReason,
+  type FormatMissReason, type SchemaLabel,
 } from '../telemetry.js';
 
 // ── Shared bounded structured-output self-repair ─────────────────────────────
@@ -57,6 +57,10 @@ export interface RepairStructuredOutputOptions {
   disallowedTools?: string[];
   /** Optional status message set on statusRef before the reopen run. */
   retryStatus?: string;
+  /** Optional bounded schema label for per-schema telemetry bucketing. When
+   *  provided, format misses, repair attempts, and successes are also counted
+   *  in the schema-dimensioned maps inside format-compliance telemetry. */
+  schemaLabel?: SchemaLabel;
 }
 
 export interface RepairStructuredOutputResult<T> {
@@ -161,7 +165,7 @@ export async function repairStructuredOutput<T = unknown>(
 ): Promise<RepairStructuredOutputResult<T>> {
   const {
     mode, requiredKeys, first, reopenPrompt,
-    ws, statusRef, model, effort, disallowedTools, retryStatus,
+    ws, statusRef, model, effort, disallowedTools, retryStatus, schemaLabel,
   } = opts;
 
   const firstAttempt = tryExtract(
@@ -174,8 +178,8 @@ export async function repairStructuredOutput<T = unknown>(
     // Record the unparseable FINAL output from the verdict (ground truth),
     // then that a self-repair re-ask is being attempted. Success is recorded
     // after re-extraction below.
-    if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason);
-    recordFormatRepairAttempt();
+    if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason, schemaLabel);
+    recordFormatRepairAttempt(schemaLabel);
     sendLog(ws, `[INFO] First structured-output attempt produced no parseable ${mode} (allOutput=${(first.allOutput || '').length}b, lastResultText=${(first.lastResultText || '').length}b). Reopening with focused continuation.\n`);
     if (retryStatus) statusRef.value = retryStatus;
 
@@ -194,7 +198,7 @@ export async function repairStructuredOutput<T = unknown>(
       mode, requiredKeys, buildSources(retryRun.lastResultText, retryRun.allOutput), ws,
     );
     value = retryAttempt.value as T | null;
-    if (value !== null) recordFormatRepairSuccess();
+    if (value !== null) recordFormatRepairSuccess(schemaLabel);
   }
 
   return { value, missReason: firstAttempt.missReason, retry };

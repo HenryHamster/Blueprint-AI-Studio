@@ -58,6 +58,12 @@ const MEMO_SCHEMA_HINT =
 // describing the reasoning. The backend persists that object as an Artifact
 // of type MEMO. No cloning, no edits, no child spawning.
 
+// Reasoning kinds the dispatcher synthesizer handles credential-free (i.e.
+// _synthesizeDispatcherMemo returns non-null for these values). Exported so
+// unit tests can assert every bake-smoke fixture uses a kind in this set —
+// catching a mismatch at test time instead of at Packer image build time.
+export const DISPATCHER_MEMO_SYNTHESIZER_KINDS = ['direction_retirement'] as const satisfies readonly string[];
+
 // For dispatcher-sourced memos the backend already holds the complete
 // reasoning in source_finding at spawn time. Synthesize the artifact
 // directly instead of invoking Claude to paraphrase already-known text.
@@ -72,27 +78,6 @@ function _synthesizeDispatcherMemo(
     directionId ? `direction:${directionId}` : null,
     sourceTaskId ? `task:${sourceTaskId}` : null,
   ].filter((x): x is string => x !== null);
-  if (reasoningKind === 'regression_false_positive') {
-    const verdictReason = sv(sf.verdict_reason);
-    if (!verdictReason) return null;
-    const parts = [`Verdict reason: ${verdictReason}`];
-    const invSummary = sv(sf.investigation_summary);
-    if (invSummary) parts.push(`Investigation summary: ${invSummary}`);
-    const rc = sv(sf.regression_class);
-    return { summary: verdictReason.slice(0, 200), reasoning: parts.join('\n\n'), citations: cite, tags: ['regression-false-positive', ...(rc ? [rc] : [])] };
-  }
-  if (reasoningKind === 'investigation_unactionable') {
-    const rootCause = sv(sf.root_cause);
-    const summary = sv(sf.summary);
-    if (!rootCause && !summary) return null;
-    const parts: string[] = [];
-    if (rootCause) parts.push(`Root cause: ${rootCause}`);
-    const fix = sv(sf.recommended_fix);
-    if (fix) parts.push(`Recommended fix: ${fix}`);
-    const outcome = sv(sf.outcome);
-    if (outcome) parts.push(`Outcome: ${outcome}`);
-    return { summary: summary.slice(0, 200) || `Investigation concluded: ${outcome}`, reasoning: parts.join('\n\n'), citations: cite, tags: ['investigation-unactionable', ...(outcome ? [outcome] : [])] };
-  }
   if (reasoningKind === 'direction_retirement') {
     const directionText = sv(sf.direction_text);
     const rationale = sv(sf.rationale);

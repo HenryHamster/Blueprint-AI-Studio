@@ -973,6 +973,9 @@ describe('handleReview — verdict file parsing', () => {
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
+      format_miss_by_schema: { review_verdict: 1 },
+      format_repair_attempts_by_schema: { review_verdict: 1 },
+      format_repair_successes_by_schema: { review_verdict: 1 },
     });
   });
 
@@ -1019,6 +1022,9 @@ describe('handleReview — verdict file parsing', () => {
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
+      format_miss_by_schema: { review_verdict: 1 },
+      format_repair_attempts_by_schema: { review_verdict: 1 },
+      format_repair_successes_by_schema: { review_verdict: 1 },
     });
   });
 
@@ -3231,5 +3237,87 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
     expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
+  });
+});
+
+// ── handleFix: surviving_issues from challenge reconciliation ─────────────────
+describe('handleFix — surviving_issues from challenge reconciliation', () => {
+  // Use a medium-scope iteration in convergence mode (iteration * 2 >= maxIterations).
+  // For medium scope, maxIterations = 12. With iteration = 7: 7*2=14 >= 12 ✓ and 7 < 12 ✓.
+  // Convergence mode uses latestIssues for file-scope guidance and CRITICAL/MAJOR counts —
+  // the primary observable place where survivingIssues influences the prompt text.
+  const rawHistoryIssue = { severity: 'major', description: 'Old issue from raw history', file: 'src/old.ts', line: 5 };
+  const survivingIssue = { severity: 'critical', description: 'Surviving issue after challenge', file: 'src/new.ts', line: 22 };
+  const rejectedIssue = { severity: 'major', description: 'Rejected issue not in surviving set', file: 'src/rejected.ts', line: 9 };
+
+  const reviewHistory = [{
+    iteration: 1,
+    feedback: 'primary review feedback',
+    issues: [rawHistoryIssue, rejectedIssue],
+  }];
+
+  // Convergence-mode context: iteration 7 of 12 (7*2=14 >= 12).
+  const convergenceContext = {
+    context: {
+      scope: 'medium',
+      review_loop: { iteration: 7, review_history: reviewHistory },
+    },
+  };
+
+  it('handleFix uses surviving_issues from payload instead of raw history issues when present', async () => {
+    await handleFix(
+      'task-surviving-payload',
+      {
+        branch: 'feat/challenge',
+        base_branch: 'main',
+        pr_number: 77,
+        prompt: 'Fix the surviving issues after challenge reconciliation',
+        surviving_issues: [survivingIssue],
+      },
+      convergenceContext,
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    // In convergence mode, survivingIssues drives the CRITICAL/MAJOR count guidance.
+    // survivingIssue has severity 'critical' → "Address exactly 1 CRITICAL and 0 MAJOR".
+    expect(prompt).toContain('Address exactly 1 CRITICAL and 0 MAJOR');
+    // The surviving file should be in the allowed-files list.
+    expect(prompt).toContain('src/new.ts');
+    // The rejected file should NOT be in the allowed-files list (it came from raw history).
+    expect(prompt).not.toContain('Files you may modify: src/rejected.ts');
+  });
+
+  it('handleFix uses surviving_issues from taskContext instead of raw history when payload has none', async () => {
+    await handleFix(
+      'task-surviving-context',
+      { branch: 'feat/challenge', base_branch: 'main', pr_number: 78, prompt: 'Fix surviving issues' },
+      {
+        context: {
+          scope: 'medium',
+          review_loop: { iteration: 7, review_history: reviewHistory },
+          surviving_issues: [survivingIssue],
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    // taskContext surviving_issues (1 critical) takes precedence over raw history (0 critical, 2 major).
+    expect(prompt).toContain('Address exactly 1 CRITICAL and 0 MAJOR');
+    expect(prompt).toContain('src/new.ts');
+  });
+
+  it('handleFix falls back to latest review-history issues when surviving_issues is absent', async () => {
+    await handleFix(
+      'task-no-surviving',
+      { branch: 'feat/challenge', base_branch: 'main', pr_number: 79, prompt: 'Fix review issues' },
+      convergenceContext,
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    // Falls back to raw history issues: rawHistoryIssue and rejectedIssue, both 'major' → 0 CRITICAL, 2 MAJOR.
+    expect(prompt).toContain('Address exactly 0 CRITICAL and 2 MAJOR');
+    // Both history files appear in allowed-files.
+    expect(prompt).toContain('src/old.ts');
+    expect(prompt).toContain('src/rejected.ts');
   });
 });

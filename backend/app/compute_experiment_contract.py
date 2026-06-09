@@ -49,6 +49,11 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "env",
         "accelerator",
         "provisioning_model",
+        "live_proof",
+        "live_proof_marker",
+        "live_release_proof",
+        "live_release_proof_marker",
+        "requires_live_release",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -79,3 +84,34 @@ def _validate_compute_launch_contract(
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
     return True, ""
+
+
+def resolve_compute_spend_threshold(
+    runtime_config: dict[str, Any],
+    direction: dict[str, Any] | None,
+) -> float:
+    """Resolve the compute_experiment approval threshold (USD).
+
+    A positive per-direction ``compute_experiment_spend_threshold_usd`` override
+    wins; otherwise the global runtime-config default applies. Malformed config
+    degrades to ``0.0`` so any positive proposed spend requires approval.
+    """
+    if direction:
+        override = direction.get("compute_experiment_spend_threshold_usd")
+        if isinstance(override, (int, float)) and override > 0:
+            return float(override)
+    try:
+        return float(runtime_config.get("compute_experiment_spend_threshold_usd", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def resolve_compute_spend_approval(
+    *,
+    runtime_config: dict[str, Any],
+    direction: dict[str, Any] | None,
+    spend_cap_usd: float,
+) -> tuple[bool, float]:
+    """Return ``(requires_approval, threshold)`` for a proposed compute spend."""
+    threshold = resolve_compute_spend_threshold(runtime_config, direction)
+    return float(spend_cap_usd) > threshold, threshold

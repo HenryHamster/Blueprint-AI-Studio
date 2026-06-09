@@ -91,4 +91,10 @@ async def kill_project_compute_job(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if killed is None:
+        # A peer drove the job terminal during the lock-free RPC window; re-fetch
+        # the now-terminal job so the caller still gets the final state.
+        killed = await session.get(ComputeJob, job_id)
+        if killed is None:
+            raise HTTPException(status_code=404, detail="Compute job not found")
     return {"compute_job": serialize_compute_job_response(killed)}

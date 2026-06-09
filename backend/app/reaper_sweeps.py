@@ -3143,6 +3143,11 @@ def reset_wake_delivery_stall_state() -> None:
     _wake_delivery_stall_cycles = 0
 
 
+def get_wake_delivery_stall_cycles() -> int:
+    """Return the current value of the cross-cycle delivery-stall counter."""
+    return _wake_delivery_stall_cycles
+
+
 class WakeSweepResult(int):
     """Per-cycle outcome of :func:`sweep_deliver_task_wakes`.
 
@@ -3160,6 +3165,8 @@ class WakeSweepResult(int):
                                 sweep (the residual delivery backlog)
       * ``stall_cycles``      — consecutive no-progress cycles with a FIRED backlog
       * ``delivery_stalled``  — True once ``stall_cycles`` crosses the threshold
+      * ``post_commit_stuck`` — DELIVERED rows that still returned False from
+                                ``run_compute_wake_post_commit`` this cycle
     """
 
     delivered: int
@@ -3169,6 +3176,7 @@ class WakeSweepResult(int):
     fired_undelivered: int
     stall_cycles: int
     delivery_stalled: bool
+    post_commit_stuck: int
 
     def __new__(
         cls,
@@ -3180,6 +3188,7 @@ class WakeSweepResult(int):
         fired_undelivered: int = 0,
         stall_cycles: int = 0,
         delivery_stalled: bool = False,
+        post_commit_stuck: int = 0,
     ) -> "WakeSweepResult":
         self = super().__new__(cls, delivered)
         self.delivered = int(delivered)
@@ -3189,6 +3198,7 @@ class WakeSweepResult(int):
         self.fired_undelivered = int(fired_undelivered)
         self.stall_cycles = int(stall_cycles)
         self.delivery_stalled = bool(delivery_stalled)
+        self.post_commit_stuck = int(post_commit_stuck)
         return self
 
     def as_log_fields(self) -> dict:
@@ -3201,6 +3211,7 @@ class WakeSweepResult(int):
             "fired_undelivered": self.fired_undelivered,
             "stall_cycles": self.stall_cycles,
             "delivery_stalled": self.delivery_stalled,
+            "post_commit_stuck": self.post_commit_stuck,
         }
 
     def is_noteworthy(self) -> bool:
@@ -3211,6 +3222,7 @@ class WakeSweepResult(int):
             or self.stranded
             or self.delivery_failed
             or self.delivery_stalled
+            or self.post_commit_stuck
         )
 
 
@@ -3247,11 +3259,13 @@ async def sweep_deliver_task_wakes(
     commit internal KnowledgeDocument rows; their post-commit broadcast + knowledge
     persistence run via ``run_compute_wake_post_commit`` AFTER the delivery commit.
     """
-    from sqlalchemy import func
+    from sqlalchemy import func, or_
 
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.database import resolve_dialect_name
     from app.failure_classification import PARK_WAKE_STRANDED
     from app.task_completion import (
+        _COMPUTE_WAKE_NEXT_RETRY_KEY,
         _COMPUTE_WAKE_POST_COMMIT_META_KEY,
         run_compute_wake_post_commit,
     )
@@ -3265,22 +3279,49 @@ async def sweep_deliver_task_wakes(
     expired = 0
     stranded_count = 0
     delivery_failed = 0
+    post_commit_stuck = 0
     touched = False
+    now_iso = now.isoformat()
 
     # Retry delivered compute-wake registrations that are carrying the durable
     # post-commit marker before processing any new FIRED rows. This keeps the
     # wake side effects recoverable even after the delivery row itself has been
     # committed as DELIVERED.
+    #
+    # ``has_key`` uses the JSONB ``?`` operator (PostgreSQL only). On SQLite
+    # (standalone tests) these predicates are omitted; the Python loop guards
+    # below still filter correctly in that case.
+    #
+    # The ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` filter excludes rows whose backoff
+    # window has not yet elapsed, preventing a failing batch from starving
+    # newer ready rows: a row is eligible only if the key is absent (never
+    # failed) OR its stored timestamp is <= now.
+    _retry_where = [
+        TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
+        TaskWakeRegistration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND,
+    ]
+    if resolve_dialect_name(session) != "sqlite":
+        _retry_where.append(
+            TaskWakeRegistration.source_metadata.has_key(
+                _COMPUTE_WAKE_POST_COMMIT_META_KEY
+            )
+        )
+        _retry_where.append(
+            or_(
+                ~TaskWakeRegistration.source_metadata.has_key(
+                    _COMPUTE_WAKE_NEXT_RETRY_KEY
+                ),
+                TaskWakeRegistration.source_metadata[
+                    _COMPUTE_WAKE_NEXT_RETRY_KEY
+                ].astext
+                <= now_iso,
+            )
+        )
     retry_rows = (
         (
             await session.execute(
                 select(TaskWakeRegistration)
-                .where(
-                    TaskWakeRegistration.delivery_state
-                    == WakeDeliveryState.DELIVERED,
-                    TaskWakeRegistration.wake_source_kind
-                    == COMPUTE_JOB_TERMINAL_WAKE_KIND,
-                )
+                .where(*_retry_where)
                 .order_by(TaskWakeRegistration.delivered_at.asc().nullsfirst())
                 .limit(batch_size)
                 .with_for_update(skip_locked=True)
@@ -3292,9 +3333,15 @@ async def sweep_deliver_task_wakes(
     for reg in retry_rows:
         if _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {}):
             continue
+        # SQLite guard: skip rows whose backoff window has not expired yet.
+        if (reg.source_metadata or {}).get(_COMPUTE_WAKE_NEXT_RETRY_KEY, "") > now_iso:
+            continue
         try:
-            await run_compute_wake_post_commit(session, reg)
+            ok = await run_compute_wake_post_commit(session, reg)
+            if not ok:
+                post_commit_stuck += 1
         except Exception:
+            post_commit_stuck += 1
             logger.exception(
                 "[REAPER] Wake post-commit retry failed for registration %s",
                 reg.id,
@@ -3477,7 +3524,73 @@ async def sweep_deliver_task_wakes(
         fired_undelivered=int(fired_undelivered),
         stall_cycles=_wake_delivery_stall_cycles,
         delivery_stalled=delivery_stalled,
+        post_commit_stuck=post_commit_stuck,
     )
+
+
+async def sweep_wake_delivery_stall_alerts(
+    session,
+    *,
+    delivery_stalled: bool,
+    stall_cycles: int,
+) -> int:
+    """Raise or clear per-project wake-delivery-stall operator alerts.
+
+    When ``delivery_stalled`` is True, creates a deduplicated WARNING alert
+    for every project that currently has a FIRED (undelivered) registration.
+    When False (delivery recovering), dismisses any open stall alerts
+    fleet-wide. Returns the number of NEW alerts created.
+
+    Follows the same dedup-on-stable-title pattern as
+    :func:`sweep_migration_slot_contention`. Caller owns no commit for the
+    create path (commits inside after the loop); the resolve path commits
+    per-project inside :func:`alert_dispatch._resolve_wake_delivery_stall_alert`.
+    """
+    from app.alert_dispatch import (
+        _WAKE_DELIVERY_STALL_ALERT_TITLE,
+        _maybe_create_wake_delivery_stall_alert,
+        _resolve_wake_delivery_stall_alert,
+    )
+    from app.models import Alert, TaskWakeRegistration, WakeDeliveryState
+
+    if not delivery_stalled:
+        # Delivery has recovered — dismiss open stall alerts fleet-wide.
+        result = await session.execute(
+            select(Alert.project_id).distinct().where(
+                Alert.dismissed_at.is_(None),
+                Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+            )
+        )
+        project_ids = result.scalars().all()
+        dismissed = 0
+        for pid in project_ids:
+            dismissed += await _resolve_wake_delivery_stall_alert(session, pid)
+        if dismissed:
+            logger.info(
+                "[REAPER] resolved wake-delivery-stall alert on %d project(s)",
+                dismissed,
+            )
+        return 0
+
+    # Delivery is stalled — raise a deduped alert per project with FIRED backlog.
+    result = await session.execute(
+        select(TaskWakeRegistration.project_id).distinct().where(
+            TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED
+        )
+    )
+    project_ids = result.scalars().all()
+    created = 0
+    for pid in project_ids:
+        created += await _maybe_create_wake_delivery_stall_alert(
+            session, pid, stall_cycles=stall_cycles
+        )
+    if created:
+        await session.commit()
+        logger.info(
+            "[REAPER] raised wake-delivery-stall alert on %d project(s)",
+            created,
+        )
+    return created
 
 
 # ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────

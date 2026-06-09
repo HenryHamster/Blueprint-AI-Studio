@@ -4220,3 +4220,225 @@ describe('MessagesPanel composer draft persistence', () => {
     expect(textarea.value).toBe('draft for project B');
   });
 });
+
+// ── Strategic cycle live-progress render tests ────────────────────────────────
+
+describe('MessagesPanel strategic cycle progress indicators', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(props: {
+    strategistActive?: boolean;
+    cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null;
+    lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null;
+  } = {}) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([]);
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  // ── Live progress indicator ────────────────────────────────────────────────
+
+  test('shows generic "Strategist working…" when strategistActive and no phase label (minimal event backward-compat)', async () => {
+    const el = await renderPanel({ strategistActive: true, cycleProgress: null });
+    expect(el.textContent).toContain('Strategist working…');
+    expect(el.textContent).not.toContain('Strategist:');
+  });
+
+  test('shows phase label from enriched event when available', async () => {
+    const el = await renderPanel({
+      strategistActive: true,
+      cycleProgress: { task_id: 't1', phase_label: 'Spawning tasks' },
+    });
+    expect(el.textContent).toContain('Strategist: Spawning tasks…');
+  });
+
+  test('shows steering excerpt under the phase label', async () => {
+    const el = await renderPanel({
+      strategistActive: true,
+      cycleProgress: {
+        task_id: 't1',
+        phase_label: 'Reviewing',
+        steering_excerpt: 'Focus on backend reliability',
+      },
+    });
+    expect(el.textContent).toContain('Strategist: Reviewing…');
+    expect(el.textContent).toContain('Focus on backend reliability');
+  });
+
+  test('truncates steering excerpt longer than 100 chars', async () => {
+    const longExcerpt = 'A'.repeat(120);
+    const el = await renderPanel({
+      strategistActive: true,
+      cycleProgress: { task_id: 't1', steering_excerpt: longExcerpt },
+    });
+    // First 100 chars + ellipsis — not the full 120 chars
+    expect(el.textContent).toContain('A'.repeat(100) + '…');
+    expect(el.textContent).not.toContain('A'.repeat(101));
+  });
+
+  test('does not show progress indicator when strategistActive is false', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      cycleProgress: { task_id: 't1', phase_label: 'Spawning tasks' },
+    });
+    expect(el.textContent).not.toContain('Strategist');
+  });
+
+  // ── Cycle completion receipt ────────────────────────────────────────────────
+
+  test('shows "Cycle complete" banner with created direction count', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', created_count: 3 },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    expect(el.textContent).toContain('+3 directions');
+  });
+
+  test('completion receipt shows retired and tasks spawned counts', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', retired_count: 2, tasks_spawned: 5 },
+    });
+    expect(el.textContent).toContain('−2 retired');
+    expect(el.textContent).toContain('5 tasks spawned');
+  });
+
+  test('completion receipt shows staged directions count', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', staged_count: 3 },
+    });
+    expect(el.textContent).toContain('3 directions staged');
+  });
+
+  test('completion receipt shows running update and problem model flags', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: {
+        status: 'completed',
+        running_update_changed: true,
+        problem_model_changed: true,
+      },
+    });
+    expect(el.textContent).toContain('running update written');
+    expect(el.textContent).toContain('problem model updated');
+  });
+
+  test('failed cycle shows "Cycle failed" with red accent, not emerald', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Timed out after 5 minutes' },
+    });
+    expect(el.textContent).toContain('Cycle failed');
+    expect(el.textContent).toContain('Timed out after 5 minutes');
+    // The banner container should have red background, not emerald
+    const banner = el.querySelector('[role="status"]');
+    expect(banner?.className).toContain('red');
+    expect(banner?.className).not.toContain('emerald');
+  });
+
+  test.each([
+    ['deferred', 'Cycle deferred', 'amber'],
+    ['FAILED', 'Cycle failed', 'red'],
+    ['CANCELLED', 'Cycle cancelled', 'red'],
+  ])('completion receipt renders %s status distinctly', async (status, label, tone) => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status, failure_reason: status === 'deferred' ? undefined : 'boom' },
+    });
+    expect(el.textContent).toContain(label);
+    const banner = el.querySelector('[role="status"]');
+    expect(banner?.className).toContain(tone);
+  });
+
+  test('successful cycle shows emerald accent, not red', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', created_count: 1 },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    const banner = el.querySelector('[role="status"]');
+    expect(banner?.className).toContain('emerald');
+    expect(banner?.className).not.toContain('red');
+  });
+
+  test('completion receipt is hidden while a new cycle is active', async () => {
+    const el = await renderPanel({
+      strategistActive: true,
+      lastCycleCompletion: { status: 'completed', created_count: 2 },
+    });
+    // While active, show progress indicator; hide the old completion receipt
+    expect(el.textContent).toContain('Strategist working…');
+    expect(el.textContent).not.toContain('Cycle complete');
+  });
+
+  test('completion receipt is absent when lastCycleCompletion is null', async () => {
+    const el = await renderPanel({ lastCycleCompletion: null });
+    expect(el.textContent).not.toContain('Cycle complete');
+    expect(el.textContent).not.toContain('Cycle failed');
+  });
+
+  test('completion receipt shows compact strategic challenge summary when present', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: {
+        status: 'completed',
+        created_count: 1,
+        strategic_judgment_challenge: {
+          mode: 'ok',
+          verdict: 'warned',
+          warned_count: 2,
+          blocked_count: 1,
+        },
+      },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    // Compact chip surfaces verdict and counts without the full item list.
+    const chip = el.querySelector('[aria-label*="Strategic judgment challenge"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toContain('challenge: ok · warned');
+    expect(chip?.textContent).toContain('1 blocked');
+    expect(chip?.textContent).toContain('2 warned');
+  });
+
+  test('completion receipt shows no challenge chip (and no warning styling) when summary absent', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', created_count: 1 },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    // Pre-challenge cycles carry no summary → no chip rendered at all.
+    expect(el.querySelector('[aria-label*="Strategic judgment challenge"]')).toBeNull();
+    expect(el.textContent).not.toContain('challenge:');
+  });
+});

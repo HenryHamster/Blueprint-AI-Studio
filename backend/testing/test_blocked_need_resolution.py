@@ -595,6 +595,25 @@ def test_knowledge_topic_equality_satisfies_need():
     assert knowledge_substance_satisfies_need(need, substance) is True
 
 
+def test_ungrounded_compute_knowledge_does_not_satisfy_need():
+    """Compute substance with no durable citations is filtered out."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    need = {"kind": "task", "ref": "gpu-proof"}
+    ungrounded = [
+        KnowledgeSubstance(
+            finding_hash=None,
+            topic="gpu-proof",
+            source_kind="compute_experiment",
+            source_citations=(),
+            forward_quality_verdict={"analysis_mode": "fallback"},
+        )
+    ]
+    # Ungrounded compute does not satisfy the need — the grounding gate always fires.
+    assert knowledge_substance_satisfies_need(need, ungrounded) is False
+
+
 def test_knowledge_finding_hash_mismatch_returns_false():
     from app.blocked_need_resolution import knowledge_substance_satisfies_need
     from app.knowledge_query import KnowledgeSubstance
@@ -602,6 +621,186 @@ def test_knowledge_finding_hash_mismatch_returns_false():
     substance = [KnowledgeSubstance(finding_hash="aaaa1111", topic="some-topic")]
     need = {"kind": "task", "ref": "bbbb2222"}
     assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_ungrounded_compute_doc_does_not_satisfy_prereq():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-1",
+            topic="compute-need-1",
+            source_kind="compute_experiment",
+            source_citations=(),
+            forward_quality_verdict={
+                "analysis_mode": "fallback",
+                "citation_grounding_miss": True,
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 0,
+                        "unresolved": ["https://signed.example.com/jobs/result.json"],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_grounded_compute_negative_result_satisfies_prereq():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-2",
+            topic="compute-need-2",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={
+                "analysis_mode": "llm",
+                "outcome": "SPEND_CAP_EXCEEDED",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-2"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_grounded_fallback_compute_doc_satisfies_prereq():
+    # Deliberate contract: the prerequisite gate uses the LOOSE grounding predicate,
+    # not the strict acceptance-evidence gate. A grounded fallback doc (analysis_mode
+    # != 'llm') still unblocks dependents — requiring LLM mode would permanently starve
+    # dependents when ANTHROPIC_API_KEY is absent. See also
+    # test_require_acceptance_evidence_matches_documented_contract_for_grounded_fallback_doc.
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-3",
+            topic="compute-need-3",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={
+                "analysis_mode": "fallback",
+                "outcome": "SUCCESS",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-3"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_require_acceptance_evidence_matches_documented_contract_for_grounded_fallback_doc():
+    """Pin the deliberate contract: a grounded analysis_mode=fallback compute document
+    satisfies a prerequisite need even though it would NOT pass the strict acceptance-
+    evidence gate (classify_knowledge_acceptance returns knowledge_acceptance_evidence=False
+    for fallback mode). The prerequisite gate uses the LOOSE durable-grounding predicate,
+    not the strict acceptance gate, so dependent tasks are never permanently starved when
+    LLM analysis is unavailable.
+
+    This test is the acceptance-requirement pin: it exercises the production code
+    (knowledge_substance_satisfies_need) that both reaper_sweeps and capability_demand
+    call, and explicitly documents the deliberate looser-than-acceptance behavior.
+    """
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance, classify_knowledge_acceptance
+
+    grounded_fallback = KnowledgeSubstance(
+        finding_hash="fallback-grounded-doc",
+        topic="fallback-grounded-doc",
+        source_kind="compute_experiment",
+        source_citations=("gs://bucket/jobs/metrics.json",),
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "outcome": "SUCCESS",
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 1,
+                    "unresolved": [],
+                }
+            },
+        },
+    )
+
+    # Confirm the strict acceptance gate REJECTS this document (analysis_mode != 'llm').
+    acceptance = classify_knowledge_acceptance(
+        source_kind=grounded_fallback.source_kind,
+        forward_quality_verdict=grounded_fallback.forward_quality_verdict,
+        source_citations=list(grounded_fallback.source_citations or ()),
+    )
+    assert acceptance["knowledge_acceptance_evidence"] is False
+    assert acceptance["compute_acceptance_grade"] == "measured_only"
+
+    # But the prerequisite gate ACCEPTS it — the durable-grounding predicate passes
+    # because there is a durable gs:// citation with grounded > 0 and no miss flag.
+    need = {"kind": "task", "ref": "fallback-grounded-doc"}
+    assert knowledge_substance_satisfies_need(need, [grounded_fallback]) is True
+
+
+def test_compute_experiment_without_durable_grounding_stays_blocked():
+    """Compute knowledge only unblocks dependents when the stored evidence is durable."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import (
+        KnowledgeSubstance,
+        knowledge_substance_has_durable_compute_grounding,
+    )
+
+    need = {"kind": "task", "ref": "blocked-compute-doc"}
+    missing_probe = KnowledgeSubstance(
+        finding_hash="blocked-compute-doc",
+        topic="blocked-compute-doc",
+        source_kind="compute_experiment",
+        source_citations=("gs://bucket/jobs/result.json",),
+        forward_quality_verdict={"analysis_mode": "fallback"},
+    )
+    transient_citation = KnowledgeSubstance(
+        finding_hash="blocked-compute-doc",
+        topic="blocked-compute-doc",
+        source_kind="compute_experiment",
+        source_citations=("https://signed.example.com/jobs/result.json",),
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 1,
+                    "unresolved": [],
+                }
+            },
+        },
+    )
+
+    assert knowledge_substance_has_durable_compute_grounding(missing_probe) is False
+    assert knowledge_substance_satisfies_need(need, [missing_probe]) is False
+    assert knowledge_substance_has_durable_compute_grounding(
+        transient_citation
+    ) is False
+    assert knowledge_substance_satisfies_need(need, [transient_citation]) is False
 
 
 def test_knowledge_topic_near_miss_not_fuzzy():
@@ -629,3 +828,90 @@ def test_knowledge_empty_index_returns_false():
 
     need = {"kind": "task", "ref": "anything"}
     assert knowledge_substance_satisfies_need(need, []) is False
+
+
+# ── fail-closed probe-absent compute-grounding gate ───────────────────────────
+
+def test_unprobed_compute_doc_does_not_satisfy_prereq():
+    """A compute substance with a durable citation but NO grounding probe must NOT
+    satisfy a prereq — the probe is the only positive proof of durable grounding,
+    so absence of the verdict fails closed (not open)."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-unprobed-1",
+            topic="compute-unprobed-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict=None,  # probe never ran — no verdict
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-unprobed-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_no_probes_key_compute_doc_does_not_satisfy_prereq():
+    """Verdict present but probes dict absent → fail closed."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-noprobes-1",
+            topic="compute-noprobes-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={"analysis_mode": "llm"},  # no probes key
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-noprobes-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_no_grounding_subprobe_compute_doc_does_not_satisfy_prereq():
+    """Probes dict present but grounding sub-probe absent → fail closed."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-noground-1",
+            topic="compute-noground-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={"analysis_mode": "llm", "probes": {}},  # no grounding
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-noground-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_ephemeral_url_citation_compute_doc_does_not_satisfy_prereq():
+    """A compute substance whose only citation is an ephemeral signed URL must not
+    satisfy a prereq — bare http(s):// URLs are transient, not durable references."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-ephemeral-1",
+            topic="compute-ephemeral-1",
+            source_kind="compute_experiment",
+            source_citations=("https://signed.storage.example.com/result.json?token=abc",),
+            forward_quality_verdict={
+                "analysis_mode": "llm",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-ephemeral-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False

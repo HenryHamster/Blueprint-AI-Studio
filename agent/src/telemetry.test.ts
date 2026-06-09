@@ -92,6 +92,9 @@ describe('format-compliance telemetry', () => {
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
     });
   });
 
@@ -119,6 +122,9 @@ describe('format-compliance telemetry', () => {
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
     });
   });
 
@@ -136,6 +142,9 @@ describe('format-compliance telemetry', () => {
       format_error_total: 4,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
     });
   });
 
@@ -149,6 +158,9 @@ describe('format-compliance telemetry', () => {
       format_error_total: 1,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
     });
   });
 
@@ -162,7 +174,70 @@ describe('format-compliance telemetry', () => {
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
     });
+  });
+});
+
+describe('format-compliance telemetry — schema dimension', () => {
+  it('records_format_compliance_by_schema_without_losing_totals', () => {
+    // This is the named acceptance test: schema-bucketed events must accumulate
+    // in the per-schema maps without losing the existing aggregate counters.
+    recordFormatMiss('unbalanced_json', 'memo');
+    recordFormatMiss('no_json_start', 'design');
+    recordFormatMiss('unbalanced_json', 'memo');
+    recordFormatRepairAttempt('memo');
+    recordFormatRepairAttempt('design');
+    recordFormatRepairSuccess('memo');
+
+    const tel = getFormatComplianceTelemetry();
+
+    // Aggregate counters are preserved.
+    expect(tel.format_error_total).toBe(3);
+    expect(tel.format_repair_attempts).toBe(2);
+    expect(tel.format_repair_successes).toBe(1);
+    expect(tel.format_miss_by_reason).toEqual({ unbalanced_json: 2, no_json_start: 1 });
+
+    // Per-schema buckets accumulate correctly.
+    expect(tel.format_miss_by_schema).toEqual({ memo: 2, design: 1 });
+    expect(tel.format_repair_attempts_by_schema).toEqual({ memo: 1, design: 1 });
+    expect(tel.format_repair_successes_by_schema).toEqual({ memo: 1 });
+  });
+
+  it('calls without schemaLabel do not create per-schema entries but still update aggregates', () => {
+    recordFormatMiss('malformed_json');
+    recordFormatRepairAttempt();
+    recordFormatRepairSuccess();
+
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_error_total).toBe(1);
+    expect(tel.format_repair_attempts).toBe(1);
+    expect(tel.format_repair_successes).toBe(1);
+    expect(tel.format_miss_by_schema).toEqual({});
+    expect(tel.format_repair_attempts_by_schema).toEqual({});
+    expect(tel.format_repair_successes_by_schema).toEqual({});
+  });
+
+  it('reset clears per-schema maps', () => {
+    recordFormatMiss('unbalanced_json', 'audit');
+    recordFormatRepairAttempt('audit');
+    recordFormatRepairSuccess('audit');
+    resetFormatComplianceTelemetry();
+
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_miss_by_schema).toEqual({});
+    expect(tel.format_repair_attempts_by_schema).toEqual({});
+    expect(tel.format_repair_successes_by_schema).toEqual({});
+  });
+
+  it('per-schema snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatMiss('no_json_start', 'web_research');
+    const snap = getFormatComplianceTelemetry();
+    (snap.format_miss_by_schema as Record<string, number>)['web_research'] = 999;
+
+    expect(getFormatComplianceTelemetry().format_miss_by_schema).toEqual({ web_research: 1 });
   });
 });
 

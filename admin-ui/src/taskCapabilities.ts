@@ -292,6 +292,11 @@ export interface ResolvedCapability {
   badge: string;
   description: string;
   userLaunchable: boolean;
+  // True for a non-user-launchable type that still has a dedicated structured
+  // launch-contract path (compute_experiment). Such types are surfaced in the
+  // new-task launcher alongside user-launchable ones so the operator can reach
+  // the dedicated contract form.
+  operatorContractLaunchable: boolean;
   providerConfigurable: boolean;
   filterVisible: boolean;
   reservable: boolean;
@@ -322,6 +327,9 @@ const STATIC_RESOLVED: ResolvedCapability[] = TASK_CAPABILITIES.map(capability =
   badge: capability.label,
   description: capability.description,
   userLaunchable: capability.userLaunchable,
+  // The static fallback table has no contract-launchable types; the dedicated
+  // compute_experiment path only surfaces when the backend publishes the flag.
+  operatorContractLaunchable: false,
   providerConfigurable: capability.providerConfigurable,
   filterVisible: capability.filterVisible,
   reservable: FALLBACK_RESERVABLE_IDS.has(capability.id),
@@ -336,6 +344,7 @@ function normalizePublished(entry: TaskCapabilityContractEntry): ResolvedCapabil
     badge: entry.badge ?? label,
     description: entry.description ?? '',
     userLaunchable: entry.user_launchable ?? false,
+    operatorContractLaunchable: entry.operator_contract_launchable ?? false,
     providerConfigurable: entry.provider_configurable ?? false,
     filterVisible: entry.filter_visible ?? false,
     reservable: entry.reservable ?? false,
@@ -355,7 +364,7 @@ function buildResolved(caps: ResolvedCapability[]): ResolvedTaskCapabilities {
     byId,
     filterIds: filterCaps.map(c => c.id),
     userLaunchableOptions: caps
-      .filter(c => c.userLaunchable && !c.synthetic)
+      .filter(c => (c.userLaunchable || c.operatorContractLaunchable) && !c.synthetic)
       .map(c => ({ value: c.id, label: c.label, description: c.description })),
     providerRoutableIds: caps
       .filter(c => c.providerConfigurable && !c.synthetic)

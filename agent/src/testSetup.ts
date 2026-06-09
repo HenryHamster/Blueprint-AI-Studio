@@ -40,6 +40,7 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'investigate',
   'self_audit',
   'release_audit',
+  'release_audit_challenge',
   'memo',
   'verify_tests',
   'compute_experiment',
