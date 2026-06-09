@@ -4297,6 +4297,41 @@ async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
 
 
 @_pytest.mark.asyncio
+async def test_finding_challenge_reentry_does_not_double_increment_spawn_count(
+    db_session, mocker
+):
+    """A finding-challenge resume is a re-entry pass and must not re-count."""
+
+    project, _direction, task = await _grader_project_and_task(db_session, "d-fc-re")
+    project.vision = {"_research_spawn_count": 7, "purpose": "keep-me"}
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+            "first_verdict": "absent",
+            "second_opinion_verdict": "present",
+            "agreement": CHALLENGE_DISAGREES,
+            "reason": "symbol relocated",
+            "sidecar_task_id": str(uuid.uuid4()),
+        },
+    }
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(project)
+
+    assert project.vision["_research_spawn_count"] == 7
+    assert project.vision["purpose"] == "keep-me"
+    assert task.context.get(QUALITY_GRADER_VERDICT_KEY) is None
+    assert task.context.get(ADVERSARIAL_GATE_VERDICT_KEY) is None
+
+
+@_pytest.mark.asyncio
 async def test_evaluating_flip_is_atomic_with_child_spawn(db_session, mocker):
     """A failure in the post-spawn wiring (AFTER the child-spawn commit) must leave
     the parent EVALUATING-with-children, never COMPLETED-with-children.

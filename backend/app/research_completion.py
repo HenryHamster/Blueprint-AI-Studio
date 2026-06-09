@@ -1604,6 +1604,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Re-entry signal: the independent grader has returned its verdict.
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
     _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
+    _finding_challenge_verdict = (task.context or {}).get(FINDING_CHALLENGE_VERDICT_KEY)
     if _grader_verdict is not None and not _grader_verdict.get("passed", False):
         # FAILED forward-quality gate: do NOT spawn implementation tasks and do
         # NOT complete clean. Mark FAILED so the research is not trusted, and
@@ -1645,10 +1646,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _increment_research_spawn_count(vision: dict) -> None:
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
 
-    # Only on the FIRST pass — a re-entrant resume after grading must not
-    # re-count the cycle (grader or adversarial verdict already present means
-    # we're on a re-entrant pass, not the initial completion).
-    if project_obj is not None and _grader_verdict is None and _adversarial_verdict_raw is None:
+    # Only on the FIRST pass — a re-entrant resume after grading or a
+    # per-finding challenge must not re-count the cycle (verdict already
+    # present means we're on a re-entrant pass, not the initial completion).
+    if (
+        project_obj is not None
+        and _grader_verdict is None
+        and _adversarial_verdict_raw is None
+        and _finding_challenge_verdict is None
+    ):
         await with_vision_locked(
             session, task.project_id, _increment_research_spawn_count
         )

@@ -38,6 +38,7 @@ backend/.testmondata*
 /done
 /fail
 /fetch
+self_review_*.json
 research-*.md
 *.bak
 
