@@ -789,6 +789,15 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                  protocols/APIs/vendors); produces a citation-grounded doc
 #   design       — codebase-grounded design exploration for a subsystem before
 #                  implementation; produces a design document
+# web_research and design are HIGH-ROI and chronically under-used: one durable
+# knowledge document de-risks every later task in the area and compounds across
+# cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:
+#   - a direction hinges on external facts (APIs, vendors, pricing/quotas,
+#     standards, how mature OSS solves the same problem) nobody has documented
+#   - an area keeps producing failed/churning implementation tasks (structure
+#     should be settled by a design doc instead of re-derived per task)
+#   - the "Existing knowledge documents" index is empty or thin for a direction
+#     you are actively advancing
 # (Implementation/PR types are intentionally NOT spawnable here — they flow
 # through the normal direction → research → plan → create path.)
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
