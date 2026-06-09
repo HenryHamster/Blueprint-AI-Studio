@@ -41,6 +41,7 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
     accrued_cost_usd: 1.0,
     final_cost_usd: null,
     result_reference: null,
+    artifact_id: null,
     accelerator_type: null,
     accelerator_count: null,
     task_title: 'compute_experiment: sweep',
@@ -208,6 +209,54 @@ describe('ComputeJobsPanel render + kill', () => {
       'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
     ));
     expect(openSpy).toHaveBeenCalled();
+  });
+
+  test('surfaces COMPUTE_RESULT artifact with a resolvable reference link', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        artifact_id: 'artifact-abc',
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+      }),
+    ]);
+    const { findByText, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Primary artifact affordance is an openable link.
+    const artifactLink = await findByText('COMPUTE_RESULT artifact');
+    expect(artifactLink.closest('a')).toHaveAttribute(
+      'href',
+      'https://storage.example.com/jobs/job-1/result.json',
+    );
+    // Raw storage URI demoted to secondary technical detail.
+    expect(getByText('Result reference')).toBeInTheDocument();
+  });
+
+  test('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        artifact_id: 'artifact-abc',
+        result_reference: null,
+      }),
+    ]);
+    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const artifact = await findByText('COMPUTE_RESULT artifact');
+    // Present but not an openable link (no reference to resolve).
+    expect(artifact.closest('a')).toBeNull();
+    expect(artifact.closest('button')).toBeNull();
+    expect(queryByText('Result reference')).toBeNull();
+  });
+
+  test('shows no artifact affordance for jobs without artifact_id', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]);
+    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText(/compute_experiment: sweep/i);
+    expect(queryByText('COMPUTE_RESULT artifact')).toBeNull();
   });
 
   test('GPU job shows accelerator label alongside machine type', async () => {

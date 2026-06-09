@@ -562,6 +562,46 @@ describe('DetailsTab — Merge Test Gate', () => {
     );
   });
 
+  it('surfaces COMPUTE_RESULT artifact as the primary outcome with a resolvable reference', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({
+        artifact_id: 'artifact-xyz',
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+      }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    const artifact = await screen.findByText('COMPUTE_RESULT artifact');
+    expect(artifact.closest('a')).toHaveAttribute(
+      'href',
+      'https://storage.example.com/jobs/job-1/result.json',
+    );
+    // Raw storage URI demoted to a secondary technical detail row.
+    expect(screen.getByText('Result reference')).toBeInTheDocument();
+  });
+
+  it('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ artifact_id: 'artifact-xyz', result_reference: null }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    const artifact = await screen.findByText('COMPUTE_RESULT artifact');
+    expect(artifact.closest('a')).toBeNull();
+    expect(artifact.closest('button')).toBeNull();
+    expect(screen.queryByText('Result reference')).toBeNull();
+  });
+
+  it('shows no artifact affordance when artifact_id is absent', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ artifact_id: null, result_reference: null }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    await screen.findByText('gcp_compute_engine');
+    expect(screen.queryByText('COMPUTE_RESULT artifact')).toBeNull();
+  });
+
   it('resolves a gs:// compute result through the admin API before opening', async () => {
     const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
     vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
@@ -1106,6 +1146,7 @@ function makeComputeJob(overrides: Partial<import('../api').ComputeJob> = {}): i
     accrued_cost_usd: 3.5,
     final_cost_usd: 3.5,
     result_reference: null,
+    artifact_id: null,
     accelerator_type: null,
     accelerator_count: null,
     task_title: 'compute_experiment: benchmark run',

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink } from 'lucide-react';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
 import { fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
@@ -192,9 +192,30 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                   </button>
                 )}
               </div>
+              {job.artifact_id && (
+                <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
+                  <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />
+                  <div className="min-w-0">
+                    {job.result_reference ? (
+                      <ResolvedReferenceLink
+                        projectId={projectId}
+                        reference={job.result_reference}
+                        className="inline-flex items-center gap-1 font-semibold text-emerald-300 hover:text-emerald-200 hover:underline break-words min-w-0 text-left disabled:opacity-70"
+                      >
+                        <span className="break-words">COMPUTE_RESULT artifact</span>
+                        <ExternalLink className="w-3 h-3 shrink-0" />
+                      </ResolvedReferenceLink>
+                    ) : (
+                      <span className="font-semibold text-emerald-300">
+                        COMPUTE_RESULT artifact
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
               {job.result_reference && (
                 <div className="mt-1.5 flex items-start gap-1.5 text-[10px] text-neutral-400 font-mono break-words">
-                  <span className="shrink-0 text-neutral-500">Result</span>
+                  <span className="shrink-0 text-neutral-500">Result reference</span>
                   <ResolvedReferenceLink
                     projectId={projectId}
                     reference={job.result_reference}

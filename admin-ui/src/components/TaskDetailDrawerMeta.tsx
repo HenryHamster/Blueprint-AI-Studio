@@ -284,12 +284,28 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
                 <span className="text-xs text-neutral-400 break-words">{job.terminal_reason}</span>
               </DetailRow>
             )}
-            {job.result_reference && (
+            {job.artifact_id && (
               <DetailRow label="Artifact">
+                {job.result_reference ? (
+                  <ResolvedReferenceLink
+                    projectId={projectId}
+                    reference={job.result_reference}
+                    className="inline-flex items-center gap-1.5 font-semibold text-emerald-400 hover:text-emerald-300 hover:underline break-words text-left disabled:opacity-70"
+                  >
+                    <span className="break-words">COMPUTE_RESULT artifact</span>
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                  </ResolvedReferenceLink>
+                ) : (
+                  <span className="font-semibold text-emerald-400">COMPUTE_RESULT artifact</span>
+                )}
+              </DetailRow>
+            )}
+            {job.result_reference && (
+              <DetailRow label="Result reference">
                 <ResolvedReferenceLink
                   projectId={projectId}
                   reference={job.result_reference}
-                  className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 hover:underline break-all text-left disabled:opacity-70"
+                  className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 hover:underline break-all text-left disabled:opacity-70 font-mono text-xs"
                 >
                   <span className="break-all">{job.result_reference}</span>
                   <ExternalLink className="w-3.5 h-3.5 shrink-0" />

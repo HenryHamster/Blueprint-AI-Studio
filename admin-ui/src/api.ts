@@ -2157,6 +2157,11 @@ export interface ComputeJob {
   accrued_cost_usd: number | null;
   final_cost_usd: number | null;
   result_reference: string | null;
+  // Identifier of the durable COMPUTE_RESULT artifact the backend creates for
+  // every terminal compute job. This — not result_reference — is the primary,
+  // completion-defining outcome of a finished compute_experiment. Optional/null
+  // on legacy or in-flight rows that predate artifact creation.
+  artifact_id?: string | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
   polling_metadata?: Record<string, unknown>;
