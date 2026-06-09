@@ -1267,44 +1267,6 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     return None
 
 
-def _match_finding_to_challenge(
-    finding: dict,
-    challenge_verdicts_list: list,
-) -> dict | None:
-    """Return the best-scoring challenge verdict that matches this finding, or None.
-
-    Matching is by summary + file.  Severity is advisory metadata for
-    confirmed/uncertain verdicts, but refuted_false_positive verdicts must carry
-    at least the finding's severity rank before they are eligible to bind.  The
-    primary audit and the challenger may independently bucket the same issue at
-    different severities, so content still wins for verdicts that do not remove
-    findings from scoring.  (file is optional — two empty file fields are treated
-    as equal so challenge verdicts without a ``file`` key match audit findings
-    that also omit it).
-
-    Summary matching uses two passes:
-    1. Exact text match (fast path — covers the case where the challenger was
-       given ``primary_findings`` and echoed back the exact text).  Scores 2.0
-       to ensure it always beats any fuzzy match in best-match assignment.
-    2. Token-overlap fuzzy match — covers the common case where the challenge
-       runs in parallel without ``primary_findings`` and independently derives
-       the same findings with different free-text wording.  Both sides must
-       share at least ``_FINDING_MATCH_TOKEN_THRESHOLD`` fraction of the
-       shorter token set (min-denominator) for a match to fire.  Scores ≤ 1.0.
-
-    Returns the highest-scoring match rather than the first, so that when
-    multiple verdicts could match a finding the most-similar one wins.
-    """
-    best_score: float = -1.0
-    best_verdict: dict | None = None
-    for cv in challenge_verdicts_list:
-        score = _score_finding_to_challenge(finding, cv)
-        if score is not None and score > best_score:
-            best_score = score
-            best_verdict = cv
-    return best_verdict
-
-
 def _reconcile_audit_with_challenge(
     report: dict[str, Any] | None,
     challenge_envelope: dict[str, Any] | None,

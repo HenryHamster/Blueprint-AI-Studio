@@ -165,7 +165,6 @@ from app.release_scoring import (
     _extract_test_erosion_detail,
     _finding_subject_is_authorized_divergence,  # noqa: F401 — re-exported for tests
     _fmt_sub_scores,
-    _match_finding_to_challenge,  # noqa: F401 — re-exported for callers/tests
     _reconcile_audit_with_challenge,  # noqa: F401 — re-exported for callers/tests
     _score_audit,
     _score_smoketest,

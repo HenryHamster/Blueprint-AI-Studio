@@ -2047,6 +2047,10 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert modified is None
         assert refuted == []
 
+    def test_match_finding_to_challenge_removed(self):
+        """_match_finding_to_challenge is no longer exported — it was dead code."""
+        assert not hasattr(rq, "_match_finding_to_challenge")
+
 
 class TestReconcileAuditBestMatchAssignment:
     """Best-match pre-assignment: Jaccard denominator + global greedy assignment.
