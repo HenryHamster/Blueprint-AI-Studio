@@ -1013,6 +1013,22 @@ async def _confirm_serving_or_fail(
             aggregate_status, aggregate_reason = aggregate_required_artifact_status(
                 provider_rows
             )
+            # Undecidable corruption: a promotion with NO recorded promoted_sha
+            # can never confirm by SHA-match — every required provider that needs
+            # it returns "no decision" (the backend times out, but agent_image
+            # bails on the missing SHA), so the aggregate sits "unconfirmed"
+            # forever and wedges the next version (the real v7 case). Once the
+            # (backstopped) confirmation window has elapsed, resolve it as a
+            # TIMEOUT, not a permanent wedge and not a deploy_failed: nothing went
+            # wrong, we simply cannot verify what shipped.
+            if aggregate_status == "unconfirmed" and not version.promoted_sha:
+                _deadline = _to_naive_utc(version.deploy_confirm_deadline)
+                _now_naive = _to_naive_utc(_now) or _now
+                if _deadline is not None and _now_naive >= _deadline:
+                    aggregate_status, aggregate_reason = (
+                        "confirmation_timed_out",
+                        "promoted_sha_missing",
+                    )
             if aggregate_status == "unconfirmed":
                 if mutated:
                     await session.commit()

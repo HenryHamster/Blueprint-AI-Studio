@@ -2149,6 +2149,63 @@ async def test_confirm_timed_out_arms_strategic_refresh_distinctly(db_session):
 
 
 @pytest.mark.asyncio
+async def test_confirm_missing_promoted_sha_times_out(db_session):
+    """A promoted version with NO recorded promoted_sha (corrupt record) can never
+    confirm by SHA-match: the backend artifact times out but the agent_image
+    provider bails on the missing SHA, so the aggregate would sit 'unconfirmed'
+    forever and wedge the next version (the real v7 case that gated v8). Once the
+    window elapses it must resolve to confirmation_timed_out (promoted_sha_missing),
+    NOT stay unconfirmed and NOT a deploy_failed."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=None
+    )
+    # A STABLE revision is serving, but with no recorded promoted_sha there is
+    # nothing to match it against.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "confirmation_timed_out"
+    assert version.deploy_failure_reason == "promoted_sha_missing"
+
+
+@pytest.mark.asyncio
+async def test_confirm_missing_promoted_sha_waits_within_window(db_session):
+    """The missing-promoted_sha timeout only fires AFTER the window — within it the
+    version stays unconfirmed (no premature resolution)."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)  # not yet elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=None
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+
+
+@pytest.mark.asyncio
 async def test_confirm_serving_confirmed_does_not_arm_refresh(db_session):
     """A clean serving_confirmed resolution must NOT wake the strategist —
     only failed deploys arm the refresh via this path."""
