@@ -560,7 +560,8 @@ def summarize_qualification_state(
     Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
     ``audit_crashed`` | ``promotion_in_flight`` | ``promotion_failed`` |
     ``not_promoted`` | ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
-    ``promotion_deploy_failed``), or ``None`` when unqualified (no verdict yet).
+    ``promotion_confirmation_timed_out`` | ``promotion_deploy_failed``), or
+    ``None`` when unqualified (no verdict yet).
 
     Audit-crash reconciliation: when ``status == "pending"`` with no
     ``promotion_pending`` sub-key, the bare result was always ``qualifying``
@@ -577,8 +578,10 @@ def summarize_qualification_state(
 
     Post-promotion serving disambiguation: when ``status == "promoted"`` the
     optional ``serving_status`` (with ``deploy_failure_reason``) splits the bare
-    "promoted" case into serving-confirmed, unconfirmed-in-window, or a distinct
-    ``promotion_deploy_failed`` state.  This is the SINGLE summary the UI,
+    "promoted" case into serving-confirmed, unconfirmed-in-window, a confirmation
+    timeout (``promotion_confirmation_timed_out`` — window elapsed, no active
+    failure), or a distinct ``promotion_deploy_failed`` state (an ACTIVE
+    failure).  This is the SINGLE summary the UI,
     operator-control guards, and the strategic payload all read, so they agree
     on whether a promotion actually shipped by construction.
     """
@@ -726,7 +729,32 @@ def summarize_qualification_state(
                     "Candidate was promoted (merged) but serving is NOT yet "
                     "confirmed — the deploy is still within its confirmation "
                     "window. Do not treat it as live-confirmed yet; the sweep "
-                    "resolves it to serving_confirmed or deploy_failed."
+                    "resolves it to serving_confirmed, confirmation_timed_out, "
+                    "or deploy_failed."
+                ),
+                **artifact_fields,
+            }
+        if effective_serving_status == "confirmation_timed_out":
+            return {
+                "state": "promotion_confirmation_timed_out",
+                "serving_status": "confirmation_timed_out",
+                "deploy_failure_reason": effective_failure_reason,
+                "summary": (
+                    "Candidate merged to the promotion target, but automated "
+                    "serving confirmation TIMED OUT within the window"
+                    + (
+                        f" ({effective_failure_reason})"
+                        if effective_failure_reason
+                        else ""
+                    )
+                    + ". This is DIFFERENT from a failed deploy: NO active "
+                    "failure (rollback / halt / sha-mismatch) was observed — the "
+                    "promoted SHA simply could not be independently confirmed "
+                    "serving in time (often an observability gap, e.g. the live "
+                    "deploy SHA could not be read). The code likely shipped but "
+                    "is UNVERIFIED. Verify serving and confirm rather than "
+                    "treating it as a crisis or rolling back; it auto-recovers "
+                    "to serving_confirmed if the SHA is later observed serving."
                 ),
                 **artifact_fields,
             }

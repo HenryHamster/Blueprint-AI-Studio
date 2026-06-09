@@ -1556,6 +1556,35 @@ describe('VersionLifecyclePanel', () => {
       expect(badge).toHaveTextContent('@abcdef1');
     });
 
+    it('renders an amber timed-out badge (NOT a red failed badge) when confirmation timed out', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promotion_confirmation_timed_out',
+                summary: 'Serving confirmation TIMED OUT — not a failed deploy.',
+                serving_status: 'confirmation_timed_out',
+                deploy_failure_reason: 'serving_sha_unobservable',
+              },
+              serving_status: 'confirmation_timed_out',
+              deploy_failure_reason: 'serving_sha_unobservable',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'confirmation_timed_out');
+      expect(badge).toHaveTextContent(/confirmation timed out/);
+      expect(badge).toHaveTextContent('serving_sha_unobservable');
+      // A timeout is unverified (amber), NOT a failure (red).
+      expect(badge.className).toContain('text-amber-400');
+      expect(badge.className).not.toContain('text-red-400');
+    });
+
     it('renders an amber awaiting-confirmation badge with the remaining window while unconfirmed', () => {
       // Deadline 10 minutes in the future — still inside the confirmation window.
       const deadline = new Date(Date.now() + 10 * 60 * 1000).toISOString();

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 
@@ -33,6 +33,7 @@ from app.release_artifacts import (
     summarize_release_artifacts,
 )
 from app.release_promotion import (
+    _DEPLOY_CONFIRM_WINDOW_SECONDS,
     _candidate_already_on_main,
     _idempotent_pr_url,
     _lts_branch_names,
@@ -119,7 +120,7 @@ async def _refresh_release_artifact_rows(
         should_check = artifact_is_unconfirmed(artifact) or (
             recheck_failed_required
             and provider.required
-            and artifact.serving_status == "deploy_failed"
+            and artifact.serving_status in ("deploy_failed", "confirmation_timed_out")
         )
         if should_check:
             outcome = await provider.check(session, version, artifact, now)
@@ -800,17 +801,36 @@ def _classify_serving_outcome(
         AFTER ``promoted_at``, is STABLE, and its live serving SHA was
         INDEPENDENTLY observed to match ``promoted_sha``.  ``served_sha`` is
         always that observed value, never a ``promoted_sha`` stand-in.
-      * ``("deploy_failed", reason)`` (third element ``None``) — the deploy did
-        not come up healthy: a ROLLED_BACK/HALTED state arose after the promotion
-        (``reason`` ``rolled_back``/``halted``), the observed serving SHA does
-        not match the promoted SHA (``sha_mismatch``), no new healthy revision
-        appeared by ``deadline`` (``no_new_revision``), or a new revision did go
-        STABLE but its serving SHA could never be independently observed before
-        the deadline (``serving_sha_unobservable``).
+      * ``("deploy_failed", reason)`` (third element ``None``) — the deploy
+        ACTIVELY went bad: a ROLLED_BACK/HALTED state arose after the promotion
+        (``reason`` ``rolled_back``/``halted``), or the observed serving SHA does
+        not match the promoted SHA (``sha_mismatch``).  This is a real failure
+        the operator/strategist must treat as a crisis (roll forward / recover).
+      * ``("confirmation_timed_out", reason)`` (third element ``None``) — the
+        bounded confirmation window elapsed WITHOUT a positive confirmation but
+        also WITHOUT any active failure signal: no new healthy revision appeared
+        by ``deadline`` (``no_new_revision``), or a new revision went STABLE but
+        its serving SHA could never be independently observed
+        (``serving_sha_unobservable`` — e.g. the deploy SHA could not be read).
+        This is NOT a failed deploy — the code likely shipped but is unverified;
+        it must be surfaced and treated DIFFERENTLY from ``deploy_failed`` (a
+        softer "verify serving" signal, not a roll-forward crisis), and it is
+        recoverable to ``serving_confirmed`` if the SHA is later observed serving.
+
+    Backstop: a promoted version with no explicit ``deadline`` would otherwise be
+    undecidable forever (the timeout branch can never fire).  When ``deadline``
+    is missing, fall back to ``promoted_at + _DEPLOY_CONFIRM_WINDOW_SECONDS`` so
+    confirmation is always bounded — no version can wedge in ``unconfirmed``.
     """
     promoted_at = _to_naive_utc(promoted_at)
     deadline = _to_naive_utc(deadline)
     now = _to_naive_utc(now) or now
+
+    # Backstop the confirmation window: a promotion recorded without a stamped
+    # deadline (legacy / a promotion path that skipped arming it) must still time
+    # out, or it sits unconfirmed forever and gates the next version.
+    if deadline is None and promoted_at is not None:
+        deadline = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS)
 
     # A new revision went STABLE after the promotion, but its live serving SHA
     # could not be independently observed (Cloud Run lookup degraded to no
@@ -858,11 +878,15 @@ def _classify_serving_outcome(
             # SHA to match it against) cannot be observed — not confirmable.
             serving_sha_unobservable = True
 
-    # No confirmation yet — deploy-failed only once the bounded window elapses.
+    # No confirmation yet — once the bounded window elapses this is a TIMEOUT,
+    # not an active failure: nothing observed the deploy going bad, the promoted
+    # SHA just could not be confirmed serving in time.  Surface it distinctly
+    # from deploy_failed (rolled_back/halted/sha_mismatch above) so it reads as
+    # "verify serving", not "recover a failed deploy".
     if deadline is not None and now >= deadline:
         if serving_sha_unobservable:
-            return ("deploy_failed", "serving_sha_unobservable", None)
-        return ("deploy_failed", "no_new_revision", None)
+            return ("confirmation_timed_out", "serving_sha_unobservable", None)
+        return ("confirmation_timed_out", "no_new_revision", None)
     return None
 
 
@@ -953,6 +977,19 @@ async def _confirm_serving_or_fail(
             # Re-check under the lock: a concurrent sweep may have resolved it.
             if version.status != "promoted":
                 return False
+            # Backstop: a promotion recorded without a confirmation deadline (a
+            # legacy promotion path that skipped arming it) would never time out
+            # and would wedge the next version forever.  Arm it durably from
+            # promoted_at so confirmation is always bounded and the artifact rows
+            # created below inherit a real deadline.
+            if (
+                version.deploy_confirm_deadline is None
+                and version.promoted_at is not None
+            ):
+                version.deploy_confirm_deadline = version.promoted_at + timedelta(
+                    seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+                )
+                session.add(version)
             (
                 provider_rows,
                 had_required_unconfirmed,
@@ -994,6 +1031,44 @@ async def _confirm_serving_or_fail(
                     "(served_sha=%s)",
                     version.version_number,
                     (version.served_sha or "")[:12],
+                )
+                return True
+
+            if aggregate_status == "confirmation_timed_out":
+                # The window elapsed without confirmation, but nothing was
+                # observed going bad (no rollback/halt/sha-mismatch).  This is
+                # NOT a failed deploy: surface a distinct, softer state so the
+                # operator/strategist verify serving rather than treating it as
+                # a crisis.  No loud deploy-failed ERROR alert; recoverable to
+                # serving_confirmed if the SHA is later observed serving.
+                version.serving_status = "confirmation_timed_out"
+                version.deploy_failure_reason = aggregate_reason
+                session.add(version)
+                await _record_post_promotion_outcome(
+                    session, version, "confirmation_timed_out", _now
+                )
+                try:
+                    from app.strategic_trigger import request_strategic_refresh
+
+                    await request_strategic_refresh(
+                        session,
+                        version.project_id,
+                        f"promotion_confirmation_timed_out:{aggregate_reason}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] strategic refresh arm raised for "
+                        "timed-out v%d (non-fatal)",
+                        version.version_number,
+                    )
+                await session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] serving confirmation TIMED OUT for "
+                    "promoted v%d (reason=%s) — promoted with no active deploy "
+                    "failure, but the promoted SHA could not be confirmed serving "
+                    "within the window",
+                    version.version_number,
+                    aggregate_reason,
                 )
                 return True
 
@@ -1214,7 +1289,10 @@ async def _reconcile_if_deploy_failed_recovered(
             # Re-check under the lock: a concurrent sweep may have resolved it.
             if version.status != "promoted":
                 return False
-            if version.serving_status != "deploy_failed":
+            # Both an active failure (deploy_failed) and a confirmation timeout
+            # (confirmation_timed_out) are non-terminal: if the promoted SHA is
+            # later observed serving, recover either to serving_confirmed.
+            if version.serving_status not in ("deploy_failed", "confirmation_timed_out"):
                 return False
 
             # Bound recovery: beyond the window a genuinely dead deploy stays

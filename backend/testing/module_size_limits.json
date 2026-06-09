@@ -130,6 +130,7 @@
   },
   "frontend": {
     "useAppState.ts": 3000,
+    "components/VersionLifecyclePanel.tsx": 1600,
     "components/DirectionsPanel.tsx": 3000,
     "components/CatchUpPanel.tsx": 3600,
     "components/TaskDetailDrawer.tsx": 2500,

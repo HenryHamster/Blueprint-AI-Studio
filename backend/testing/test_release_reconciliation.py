@@ -1270,19 +1270,20 @@ def test_classify_unobservable_serving_sha_does_not_confirm_within_window():
     assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
 
 
-def test_classify_unobservable_serving_sha_fails_after_deadline():
+def test_classify_unobservable_serving_sha_times_out_after_deadline():
     """If the serving SHA stays unobservable until the deadline elapses, the gate
-    lands a DISTINCT deploy_failed reason (serving_sha_unobservable) rather than
-    silently confirming with the promoted SHA."""
+    lands a DISTINCT confirmation_timed_out reason (serving_sha_unobservable) —
+    NOT deploy_failed: nothing was observed going bad, the SHA just couldn't be
+    confirmed in time. It never silently confirms with the promoted SHA."""
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
     after = datetime(2026, 6, 5, 13, 1, 0)
     ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha="")
     out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, after)
-    assert out == ("deploy_failed", "serving_sha_unobservable", None)
+    assert out == ("confirmation_timed_out", "serving_sha_unobservable", None)
 
 
-def test_classify_no_new_revision_only_after_deadline():
+def test_classify_no_new_revision_times_out_after_deadline():
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
     # Old revision that predates the promotion never advanced; STABLE but stale.
@@ -1296,11 +1297,31 @@ def test_classify_no_new_revision_only_after_deadline():
         )
         is None
     )
-    # Past the deadline → deploy_failed.
+    # Past the deadline → confirmation_timed_out (no active failure observed).
     out = _classify_serving_outcome(
         ds, promoted_at, _SHA_A, deadline, datetime(2026, 6, 5, 13, 1, 0)
     )
-    assert out == ("deploy_failed", "no_new_revision", None)
+    assert out == ("confirmation_timed_out", "no_new_revision", None)
+
+
+def test_classify_missing_deadline_backstops_from_promoted_at():
+    """A promotion with NO stamped deadline must still be bounded: the classifier
+    derives the confirmation window from promoted_at so it can never wedge in an
+    undecidable 'unconfirmed' forever. This is the v7 wedge regression guard."""
+    from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
+
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    # Stale revision that predates the promotion never advanced; deadline=None.
+    ds = _ds(
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A
+    )
+    # Just before the derived deadline → still waiting (no premature decision).
+    within = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS - 60)
+    assert _classify_serving_outcome(ds, promoted_at, _SHA_A, None, within) is None
+    # Past the derived deadline → times out instead of hanging forever.
+    after = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS + 60)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, None, after)
+    assert out == ("confirmation_timed_out", "no_new_revision", None)
 
 
 def test_classify_rollback_after_promotion_is_deploy_failed():
@@ -1895,10 +1916,12 @@ async def test_confirm_unobservable_sha_within_window_stays_unconfirmed(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_confirm_unobservable_sha_after_deadline_deploy_failed(db_session):
+async def test_confirm_unobservable_sha_after_deadline_times_out(db_session):
     """If the serving SHA never becomes observable before the deadline, the sweep
-    lands a distinct serving_sha_unobservable deploy_failed state — it never
-    upgrades to serving_confirmed by echoing the merged SHA."""
+    lands a distinct serving_sha_unobservable CONFIRMATION_TIMED_OUT state — NOT
+    deploy_failed: nothing was observed going bad, the SHA just couldn't be read.
+    It never upgrades to serving_confirmed by echoing the merged SHA, and it must
+    NOT fire the loud deploy-failed crisis alert."""
     promoted_at = _utcnow() - timedelta(hours=2)
     deadline = promoted_at + timedelta(hours=1)  # already elapsed
     _project, version = await _make_promoted_unconfirmed_version(
@@ -1917,25 +1940,41 @@ async def test_confirm_unobservable_sha_after_deadline_deploy_failed(db_session)
     )
     assert resolved is True
     await db_session.refresh(version)
-    assert version.serving_status == "deploy_failed"
+    assert version.serving_status == "confirmation_timed_out"
     assert version.deploy_failure_reason == "serving_sha_unobservable"
     # No fabricated served_sha.
     assert version.served_sha is None
+    # A timeout is NOT a deploy-failed crisis: no loud alert dedup stamp.
+    assert version.deploy_confirm_alerted_at is None
 
     state = rv.summarize_qualification_state(
         version.last_qualification,
         version.serving_status,
         version.deploy_failure_reason,
     )
-    assert state["state"] == "promotion_deploy_failed"
-    assert state["serving_status"] == "deploy_failed"
+    assert state["state"] == "promotion_confirmation_timed_out"
+    assert state["serving_status"] == "confirmation_timed_out"
+
+    # The loud deploy-FAILED ERROR alert must NOT fire for a timeout.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a for a in alerts if "deploy FAILED" in a.title] == []
 
 
 @pytest.mark.asyncio
-async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
-    """(b) The live revision never advances within the window → deploy_failed,
-    a loud ERROR alert fires, a distinct state is reported, and the never-shipped
-    promotion is NOT summarized as cleanly shipped."""
+async def test_confirm_no_new_revision_times_out_scenario(db_session):
+    """(b) The live revision never advances within the window → CONFIRMATION
+    TIMED OUT, distinct from deploy_failed: nothing was observed going bad, so NO
+    loud ERROR alert fires and the verdict outcome is confirmation_timed_out. The
+    never-confirmed promotion is reported as a distinct state, not cleanly
+    shipped and not a crisis."""
     promoted_at = _utcnow() - timedelta(hours=2)
     deadline = promoted_at + timedelta(hours=1)  # already elapsed
     _project, version = await _make_promoted_unconfirmed_version(
@@ -1954,18 +1993,19 @@ async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
     )
     assert resolved is True
     await db_session.refresh(version)
-    assert version.serving_status == "deploy_failed"
+    assert version.serving_status == "confirmation_timed_out"
     assert version.deploy_failure_reason == "no_new_revision"
-    assert version.deploy_confirm_alerted_at is not None
+    # No loud deploy-failed alert → no dedup stamp.
+    assert version.deploy_confirm_alerted_at is None
 
     state = rv.summarize_qualification_state(
         version.last_qualification,
         version.serving_status,
         version.deploy_failure_reason,
     )
-    # Distinct PROMOTION_DEPLOY_FAILED-class state — NOT a clean "promoted".
-    assert state["state"] == "promotion_deploy_failed"
-    assert state["serving_status"] == "deploy_failed"
+    # Distinct timeout-class state — NOT a clean "promoted", NOT deploy_failed.
+    assert state["state"] == "promotion_confirmation_timed_out"
+    assert state["serving_status"] == "confirmation_timed_out"
 
     alerts = (
         (
@@ -1976,9 +2016,8 @@ async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
         .scalars()
         .all()
     )
-    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
-    assert len(deploy_alerts) == 1
-    assert deploy_alerts[0].severity == AlertSeverity.ERROR
+    # The loud deploy-FAILED ERROR alert is reserved for ACTIVE failures.
+    assert [a for a in alerts if "deploy FAILED" in a.title] == []
 
     verdict = (
         (
@@ -1991,7 +2030,7 @@ async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
         .scalars()
         .first()
     )
-    assert verdict.post_promotion_outcome == "deploy_failed"
+    assert verdict.post_promotion_outcome == "confirmation_timed_out"
 
 
 @pytest.mark.asyncio
@@ -2037,23 +2076,28 @@ async def test_confirm_rollback_after_promotion_deploy_failed_scenario(db_sessio
 
 @pytest.mark.asyncio
 async def test_confirm_deploy_failed_arms_strategic_refresh(db_session):
-    """A deploy_failed resolution wakes the strategist: it arms exactly one
-    coalescing strategic-refresh marker (qualification origin, deploy-failed
-    reason) so recovery is not gated behind the strategic-spawn cooldown."""
-    promoted_at = _utcnow() - timedelta(hours=2)
-    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    """An ACTIVE-failure (deploy_failed) resolution wakes the strategist: it arms
+    exactly one coalescing strategic-refresh marker (qualification origin,
+    deploy-failed reason) so recovery is not gated behind the strategic-spawn
+    cooldown."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
     project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
+    # A ROLLED_BACK after promotion is an ACTIVE failure → deploy_failed (even
+    # within the window), distinct from a confirmation timeout.
     await _set_deploy_state(
         db_session,
-        status=DeploymentStatus.STABLE,
-        current_sha="c" * 40,  # stale revision, never advanced
-        deployed_at=promoted_at - timedelta(minutes=30),
+        status=DeploymentStatus.ROLLED_BACK,
+        current_sha="c" * 40,
+        deployed_at=promoted_at + timedelta(minutes=10),
     )
 
     resolved = await _confirm_serving_or_fail(
-        version.id, session_factory=_shared_session_factory(db_session)
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
     )
     assert resolved is True
     await db_session.refresh(version)
@@ -2067,6 +2111,41 @@ async def test_confirm_deploy_failed_arms_strategic_refresh(db_session):
     assert str(marker.get("reason", "")).startswith("promotion_deploy_failed:")
     # Single-slot / coalescing: exactly one refresh was armed, not stacked.
     assert int(marker.get("count") or 1) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirm_timed_out_arms_strategic_refresh_distinctly(db_session):
+    """A confirmation TIMEOUT also wakes the strategist, but with a DISTINCT
+    reason (promotion_confirmation_timed_out:...) — never the deploy_failed crisis
+    reason — so the handoff reads as 'verify serving', not 'recover a failed
+    deploy'."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # Stale revision that never advanced → no active failure → timeout.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "confirmation_timed_out"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    assert strategic_refresh_origin(project.vision) == ORIGIN_QUALIFICATION
+    marker = project.vision["_strategic_refresh"]
+    reason = str(marker.get("reason", ""))
+    assert reason.startswith("promotion_confirmation_timed_out:")
+    assert not reason.startswith("promotion_deploy_failed:")
 
 
 @pytest.mark.asyncio
@@ -2315,6 +2394,59 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
     deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
     assert len(deploy_alerts) == 1
     assert deploy_alerts[0].dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_recover_confirmation_timed_out_when_sha_serves_within_window(db_session):
+    """A version latched confirmation_timed_out (NOT deploy_failed) whose promoted
+    SHA is later observed serving within the recovery window also recovers to
+    serving_confirmed — the timeout was an observability gap, not a dead deploy."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    project = Project(
+        name="Recover-Timeout-Test",
+        user_id="recover-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = _SHA_A
+    version.serving_status = "confirmation_timed_out"
+    version.deploy_failure_reason = "serving_sha_unobservable"
+    version.deploy_confirm_deadline = promoted_at + timedelta(hours=1)
+    version.last_qualification = {"status": "promoted", "promoted_sha": _SHA_A}
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The promoted SHA is now INDEPENDENTLY observed serving (a STABLE revision
+    # booted after promotion whose live current_sha matches).
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.deploy_failure_reason is None
 
     # The strategist was woken so the "recover the failed deploy" crisis directive
     # recomputes against the now-true serving_confirmed state.

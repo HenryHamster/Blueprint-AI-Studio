@@ -125,9 +125,18 @@ def aggregate_required_artifact_status(
     ]
     if not required:
         return ("serving_confirmed", None)
+    # Precedence: an ACTIVE failure dominates everything; while anything is still
+    # genuinely pending we keep waiting (unconfirmed); only once nothing is
+    # pending does a TIMEOUT surface; all-confirmed is the success case.
     for _provider, artifact in required:
         if artifact.serving_status == "deploy_failed":
             return ("deploy_failed", artifact.reason_code)
+    for _provider, artifact in required:
+        if (artifact.serving_status or "unconfirmed") == "unconfirmed":
+            return ("unconfirmed", None)
+    for _provider, artifact in required:
+        if artifact.serving_status == "confirmation_timed_out":
+            return ("confirmation_timed_out", artifact.reason_code)
     if all(
         artifact.serving_status == "serving_confirmed"
         for _provider, artifact in required
@@ -248,6 +257,7 @@ def summarize_required_artifact_gap(
     """Return a compact description of pending/failed required artifacts."""
 
     failed_parts: list[str] = []
+    timed_out_parts: list[str] = []
     pending_parts: list[str] = []
     for artifact in artifact_evidence or []:
         if not artifact.get("required"):
@@ -259,10 +269,18 @@ def summarize_required_artifact_gap(
             failed_parts.append(
                 f"{artifact_kind} (reason={reason})" if reason else artifact_kind
             )
+        elif status == "confirmation_timed_out":
+            timed_out_parts.append(
+                f"{artifact_kind} (reason={reason})" if reason else artifact_kind
+            )
         elif status != "serving_confirmed":
             pending_parts.append(artifact_kind)
     if failed_parts:
         return "required artifacts failed: " + ", ".join(failed_parts)
+    if timed_out_parts:
+        return "required artifacts confirmation timed out: " + ", ".join(
+            timed_out_parts
+        )
     if pending_parts:
         return "waiting on required artifacts: " + ", ".join(pending_parts)
     return None

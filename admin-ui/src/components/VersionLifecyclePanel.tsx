@@ -198,6 +198,9 @@ const QUAL_STATE_STYLE: Record<string, string> = {
   // Promotion merged but the deploy never confirmed serving — loud red, NOT the
   // clean green 'promoted' look.
   promotion_deploy_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
+  // Promotion merged but serving confirmation TIMED OUT with no active failure —
+  // unverified, not failed. Amber (caution), distinct from the red failed look.
+  promotion_confirmation_timed_out: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
@@ -287,6 +290,25 @@ function ServingStatusBadge({
       </span>
     );
   }
+  if (servingStatus === 'confirmation_timed_out') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="confirmation_timed_out"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/40 text-amber-400"
+        title={
+          deployFailureReason
+            ? `Promoted, but serving confirmation timed out (${deployFailureReason}). No active deploy failure was observed — the promoted commit just could not be confirmed serving in time. Verify serving; it auto-recovers if later observed live.`
+            : 'Promoted, but serving confirmation timed out — no active deploy failure was observed. Verify serving; it auto-recovers if later observed live.'
+        }
+      >
+        ⧖ confirmation timed out — unverified
+        {deployFailureReason && (
+          <span className="font-normal text-amber-300 truncate max-w-[200px]">{deployFailureReason}</span>
+        )}
+      </span>
+    );
+  }
   if (servingStatus === 'unconfirmed') {
     // Compute the confirmation-window state at render time so the panel is
     // honest at view time, not at fetch time. When `now` is past the deadline
@@ -331,6 +353,7 @@ function ServingStatusBadge({
 const ARTIFACT_STATUS_STYLE: Record<string, { cls: string; label: string }> = {
   serving_confirmed: { cls: 'text-emerald-400', label: '✓ serving' },
   deploy_failed: { cls: 'text-red-400', label: '⚠ failed' },
+  confirmation_timed_out: { cls: 'text-amber-400', label: '⧖ timed out' },
   unconfirmed: { cls: 'text-amber-400', label: '… pending' },
 };
 

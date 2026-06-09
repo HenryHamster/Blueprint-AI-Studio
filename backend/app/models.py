@@ -3554,7 +3554,11 @@ class ReleaseVersion(SQLModel, table=True):
     # while backend_revision is the sole required artifact.
     #
     #   serving_status values: NULL (not-yet-promoted / NA) | "unconfirmed"
-    #     | "serving_confirmed" | "deploy_failed".
+    #     | "serving_confirmed" | "confirmation_timed_out" | "deploy_failed".
+    #   "confirmation_timed_out" = the confirmation window elapsed with NO active
+    #     failure (no rollback/halt/sha-mismatch) — the promoted SHA just could
+    #     not be confirmed serving in time; distinct from "deploy_failed" (an
+    #     active failure) and recoverable to "serving_confirmed" if later observed.
     serving_status: str | None = Field(
         default=None,
         sa_column=Column(String(32), nullable=True),
@@ -3593,8 +3597,11 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
-    # Short code for why confirmation failed:
-    # no_new_revision | rolled_back | halted | sha_mismatch.
+    # Short code for why confirmation did not reach serving_confirmed:
+    #   active failure (serving_status=deploy_failed): rolled_back | halted
+    #     | sha_mismatch
+    #   timeout (serving_status=confirmation_timed_out): no_new_revision
+    #     | serving_sha_unobservable
     deploy_failure_reason: str | None = Field(
         default=None,
         sa_column=Column(String(128), nullable=True),
@@ -3650,7 +3657,8 @@ class ReleaseDeployArtifact(SQLModel, table=True):
         sa_column=Column(String(64), nullable=True),
     )
 
-    # Values: "unconfirmed" | "serving_confirmed" | "deploy_failed".
+    # Values: "unconfirmed" | "serving_confirmed" | "confirmation_timed_out"
+    #   | "deploy_failed".
     serving_status: str | None = Field(
         default=None,
         sa_column=Column(String(32), nullable=True),
@@ -3808,7 +3816,7 @@ class QualificationVerdict(SQLModel, table=True):
     # production.  Nullable: only set for verdicts that promoted and then had
     # their deploy confirmed/failed.
     #   post_promotion_outcome values: "serving_confirmed" | "deploy_failed"
-    #     | "unconfirmed".
+    #     | "confirmation_timed_out" | "unconfirmed".
     post_promotion_outcome: str | None = Field(
         default=None,
         sa_column=Column(String(32), nullable=True),

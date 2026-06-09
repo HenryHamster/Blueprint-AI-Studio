@@ -4530,6 +4530,36 @@ async def _spawn_strategic_review(
                 f"served); only after it is serving should you move focus on."
                 f"{_artifact_txt}"
             )
+        elif _prior_serving_status == "confirmation_timed_out":
+            # Distinct from deploy_failed: the promotion merged and likely
+            # shipped, but automated serving confirmation TIMED OUT with no
+            # active failure observed. This is a "verify", not a "recover from a
+            # failed deploy" — do NOT trigger the roll-forward crisis, and do NOT
+            # block advancing on it the way deploy_failed does.
+            _reason_txt = (
+                f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
+            )
+            _artifact_txt = (
+                f" Evidence: {_prior_artifact_gap}."
+                if _prior_artifact_gap
+                else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
+                f"{_target}{_promoted_when}{_verdict_txt}, but its automated "
+                f"serving confirmation TIMED OUT{_reason_txt} (see "
+                f"`deployment_state.promoted_serving_status` = "
+                f"'confirmation_timed_out'). This is NOT a failed deploy: NO "
+                f"rollback/halt/sha-mismatch was observed — the promoted SHA "
+                f"just could not be independently confirmed serving within the "
+                f"window (commonly an observability gap, e.g. the live deploy "
+                f"SHA could not be read). The code very likely shipped but is "
+                f"UNVERIFIED. Do NOT treat this as a deploy crisis or roll back, "
+                f"and do NOT re-promote/re-qualify v{_prior_n}. VERIFY serving "
+                f"(it auto-recovers to serving_confirmed once the promoted SHA "
+                f"is observed live); you may proceed with v{_cur_n}'s mission "
+                f"meanwhile.{_artifact_txt}"
+            )
         elif _prior_serving_status == "unconfirmed":
             _artifact_txt = (
                 f" Evidence: {_prior_artifact_gap}."
@@ -4543,10 +4573,11 @@ async def _spawn_strategic_review(
                 f"`deployment_state.promoted_serving_status` = 'unconfirmed') — "
                 f"it is still inside the post-promotion confirmation window. Do "
                 f"NOT yet treat the milestone as fully shipped; the sweep will "
-                f"resolve it to serving_confirmed or deploy_failed shortly. You "
-                f"may begin setting v{_cur_n}'s mission, but do not declare "
-                f"v{_prior_n} live until serving is confirmed, and do NOT "
-                f"re-promote/re-qualify v{_prior_n}.{_artifact_txt}"
+                f"resolve it to serving_confirmed, confirmation_timed_out, or "
+                f"deploy_failed shortly. You may begin setting v{_cur_n}'s "
+                f"mission, but do not declare v{_prior_n} live until serving is "
+                f"confirmed, and do NOT re-promote/re-qualify v{_prior_n}."
+                f"{_artifact_txt}"
             )
         else:
             _post_promote_hint = (
