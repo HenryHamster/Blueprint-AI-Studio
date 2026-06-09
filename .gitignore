@@ -41,6 +41,10 @@ backend/.testmondata*
 self_review_*.json
 research-*.md
 *.bak
+# Repo-root self-review JSON output (agents write to /tmp; strays at the root
+# are generated noise). Root-anchored so nested fixtures like
+# backend/testing/**/self_review_*.json are not ignored.
+/self_review_*.json
 
 # Local git worktrees spawned by Claude Code — never commit as gitlinks
 .claude/worktrees/

@@ -394,6 +394,81 @@ class TestSchemaRevisionSync:
             leaked
         )
 
+    def test_repo_root_self_review_outputs_are_ignored_and_untracked(self):
+        """Repo-root self_review_*.json output must be gitignored and untracked.
+
+        Agents write self-review JSON to /tmp/self_review_<task_id>.json; any
+        self_review_*.json that lands at the repo root is generated noise. The
+        ignore rule must be root-anchored so it does NOT swallow nested
+        fixtures such as backend/testing/**/self_review_*.json.
+
+        Skipped when the repo root / .git checkout is unavailable (e.g. CI's
+        backend-only Docker build context), following the same repo-root
+        availability pattern as test_agent_helper_exclusions_match_prompt_and_gitignore.
+        """
+        gitignore_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", ".gitignore"
+        )
+        repo_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        if not (
+            os.path.exists(gitignore_path)
+            and os.path.isdir(os.path.join(repo_root, ".git"))
+        ):
+            pytest.skip(
+                "repo root sources not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+
+        with open(gitignore_path) as f:
+            gitignore = f.read().splitlines()
+        assert "/self_review_*.json" in gitignore, (
+            ".gitignore is missing the root-anchored '/self_review_*.json' rule "
+            "— repo-root self-review output would become committable noise."
+        )
+
+        # The rule must be root-anchored: git must ignore a root stray but must
+        # NOT ignore a nested fixture of the same name.
+        root_ignored = subprocess.run(
+            ["git", "check-ignore", "self_review_probe.json"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert root_ignored.returncode == 0, (
+            "repo-root self_review_probe.json is not ignored by .gitignore"
+        )
+        nested_ignored = subprocess.run(
+            ["git", "check-ignore", "backend/testing/self_review_probe.json"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert nested_ignored.returncode == 1, (
+            "nested backend/testing/self_review_probe.json must NOT be ignored "
+            "— the rule is over-broad and would hide nested fixtures."
+        )
+
+        # No root-level self_review_*.json file may be tracked.
+        tracked = subprocess.run(
+            ["git", "ls-files"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        leaked_root = [
+            path
+            for path in tracked
+            if re.match(r"^self_review_.*\.json$", path)
+        ]
+        assert not leaked_root, (
+            "Tracked repo-root self_review_*.json files found:\n  "
+            + "\n  ".join(leaked_root)
+        )
+
     def test_schema_gate_raises_on_mismatch(self):
         """_verify_schema_version() must raise RuntimeError when the alembic
         revision in the database does not exactly match EXPECTED_SCHEMA_REVISION.
