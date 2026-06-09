@@ -41,6 +41,8 @@ from app.task_completion import (
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
+    reconcile_review_second_opinion,
+    _parse_panel_review_output,
 )
 from app.models import PoolVmState, Task, TaskStatus
 from testing.factories import make_project, make_task
@@ -3297,3 +3299,97 @@ class TestSafeguardMergeGateChallenge:
         assert result is None, "spawn must return None when a challenge is already in flight"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Review second-opinion reconciliation (reconcile_review_second_opinion)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _panel_verdict(overall, *, issues=None, lens_verdict=None, summary="ok"):
+    """Build a normalized-ready panel-review verdict object with all 4 lenses."""
+    lv = lens_verdict or overall
+    return {
+        "overall_verdict": overall,
+        "summary": summary,
+        "issues": list(issues or []),
+        "lenses": {
+            "correctness": {"verdict": lv, "summary": "c", "issues": []},
+            "security": {"verdict": lv, "summary": "s", "issues": []},
+            "code_quality": {"verdict": lv, "summary": "q", "issues": []},
+            "test_coverage": {"verdict": lv, "summary": "t", "issues": []},
+        },
+    }
+
+
+def test_reconcile_confirmed_approve():
+    """Both APPROVE → challenged_confirmed, reconciled APPROVE, no surviving issues."""
+    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
+    rec = reconcile_review_second_opinion("APPROVE", [], panel)
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["surviving_issues"] == []
+    assert rec["challenge_verdict"] == "APPROVE"
+
+
+def test_reconcile_rejected_approve_overturned():
+    """Primary APPROVE, challenge REQUEST_CHANGES → challenged_rejected, must not approve."""
+    chal_issues = [{"description": "real bug", "severity": "critical"}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
+    )
+    rec = reconcile_review_second_opinion("APPROVE", [], panel)
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == chal_issues
+
+
+def test_reconcile_rejected_request_changes_overturned():
+    """Primary REQUEST_CHANGES, challenge APPROVE → challenged_rejected, must not spawn fix."""
+    primary_issues = [{"description": "maybe a bug", "severity": "major"}]
+    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["surviving_issues"] == []
+
+
+def test_reconcile_confirmed_request_changes_same_issues():
+    """Both REQUEST_CHANGES with identical issue set → challenged_confirmed."""
+    issues = [{"description": "SQL injection", "file": "a.py", "line": 5}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=issues))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", issues, panel)
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == issues
+
+
+def test_reconcile_revised_request_changes_changed_issues():
+    """Both REQUEST_CHANGES but surviving issue set changed → challenged_revised.
+
+    The challenge upholds only one of the two primary issues; the surviving set
+    is the agreed intersection.
+    """
+    agreed = {"description": "SQL injection", "file": "a.py", "line": 5}
+    only_primary = {"description": "nit naming", "file": "b.py", "line": 9}
+    primary_issues = [agreed, only_primary]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=[agreed]))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_revised"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == [agreed]
+    assert only_primary not in rec["surviving_issues"]
+
+
+def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
+    """Disjoint issue sets → revised, surviving falls back to the challenge's set."""
+    primary_issues = [{"description": "primary only", "file": "p.py", "line": 1}]
+    chal_issues = [{"description": "challenge only", "file": "c.py", "line": 2}]
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
+    assert rec["state"] == "challenged_revised"
+    assert rec["surviving_issues"] == chal_issues

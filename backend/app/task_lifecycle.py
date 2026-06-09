@@ -621,6 +621,168 @@ async def _resolve_safeguard_challenge_completion(
     )
 
 
+async def _resolve_review_second_opinion(
+    challenger: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Resolve an independent panel-review challenge and reconcile it.
+
+    The challenger (spawned by
+    ``task_evaluators.spawn_review_second_opinion``) ran an independent
+    multi-lens panel review of the same PR. Here we parse its verdict,
+    reconcile it against the parked primary verdict, persist a durable
+    reconciliation record on the review task's context, and re-dispatch the
+    review task through the normal finalization path with the reconciled
+    verdict. Fail-closed: if the challenge FAILED or its output is
+    unparseable, do NOT merge or spawn.
+    """
+    from app.task_evaluators import (
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_AWAITING_KEY,
+        REVIEW_SECOND_OPINION_PARKED_KEY,
+    )
+    from app.task_completion import (
+        _parse_panel_review_output,
+        reconcile_review_second_opinion,
+        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    )
+    from app.broadcast import broadcast_to_project
+
+    source_id = (challenger.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    review = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if review is None:
+        await session.commit()
+        logger.warning(
+            "[REVIEW SECOND-OPINION] Review task %s for challenger %s is gone; verdict dropped",
+            source_id,
+            challenger.id,
+        )
+        return
+
+    parked = (review.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
+    primary_verdict = parked.get("verdict") or "REQUEST_CHANGES"
+    primary_issues = parked.get("issues") or []
+
+    completed = payload.status == TaskStatus.COMPLETED
+    panel = (
+        _parse_panel_review_output(
+            payload.logs or challenger.latest_status_message or ""
+        )
+        if completed
+        else None
+    )
+
+    if panel is None:
+        original_task_id = parked.get("original_task_id") or ""
+        ctx = dict(review.context or {})
+        ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+        ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
+            "state": "unchallenged",
+            "escalated": True,
+            "reason": (
+                "second-opinion challenge failed or produced an unparseable "
+                "verdict — escalated to manual review"
+            ),
+            "primary_verdict": primary_verdict,
+            "challenger_task_id": str(challenger.id),
+        }
+        ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
+        review.context = ctx
+        flag_modified(review, "context")
+        review.status = TaskStatus.COMPLETED
+        review.latest_status_message = (
+            "Second-opinion challenge unresolved — manual review required; "
+            "no merge or fix spawned"
+        )[:500]
+        session.add(review)
+        challenger.latest_status_message = (
+            "Second-opinion panel review failed/unparseable — review escalated"
+        )[:500]
+        session.add(challenger)
+        if original_task_id:
+            try:
+                orig = await session.get(Task, uuid.UUID(original_task_id))
+                if orig:
+                    orig.requires_approval = True
+                    orig.latest_status_message = (
+                        "Second-opinion review challenge unresolved — manual "
+                        "review required"
+                    )[:500]
+                    session.add(orig)
+            except (ValueError, TypeError):
+                pass
+        await session.commit()
+        logger.warning(
+            "[REVIEW SECOND-OPINION] Challenge %s for review %s failed/unparseable — fail-closed escalation, no action taken",
+            challenger.id,
+            review.id,
+        )
+        try:
+            await broadcast_to_project(
+                str(review.project_id),
+                "task_updated",
+                {"task_id": str(review.id), "status": review.status},
+            )
+        except Exception:
+            logger.debug(
+                "[REVIEW SECOND-OPINION] broadcast after escalation failed",
+                exc_info=True,
+            )
+        return
+
+    record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
+    record["challenger_task_id"] = str(challenger.id)
+
+    ctx = dict(review.context or {})
+    ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
+    ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+    review.context = ctx
+    flag_modified(review, "context")
+    review.status = TaskStatus.COMPLETED
+    session.add(review)
+    challenger.latest_status_message = (
+        f"Second-opinion panel: {record['state']} "
+        f"→ {record['reconciled_verdict']}"
+    )[:500]
+    session.add(challenger)
+    await session.commit()
+
+    reconstructed = AgentStatusPayload(
+        task_id=review.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json=json.dumps(
+            {
+                "verdict": record["reconciled_verdict"],
+                "issues": record.get("surviving_issues", []),
+                "feedback": parked.get("feedback", ""),
+                "investigated_files": parked.get("investigated_files", []),
+            }
+        ),
+    )
+    logger.info(
+        "[REVIEW SECOND-OPINION] Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        challenger.id,
+        review.id,
+        record["state"],
+        primary_verdict,
+        record["reconciled_verdict"],
+    )
+    await _process_post_commit(review.id, reconstructed)
+
+
 async def _resolve_finding_challenge_completion(
     challenge: Task, payload: AgentStatusPayload, session: AsyncSession
 ) -> None:
@@ -690,14 +852,10 @@ async def _resolve_finding_challenge_completion(
     ctx.pop("awaiting_finding_challenge", None)
     source.context = ctx
     flag_modified(source, "context")
-    # Re-establish the terminal status the source originally reported before it
-    # parked; the resume handler decides the final outcome.
     source.status = TaskStatus.COMPLETED
     session.add(source)
     await session.commit()
 
-    # Only research findings drive this per-finding challenge today; re-dispatch
-    # through the same registry-keyed completion handler the source originally ran.
     _resume_handlers = {
         "research": _handle_research_completion,
     }
@@ -720,15 +878,12 @@ async def _resolve_finding_challenge_completion(
         await handler(source, resume_logs, session)
     else:
         logger.warning(
-            "[CHALLENGE] No resume handler for source type %r (task %s); verdict "
-            "recorded but source not re-dispatched",
+            "[CHALLENGE] No resume handler for source type %r (task %s); verdict recorded but source not re-dispatched",
             source_type,
             source.id,
         )
     await session.commit()
 
-    # Source is now terminal — propagate to its parent rollup and broadcast.
-    # Snapshot plain values first (the rollup can poison the session).
     _source_id_str = str(source.id)
     _source_project_id_str = str(source.project_id)
     _source_status = source.status
@@ -750,7 +905,6 @@ async def _resolve_finding_challenge_completion(
         )
     except Exception:
         logger.debug("[CHALLENGE] broadcast after challenge failed", exc_info=True)
-
 
 async def _process_post_commit(
     task_id: uuid.UUID,
@@ -1007,6 +1161,22 @@ async def _process_post_commit(
         # fail-closed rather than stranding it EVALUATING forever.
         if (task.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY):
             await _resolve_finding_challenge_completion(task, payload, session)
+            return {"status": "accepted"}
+
+        # Review second-opinion challenger side-car: a panel_review task spawned
+        # by the second-opinion gate carries REVIEW_SECOND_OPINION_SOURCE_KEY
+        # pointing at the parked ordinary review task. Its completion resolves
+        # the challenge and re-dispatches the review with the reconciled verdict
+        # — it does NOT flow through the panel_review completion handler, and
+        # (critically) it never re-enters the review-finalization branch, so the
+        # challenger can never recursively re-trigger the gate. Handled before
+        # the COMPLETED-gated pipeline so a FAILED challenger fails closed
+        # (escalates) rather than stranding the review EVALUATING.
+        from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
+
+        if (task.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY):
+            await _resolve_review_second_opinion(task, payload, session)
+            return {"status": "accepted"}
             return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
@@ -2366,6 +2536,106 @@ async def _process_post_commit(
                                 f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}",
                                 exc_info=True,
                             )
+
+                # ── Default-on second-opinion gate ──────────────────────────
+                # Before a high-stakes ordinary review verdict commits (an
+                # APPROVE→merge or a REQUEST_CHANGES→fix), require an independent
+                # panel_review challenge and reconcile it against this primary
+                # verdict. Default-on; operator rollback via the
+                # ``review_second_opinion_gate_enabled`` runtime flag restores
+                # today's synchronous behavior and records ``unchallenged``.
+                #
+                # Re-entry: once the challenge has reconciled, the review task
+                # carries the reconciliation record. That record (a) overrides
+                # ``verdict``/``issues`` with the reconciled, surviving set and
+                # (b) suppresses re-spawning the gate (single-shot), so the rest
+                # of this branch runs exactly once more with the reconciled
+                # verdict and every downstream gate unchanged.
+                from app.task_completion import (
+                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+                )
+                from app.task_evaluators import (
+                    review_is_high_stakes,
+                    spawn_review_second_opinion,
+                )
+
+                _recon_record = (task.context or {}).get(
+                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+                )
+                if _recon_record is not None:
+                    # Re-entrant pass after reconciliation: adopt the reconciled
+                    # verdict + surviving issue set, then fall through to the
+                    # normal action branches without re-evaluating the gate.
+                    _reconciled = _recon_record.get("reconciled_verdict")
+                    if _reconciled in ("APPROVE", "REQUEST_CHANGES"):
+                        verdict = _reconciled
+                    _surviving = _recon_record.get("surviving_issues")
+                    if isinstance(_surviving, list):
+                        issues = _surviving
+                elif not verdict_unparseable and _runtime_config.get(
+                    "review_second_opinion_gate_enabled", True
+                ):
+                    if review_is_high_stakes(
+                        verdict, issues, investigated_files, task
+                    ):
+                        _challenger = await spawn_review_second_opinion(
+                            task,
+                            session,
+                            verdict=verdict,
+                            issues=issues,
+                            feedback=feedback,
+                            pr_number=pr_number,
+                            branch=branch,
+                            base_branch=base_branch,
+                            original_task_id=original_task_id,
+                            original_prompt=original_prompt,
+                            investigated_files=investigated_files,
+                        )
+                        if _challenger is not None:
+                            logger.info(
+                                "[REVIEW PIPELINE] PR #%s: parked review %s "
+                                "awaiting second-opinion challenge %s "
+                                "(primary verdict=%s) — not acting yet",
+                                pr_number,
+                                task.id,
+                                _challenger.id,
+                                verdict,
+                            )
+                            return {"status": "accepted"}
+                        # spawn refused: a challenge is already in flight. Stay
+                        # parked rather than act on the unreconciled verdict.
+                        if (task.context or {}).get(
+                            "awaiting_review_second_opinion"
+                        ):
+                            return {"status": "accepted"}
+                    else:
+                        # Gate on but verdict not high-stakes — proceed
+                        # synchronously and record the unchallenged outcome.
+                        task.context = {
+                            **(task.context or {}),
+                            REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                                "state": "unchallenged",
+                                "reason": "verdict not high-stakes",
+                                "primary_verdict": verdict,
+                                "reconciled_verdict": verdict,
+                                "surviving_issues": issues,
+                            },
+                        }
+                        session.add(task)
+                elif not verdict_unparseable:
+                    # Gate disabled — preserve today's synchronous behavior and
+                    # record the unchallenged outcome.
+                    task.context = {
+                        **(task.context or {}),
+                        REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                            "state": "unchallenged",
+                            "reason": "second-opinion gate disabled",
+                            "primary_verdict": verdict,
+                            "reconciled_verdict": verdict,
+                            "surviving_issues": issues,
+                        },
+                    }
+                    session.add(task)
 
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
