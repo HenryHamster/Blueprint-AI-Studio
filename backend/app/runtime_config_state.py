@@ -127,6 +127,18 @@ runtime_config: Dict = {
         "RESEARCH_FINDING_CHALLENGE_INDETERMINATE_DISPATCH_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # DEFAULT-ON per-finding adversarial challenge gate for high-stakes research
+    # findings. When True (default), each finding that carries large blast radius
+    # (scope=large, risk=high) OR a partial-staleness / over-claim signal
+    # (downgraded verification_basis, broken_refs, ungrounded_refs,
+    # needs_revalidation) is independently challenged by a refute-first grader
+    # before it spawns. A challenged finding that fails is DEFERRED (not dropped)
+    # so strategic review sees it. Low-stakes findings are never escalated.
+    # Set to False to disable (settable via PATCH /api/admin/settings, no deploy).
+    "adversarial_spawn_gate_enabled": os.getenv(
+        "ADVERSARIAL_SPAWN_GATE_ENABLED", "true"
+    ).lower()
+    not in ("0", "false", "no"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -1071,6 +1083,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "cochange_decomposition_enabled",
                         bool(config_json["cochange_decomposition_enabled"]),
+                    )
+                if "adversarial_spawn_gate_enabled" in config_json:
+                    _set(
+                        "adversarial_spawn_gate_enabled",
+                        bool(config_json["adversarial_spawn_gate_enabled"]),
                     )
                 if "warm_retarget_enabled" in config_json:
                     _set(

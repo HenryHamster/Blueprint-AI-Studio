@@ -41,12 +41,15 @@ from app.task_evaluators import (
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
     FINDING_CHALLENGE_SOURCE_KEY,
     FINDING_CHALLENGE_VERDICT_KEY,
+    ADVERSARIAL_GATE_VERDICT_KEY,
     QUALITY_GRADER_SOURCE_KEY,
     QUALITY_GRADER_VERDICT_KEY,
+    parse_adversarial_finding_verdicts,
     parse_grader_verdict,
     spawn_finding_challenge,
     spawn_forward_quality_grader,
 )
+from app.research_completion import _is_high_stakes_finding
 from app.time_utils import _utcnow
 
 
@@ -6212,3 +6215,599 @@ def test_annotate_capability_declarations_clears_stale_markers_and_skips_non_dic
     _annotate_capability_declarations(findings, ["seeded-eval-harness"])
     assert "_off_registry_capabilities" not in findings[0]
     assert findings[0]["_provides_capability"] == "seeded-eval-harness"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial spawn-gate: _is_high_stakes_finding predicate (pure unit tests)
+# ---------------------------------------------------------------------------
+
+
+class TestIsHighStakesFinding:
+    """_is_high_stakes_finding: identifies findings that warrant an adversarial challenge."""
+
+    def _f(self, **kw):
+        base = {
+            "title": "Refactor auth",
+            "description": "The auth module has a bug.",
+            "prompt": "Fix the auth module",
+            "type": "improvement",
+            "scope": "small",
+            "risk": "low",
+        }
+        base.update(kw)
+        return base
+
+    def test_large_scope_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._f(scope="large"))
+
+    def test_high_risk_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._f(risk="high"))
+
+    def test_critical_risk_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._f(risk="critical"))
+
+    def test_very_high_risk_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._f(risk="very_high"))
+
+    def test_verification_basis_downgraded_is_high_stakes(self):
+        assert _is_high_stakes_finding(
+            self._f(verification_basis_downgraded_from="code_confirmed")
+        )
+
+    def test_broken_refs_provenance_is_high_stakes(self):
+        assert _is_high_stakes_finding(
+            self._f(_provenance_warnings={"broken_refs": ["app/auth.py"]})
+        )
+
+    def test_ungrounded_refs_provenance_is_high_stakes(self):
+        assert _is_high_stakes_finding(
+            self._f(_provenance_warnings={"ungrounded_refs": ["app/foo.py:bar"]})
+        )
+
+    def test_cited_files_changed_is_high_stakes(self):
+        assert _is_high_stakes_finding(
+            self._f(_provenance_warnings={"cited_files_changed_since_generation": True})
+        )
+
+    def test_needs_revalidation_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._f(needs_revalidation=True))
+
+    def test_small_scope_low_risk_no_signals_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding(self._f())
+
+    def test_non_spawning_type_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding(
+            self._f(scope="large", type="design_doc_observation")
+        )
+
+    def test_empty_prompt_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding(self._f(scope="large", prompt="   "))
+
+    def test_already_spawned_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding(self._f(scope="large", already_spawned=True))
+
+    def test_low_actionability_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding(
+            self._f(scope="large", actionability_grade="LOW")
+        )
+
+    def test_non_dict_is_not_high_stakes(self):
+        assert not _is_high_stakes_finding("not a dict")
+        assert not _is_high_stakes_finding(None)
+
+
+# ---------------------------------------------------------------------------
+# parse_adversarial_finding_verdicts: fail-open parse (pure unit tests)
+# ---------------------------------------------------------------------------
+
+
+class TestParseAdversarialFindingVerdicts:
+    """parse_adversarial_finding_verdicts: fail-open pass/fail extraction."""
+
+    def test_extracts_fail_verdict(self):
+        logs = '[{"hash": "abc123", "verdict": "fail", "reason": "premise wrong"}]'
+        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        assert result["abc123"] is False
+
+    def test_extracts_pass_verdict(self):
+        logs = '[{"hash": "abc123", "verdict": "pass", "reason": "well-grounded"}]'
+        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        assert result["abc123"] is True
+
+    def test_missing_hash_defaults_to_pass(self):
+        logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
+        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        assert result["abc123"] is True
+
+    def test_not_completed_defaults_all_to_pass(self):
+        logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
+        result = parse_adversarial_finding_verdicts(logs, ["abc123"], completed=False)
+        assert result["abc123"] is True
+
+    def test_none_logs_defaults_all_to_pass(self):
+        result = parse_adversarial_finding_verdicts(None, ["abc123"])
+        assert result["abc123"] is True
+
+    def test_malformed_json_defaults_all_to_pass(self):
+        result = parse_adversarial_finding_verdicts("not json at all", ["abc123"])
+        assert result["abc123"] is True
+
+    def test_multiple_findings_partial_fail(self):
+        logs = (
+            '[{"hash": "h1", "verdict": "fail", "reason": "bad"}, '
+            '{"hash": "h2", "verdict": "pass", "reason": "ok"}]'
+        )
+        result = parse_adversarial_finding_verdicts(logs, ["h1", "h2", "h3"])
+        assert result["h1"] is False
+        assert result["h2"] is True
+        assert result["h3"] is True  # absent → pass
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: adversarial spawn-gate in _handle_research_completion
+# ---------------------------------------------------------------------------
+
+
+def _high_stakes_finding(direction_id: str, title: str = "Big risky change") -> dict:
+    """A minimal finding that triggers _is_high_stakes_finding (risk=high)."""
+    return {
+        "title": title,
+        "description": f"Description: {title}",
+        "prompt": f"Implement: {title}",
+        "type": "improvement",
+        "priority": "high",
+        "scope": "small",
+        "risk": "high",
+        "direction_id": direction_id,
+        "actionability_grade": "HIGH",
+    }
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_parks_source_with_high_stakes_findings(
+    db_session, mocker
+):
+    """Default-on adversarial gate: a high-stakes finding parks the task awaiting the grader."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv01")
+    _patch_research_externals(mocker)
+    # Override the patch set by _patch_research_externals to ALLOW the gate to fire.
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_high_stakes_finding(direction["id"])],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Task must be parked EVALUATING, no implementation children yet.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "high-stakes finding must not spawn before adversarial verdict"
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_adversarial_grader")
+
+    # An adversarial grader task must have been spawned.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1
+    grader = others[0]
+    assert (grader.context or {}).get("adversarial_grader") is True
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_skips_when_no_high_stakes_findings(db_session, mocker):
+    """Low-stakes findings bypass the adversarial gate entirely."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv02")
+    _patch_research_externals(mocker)
+    # Override patch to ALLOW gate but return False for all findings (none high-stakes).
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        return_value=False,
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # No grader, and children should have been spawned normally.
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert graders == [], "no adversarial grader for low-stakes findings"
+    assert not task.context.get("awaiting_adversarial_grader")
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_disabled_by_flag(db_session, mocker):
+    """Disabling adversarial_spawn_gate_enabled bypasses the gate entirely."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv03")
+    _patch_research_externals(mocker)
+    # Let the predicate fire, but disable the gate via runtime config.
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_high_stakes_finding(direction["id"])],
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_enabled": False},
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert graders == [], "disabled gate must not spawn adversarial grader"
+    assert not task.context.get("awaiting_adversarial_grader")
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_reentry_failed_finding_is_deferred(db_session, mocker):
+    """Re-entry after adversarial verdict: a failed finding is DEFERRED, not dropped."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv04")
+    _patch_research_externals(mocker)
+    # Allow the predicate so _is_high_stakes_finding returns normally.
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Risky deferred finding")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
+
+    # Simulate the adversarial grader having already returned a FAIL verdict.
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {fhash: False},
+            "grader_task_id": "test-grader-001",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # No implementation children — deferred, not spawned.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "adversarial-failed finding must not spawn"
+
+    # The failed finding must appear in deferred_findings (for the next cycle).
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert any(
+        d.get("title") == hs["title"] for d in deferred
+    ), "failed finding must be in deferred_findings"
+    # _adversarial_verdict must be stripped from the deferred entry.
+    for d in deferred:
+        assert "_adversarial_verdict" not in d, "_adversarial_verdict must be cleared on deferral"
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_fails_open_on_absent_verdicts(db_session, mocker):
+    """Fail-open: if grader output missing a finding's hash, that finding still spawns."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv05")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Fail-open finding")
+
+    # Adversarial grader returned verdicts but NOT for this finding (empty dict).
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},  # empty — absent hash defaults to pass
+            "grader_task_id": "test-grader-002",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "absent hash in verdict → fail-open → finding must spawn"
+
+
+@_pytest.mark.asyncio
+async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
+    """Spawned children carry spawn-gate telemetry and the parent tracks cycle counts."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv06")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    high_pass = _high_stakes_finding(direction["id"], "Security-critical refactor")
+    high_fail = _high_stakes_finding(direction["id"], "Rejected risky follow-up")
+    low = _make_finding(direction_id=direction["id"])
+    low["title"] = "Routine low-stakes follow-up"
+    low["risk"] = "low"
+
+    pass_hash = _finding_hash(
+        high_pass["title"],
+        high_pass.get("description", "") or high_pass.get("prompt", ""),
+    )
+    fail_hash = _finding_hash(
+        high_fail["title"],
+        high_fail.get("description", "") or high_fail.get("prompt", ""),
+    )
+    task.plan_output = [high_pass, high_fail, low]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {pass_hash: True, fail_hash: False},
+            "grader_task_id": "test-grader-telemetry-001",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[high_pass, high_fail, low],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2, "one challenged pass + one unchallenged finding must spawn"
+
+    by_title = {child.title: child for child in children}
+    challenged = by_title[high_pass["title"]]
+    unchallenged = by_title[low["title"]]
+    assert (challenged.context or {}).get("research_spawn_gate_challenged") is True
+    assert (challenged.context or {}).get("research_spawn_gate_verdict") == "pass"
+    assert (unchallenged.context or {}).get("research_spawn_gate_challenged") is False
+    assert (unchallenged.context or {}).get("research_spawn_gate_verdict") is None
+
+    assert (task.context or {}).get("research_spawn_gate_challenged_count") == 2
+    assert (task.context or {}).get("research_spawn_gate_refuted_count") == 1
+    assert (task.context or {}).get("research_spawn_gate_survived_count") == 1
+
+
+@_pytest.mark.asyncio
+async def test_high_stakes_finding_default_on_adversarial_rejudgment(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: default-on adversarial gate lifecycle — park, verdict, re-entry.
+
+    Full lifecycle: first pass parks the task; second pass with a PASS verdict
+    lets the finding spawn; a FAIL verdict defers it.
+
+    Phase 1 — first pass: high-stakes finding → gate parks the task.
+    Phase 2a — re-entry with PASS verdict: finding spawns normally.
+    Phase 2b — re-entry with FAIL verdict (separate task): finding is deferred.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    # --- PHASE 1: first pass parks the task ---
+    _project, direction, task = await _grader_project_and_task(db_session, "d-acc01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Security-critical refactor")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.EVALUATING, "Phase 1: task must be parked EVALUATING"
+    assert task.context.get("awaiting_adversarial_grader"), "Phase 1: must set awaiting flag"
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1, "Phase 1: exactly one adversarial grader task must be spawned"
+    assert (others[0].context or {}).get("adversarial_grader") is True
+
+    children_p1 = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children_p1 == [], "Phase 1: no implementation tasks yet"
+
+    # --- PHASE 2a: re-entry with PASS verdict → finding spawns ---
+    fhash = _finding_hash(
+        hs["title"], hs.get("description", "") or hs.get("prompt", "")
+    )
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {fhash: True},
+            "grader_task_id": str(others[0].id),
+        },
+    }
+    task.context.pop("awaiting_adversarial_grader", None)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children_p2 = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children_p2) == 1, "Phase 2a (PASS): finding must spawn exactly one child"
+    assert not task.context.get("awaiting_adversarial_grader"), "Phase 2a: flag cleared"
+
+    # --- PHASE 2b: separate task, re-entry with FAIL verdict → finding deferred ---
+    _project2, direction2, task2 = await _grader_project_and_task(db_session, "d-acc02")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs2 = _high_stakes_finding(direction2["id"], "High-risk finding that fails gate")
+    fhash2 = _finding_hash(
+        hs2["title"], hs2.get("description", "") or hs2.get("prompt", "")
+    )
+    task2.plan_output = [hs2]
+    task2.status = TaskStatus.COMPLETED
+    task2.context = {
+        **(task2.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {fhash2: False},
+            "grader_task_id": "mock-grader-fail-001",
+        },
+    }
+    db_session.add(task2)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs2],
+    )
+
+    await _handle_research_completion(task2, "", db_session)
+    await db_session.refresh(task2)
+
+    children_fail = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task2.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children_fail == [], "Phase 2b (FAIL): adversarial-failed finding must NOT spawn"
+
+    deferred = (task2.context or {}).get("deferred_findings", [])
+    assert any(
+        d.get("title") == hs2["title"] for d in deferred
+    ), "Phase 2b (FAIL): failed finding must appear in deferred_findings"
+    for d in deferred:
+        assert "_adversarial_verdict" not in d, "Phase 2b: _adversarial_verdict must be cleared"

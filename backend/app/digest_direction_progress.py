@@ -181,6 +181,13 @@ async def compute_direction_progress(
         dir_reviews_dismissed = 0
         dir_reviews_overridden = 0
         dir_user_issues_caught = 0
+        spawn_gate_challenged_count = 0
+        spawn_gate_refuted_count = 0
+        spawn_gate_survived_count = 0
+        spawn_gate_challenged_spawned = 0
+        spawn_gate_challenged_merged = 0
+        spawn_gate_unchallenged_spawned = 0
+        spawn_gate_unchallenged_merged = 0
         for entry in d.get("research_history") or []:
             try:
                 entry_ts = _coerce_naive_utc(
@@ -324,6 +331,27 @@ async def compute_direction_progress(
                     title = (fd or {}).get("title")
                     if title:
                         recent_failed_titles.append(title)
+                spawn_gate_challenged_count += (
+                    entry.get("research_spawn_gate_challenged_count") or 0
+                )
+                spawn_gate_refuted_count += (
+                    entry.get("research_spawn_gate_refuted_count") or 0
+                )
+                spawn_gate_survived_count += (
+                    entry.get("research_spawn_gate_survived_count") or 0
+                )
+                spawn_gate_challenged_spawned += (
+                    entry.get("research_spawn_gate_challenged_spawned") or 0
+                )
+                spawn_gate_challenged_merged += (
+                    entry.get("research_spawn_gate_challenged_merged") or 0
+                )
+                spawn_gate_unchallenged_spawned += (
+                    entry.get("research_spawn_gate_unchallenged_spawned") or 0
+                )
+                spawn_gate_unchallenged_merged += (
+                    entry.get("research_spawn_gate_unchallenged_merged") or 0
+                )
             elif entry_ts >= prev_window_start:
                 for scope, stats in (entry.get("scope_breakdown") or {}).items():
                     agg = prev_dir_scope_agg.setdefault(
@@ -646,6 +674,31 @@ async def compute_direction_progress(
         _dir_fc = compute_format_compliance_metrics(tasks_for_dir)["overall"]
         dir_format_compliance_rate = _dir_fc["format_compliance_rate"]
         dir_self_repair_success_rate = _dir_fc["self_repair_success_rate"]
+        spawn_gate_challenged_merge_rate = (
+            round(spawn_gate_challenged_merged / spawn_gate_challenged_spawned, 3)
+            if spawn_gate_challenged_spawned > 0
+            else None
+        )
+        spawn_gate_unchallenged_merge_rate = (
+            round(
+                spawn_gate_unchallenged_merged / spawn_gate_unchallenged_spawned, 3
+            )
+            if spawn_gate_unchallenged_spawned > 0
+            else None
+        )
+        research_spawn_gate = {
+            "challenged_count": spawn_gate_challenged_count,
+            "refuted_count": spawn_gate_refuted_count,
+            "survived_count": spawn_gate_survived_count,
+            "challenged_spawned": spawn_gate_challenged_spawned,
+            "challenged_merged": spawn_gate_challenged_merged,
+            "challenged_merge_rate": spawn_gate_challenged_merge_rate,
+            "unchallenged_spawned": spawn_gate_unchallenged_spawned,
+            "unchallenged_merged": spawn_gate_unchallenged_merged,
+            "unchallenged_merge_rate": spawn_gate_unchallenged_merge_rate,
+        }
+        if not any(research_spawn_gate.values()):
+            research_spawn_gate = None
 
         cost_budget_usd = d.get("cost_budget_usd")
         budget_utilization_pct = None
@@ -741,6 +794,7 @@ async def compute_direction_progress(
                     "first_attempt_sample_size": dir_fa_sample_size,
                     "format_compliance_rate": dir_format_compliance_rate,
                     "self_repair_success_rate": dir_self_repair_success_rate,
+                    "research_spawn_gate": research_spawn_gate,
                     "quality_score": round(_compute_direction_quality_score(d), 3),
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,

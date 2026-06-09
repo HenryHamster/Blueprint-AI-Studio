@@ -6803,6 +6803,64 @@ async def test_digest_pipeline_autonomy_legacy_fallback(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_exposes_spawn_gate_block(
+    client: AsyncClient, db_session
+):
+    """Digest direction_progress includes the research spawn-gate comparison block."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-spawn-gate",
+                "text": "Spawn gate direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-1",
+                        "tasks_created": 1,
+                        "research_spawn_gate_challenged_count": 2,
+                        "research_spawn_gate_refuted_count": 1,
+                        "research_spawn_gate_survived_count": 1,
+                        "research_spawn_gate_challenged_spawned": 2,
+                        "research_spawn_gate_challenged_merged": 1,
+                        "research_spawn_gate_challenged_merge_rate": 0.5,
+                        "research_spawn_gate_unchallenged_spawned": 3,
+                        "research_spawn_gate_unchallenged_merged": 1,
+                        "research_spawn_gate_unchallenged_merge_rate": 0.333,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-spawn-gate"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-spawn-gate")
+    gate = dp["research_spawn_gate"]
+    assert gate["challenged_count"] == 2
+    assert gate["refuted_count"] == 1
+    assert gate["survived_count"] == 1
+    assert gate["challenged_merge_rate"] == 0.5
+    assert gate["unchallenged_merge_rate"] == 0.333
+
+
+@pytest.mark.asyncio
 async def test_digest_active_tasks_ordered_oldest_first(
     client: AsyncClient, db_session
 ):

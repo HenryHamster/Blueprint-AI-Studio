@@ -199,6 +199,17 @@ _RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG = (
     "research_finding_challenge_indeterminate_dispatch_enabled"
 )
 
+_RESEARCH_SPAWN_GATE_CHILD_FIELDS = (
+    "research_spawn_gate_challenged",
+    "research_spawn_gate_verdict",
+)
+
+_RESEARCH_SPAWN_GATE_PARENT_COUNT_FIELDS = (
+    "research_spawn_gate_challenged_count",
+    "research_spawn_gate_refuted_count",
+    "research_spawn_gate_survived_count",
+)
+
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
 # so the normalization and the HEAD-reconciliation below share a single source
@@ -1315,6 +1326,53 @@ _REPRODUCE_VERDICT_FINDING_TYPES = frozenset({"bug"})
 _VOCAB_RENDERING_TASK_TYPES = frozenset({"plan", "research", "design"})
 
 
+def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
+    """Return True when a finding warrants an adversarial second opinion.
+
+    Selects findings with large blast radius (scope=large, risk=high) OR any
+    finding carrying a partial-staleness / over-claim signal regardless of scope
+    (downgraded verification_basis, broken file refs, ungrounded path:symbol
+    claims, cited-files-changed staleness). Non-spawning types and LOW-
+    actionability findings are never high-stakes (they don't launch work).
+    """
+    if not isinstance(finding, dict):
+        return False
+    if finding.get("type") in _NON_SPAWNING_FINDING_TYPES:
+        return False
+    if not str(finding.get("prompt") or "").strip():
+        return False
+    if finding.get("already_spawned"):
+        return False
+    if finding.get("actionability_grade") == "LOW":
+        return False
+
+    # Large blast radius: large scope
+    if str(finding.get("scope") or "").lower() == "large":
+        return True
+
+    # High risk
+    if str(finding.get("risk") or "").lower() in ("high", "critical", "very_high"):
+        return True
+
+    # Over-claim signal: verification_basis was downgraded because citations failed HEAD
+    if finding.get("verification_basis_downgraded_from"):
+        return True
+
+    # Provenance warnings: broken file refs or ungrounded path:symbol claims
+    prov = finding.get("_provenance_warnings")
+    if isinstance(prov, dict):
+        if prov.get("broken_refs") or prov.get("ungrounded_refs"):
+            return True
+        if prov.get("cited_files_changed_since_generation"):
+            return True
+
+    # Deferred-finding staleness: cited files changed since generation
+    if finding.get("needs_revalidation") is True:
+        return True
+
+    return False
+
+
 def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
     """True if at least one finding would spawn downstream implementation work.
 
@@ -1475,6 +1533,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     radius, as the framework intends.
     """
     from app.task_evaluators import (
+        ADVERSARIAL_GATE_VERDICT_KEY,
         QUALITY_GRADER_VERDICT_KEY,
         EvaluationVerdict,
         record_failed_gate,
@@ -1483,6 +1542,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Re-entry signal: the independent grader has returned its verdict.
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
+    _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
     if _grader_verdict is not None and not _grader_verdict.get("passed", False):
         # FAILED forward-quality gate: do NOT spawn implementation tasks and do
         # NOT complete clean. Mark FAILED so the research is not trusted, and
@@ -1525,8 +1585,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
 
     # Only on the FIRST pass — a re-entrant resume after grading must not
-    # re-count the cycle (the grader verdict is already present in context).
-    if project_obj is not None and _grader_verdict is None:
+    # re-count the cycle (grader or adversarial verdict already present means
+    # we're on a re-entrant pass, not the initial completion).
+    if project_obj is not None and _grader_verdict is None and _adversarial_verdict_raw is None:
         await with_vision_locked(
             session, task.project_id, _increment_research_spawn_count
         )
@@ -1785,6 +1846,74 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 grader.id,
             )
             return
+
+    # Adversarial spawn-gate (DEFAULT ON). When enabled and no adversarial
+    # verdict has been written yet, select the high-stakes findings and spawn a
+    # refute-first per-finding adversarial challenger. The source parks
+    # EVALUATING until the challenger returns, then re-enters this handler with
+    # ADVERSARIAL_GATE_VERDICT_KEY in context. On re-entry the per-finding
+    # verdicts are stamped onto findings below, and the spawn loop defers any
+    # finding marked failed (not dropped — deferred to the next cycle).
+    # FAIL-OPEN: a crashed or absent grader writes no failing verdicts, so the
+    # gate never blocks spawning on infrastructure failure. Low-stakes findings
+    # keep the cheap synchronous path and are never escalated.
+    if _adversarial_verdict_raw is None and _runtime_config.get(
+        "adversarial_spawn_gate_enabled", True
+    ):
+        _high_stakes = [f for f in findings if _is_high_stakes_finding(f)]
+        if _high_stakes:
+            # Build a compact payload for the adversarial grader: include hash
+            # identifiers so the per-finding verdict response can be matched back.
+            from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+            _hs_with_hash = []
+            for _f in _high_stakes:
+                _h = _fh(str(_f.get("title", "")), str(_f.get("description", "") or _f.get("prompt", "")))
+                _hs_with_hash.append({**_f, "_adversarial_hash": _h})
+            adv_grader = await spawn_forward_quality_grader(
+                task,
+                json.dumps(_hs_with_hash),
+                session,
+                adversarial_mode=True,
+            )
+            if adv_grader is not None:
+                logger.info(
+                    "[RESEARCH] Task %s parked awaiting adversarial challenge "
+                    "(grader %s, %d high-stakes finding(s))",
+                    task.id,
+                    adv_grader.id,
+                    len(_high_stakes),
+                )
+                return
+
+    # Adversarial re-entry: stamp per-finding verdicts so the spawn loop can
+    # skip challenged-and-failed findings. The gate is fail-open: any finding
+    # whose hash is absent from the verdict dict was passed by default.
+    _spawn_gate_challenged_count = 0
+    _spawn_gate_refuted_count = 0
+    _spawn_gate_survived_count = 0
+    if _adversarial_verdict_raw is not None:
+        _adv_verdicts: dict[str, bool] = (
+            _adversarial_verdict_raw.get("finding_verdicts") or {}
+        )
+        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+        for _f in findings:
+            _fhash = _fh(
+                str(_f.get("title", "")),
+                str(_f.get("description", "") or _f.get("prompt", "")),
+            )
+            if not _adv_verdicts.get(_fhash, True):
+                _f["_adversarial_verdict"] = "fail"
+        _spawn_gate_challenged_count = sum(
+            1 for _f in findings if _is_high_stakes_finding(_f)
+        )
+        _spawn_gate_refuted_count = sum(
+            1 for _f in findings if _f.get("_adversarial_verdict") == "fail"
+        )
+        _spawn_gate_survived_count = (
+            _spawn_gate_challenged_count - _spawn_gate_refuted_count
+        )
 
     # Separate direction proposals and notes from actionable findings — these are processed
     # separately and must not enter the hash-based deduplication loop (they never create tasks,
@@ -2460,6 +2589,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # compute_experiment findings whose authored launch contract was incomplete
     # or malformed — deferred loudly rather than spawning a broken compute job.
     _compute_contract_deferred: list[dict] = []
+    # Findings that failed the adversarial per-finding challenge: deferred (not
+    # dropped) so they resurface on the next cycle for a fresh attempt.
+    _adversarial_gate_deferred: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []
     _scope_skip_counts: dict[str, int] = {}
 
@@ -2658,6 +2790,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Skip findings already directly dispatched by the research agent (scope=small+risk=low).
         # These were sent via /api/agent/spawn before research completed; no task needed here.
         if finding.get("already_spawned"):
+            continue
+
+        # Adversarial gate: defer findings that failed the per-finding adversarial
+        # challenge. The finding is deferred (not dropped) so it resurfaces in
+        # prior_deferred_findings on the next research cycle for a fresh attempt.
+        # The _adversarial_verdict key is cleared in the deferral stamp so the
+        # finding re-enters the next cycle clean (without a stale fail verdict).
+        if finding.get("_adversarial_verdict") == "fail":
+            _adversarial_gate_deferred.append(finding)
+            logger.info(
+                "[RESEARCH] Deferring finding %r (task %s): failed adversarial challenge",
+                finding.get("title") or finding.get("description", "")[:60],
+                task.id,
+            )
             continue
 
         # Reproduce-on-HEAD GATE. A finding stamped ``_reproduce_on_head ==
@@ -3797,6 +3943,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             depends_on=[],
             priority=finding_priority,
         )
+        new_task.context = {
+            **(new_task.context or {}),
+            "research_spawn_gate_challenged": bool(
+                _adversarial_verdict_raw is not None
+                and _is_high_stakes_finding(finding)
+            ),
+            "research_spawn_gate_verdict": (
+                "pass"
+                if _adversarial_verdict_raw is not None
+                and _is_high_stakes_finding(finding)
+                and finding.get("_adversarial_verdict") != "fail"
+                else None
+            ),
+        }
         # Record the defect's reproduce-on-HEAD verdict on the spawned fix so its
         # outcome scoring can refuse bare-merge success when the target defect
         # was never established to reproduce. Absent findings are already gated
@@ -3840,6 +4000,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         return stamped
 
+    # Adversarially-deferred findings: stamp deferral + clear the fail verdict so
+    # the finding re-enters the next cycle clean (no stale _adversarial_verdict).
+    _adv_deferred_stamped = []
+    for _adf in _adversarial_gate_deferred:
+        _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
+        _adf_stamped.pop("_adversarial_verdict", None)
+        _adv_deferred_stamped.append(_adf_stamped)
+
     _all_deferred = (
         [_stamp_deferral(f, "low_actionability") for f in _low_actionability_deferred]
         + [
@@ -3852,6 +4020,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for f in _compute_contract_deferred
         ]
         + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
+        + _adv_deferred_stamped
         + [
             {
                 **_stamp_deferral(f, "ultra_low_confidence"),
@@ -3977,6 +4146,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _deferral_reasons.append(
             f"compute_contract_invalid ({len(_compute_contract_deferred)})"
         )
+    if _adversarial_gate_deferred:
+        _deferral_reasons.append(
+            f"adversarial_gate ({len(_adversarial_gate_deferred)})"
+        )
 
     if (
         _all_deferred
@@ -3984,6 +4157,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _spawned_memo_ids
         or _finding_give_up
         or _reproduce_rejected
+        or _spawn_gate_challenged_count
     ):
         ctx = dict(task.context or {})
         if _all_deferred:
@@ -3999,6 +4173,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # rejected this cycle. Excluded from deferred_findings (no retry) and
             # from the surviving-finding signal (neutral, not success/failure).
             ctx["research_reproduce_rejected"] = len(_reproduce_rejected)
+        if _spawn_gate_challenged_count:
+            ctx["research_spawn_gate_challenged_count"] = _spawn_gate_challenged_count
+            ctx["research_spawn_gate_refuted_count"] = _spawn_gate_refuted_count
+            ctx["research_spawn_gate_survived_count"] = _spawn_gate_survived_count
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)

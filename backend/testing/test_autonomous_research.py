@@ -130,6 +130,12 @@ def _patch_research_externals(mocker):
         "app.research_completion._apply_structural_actionability_downgrade",
         return_value=0,
     )
+    # Disable the adversarial spawn-gate (default-on) so existing tests that
+    # incidentally use high-risk findings are not parked awaiting the grader.
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        return_value=False,
+    )
 
 
 def _make_finding(

@@ -5393,3 +5393,68 @@ async def test_per_direction_format_metrics_have_a_consumer_or_are_retired(
     assert entry["format_compliance_rate"] == 0.5
     # 1 repair attempt, 1 success → 100% repair success rate.
     assert entry["self_repair_success_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_counts_and_rates_are_recorded(db_session: AsyncSession):
+    """research_history records challenged/refuted/survived counts and merge rates."""
+    direction_id = "d-spawn-gate"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 2,
+        "research_spawn_gate_refuted_count": 1,
+        "research_spawn_gate_survived_count": 1,
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+            "research_spawn_gate_verdict": "pass",
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-open",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+            "research_spawn_gate_verdict": None,
+        },
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["research_spawn_gate_challenged_count"] == 2
+    assert entry["research_spawn_gate_refuted_count"] == 1
+    assert entry["research_spawn_gate_survived_count"] == 1
+    assert entry["research_spawn_gate_challenged_spawned"] == 1
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 1.0
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1
+    assert entry["research_spawn_gate_unchallenged_merged"] == 0
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 0.0

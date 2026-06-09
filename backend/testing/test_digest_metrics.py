@@ -777,6 +777,39 @@ def test_compute_narrative_summary_consumes_explicit_churn_direction():
     )
 
 
+def test_compute_narrative_summary_includes_spawn_gate_before_after_sentence():
+    """Pipeline narrative compares challenged vs unchallenged spawn outcomes."""
+    narrative = _build_narrative_summary(
+        failed_count=1,
+        failure_groups=[],
+        failure_taxonomy_distribution={
+            "categories": {},
+            "total_failures": 0,
+            "dominant_category": None,
+        },
+        direction_progress_list=[
+            {
+                "direction_text": "Spawn gate direction",
+                "prs_merged": 0,
+                "tasks_created": 1,
+                "research_spawn_gate": {
+                    "challenged_spawned": 2,
+                    "challenged_merged": 1,
+                    "challenged_merge_rate": 0.5,
+                    "unchallenged_spawned": 3,
+                    "unchallenged_merged": 1,
+                    "unchallenged_merge_rate": 0.333,
+                    "refuted_count": 2,
+                },
+            }
+        ],
+        failed_tasks=[],
+    )
+    assert "Before/after, research spawn gate:" in narrative
+    assert "challenged-and-survived spawns merged at 50.0% versus 33.3%" in narrative
+    assert "2 refuted findings were prevented from spawning." in narrative
+
+
 def _make_failed_task(**kwargs):
     """Minimal failed Task object for compute_failure_grouping unit tests."""
     return make_task(status=TaskStatus.FAILED, **kwargs)

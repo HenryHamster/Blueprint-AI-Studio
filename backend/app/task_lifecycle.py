@@ -356,10 +356,19 @@ async def _resolve_quality_grader_completion(
     through the re-entrant completion path. Resolves BOTH a COMPLETED and a
     FAILED grader (a FAILED grader fails closed) so the source never strands
     EVALUATING.
+
+    Adversarial mode: when the grader has ``adversarial_grader=True`` in its
+    context, the grader produced per-finding verdicts (not an artifact-level
+    pass/fail). The per-finding dict is written under ``ADVERSARIAL_GATE_VERDICT_KEY``
+    and the source is re-dispatched normally (the spawn loop will defer findings
+    whose hash maps to False in the verdict dict). Fail-open: absent hashes default
+    to pass so a crashed adversarial grader never blocks spawning.
     """
     from app.task_evaluators import (
+        ADVERSARIAL_GATE_VERDICT_KEY,
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
+        parse_adversarial_finding_verdicts,
         parse_grader_verdict,
     )
     from app.research_completion import _handle_research_completion
@@ -369,14 +378,9 @@ async def _resolve_quality_grader_completion(
         _handle_web_research_completion,
     )
 
+    is_adversarial = bool((grader.context or {}).get("adversarial_grader"))
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
-    verdict = parse_grader_verdict(grader_logs, completed=completed)
-    grader.latest_status_message = (
-        f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
-        f"{verdict.reason}"
-    )[:500]
-    session.add(grader)
 
     source_id = (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY)
     try:
@@ -404,13 +408,46 @@ async def _resolve_quality_grader_completion(
         return
 
     ctx = dict(source.context or {})
-    ctx[QUALITY_GRADER_VERDICT_KEY] = {
-        "passed": verdict.passed,
-        "reason": verdict.reason,
-        "grader_task_id": str(grader.id),
-        "strategy": "forward-quality",
-    }
-    ctx.pop("awaiting_quality_grader", None)
+    if is_adversarial:
+        # Derive finding hashes from stored plan_output so the fail-open default
+        # covers all known findings without requiring the caller to pass them.
+        stored_findings = source.plan_output or []
+        if isinstance(stored_findings, dict):
+            stored_findings = stored_findings.get("findings") or []
+        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+
+        all_hashes = [
+            _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
+            for f in stored_findings
+            if isinstance(f, dict)
+        ]
+        finding_verdicts = parse_adversarial_finding_verdicts(
+            grader_logs, all_hashes, completed=completed
+        )
+        failed_count = sum(1 for v in finding_verdicts.values() if not v)
+        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
+            "finding_verdicts": finding_verdicts,
+            "grader_task_id": str(grader.id),
+        }
+        ctx.pop("awaiting_adversarial_grader", None)
+        grader.latest_status_message = (
+            f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "
+            f"finding(s) failed"
+        )[:500]
+    else:
+        verdict = parse_grader_verdict(grader_logs, completed=completed)
+        grader.latest_status_message = (
+            f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
+            f"{verdict.reason}"
+        )[:500]
+        ctx[QUALITY_GRADER_VERDICT_KEY] = {
+            "passed": verdict.passed,
+            "reason": verdict.reason,
+            "grader_task_id": str(grader.id),
+            "strategy": "forward-quality",
+        }
+        ctx.pop("awaiting_quality_grader", None)
+    session.add(grader)
     source.context = ctx
     flag_modified(source, "context")
     # Re-establish the terminal status the source originally reported before it

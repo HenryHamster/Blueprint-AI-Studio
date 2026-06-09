@@ -3697,6 +3697,37 @@ def compute_narrative_summary(
             shipped += f" (down from {prev_completed_count} last period)"
         narrative_parts.append(shipped + ".")
 
+    if direction_progress_list:
+        gate_challenged_spawned = 0
+        gate_challenged_merged = 0
+        gate_unchallenged_spawned = 0
+        gate_unchallenged_merged = 0
+        gate_refuted_count = 0
+        for dp in direction_progress_list:
+            gate = dp.get("research_spawn_gate") or {}
+            gate_challenged_spawned += int(gate.get("challenged_spawned") or 0)
+            gate_challenged_merged += int(gate.get("challenged_merged") or 0)
+            gate_unchallenged_spawned += int(gate.get("unchallenged_spawned") or 0)
+            gate_unchallenged_merged += int(gate.get("unchallenged_merged") or 0)
+            gate_refuted_count += int(gate.get("refuted_count") or 0)
+        challenged_rate = (
+            round(gate_challenged_merged / gate_challenged_spawned, 3)
+            if gate_challenged_spawned > 0
+            else None
+        )
+        unchallenged_rate = (
+            round(gate_unchallenged_merged / gate_unchallenged_spawned, 3)
+            if gate_unchallenged_spawned > 0
+            else None
+        )
+        if challenged_rate is not None and unchallenged_rate is not None:
+            narrative_parts.append(
+                "Before/after, research spawn gate: challenged-and-survived spawns "
+                f"merged at {challenged_rate:.1%} versus {unchallenged_rate:.1%} "
+                f"for unchallenged spawns; {gate_refuted_count} refuted finding"
+                f"{'s' if gate_refuted_count != 1 else ''} were prevented from spawning."
+            )
+
     if project_id and direction_progress_list:
         _dir_tax_hints = {
             "review_quality": "mostly review-quality failures",

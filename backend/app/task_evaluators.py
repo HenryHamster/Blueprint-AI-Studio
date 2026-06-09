@@ -61,6 +61,12 @@ QUALITY_GRADER_SOURCE_KEY = "quality_grader_for_task_id"
 # re-spawning a grader on the re-entrant pass.
 QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 
+# Context key written on the SOURCE task when the adversarial per-finding grader
+# returns. Value is {"finding_verdicts": {hash: bool}, "grader_task_id": "..."}.
+# True = finding passed adversarial challenge; False = failed (finding deferred).
+# Absent hash → pass (fail-open: a crashed grader never blocks spawning).
+ADVERSARIAL_GATE_VERDICT_KEY = "adversarial_gate"
+
 
 # ---------------------------------------------------------------------------
 # Per-finding second-opinion CHALLENGE seam.
@@ -681,6 +687,77 @@ def _extract_verdict_object_any(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def build_adversarial_finding_prompt(high_stakes_findings_json: str) -> str:
+    """Build a refute-first per-finding adversarial challenge prompt.
+
+    Instructs a fresh agent to actively try to REFUTE each finding before it
+    spawns implementation work. Fail-open semantics: absent findings in the
+    output default to pass so a truncated or crashed grader never blocks work.
+    """
+    return (
+        "You are an ADVERSARIAL CHALLENGER. Each of the following research "
+        "findings is about to SPAWN implementation work (PRs, plans). Your job "
+        "is to actively try to REFUTE each finding — not to confirm it. Default "
+        "to skeptical: if you cannot confidently confirm all three criteria, "
+        "mark the finding as failing.\n\n"
+        "For each finding, judge:\n"
+        "  1. PREMISE — Is the finding's core premise still true at HEAD? "
+        "(The cited code/behavior exists AND has the claimed problem.)\n"
+        "  2. EVIDENCE — Are the citations real and do they actually support "
+        "the conclusion, not just tangentially related?\n"
+        "  3. SCOPE — Does the finding overstate its blast radius, severity, "
+        "or impact beyond what the cited evidence actually shows?\n\n"
+        "FAIL when uncertain. Only PASS a finding when all three criteria "
+        "clearly hold at HEAD.\n\n"
+        "Findings to challenge (JSON array, each has a 'hash' identifier):\n"
+        "-----8<----- FINDINGS START -----8<-----\n"
+        f"{high_stakes_findings_json[:20000]}\n"
+        "-----8<----- FINDINGS END -----8<-----\n\n"
+        "End your response with EXACTLY ONE JSON array, one object per finding "
+        "in the SAME ORDER as the input, and nothing after it:\n"
+        '[{"hash": "<finding_hash from input>", "verdict": "pass" | "fail", '
+        '"reason": "<one-sentence justification>"}]'
+    )
+
+
+def parse_adversarial_finding_verdicts(
+    logs: str | None,
+    finding_hashes: list[str],
+    completed: bool = True,
+) -> dict[str, bool]:
+    """Parse per-finding pass/fail verdicts from adversarial grader output.
+
+    Returns a dict mapping finding_hash → passed (bool). FAIL-OPEN: any finding
+    whose hash is absent from the output defaults to True (pass) so a crashed or
+    truncated adversarial grader never blocks spawning.
+    """
+    result: dict[str, bool] = {h: True for h in finding_hashes}
+    if not completed or not logs:
+        return result
+    from app.task_completion import _extract_json_array  # noqa: PLC0415
+
+    text = (logs or "").strip()
+    json_str = _extract_json_array(text, "hash", "verdict")
+    if json_str:
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    h = str(item.get("hash") or "").strip()
+                    if h not in result:
+                        continue
+                    v = str(item.get("verdict") or "").strip().lower()
+                    if v in ("pass", "passed", "approve", "approved"):
+                        result[h] = True
+                    elif v in ("fail", "failed", "reject", "rejected"):
+                        result[h] = False
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return result
+
+
 def build_forward_quality_grader_prompt(
     task_type: str, artifact_text: str, *, question: str | None = None
 ) -> str:
@@ -743,6 +820,7 @@ async def spawn_forward_quality_grader(
     *,
     rubric: str | None = None,
     question: str | None = None,
+    adversarial_mode: bool = False,
 ) -> Task | None:
     """Spawn an independent grader task for ``source_task`` and park the source.
 
@@ -751,30 +829,62 @@ async def spawn_forward_quality_grader(
     at most once; this is the convergence control, analogous to the review
     pipeline's per-chain iteration cap).
 
+    When ``adversarial_mode=True``, the grader uses a refute-first per-finding
+    challenge prompt and writes ``ADVERSARIAL_GATE_VERDICT_KEY`` on the source
+    rather than ``QUALITY_GRADER_VERDICT_KEY``. The two gates are independent
+    and use separate awaiting/verdict keys so they can both run on a single
+    research task without interfering.
+
     The source task is moved to EVALUATING and will NOT complete or spawn
     children until the grader's verdict returns via the re-entrant completion
     path (``task_lifecycle._resolve_quality_grader_completion``).
     """
     ctx = dict(source_task.context or {})
-    if ctx.get(QUALITY_GRADER_VERDICT_KEY) is not None or ctx.get(
-        "awaiting_quality_grader"
-    ):
-        # Already graded, or a grader is already in flight — never double-spawn.
-        return None
+    if adversarial_mode:
+        if ctx.get(ADVERSARIAL_GATE_VERDICT_KEY) is not None or ctx.get(
+            "awaiting_adversarial_grader"
+        ):
+            return None
+    else:
+        if ctx.get(QUALITY_GRADER_VERDICT_KEY) is not None or ctx.get(
+            "awaiting_quality_grader"
+        ):
+            # Already graded, or a grader is already in flight — never double-spawn.
+            return None
 
     task_type = _task_type_of(source_task)
-    prompt = rubric or build_forward_quality_grader_prompt(
-        task_type, artifact_text, question=question
-    )
+    if adversarial_mode:
+        prompt = rubric or build_adversarial_finding_prompt(artifact_text)
+        _awaiting_key = "awaiting_adversarial_grader"
+        _title_suffix = "adversarial-challenge"
+        _description = (
+            "Independent adversarial challenge of high-stakes research findings "
+            "before they are allowed to spawn downstream implementation work."
+        )
+        _status_message = (
+            "Awaiting adversarial challenge verdict before spawning "
+            "high-stakes implementation tasks"
+        )
+    else:
+        prompt = rubric or build_forward_quality_grader_prompt(
+            task_type, artifact_text, question=question
+        )
+        _awaiting_key = "awaiting_quality_grader"
+        _title_suffix = "forward-quality grade"
+        _description = (
+            "Independent forward-quality grade of an upstream artifact before "
+            "it is allowed to spawn downstream implementation work."
+        )
+        _status_message = (
+            "Awaiting independent forward-quality grade before spawning "
+            "implementation tasks"
+        )
     base_branch = (source_task.first_payload or {}).get("base_branch", "main")
 
     grader = Task(
         project_id=source_task.project_id,
-        title=f"[GRADE] forward-quality grade for {task_type} {str(source_task.id)[:8]}",
-        description=(
-            "Independent forward-quality grade of an upstream artifact before "
-            "it is allowed to spawn downstream implementation work."
-        ),
+        title=f"[GRADE] {_title_suffix} for {task_type} {str(source_task.id)[:8]}",
+        description=_description,
         # Deliberately NOT parent_task_id=source: the grader is a side-car, not
         # a rollup child. Linking it as a child would entangle it in the
         # source's parent-rollup accounting. The back-reference lives in
@@ -792,6 +902,7 @@ async def spawn_forward_quality_grader(
             QUALITY_GRADER_SOURCE_KEY: str(source_task.id),
             "scope": "small",
             "graded_task_type": task_type,
+            **({"adversarial_grader": True} if adversarial_mode else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -803,11 +914,8 @@ async def spawn_forward_quality_grader(
     # Park the source awaiting the verdict. Overrides the COMPLETED status the
     # orchestrator set pre-handler — the source is NOT done until graded.
     source_task.status = TaskStatus.EVALUATING
-    source_task.latest_status_message = (
-        "Awaiting independent forward-quality grade before spawning "
-        "implementation tasks"
-    )[:500]
-    ctx["awaiting_quality_grader"] = True
+    source_task.latest_status_message = _status_message[:500]
+    ctx[_awaiting_key] = True
     source_task.context = ctx
     flag_modified(source_task, "context")
     session.add(source_task)
@@ -816,15 +924,16 @@ async def spawn_forward_quality_grader(
 
     # Record the concrete grader id for observability now that it exists.
     ctx2 = dict(source_task.context or {})
-    ctx2["awaiting_quality_grader"] = str(grader.id)
+    ctx2[_awaiting_key] = str(grader.id)
     source_task.context = ctx2
     flag_modified(source_task, "context")
     session.add(source_task)
     await session.commit()
 
     logger.info(
-        "[EVAL] Spawned forward-quality grader %s for %s task %s; source parked "
+        "[EVAL] Spawned %s grader %s for %s task %s; source parked "
         "EVALUATING awaiting verdict",
+        "adversarial" if adversarial_mode else "forward-quality",
         grader.id,
         task_type,
         source_task.id,
