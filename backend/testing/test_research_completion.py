@@ -37,9 +37,14 @@ from app.research_completion import (
 )
 from app.finding_deduplication import resolve_prerequisite_task
 from app.task_evaluators import (
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    FINDING_CHALLENGE_SOURCE_KEY,
+    FINDING_CHALLENGE_VERDICT_KEY,
     QUALITY_GRADER_SOURCE_KEY,
     QUALITY_GRADER_VERDICT_KEY,
     parse_grader_verdict,
+    spawn_finding_challenge,
     spawn_forward_quality_grader,
 )
 from app.time_utils import _utcnow
@@ -1463,7 +1468,15 @@ class TestProvenanceWarningsAttachment:
     """End-to-end: validate_source_refs + summarize_broken_refs flow used by
     research_completion to attach provenance to findings."""
 
-    async def _spawn_deferred_child(self, db_session, mocker, *, direction_id, deferred):
+    async def _spawn_deferred_child(
+        self,
+        db_session,
+        mocker,
+        *,
+        direction_id,
+        deferred,
+        passthrough_validate_source_refs=True,
+    ):
         from test_autonomous_research import _make_finding, _patch_research_externals
 
         _project, direction, task = await _grader_project_and_task(
@@ -1494,18 +1507,19 @@ class TestProvenanceWarningsAttachment:
             ("app.research_completion._summarize_ungrounded_claims_grounded", None),
         ):
             mocker.patch(path, new=AsyncMock(return_value=value))
-        # The deferred-recovery flow re-grounds cited FILE refs against HEAD
-        # (reproduce-on-HEAD gate). These provenance tests cite placeholder paths
-        # that are absent on HEAD, which would trip the gate and reject the finding
-        # before it spawns its child. Echo the sources back unchanged (no
-        # ``valid: False`` stamp → counted present) so the finding survives the
-        # gate and we exercise only the staleness-provenance propagation under
-        # test here. The gate's own absent-rejection behavior is covered by
-        # TestReproduceOnHeadGate.
-        mocker.patch(
-            "app.research_completion.validate_source_refs",
-            new=AsyncMock(side_effect=lambda sources, **kwargs: sources),
-        )
+        if passthrough_validate_source_refs:
+            # The deferred-recovery flow re-grounds cited FILE refs against HEAD
+            # (reproduce-on-HEAD gate). These provenance tests cite placeholder
+            # paths that are absent on HEAD, which would trip the gate and reject
+            # the finding before it spawns its child. Echo the sources back
+            # unchanged (no ``valid: False`` stamp → counted present) so the
+            # finding survives the gate and we exercise only the
+            # staleness-provenance propagation under test here. The gate's own
+            # absent-rejection behavior is covered by TestReproduceOnHeadGate.
+            mocker.patch(
+                "app.research_completion.validate_source_refs",
+                new=AsyncMock(side_effect=lambda sources, **kwargs: sources),
+            )
 
         await _handle_research_completion(task, "", db_session)
 
@@ -1756,6 +1770,25 @@ class TestProvenanceWarningsAttachment:
         assert verdict is not None
         assert verdict["status"] == "indeterminate"
 
+    def test_reconcile_overturned_absent_provenance_updates_seed(self):
+        """A challenge that overturns reproduce-absent must clear the stale seed."""
+        from app.research_completion import _reconcile_reproduce_provenance_state
+
+        finding = {
+            "_provenance_warnings": {
+                "citation_state": "absent",
+                "broken_source_ref_count": 1,
+                "broken_refs": ["backend/app/missing.py"],
+            },
+            "_reproduce_on_head": "present",
+        }
+        _reconcile_reproduce_provenance_state(finding, finding["_reproduce_on_head"])
+        assert finding["_provenance_warnings"]["citation_state"] == "present"
+
+        unchanged = {"_provenance_warnings": {"citation_state": "present"}}
+        _reconcile_reproduce_provenance_state(unchanged, "present")
+        assert unchanged["_provenance_warnings"]["citation_state"] == "present"
+
     @_pytest.mark.asyncio
     @_pytest.mark.parametrize("finding_type", ["feature", "improvement", "refactor"])
     async def test_spawned_non_defect_child_omits_reproduce_verdict(
@@ -1799,6 +1832,7 @@ class TestReproduceOnHeadGate:
         direction_id,
         parsed_findings,
         prior_deferred=None,
+        task_context=None,
         has_backend=True,
         validate=None,
         ungrounded=None,
@@ -1808,6 +1842,13 @@ class TestReproduceOnHeadGate:
         _project, direction, task = await _grader_project_and_task(
             db_session, direction_id
         )
+        if task_context:
+            task.context = {
+                **(task.context or {}),
+                **task_context,
+            }
+            db_session.add(task)
+            await db_session.commit()
         if prior_deferred is not None:
             task.context = {
                 **(task.context or {}),
@@ -2222,6 +2263,522 @@ class TestReproduceOnHeadGate:
         assert memo.plan_output and memo.plan_output.get("memo"), (
             "plan_output['memo'] must be set for inline-completed memo"
         )
+
+    @_pytest.mark.asyncio
+    async def test_reproduce_absent_second_opinion_overturn_spawns_and_memo_records_disagreement(
+        self, db_session, mocker
+    ):
+        """Flag-on reproduce-absent gate parks for a real side-car verdict; a
+        disagreement keeps the finding, records the second opinion on the finding
+        and spawned child, and suppresses the absent-drop memo."""
+        from app.schemas import AgentStatusPayload
+        from app.task_lifecycle import _resolve_finding_challenge_completion
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"research_finding_challenge_enabled": True},
+        )
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-repro-chal01"
+        )
+        finding = _make_finding(
+            title="Moved semantic target", direction_id=direction["id"]
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/old_place.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_head_commit",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion.cited_paths_changed_since",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion._has_validation_backend",
+            return_value=True,
+        )
+        mocker.patch("app.research_completion.validate_source_refs", new=_validate)
+        mocker.patch(
+            "app.research_completion._summarize_ungrounded_claims_grounded",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert task.context.get("awaiting_finding_challenge")
+
+        sidecar = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.context[FINDING_CHALLENGE_SOURCE_KEY].as_string()
+                        == str(task.id)
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        payload = AgentStatusPayload(
+            task_id=sidecar.id,
+            status=TaskStatus.COMPLETED,
+            logs=(
+                "The subject moved from old_place.py to new_place.py.\n"
+                '{"verdict": "present", "agreement": "disagrees", '
+                '"reasoning": "semantic target was renamed, not removed"}'
+            ),
+        )
+        await _resolve_finding_challenge_completion(sidecar, payload, db_session)
+
+        await db_session.refresh(task)
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        spawned = [c for c in children if c.title == "Moved semantic target"]
+        assert len(spawned) == 1
+        assert (task.context or {}).get("research_reproduce_rejected") is None
+        assert (task.context or {}).get("spawned_memo_ids") is None
+        record = (spawned[0].context or {}).get("finding_challenge")
+        assert record["challenged_boundary"] == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+        assert record["first_verdict"] == "absent"
+        assert record["second_opinion_verdict"] == "present"
+        assert record["agreement"] == "disagrees"
+        assert "renamed" in record["reason"]
+        assert (spawned[0].context or {}).get("target_defect_reproduction") == "present"
+        assert (task.context or {})["finding_challenge_records"][0]["agreement"] == (
+            "disagrees"
+        )
+        assert (task.plan_output or [])[0]["finding_challenge"]["agreement"] == (
+            "disagrees"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_confirmed_absent_second_opinion_still_drops_and_memo_includes_record(
+        self, db_session, mocker
+    ):
+        """A second opinion that agrees with absent preserves the genuine-absent
+        drop and includes the structured record in the dropped-finding memo."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Confirmed deleted subject", direction_id="d-repro-chal02"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/gone.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-chal02",
+            parsed_findings=[finding],
+            task_context={
+                FINDING_CHALLENGE_VERDICT_KEY: {
+                    "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "first_verdict": "absent",
+                    "second_opinion_verdict": "absent",
+                    "agreement": "agrees",
+                    "reason": "old symbol is genuinely gone",
+                    "sidecar_task_id": "sidecar-confirm",
+                },
+            },
+            validate=_validate,
+        )
+        assert "Confirmed deleted subject" not in titles
+        assert (task.context or {}).get("research_reproduce_rejected") == 1
+        memo = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.parent_task_id == task.id,
+                        _Task.context["memo_drop_reason"].as_string()
+                        == "reproduce_on_head_absent",
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        source_finding = memo.first_payload.get("source_finding") or {}
+        assert source_finding["finding_challenge"]["agreement"] == "agrees"
+        reasoning = (memo.plan_output or {}).get("memo", {}).get("reasoning", "")
+        assert "Second opinion: agrees" in reasoning
+
+    @_pytest.mark.asyncio
+    async def test_indeterminate_absent_second_opinion_keeps_finding(
+        self, db_session, mocker
+    ):
+        """A challenge record that does not confirm absence keeps the finding
+        and routes it to the child task instead of terminally dropping it."""
+        from test_autonomous_research import _make_finding
+
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"research_finding_challenge_enabled": True},
+        )
+        finding = _make_finding(
+            title="Moved semantic target indeterminate", direction_id="d-repro-chal03"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/old_place.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-chal03",
+            parsed_findings=[finding],
+            task_context={
+                FINDING_CHALLENGE_VERDICT_KEY: {
+                    "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "first_verdict": "absent",
+                    "second_opinion_verdict": "indeterminate",
+                    "agreement": "agrees",
+                    "reason": "sidecar failed before confirming the semantic target",
+                    "sidecar_task_id": "sidecar-indeterminate",
+                },
+            },
+            validate=_validate,
+        )
+        assert "Moved semantic target indeterminate" in titles
+        assert (task.context or {}).get("research_reproduce_rejected") is None
+        assert (task.context or {}).get("spawned_memo_ids") is None
+        child = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.parent_task_id == task.id,
+                        _Task.title == "Moved semantic target indeterminate",
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        record = (child.context or {}).get("finding_challenge")
+        assert record["second_opinion_verdict"] == "indeterminate"
+        assert (child.context or {}).get("target_defect_reproduction") == "indeterminate"
+
+    @_pytest.mark.asyncio
+    async def test_reproduce_absent_challenge_flag_off_uses_legacy_drop_without_sidecar(
+        self, db_session, mocker
+    ):
+        """Default/off flag preserves the legacy single-pass absent rejection."""
+        from test_autonomous_research import _make_finding
+
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"research_finding_challenge_enabled": False},
+        )
+        finding = _make_finding(
+            title="Legacy absent drop", direction_id="d-repro-legacy01"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/gone.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-legacy01",
+            parsed_findings=[finding],
+            validate=_validate,
+        )
+        assert "Legacy absent drop" not in titles
+        assert not (task.context or {}).get("awaiting_finding_challenge")
+        sidecars = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.context[FINDING_CHALLENGE_SOURCE_KEY].as_string()
+                        == str(task.id)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sidecars == []
+
+
+@_pytest.mark.asyncio
+async def test_confirmed_low_actionability_decay_spawns_memo_with_second_opinion(
+    db_session, mocker
+):
+    """A low-actionability finding at terminal decay still drops when the
+    second opinion agrees, and the terminal memo carries that challenge record."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_finding_challenge_enabled": True},
+    )
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-low-chal01"
+    )
+    decayed = _make_finding("Vague cleanup", direction_id=direction["id"])
+    decayed["actionability_grade"] = "LOW"
+    decayed["deferred_reason"] = "low_actionability"
+    decayed["deferred_count"] = 3
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "LOW",
+            "agreement": "agrees",
+            "reason": "still lacks a concrete code-change target",
+            "sidecar_task_id": "sidecar-low-confirm",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up["by_reason"] == {"low_actionability": 1}
+    assert not any(
+        f.get("title") == "Vague cleanup"
+        for f in (task.context or {}).get("deferred_findings", [])
+    )
+    memo = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.parent_task_id == task.id,
+                    _Task.context["memo_drop_reason"].as_string()
+                    == "low_actionability_decay",
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    source_finding = memo.first_payload.get("source_finding") or {}
+    assert source_finding["finding_challenge"]["agreement"] == "agrees"
+    reasoning = (memo.plan_output or {}).get("memo", {}).get("reasoning", "")
+    assert "Second opinion: agrees" in reasoning
+    assert "concrete code-change target" in reasoning
+
+
+@_pytest.mark.asyncio
+async def test_low_actionability_challenge_indeterminate_redefers(
+    db_session, mocker
+):
+    """A low-actionability challenge that does not confirm LOW keeps the
+    finding deferred for refinement instead of terminally dropping it."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_finding_challenge_enabled": True},
+    )
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-low-chal03"
+    )
+    decayed = _make_finding(
+        "Specific retry starvation hardening", direction_id=direction["id"]
+    )
+    decayed["actionability_grade"] = "LOW"
+    decayed["deferred_reason"] = "low_actionability"
+    decayed["deferred_count"] = 3
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "indeterminate",
+            "agreement": "agrees",
+            "reason": "sidecar failed before confirming the finding is unactionable",
+            "sidecar_task_id": "sidecar-low-indeterminate",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert (task.context or {}).get("finding_structural_give_up") is None
+    deferred = (task.context or {}).get("deferred_findings", [])
+    kept = next(f for f in deferred if f.get("title") == decayed["title"])
+    assert kept["deferred_reason"] == "low_actionability_refinement"
+    assert kept["finding_challenge"]["second_opinion_verdict"] == "indeterminate"
+    assert "sidecar failed" in kept["low_actionability_refinement_reason"]
+    children = (
+        (
+            await db_session.execute(_select(_Task).where(_Task.parent_task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert not any(
+        c.context and c.context.get("memo_drop_reason") == "low_actionability_decay"
+        for c in children
+    )
+
+
+@_pytest.mark.asyncio
+async def test_low_actionability_flag_off_preserves_legacy_drop_without_memo(
+    db_session, mocker
+):
+    """With the challenge flag off, repeated low-actionability decay keeps the
+    legacy structural give-up path and does not spawn a memo."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-low-legacy01"
+    )
+    decayed = _make_finding("Vague cleanup", direction_id=direction["id"])
+    decayed["actionability_grade"] = "LOW"
+    decayed["deferred_reason"] = "low_actionability"
+    decayed["deferred_count"] = 3
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up["by_reason"] == {"low_actionability": 1}
+    assert (task.context or {}).get("spawned_memo_ids") is None
+    children = (
+        (
+            await db_session.execute(_select(_Task).where(_Task.parent_task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert not any(
+        c.context and c.context.get("memo_drop_reason") == "low_actionability_decay"
+        for c in children
+    )
+
+
+@_pytest.mark.asyncio
+async def test_overturned_low_actionability_decay_redefers_for_refinement(
+    db_session, mocker
+):
+    """A disagreeing low-actionability second opinion prevents terminal decay
+    and keeps the finding in deferred_findings with the disagreement reason."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_finding_challenge_enabled": True},
+    )
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-low-chal02"
+    )
+    decayed = _make_finding(
+        "Specific retry starvation hardening", direction_id=direction["id"]
+    )
+    decayed["actionability_grade"] = "LOW"
+    decayed["deferred_reason"] = "low_actionability"
+    decayed["deferred_count"] = 3
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "MEDIUM",
+            "agreement": "disagrees",
+            "reason": "has a concrete retry-starvation boundary to refine",
+            "sidecar_task_id": "sidecar-low-overturn",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert (task.context or {}).get("finding_structural_give_up") is None
+    deferred = (task.context or {}).get("deferred_findings", [])
+    kept = next(f for f in deferred if f.get("title") == decayed["title"])
+    assert kept["deferred_reason"] == "low_actionability_refinement"
+    assert kept["finding_challenge"]["agreement"] == "disagrees"
+    assert "retry-starvation" in kept["low_actionability_refinement_reason"]
 
 
 class TestKnowledgeFindingRouting:
@@ -3380,6 +3937,100 @@ async def test_spawn_forward_quality_grader_is_single_shot(db_session):
         .all()
     )
     assert len(graders) == 1
+
+
+@_pytest.mark.asyncio
+async def test_research_finding_second_opinion_sidecar_parks_and_records_verdict(
+    db_session, mocker
+):
+    """End-to-end per-finding challenge seam: spawn_finding_challenge parks the
+    source research task EVALUATING behind a bounded read-only investigate
+    side-car, and _resolve_finding_challenge_completion routes the side-car's
+    structured second opinion back onto the source as a FindingChallengeRecord
+    — distinct from the batch quality_grader verdict."""
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_finding_challenge_completion
+
+    _project, _direction, task = await _grader_project_and_task(db_session, "d-chal01")
+
+    finding = {
+        "title": "Stale ref to compute_jobs.poll()",
+        "prompt": "fix the polling call",
+        "actionability_grade": "MEDIUM",
+    }
+
+    # Spawn the challenge side-car for a reproduce-absent verdict.
+    sidecar = await spawn_finding_challenge(
+        task,
+        finding,
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        "absent",
+        db_session,
+        question="did compute_jobs.poll move?",
+    )
+    assert sidecar is not None
+    assert (sidecar.first_payload or {}).get("type") == "investigate"
+    assert (sidecar.first_payload or {}).get("scope") == "small"
+    assert (sidecar.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY) == str(task.id)
+    assert (sidecar.context or {}).get("challenged_boundary") == (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    )
+    assert sidecar.parent_task_id is None
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_finding_challenge")
+    # The challenge verdict is NOT yet recorded, and is kept separate from the
+    # batch quality_grader verdict key.
+    assert task.context.get(FINDING_CHALLENGE_VERDICT_KEY) is None
+
+    # Single-shot: a second spawn while one is in flight must no-op.
+    dup = await spawn_finding_challenge(
+        task, finding, CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "absent", db_session
+    )
+    assert dup is None
+
+    # The side-car returns a disagreeing second opinion (code was moved, not gone).
+    sidecar.status = TaskStatus.COMPLETED
+    db_session.add(sidecar)
+    await db_session.commit()
+
+    # Keep the re-dispatch focused on the seam: stub the research resume handler
+    # (its drop/dispatch wiring is exercised elsewhere) and the broadcast.
+    resume = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    payload = AgentStatusPayload(
+        task_id=sidecar.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            "Checked git history: compute_jobs.poll() was renamed, not removed.\n"
+            '{"verdict": "present", "agreement": "disagrees", '
+            '"reasoning": "symbol relocated to poll_once()"}'
+        ),
+    )
+    await _resolve_finding_challenge_completion(sidecar, payload, db_session)
+
+    # The source was re-dispatched to its completion handler with the verdict set.
+    resume.assert_awaited_once()
+
+    await db_session.refresh(task)
+    record = task.context.get(FINDING_CHALLENGE_VERDICT_KEY)
+    assert record is not None, "second opinion must be recorded on the source"
+    assert record["challenged_boundary"] == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    assert record["first_verdict"] == "absent"
+    assert record["second_opinion_verdict"] == "present"
+    assert record["agreement"] == "disagrees"
+    assert record["sidecar_task_id"] == str(sidecar.id)
+    assert "relocated" in record["reason"]
+    # The per-finding record is distinct from the batch quality_grader verdict.
+    assert task.context.get(QUALITY_GRADER_VERDICT_KEY) is None
+    assert not task.context.get("awaiting_finding_challenge")
 
 
 @_pytest.mark.asyncio

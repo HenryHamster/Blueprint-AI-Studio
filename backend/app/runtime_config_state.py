@@ -103,6 +103,30 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Per-finding second-opinion challenge for high-stakes research-finding
+    # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
+    # 'absent' hard-drop or a low-actionability decay) is independently re-examined
+    # by a bounded read-only `investigate` side-car
+    # (task_evaluators.spawn_finding_challenge) BEFORE the finding is dropped or
+    # dispatched: the source research task parks EVALUATING, the side-car emits a
+    # structured second-opinion verdict, and the recorded FindingChallengeRecord
+    # routes back into research completion. Distinct from the batch
+    # research_quality_grader_enabled gate (which grades the WHOLE artifact); this
+    # challenges ONE finding's verdict. Ships DARK (default OFF) — OFF preserves
+    # the legacy single-pass drop/dispatch behavior exactly.
+    "research_finding_challenge_enabled": os.getenv(
+        "RESEARCH_FINDING_CHALLENGE_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Narrow pilot for the optional third research-finding challenge boundary:
+    # an indeterminate reproduce-on-HEAD verdict that would otherwise dispatch a
+    # defect finding unverified. Kept separate from
+    # research_finding_challenge_enabled so enabling absent/decay hardening cannot
+    # fan out into broad pre-dispatch challenge traffic.
+    "research_finding_challenge_indeterminate_dispatch_enabled": os.getenv(
+        "RESEARCH_FINDING_CHALLENGE_INDETERMINATE_DISPATCH_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new

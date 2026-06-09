@@ -598,3 +598,148 @@ def test_grader_prompt_adds_relevance_lens_with_question():
     assert "5. RELEVANCE" in prompt
     assert "state of quantum computing" in prompt
     assert "REQUEST START" in prompt
+
+
+# ── per-finding challenge: prompt builder (read-only, single finding) ─────────
+
+
+def test_finding_challenge_prompt_is_single_finding_and_ends_with_one_json():
+    """build_finding_challenge_prompt frames ONE finding read-only and ends with
+    exactly one JSON object (reusing the grader's end-with-one-JSON convention)."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    finding = {"title": "Stale ref to foo()", "prompt": "fix foo"}
+    prompt = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, finding, "absent"
+    )
+    assert "SINGLE research finding" in prompt
+    assert "read-only" in prompt
+    # The first verdict being challenged is named.
+    assert "'absent'" in prompt
+    # The finding body is embedded.
+    assert "Stale ref to foo()" in prompt
+    # Ends with exactly one JSON verdict object the parser can read back.
+    assert prompt.rstrip().endswith("}")
+    assert '"agreement"' in prompt
+    assert prompt.count("FINDING START") == 1
+
+
+def test_finding_challenge_prompt_boundary_specific_framing():
+    """Each boundary selects its own framing language."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    absent = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, {"title": "x"}, "absent"
+    )
+    assert "MOVED or RENAMED" in absent
+    decay = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, {"title": "x"}, "LOW"
+    )
+    assert "LOW actionability" in decay
+
+
+def test_finding_challenge_prompt_includes_question_when_supplied():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        build_finding_challenge_prompt,
+    )
+
+    prompt = build_finding_challenge_prompt(
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        {"title": "x"},
+        "absent",
+        question="is the reaper sweep correct",
+    )
+    assert "is the reaper sweep correct" in prompt
+    assert "REQUEST START" in prompt
+
+
+# ── per-finding challenge: verdict parser (fail-closed) ──────────────────────
+
+
+def test_parse_finding_challenge_disagrees():
+    """A structured 'disagrees' second opinion is recorded with all six fields."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FindingChallengeRecord,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = (
+        "I checked git log; foo() moved to bar.py.\n"
+        '{"verdict": "present", "agreement": "disagrees", '
+        '"reasoning": "code was renamed, not deleted"}'
+    )
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "sidecar-1"
+    )
+    assert isinstance(rec, FindingChallengeRecord)
+    assert rec.challenged_boundary == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    assert rec.first_verdict == "absent"
+    assert rec.second_opinion_verdict == "present"
+    assert rec.agreement == "disagrees"
+    assert "renamed" in rec.reason
+    assert rec.sidecar_task_id == "sidecar-1"
+
+
+def test_parse_finding_challenge_agrees():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "absent", "agreement": "agrees", "reasoning": "truly gone"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s2"
+    )
+    assert rec.agreement == "agrees"
+    assert rec.second_opinion_verdict == "absent"
+
+
+def test_parse_finding_challenge_not_completed_is_indeterminate():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        parse_finding_challenge_verdict,
+    )
+
+    rec = parse_finding_challenge_verdict(
+        "anything", "LOW", CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, "s3",
+        completed=False,
+    )
+    assert rec.agreement == "indeterminate"
+    assert rec.sidecar_task_id == "s3"
+
+
+def test_parse_finding_challenge_unparseable_and_empty_are_indeterminate():
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    for logs in ("no machine verdict here", ""):
+        rec = parse_finding_challenge_verdict(
+            logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s4"
+        )
+        assert rec.agreement == "indeterminate", logs
+        assert rec.first_verdict == "absent"
+
+
+def test_parse_finding_challenge_unknown_agreement_collapses_to_indeterminate():
+    """A parsed agreement outside the recognized set fails closed."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "present", "agreement": "maybe", "reasoning": "unsure"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s5"
+    )
+    assert rec.agreement == "indeterminate"

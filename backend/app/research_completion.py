@@ -68,6 +68,15 @@ from app.finding_deduplication import (
     resolve_prerequisite_task,
 )
 from app.task_blocked import NEED_REF_MAX_LEN
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    FINDING_CHALLENGE_VERDICT_KEY,
+    spawn_finding_challenge,
+)
 from app.capability_registry import (
     off_registry_capability_refs,
     registry_capability_names,
@@ -181,6 +190,14 @@ MEMO_SPAWN_CAP_PER_CYCLE = 5
 # so strategic review can tell "the cited code is unambiguously gone" — the
 # strongest truthfulness signal — apart from a merely deferred finding.
 _REPRODUCE_REJECTED_DROP_REASON = "reproduce_on_head_absent"
+
+_FINDING_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
+_FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
+_LOW_ACTIONABILITY_REFINEMENT_REASON = "low_actionability_refinement"
+_RESEARCH_FINDING_CHALLENGE_FLAG = "research_finding_challenge_enabled"
+_RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG = (
+    "research_finding_challenge_indeterminate_dispatch_enabled"
+)
 
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
@@ -371,6 +388,21 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
         absent += [str(r) for r in (prov.get("ungrounded_refs") or [])]
         if absent:
             trimmed["absent_references"] = absent[:20]
+    challenge = finding.get(_FINDING_CHALLENGE_RECORD_KEY)
+    if isinstance(challenge, dict):
+        trimmed[_FINDING_CHALLENGE_RECORD_KEY] = {
+            str(k): v
+            for k, v in challenge.items()
+            if k
+            in {
+                "challenged_boundary",
+                "first_verdict",
+                "second_opinion_verdict",
+                "agreement",
+                "reason",
+                "sidecar_task_id",
+            }
+        }
     return trimmed
 
 
@@ -397,12 +429,123 @@ def _synthesize_deferred_finding_memo(
         parts.append(
             "Cited code absent on HEAD: " + ", ".join(str(r) for r in absent)
         )
+    challenge = sf.get(_FINDING_CHALLENGE_RECORD_KEY)
+    if isinstance(challenge, dict):
+        agreement = str(challenge.get("agreement") or "unknown")
+        second = str(challenge.get("second_opinion_verdict") or "unknown")
+        reason = str(challenge.get("reason") or "").strip()
+        challenge_line = (
+            f"Second opinion: {agreement} with original "
+            f"{challenge.get('challenged_boundary') or 'finding'} verdict; "
+            f"second verdict={second}."
+        )
+        if reason:
+            challenge_line += f" Reason: {reason}"
+        parts.append(challenge_line)
     return {
         "summary": (title or description)[:200],
         "reasoning": "\n\n".join(parts),
         "citations": [f"task:{source_task_id}"] if source_task_id else [],
         "tags": ["deferred-finding", drop_reason],
     }
+
+
+def _finding_challenge_enabled(boundary: str) -> bool:
+    if boundary in (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    ):
+        return bool(_runtime_config.get(_RESEARCH_FINDING_CHALLENGE_FLAG, False))
+    if boundary == CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH:
+        return bool(
+            _runtime_config.get(
+                _RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG, False
+            )
+        )
+    return False
+
+
+def _consume_finding_challenge_record(
+    task: Task,
+    finding: Dict[str, Any],
+    *,
+    boundary: str,
+    first_verdict: str,
+) -> Optional[Dict[str, Any]]:
+    """Attach one returned challenge verdict to the finding it gates.
+
+    ``task_evaluators`` writes a single active record on the source task. The
+    research handler consumes that active record on the resume pass, stores a
+    bounded source-task history, and removes the active key so another later
+    high-stakes finding can be challenged without double-applying this verdict.
+    """
+    ctx = dict(task.context or {})
+    record = ctx.get(FINDING_CHALLENGE_VERDICT_KEY)
+    if not isinstance(record, dict):
+        return None
+    if record.get("challenged_boundary") != boundary:
+        return None
+    if str(record.get("first_verdict") or "") != str(first_verdict):
+        return None
+
+    attached = dict(record)
+    finding[_FINDING_CHALLENGE_RECORD_KEY] = attached
+    with contextlib.suppress(Exception):
+        flag_modified(task, "plan_output")
+    history = [
+        h
+        for h in (ctx.get(_FINDING_CHALLENGE_HISTORY_KEY) or [])
+        if isinstance(h, dict)
+    ]
+    history.append(attached)
+    ctx[_FINDING_CHALLENGE_HISTORY_KEY] = history[-20:]
+    ctx.pop(FINDING_CHALLENGE_VERDICT_KEY, None)
+    ctx.pop("awaiting_finding_challenge", None)
+    task.context = ctx
+    flag_modified(task, "context")
+    return attached
+
+
+def _challenge_agrees(record: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(record, dict) and record.get("agreement") == CHALLENGE_AGREES
+
+
+def _challenge_disagrees(record: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(record, dict) and record.get("agreement") == CHALLENGE_DISAGREES
+
+
+def _challenge_second_verdict(record: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(record, dict):
+        return ""
+    return str(record.get("second_opinion_verdict") or "").lower()
+
+
+def _challenge_confirms_verdict(record: Optional[Dict[str, Any]], verdict: str) -> bool:
+    return _challenge_agrees(record) and _challenge_second_verdict(record) == str(
+        verdict
+    ).lower()
+
+
+def _reconcile_reproduce_provenance_state(
+    finding: Dict[str, Any], verdict: str
+) -> None:
+    """Keep reproduce-on-HEAD provenance aligned with an overturned challenge.
+
+    When a reproduce-absent challenge keeps the finding, the child task must not
+    inherit a stale ``citation_state == 'absent'`` seed. Reconcile that seed to
+    the same keep-verdict so downstream context builders and scoring see the
+    updated reproduce state.
+    """
+    if verdict not in (CITATION_STATE_PRESENT, CITATION_STATE_INDETERMINATE):
+        return
+    prov = finding.get("_provenance_warnings")
+    if not isinstance(prov, dict):
+        return
+    if prov.get("citation_state") != CITATION_STATE_ABSENT:
+        return
+    reconciled = dict(prov)
+    reconciled["citation_state"] = verdict
+    finding["_provenance_warnings"] = reconciled
 
 
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -1661,6 +1804,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # (when stamping task.context) on every code path, including the one where
     # there were no prior-deferred findings to decay.
     _finding_give_up: dict | None = None
+    _low_actionability_decayed: list[dict] = []
+    _low_actionability_refinement_deferred: list[dict] = []
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
@@ -1708,12 +1853,56 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in prior_actionable:
             _count = int(f.get("deferred_count", 0) or 0)
             _reason = f.get("deferred_reason")
-            if _reason == "ultra_low_confidence" and _count >= 4:
-                _decayed.append(f)
-            elif _reason == "degradation_gate" and _count >= 3:
+            if (
+                (_reason == "ultra_low_confidence" and _count >= 4)
+                or (_reason == "degradation_gate" and _count >= 3)
+            ):
                 _decayed.append(f)
             elif _reason == "low_actionability" and _count >= 3:
-                _decayed.append(f)
+                _record = _consume_finding_challenge_record(
+                    task,
+                    f,
+                    boundary=CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+                    first_verdict="LOW",
+                )
+                _challenge_enabled = _finding_challenge_enabled(
+                    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY
+                )
+                if _challenge_enabled and _record is None:
+                    _challenge = await spawn_finding_challenge(
+                        task,
+                        f,
+                        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+                        "LOW",
+                        session,
+                        question=(
+                            "Is this finding genuinely unactionable after repeated "
+                            "deferral, or should it be refined and kept?"
+                        ),
+                    )
+                    if _challenge is not None or (task.context or {}).get(
+                        "awaiting_finding_challenge"
+                    ):
+                        logger.info(
+                            "[RESEARCH] Task %s parked awaiting low-actionability "
+                            "decay challenge for finding %r",
+                            task.id,
+                            f.get("title") or f.get("description", "")[:60],
+                        )
+                        return
+                if _challenge_enabled:
+                    if _challenge_confirms_verdict(_record, "LOW"):
+                        _low_actionability_decayed.append(f)
+                        _decayed.append(f)
+                    else:
+                        f["low_actionability_refinement_reason"] = str(
+                            (_record or {}).get("reason")
+                            or "second opinion did not confirm low_actionability"
+                        )[:500]
+                        _low_actionability_refinement_deferred.append(f)
+                else:
+                    _low_actionability_decayed.append(f)
+                    _decayed.append(f)
             elif _reason == "prereq_deferred_same_cycle" and _count >= 3:
                 # Co-deferred dependent whose foundation never re-surfaced in time:
                 # give up after 3 cycles (its deferred foundation has typically
@@ -2479,6 +2668,129 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # avoid a retry loop); it is excluded from the surviving-finding success
         # signal so the cycle scores neutral. Indeterminate/partially-grounded
         # findings are never stamped absent and fall through untouched.
+        if finding.get("_reproduce_on_head") == "absent":
+            _record = _consume_finding_challenge_record(
+                task,
+                finding,
+                boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                first_verdict="absent",
+            )
+            _challenge_enabled = _finding_challenge_enabled(
+                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+            )
+            if _challenge_enabled and _record is None:
+                _challenge = await spawn_finding_challenge(
+                    task,
+                    finding,
+                    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+                    "absent",
+                    session,
+                    question=(
+                        "Is the actual subject gone on current HEAD, or did the "
+                        "cited path/symbol move or rename while the semantic "
+                        "target still exists?"
+                    ),
+                )
+                if _challenge is not None or (task.context or {}).get(
+                    "awaiting_finding_challenge"
+                ):
+                    logger.info(
+                        "[RESEARCH] Task %s parked awaiting reproduce-absent "
+                        "challenge for finding %r",
+                        task.id,
+                        finding.get("title")
+                        or finding.get("description", "")[:60],
+                    )
+                    return
+            if _challenge_enabled:
+                if _challenge_confirms_verdict(_record, "absent"):
+                    _reproduce_rejected.append(finding)
+                    logger.warning(
+                        "[RESEARCH] Rejecting finding %r (task %s): cited code is absent on "
+                        "HEAD (does not reproduce); not spawning.",
+                        finding.get("title") or finding.get("description", "")[:60],
+                        task.id,
+                    )
+                    continue
+                second = _challenge_second_verdict(_record)
+                finding["_reproduce_on_head"] = (
+                    CITATION_STATE_PRESENT
+                    if second == CITATION_STATE_PRESENT
+                    else CITATION_STATE_INDETERMINATE
+                )
+                _reconcile_reproduce_provenance_state(finding, finding["_reproduce_on_head"])
+                logger.info(
+                    "[RESEARCH] Keeping finding %r after reproduce-absent "
+                    "challenge did not confirm absence: %s",
+                    finding.get("title") or finding.get("description", "")[:60],
+                    (_record or {}).get("reason"),
+                )
+            else:
+                if _record is not None and not _challenge_agrees(_record):
+                    logger.info(
+                        "[RESEARCH] Reproduce-absent challenge for finding %r "
+                        "was indeterminate; preserving original absent verdict",
+                        finding.get("title")
+                        or finding.get("description", "")[:60],
+                    )
+                _reproduce_rejected.append(finding)
+                logger.warning(
+                    "[RESEARCH] Rejecting finding %r (task %s): cited code is absent on "
+                    "HEAD (does not reproduce); not spawning.",
+                    finding.get("title") or finding.get("description", "")[:60],
+                    task.id,
+                )
+                continue
+
+        if (
+            finding.get("_reproduce_on_head") == CITATION_STATE_INDETERMINATE
+            and finding_type in _REPRODUCE_VERDICT_FINDING_TYPES
+            and _finding_challenge_enabled(
+                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH
+            )
+        ):
+            _record = _consume_finding_challenge_record(
+                task,
+                finding,
+                boundary=CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+                first_verdict=CITATION_STATE_INDETERMINATE,
+            )
+            if _record is None:
+                _challenge = await spawn_finding_challenge(
+                    task,
+                    finding,
+                    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+                    CITATION_STATE_INDETERMINATE,
+                    session,
+                    question=(
+                        "Before dispatch, can this defect finding's target be "
+                        "confirmed present or absent on current HEAD?"
+                    ),
+                )
+                if _challenge is not None or (task.context or {}).get(
+                    "awaiting_finding_challenge"
+                ):
+                    logger.info(
+                        "[RESEARCH] Task %s parked awaiting indeterminate "
+                        "reproduce challenge for finding %r",
+                        task.id,
+                        finding.get("title")
+                        or finding.get("description", "")[:60],
+                    )
+                    return
+            elif _challenge_agrees(_record):
+                second = str(_record.get("second_opinion_verdict") or "").lower()
+                if second in (
+                    CITATION_STATE_PRESENT,
+                    CITATION_STATE_ABSENT,
+                    CITATION_STATE_INDETERMINATE,
+                ):
+                    finding["_reproduce_on_head"] = second
+            elif _challenge_disagrees(_record):
+                second = str(_record.get("second_opinion_verdict") or "").lower()
+                if second in (CITATION_STATE_PRESENT, CITATION_STATE_ABSENT):
+                    finding["_reproduce_on_head"] = second
+
         if finding.get("_reproduce_on_head") == "absent":
             _reproduce_rejected.append(finding)
             logger.warning(
@@ -3364,6 +3676,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ),
                 **(
                     {
+                        _FINDING_CHALLENGE_RECORD_KEY: finding[
+                            _FINDING_CHALLENGE_RECORD_KEY
+                        ]
+                    }
+                    if isinstance(finding.get(_FINDING_CHALLENGE_RECORD_KEY), dict)
+                    else {}
+                ),
+                **(
+                    {
                         # Baseline reproduce-on-HEAD verdict seeded from the
                         # already-computed citation-grounding signal (no new
                         # validation pass): a defect finding whose cited code is
@@ -3516,6 +3837,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     _all_deferred = (
         [_stamp_deferral(f, "low_actionability") for f in _low_actionability_deferred]
+        + [
+            _stamp_deferral(f, _LOW_ACTIONABILITY_REFINEMENT_REASON)
+            for f in _low_actionability_refinement_deferred
+        ]
         + [_stamp_deferral(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [
             _stamp_deferral(f, "compute_contract_invalid")
@@ -3545,6 +3870,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         + [(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [(f, _REPRODUCE_REJECTED_DROP_REASON) for f in _reproduce_rejected]
     )
+    if _finding_challenge_enabled(CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY):
+        _memo_candidates.extend(
+            [(f, "low_actionability_decay") for f in _low_actionability_decayed]
+        )
     _research_direction_id = (task.context or {}).get("direction_id")
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
         _mf_hash = _mf.get("finding_hash") or _finding_hash(
@@ -3627,6 +3956,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if _low_actionability_deferred:
         _deferral_reasons.append(
             f"low_actionability ({len(_low_actionability_deferred)})"
+        )
+    if _low_actionability_refinement_deferred:
+        _deferral_reasons.append(
+            "low_actionability refinement "
+            f"({len(_low_actionability_refinement_deferred)})"
         )
     if _degradation_gate_deferred:
         _deferral_reasons.append(
@@ -4042,6 +4376,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             "total": _total_deferred,
             "by_reason": {
                 "low_actionability": len(_low_actionability_deferred),
+                _LOW_ACTIONABILITY_REFINEMENT_REASON: len(
+                    _low_actionability_refinement_deferred
+                ),
                 "degradation_gate": len(_degradation_gate_deferred),
                 "batch_cap": len(_batch_cap_deferred),
                 "ultra_low_confidence": len(_low_conf_skipped_findings),

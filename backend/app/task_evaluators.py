@@ -62,6 +62,56 @@ QUALITY_GRADER_SOURCE_KEY = "quality_grader_for_task_id"
 QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 
 
+# ---------------------------------------------------------------------------
+# Per-finding second-opinion CHALLENGE seam.
+#
+# Distinct from the batch QUALITY_GRADER above (which grades the WHOLE research
+# artifact before any finding spawns work), this seam challenges ONE high-stakes
+# per-finding verdict before it is dropped or dispatched: a reproduce-on-HEAD
+# 'absent' hard-drop, a low-actionability decay, or (room reserved) an
+# indeterminate reproduce verdict that would otherwise dispatch unverified.
+#
+# The challenge runs as a bounded, read-only ``investigate`` side-car carrying
+# FINDING_CHALLENGE_SOURCE_KEY; its completion routes back through the re-entrant
+# completion path (task_lifecycle._resolve_finding_challenge_completion) to the
+# parked source, which records a FindingChallengeRecord under
+# FINDING_CHALLENGE_VERDICT_KEY and re-dispatches its completion handler.
+# ---------------------------------------------------------------------------
+
+# The high-stakes per-finding boundaries a challenge can re-examine.
+CHALLENGE_BOUNDARY_REPRODUCE_ABSENT = "reproduce_absent"
+CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY = "low_actionability_decay"
+# Reserved: an indeterminate reproduce verdict that would dispatch unverified.
+CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH = (
+    "reproduce_indeterminate_dispatch"
+)
+
+_CHALLENGE_BOUNDARIES: frozenset[str] = frozenset(
+    {
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    }
+)
+
+# Context key written on a spawned challenge side-car, pointing at the source
+# research task whose finding it challenges. ``task_lifecycle._process_post_commit``
+# watches for this key (mirroring QUALITY_GRADER_SOURCE_KEY) to route the
+# side-car's completion back to the parked source.
+FINDING_CHALLENGE_SOURCE_KEY = "finding_challenge_for_task_id"
+
+# Context key written on the SOURCE task once its challenge side-car returns.
+# Presence means the challenged finding got its second opinion; the source
+# completion handler reads the recorded FindingChallengeRecord to decide whether
+# to drop or dispatch the finding, and to avoid re-spawning a challenge.
+FINDING_CHALLENGE_VERDICT_KEY = "finding_challenge"
+
+# Agreement of the second opinion with the first verdict being challenged.
+CHALLENGE_AGREES = "agrees"
+CHALLENGE_DISAGREES = "disagrees"
+CHALLENGE_INDETERMINATE = "indeterminate"
+
+
 @dataclass(frozen=True)
 class EvaluationVerdict:
     """Result of running a forward evaluation gate on a terminal artifact.
@@ -856,4 +906,308 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
         )
     return EvaluationVerdict(
         False, "grader verdict unparseable; failing closed", "forward-quality"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-finding second-opinion CHALLENGE implementation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FindingChallengeRecord:
+    """Structured record of an independent second opinion on ONE finding verdict.
+
+    ``challenged_boundary`` is the high-stakes verdict being re-examined (one of
+    the ``CHALLENGE_BOUNDARY_*`` constants). ``first_verdict`` is the original
+    single-pass classification being challenged (e.g. ``"absent"`` / ``"LOW"``).
+    ``second_opinion_verdict`` is the independent re-classification the side-car
+    produced. ``agreement`` is one of ``agrees`` / ``disagrees`` /
+    ``indeterminate`` — and is ``indeterminate`` whenever the side-car's output
+    cannot be parsed or the side-car did not complete (fail-closed, so an
+    ambiguous second opinion never overturns the original verdict). ``reason`` is
+    a human-readable justification; ``sidecar_task_id`` is the challenge task's
+    id for observability and audit.
+    """
+
+    challenged_boundary: str
+    first_verdict: str
+    second_opinion_verdict: str
+    agreement: str
+    reason: str
+    sidecar_task_id: str | None
+
+    def to_context(self) -> dict[str, Any]:
+        """Plain-dict form for stamping under ``FINDING_CHALLENGE_VERDICT_KEY``."""
+        return {
+            "challenged_boundary": self.challenged_boundary,
+            "first_verdict": self.first_verdict,
+            "second_opinion_verdict": self.second_opinion_verdict,
+            "agreement": self.agreement,
+            "reason": self.reason,
+            "sidecar_task_id": self.sidecar_task_id,
+        }
+
+
+def build_finding_challenge_prompt(
+    boundary: str,
+    finding: dict[str, Any],
+    first_verdict: str,
+    *,
+    question: str | None = None,
+) -> str:
+    """Build a read-only rubric prompt challenging ONE finding's verdict.
+
+    The challenger runs as a fresh, read-only agent with no stake in the
+    original verdict. It re-examines a SINGLE finding (not the whole artifact)
+    against ``first_verdict`` and must end its output with exactly one JSON
+    object so ``parse_finding_challenge_verdict`` can read it back
+    deterministically (reusing the grader's end-with-one-JSON convention).
+
+    ``boundary`` selects the framing: ``reproduce_absent`` asks whether the cited
+    code is truly gone vs. merely moved/renamed; ``low_actionability_decay`` asks
+    whether the finding is truly too vague to act on. When ``question`` (the
+    research task's topic) is supplied the challenger is told what was originally
+    asked so it can judge on-topic-ness.
+    """
+    if boundary == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT:
+        framing = (
+            "The first pass judged this finding's cited code ABSENT on HEAD and "
+            "is about to HARD-DROP it (the finding would be rejected forever). "
+            "But an 'absent' verdict is derived purely from whether cited file "
+            "PATHS and SYMBOL references still resolve at HEAD — code that was "
+            "MOVED or RENAMED rather than deleted reads as 'absent' too. "
+            "Independently decide: is the cited code TRULY gone, or merely "
+            "relocated/renamed (in which case the finding should NOT be dropped)?"
+        )
+    elif boundary == CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY:
+        framing = (
+            "The first pass decayed this finding to LOW actionability and is "
+            "about to drop it as too vague to spawn work. Independently decide: "
+            "is the finding genuinely unactionable, or is it specific and scoped "
+            "enough that an implementer could act on it (in which case the decay "
+            "is wrong and the finding should be dispatched)?"
+        )
+    elif boundary == CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH:
+        framing = (
+            "The first pass could not determine whether this finding reproduces "
+            "on HEAD and is about to DISPATCH it unverified. Independently "
+            "decide: does the finding actually reproduce against the codebase at "
+            "HEAD, or is it stale/already-fixed (in which case it should NOT be "
+            "dispatched)?"
+        )
+    else:
+        framing = (
+            "Independently re-examine the first-pass verdict on this finding and "
+            "decide whether it holds up."
+        )
+
+    asked = (question or "").strip()
+    relevance_block = ""
+    if asked:
+        relevance_block = (
+            "\nFor context, the research task was asked:\n"
+            "-----8<----- REQUEST START -----8<-----\n"
+            f"{asked[:2000]}\n"
+            "-----8<----- REQUEST END -----8<-----\n"
+        )
+
+    try:
+        finding_json = json.dumps(finding, indent=2, default=str)[:8000]
+    except (TypeError, ValueError):
+        finding_json = str(finding)[:8000]
+
+    return (
+        "You are an INDEPENDENT second opinion on a SINGLE research finding. A "
+        "prior agent reached a high-stakes verdict on this finding, and that "
+        "verdict is about to be final. Your job is to challenge it — read-only, "
+        "with no stake in the original call.\n\n"
+        f"{framing}\n"
+        f"\nThe first-pass verdict being challenged is: {first_verdict!r}.\n"
+        f"{relevance_block}"
+        "\nFinding under challenge:\n"
+        "-----8<----- FINDING START -----8<-----\n"
+        f"{finding_json}\n"
+        "-----8<----- FINDING END -----8<-----\n\n"
+        "Investigate the actual codebase at HEAD as needed. Be specific about "
+        "what you checked. If you cannot reach a confident conclusion, say so "
+        "(verdict 'indeterminate') rather than guessing — an indeterminate "
+        "second opinion preserves the original verdict.\n\n"
+        "End your response with EXACTLY ONE JSON object on its own line, and "
+        "nothing after it:\n"
+        '{"verdict": "<your independent classification>", '
+        '"agreement": "agrees" | "disagrees" | "indeterminate", '
+        '"reasoning": "<one-sentence justification>"}'
+    )
+
+
+async def spawn_finding_challenge(
+    source_task: Task,
+    finding: dict[str, Any],
+    boundary: str,
+    first_verdict: str,
+    session: AsyncSession,
+    *,
+    question: str | None = None,
+) -> Task | None:
+    """Spawn a single read-only challenge side-car and park the source EVALUATING.
+
+    Returns the spawned challenge ``Task``, or ``None`` when a challenge is
+    already in flight or already resolved (single-shot guard — a finding verdict
+    is challenged at most once). The source is moved to EVALUATING and will NOT
+    complete or spawn children until the second opinion returns via the
+    re-entrant completion path
+    (``task_lifecycle._resolve_finding_challenge_completion``).
+
+    An unrecognized ``boundary`` is rejected (returns ``None``) so a caller can
+    never park a source on a challenge framing the prompt builder cannot express.
+    """
+    if boundary not in _CHALLENGE_BOUNDARIES:
+        logger.warning(
+            "[CHALLENGE] Unknown challenge boundary %r for task %s — not spawning",
+            boundary,
+            source_task.id,
+        )
+        return None
+
+    ctx = dict(source_task.context or {})
+    if ctx.get(FINDING_CHALLENGE_VERDICT_KEY) is not None or ctx.get(
+        "awaiting_finding_challenge"
+    ):
+        # Already challenged, or a challenge is already in flight — never
+        # double-spawn (mirrors spawn_forward_quality_grader's single-shot guard).
+        return None
+
+    prompt = build_finding_challenge_prompt(
+        boundary, finding, first_verdict, question=question
+    )
+    base_branch = (source_task.first_payload or {}).get("base_branch", "main")
+
+    challenge = Task(
+        project_id=source_task.project_id,
+        title=(
+            f"[CHALLENGE] {boundary} second opinion for research "
+            f"{str(source_task.id)[:8]}"
+        ),
+        description=(
+            "Independent per-finding second opinion on a high-stakes research "
+            "verdict before the finding is dropped or dispatched."
+        ),
+        # Deliberately NOT parent_task_id=source: the challenge is a side-car, not
+        # a rollup child. The back-reference lives in context instead.
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": base_branch,
+                "scope": "small",
+            }
+        ],
+        context={
+            FINDING_CHALLENGE_SOURCE_KEY: str(source_task.id),
+            "scope": "small",
+            "challenged_boundary": boundary,
+            "challenged_first_verdict": first_verdict,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=source_task.priority,
+    )
+    session.add(challenge)
+
+    # Park the source awaiting the second opinion. Overrides the COMPLETED status
+    # the orchestrator set pre-handler — the source is NOT done until challenged.
+    source_task.status = TaskStatus.EVALUATING
+    source_task.latest_status_message = (
+        f"Awaiting independent second opinion on a {boundary} verdict before "
+        "dropping/dispatching the finding"
+    )[:500]
+    ctx["awaiting_finding_challenge"] = True
+    source_task.context = ctx
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+    await session.refresh(challenge)
+
+    # Record the concrete side-car id for observability now that it exists.
+    ctx2 = dict(source_task.context or {})
+    ctx2["awaiting_finding_challenge"] = str(challenge.id)
+    source_task.context = ctx2
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+
+    logger.info(
+        "[CHALLENGE] Spawned %s challenge %s for research task %s; source parked "
+        "EVALUATING awaiting second opinion",
+        boundary,
+        challenge.id,
+        source_task.id,
+    )
+    return challenge
+
+
+def parse_finding_challenge_verdict(
+    logs: str | None,
+    first_verdict: str,
+    boundary: str,
+    sidecar_task_id: str | None,
+    completed: bool = True,
+) -> FindingChallengeRecord:
+    """Parse a challenge side-car's second opinion into a FindingChallengeRecord.
+
+    FAIL-CLOSED on every ambiguous case: a side-car that did not complete,
+    emitted nothing, or produced output we cannot parse yields
+    ``agreement="indeterminate"`` with a recorded reason, so an unparseable or
+    incomplete second opinion never overturns the original verdict. A parsed
+    ``agreement`` outside the recognized set also collapses to indeterminate.
+    """
+    if not completed:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge side-car did not complete; verdict unchallenged",
+            sidecar_task_id=sidecar_task_id,
+        )
+
+    text = (logs or "").strip()
+    if not text:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge side-car produced no output",
+            sidecar_task_id=sidecar_task_id,
+        )
+
+    obj = _extract_verdict_object(text)
+    if obj is None:
+        return FindingChallengeRecord(
+            challenged_boundary=boundary,
+            first_verdict=first_verdict,
+            second_opinion_verdict="",
+            agreement=CHALLENGE_INDETERMINATE,
+            reason="challenge verdict unparseable; failing closed",
+            sidecar_task_id=sidecar_task_id,
+        )
+
+    second = str(obj.get("verdict") or "").strip()
+    reason = str(obj.get("reasoning") or obj.get("reason") or "")[:480]
+    agreement = str(obj.get("agreement") or "").strip().lower()
+    if agreement not in (CHALLENGE_AGREES, CHALLENGE_DISAGREES, CHALLENGE_INDETERMINATE):
+        agreement = CHALLENGE_INDETERMINATE
+        if not reason:
+            reason = "challenge omitted a recognized agreement; failing closed"
+    return FindingChallengeRecord(
+        challenged_boundary=boundary,
+        first_verdict=first_verdict,
+        second_opinion_verdict=second,
+        agreement=agreement,
+        reason=reason or f"second opinion {agreement} with the {boundary} verdict",
+        sidecar_task_id=sidecar_task_id,
     )

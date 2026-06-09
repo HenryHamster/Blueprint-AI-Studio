@@ -487,6 +487,137 @@ async def _resolve_quality_grader_completion(
         logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
 
 
+async def _resolve_finding_challenge_completion(
+    challenge: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Route a per-finding challenge side-car's second opinion back to its source.
+
+    The side-car (spawned by ``task_evaluators.spawn_finding_challenge``) gave an
+    independent second opinion on a single high-stakes research-finding verdict.
+    Here we parse that opinion into a ``FindingChallengeRecord`` (fail-closed:
+    unparseable/incomplete → ``agreement="indeterminate"``, which preserves the
+    original verdict), write it onto the parked source under
+    ``FINDING_CHALLENGE_VERDICT_KEY``, restore the source's terminal status, and
+    re-dispatch the source to its registry completion handler so the
+    drop/dispatch decision runs with the second opinion in hand. Resolves BOTH a
+    COMPLETED and a FAILED side-car so the source never strands EVALUATING.
+    """
+    from app.task_evaluators import (
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
+        parse_finding_challenge_verdict,
+    )
+    from app.research_completion import _handle_research_completion
+
+    completed = payload.status == TaskStatus.COMPLETED
+    challenge_logs = payload.logs or challenge.latest_status_message or ""
+    cctx = challenge.context or {}
+    boundary = str(cctx.get("challenged_boundary") or "")
+    first_verdict = str(cctx.get("challenged_first_verdict") or "")
+    record = parse_finding_challenge_verdict(
+        challenge_logs,
+        first_verdict,
+        boundary,
+        str(challenge.id),
+        completed=completed,
+    )
+    challenge.latest_status_message = (
+        f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
+    )[:500]
+    session.add(challenge)
+
+    source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    source = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if source is None:
+        await session.commit()
+        logger.warning(
+            "[CHALLENGE] Source task %s for challenge %s is gone; verdict dropped",
+            source_id,
+            challenge.id,
+        )
+        return
+
+    ctx = dict(source.context or {})
+    ctx[FINDING_CHALLENGE_VERDICT_KEY] = record.to_context()
+    ctx.pop("awaiting_finding_challenge", None)
+    source.context = ctx
+    flag_modified(source, "context")
+    # Re-establish the terminal status the source originally reported before it
+    # parked; the resume handler decides the final outcome.
+    source.status = TaskStatus.COMPLETED
+    session.add(source)
+    await session.commit()
+
+    # Only research findings drive this per-finding challenge today; re-dispatch
+    # through the same registry-keyed completion handler the source originally ran.
+    _resume_handlers = {
+        "research": _handle_research_completion,
+    }
+    source_type = (source.first_payload or {}).get("type")
+    cap = get_task_capability(source_type)
+    handler = (
+        _resume_handlers.get(cap.completion_handler)
+        if cap and cap.completion_handler
+        else None
+    )
+    if handler is not None:
+        if isinstance(source.plan_output, list):
+            resume_logs = json.dumps(source.plan_output)
+        elif isinstance(source.plan_output, dict) and isinstance(
+            source.plan_output.get("findings"), list
+        ):
+            resume_logs = json.dumps(source.plan_output["findings"])
+        else:
+            resume_logs = source.latest_status_message or ""
+        await handler(source, resume_logs, session)
+    else:
+        logger.warning(
+            "[CHALLENGE] No resume handler for source type %r (task %s); verdict "
+            "recorded but source not re-dispatched",
+            source_type,
+            source.id,
+        )
+    await session.commit()
+
+    # Source is now terminal — propagate to its parent rollup and broadcast.
+    # Snapshot plain values first (the rollup can poison the session).
+    _source_id_str = str(source.id)
+    _source_project_id_str = str(source.project_id)
+    _source_status = source.status
+    if source.parent_task_id:
+        try:
+            await _check_and_trigger_rollup(source, session)
+        except Exception:
+            logger.error(
+                "[CHALLENGE] rollup after challenge failed for %s",
+                _source_id_str,
+                exc_info=True,
+            )
+            await session.rollback()
+    try:
+        await broadcast_to_project(
+            _source_project_id_str,
+            "task_updated",
+            {"task_id": _source_id_str, "status": _source_status},
+        )
+    except Exception:
+        logger.debug("[CHALLENGE] broadcast after challenge failed", exc_info=True)
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -713,10 +844,22 @@ async def _process_post_commit(
         # and route it back to the parked source, then return. Handled here —
         # before the COMPLETED-gated pipeline — so even a FAILED grader resolves
         # the source (fail-closed) rather than stranding it EVALUATING forever.
-        from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+        from app.task_evaluators import (
+            FINDING_CHALLENGE_SOURCE_KEY,
+            QUALITY_GRADER_SOURCE_KEY,
+        )
 
         if (task.context or {}).get(QUALITY_GRADER_SOURCE_KEY):
             await _resolve_quality_grader_completion(task, payload, session)
+            return {"status": "accepted"}
+
+        # Per-finding challenge side-car: an independent second opinion spawned by
+        # task_evaluators.spawn_finding_challenge carries FINDING_CHALLENGE_SOURCE_KEY
+        # pointing at the source research task. Resolve it the same way (before the
+        # COMPLETED-gated pipeline) so even a FAILED side-car resolves the source
+        # fail-closed rather than stranding it EVALUATING forever.
+        if (task.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY):
+            await _resolve_finding_challenge_completion(task, payload, session)
             return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
