@@ -9100,6 +9100,17 @@ def _mock_merge_success_deps(mocker):
     """Mock GH deps so _process_post_commit's review/APPROVE path reaches the
     merge-success block and merges. base_branch is a NON-integration branch so
     the CI gate is skipped (is_ci_gated_merge=False → ci_status=None)."""
+    # All callers here drive an APPROVE verdict straight to the synchronous
+    # merge-success path. An APPROVE is always high-stakes, so the default-on
+    # second-opinion gate would park the review EVALUATING + spawn a panel
+    # challenger before any merge bookkeeping ran — defeating these tests'
+    # purpose. Disable the gate so the merge-success path under test runs
+    # directly (the gate itself is covered in
+    # test_task_lifecycle.py::test_second_opinion_*).
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "owner", "repo")),
