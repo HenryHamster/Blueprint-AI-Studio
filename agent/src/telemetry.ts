@@ -104,6 +104,7 @@ export type SchemaLabel =
   | 'specialized_findings'
   | 'specialized_result'
   | 'thinker'
+  | 'review_verdict'
   | 'unknown';
 
 let _formatMissByReason: Record<string, number> = {};

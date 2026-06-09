@@ -629,6 +629,7 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
       effort,
       disallowedTools,
       retryStatus: 'Retrying review verdict extraction...',
+      schemaLabel: 'review_verdict',
     });
     if (repair.value !== null) {
       verdictJsonField = augmentVerdict(repair.value);
