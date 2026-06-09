@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { PipelineView } from './PipelineView';
+import { buildForest, type TreeNode } from './PipelineView.utils';
 import type { Task } from './TaskCard';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -91,5 +92,128 @@ describe('PipelineView Blocked filter', () => {
 
     const title = nodeFor('plain-running').getAttribute('title') ?? '';
     expect(title).not.toContain('stale reason that should not render');
+  });
+});
+
+function findNode(roots: TreeNode[], id: string): TreeNode | null {
+  for (const root of roots) {
+    if (root.task.id === id) return root;
+    const inChildren = findNode(root.children, id);
+    if (inChildren) return inChildren;
+    const inSidecars = findNode(root.sidecars, id);
+    if (inSidecars) return inSidecars;
+  }
+  return null;
+}
+
+describe('buildForest side-car nesting', () => {
+  it('nests a side-car under its primary instead of rendering it top-level', () => {
+    const primary = makeTask({ id: 'review-1', title: 'Review PR', task_type: 'review' });
+    const sidecar = makeTask({
+      id: 'challenger-1',
+      title: '[CHALLENGE] second-opinion panel review',
+      status: 'IN_PROGRESS',
+      created_at: '2026-05-01T11:00:00Z',
+      context: { review_second_opinion_for_task_id: 'review-1' },
+    });
+
+    const forest = buildForest([primary, sidecar]);
+
+    // The side-car is NOT a top-level root...
+    expect(forest.map(r => r.task.id)).toEqual(['review-1']);
+    // ...it nests under the primary, flagged as a side-car.
+    expect(forest[0].sidecars.map(s => s.task.id)).toEqual(['challenger-1']);
+    expect(forest[0].sidecars[0].isSidecar).toBe(true);
+  });
+
+  it('nests a side-car whose primary is itself a nested child', () => {
+    const parent = makeTask({ id: 'research-1', task_type: 'research' });
+    const child = makeTask({ id: 'review-1', task_type: 'review', parent_task_id: 'research-1' });
+    const sidecar = makeTask({
+      id: 'grader-1',
+      context: { quality_grader_for_task_id: 'review-1' },
+    });
+
+    const forest = buildForest([parent, child, sidecar]);
+
+    expect(forest.map(r => r.task.id)).toEqual(['research-1']);
+    const reviewNode = findNode(forest, 'review-1');
+    expect(reviewNode?.sidecars.map(s => s.task.id)).toEqual(['grader-1']);
+  });
+
+  it('falls back to a top-level row when the primary is not on this page', () => {
+    const sidecar = makeTask({
+      id: 'challenger-1',
+      status: 'COMPLETED',
+      context: { finding_challenge_for_task_id: 'off-page-primary' },
+    });
+
+    const forest = buildForest([sidecar]);
+
+    expect(forest.map(r => r.task.id)).toEqual(['challenger-1']);
+    expect(forest[0].isSidecarFallback).toBe(true);
+  });
+
+  it('orders multiple side-cars under one primary by creation time', () => {
+    const primary = makeTask({ id: 'research-1', task_type: 'research' });
+    const later = makeTask({
+      id: 'grader-1',
+      created_at: '2026-05-01T13:00:00Z',
+      context: { quality_grader_for_task_id: 'research-1' },
+    });
+    const earlier = makeTask({
+      id: 'challenge-1',
+      created_at: '2026-05-01T12:00:00Z',
+      context: { finding_challenge_for_task_id: 'research-1' },
+    });
+
+    const forest = buildForest([primary, later, earlier]);
+
+    expect(forest[0].sidecars.map(s => s.task.id)).toEqual(['challenge-1', 'grader-1']);
+  });
+
+  it('does not nest self- or mutually-referencing side-cars (cycle guard)', () => {
+    const selfRef = makeTask({ id: 'weird-1', context: { quality_grader_for_task_id: 'weird-1' } });
+    const mutualA = makeTask({ id: 'mutual-a', context: { quality_grader_for_task_id: 'mutual-b' } });
+    const mutualB = makeTask({ id: 'mutual-b', context: { quality_grader_for_task_id: 'mutual-a' } });
+
+    const forest = buildForest([selfRef, mutualA, mutualB]);
+
+    // All three stay top-level instead of forming a render cycle.
+    expect(forest.map(r => r.task.id).sort()).toEqual(['mutual-a', 'mutual-b', 'weird-1']);
+  });
+});
+
+describe('PipelineView side-car rendering', () => {
+  it('renders side-cars collapsed by default with an outcome badge on the primary', async () => {
+    const user = userEvent.setup();
+    const tasks = [
+      makeTask({
+        id: 'review-1',
+        title: 'Review PR #42',
+        task_type: 'review',
+        status: 'COMPLETED',
+        context: { review_second_opinion: { state: 'challenged_confirmed' } },
+      }),
+      makeTask({
+        id: 'challenger-1',
+        title: '[CHALLENGE] second-opinion panel review for PR #42',
+        status: 'COMPLETED',
+        created_at: '2026-05-01T11:00:00Z',
+        context: { review_second_opinion_for_task_id: 'review-1' },
+      }),
+      makeTask({ id: 'sibling', title: 'Sibling root', status: 'IN_PROGRESS' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: 'Expand all' }));
+
+    // The primary row carries the compact challenge-outcome badge.
+    expect(screen.getByText('challenged ✓')).toBeTruthy();
+    // Collapsed by default: the side-car row is not rendered yet.
+    expect(document.querySelector('[data-task-id="challenger-1"]')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: /1 side-car/ }));
+    expect(document.querySelector('[data-task-id="challenger-1"]')).not.toBeNull();
+    expect(screen.getByText('↳ side-car')).toBeTruthy();
   });
 });
