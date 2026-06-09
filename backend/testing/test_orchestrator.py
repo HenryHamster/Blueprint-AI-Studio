@@ -3148,10 +3148,60 @@ class TestWarmVMSkipProvision:
         import asyncio
         import contextlib
         import app.orchestrator as _orch_module
+        import app.pipeline_health_state as _pipeline_state
 
         mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
         with contextlib.suppress(asyncio.CancelledError):
             await _orch_module.orchestrator_worker()
+
+        # Cancel any background provisioning coroutines the cycle spawned.
+        #
+        # The dispatch path commits status=PROVISIONING INLINE, then fires the
+        # real VM provision via `asyncio.create_task(_provision_and_handle(...))`
+        # — an INDEPENDENT task (tracked in the module global
+        # `app.orchestrator._provision_coroutines`), NOT a child of
+        # `orchestrator_worker`. The worker's cycle-ending CancelledError never
+        # reaches it. Left dangling, that task keeps running
+        # `_provision_and_handle` against this test's shared in-memory StaticPool
+        # SINGLE connection (`orch_warm_db`): after the mocked
+        # `provision_agent_vm` returns it opens a fresh `AsyncSessionLocal()`
+        # session and issues `_lock_provisioning_task_for_vm` (SELECT ... FOR
+        # UPDATE) + commit/rollback. Concurrent DB work on that one shared
+        # connection races the post-cycle verify read + event-loop teardown,
+        # corrupting the read — the shard-5 CI flake where a dispatch-positive
+        # assertion samples QUEUED (or a torn/cancelled read) instead of the
+        # committed PROVISIONING.
+        #
+        # We CANCEL rather than await-to-completion: the PROVISIONING status is
+        # already committed inline before this task is created, so the dispatch
+        # result is settled. At this point (no await since the worker yielded)
+        # the coroutine is still parked at its first real suspension (the
+        # payload-upload `to_thread` inside `asyncio.gather`), i.e. BEFORE it
+        # ever touches the shared connection. Cancelling there unwinds it without
+        # running any DB op (CancelledError is BaseException, so the coroutine's
+        # `except Exception` requeue paths never fire — only its
+        # `except CancelledError`/`finally` cleanup, whose side effects are
+        # mocked) and frees the shared connection before the verify.
+        #
+        # Awaiting to completion was tried and made the CI flake WORSE: it RUNS
+        # the post-provision DB work on the shared connection, which is exactly
+        # the conflict we are eliminating.
+        _orphan_keys_before = set(_pipeline_state.background_tasks)
+        for _coro in list(_orch_module._provision_coroutines.values()):
+            _coro.cancel()
+            with contextlib.suppress(BaseException):
+                await _coro
+        _orch_module._provision_coroutines.clear()
+        # The `except CancelledError` arm of `_provision_and_handle` schedules a
+        # `_delayed_orphan_cleanup` background task (sleeps 120s then calls the
+        # mocked `_ensure_vm_deleted`). Cancel + drop any such task this cleanup
+        # provoked so the cycle leaves no dangling work for later tests.
+        for _key in set(_pipeline_state.background_tasks) - _orphan_keys_before:
+            _orphan = _pipeline_state.background_tasks.pop(_key, None)
+            if _orphan is not None:
+                _orphan.cancel()
+                with contextlib.suppress(BaseException):
+                    await _orphan
 
     @pytest.mark.asyncio
     async def test_failed_foundation_dependent_cancelled_on_zero_slot_cycle(
@@ -4585,6 +4635,87 @@ class TestWarmVMSkipProvision:
             )
             assert row is not None
             assert row.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_cycle_leaves_no_dangling_provision_coroutine(
+        self, orch_warm_db, mocker
+    ):
+        """Regression guard for the shard-5 dispatch flake.
+
+        A cold dispatch fires the real VM provision via
+        ``asyncio.create_task(_provision_and_handle(...))`` — an INDEPENDENT
+        task (module global ``_provision_coroutines``), NOT a child of
+        ``orchestrator_worker``. If the one-cycle harness leaves it dangling it
+        keeps running ``_provision_and_handle`` DB work against this fixture's
+        shared in-memory StaticPool SINGLE connection, racing the post-cycle
+        verify read; a concurrent transaction reset on that shared connection
+        can discard the inline PROVISIONING commit, so the verify intermittently
+        observes QUEUED. ``_run_one_cycle`` must cancel + clear those coroutines
+        (and any ``_delayed_orphan_cleanup`` they spawn) before returning, so no
+        background DB work survives into the verify window. This guards that
+        invariant directly — deterministically, without depending on CI timing.
+
+        See ``backend/testing/test_orch_db_isolation.py`` for the standalone
+        demonstration that an uncoordinated background session on the shared
+        connection corrupts a PROVISIONING read into QUEUED.
+        """
+        import app.orchestrator as _orch_module
+        import app.pipeline_health_state as _pipeline_state
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _orch_module._provision_coroutines.clear()
+        _bg_before = set(_pipeline_state.background_tasks)
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="No-Dangle", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # No provision coroutine survives the cycle (it dispatched one, which
+        # _run_one_cycle must have cancelled + cleared).
+        assert _orch_module._provision_coroutines == {}, (
+            "dispatch cycle left a dangling provision coroutine that would race "
+            "the verify read on the shared connection: "
+            f"{list(_orch_module._provision_coroutines)}"
+        )
+        # And the cancel did not leak an orphan-cleanup background task.
+        _leaked = set(_pipeline_state.background_tasks) - _bg_before
+        assert not _leaked, (
+            f"cycle cleanup leaked background task(s): {_leaked}"
+        )
 
 
 class TestClassifyStuckTasksSharedPolicy:
