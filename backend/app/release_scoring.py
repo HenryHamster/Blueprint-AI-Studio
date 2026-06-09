@@ -604,6 +604,8 @@ def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
 # pack budget while still giving the agent enough to target the audit sub-score.
 _MAX_CARRIED_FINDINGS = 12
 _FINDING_SUMMARY_MAX = 280
+# Maximum binding-record entries persisted alongside audit_reconciliation.
+_BINDING_RECORD_CAP = 20
 # Minimum fraction of shared significant tokens (length >= 3) required for a
 # fuzzy summary match between an audit finding and a challenge verdict when the
 # challenger derives findings independently (no primary_findings in payload).
@@ -1239,7 +1241,7 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
         or finding.get("text")
         or ""
     ).strip()
-    f_file = str(finding.get("file") or "").strip()
+    f_file = str(finding.get("file") or finding.get("file_path") or "").strip()
     cv_summary = str(verdict_entry.get("summary") or "").strip()
     cv_file = str(verdict_entry.get("file") or "").strip()
 
@@ -1287,16 +1289,16 @@ def _reconcile_audit_with_challenge(
     report: dict[str, Any] | None,
     challenge_envelope: dict[str, Any] | None,
     candidate_sha: str | None,
-) -> tuple[str | None, dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[str | None, dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
     """Reconcile verified audit findings with challenge verdicts (fail-closed)."""
     if not isinstance(report, dict):
-        return None, report, []
+        return None, report, [], []
 
     findings = report.get("findings")
     if not isinstance(findings, list):
         findings = report.get("issues")
     if not isinstance(findings, list):
-        return None, report, []
+        return None, report, [], []
 
     deductible: list[tuple[int, dict]] = []
     for idx, f in enumerate(findings):
@@ -1329,8 +1331,13 @@ def _reconcile_audit_with_challenge(
                         _sev = str(_cv.get("severity") or "").lower().strip()
                         _rank = _SEVERITY_RANK.get(_sev, 99)
                         if _rank != 99 and _rank <= 1:
-                            return "audit_challenge_independent_blocker", None, []
-        return None, report, []
+                            return (
+                                "audit_challenge_independent_blocker",
+                                None,
+                                [],
+                                [],
+                            )
+        return None, report, [], []
 
     challenge_verdicts_list: list = []
     sha_matched = False
@@ -1353,39 +1360,78 @@ def _reconcile_audit_with_challenge(
             )
             else "audit_challenge_missing"
         )
-        return hold_code, None, []
+        return hold_code, None, [], []
 
     challenger_refuted: list[dict[str, Any]] = []
     remove_idxs: set[int] = set()
     available_verdicts = list(challenge_verdicts_list)
 
-    # Precompute (score, fi, vi) pairs for all deductible findings x available verdicts.
-    # fi indexes into deductible; vi indexes into available_verdicts.
-    scored_pairs: list[tuple[float, int, int]] = []
-    for fi, (idx, f) in enumerate(deductible):
+    # Build per-finding adjacency lists sorted by score descending.
+    # Add a small severity-agreement bonus so a verdict prefers the finding
+    # whose severity label matches its own over one that only scores the same
+    # via text overlap alone.
+    adj: list[list[int]] = [[] for _ in range(len(deductible))]
+    for fi, (_, f) in enumerate(deductible):
+        f_sev = str(f.get("severity") or f.get("level") or "").lower()
+        pairs: list[tuple[float, int]] = []
         for vi, cv in enumerate(available_verdicts):
-            score = _score_finding_to_challenge(f, cv)
-            if score is not None:
-                scored_pairs.append((score, fi, vi))
+            s = _score_finding_to_challenge(f, cv)
+            if s is not None:
+                cv_sev = str(cv.get("severity") or "").lower()
+                bonus = 0.001 if cv_sev and cv_sev == f_sev else 0.0
+                pairs.append((s + bonus, vi))
+        pairs.sort(key=lambda x: -x[0])
+        adj[fi] = [vi for _, vi in pairs]
 
-    # Sort descending so the best matches are assigned first.
-    scored_pairs.sort(key=lambda x: -x[0])
+    # Maximum-cardinality bipartite matching via DFS augmenting paths.
+    # This finds a complete assignment whenever one exists, unlike greedy
+    # sort-and-assign which can strand a finding when a high-scoring verdict
+    # is shared between two findings.
+    match_vi: dict[int, int] = {}  # vi -> fi currently matched
 
-    # Greedy 1-to-1 assignment: each finding and each verdict used at most once.
-    fi_assigned: set[int] = set()
-    vi_assigned: set[int] = set()
-    assignment: dict[int, int] = {}  # fi -> vi
+    def _try_augment(fi: int, visited: set[int]) -> bool:
+        for vi in adj[fi]:
+            if vi in visited:
+                continue
+            visited.add(vi)
+            if vi not in match_vi or _try_augment(match_vi[vi], visited):
+                match_vi[vi] = fi
+                return True
+        return False
 
-    for score, fi, vi in scored_pairs:
-        if fi not in fi_assigned and vi not in vi_assigned:
-            assignment[fi] = vi
-            fi_assigned.add(fi)
-            vi_assigned.add(vi)
+    for fi in range(len(deductible)):
+        _try_augment(fi, set())
+
+    assignment: dict[int, int] = {fi: vi for vi, fi in match_vi.items()}
 
     # All deductible findings must have exactly one verdict (fail-closed).
+    # Distinguish verdicts-present-but-unbindable from artifact-absent.
     if len(assignment) < len(deductible):
-        return "audit_challenge_missing", None, []
+        return "audit_challenge_binding_incomplete", None, [], []
 
+    # Validate refutation bindings: the augmenting-path DFS maximises cardinality
+    # but not match quality — a later finding can steal an exact refuted_false_positive
+    # verdict from the finding it best matches, leaving a worse-matched finding bound
+    # to the refutation.  Because refuted verdicts remove findings from audit scoring,
+    # an ambiguous refutation binding can suppress a valid high-severity deduction.
+    # Fail closed: if any refuted verdict was assigned to a finding that is NOT its
+    # best-scoring match (i.e. a higher-scoring finding exists and was assigned
+    # elsewhere), the challenge output is ambiguous — hold rather than risk a wrong
+    # finding removal.
+    for vi, fi in match_vi.items():
+        cv = available_verdicts[vi]
+        if str(cv.get("verdict") or "").lower().strip() != "refuted_false_positive":
+            continue
+        _, f = deductible[fi]
+        bound_score = _score_finding_to_challenge(f, cv) or 0.0
+        for other_fi, (_, other_f) in enumerate(deductible):
+            if other_fi == fi:
+                continue
+            other_score = _score_finding_to_challenge(other_f, cv)
+            if other_score is not None and other_score > bound_score:
+                return "audit_challenge_uncertain", None, [], []
+
+    binding_record: list[dict[str, Any]] = []
     for fi, (idx, f) in enumerate(deductible):
         matched = available_verdicts[assignment[fi]]
         verdict_val = str(matched.get("verdict") or "").lower().strip()
@@ -1394,7 +1440,7 @@ def _reconcile_audit_with_challenge(
         elif verdict_val == "refuted_false_positive":
             reason = str(matched.get("reason") or "")
             if sum(1 for c in reason if not c.isspace()) < 20:
-                return "audit_challenge_uncertain", None, []
+                return "audit_challenge_uncertain", None, [], []
             remove_idxs.add(idx)
             sev = str(f.get("severity") or f.get("level") or "").lower()
             summary = str(
@@ -1415,29 +1461,49 @@ def _reconcile_audit_with_challenge(
                 }
             )
         else:
-            return "audit_challenge_uncertain", None, []
+            return "audit_challenge_uncertain", None, [], []
+        if len(binding_record) < _BINDING_RECORD_CAP:
+            binding_record.append(
+                {
+                    "finding_summary": str(
+                        f.get("summary")
+                        or f.get("description")
+                        or f.get("title")
+                        or f.get("text")
+                        or ""
+                    ).strip()[:_FINDING_SUMMARY_MAX],
+                    "finding_severity": str(
+                        f.get("severity") or f.get("level") or ""
+                    ).lower(),
+                    "finding_file": str(f.get("file") or "").strip(),
+                    "verdict": verdict_val,
+                    "verdict_summary": str(matched.get("summary") or "").strip()[
+                        :_FINDING_SUMMARY_MAX
+                    ],
+                }
+            )
 
     # Scan unmatched challenger verdicts for independent confirmed blockers.
     # The challenger may identify >=HIGH issues the primary audit missed; these
     # must gate qualification even though no primary finding was matched to them.
     for vi, cv in enumerate(available_verdicts):
-        if vi in vi_assigned:
+        if vi in match_vi:
             continue
         if str(cv.get("verdict") or "").lower().strip() != "confirmed":
             continue
         sev = str(cv.get("severity") or "").lower().strip()
         rank = _SEVERITY_RANK.get(sev, 99)
         if rank != 99 and rank <= 1:
-            return "audit_challenge_independent_blocker", None, []
+            return "audit_challenge_independent_blocker", None, [], []
 
     if not remove_idxs:
-        return None, report, []
+        return None, report, [], binding_record
 
     modified_findings = [f for i, f in enumerate(findings) if i not in remove_idxs]
     modified_report = dict(report)
     key = "findings" if isinstance(report.get("findings"), list) else "issues"
     modified_report[key] = modified_findings
-    return None, modified_report, challenger_refuted
+    return None, modified_report, challenger_refuted, binding_record
 
 
 # Minimum sample size for each cohort before telemetry rates are computed.

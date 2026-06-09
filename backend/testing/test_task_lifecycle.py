@@ -20,6 +20,11 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock
 
+from sqlalchemy import text as _sa_text
+from sqlalchemy.exc import (
+    IntegrityError as _IntegrityError,
+    PendingRollbackError as _PendingRollbackError,
+)
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -6377,13 +6382,6 @@ class TestRequeueExtractionTripwire:
 # instead of returning ``{"status": "received"}``. WITH the C1 fix the rollback
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
-
-from sqlalchemy import text as _sa_text
-from sqlalchemy.exc import (
-    IntegrityError as _IntegrityError,
-    PendingRollbackError as _PendingRollbackError,
-)
-
 
 async def _poison_session(session) -> None:
     """Put ``session`` into a real aborted / PendingRollback transaction via a

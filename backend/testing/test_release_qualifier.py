@@ -1937,12 +1937,12 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
         # The second finding has no verdict left → HOLD, not a silent double exclusion.
-        assert hold == "audit_challenge_missing"
+        assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
         assert refuted == []
 
@@ -1960,11 +1960,11 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, _refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
-        assert hold == "audit_challenge_missing"
+        assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
 
     def test_two_verdicts_two_findings_both_matched(self):
@@ -1985,7 +1985,7 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2014,7 +2014,7 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2039,7 +2039,7 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2079,14 +2079,12 @@ class TestReconcileAuditBestMatchAssignment:
 
         Finding A (CRITICAL) has a detailed summary with many tokens.
         Finding B (HIGH) has a short summary whose tokens are a strict subset of A's.
-        The refutation verdict exactly matches B's summary.
+        The refutation verdict exactly matches B's summary with severity "high".
 
-        Under the old min-denominator, "File read path traversal in upload module"
-        tokens are a subset of A's tokens → score = 1.0 against A, so the refutation
-        was mis-bound to A (CRITICAL, larger deduction = score inflation).
-
-        Under Jaccard (union denominator), the score against A is ~0.5 (below the 0.6
-        threshold), so the refutation is correctly bound to B.
+        The severity ceiling in _score_finding_to_challenge fires first: a "high"
+        refutation has verdict_rank=1 > finding_rank=0 (critical) → returns None,
+        so the refutation cannot score against A at all.  Jaccard is a secondary
+        guard and would also reject it, but severity ceiling fires earlier.
         """
         finding_a = self._verified(
             "critical",
@@ -2114,7 +2112,7 @@ class TestReconcileAuditBestMatchAssignment:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2155,7 +2153,7 @@ class TestReconcileAuditBestMatchAssignment:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2195,7 +2193,7 @@ class TestReconcileAuditBestMatchAssignment:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2231,12 +2229,12 @@ class TestReconcileAuditBestMatchAssignment:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, _refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
         # Verdict does not reach the 0.6 token-overlap threshold → HOLD (fail-closed).
-        assert hold == "audit_challenge_missing"
+        assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
 
     def test_best_match_assignment_ignores_emission_order(self):
@@ -2265,7 +2263,7 @@ class TestReconcileAuditBestMatchAssignment:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2276,6 +2274,54 @@ class TestReconcileAuditBestMatchAssignment:
         assert "rate limit" in modified["findings"][0]["summary"]
         assert len(refuted) == 1
         assert "Race condition" in refuted[0]["summary"]
+
+    def test_complete_assignment_found_when_greedy_order_would_strand_a_finding(self):
+        """Augmenting-path matching finds a complete assignment greedy would miss.
+
+        F1: medium "Race condition in cache invalidation logic"
+        F2: medium "Race condition in session token refresh"
+        V1 (refuted_false_positive, medium): "Race condition cache invalidation refresh"
+            → Jaccard against F1 ≈ 4/6 = 0.667 (≥ 0.6 threshold) — matches F1 only.
+            → Jaccard against F2 ≈ 3/7 ≈ 0.43 (< 0.6 threshold) — no match.
+        V2 (confirmed): "race condition"
+            → min-denominator against F1 = 2/2 = 1.0 — matches.
+            → min-denominator against F2 = 2/2 = 1.0 — matches.
+
+        Greedy assigns F1→V2 first (score 1.0), then cannot assign F2 (V2 used, V1
+        only matches F1 which is taken) → spurious audit_challenge_missing hold.
+
+        Augmenting path re-routes F1→V1, F2→V2 so the complete assignment is found.
+        """
+        finding_f1 = self._verified("medium", "Race condition in cache invalidation logic")
+        finding_f2 = self._verified("medium", "Race condition in session token refresh")
+        report = self._report([finding_f1, finding_f2])
+
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "severity": "medium",
+                "summary": "Race condition cache invalidation refresh",
+                "reason": "lock is held before cache state is read",
+            },
+            {
+                "verdict": "confirmed",
+                "summary": "race condition",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Complete assignment exists: no spurious hold.
+        assert hold is None
+        assert modified is not None
+        # F1 is refuted (removed), F2 is confirmed (kept).
+        assert len(modified["findings"]) == 1
+        assert "session token" in modified["findings"][0]["summary"]
+        assert len(refuted) == 1
+        assert "cache invalidation" in refuted[0]["summary"]
 
 
 class TestReconcileAuditChallengeRefutedSeverityCeiling:
@@ -2310,11 +2356,11 @@ class TestReconcileAuditChallengeRefutedSeverityCeiling:
             ],
         )
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
 
-        assert hold == "audit_challenge_missing"
+        assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
         assert refuted == []
 
@@ -2336,7 +2382,7 @@ class TestReconcileAuditChallengeRefutedSeverityCeiling:
             ],
         )
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
 
@@ -2363,7 +2409,7 @@ class TestReconcileAuditChallengeRefutedSeverityCeiling:
             ],
         )
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2516,12 +2562,12 @@ class TestRefutedSeverityMatrixReconcile:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
-        assert hold == "audit_challenge_missing", (
+        assert hold == "audit_challenge_binding_incomplete", (
             f"verdict_sev={verdict_sev!r} vs finding_sev={finding_sev!r}: "
-            f"expected hold='audit_challenge_missing', got {hold!r}"
+            f"expected hold='audit_challenge_binding_incomplete', got {hold!r}"
         )
         assert modified is None
         assert refuted == []
@@ -2548,7 +2594,7 @@ class TestRefutedSeverityMatrixReconcile:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold is None, (
@@ -2587,7 +2633,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
@@ -2607,7 +2653,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
@@ -2627,7 +2673,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
@@ -2647,7 +2693,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold is None
@@ -2666,7 +2712,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold is None
@@ -2683,7 +2729,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold is None
@@ -2702,7 +2748,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         # No primary findings -> no deductible -> no assignment needed -> no hold
@@ -2734,7 +2780,7 @@ class TestChallengerIndependentBlocker:
                 },
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
@@ -2760,7 +2806,7 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
         # confirmed matched verdict keeps the finding, no independent blocker
@@ -2802,7 +2848,7 @@ class TestReconcileRefutedJustificationGate:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold == "audit_challenge_uncertain"
@@ -2822,7 +2868,7 @@ class TestReconcileRefutedJustificationGate:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold == "audit_challenge_uncertain"
@@ -2846,7 +2892,7 @@ class TestReconcileRefutedJustificationGate:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold == "audit_challenge_uncertain"
@@ -2869,7 +2915,7 @@ class TestReconcileRefutedJustificationGate:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold is None
@@ -2891,7 +2937,7 @@ class TestReconcileRefutedJustificationGate:
                 }
             ],
         )
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             self._report([finding]), envelope, self.SHA
         )
         assert hold is None
@@ -2934,7 +2980,7 @@ class TestReconcileRefutedJustificationGate:
         ]
         envelope = _make_challenge_envelope(self.SHA, verdicts)
 
-        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
 
@@ -2947,6 +2993,139 @@ class TestReconcileRefutedJustificationGate:
         assert refuted[0]["summary"] == (
             "SQL injection via query parameter search endpoint"
         )
+
+
+class TestBindingRecordAndUnboundHoldDistinction:
+    """Tests for binding record persistence and hold-code disambiguation.
+
+    Requirement: audit_challenge_binding_incomplete (verdicts present but
+    assignment incomplete) must be distinct from audit_challenge_missing
+    (artifact absent).  A successful assignment must produce an auditable
+    binding record with per-finding entries.
+    """
+
+    SHA = "bead1234"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def _verified(self, severity: str, summary: str, file: str = "") -> dict:
+        entry: dict = {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        if file:
+            entry["file"] = file
+        return entry
+
+    def test_binding_record_persisted_and_unbound_hold_distinguished_from_absent(self):
+        """Acceptance test: binding record populated on merge-verdict; unbound hold
+        uses audit_challenge_binding_incomplete (not audit_challenge_missing).
+
+        Step A — successful reconciliation with one confirmed and one refuted finding:
+        a binding_record entry exists for each deductible finding, with the correct
+        verdict value and summary.
+
+        Step B — one finding but no matching verdict (topic mismatch): the hold code
+        is audit_challenge_binding_incomplete, not audit_challenge_missing (which is
+        reserved for artifact-absent/SHA-mismatch cases).
+        """
+        # ---- Step A: full assignment, binding record populated ----
+        finding_a = self._verified("high", "SQL injection via unsanitized query parameter", "backend/db.py")
+        finding_b = self._verified("high", "Hardcoded API secret in config file", "backend/config.py")
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "SQL injection via unsanitized query parameter",
+            },
+            {
+                "verdict": "refuted_false_positive",
+                "severity": "high",
+                "summary": "Hardcoded API secret in config file",
+                "reason": "secret is loaded from environment variable at runtime",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None, f"expected no hold, got {hold!r}"
+        assert modified is not None
+        assert len(refuted) == 1
+
+        # Binding record must have one entry per deductible finding.
+        assert len(binding) == 2, f"expected 2 binding entries, got {len(binding)}"
+        confirmed_entry = next((e for e in binding if e["verdict"] == "confirmed"), None)
+        refuted_entry = next((e for e in binding if e["verdict"] == "refuted_false_positive"), None)
+        assert confirmed_entry is not None
+        assert confirmed_entry["finding_severity"] == "high"
+        assert "SQL injection" in confirmed_entry["finding_summary"]
+        assert refuted_entry is not None
+        assert "Hardcoded API secret" in refuted_entry["finding_summary"]
+        # verdict_summary is populated from the challenger's summary of the finding.
+        assert "Hardcoded API secret" in refuted_entry["verdict_summary"]
+
+        # ---- Step B: verdicts present but no matching verdict → binding_incomplete ----
+        finding_unmatched = self._verified("high", "Cross-site request forgery in admin panel")
+        report_b = self._report([finding_unmatched])
+        # Verdict summary shares only one token ("admin") — below the 0.6 threshold.
+        verdicts_b = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "SQL injection admin endpoint",
+            }
+        ]
+        envelope_b = _make_challenge_envelope(self.SHA, verdicts_b)
+        hold_b, modified_b, _refuted_b, binding_b = rq._reconcile_audit_with_challenge(
+            report_b, envelope_b, self.SHA
+        )
+
+        # Verdicts ARE present and SHA matched — must use binding_incomplete, not missing.
+        assert hold_b == "audit_challenge_binding_incomplete", (
+            f"expected 'audit_challenge_binding_incomplete', got {hold_b!r}"
+        )
+        assert modified_b is None
+        assert binding_b == []
+
+        # Artifact-absent case must still use audit_challenge_missing.
+        hold_absent, _, _, _ = rq._reconcile_audit_with_challenge(
+            report_b, None, self.SHA
+        )
+        assert hold_absent == "audit_challenge_missing", (
+            f"artifact-absent should be 'audit_challenge_missing', got {hold_absent!r}"
+        )
+
+    def test_binding_incomplete_in_binding_holds_frozenset(self):
+        """audit_challenge_binding_incomplete must trigger challenge respawn."""
+        assert "audit_challenge_binding_incomplete" in rq._AUDIT_CHALLENGE_BINDING_HOLDS
+
+    def test_binding_record_capped_at_binding_record_cap(self):
+        """Binding record must not exceed _BINDING_RECORD_CAP entries."""
+        cap = rs._BINDING_RECORD_CAP
+        findings = [
+            self._verified("high", f"Finding {i} with enough tokens to match verdict {i}")
+            for i in range(cap + 5)
+        ]
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": f"Finding {i} with enough tokens to match verdict {i}",
+            }
+            for i in range(cap + 5)
+        ]
+        report = self._report(findings)
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        _hold, _modified, _refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert len(binding) <= cap, f"binding record exceeds cap: {len(binding)} > {cap}"
 
 
 class TestChallengedVsUnchallengedTelemetry:
@@ -5118,6 +5297,276 @@ async def _seed_qualification_children(
     return audit_task, smoke_task
 
 
+async def _seed_completed_challenge_without_artifact(db_session, project, version):
+    challenge_task = Task(
+        project_id=project.id,
+        title="audit-challenge",
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        vm_instance_id="vm-challenge",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": version.last_qualification["candidate_sha"]},
+    )
+    db_session.add(challenge_task)
+    await db_session.flush()
+    await db_session.refresh(challenge_task)
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": str(challenge_task.id),
+        "audit_challenge_task_id": str(challenge_task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return challenge_task
+
+
+@pytest.mark.asyncio
+async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
+    db_session,
+):
+    """A binding challenge hold re-spawns only the challenge child with the
+    primary audit's deductible findings, keeping the qualification pending."""
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Unbounded retry can promote stale challenge state.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "Read backend/app/release_qualifier.py:1950 and confirmed the stale challenge state can be reused.",
+                },
+                {
+                    "severity": "medium",
+                    "description": "Challenge matching loses the release scoring file.",
+                    "file_path": "backend/app/release_scoring.py",
+                    "verification_note": "Read backend/app/release_scoring.py:1300 and confirmed the binding match can fail.",
+                },
+                {
+                    "severity": "low",
+                    "summary": "Cosmetic label is stale.",
+                    "file": "backend/app/release_qualifier.py",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Speculative unverified high finding.",
+                    "file": "backend/app/release_qualifier.py",
+                },
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+    await _seed_completed_challenge_without_artifact(db_session, project, version)
+    original_challenge_id = version.last_qualification["challenge_task_id"]
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result == {
+        "status": "audit_challenge_respawned",
+        "reason": "audit_challenge_missing",
+        "respawn_count": 1,
+        "challenge_task_id": version.last_qualification["challenge_task_id"],
+    }
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["audit_task_id"] == str(audit_task.id)
+    assert version.last_qualification["smoketest_task_id"] == str(smoke_task.id)
+    assert version.last_qualification["challenge_task_id"] != original_challenge_id
+    assert version.last_qualification["audit_challenge_task_id"] == (
+        version.last_qualification["challenge_task_id"]
+    )
+    assert version.last_qualification["audit_challenge_respawn_count"] == 1
+    assert version.last_qualification["audit_challenge_retry_reason"] == (
+        "audit_challenge_missing"
+    )
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    audit_tasks = [t for t in tasks if (t.first_payload or {}).get("type") == "release_audit"]
+    smoke_tasks = [t for t in tasks if (t.first_payload or {}).get("type") == "smoketest"]
+    challenge_tasks = [
+        t
+        for t in tasks
+        if (t.first_payload or {}).get("type") == "release_audit_challenge"
+    ]
+    assert [str(t.id) for t in audit_tasks] == [str(audit_task.id)]
+    assert [str(t.id) for t in smoke_tasks] == [str(smoke_task.id)]
+    assert len(challenge_tasks) == 2
+
+    retry_task = next(
+        t
+        for t in challenge_tasks
+        if str(t.id) == version.last_qualification["challenge_task_id"]
+    )
+    assert retry_task.first_payload["primary_audit_task_id"] == str(audit_task.id)
+    assert retry_task.first_payload["candidate_sha"] == version.last_qualification[
+        "candidate_sha"
+    ]
+    assert retry_task.first_payload["primary_findings"] == [
+        {
+            "severity": "high",
+            "summary": "Unbounded retry can promote stale challenge state.",
+            "file": "backend/app/release_qualifier.py",
+        },
+        {
+            "severity": "medium",
+            "summary": "Challenge matching loses the release scoring file.",
+            "file": "backend/app/release_scoring.py",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_challenge_hold_respawn_cap_exhausted_falls_back_to_infra_failure(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Retry cap finding still needs a challenge verdict.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "Read backend/app/release_qualifier.py:1950 and confirmed this still needs a verdict.",
+                }
+            ],
+            "test_erosion": {"deleted_test_files": []},
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+    await _seed_completed_challenge_without_artifact(db_session, project, version)
+    version.last_qualification = {
+        **version.last_qualification,
+        "audit_challenge_respawn_count": rq._MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "audit_challenge_missing"
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["error"] == "audit_challenge_missing"
+
+
+@pytest.mark.asyncio
+async def test_challenge_hold_does_not_retry_with_stale_primary_audit_candidate(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Old candidate finding must not drive a retry.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "Read backend/app/release_qualifier.py:1950 and confirmed stale audit evidence must not be reused.",
+                }
+            ],
+            "test_erosion": {"deleted_test_files": []},
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+    await _seed_completed_challenge_without_artifact(db_session, project, version)
+    original_challenge_id = version.last_qualification["challenge_task_id"]
+    version.last_qualification = {
+        **version.last_qualification,
+        "candidate_sha": "deed" * 10,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "audit_challenge_missing"
+    assert version.last_qualification["audit_challenge_task_id"] == original_challenge_id
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    challenge_tasks = [
+        t
+        for t in tasks
+        if (t.first_payload or {}).get("type") == "release_audit_challenge"
+    ]
+    assert len(challenge_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_required_children_terminal_waits_for_challenge_task(db_session):
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={"findings": [], "test_erosion": {"deleted_test_files": []}},
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+    challenge_task = await db_session.get(
+        Task, uuid.UUID(version.last_qualification["challenge_task_id"])
+    )
+    assert challenge_task is not None
+    challenge_task.status = TaskStatus.QUEUED
+    db_session.add(challenge_task)
+    await db_session.commit()
+
+    assert await rq._required_children_terminal(db_session, version) is False
+
+    challenge_task.status = TaskStatus.COMPLETED
+    db_session.add(challenge_task)
+    await db_session.commit()
+
+    assert await rq._required_children_terminal(db_session, version) is True
+
+
 async def _attach_audit_challenge(
     db_session,
     project,
@@ -5989,7 +6438,7 @@ async def test_finalize_holds_when_deductible_finding_lacks_challenge_confirmati
     project, version = await _make_project_and_version(db_session)
     # Audit reports a verified HIGH finding (verification_note ≥ 20 chars so it
     # passes _finding_is_verified and would normally deduct 0.15).
-    audit_task, _smoke = await _seed_qualification_children(
+    _audit_task, _smoke = await _seed_qualification_children(
         db_session,
         project,
         version,
@@ -6294,6 +6743,14 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
     )
     # The refuted verified high finding no longer deducts → audit score is 1.0.
     assert applied_audit == pytest.approx(1.0, abs=0.01)
+
+    # 5. Binding record is persisted alongside audit_reconciliation and contains
+    #    the refuted entry with verdict + summary fields.
+    binding = recon.get("challenge_binding_record")
+    assert isinstance(binding, list), f"expected list, got {type(binding)}"
+    assert len(binding) == 1, f"expected 1 binding entry, got {len(binding)}"
+    assert binding[0]["verdict"] == "refuted_false_positive"
+    assert "XSS vulnerability" in binding[0]["finding_summary"]
 
 
 @pytest.mark.asyncio
@@ -8638,6 +9095,111 @@ class TestFinalizeInfraFailure:
         assert (
             version.last_qualification["error"] == "smoketest_task_failed_rate_limited"
         )
+
+    @pytest.mark.asyncio
+    async def test_challenge_task_failed_records_infra_failure(self, db_session):
+        """A FAILED challenge child routes to infra_failure with an enriched label,
+        consistent with audit/smoketest terminal-status handling."""
+        project, version = await _make_project_and_version(db_session)
+        # Seed audit + smoketest COMPLETED (with a verified high finding so the
+        # challenge gate is active), plus a FAILED challenge child.
+        _candidate_sha = "feed" * 10
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-chal",
+            status=TaskStatus.COMPLETED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-chal",
+            status=TaskStatus.COMPLETED,
+        )
+        challenge_task = Task(
+            project_id=project.id,
+            title="audit-challenge",
+            payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+            vm_instance_id="vm-challenge-chal",
+            status=TaskStatus.FAILED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        db_session.add(audit_task)
+        db_session.add(smoke_task)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(smoke_task)
+        await db_session.refresh(challenge_task)
+
+        # Seed a verified high finding so the challenge gate is active.
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "severity": "high",
+                                "summary": "Unvalidated redirect in login flow",
+                                "verification_note": "confirmed via full repo scan",
+                            }
+                        ],
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=smoke_task.id,
+                artifact_type=ArtifactType.SMOKETEST_RESULT,
+                logs=json.dumps(
+                    {
+                        "passed": True,
+                        "tests": [{"name": "startup", "status": "pass"}],
+                        "suites": {"startup": {"passed": True}},
+                    }
+                ),
+            )
+        )
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": _candidate_sha,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": str(smoke_task.id),
+            "challenge_task_id": str(challenge_task.id),
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert "audit_challenge_task_failed" in result["error"]
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert "audit_challenge_task_failed" in version.last_qualification["error"]
+
+        # No QualificationVerdict row — infra path never records a quality verdict.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
 
     @pytest.mark.asyncio
     async def test_infra_failure_dispatches_external_webhook(self, db_session, mocker):

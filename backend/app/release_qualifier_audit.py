@@ -136,6 +136,7 @@ async def _spawn_release_audit_challenge_task(
     diff_range: str,
     candidate_sha: str,
     primary_audit_task_id: str | None = None,
+    primary_findings: list[dict[str, str]] | None = None,
 ) -> Task:
     """Create + queue a challenge task for the release-audit flow.
 
@@ -153,6 +154,8 @@ async def _spawn_release_audit_challenge_task(
     if primary_audit_task_id is not None:
         payload["primary_audit_task_id"] = primary_audit_task_id
         payload["primary_audit_report"] = None
+    if primary_findings is not None:
+        payload["primary_findings"] = primary_findings
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         "release_audit_challenge"
     )
