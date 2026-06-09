@@ -92,6 +92,14 @@ class ComputeLaunchSpec:
     machine_type: str
     spend_cap_usd: float
     deadline_at: datetime | None
+    # Provisioning timeout used by the monitor to bound the launch phase. This
+    # remains separate from the command's runtime budget so launch delay never
+    # steals runtime from the command itself.
+    provisioning_deadline_at: datetime | None = None
+    # Runtime budget in seconds, counted from actual launch/start time. The
+    # backend startup script and runtime watchdog both use this instead of the
+    # prelaunch wall-clock deadline.
+    runtime_deadline_seconds: int | None = None
     # Deterministically reserved external id, persisted on the row BEFORE the
     # external launch side-effect so a re-launch after a crash is idempotent.
     external_id: str | None = None
@@ -346,9 +354,17 @@ class GcpComputeBackend:
                 message="adopted existing compute-job VM",
                 metadata={"zone": existing_zone, "artifact_uri": artifact_uri},
             )
+        runtime_budget_seconds = spec.runtime_deadline_seconds
+        if runtime_budget_seconds is not None:
+            artifact_expiry_base = _utcnow() + timedelta(
+                seconds=max(0, int(runtime_budget_seconds))
+            )
+        else:
+            artifact_expiry_base = spec.deadline_at
+        artifact_expiry_at = _artifact_upload_expiry(artifact_expiry_base)
         artifact_upload_url = await storage.generate_compute_job_artifact_upload_signed_url(
             spec.job_id,
-            expires_at=_artifact_upload_expiry(spec.deadline_at),
+            expires_at=artifact_expiry_at,
         )
         ok = await compute.provision_ephemeral_vm(
             external_id,
@@ -362,6 +378,12 @@ class GcpComputeBackend:
             raise RuntimeError("GCP compute-job VM provisioning failed")
         zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
         metadata: Dict[str, Any] = {"artifact_uri": artifact_uri}
+        if spec.provisioning_deadline_at is not None:
+            metadata["provisioning_deadline_at"] = (
+                spec.provisioning_deadline_at.isoformat()
+            )
+        if spec.runtime_deadline_seconds is not None:
+            metadata["runtime_deadline_seconds"] = spec.runtime_deadline_seconds
         if zone and zone != "unknown":
             metadata["zone"] = zone
         return ComputeLaunchResult(
@@ -875,7 +897,9 @@ def _build_gcp_startup_script(
         env_lines.append(f"export {key}={shlex.quote(value)}")
     env_block = "\n".join(env_lines)
     cwd_line = f"cd {shlex.quote(spec.cwd)}" if spec.cwd else ""
-    if spec.deadline_at is not None:
+    if spec.runtime_deadline_seconds is not None:
+        deadline_seconds = max(60, int(spec.runtime_deadline_seconds) + 30)
+    elif spec.deadline_at is not None:
         deadline_seconds = max(
             60,
             int((spec.deadline_at - _utcnow()).total_seconds()) + 30,
@@ -941,7 +965,7 @@ PY
 trap upload_artifacts EXIT HUP INT TERM QUIT
 (
   sleep "$TTL_SECONDS"
-  echo "{_SERIAL_REASON_PREFIX}startup_ttl"
+  echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
   poweroff || shutdown -h now || true

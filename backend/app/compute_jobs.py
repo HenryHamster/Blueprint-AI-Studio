@@ -10,6 +10,7 @@ upstream ``status`` / ``outcome`` / ``terminal_reason`` columns.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from sqlmodel import select
 from app.compute_backends import (
     LOCAL_BACKEND_NAME,
     ComputeLaunchSpec,
+    ComputeStatusResult,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
     get_compute_backend,
@@ -233,9 +235,11 @@ async def create_compute_job(
             "command": command,
             "cwd": cwd,
             "env": {str(k): str(v) for k, v in (env or {}).items()},
+            "provisioning_deadline_at": deadline_at.isoformat(),
             "provisioning_model": normalized_provisioning,
             "cost_rate_per_second": rate,
             "requested_deadline_seconds": capped_deadline,
+            "runtime_deadline_seconds": capped_deadline,
             "launch_request_fingerprint": launch_request_fingerprint,
             "status_message": "queued for compute-job launch",
         },
@@ -307,6 +311,57 @@ def _launch_request_matches(job: ComputeJob, request_fingerprint: str) -> bool:
         (job.polling_metadata or {}).get("launch_request_fingerprint") or ""
     ).strip()
     return bool(existing) and existing == request_fingerprint
+
+
+def _requested_deadline_seconds(job: ComputeJob) -> int | None:
+    raw = (job.polling_metadata or {}).get("requested_deadline_seconds")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _parse_naive_iso_datetime(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    return None
+
+
+def _runtime_deadline_at(job: ComputeJob) -> datetime | None:
+    meta_deadline = _parse_naive_iso_datetime(
+        (job.polling_metadata or {}).get("runtime_deadline_at")
+    )
+    if meta_deadline is not None:
+        return meta_deadline
+    if job.started_at is None:
+        return None
+    requested = _requested_deadline_seconds(job)
+    if requested is None:
+        return None
+    return job.started_at + timedelta(seconds=requested)
+
+
+def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
+    if job.wall_clock_deadline is None:
+        return None
+    return max(0.0, (job.wall_clock_deadline - now).total_seconds())
+
+
+def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
+    message = (status.message or "").strip().lower()
+    if message in {"runtime_ttl", "runtime_timeout", "command_runtime_timeout"}:
+        return True
+    return status.exit_code == 124
 
 
 async def get_compute_job_for_task(
@@ -654,9 +709,111 @@ async def _process_single_compute_job(
         )
         if reserved is None:
             return
+        provisioning_timeout_seconds = _provisioning_timeout_seconds(job, now=now)
+        if provisioning_timeout_seconds == 0.0:
+            started_at = _utcnow()
+            terminate_diagnostic = None
+            try:
+                terminated = await backend.terminate(job, reason="provisioning")
+            except Exception as exc:
+                failed_at = _utcnow()
+                logger.exception(
+                    "[COMPUTE_JOB] provisioning deadline terminate failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+                terminated = False
+                terminate_diagnostic = _build_compute_rpc_diagnostic(
+                    job,
+                    operation="terminate",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning",
+                )
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason="compute job timed out while provisioning",
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic
+                or _build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=TimeoutError("compute job provisioning deadline exceeded"),
+                    started_at=now,
+                    failed_at=now,
+                    next_retry_at=None,
+                    reason="provisioning_timeout",
+                ),
+            )
+            return
         started_at = _utcnow()
         try:
-            result = await backend.launch(_build_launch_spec(reserved))
+            launch_coro = backend.launch(_build_launch_spec(reserved))
+            if provisioning_timeout_seconds is not None:
+                result = await asyncio.wait_for(
+                    launch_coro, timeout=provisioning_timeout_seconds
+                )
+            else:
+                result = await launch_coro
+        except asyncio.TimeoutError:
+            failed_at = _utcnow()
+            logger.warning(
+                "[COMPUTE_JOB] launch provisioning timed out for job=%s", job.id
+            )
+            terminate_diagnostic = None
+            try:
+                terminated = await backend.terminate(job, reason="provisioning")
+            except Exception as exc:
+                failed_at = _utcnow()
+                logger.exception(
+                    "[COMPUTE_JOB] provisioning deadline terminate failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+                terminated = False
+                terminate_diagnostic = _build_compute_rpc_diagnostic(
+                    job,
+                    operation="terminate",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning",
+                )
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason="compute job timed out while provisioning",
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic
+                or _build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=TimeoutError("compute job provisioning deadline exceeded"),
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning_timeout",
+                ),
+            )
+            return
         except Exception as exc:
             failed_at = _utcnow()
             logger.exception(
@@ -736,10 +893,15 @@ async def _process_single_compute_job(
         accrued_cost_usd = max(
             float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
         )
+        timeout_like = _status_is_runtime_timeout(status)
         outcome = (
-            ComputeJobOutcome.SUCCESS
-            if status.status == ComputeJobStatus.SUCCEEDED
-            else ComputeJobOutcome.FAILURE
+            ComputeJobOutcome.TIMED_OUT
+            if timeout_like
+            else (
+                ComputeJobOutcome.SUCCESS
+                if status.status == ComputeJobStatus.SUCCEEDED
+                else ComputeJobOutcome.FAILURE
+            )
         )
         await _apply_polled_compute_job_result(
             session_factory,
@@ -749,11 +911,15 @@ async def _process_single_compute_job(
             next_poll_at=next_poll_at,
             status=status,
             accrued_cost_usd=accrued_cost_usd,
-            terminal_status=status.status,
+            terminal_status=ComputeJobStatus.TIMED_OUT
+            if timeout_like
+            else status.status,
             outcome=outcome,
-            terminal_reason=status.message
-            or _meta_message(job)
-            or "compute job finished",
+            terminal_reason=(
+                "compute job exceeded runtime deadline"
+                if timeout_like
+                else status.message or _meta_message(job) or "compute job finished"
+            ),
             exit_code=status.exit_code,
         )
         return
@@ -782,7 +948,8 @@ async def _process_single_compute_job(
         return
     accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
 
-    if job.wall_clock_deadline is not None and job.wall_clock_deadline <= now:
+    runtime_deadline_at = _runtime_deadline_at(job)
+    if runtime_deadline_at is not None and runtime_deadline_at <= now:
         started_at = _utcnow()
         terminate_diagnostic = None
         try:
@@ -790,7 +957,7 @@ async def _process_single_compute_job(
         except Exception as exc:
             failed_at = _utcnow()
             logger.exception(
-                "[COMPUTE_JOB] deadline terminate failed for job=%s: %s",
+                "[COMPUTE_JOB] runtime deadline terminate failed for job=%s: %s",
                 job.id,
                 exc,
             )
@@ -814,7 +981,7 @@ async def _process_single_compute_job(
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
-            terminal_reason="compute job terminated at deadline",
+            terminal_reason="compute job exceeded runtime deadline",
             terminate_ok=terminated,
             compute_rpc_diagnostic=terminate_diagnostic,
         )
@@ -911,6 +1078,13 @@ async def _apply_launch_result(
             seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS
         )
         extra: dict[str, Any] = dict(result.metadata or {})
+        runtime_seconds = _requested_deadline_seconds(live)
+        if runtime_seconds is not None:
+            extra.setdefault("runtime_deadline_seconds", runtime_seconds)
+            extra["runtime_deadline_at"] = (
+                (live.started_at or result.started_at)
+                + timedelta(seconds=runtime_seconds)
+            ).isoformat()
         if result.cost_rate_per_second and result.cost_rate_per_second > 0:
             extra["cost_rate_per_second"] = result.cost_rate_per_second
         extra["status_message"] = result.message or "compute job launched"
@@ -1034,6 +1208,9 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         machine_type=job.machine_type or "",
         spend_cap_usd=float(job.spend_cap_usd or 0.0),
         deadline_at=job.wall_clock_deadline,
+        provisioning_deadline_at=job.wall_clock_deadline,
+        runtime_deadline_seconds=int(meta.get("requested_deadline_seconds") or 0)
+        or None,
         cwd=meta.get("cwd"),
         env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),

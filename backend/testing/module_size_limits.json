@@ -86,7 +86,8 @@
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 2100,
-    "alert_dispatch.py": 1750
+    "alert_dispatch.py": 1750,
+    "compute_jobs.py": 1800
   },
   "agent": {
     "index.ts": 4600,
