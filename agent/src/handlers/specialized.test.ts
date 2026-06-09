@@ -620,6 +620,94 @@ describe('handleInvestigate — report reading and status mapping', () => {
   });
 });
 
+// ── handleInvestigate — adversarial spawn-gate grader branch ──────────────────
+describe('handleInvestigate — adversarial grader', () => {
+  // The adversarial challenge prompt already carries its own output contract:
+  // a JSON array of [{hash, verdict, reason}] objects the backend parser anchors
+  // on. The handler must bypass the investigation template entirely and emit the
+  // raw challenger output as logs.
+  const ADVERSARIAL_TASK = {
+    ...BASE_TASK,
+    context: { adversarial_grader: true, _adversarial_challenged_hashes: ['abc123'] },
+  };
+  const VERDICT_ARRAY = '[{"hash": "abc123", "verdict": "fail", "reason": "premise no longer holds at HEAD"}]';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('runs the raw payload prompt and persists the verdict array verbatim as logs', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The prompt passed to Claude is the raw payload prompt (no investigation
+    // template wrapping) — it must NOT instruct writing the summary/root_cause
+    // schema to /tmp/investigation_report_*.json.
+    const runPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(runPrompt).toContain('investigate the issue');
+    expect(runPrompt).not.toContain('You are an investigation agent');
+    expect(runPrompt).not.toContain('investigation_report_');
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    // logs carry the raw [{hash, verdict, reason}] array, not a JSON.stringify of
+    // a summary/root_cause investigation object.
+    expect(call.logs).toContain('"hash"');
+    expect(call.logs).toContain('"verdict"');
+    expect(call.logs).toBe(VERDICT_ARRAY);
+  });
+
+  it('does NOT consult readHandlerOutput on the adversarial branch', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(readHandlerOutput)).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the transcript tail when no final text is surfaced', async () => {
+    const prose = `Challenged each finding.\n${VERDICT_ARRAY}`;
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: prose, lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toBe(prose);
+  });
+
+  it('sets status FAILED with claude_code_failed on non-zero exitCode', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crashed', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('regression guard: a non-adversarial task still uses the investigation template', async () => {
+    const investigationResult = {
+      summary: 'Found issue', root_cause: 'cause', affected_files: [],
+      recommended_fix: 'fix', severity: 'low', confidence: 'high',
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(investigationResult);
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const runPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(runPrompt).toContain('You are an investigation agent');
+    expect(vi.mocked(readHandlerOutput)).toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(investigationResult));
+  });
+});
+
 // ── handleInvestigate — bounded self-repair on a clean-exit-but-unparseable run ─
 describe('handleInvestigate — bounded self-repair on format miss', () => {
   const RECOVERED = {

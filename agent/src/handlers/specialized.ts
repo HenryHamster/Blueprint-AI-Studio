@@ -736,6 +736,43 @@ export async function handleInvestigate(
   const investigateCtx = task.context as Record<string, unknown> | undefined;
   const investigateCitationProvenance = formatInvestigateCitationProvenance(investigateCtx);
 
+  // ── Adversarial spawn-gate grader branch ──
+  // spawn_forward_quality_grader(adversarial_mode=True) spawns a task of
+  // type "investigate" whose payload prompt (build_adversarial_finding_prompt)
+  // already specifies its own output contract: a JSON array of
+  // [{hash, verdict, reason}] objects. Wrapping that prompt in the standard
+  // investigation template below would instruct Claude to instead write a
+  // single {summary, root_cause, ...} object with NO `hash` field, so the
+  // backend parser (parse_adversarial_finding_verdicts, anchored on the
+  // ['hash','verdict'] keywords) finds no array and every finding fails closed
+  // with "no verdict returned". When this is an adversarial grader, run the raw
+  // payload prompt and let its [{hash, verdict, reason}] output flow straight
+  // through to `logs` unmodified — _resolve_quality_grader_completion reads
+  // payload.logs directly.
+  if (investigateCtx?.adversarial_grader === true) {
+    statusRef.value = 'Running adversarial finding challenge...';
+    const challengeFingerprint = computePromptFingerprint('investigate');
+    setCurrentPromptFingerprint(challengeFingerprint);
+    sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: challengeFingerprint });
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+      `${userPrompt}\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+      ws, statusRef, model, effort, disallowedTools
+    );
+    // Preserve the raw challenger output verbatim — the verdict array lives in
+    // the final text. Prefer lastResultText (the model's final message); fall
+    // back to the transcript tail when the runner did not surface a final text.
+    const challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+      ...(exitCode !== 0
+        ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' }
+        : { artifact_type: 'INVESTIGATION_REPORT' }),
+      logs: challengeLogs,
+    });
+    return;
+  }
+
   const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
