@@ -1302,6 +1302,11 @@ async def _maybe_release_safeguard_gate(
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
+    from app.task_evaluators import (
+        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        spawn_safeguard_challenge,
+    )
+
     safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
     if not safeguard_for_id:
         return
@@ -1318,10 +1323,47 @@ async def _maybe_release_safeguard_gate(
         )
         return
     if has_blocker:
-        logger.info(
-            f"[SAFEGUARD] Gate maintained on {safeguard_for_id[:8]} — critical/high findings"
-        )
-        return
+        _challenge_verdict = (safeguard_task.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+        if _challenge_verdict is not None:
+            outcome = (_challenge_verdict.get("outcome") or "confirmed").lower()
+            if outcome in ("rejected", "downgraded"):
+                # Challenge overrides the blocker — fall through to gate release.
+                logger.info(
+                    "[SAFEGUARD] Gate released on %s — challenge %s the finding: %s",
+                    safeguard_for_id[:8],
+                    outcome,
+                    _challenge_verdict.get("reasoning", ""),
+                )
+            else:
+                logger.info(
+                    "[SAFEGUARD] Gate maintained on %s — challenge confirmed critical/high finding",
+                    safeguard_for_id[:8],
+                )
+                return
+        elif _runtime_config.get("safeguard_challenge_enabled", False):
+            challenge = await spawn_safeguard_challenge(
+                safeguard_task, json.dumps(findings), session
+            )
+            if challenge is not None:
+                logger.info(
+                    "[SAFEGUARD] Gate decision parked for %s — challenge %s spawned",
+                    safeguard_for_id[:8],
+                    challenge.id,
+                )
+                return
+            # spawn returned None (already in flight) — maintain gate
+            logger.info(
+                "[SAFEGUARD] Gate maintained on %s — critical/high findings "
+                "(challenge already in flight)",
+                safeguard_for_id[:8],
+            )
+            return
+        else:
+            logger.info(
+                "[SAFEGUARD] Gate maintained on %s — critical/high findings",
+                safeguard_for_id[:8],
+            )
+            return
     orig.requires_approval = False
     pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
     orig_ctx = dict(orig.context or {})

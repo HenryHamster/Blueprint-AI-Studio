@@ -7564,3 +7564,256 @@ async def test_park_task_catches_up_already_terminal_compute_job(tl_db):
         "park_task must not touch PENDING state for non-compute-job wake kinds"
     )
     assert reg_other.fired_at is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _resolve_safeguard_challenge_completion
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_safeguard_triplet(
+    session,
+    project_id,
+    *,
+    plan_output=None,
+):
+    """Return (orig, safeguard, challenge) set up for _resolve_safeguard_challenge_completion tests.
+
+    orig — EVALUATING, requires_approval=True (simulates review approved, safeguard pending).
+    safeguard — EVALUATING (parked awaiting challenge), with safeguard_for_task_id → orig.
+    challenge — COMPLETED, with SAFEGUARD_CHALLENGE_SOURCE_KEY → safeguard.
+    """
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+
+    orig = await _make_task(
+        session,
+        project_id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"review_approved": True}},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    orig.requires_approval = True
+    session.add(orig)
+    await session.commit()
+
+    safeguard = await _make_task(
+        session,
+        project_id,
+        task_type="security_audit",
+        status=TaskStatus.EVALUATING,
+        context={
+            "safeguard_for_task_id": str(orig.id),
+            "safeguard_pr_number": "88",
+            "awaiting_safeguard_challenge": str(uuid.uuid4()),
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    if plan_output is not None:
+        safeguard.plan_output = plan_output
+        session.add(safeguard)
+        await session.commit()
+
+    challenge = Task(
+        project_id=project_id,
+        payloads=[{"type": "investigate", "prompt": "assess finding"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard.id)},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(challenge)
+    await session.commit()
+    await session.refresh(challenge)
+    return orig, safeguard, challenge
+
+
+@pytest.mark.asyncio
+async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
+    """A COMPLETED challenger with 'rejected' outcome:
+    (a) writes the verdict under SAFEGUARD_CHALLENGE_VERDICT_KEY,
+    (b) restores safeguard to COMPLETED,
+    (c) pops awaiting_safeguard_challenge,
+    (d) re-invokes the gate function, which releases the gate."""
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+    from app.task_lifecycle import _resolve_safeguard_challenge_completion
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    high_finding = {
+        "severity": "high",
+        "title": "Missing auth",
+        "description": "desc",
+        "fix_prompt": "fix it",
+        "file_path": "app/x.py",
+        "line_number": 1,
+    }
+    orig, safeguard, challenge = await _make_safeguard_triplet(
+        session, project.id, plan_output={"findings": [high_finding]}
+    )
+
+    payload = AgentStatusPayload(
+        task_id=challenge.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"outcome": "rejected", "reasoning": "false positive confirmed"}',
+    )
+
+    await _resolve_safeguard_challenge_completion(challenge, payload, session)
+
+    await session.refresh(safeguard)
+    assert safeguard.status == TaskStatus.COMPLETED, "Safeguard must be restored to COMPLETED"
+    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+    assert verdict is not None, "Verdict must be written to safeguard context"
+    assert verdict["outcome"] == "rejected"
+    assert verdict["reasoning"] == "false positive confirmed"
+    assert verdict["challenge_task_id"] == str(challenge.id)
+    assert "awaiting_safeguard_challenge" not in (safeguard.context or {}), (
+        "awaiting_safeguard_challenge must be popped after resolution"
+    )
+
+    await session.refresh(orig)
+    assert orig.requires_approval is False, "Gate must be released on 'rejected' verdict"
+
+
+@pytest.mark.asyncio
+async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
+    """A COMPLETED challenger with 'confirmed' outcome writes the verdict and
+    maintains the merge gate (orig.requires_approval stays True)."""
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+    from app.task_lifecycle import _resolve_safeguard_challenge_completion
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    critical_finding = {
+        "severity": "critical",
+        "title": "SQL injection",
+        "description": "Raw query.",
+        "fix_prompt": "Parameterize.",
+        "file_path": "app/db.py",
+        "line_number": 5,
+    }
+    orig, safeguard, challenge = await _make_safeguard_triplet(
+        session, project.id, plan_output={"findings": [critical_finding]}
+    )
+
+    payload = AgentStatusPayload(
+        task_id=challenge.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"outcome": "confirmed", "reasoning": "genuine SQL injection"}',
+    )
+
+    await _resolve_safeguard_challenge_completion(challenge, payload, session)
+
+    await session.refresh(safeguard)
+    assert safeguard.status == TaskStatus.COMPLETED
+    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+    assert verdict["outcome"] == "confirmed"
+
+    await session.refresh(orig)
+    assert orig.requires_approval is True, "Gate must remain closed on 'confirmed' verdict"
+
+
+@pytest.mark.asyncio
+async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
+    """A FAILED challenger (payload.status != COMPLETED) produces outcome='confirmed'
+    so the merge gate is maintained rather than accidentally released."""
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
+    from app.task_lifecycle import _resolve_safeguard_challenge_completion
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    high_finding = {
+        "severity": "high",
+        "title": "Auth bypass",
+        "description": "desc",
+        "fix_prompt": "fix it",
+        "file_path": "app/y.py",
+        "line_number": 2,
+    }
+    orig, safeguard, challenge = await _make_safeguard_triplet(
+        session, project.id, plan_output={"findings": [high_finding]}
+    )
+
+    payload = AgentStatusPayload(
+        task_id=challenge.id,
+        status=TaskStatus.FAILED,
+        logs=None,
+    )
+
+    await _resolve_safeguard_challenge_completion(challenge, payload, session)
+
+    await session.refresh(safeguard)
+    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+    assert verdict is not None
+    assert verdict["outcome"] == "confirmed", (
+        "A failed challenger must produce 'confirmed' outcome (fail-closed)"
+    )
+    assert safeguard.status == TaskStatus.COMPLETED
+
+    await session.refresh(orig)
+    assert orig.requires_approval is True, "Gate must remain closed when challenger failed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_challenge_invalid_uuid_source_early_return(tl_db):
+    """When SAFEGUARD_CHALLENGE_SOURCE_KEY holds a non-UUID value, the function
+    commits the challenge status message and returns without error."""
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+    from app.task_lifecycle import _resolve_safeguard_challenge_completion
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    challenge = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "assess"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: "not-a-valid-uuid"},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(challenge)
+    await session.commit()
+    await session.refresh(challenge)
+
+    payload = AgentStatusPayload(
+        task_id=challenge.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"outcome": "rejected", "reasoning": "fp"}',
+    )
+
+    # Must not raise even with an invalid source UUID.
+    await _resolve_safeguard_challenge_completion(challenge, payload, session)
+
+
+@pytest.mark.asyncio
+async def test_resolve_challenge_source_gone_early_return(tl_db):
+    """When the safeguard task UUID is valid but not in the DB, the function
+    commits the challenge status message, logs a warning, and returns without error."""
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+    from app.task_lifecycle import _resolve_safeguard_challenge_completion
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    phantom_safeguard_id = uuid.uuid4()  # valid UUID but not in DB
+    challenge = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "assess"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(phantom_safeguard_id)},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(challenge)
+    await session.commit()
+    await session.refresh(challenge)
+
+    payload = AgentStatusPayload(
+        task_id=challenge.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"outcome": "rejected", "reasoning": "fp"}',
+    )
+
+    # Must not raise even when the source safeguard is missing from the DB.
+    await _resolve_safeguard_challenge_completion(challenge, payload, session)

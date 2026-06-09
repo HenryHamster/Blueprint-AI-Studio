@@ -4,7 +4,7 @@
     "main.py": 3900,
     "task_completion.py": 4200,
     "task_completion_self_audit.py": 600,
-    "task_lifecycle.py": 5750,
+    "task_lifecycle.py": 6700,
     "task_lifecycle_requeue.py": 1000,
     "orchestrator.py": 6600,
     "orchestrator_health.py": 1150,

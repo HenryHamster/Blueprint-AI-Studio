@@ -103,6 +103,17 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Independent challenge of a safeguard merge-gate blocker: when True, a
+    # safeguard audit's critical/high finding is independently challenged before
+    # the merge gate is held, and a challenger verdict of "rejected" or
+    # "downgraded" automatically releases the gate with an auditable record.
+    # Ships DARK (default OFF) — OFF preserves today's behavior of blocking on
+    # any raw critical/high finding. Fail-closed: if the challenge errors or
+    # times out the gate stays closed.
+    "safeguard_challenge_enabled": os.getenv(
+        "SAFEGUARD_CHALLENGE_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
