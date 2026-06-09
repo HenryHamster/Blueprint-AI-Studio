@@ -1290,16 +1290,18 @@ def _reconcile_audit_with_challenge(
 
     challenger_refuted: list[dict[str, Any]] = []
     remove_idxs: set[int] = set()
+    available_verdicts = list(challenge_verdicts_list)
 
     for idx, f in deductible:
-        matched = _match_finding_to_challenge(f, challenge_verdicts_list)
+        matched = _match_finding_to_challenge(f, available_verdicts)
         if matched is None:
             return "audit_challenge_missing", None, []
 
         verdict_val = str(matched.get("verdict") or "").lower().strip()
         if verdict_val == "confirmed":
-            pass
+            available_verdicts.remove(matched)
         elif verdict_val == "refuted_false_positive":
+            available_verdicts.remove(matched)
             remove_idxs.add(idx)
             sev = str(f.get("severity") or f.get("level") or "").lower()
             summary = str(

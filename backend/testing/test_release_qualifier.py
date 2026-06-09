@@ -1887,6 +1887,164 @@ class TestComputeAuditChallengeSynthesis:
         assert out["disagreement"]["challenger_only"] == []
         assert out["disagreement"]["overstated_findings"] == []
 
+
+def _make_verified_finding(summary: str, file: str = "") -> dict:
+    """Return a verified high-severity finding for reconciliation tests."""
+    return {
+        "severity": "high",
+        "summary": summary,
+        "file": file,
+        "verification_note": "confirmed via full repo scan with supporting evidence",
+    }
+
+
+def _make_challenge_envelope(sha: str, verdicts: list) -> dict:
+    return {"challenged_candidate_sha": sha, "verdicts": verdicts}
+
+
+class TestReconcileAuditWithChallengeVerdictConsumedOnce:
+    """Each challenge verdict may match at most one deductible finding.
+
+    A single refuted_false_positive cannot cancel multiple distinct real
+    findings, and a single confirmed verdict cannot satisfy multiple findings.
+    """
+
+    SHA = "abc123"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def test_single_refuted_verdict_cannot_exclude_multiple_findings(self):
+        """Two verified findings, one refuted_false_positive verdict (no file).
+
+        The verdict fuzzy-matches the first finding and is consumed; the second
+        finding has no remaining verdict and triggers an audit_challenge_missing HOLD.
+        """
+        finding_a = _make_verified_finding("SQL injection in query builder module")
+        finding_b = _make_verified_finding("Hardcoded credentials in config file")
+        report = self._report([finding_a, finding_b])
+
+        # Single verdict that omits `file` can fuzzy-match either finding by summary,
+        # but after matching the first it should be consumed and unavailable for the second.
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "SQL injection in query builder module",
+                "reason": "not present in current HEAD",
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # The second finding has no verdict left → HOLD, not a silent double exclusion.
+        assert hold == "audit_challenge_missing"
+        assert modified is None
+        assert refuted == []
+
+    def test_single_confirmed_verdict_consumed_by_first_finding(self):
+        """Two findings, one confirmed verdict: second triggers HOLD."""
+        finding_a = _make_verified_finding("Missing authentication on admin endpoint")
+        finding_b = _make_verified_finding("Unsafe deserialization in upload handler")
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "summary": "Missing authentication on admin endpoint",
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold == "audit_challenge_missing"
+        assert modified is None
+
+    def test_two_verdicts_two_findings_both_matched(self):
+        """One-to-one verdict-to-finding matching still works correctly."""
+        finding_a = _make_verified_finding("Race condition in cache invalidation")
+        finding_b = _make_verified_finding("Insecure direct object reference in API")
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "summary": "Race condition in cache invalidation",
+            },
+            {
+                "verdict": "confirmed",
+                "summary": "Insecure direct object reference in API",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Both findings confirmed → no HOLD, report unchanged, no refuted.
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+
+    def test_refuted_verdict_consumed_second_finding_held(self):
+        """One refuted verdict + one confirmed verdict match one finding each."""
+        finding_a = _make_verified_finding("Path traversal vulnerability in file server")
+        finding_b = _make_verified_finding("Weak password hashing algorithm used")
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "Path traversal vulnerability in file server",
+                "reason": "no user input reaches the file path",
+            },
+            {
+                "verdict": "confirmed",
+                "summary": "Weak password hashing algorithm used",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # First finding refuted (removed), second confirmed (kept) → no HOLD.
+        assert hold is None
+        assert modified is not None
+        assert len(modified["findings"]) == 1
+        assert modified["findings"][0]["summary"] == "Weak password hashing algorithm used"
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "Path traversal vulnerability in file server"
+
+    def test_uncertain_verdict_consumed_triggers_hold(self):
+        """An uncertain verdict immediately triggers HOLD (existing behavior preserved)."""
+        finding_a = _make_verified_finding("SSRF vulnerability in outbound request handler")
+        report = self._report([finding_a])
+
+        verdicts = [
+            {
+                "verdict": "uncertain",
+                "summary": "SSRF vulnerability in outbound request handler",
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold == "audit_challenge_uncertain"
+        assert modified is None
+        assert refuted == []
+
+
 class TestChallengedVsUnchallengedTelemetry:
     """Tests for compute_challenged_vs_unchallenged_telemetry (pure function)."""
 

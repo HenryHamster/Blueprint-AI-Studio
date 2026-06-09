@@ -1,12 +1,11 @@
-const PACKER_MEMO_LOG_FRAGMENT = 'stale memo runtime';
+const PACKER_MEMO_LOG_FRAGMENT = 'smoke-direction-retirement-rationale';
 
 const memoTaskPayload = {
-  reasoning_kind: 'regression_false_positive',
+  reasoning_kind: 'direction_retirement',
   source_task_id: 'task-123',
   source_finding: {
-    verdict_reason: PACKER_MEMO_LOG_FRAGMENT,
-    investigation_summary: 'smoke check',
-    regression_class: 'memo',
+    direction_text: 'smoke direction',
+    rationale: PACKER_MEMO_LOG_FRAGMENT,
   },
 } satisfies Record<string, unknown>;
 

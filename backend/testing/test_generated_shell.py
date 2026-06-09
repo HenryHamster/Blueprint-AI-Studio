@@ -657,9 +657,6 @@ _PACKER_HCL = (
 _AGENT_DIR = Path(__file__).resolve().parent.parent.parent / "agent"
 _PACKER_MEMO_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke.ts"
 _PACKER_CODEX_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-codex.ts"
-_PACKER_INVESTIGATION_SMOKE = (
-    _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-investigation.ts"
-)
 _PACKER_PRIMARY_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-primary.ts"
 _PACKER_REOPEN_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-reopen.ts"
 
@@ -680,12 +677,6 @@ def _read_packer_codex_smoke() -> str:
     if not _PACKER_CODEX_SMOKE.exists():
         pytest.skip("agent/src/handlers/memo-bake-smoke-codex.ts not present")
     return _PACKER_CODEX_SMOKE.read_text(encoding="utf-8")
-
-
-def _read_packer_investigation_smoke() -> str:
-    if not _PACKER_INVESTIGATION_SMOKE.exists():
-        pytest.skip("agent/src/handlers/memo-bake-smoke-investigation.ts not present")
-    return _PACKER_INVESTIGATION_SMOKE.read_text(encoding="utf-8")
 
 
 def _read_packer_primary_smoke() -> str:
@@ -764,8 +755,8 @@ class TestPackerMemoBakeContract:
     def test_smoke_validates_log_fragment(self):
         """Fetch stub must also check log content so a handler that posts
         COMPLETED with empty logs is still caught at bake time."""
-        assert "stale memo runtime" in _read_packer_memo_smoke(), (
-            "memo-bake-smoke.ts must validate logs contain 'stale memo runtime'."
+        assert "smoke-direction-retirement-rationale" in _read_packer_memo_smoke(), (
+            "memo-bake-smoke.ts must validate logs contain 'smoke-direction-retirement-rationale'."
         )
 
     def test_smoke_file_is_in_agent_typecheck_surface(self):
@@ -849,16 +840,11 @@ class TestPackerMemoBakeContract:
 
     def test_claude_path_smoke_bypasses_dispatcher_short_circuit(self):
         """Payload must NOT match the dispatcher short-circuit conditions
-        (regression_false_positive / investigation_unactionable with a
-        source_finding object) — otherwise the synth path fires and
-        runClaudeCode is never reached."""
+        (direction_retirement with a source_finding object) — otherwise the
+        synth path fires and runClaudeCode is never reached."""
         codex = _read_packer_codex_smoke()
-        # Dispatcher reasoning_kind values that route to _synthesizeDispatcherMemo.
-        assert "regression_false_positive" not in codex, (
-            "Codex-extractor memo smoke payload must NOT use a dispatcher "
-            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
-        )
-        assert "investigation_unactionable" not in codex, (
+        # The only dispatcher reasoning_kind that routes to _synthesizeDispatcherMemo.
+        assert "direction_retirement" not in codex, (
             "Codex-extractor memo smoke payload must NOT use a dispatcher "
             "reasoning_kind or the synth short-circuit will skip runClaudeCode."
         )
@@ -904,120 +890,15 @@ class TestPackerMemoBakeContract:
             "must run on every bake."
         )
 
-    # ── investigation_unactionable dispatcher arm ────────────────────────────
-    #
-    # _synthesizeDispatcherMemo in handlers/memo.ts has two arms:
-    # regression_false_positive (covered by memo-bake-smoke.ts) and
-    # investigation_unactionable (root_cause / recommended_fix / summary /
-    # outcome). The second arm is emitted in production by
-    # backend/app/task_completion.py, so a regression there could ship inside
-    # a baked image without the bake catching it. These assertions lock in a
-    # dedicated third bake smoke that exercises the investigation arm so any
-    # future packer edit cannot silently drop it.
-
-    def test_investigation_smoke_sentinel_present(self):
-        """Build must emit PACKER_MEMO_INVESTIGATION_OK so the provisioner can
-        gate on the sentinel; without it a silent failure passes undetected."""
-        hcl = _read_packer_hcl()
-        assert "PACKER_MEMO_INVESTIGATION_OK" in hcl, (
-            "agent.pkr.hcl must emit PACKER_MEMO_INVESTIGATION_OK after the "
-            "investigation_unactionable memo smoke."
-        )
-
-    def test_packer_runs_investigation_smoke_file(self):
-        """The provisioner must execute the investigation-path smoke source
-        file directly so the smoke is exercised on every bake."""
-        hcl = _read_packer_hcl()
-        assert "./src/handlers/memo-bake-smoke-investigation.ts" in hcl, (
-            "agent.pkr.hcl must execute "
-            "./src/handlers/memo-bake-smoke-investigation.ts."
-        )
-
-    def test_investigation_smoke_imports_runtime_entrypoint(self):
-        """Smoke must exercise src/handlers/index.ts — the actual shipped
-        entrypoint — not a test double. Wrong module defeats the purpose."""
-        smoke = _read_packer_investigation_smoke()
-        assert "./index.ts" in smoke, (
-            "memo-bake-smoke-investigation.ts must import src/handlers/index.ts."
-        )
-        assert "handlers.memo(" in smoke, (
-            "memo-bake-smoke-investigation.ts must call handlers.memo()."
-        )
-
-    def test_investigation_smoke_uses_dispatcher_reasoning_kind(self):
-        """Payload must use reasoning_kind=investigation_unactionable so the
-        sibling arm of _synthesizeDispatcherMemo fires (otherwise the smoke
-        is testing the wrong code path)."""
-        smoke = _read_packer_investigation_smoke()
-        assert "investigation_unactionable" in smoke, (
-            "memo-bake-smoke-investigation.ts must set "
-            "reasoning_kind=investigation_unactionable so the synth branch "
-            "for that dispatcher arm actually runs."
-        )
-
-    def test_investigation_smoke_exercises_root_cause_field(self):
-        """The investigation_unactionable synth branch reads root_cause from
-        the source_finding object. The smoke must populate it so the branch's
-        distinctive field-extraction logic runs end-to-end."""
-        smoke = _read_packer_investigation_smoke()
-        assert "root_cause" in smoke, (
-            "memo-bake-smoke-investigation.ts must populate "
-            "source_finding.root_cause — that is the distinctive field of the "
-            "investigation_unactionable synth arm."
-        )
-
-    def test_investigation_smoke_validates_completed_status(self):
-        """Fetch stub must assert COMPLETED; accepting any status cannot
-        catch a handler that swallows the completion path."""
-        assert "COMPLETED" in _read_packer_investigation_smoke(), (
-            "memo-bake-smoke-investigation.ts must assert status=COMPLETED."
-        )
-
-    def test_investigation_smoke_validates_log_sentinel(self):
-        """Fetch stub must check that a distinctive content sentinel travels
-        all the way from the source_finding into the COMPLETED logs. The
-        chosen sentinel ('Root cause:' prefix and/or a custom embedded
-        sentinel string) can ONLY appear if the investigation_unactionable
-        synth branch produced the memo — regression_false_positive emits a
-        different prefix ('Verdict reason:')."""
-        smoke = _read_packer_investigation_smoke()
-        # The `Root cause:` prefix is unique to the investigation_unactionable
-        # synth arm — regression_false_positive emits `Verdict reason:` instead.
-        assert "Root cause:" in smoke, (
-            "memo-bake-smoke-investigation.ts must assert the logs contain the "
-            "`Root cause:` prefix that is unique to the investigation_unactionable "
-            "synth branch (regression_false_positive emits `Verdict reason:` "
-            "instead, so this prefix proves the correct arm fired)."
-        )
-        # A custom embedded sentinel inside root_cause is the strongest
-        # signal — it round-trips the payload through the memo JSON.
-        assert "investigation-unactionable bake smoke" in smoke, (
-            "memo-bake-smoke-investigation.ts must embed a custom content "
-            "sentinel (e.g. 'investigation-unactionable bake smoke') in the "
-            "root_cause payload and assert it appears in the COMPLETED logs."
-        )
-
-    def test_investigation_smoke_file_is_in_agent_typecheck_surface(self):
-        """The investigation-path smoke must live under agent/src so the
-        existing tsconfig include + `tsc --noEmit` build covers it."""
-        relative_smoke_path = _PACKER_INVESTIGATION_SMOKE.relative_to(
-            _AGENT_DIR
-        ).as_posix()
-        assert relative_smoke_path.startswith("src/"), (
-            "memo-bake-smoke-investigation.ts must live under agent/src so "
-            "the agent typecheck covers it."
-        )
-
     def test_existing_dispatcher_and_codex_smokes_not_regressed(self):
-        """Adding the investigation smoke must not drop the dispatcher or
-        Codex-path smokes — all three must run on every bake."""
+        """The dispatcher-path and Codex-path smokes must both run on every bake."""
         hcl = _read_packer_hcl()
         assert "PACKER_MEMO_SMOKE_OK" in hcl, (
-            "Dispatcher-path memo smoke sentinel was dropped — all three "
-            "memo smokes must run on every bake."
+            "Dispatcher-path memo smoke sentinel was dropped — both memo "
+            "smokes must run on every bake."
         )
         assert "PACKER_MEMO_CLAUDE_PATH_OK" in hcl, (
-            "Codex-path memo smoke sentinel was dropped — all three memo "
+            "Codex-path memo smoke sentinel was dropped — both memo "
             "smokes must run on every bake."
         )
         assert "./src/handlers/memo-bake-smoke.ts" in hcl, (
@@ -1113,15 +994,10 @@ class TestPackerMemoBakeContract:
 
     def test_primary_path_smoke_bypasses_dispatcher_short_circuit(self):
         """Payload must NOT match the dispatcher short-circuit conditions
-        (regression_false_positive / investigation_unactionable with a
-        source_finding object) — otherwise the synth path fires and
-        runClaudeCode is never reached."""
+        (direction_retirement with a source_finding object) — otherwise the
+        synth path fires and runClaudeCode is never reached."""
         primary = _read_packer_primary_smoke()
-        assert "regression_false_positive" not in primary, (
-            "Primary-path memo smoke payload must NOT use a dispatcher "
-            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
-        )
-        assert "investigation_unactionable" not in primary, (
+        assert "direction_retirement" not in primary, (
             "Primary-path memo smoke payload must NOT use a dispatcher "
             "reasoning_kind or the synth short-circuit will skip runClaudeCode."
         )
@@ -1281,15 +1157,10 @@ class TestPackerMemoReopenContract:
 
     def test_reopen_smoke_bypasses_dispatcher_short_circuit(self):
         """Payload must NOT match the dispatcher short-circuit conditions
-        (regression_false_positive / investigation_unactionable with a
-        source_finding object) — otherwise the synth path fires and
-        runClaudeCode is never reached."""
+        (direction_retirement with a source_finding object) — otherwise the
+        synth path fires and runClaudeCode is never reached."""
         smoke = _read_packer_reopen_smoke()
-        assert "regression_false_positive" not in smoke, (
-            "memo-bake-smoke-reopen.ts payload must NOT use a dispatcher "
-            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
-        )
-        assert "investigation_unactionable" not in smoke, (
+        assert "direction_retirement" not in smoke, (
             "memo-bake-smoke-reopen.ts payload must NOT use a dispatcher "
             "reasoning_kind or the synth short-circuit will skip runClaudeCode."
         )

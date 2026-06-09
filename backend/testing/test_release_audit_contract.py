@@ -23,41 +23,6 @@ from app.release_scoring import (
 _FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "release_audit_sample.json"
 
 
-def _resolve_audits_ts_path() -> "str | None":
-    """Locate ``agent/src/handlers/audits.ts`` across local + Docker envs.
-
-    The release-audit prompt and its JSON schema block live in ``audits.ts``
-    (moved out of ``specialized.ts`` when the agent handlers were decomposed
-    into focused modules in #6597).  Mirrors ``_resolve_prompt_ts_path`` in
-    test_invariants.py.  CI runs pytest inside the backend Docker image (built
-    from ./backend only), so the agent tree is not on the filesystem unless
-    ``scripts/test-backend.sh`` mounts it at ``/agent/src``.  Returns the first
-    existing path or ``None`` to let the test skip rather than error.
-    """
-    env_override = os.getenv("AGENT_AUDITS_TS")
-    candidates = []
-    if env_override:
-        candidates.append(env_override)
-    candidates.append("/agent/src/handlers/audits.ts")
-    candidates.append(
-        os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "agent",
-                "src",
-                "handlers",
-                "audits.ts",
-            )
-        )
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
 @pytest.fixture(scope="module")
 def audit_fixture() -> dict:
     return json.loads(_FIXTURE_PATH.read_text())
@@ -99,6 +64,73 @@ class TestReleaseAuditFixtureShape:
             )
 
 
+def _resolve_audits_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/audits.ts`` across local + Docker envs.
+
+    The release-audit prompt and its JSON schema block live in ``audits.ts``
+    (moved out of ``specialized.ts`` when the agent handlers were decomposed
+    into focused modules in #6597).  CI runs pytest inside the backend Docker
+    image (built from ./backend only), so the agent tree is not on the
+    filesystem unless ``scripts/test-backend.sh`` mounts it at ``/agent/src``.
+    Returns the first existing path or ``None`` to let the test skip rather
+    than error.
+    """
+    env_override = os.getenv("AGENT_AUDITS_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/audits.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "audits.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _resolve_audit_challenge_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/audit-challenge.ts`` across local + Docker.
+
+    The advisory release-audit challenge handler emits a
+    RELEASE_AUDIT_CHALLENGE artifact whose shape a backend consumer reads
+    verbatim; these tests pin that the producer's prompt still documents the
+    contract keys + verdict enum.
+    """
+    env_override = os.getenv("AGENT_AUDIT_CHALLENGE_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/audit-challenge.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "audit-challenge.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 class TestAuditsTsSchemaContract:
     """Introspect agent/src/handlers/audits.ts to ensure the release-audit prompt
     documents 'findings' and 'severity' in its JSON schema block, not legacy
@@ -119,7 +151,6 @@ class TestAuditsTsSchemaContract:
 
     def test_audits_ts_uses_findings_not_issues(self, ts_source):
         """The agent prompt must reference 'findings' as the top-level key."""
-        # The JSON schema block emitted to the LLM must instruct it to use "findings".
         assert '"findings"' in ts_source, (
             "agent/src/handlers/audits.ts does not contain '\"findings\"'; "
             "the prompt may have drifted to a legacy key name"
@@ -140,7 +171,6 @@ class TestAuditsTsSchemaContract:
         """
         import re
 
-        # Inside a TS template literal, ``` is written as \`\`\`.
         blocks = re.findall(r"\\`\\`\\`json\s*(.*?)\\`\\`\\`", ts_source, re.DOTALL)
         audit_blocks = [b for b in blocks if "audit_score" in b]
         assert audit_blocks, (
@@ -171,63 +201,6 @@ class TestAuditsTsSchemaContract:
             "The JSON schema block in audits.ts uses 'level' as a severity "
             "field name — must use 'severity' to avoid drift"
         )
-
-    def _extract_challenge_schema_block(self, ts_source: str) -> str:
-        import re
-
-        blocks = re.findall(r"\\`\\`\\`json\s*(.*?)\\`\\`\\`", ts_source, re.DOTALL)
-        challenge_blocks = [b for b in blocks if "challenge_severity" in b]
-        assert challenge_blocks, (
-            "Could not find a fenced JSON block containing 'challenge_severity' "
-            "in agent/src/handlers/audits.ts"
-        )
-        return challenge_blocks[0]
-
-    def test_audits_ts_challenge_schema_uses_backend_contract_keys(self, ts_source):
-        assert "RELEASE_AUDIT_CHALLENGE_REPORT" in ts_source
-        schema_block = self._extract_challenge_schema_block(ts_source)
-        for key in (
-            "agreement",
-            "agreement_assessment",
-            "missing_findings",
-            "overstated_findings",
-            "challenge_severity",
-            "severity",
-        ):
-            assert f'"{key}"' in schema_block
-        assert '"issues"' not in schema_block
-        assert '"level"' not in schema_block
-
-def _resolve_audit_challenge_ts_path() -> "str | None":
-    """Locate ``agent/src/handlers/audit-challenge.ts`` across local + Docker.
-
-    Mirrors :func:`_resolve_audits_ts_path`.  The advisory release-audit
-    challenge handler emits a RELEASE_AUDIT_CHALLENGE artifact whose shape a
-    backend consumer reads verbatim; these tests pin that the producer's prompt
-    still documents the contract keys + verdict enum.
-    """
-    env_override = os.getenv("AGENT_AUDIT_CHALLENGE_TS")
-    candidates = []
-    if env_override:
-        candidates.append(env_override)
-    candidates.append("/agent/src/handlers/audit-challenge.ts")
-    candidates.append(
-        os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "agent",
-                "src",
-                "handlers",
-                "audit-challenge.ts",
-            )
-        )
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
 
 
 class TestAuditChallengeTsContract:
