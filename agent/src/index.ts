@@ -26,7 +26,7 @@ import {
 import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
   PROCESS_KILL_GRACE_MS,
-  HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
+  HEARTBEAT_INTERVAL, MAX_LOG_BUFFER, HEARTBEAT_INFLIGHT_DEADLINE,
   HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -642,11 +642,23 @@ export async function apiRequest(
 ): Promise<unknown> {
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
+    // The abort timer must cover the response BODY read, not just the headers.
+    // Clearing it the instant `fetch()` resolves (the prior behaviour) left
+    // `await res.json()/res.text()` UNBOUNDED by our timeout: a server that
+    // returns headers and then stalls the body hangs the request indefinitely
+    // (undici's own body timeout is far longer, or never if bytes trickle). On
+    // the heartbeat path such a hang never settled, so the `heartbeatInFlight`
+    // mutex latched and silenced every subsequent liveness POST (rich heartbeat
+    // AND off-row vmcontact ping) until the reaper false-killed a live VM as
+    // AGENT_TIMEOUT (the 1474c03c failure mode). Re-arm a fresh body-phase timer
+    // after headers and clear it in `finally` on every exit path, so the whole
+    // request always settles (~2×timeoutMs worst case).
+    const controller = new AbortController();
+    let timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { ...init(), signal: controller.signal });
       clearTimeout(timeout);
+      timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
       if (res.ok) return await res.json() as unknown;
       const text = await res.text();
 
@@ -691,6 +703,10 @@ export async function apiRequest(
       // intentionally excluded from the 4xx bail-out via the explicit check
       // above, which uses `continue` before this catch runs.
       if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
+    } finally {
+      // Clear whichever timer is currently armed (header- or body-phase) on
+      // every exit: return, throw, 401/429 `continue`, or 5xx fall-through.
+      clearTimeout(timeout);
     }
     await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, API_RETRY_BACKOFF_MAX_MS)));
   }
@@ -1824,7 +1840,19 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
 // and add pressure on the event loop. With the mutex the next tick simply
 // skips and logs — last_heartbeat at the orchestrator stays correct because
 // the previous in-flight call still finishes and reports.
+//
+// DEADLINE ESCAPE (durability): the mutex above assumes the in-flight POST
+// eventually settles. If one ever hangs (e.g. a stalled response body — see the
+// apiRequest body-phase timeout), the flag latches `true` forever and EVERY
+// subsequent tick skips, silencing both the rich heartbeat AND the off-row
+// vmcontact liveness ping → the reaper false-kills a live VM as AGENT_TIMEOUT
+// (the 1474c03c failure mode). So a tick that finds the slot held longer than
+// HEARTBEAT_INFLIGHT_DEADLINE treats the prior POST as wedged and reclaims it.
+// A `generation` token stops a late-settling wedged POST from clobbering the
+// reclaiming tick's own in-flight flag.
 let heartbeatInFlight = false;
+let heartbeatInFlightSince = 0;
+let heartbeatGeneration = 0;
 
 function startHeartbeat(taskId: string, getMessage: () => string) {
   // Fire first heartbeat immediately — don't wait 30s.
@@ -1875,11 +1903,23 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       return;
     }
     if (heartbeatInFlight) {
-      traceHeartbeat('periodic', Date.now(), Date.now(), 'skip-in-flight');
-      log('Heartbeat skipped — previous still in flight');
-      return;
+      const heldMs = Date.now() - heartbeatInFlightSince;
+      if (heldMs <= HEARTBEAT_INFLIGHT_DEADLINE) {
+        traceHeartbeat('periodic', Date.now(), Date.now(), 'skip-in-flight');
+        log('Heartbeat skipped — previous still in flight');
+        return;
+      }
+      // Held past the deadline — the prior POST is wedged (should be impossible
+      // now that apiRequest bounds the body read, but this keeps liveness
+      // un-latchable regardless). Reclaim the slot so heartbeats resume; the
+      // generation bump below stops the wedged POST's `finally` from clearing
+      // the new tick's flag when it eventually settles.
+      log(`Heartbeat in-flight ${Math.round(heldMs / 1000)}s > deadline — reclaiming slot (prior POST wedged)`);
+      traceHeartbeat('periodic', Date.now(), Date.now(), 'reclaim-wedged');
     }
     heartbeatInFlight = true;
+    heartbeatInFlightSince = Date.now();
+    const myGeneration = ++heartbeatGeneration;
     const start = Date.now();
     const metrics = collectMetrics();
     // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
@@ -1983,7 +2023,11 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     } finally {
-      heartbeatInFlight = false;
+      // Only release the slot if a later tick hasn't already reclaimed it (i.e.
+      // this POST wasn't declared wedged and superseded). Without the guard, a
+      // wedged POST settling late would clear the reclaiming tick's flag and let
+      // a third overlap through.
+      if (heartbeatGeneration === myGeneration) heartbeatInFlight = false;
     }
   })().catch((e: unknown) => { log(`Heartbeat outer error (W4/C1): ${String(e)}`); }); }, HEARTBEAT_INTERVAL);
 }
@@ -1995,7 +2039,10 @@ function stopHeartbeat() {
   // tasks) starts the next task with a clean in-flight state. Without this,
   // a stuck heartbeat at role-end would leave the flag true and the new
   // task's first periodic tick would skip-and-log instead of firing.
+  // (heartbeatGeneration is intentionally left monotonic — it only needs to be
+  // unique per tick, never reset.)
   heartbeatInFlight = false;
+  heartbeatInFlightSince = 0;
 }
 
 /** Test-only: drive the heartbeat loop without running main(). */

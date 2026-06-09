@@ -69,6 +69,17 @@ export const LOG_TAIL_BYTES = 5_000;
 // Heartbeat
 export const HEARTBEAT_INTERVAL = 30_000;
 
+// Deadline-escape for the heartbeat in-flight mutex. If a heartbeat POST stays
+// outstanding longer than this, the next tick treats it as wedged and reclaims
+// the slot so liveness can't be latched silent by a single hung request. Set
+// above the worst-case LEGIT hold so a merely-slow cycle doesn't spuriously
+// reclaim: a fully-stalling 409 retry chain (a fast 409, then two body-stalling
+// retry POSTs each bounded to ~2×HEARTBEAT_API_TIMEOUT by the apiRequest
+// body-phase re-arm, plus the 5s/10s inter-retry backoffs) is ~100s. And well
+// below the reaper's 5-minute (300s) no-heartbeat cutoff, so a genuine wedge is
+// reclaimed (≤150s + one 30s tick) with ample margin before a false reap.
+export const HEARTBEAT_INFLIGHT_DEADLINE = 150_000;
+
 // Proactive agent-JWT refresh timing.
 // The agent decodes the token's real exp claim and schedules refresh at
 // FRACTION of remaining lifetime, clamped to [FLOOR, CEILING]. This removes

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -95,6 +95,8 @@ import {
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
   BOOTSTRAP_TOKEN_THRESHOLD_MS,
+  HEARTBEAT_INTERVAL,
+  HEARTBEAT_INFLIGHT_DEADLINE,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -5669,6 +5671,59 @@ describe('readAgentSourceSha', () => {
   });
 });
 
+describe('apiRequest body-read timeout', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('aborts a stalled response body instead of hanging forever', async () => {
+    vi.useFakeTimers();
+    // fetch resolves (headers arrive) but the body read (res.json) never
+    // settles on its own — it only rejects when the request signal aborts.
+    // Pre-fix, the abort timer was cleared right after headers, leaving this
+    // read unbounded → the promise would hang forever (the heartbeat-latch
+    // root cause). Post-fix, the re-armed body-phase timer aborts it.
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      const signal = init?.signal;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject(new Error('The operation was aborted'));
+          });
+        }),
+        text: () => Promise.resolve(''),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // retries=1 (single attempt), timeout=5s.
+    const p = apiRequest('POST', '/api/agent/heartbeat', () => ({ method: 'POST' }), 1, 5_000);
+    const settled = expect(p).rejects.toThrow(/aborted/);
+    // Without the body-phase timer this advance would not settle the promise.
+    await vi.advanceTimersByTimeAsync(5_000);
+    await settled;
+  });
+
+  it('does not abort a body that arrives within the timeout', async () => {
+    vi.useFakeTimers();
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ status: 'ok' }),
+      text: () => Promise.resolve(''),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await apiPost('/api/agent/heartbeat', {}, 1, 5_000);
+    expect(result).toEqual({ status: 'ok' });
+    // No dangling abort timer should fire after a clean read.
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+});
+
 describe('agent runtime fingerprint heartbeats', () => {
   let fetchMock: FetchMock;
   const runtimeFingerprint = 'a'.repeat(64);
@@ -5747,6 +5802,33 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(body.task_id).toBe('task-runtime-fp');
     expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
     expect(body.agent_source_sha).toBe(sourceSha);
+  });
+
+  it('reclaims the in-flight slot when a heartbeat POST wedges past the deadline', async () => {
+    vi.useFakeTimers();
+    let heartbeatCalls = 0;
+    // Every heartbeat POST hangs forever (never resolves). Pre-fix, the first
+    // periodic tick would latch `heartbeatInFlight` and every later tick would
+    // skip indefinitely → liveness silenced → false AGENT_TIMEOUT. Post-fix, a
+    // tick past HEARTBEAT_INFLIGHT_DEADLINE reclaims the slot and fires again.
+    fetchMock.mockImplementation((input: unknown) => {
+      if (String(input).endsWith('/api/agent/heartbeat')) {
+        heartbeatCalls += 1;
+        return new Promise(() => { /* never settles */ });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+
+    _startHeartbeatForTesting('task-wedged', () => 'hb');
+    // Initial fire + the first periodic tick each start a (hanging) POST.
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL + 5);
+    const callsAfterFirstTick = heartbeatCalls;
+    // Ticks within the deadline must skip — no new POSTs.
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INFLIGHT_DEADLINE - HEARTBEAT_INTERVAL);
+    expect(heartbeatCalls).toBe(callsAfterFirstTick);
+    // Once held past the deadline, the next tick reclaims and fires a new POST.
+    await vi.advanceTimersByTimeAsync(2 * HEARTBEAT_INTERVAL);
+    expect(heartbeatCalls).toBeGreaterThan(callsAfterFirstTick);
   });
 });
 
