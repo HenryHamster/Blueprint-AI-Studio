@@ -281,9 +281,13 @@ interface SchemaFormProps {
 // field in the UI and shows the reason; the backend will also ignore it, but
 // catching it at the UI layer keeps the operator from setting a dead knob.
 function crossFieldLock(key: string, bag: ProviderSettingsBag): string | null {
-  // Anthropic: advisor only makes sense with a non-opus executor, because
-  // opus+opus advisor is silently ignored by settings_to_cli.
-  if (key === 'advisor' && (bag.model === 'claude-opus-4-8' || bag.model === 'claude-opus-4-7')) {
+  // Anthropic: advisor only makes sense with a non-advisor-class executor,
+  // because an opus/fable executor + opus advisor is silently ignored by
+  // settings_to_cli.
+  if (
+    key === 'advisor' &&
+    (bag.model === 'claude-fable-5' || bag.model === 'claude-opus-4-8' || bag.model === 'claude-opus-4-7')
+  ) {
     return 'Advisor only applies when the executor model is sonnet or haiku.';
   }
   return null;

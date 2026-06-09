@@ -341,7 +341,7 @@ class TestOpenAITierAndEffort:
 # ---------------------------------------------------------------------------
 # Anthropic 1M context opt-in — regression for the missed capability.
 # The [1m] suffix on the model ID is the documented activation mechanism;
-# model-gated to opus-4-8, opus-4-7, opus-4-6, sonnet-4-6.
+# model-gated to fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-4-6.
 # ---------------------------------------------------------------------------
 
 
@@ -349,6 +349,7 @@ class TestAnthropic1MContext:
     @pytest.mark.parametrize(
         "model",
         [
+            "claude-fable-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
@@ -658,10 +659,15 @@ class TestGeminiLegacyAliases:
         assert provider.fallback_model(None) is None
         assert provider.fallback_model("") is None
 
-    def test_base_class_returns_none_by_default(self):
-        """Anthropic doesn't gate models per key; no fallback map needed."""
+    def test_anthropic_fallback_map_covers_fable_only(self):
+        """Anthropic's only restricted entry is the TEMPORARY fable-5 →
+        opus-4-8 mapping (removal-safety net for the limited-availability
+        window); GA models have no fallback."""
         provider = get_provider(LLMProviderName.ANTHROPIC)
+        assert provider.fallback_model("claude-fable-5") == "claude-opus-4-8"
+        assert provider.fallback_model("claude-opus-4-8") is None
         assert provider.fallback_model("claude-opus-4-7") is None
+        assert provider.fallback_model(None) is None
 
 
 # ── Usage-headroom probe (provider-agnostic, advisory) ───────────────────────

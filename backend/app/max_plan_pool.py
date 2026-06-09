@@ -596,6 +596,13 @@ _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-7": ("claude-opus-4-8",),
     "claude-opus-4-6": ("claude-opus-4-8",),
     "claude-sonnet-4-6": ("claude-opus-4-8",),
+    # TEMPORARY (fable availability window ~2 weeks from 2026-06-09): tracked
+    # on its own meter — we don't yet know whether a fable 429 implies the
+    # shared opus session bucket is exhausted. If it does, the CLI-level
+    # --fallback-model opus retry 429s immediately and the normal patterns
+    # disable the account, so isolation fails safe. On removal, rewrite to
+    # ("claude-opus-4-8",) like the legacy entries above.
+    "claude-fable-5": ("claude-fable-5",),
 }
 
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -1876,7 +1883,7 @@ def _runtime_config_snapshot() -> Mapping[str, Any]:
         from app.shared_state import runtime_config as _rc
 
         return _rc if isinstance(_rc, Mapping) else {}
-    except Exception:  # noqa: BLE001 — advisory; absence means feature off
+    except Exception:  # advisory; absence means feature off
         return {}
 
 
@@ -1976,7 +1983,7 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
         snapshot = await provider.probe_usage(
             secret, LLMAuthMode(auth_mode_raw), acct.get("provider_metadata") or {}
         )
-    except Exception as exc:  # noqa: BLE001 — advisory; cache unknown on failure
+    except Exception as exc:  # advisory; cache unknown on failure
         logger.debug("[POOL] usage probe errored for %s: %s", acct_id, exc)
         snapshot = UsageSnapshot.unknown()
     async with _max_plan_pool_lock:
@@ -2732,9 +2739,10 @@ def build_account_retarget_manifest(
             settings = resolve_task_provider_settings(
                 task, runtime_config, resolved_provider
             )
-        except Exception:  # noqa: BLE001 — settings are best-effort; a bad bag
-            # must not block the credential re-target (the agent falls back to
-            # provider defaults). Loud failure here would strand the warm claim.
+        except Exception:
+            # Settings are best-effort; a bad bag must not block the
+            # credential re-target (the agent falls back to provider
+            # defaults). Loud failure here would strand the warm claim.
             logger.exception(
                 "[WARM-POOL] provider-settings resolve failed for re-target "
                 "account=%s provider=%s; emitting manifest without settings",
