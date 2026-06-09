@@ -1894,18 +1894,15 @@ async def _finalize_qualification(
         audit_challenge_reason = "challenge_spawn_failed"
 
     audit_score, test_erosion_score = _score_audit(audit_report)
-    # Observability: record model-reported vs findings-derived score delta and
-    # count of findings excluded for missing/short verification_note.  Use the
-    # original (un-reconciled) report for the model-vs-derived cross-check.
-    audit_reconciliation = _compute_audit_reconciliation(audit_report)
-    audit_reconciliation = {
-        **audit_reconciliation,
-        "audit_challenge": _compute_audit_challenge_synthesis(
-            audit_report,
-            audit_challenge_report,
-            challenge_reason=audit_challenge_reason,
-        ),
-    }
+    # Pre-compute challenge synthesis now (uses original reports — correct for
+    # synthesis observability).  The reconciliation record is deferred until AFTER
+    # _reconcile_audit_with_challenge so findings_derived_score is computed on the
+    # reconciled report and agrees with the applied audit_score.
+    _audit_challenge_synthesis = _compute_audit_challenge_synthesis(
+        audit_report,
+        audit_challenge_report,
+        challenge_reason=audit_challenge_reason,
+    )
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
@@ -2038,6 +2035,16 @@ async def _finalize_qualification(
     # strategic agent can target them.  Use reconciled report when available so
     # refuted findings are not surfaced as actionable blockers.
     audit_findings = _extract_audit_findings(_audit_report_scored)
+    # Build the reconciliation record on the RECONCILED report so
+    # findings_derived_score agrees with the applied audit_score.  The challenge
+    # synthesis (computed above on original reports) is merged in, plus a distinct
+    # count of challenge-driven exclusions — kept separate from excluded_findings_count
+    # (verification-gate drops) so they are never double-counted.
+    audit_reconciliation = {
+        **_compute_audit_reconciliation(_audit_report_scored),
+        "audit_challenge": _audit_challenge_synthesis,
+        "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
+    }
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed

@@ -4721,6 +4721,112 @@ async def test_finalize_refuted_finding_excluded_and_recorded(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_counts_challenge_exclusion_separately_from_verification_gate(
+    db_session, mocker
+):
+    """The audit_reconciliation record uses TWO distinct exclusion counts.
+
+    - excluded_findings_count  — findings the VERIFICATION GATE dropped (unverified
+      primary findings that lack a substantive verification_note).
+    - challenge_excluded_findings_count — findings the CHALLENGE GATE excluded
+      (challenger marked refuted_false_positive).
+
+    A run with one unverified-primary drop AND one challenger-refuted finding must
+    show each in its own count; neither may appear in the other.  Furthermore,
+    findings_derived_score in the reconciliation record must agree with the applied
+    audit sub-score (no contradiction visible to an operator reading the record).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.70,
+            "findings": [
+                {
+                    # VERIFIED high finding — challenger will refute this one.
+                    "severity": "high",
+                    "summary": "XSS vulnerability in template rendering.",
+                    "file": "app/templates.py",
+                    "verification_note": "Confirmed: user input reaches template without escaping.",
+                },
+                {
+                    # UNVERIFIED high finding — verification gate drops this one.
+                    "severity": "high",
+                    "summary": "Potential SQL injection in query builder.",
+                    # No verification_note → fails _finding_is_verified → excluded_findings_count
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Challenge refutes the verified finding (the unverified one is invisible to
+    # the challenge gate since it never passed the verification gate).
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "high",
+                "summary": "XSS vulnerability in template rendering.",
+                "file": "app/templates.py",
+                "verdict": "refuted_false_positive",
+                "reason": "Template output is auto-escaped by the framework — not a real XSS.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    lq = version.last_qualification
+
+    recon = lq["audit_reconciliation"]
+
+    # 1. The verified+refuted finding is excluded via challenge gate (not verification gate).
+    assert recon["challenge_excluded_findings_count"] == 1
+
+    # 2. The unverified finding is excluded via verification gate (not challenge gate).
+    assert recon["excluded_findings_count"] == 1
+
+    # 3. The two counts represent DIFFERENT findings — they must never overlap.
+    #    (Both equal 1, so their sum is 2, covering both findings separately.)
+    assert recon["challenge_excluded_findings_count"] + recon["excluded_findings_count"] == 2
+
+    # 4. findings_derived_score agrees with the applied audit sub-score.
+    #    Only the unverified finding is left after challenge removes the verified one;
+    #    the unverified finding also passes through _score_audit untouched (it has no
+    #    verification_note so it is silently skipped) → derived score is 1.0.
+    applied_audit = lq["sub_scores"]["audit"]
+    assert recon["findings_derived_score"] == pytest.approx(applied_audit, abs=0.01), (
+        f"findings_derived_score {recon['findings_derived_score']} disagrees with "
+        f"applied audit sub-score {applied_audit}"
+    )
+    # The refuted verified high finding no longer deducts → audit score is 1.0.
+    assert applied_audit == pytest.approx(1.0, abs=0.01)
+
+
+@pytest.mark.asyncio
 async def test_finalize_challenge_matches_nonverbatim_challenger_summary(
     db_session, mocker
 ):
