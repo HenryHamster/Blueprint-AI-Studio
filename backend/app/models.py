@@ -91,9 +91,9 @@ def _coerce_provider_context_values(raw: object) -> list[str]:
     if isinstance(raw, str) and raw.strip():
         values.append(raw.strip())
     elif isinstance(raw, (list, tuple, set)):
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                values.append(item.strip())
+        values.extend(
+            item.strip() for item in raw if isinstance(item, str) and item.strip()
+        )
     return values
 
 
@@ -219,6 +219,7 @@ class ArtifactType(str, Enum):
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
+    RELEASE_AUDIT_CHALLENGE_REPORT = "RELEASE_AUDIT_CHALLENGE_REPORT"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is

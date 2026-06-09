@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import release_version
 from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
 from app.models import QualificationVerdict, ReleaseVersion
+from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
 from app.shared_state import resolve_project_promotion_enabled
 
 logger = logging.getLogger(__name__)
@@ -425,6 +426,39 @@ def _empty_readiness(
         "regime": "pre_go_live_calibration",
         "is_current_readiness": True,
     }
+
+
+async def get_challenged_vs_unchallenged_telemetry(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window: int = 100,
+) -> dict[str, Any]:
+    """Query QualificationVerdict history and compare challenged vs unchallenged audits.
+
+    Fetches the most recent ``window`` verdicts for the project and delegates
+    to :func:`compute_challenged_vs_unchallenged_telemetry` (pure, no I/O) to
+    partition them into challenged vs unchallenged cohorts and compute the
+    comparison.  Advisory and read-only — no effect on scoring or promotion.
+    """
+    stmt = (
+        select(QualificationVerdict)
+        .where(QualificationVerdict.project_id == project_id)
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(window)
+    )
+    verdicts = list((await session.execute(stmt)).scalars().all())
+    verdict_dicts = [
+        {
+            "audit_reconciliation": v.audit_reconciliation,
+            "would_promote": v.would_promote,
+            "terminal_status": v.terminal_status,
+            "post_promotion_outcome": v.post_promotion_outcome,
+            "excluded_audit_findings": v.excluded_audit_findings,
+        }
+        for v in verdicts
+    ]
+    return compute_challenged_vs_unchallenged_telemetry(verdict_dicts)
 
 
 async def compute_promotion_readiness(

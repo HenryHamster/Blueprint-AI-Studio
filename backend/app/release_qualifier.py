@@ -62,6 +62,7 @@ Public API: ``run_qualification``, ``maybe_finalize_qualification``,
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,7 @@ from app.acceptance_gate import (
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import (
+    Artifact,
     ArtifactType,
     Project,
     Task,
@@ -126,6 +128,7 @@ from app.release_qualifier_audit import (
     _latest_artifact_logs,
     _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_smoketest_task,
+    _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
@@ -149,19 +152,22 @@ from app.release_scoring import (
     _MAX_CARRIED_FINDINGS,  # noqa: F401
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
     _MAX_FAILED_SMOKE_TESTS,  # noqa: F401 — re-exported for callers/tests
+    _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
     _SEVERITY_RANK,  # noqa: F401
     _audit_missing_reason,
     _clamp01,  # noqa: F401
     _classify_check_runs,
     _compute_audit_reconciliation,
+    _compute_audit_challenge_synthesis,
     _extract_audit_findings,
     _extract_excluded_audit_findings,
-    _extract_smoketest_detail,  # noqa: F401 — re-exported for callers/tests
-    _extract_test_erosion_detail,  # noqa: F401 — re-exported for callers/tests
+    _extract_smoketest_detail,
+    _extract_test_erosion_detail,
     _finding_subject_is_authorized_divergence,  # noqa: F401 — re-exported for tests
     _fmt_sub_scores,
     _score_audit,
     _score_smoketest,
+    compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
 )
 from app.acceptance_gate import summarize_version_acceptance_aggregate
@@ -213,6 +219,7 @@ from app.release_readiness import (
     compute_promotion_readiness,  # noqa: F401 — re-exported for strategic_spawning + tests
     format_qualification_for_api,  # noqa: F401 — re-exported for tests
     format_verdict_for_api,  # noqa: F401 — re-exported for tests
+    get_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
 )
 from app.shared_state import (
     get_project_integration_branch,
@@ -1270,6 +1277,8 @@ async def run_qualification(
     # the design doc specifies (audit + test-erosion + smoketest).
     smoketest_enabled = bool(_runtime_config.get("smoketest_enabled"))
     audit_task_id: str | None = None
+    audit_challenge_task_id: str | None = None
+    audit_challenge_spawn_error: str | None = None
     smoketest_task_id: str | None = None
     try:
         audit_task = await _spawn_release_audit_task(
@@ -1281,6 +1290,27 @@ async def run_qualification(
             candidate_sha=candidate_sha,
         )
         audit_task_id = str(audit_task.id)
+        try:
+            audit_challenge_task = await _spawn_release_audit_challenge_task(
+                session,
+                project_id,
+                version_id=version.id,
+                base_branch=promotion_target,
+                diff_range=diff_range,
+                candidate_sha=candidate_sha,
+                primary_audit_task_id=audit_task_id,
+            )
+            audit_challenge_task_id = str(audit_challenge_task.id)
+        except Exception as exc:  # noqa: BLE001 — advisory task must not block qualification
+            audit_challenge_spawn_error = str(exc)[:300]
+            logger.warning(
+                "[RELEASE_QUALIFIER] advisory audit challenge spawn failed for "
+                "version v%d candidate %s (qualification continues): %s",
+                version.version_number,
+                candidate_sha[:8],
+                exc,
+                exc_info=True,
+            )
         if smoketest_enabled:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
@@ -1330,6 +1360,8 @@ async def run_qualification(
         "smoketest_enabled": smoketest_enabled,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
+        "audit_challenge_task_id": audit_challenge_task_id,
+        "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "smoketest_task_id": smoketest_task_id,
         "prior_infra_streak": prior_infra_streak,
     }
@@ -1345,13 +1377,14 @@ async def run_qualification(
     logger.info(
         "[RELEASE_QUALIFIER] qualification started for v%d project=%s "
         "candidate=%s ci_green=%s smoketest_enabled=%s audit_task=%s "
-        "smoketest_task=%s",
+        "audit_challenge_task=%s smoketest_task=%s",
         version.version_number,
         project_id,
         candidate_sha[:8],
         ci_green,
         smoketest_enabled,
         audit_task_id,
+        audit_challenge_task_id,
         smoketest_task_id,
     )
     return {
@@ -1361,6 +1394,8 @@ async def run_qualification(
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "audit_task_id": audit_task_id,
+        "audit_challenge_task_id": audit_challenge_task_id,
+        "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "smoketest_task_id": smoketest_task_id,
     }
 
@@ -1594,6 +1629,57 @@ async def _compute_acceptance_window_aggregate(
     }
 
 
+async def _load_release_audit_challenge_report(
+    session: AsyncSession,
+    challenge_task_id: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Load optional advisory challenge evidence without affecting qualification."""
+    if not challenge_task_id:
+        return None, "challenge_absent"
+    try:
+        task_id = uuid.UUID(str(challenge_task_id))
+    except (ValueError, TypeError):
+        return None, "challenge_task_id_invalid"
+
+    challenge_task = await session.get(Task, task_id)
+    if challenge_task is None:
+        return None, "challenge_task_missing"
+    if challenge_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return None, f"challenge_task_{challenge_task.status.lower()}"
+    if challenge_task.status != TaskStatus.COMPLETED:
+        return None, f"challenge_task_{challenge_task.status.lower()}"
+
+    artifact = (
+        (
+            await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id == task_id,
+                    Artifact.artifact_type
+                    == ArtifactType.RELEASE_AUDIT_CHALLENGE_REPORT,
+                )
+                .order_by(Artifact.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if artifact is None or not artifact.logs:
+        return None, "challenge_absent"
+    try:
+        parsed = json.loads(artifact.logs)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] challenge artifact for task %s is unparseable",
+            task_id,
+        )
+        return None, "challenge_unparseable"
+    if not isinstance(parsed, dict):
+        return None, "challenge_unparseable"
+    return parsed, None
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1628,6 +1714,7 @@ async def _finalize_qualification(
     qual = dict(version.last_qualification or {})
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
+    audit_challenge_task_id = qual.get("audit_challenge_task_id")
     smoketest_task_id = qual.get("smoketest_task_id")
     # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
     # Read from the recorded qualification (NOT live runtime_config) — the
@@ -1796,10 +1883,27 @@ async def _finalize_qualification(
             session, version, qual, "audit_report_missing"
         )
 
+    audit_challenge_report, audit_challenge_reason = (
+        await _load_release_audit_challenge_report(session, audit_challenge_task_id)
+    )
+    if (
+        audit_challenge_reason == "challenge_absent"
+        and qual.get("audit_challenge_spawn_error")
+    ):
+        audit_challenge_reason = "challenge_spawn_failed"
+
     audit_score, test_erosion_score = _score_audit(audit_report)
     # Observability: record model-reported vs findings-derived score delta and
     # count of findings excluded for missing/short verification_note.
     audit_reconciliation = _compute_audit_reconciliation(audit_report)
+    audit_reconciliation = {
+        **audit_reconciliation,
+        "audit_challenge": _compute_audit_challenge_synthesis(
+            audit_report,
+            audit_challenge_report,
+            challenge_reason=audit_challenge_reason,
+        ),
+    }
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
@@ -1972,6 +2076,7 @@ async def _finalize_qualification(
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": audit_task_id,
+        "audit_challenge_task_id": audit_challenge_task_id,
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
         "excluded_audit_findings": excluded_audit_findings,

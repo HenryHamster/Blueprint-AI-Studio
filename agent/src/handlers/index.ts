@@ -22,7 +22,9 @@ import { handleReview, handleFix } from './review-fix.js';
 import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
-import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
+import {
+  handleSecurityAudit, handleSelfAudit, handleReleaseAudit, handleReleaseAuditChallenge,
+} from './audits.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
@@ -80,6 +82,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   design_doc_update: handleDesignDocUpdate,
   strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
+  release_audit_challenge: handleReleaseAuditChallenge,
   memo: handleMemo,
   verify_tests: handleVerifyTests,
   compute_experiment: handleComputeExperiment,

@@ -127,6 +127,79 @@ async def _spawn_release_audit_task(
     return task
 
 
+async def _spawn_release_audit_challenge_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    base_branch: str,
+    diff_range: str,
+    candidate_sha: str,
+    primary_audit_task_id: str,
+) -> Task:
+    """Create + queue an advisory ``release_audit_challenge`` task."""
+    payload: dict[str, Any] = {
+        "type": "release_audit_challenge",
+        "base_branch": base_branch,
+        "diff_range": diff_range,
+        "candidate_sha": candidate_sha,
+        "primary_audit_task_id": primary_audit_task_id,
+        "primary_audit_report": None,
+    }
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        "release_audit_challenge"
+    )
+    if type_model:
+        payload["model"] = type_model
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        "release_audit_challenge"
+    )
+    if type_effort:
+        payload["effort"] = type_effort
+    try:
+        payload = validate_internal_payload(
+            payload, "release_qualifier:release_audit_challenge"
+        )
+    except PayloadTooLargeError:
+        # Challenger payloads are tiny; a too-large error here is a real bug.
+        raise
+
+    task = Task(
+        project_id=project_id,
+        title=f"Release audit challenge: {base_branch}...{candidate_sha[:8]} diff",
+        description=(
+            f"Advisory challenge of {diff_range} against the primary release "
+            "audit for the release qualifier"
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+            "primary_audit_task_id": primary_audit_task_id,
+            "scope": "medium",
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "release_audit_challenge",
+                "diff_range": diff_range,
+                "release_version_id": str(version_id),
+                "primary_audit_task_id": primary_audit_task_id,
+            },
+        )
+    )
+    return task
+
+
 async def _spawn_qualifier_smoketest_task(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -406,6 +479,8 @@ async def _handle_infra_failure(
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": qual.get("audit_task_id"),
+        "audit_challenge_task_id": qual.get("audit_challenge_task_id"),
+        "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
     }
     version.last_qualification = record

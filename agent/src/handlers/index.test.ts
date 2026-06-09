@@ -37,6 +37,7 @@ vi.mock('./audits.js', () => ({
   handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
   handleSelfAudit: vi.fn().mockResolvedValue(undefined),
   handleReleaseAudit: vi.fn().mockResolvedValue(undefined),
+  handleReleaseAuditChallenge: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock fs and child_process so handler files that import them at module level
@@ -93,13 +94,13 @@ import { expectCalledWith } from '../utils/typed-mock-call.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 25 BESPOKE handlers are hand-registered today. This is no longer the
+  // 26 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 25 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(25);
+  it('has exactly 26 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(26);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -359,12 +360,13 @@ const TASK_CLASS_MAP = {
   docs:              'code-change',
   qa:                'code-change',
   deps:              'code-change',
-  // Read-only / investigative (10): analysis only, must not push code
+  // Read-only / investigative (12): analysis only, must not push code
   review:            'read-only',
   panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
+  release_audit_challenge: 'read-only',
   smoketest:         'read-only',
   debug:             'read-only',
   perf:              'read-only',
@@ -395,11 +397,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 11 read-only + 7 research = 25 total', () => {
+  it('class distribution is 7 code-change + 12 read-only + 7 research = 26 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(11);
+    expect(counts['read-only']).toBe(12);
     expect(counts['research']).toBe(7);
   });
 

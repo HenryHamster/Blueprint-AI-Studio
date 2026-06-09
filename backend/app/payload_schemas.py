@@ -497,6 +497,23 @@ class ReleaseAuditPayload(_SystemPopulated):
     prompt: str | None = None
 
 
+class ReleaseAuditChallengePayload(_SystemPopulated):
+    """Payload for the advisory release-audit challenger pass.
+
+    Like :class:`ReleaseAuditPayload` the task scores ONE pinned candidate
+    commit (``candidate_sha``) against ``base_branch``. It additionally receives
+    the primary audit report it must challenge via ``primary_audit_report``.
+    Both are optional here because BasePayload is extra-field tolerant
+    (``extra='allow'``) and the agent handler fails loud at runtime when the
+    candidate SHA is missing/invalid — the schema does not need to re-enforce it.
+    """
+
+    diff_range: str | None = None
+    prompt: str | None = None
+    candidate_sha: str | None = None
+    primary_audit_report: dict | None = None
+
+
 class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
@@ -743,6 +760,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
+    TaskType.release_audit_challenge: ReleaseAuditChallengePayload,
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
     TaskType.compute_experiment: ComputeExperimentPayload,

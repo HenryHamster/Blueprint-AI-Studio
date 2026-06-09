@@ -613,6 +613,179 @@ _SEVERITY_RANK = {
     "info": 3,
 }
 
+_CHALLENGE_FINDING_MAX = 12
+_CHALLENGE_ASSESSMENT_MAX = 600
+_CHALLENGE_SEVERITIES: frozenset[str] = frozenset({"low", "medium", "high"})
+_CHALLENGE_AGREEMENTS: frozenset[str] = frozenset(
+    {"agree", "partial", "disagree"}
+)
+
+
+def _raw_audit_findings(report: dict[str, Any] | None) -> list[Any]:
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("findings")
+    if not isinstance(raw, list) or not raw:
+        raw = report.get("issues")
+    return raw if isinstance(raw, list) else []
+
+
+def _compact_challenge_finding(finding: Any) -> dict[str, str] | None:
+    if isinstance(finding, dict):
+        sev = str(finding.get("severity") or finding.get("level") or "unknown").lower()
+        summary = (
+            finding.get("summary")
+            or finding.get("description")
+            or finding.get("title")
+            or finding.get("text")
+            or ""
+        )
+        file_path = str(finding.get("file") or finding.get("path") or "").strip()
+        note = str(finding.get("verification_note") or "").strip()
+        origin = str(finding.get("origin") or "").strip()
+    else:
+        sev = "unknown"
+        summary = str(finding)
+        file_path = ""
+        note = ""
+        origin = ""
+
+    summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
+    if not summary:
+        return None
+
+    compact = {"severity": sev, "summary": summary}
+    if file_path:
+        compact["file"] = file_path[:_DETAIL_NAME_MAX]
+    if note:
+        compact["verification_note"] = note[:_FINDING_SUMMARY_MAX]
+    if origin:
+        compact["origin"] = origin[:80]
+    return compact
+
+
+def _compact_challenge_findings(findings: list[Any]) -> list[dict[str, str]]:
+    compacted = [
+        compact
+        for finding in findings
+        if (compact := _compact_challenge_finding(finding)) is not None
+    ]
+    compacted.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
+    return compacted[:_CHALLENGE_FINDING_MAX]
+
+
+def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
+    return (
+        str(finding.get("file") or "").strip().lower(),
+        str(finding.get("summary") or "").strip().lower(),
+    )
+
+
+def _compute_audit_challenge_synthesis(
+    primary_report: dict[str, Any] | None,
+    challenge_report: dict[str, Any] | None,
+    *,
+    challenge_reason: str | None = None,
+) -> dict[str, Any]:
+    """Compute non-gating release-audit challenge synthesis."""
+    if challenge_reason:
+        return {
+            "status": "unavailable",
+            "reason": challenge_reason,
+            "reported_agreement": None,
+            "agreement_assessment": None,
+            "challenge_severity": None,
+            "agreement": {"findings_both_flagged": [], "count": 0},
+            "disagreement": {
+                "primary_only": [],
+                "challenger_only": [],
+                "overstated_findings": [],
+            },
+            "counts": {
+                "primary_findings": len(_compact_challenge_findings(_raw_audit_findings(primary_report))),
+                "challenger_missing": 0,
+                "challenger_overstated": 0,
+            },
+        }
+    if not isinstance(challenge_report, dict):
+        return _compute_audit_challenge_synthesis(
+            primary_report, None, challenge_reason="challenge_absent"
+        )
+
+    primary_findings = _compact_challenge_findings(_raw_audit_findings(primary_report))
+    missing_raw = challenge_report.get("missing_findings")
+    overstated_raw = challenge_report.get("overstated_findings")
+    missing_findings = _compact_challenge_findings(
+        missing_raw if isinstance(missing_raw, list) else []
+    )
+    overstated_findings = _compact_challenge_findings(
+        overstated_raw if isinstance(overstated_raw, list) else []
+    )
+
+    primary_keys = {_finding_match_key(finding) for finding in primary_findings}
+    missing_keys = {_finding_match_key(finding) for finding in missing_findings}
+    overstated_keys = {_finding_match_key(finding) for finding in overstated_findings}
+
+    reported_agreement_raw = str(challenge_report.get("agreement") or "").lower()
+    reported_agreement = (
+        reported_agreement_raw
+        if reported_agreement_raw in _CHALLENGE_AGREEMENTS
+        else None
+    )
+    severity_raw = str(challenge_report.get("challenge_severity") or "").lower()
+    challenge_severity = (
+        severity_raw if severity_raw in _CHALLENGE_SEVERITIES else "low"
+    )
+    assessment_raw = challenge_report.get("agreement_assessment")
+    agreement_assessment = (
+        str(assessment_raw).strip()[:_CHALLENGE_ASSESSMENT_MAX]
+        if assessment_raw is not None
+        else ""
+    )
+
+    if reported_agreement == "agree" and not missing_findings and not overstated_findings:
+        both_flagged = primary_findings
+        primary_only: list[dict[str, str]] = []
+    else:
+        both_flagged = [
+            finding
+            for finding in primary_findings
+            if _finding_match_key(finding) in missing_keys
+        ]
+        primary_only = [
+            finding
+            for finding in primary_findings
+            if _finding_match_key(finding) not in missing_keys | overstated_keys
+        ]
+
+    challenger_only = [
+        finding
+        for finding in missing_findings
+        if _finding_match_key(finding) not in primary_keys
+    ]
+
+    return {
+        "status": "available",
+        "reason": None,
+        "reported_agreement": reported_agreement,
+        "agreement_assessment": agreement_assessment,
+        "challenge_severity": challenge_severity,
+        "agreement": {
+            "findings_both_flagged": both_flagged,
+            "count": len(both_flagged),
+        },
+        "disagreement": {
+            "primary_only": primary_only,
+            "challenger_only": challenger_only,
+            "overstated_findings": overstated_findings,
+        },
+        "counts": {
+            "primary_findings": len(primary_findings),
+            "challenger_missing": len(missing_findings),
+            "challenger_overstated": len(overstated_findings),
+        },
+    }
+
 
 def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
     """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
@@ -894,3 +1067,117 @@ def _fmt_sub_scores(
     if smoketest_enabled:
         parts.append(f"smoke {float(sub_scores.get('smoketest', 0.0)):.2f}")
     return " · ".join(parts)
+
+
+# Minimum sample size for each cohort before telemetry rates are computed.
+# Below this the cohort is marked insufficient_sample to avoid misleading zeros.
+_MIN_TELEMETRY_SAMPLE = 3
+
+
+def compute_challenged_vs_unchallenged_telemetry(
+    verdicts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare challenged vs unchallenged release-audit cohorts using durable signals.
+
+    Partitions ``verdicts`` (each a plain dict with the fields from
+    QualificationVerdict) by whether the advisory challenge task ran and
+    produced a report (``audit_reconciliation["audit_challenge"]["status"] ==
+    "available"``).  Verdicts where the challenge is absent, unavailable, or
+    the reconciliation field is null fall into the unchallenged cohort.
+
+    Reports for each cohort:
+    - ``disagreement_rate`` — fraction of challenged verdicts where the
+      challenger reported_agreement != "agree" (advisory signal of audit risk;
+      only meaningful for the challenged cohort).
+    - ``exclusion_rate`` — fraction where ``excluded_findings_count > 0``
+      (findings dropped by the verification gate).
+    - ``wrong_decision_rate`` — fraction of resolved promoted verdicts where
+      ``post_promotion_outcome == "deploy_failed"`` (ground-truth precision
+      check; computed from the promoted-and-resolved subset only).
+
+    Cohorts with fewer than ``_MIN_TELEMETRY_SAMPLE`` verdicts are marked
+    ``insufficient_sample: True`` and rates are omitted to prevent misleading
+    zeros at pilot start.
+
+    Pure and read-only — no I/O, no DB, no side effects.
+    """
+    challenged: list[dict[str, Any]] = []
+    unchallenged: list[dict[str, Any]] = []
+
+    for v in verdicts:
+        if not isinstance(v, dict):
+            unchallenged.append(v)
+            continue
+        recon = v.get("audit_reconciliation")
+        challenge = recon.get("audit_challenge") if isinstance(recon, dict) else None
+        if isinstance(challenge, dict) and challenge.get("status") == "available":
+            challenged.append(v)
+        else:
+            unchallenged.append(v)
+
+    def _cohort_stats(
+        cohort: list[dict[str, Any]], *, include_disagreement: bool
+    ) -> dict[str, Any]:
+        n = len(cohort)
+        if n < _MIN_TELEMETRY_SAMPLE:
+            return {"sample_size": n, "insufficient_sample": True}
+
+        # exclusion_rate: fraction where excluded_findings_count > 0
+        exclusion_count = sum(
+            1
+            for v in cohort
+            if isinstance(v.get("audit_reconciliation"), dict)
+            and int(v["audit_reconciliation"].get("excluded_findings_count") or 0) > 0
+        )
+        exclusion_rate = round(exclusion_count / n, 4)
+
+        # wrong_decision_rate: among promoted verdicts with resolved outcomes,
+        # fraction that ended in deploy_failed.
+        resolved = [
+            v
+            for v in cohort
+            if v.get("terminal_status") == "promoted"
+            and v.get("post_promotion_outcome") in ("serving_confirmed", "deploy_failed")
+        ]
+        resolved_sample = len(resolved)
+        wrong_decision_count = sum(
+            1 for v in resolved if v.get("post_promotion_outcome") == "deploy_failed"
+        )
+        wrong_decision_rate = (
+            round(wrong_decision_count / resolved_sample, 4)
+            if resolved_sample > 0
+            else None
+        )
+
+        stats: dict[str, Any] = {
+            "sample_size": n,
+            "insufficient_sample": False,
+            "exclusion_rate": exclusion_rate,
+            "exclusion_count": exclusion_count,
+            "wrong_decision_rate": wrong_decision_rate,
+            "wrong_decision_resolved_sample": resolved_sample,
+        }
+
+        if include_disagreement:
+            disagree_count = sum(
+                1
+                for v in cohort
+                if isinstance(v.get("audit_reconciliation"), dict)
+                and isinstance(
+                    v["audit_reconciliation"].get("audit_challenge"), dict
+                )
+                and v["audit_reconciliation"]["audit_challenge"].get(
+                    "reported_agreement"
+                )
+                != "agree"
+            )
+            stats["disagreement_rate"] = round(disagree_count / n, 4)
+            stats["disagreement_count"] = disagree_count
+
+        return stats
+
+    return {
+        "challenged": _cohort_stats(challenged, include_disagreement=True),
+        "unchallenged": _cohort_stats(unchallenged, include_disagreement=False),
+        "total_verdicts": len(verdicts),
+    }

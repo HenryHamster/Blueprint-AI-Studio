@@ -34,6 +34,7 @@ class TaskType(str, Enum):
     investigate = "investigate"
     self_audit = "self_audit"
     release_audit = "release_audit"
+    release_audit_challenge = "release_audit_challenge"
     memo = "memo"
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
@@ -495,6 +496,29 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.release_audit_challenge,
+        "Release Audit Challenge",
+        "read_only",
+        description=(
+            "Advisory, independent challenger pass over a release-audit "
+            "candidate: re-examines the same pinned candidate/diff plus the "
+            "primary audit report and emits a structured challenge record "
+            "(agreement, missing/overstated findings, challenge severity). "
+            "Advisory only — the primary release_audit remains the "
+            "promotion-influencing verdict."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        # No forward gate: this is an advisory pilot whose challenge artifact is
+        # consumed by the deterministic qualifier synthesis (a separate change),
+        # not graded by a terminal-artifact forward-quality check here. Mirrors
+        # ``plan``'s gate-less ``none`` so a missing/partial challenge artifact
+        # never fails the pilot task at the forward gate.
+        evaluation="none",
     ),
     TaskCapability(
         TaskType.memo,

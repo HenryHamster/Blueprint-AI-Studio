@@ -13,9 +13,36 @@ import pathlib
 import pytest
 
 # Pure functions — no DB, no I/O.
-from app.release_scoring import _audit_missing_reason, _score_audit
+from app.models import ArtifactType
+from app.release_scoring import (
+    _audit_missing_reason,
+    _compute_audit_challenge_synthesis,
+    _score_audit,
+)
 
 _FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "release_audit_sample.json"
+
+_CHALLENGE_SAMPLE = {
+    "agreement": "partial",
+    "agreement_assessment": "The primary audit found one risk but missed another.",
+    "missing_findings": [
+        {
+            "severity": "medium",
+            "summary": "Missed release-risk finding.",
+            "file": "backend/app/release_qualifier.py",
+            "verification_note": "verified by reading the changed finalize path",
+        }
+    ],
+    "overstated_findings": [
+        {
+            "severity": "low",
+            "summary": "Primary overstates migration risk.",
+            "file": "backend/app/models.py",
+            "verification_note": "the cited schema column is not changed here",
+        }
+    ],
+    "challenge_severity": "medium",
+}
 
 
 def _resolve_audits_ts_path() -> "str | None":
@@ -94,6 +121,38 @@ class TestReleaseAuditFixtureShape:
             )
 
 
+class TestReleaseAuditChallengeFixtureShape:
+    def test_challenge_sample_is_recognized_by_backend_synthesis(self, audit_fixture):
+        assert (
+            ArtifactType.RELEASE_AUDIT_CHALLENGE_REPORT.value
+            == "RELEASE_AUDIT_CHALLENGE_REPORT"
+        )
+        for key in (
+            "agreement",
+            "agreement_assessment",
+            "missing_findings",
+            "overstated_findings",
+            "challenge_severity",
+        ):
+            assert key in _CHALLENGE_SAMPLE
+        assert "issues" not in _CHALLENGE_SAMPLE
+        assert "level" not in _CHALLENGE_SAMPLE["missing_findings"][0]
+
+        out = _compute_audit_challenge_synthesis(audit_fixture, _CHALLENGE_SAMPLE)
+
+        assert out["status"] == "available"
+        assert out["reported_agreement"] == "partial"
+        assert out["challenge_severity"] == "medium"
+        assert out["counts"]["challenger_missing"] == 1
+        assert out["counts"]["challenger_overstated"] == 1
+        assert out["disagreement"]["challenger_only"][0]["summary"] == (
+            "Missed release-risk finding."
+        )
+        assert out["disagreement"]["overstated_findings"][0]["summary"] == (
+            "Primary overstates migration risk."
+        )
+
+
 class TestAuditsTsSchemaContract:
     """Introspect agent/src/handlers/audits.ts to ensure the release-audit prompt
     documents 'findings' and 'severity' in its JSON schema block, not legacy
@@ -166,3 +225,29 @@ class TestAuditsTsSchemaContract:
             "The JSON schema block in audits.ts uses 'level' as a severity "
             "field name — must use 'severity' to avoid drift"
         )
+
+    def _extract_challenge_schema_block(self, ts_source: str) -> str:
+        import re
+
+        blocks = re.findall(r"\\`\\`\\`json\s*(.*?)\\`\\`\\`", ts_source, re.DOTALL)
+        challenge_blocks = [b for b in blocks if "challenge_severity" in b]
+        assert challenge_blocks, (
+            "Could not find a fenced JSON block containing 'challenge_severity' "
+            "in agent/src/handlers/audits.ts"
+        )
+        return challenge_blocks[0]
+
+    def test_audits_ts_challenge_schema_uses_backend_contract_keys(self, ts_source):
+        assert "RELEASE_AUDIT_CHALLENGE_REPORT" in ts_source
+        schema_block = self._extract_challenge_schema_block(ts_source)
+        for key in (
+            "agreement",
+            "agreement_assessment",
+            "missing_findings",
+            "overstated_findings",
+            "challenge_severity",
+            "severity",
+        ):
+            assert f'"{key}"' in schema_block
+        assert '"issues"' not in schema_block
+        assert '"level"' not in schema_block

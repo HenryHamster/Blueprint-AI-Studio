@@ -1850,6 +1850,240 @@ class TestComputeAuditReconciliation:
         assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
+class TestComputeAuditChallengeSynthesis:
+    def test_agree_marks_primary_findings_as_both_flagged(self):
+        out = rq._compute_audit_challenge_synthesis(
+            {
+                "findings": [
+                    {
+                        "severity": "high",
+                        "summary": "Unsafe migration path.",
+                        "file": "backend/app/models.py",
+                    }
+                ]
+            },
+            {
+                "agreement": "agree",
+                "overstated_findings": [],
+                "challenge_severity": "low",
+            },
+        )
+
+        assert out["status"] == "available"
+        assert out["reported_agreement"] == "agree"
+        assert out["challenge_severity"] == "low"
+        assert out["agreement"]["count"] == 1
+        assert out["agreement"]["findings_both_flagged"][0]["summary"] == (
+            "Unsafe migration path."
+        )
+        assert out["disagreement"]["primary_only"] == []
+        assert out["disagreement"]["challenger_only"] == []
+        assert out["disagreement"]["overstated_findings"] == []
+
+class TestChallengedVsUnchallengedTelemetry:
+    """Tests for compute_challenged_vs_unchallenged_telemetry (pure function)."""
+
+    def _make_verdict(
+        self,
+        *,
+        challenged: bool = False,
+        reported_agreement: str | None = "agree",
+        excluded_findings_count: int = 0,
+        would_promote: bool = False,
+        terminal_status: str = "not_promoted",
+        post_promotion_outcome: str | None = None,
+    ) -> dict:
+        recon: dict = {
+            "model_reported_score": 1.0,
+            "findings_derived_score": 1.0,
+            "score_delta": 0.0,
+            "excluded_findings_count": excluded_findings_count,
+        }
+        if challenged:
+            recon["audit_challenge"] = {
+                "status": "available",
+                "reported_agreement": reported_agreement,
+                "challenge_severity": "low",
+            }
+        else:
+            recon["audit_challenge"] = {
+                "status": "unavailable",
+                "reason": "challenge_absent",
+                "reported_agreement": None,
+            }
+        return {
+            "audit_reconciliation": recon,
+            "would_promote": would_promote,
+            "terminal_status": terminal_status,
+            "post_promotion_outcome": post_promotion_outcome,
+            "excluded_audit_findings": None,
+        }
+
+    def test_empty_list_returns_insufficient_sample_both_cohorts(self):
+        result = rq.compute_challenged_vs_unchallenged_telemetry([])
+        assert result["total_verdicts"] == 0
+        assert result["challenged"]["insufficient_sample"] is True
+        assert result["challenged"]["sample_size"] == 0
+        assert result["unchallenged"]["insufficient_sample"] is True
+        assert result["unchallenged"]["sample_size"] == 0
+
+    def test_single_challenged_verdict_insufficient_sample(self):
+        verdicts = [self._make_verdict(challenged=True)]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["insufficient_sample"] is True
+        assert result["challenged"]["sample_size"] == 1
+        # unchallenged cohort is empty
+        assert result["unchallenged"]["insufficient_sample"] is True
+        assert result["unchallenged"]["sample_size"] == 0
+
+    def test_cohort_of_one_is_insufficient_sample(self):
+        # Exactly one challenged, one unchallenged — both below _MIN_TELEMETRY_SAMPLE.
+        verdicts = [
+            self._make_verdict(challenged=True),
+            self._make_verdict(challenged=False),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["insufficient_sample"] is True
+        assert result["unchallenged"]["insufficient_sample"] is True
+
+    def test_disagreement_rate_challenged_cohort(self):
+        # 3 challenged verdicts: 2 disagree, 1 agrees.
+        # 3 unchallenged verdicts (no disagreement field).
+        verdicts = [
+            self._make_verdict(challenged=True, reported_agreement="disagree"),
+            self._make_verdict(challenged=True, reported_agreement="partial"),
+            self._make_verdict(challenged=True, reported_agreement="agree"),
+            self._make_verdict(challenged=False),
+            self._make_verdict(challenged=False),
+            self._make_verdict(challenged=False),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["insufficient_sample"] is False
+        assert ch["sample_size"] == 3
+        assert ch["disagreement_count"] == 2
+        assert ch["disagreement_rate"] == pytest.approx(2 / 3, abs=1e-4)
+        # unchallenged cohort has no disagreement keys
+        unch = result["unchallenged"]
+        assert unch["insufficient_sample"] is False
+        assert "disagreement_rate" not in unch
+        assert "disagreement_count" not in unch
+
+    def test_exclusion_rate_computation(self):
+        # 2 of 3 challenged verdicts have excluded_findings_count > 0.
+        verdicts = [
+            self._make_verdict(challenged=True, excluded_findings_count=2),
+            self._make_verdict(challenged=True, excluded_findings_count=1),
+            self._make_verdict(challenged=True, excluded_findings_count=0),
+            self._make_verdict(challenged=False, excluded_findings_count=0),
+            self._make_verdict(challenged=False, excluded_findings_count=0),
+            self._make_verdict(challenged=False, excluded_findings_count=3),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["exclusion_count"] == 2
+        assert ch["exclusion_rate"] == pytest.approx(2 / 3, abs=1e-4)
+        unch = result["unchallenged"]
+        assert unch["exclusion_count"] == 1
+        assert unch["exclusion_rate"] == pytest.approx(1 / 3, abs=1e-4)
+
+    def test_wrong_decision_rate_deploy_failed(self):
+        # 2 of 3 promoted challenged verdicts ended in deploy_failed.
+        verdicts = [
+            self._make_verdict(
+                challenged=True,
+                would_promote=True,
+                terminal_status="promoted",
+                post_promotion_outcome="deploy_failed",
+            ),
+            self._make_verdict(
+                challenged=True,
+                would_promote=True,
+                terminal_status="promoted",
+                post_promotion_outcome="deploy_failed",
+            ),
+            self._make_verdict(
+                challenged=True,
+                would_promote=True,
+                terminal_status="promoted",
+                post_promotion_outcome="serving_confirmed",
+            ),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["insufficient_sample"] is False
+        assert ch["wrong_decision_resolved_sample"] == 3
+        assert ch["wrong_decision_rate"] == pytest.approx(2 / 3, abs=1e-4)
+
+    def test_unresolved_outcomes_excluded_from_wrong_decision(self):
+        # Verdicts with unconfirmed or None outcome are not in the resolved sample.
+        verdicts = [
+            self._make_verdict(
+                challenged=True,
+                terminal_status="promoted",
+                post_promotion_outcome="unconfirmed",
+            ),
+            self._make_verdict(
+                challenged=True,
+                terminal_status="promoted",
+                post_promotion_outcome=None,
+            ),
+            self._make_verdict(
+                challenged=True,
+                terminal_status="not_promoted",
+                post_promotion_outcome=None,
+            ),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["insufficient_sample"] is False
+        # No resolved outcomes in the promoted subset
+        assert ch["wrong_decision_resolved_sample"] == 0
+        assert ch["wrong_decision_rate"] is None
+
+    def test_partition_null_audit_reconciliation_goes_unchallenged(self):
+        # A verdict with audit_reconciliation=None falls into the unchallenged cohort.
+        verdicts = [
+            {"audit_reconciliation": None, "would_promote": False,
+             "terminal_status": "not_promoted", "post_promotion_outcome": None,
+             "excluded_audit_findings": None},
+            {"audit_reconciliation": None, "would_promote": False,
+             "terminal_status": "not_promoted", "post_promotion_outcome": None,
+             "excluded_audit_findings": None},
+            {"audit_reconciliation": None, "would_promote": False,
+             "terminal_status": "not_promoted", "post_promotion_outcome": None,
+             "excluded_audit_findings": None},
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["insufficient_sample"] is True
+        assert result["challenged"]["sample_size"] == 0
+        assert result["unchallenged"]["sample_size"] == 3
+        assert result["unchallenged"]["insufficient_sample"] is False
+
+    def test_total_verdicts_count(self):
+        verdicts = [
+            self._make_verdict(challenged=True),
+            self._make_verdict(challenged=False),
+            self._make_verdict(challenged=False),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["total_verdicts"] == 3
+        assert result["challenged"]["sample_size"] == 1
+        assert result["unchallenged"]["sample_size"] == 2
+
+    def test_no_division_by_zero_on_empty_resolved_subset(self):
+        # All 3 verdicts are not_promoted — no promoted rows, resolved_sample=0.
+        verdicts = [
+            self._make_verdict(challenged=True, terminal_status="not_promoted"),
+            self._make_verdict(challenged=True, terminal_status="not_promoted"),
+            self._make_verdict(challenged=True, terminal_status="not_promoted"),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["wrong_decision_rate"] is None
+        assert ch["wrong_decision_resolved_sample"] == 0
+
+
 class TestScoreSmoketest:
     def test_all_tests_pass(self):
         """A fully-passing smoketest yields a 1.0 score."""
@@ -2509,10 +2743,10 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     db_session, mocker
 ):
     """With smoketest_enabled=True, run_qualification snapshots the SHA, spawns
-    release_audit + qualifier-smoketest, and stamps version.last_qualification
-    = {status: 'pending', ...}.  Both child payloads carry the exact 40-char
-    candidate_sha (audit C4 contract), and the audit diff_range is pinned to
-    main...<candidate_sha> (NOT main...automain)."""
+    release_audit + advisory release_audit_challenge + qualifier-smoketest, and
+    stamps version.last_qualification = {status: 'pending', ...}.  All child
+    payloads carry the exact 40-char candidate_sha (audit C4 contract), and the
+    audit diff_range is pinned to main...<candidate_sha> (NOT main...automain)."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = True
@@ -2549,7 +2783,7 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert version.last_qualification["smoketest_enabled"] is True
     assert version.qualification_attempts == 1
 
-    # Two child tasks exist: a release_audit and a qualifier smoketest.
+    # Three child tasks exist: release_audit, advisory challenge, and smoketest.
     from sqlmodel import select
 
     tasks = (
@@ -2558,21 +2792,30 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "smoketest"]
+    assert types == ["release_audit", "release_audit_challenge", "smoketest"]
 
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     audit_task = by_type["release_audit"]
+    challenge_task = by_type["release_audit_challenge"]
     smoke_task = by_type["smoketest"]
 
-    # release_audit clones main and audits the main...<candidate_sha> diff —
-    # pinned to the exact snapshot commit, NOT the live automain branch.
     assert audit_task.first_payload["base_branch"] == "main"
     assert audit_task.first_payload["diff_range"] == f"main...{candidate}"
-    # Audit C4 contract: candidate_sha is in the PAYLOAD, named exactly
-    # candidate_sha, the full 40-char SHA.
     assert audit_task.first_payload["candidate_sha"] == candidate
     assert audit_task.context["release_version_id"] == str(version.id)
     assert audit_task.context["scope"] == "medium"
+    assert version.last_qualification["audit_task_id"] == str(audit_task.id)
+
+    assert challenge_task.first_payload["base_branch"] == "main"
+    assert challenge_task.first_payload["diff_range"] == f"main...{candidate}"
+    assert challenge_task.first_payload["candidate_sha"] == candidate
+    assert challenge_task.first_payload["primary_audit_task_id"] == str(audit_task.id)
+    assert challenge_task.context["release_version_id"] == str(version.id)
+    assert challenge_task.context["candidate_sha"] == candidate
+    assert challenge_task.context["primary_audit_task_id"] == str(audit_task.id)
+    assert version.last_qualification["audit_challenge_task_id"] == str(
+        challenge_task.id
+    )
 
     from datetime import datetime, timezone
 
@@ -2595,9 +2838,9 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
     """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit child is spawned — NO qualifier-smoketest task — and
-    last_qualification records smoketest_enabled=False with smoketest_task_id
-    None."""
+    release_audit and advisory challenge children are spawned — NO
+    qualifier-smoketest task — and last_qualification records
+    smoketest_enabled=False with smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
@@ -2630,8 +2873,9 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     assert version.last_qualification["smoketest_enabled"] is False
     assert version.last_qualification["smoketest_task_id"] is None
     assert version.last_qualification["audit_task_id"] is not None
+    assert version.last_qualification["audit_challenge_task_id"] is not None
 
-    # Exactly one child task — the release_audit — and NO smoketest.
+    # Exactly two child tasks — release_audit and its advisory challenge — and NO smoketest.
     from sqlmodel import select
 
     tasks = (
@@ -2640,10 +2884,15 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit"]
-    # The audit child still carries the pinned candidate_sha.
-    assert tasks[0].first_payload["candidate_sha"] == candidate
-    assert tasks[0].first_payload["diff_range"] == f"main...{candidate}"
+    assert types == ["release_audit", "release_audit_challenge"]
+    by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
+    assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
+    assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
+    assert by_type["release_audit_challenge"].first_payload["candidate_sha"] == candidate
+    assert (
+        by_type["release_audit_challenge"].first_payload["primary_audit_task_id"]
+        == version.last_qualification["audit_task_id"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3112,7 +3361,7 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
     await db_session.commit()
     assert second["status"] == "already_pending"
 
-    # Exactly one child task total — no duplicate pair from the second call.
+    # Exactly one primary/challenge pair total — no duplicate from the second call.
     from sqlmodel import select
 
     tasks = (
@@ -3120,8 +3369,11 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
         .scalars()
         .all()
     )
-    # smoketest_enabled defaults False → one release_audit child only.
-    assert len(tasks) == 1
+    # smoketest_enabled defaults False → release_audit + advisory challenge only.
+    assert sorted(t.first_payload.get("type") for t in tasks) == [
+        "release_audit",
+        "release_audit_challenge",
+    ]
     # qualification_attempts bumped exactly once (the second call no-op'd).
     await db_session.refresh(version)
     assert version.qualification_attempts == 1
@@ -3514,6 +3766,48 @@ async def _seed_qualification_children(
     return audit_task, smoke_task
 
 
+async def _attach_audit_challenge(
+    db_session,
+    project,
+    version,
+    *,
+    logs: dict | None = None,
+    raw_logs: str | None = None,
+    status: TaskStatus = TaskStatus.COMPLETED,
+):
+    task = Task(
+        project_id=project.id,
+        title="audit challenge",
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        vm_instance_id="vm-audit-challenge",
+        status=status,
+        context={
+            "release_version_id": str(version.id),
+            "candidate_sha": version.last_qualification["candidate_sha"],
+            "primary_audit_task_id": version.last_qualification["audit_task_id"],
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    if logs is not None or raw_logs is not None:
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE_REPORT,
+                logs=json.dumps(logs) if logs is not None else raw_logs,
+            )
+        )
+    version.last_qualification = {
+        **version.last_qualification,
+        "audit_challenge_task_id": str(task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return task
+
+
 @pytest.mark.asyncio
 async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     """A high-confidence candidate is NOT promoted while promotion_enabled is
@@ -3559,6 +3853,174 @@ async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     await db_session.refresh(version)
     assert version.status == "open"
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_finalize_persists_advisory_audit_challenge_synthesis(
+    db_session, mocker
+):
+    """Challenge synthesis is nested in audit_reconciliation and persisted."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Primary migration concern.",
+                    "file": "backend/app/models.py",
+                    "verification_note": "confirmed against the migration code",
+                }
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={"passed": True},
+    )
+    await _attach_audit_challenge(
+        db_session,
+        project,
+        version,
+        logs={
+            "agreement": "partial",
+            "agreement_assessment": "Primary found one issue but missed another.",
+            "missing_findings": [
+                {
+                    "severity": "medium",
+                    "summary": "Missed rollout-risk finding.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "verified by reading the finalize branch",
+                }
+            ],
+            "overstated_findings": [
+                {
+                    "severity": "low",
+                    "summary": "Primary migration concern.",
+                    "file": "backend/app/models.py",
+                    "verification_note": "the severity is overstated in the diff",
+                }
+            ],
+            "challenge_severity": "medium",
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+
+    await db_session.refresh(version)
+    synthesis = version.last_qualification["audit_reconciliation"]["audit_challenge"]
+    assert synthesis["status"] == "available"
+    assert synthesis["reported_agreement"] == "partial"
+    assert synthesis["challenge_severity"] == "medium"
+    assert synthesis["disagreement"]["challenger_only"][0]["summary"] == (
+        "Missed rollout-risk finding."
+    )
+    assert synthesis["disagreement"]["overstated_findings"][0]["summary"] == (
+        "Primary migration concern."
+    )
+
+    verdict = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.terminal_status == "dry_run"
+    assert verdict.audit_reconciliation["audit_challenge"] == synthesis
+
+
+@pytest.mark.asyncio
+async def test_finalize_unparseable_challenge_is_advisory_and_verdict_identical(
+    db_session, mocker
+):
+    """Unparseable challenge evidence records a reason but cannot affect verdict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    audit_logs = {
+        "audit_score": 1.0,
+        "findings": [],
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+    }
+    smoke_logs = {"passed": True}
+
+    baseline_project, baseline_version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        baseline_project,
+        baseline_version,
+        audit_logs=audit_logs,
+        smoke_logs=smoke_logs,
+    )
+    baseline_result = await rq._finalize_qualification(db_session, baseline_version)
+    await db_session.commit()
+    await db_session.refresh(baseline_version)
+    baseline_tuple = (
+        baseline_result["status"],
+        baseline_result["confidence"],
+        baseline_result["would_promote"],
+        baseline_version.last_qualification["blocker"],
+    )
+    baseline_challenge = baseline_version.last_qualification["audit_reconciliation"][
+        "audit_challenge"
+    ]
+    assert baseline_challenge["status"] == "unavailable"
+    assert baseline_challenge["reason"] == "challenge_absent"
+
+    challenged_project, challenged_version = await _make_project_and_version(
+        db_session
+    )
+    await _seed_qualification_children(
+        db_session,
+        challenged_project,
+        challenged_version,
+        audit_logs=audit_logs,
+        smoke_logs=smoke_logs,
+    )
+    await _attach_audit_challenge(
+        db_session,
+        challenged_project,
+        challenged_version,
+        raw_logs="not valid json {{{",
+    )
+    challenged_result = await rq._finalize_qualification(db_session, challenged_version)
+    await db_session.commit()
+    await db_session.refresh(challenged_version)
+    challenged_tuple = (
+        challenged_result["status"],
+        challenged_result["confidence"],
+        challenged_result["would_promote"],
+        challenged_version.last_qualification["blocker"],
+    )
+
+    assert challenged_tuple == baseline_tuple
+    challenge = challenged_version.last_qualification["audit_reconciliation"][
+        "audit_challenge"
+    ]
+    assert challenge["status"] == "unavailable"
+    assert challenge["reason"] == "challenge_unparseable"
 
 
 @pytest.mark.asyncio
@@ -4411,7 +4873,7 @@ async def test_promote_blocks_on_dual_alembic_head(db_session, mocker):
 @pytest.mark.asyncio
 async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
     """A blocking guard verdict prevents promote() from reaching auto-merge."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     mocker.patch(
         "app.github.get_repo_installation_token",
@@ -5397,7 +5859,7 @@ class TestFinalizeInfraFailure:
         project, version = await _make_project_and_version(db_session)
         # Both children COMPLETED but NO artifacts seeded — audit produced
         # no report, which is an infra failure (defense-in-depth path).
-        audit_task, _ = await _seed_infra_failure_children(
+        _audit_task, _ = await _seed_infra_failure_children(
             db_session,
             project,
             version,
@@ -5944,7 +6406,7 @@ class TestFinalizeInfraFailure:
     ):
         """FAILED smoketest with agent_failure_category_raw → enriched error label."""
         project, version = await _make_project_and_version(db_session)
-        audit_task, smoke_task = await _seed_infra_failure_children(
+        _audit_task, smoke_task = await _seed_infra_failure_children(
             db_session,
             project,
             version,
@@ -10912,7 +11374,7 @@ async def test_build_stall_alert_not_fired_for_stabilize_version(db_session):
     even when old."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 30)
     db_session.add(version)
     await db_session.commit()
@@ -11125,7 +11587,7 @@ async def test_stabilize_stall_alert_not_fired_for_build_version(db_session):
     """A build-phase version is never a stabilize stall — wrong phase, no-op."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="build")
+    _project, version = await _make_project_and_version(db_session, phase="build")
     version.phase_changed_at = rq._utcnow() - timedelta(
         days=rq._STABILIZE_STALL_AGE_DAYS + 30
     )
@@ -11143,7 +11605,7 @@ async def test_stabilize_stall_not_fired_for_dry_run_hold(db_session):
     (dry_run) must NOT trigger a stabilize-stall alert — it is healthy."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.phase_changed_at = rq._utcnow() - timedelta(
         days=rq._STABILIZE_STALL_AGE_DAYS + 10
     )
@@ -11162,7 +11624,7 @@ async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session
     the calcification alert — stabilize-stall must not double-alert."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.phase_changed_at = rq._utcnow() - timedelta(
         days=rq._STABILIZE_STALL_AGE_DAYS + 10
     )
@@ -11721,7 +12183,7 @@ async def _seed_verdict(
 @pytest.mark.asyncio
 async def test_readiness_empty_history_not_ready(db_session):
     """No verdict history → not ready, with an explanatory reason."""
-    project, version = await _make_project_and_version(db_session)
+    project, _version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
@@ -12388,7 +12850,7 @@ async def test_readiness_consecutive_infra_errors_from_pending_prior_streak(db_s
 async def test_check_promotion_readiness_skips_non_open_version(db_session):
     """A promoted (or otherwise closed) version is skipped immediately — no
     message posted, no state change."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.status = "promoted"
     db_session.add(version)
     await db_session.commit()
@@ -12410,7 +12872,7 @@ async def test_check_promotion_readiness_skips_when_promotion_already_enabled(
 
     shared_state.runtime_config["promotion_enabled"] = True
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     result = await rq._check_version_promotion_readiness(db_session, version)
 
@@ -12486,7 +12948,7 @@ async def test_check_promotion_readiness_resets_dedup_flag_on_lapse(db_session):
 
     shared_state.runtime_config["promotion_enabled"] = False
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     # No verdicts → not ready.
     version.promotion_ready_notified = True
@@ -13109,7 +13571,7 @@ async def test_ci_unresolved_stall_distinct_from_calcification_alert(db_session)
     """ci_not_green triggers calcification but NOT ci_unresolved stall, and
     ci_unresolved triggers ci_unresolved stall but NOT calcification."""
     # ci_not_green: calcification fires, ci_unresolved stall does not.
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
     version.last_qualification = {
         "status": "not_promoted",
@@ -13127,7 +13589,7 @@ async def test_ci_unresolved_stall_distinct_from_calcification_alert(db_session)
     assert ci_stall_fired is False
 
     # ci_unresolved: ci_unresolved stall fires, calcification does not.
-    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    _project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
     version2.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
     version2.last_qualification = {
         "status": "not_promoted",
@@ -13376,7 +13838,7 @@ async def test_promotion_failed_candidate_on_main_reconciled(db_session, mocker)
 async def test_promotion_failed_candidate_not_on_main_skipped(db_session, mocker):
     """An open version with last_qualification.status='promotion_failed' whose
     candidate_sha is NOT on main is left untouched by the sweep (count=0)."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     candidate_sha = "notlanded" * 4 + "abcd"  # 40 chars
     version.last_qualification = {
@@ -13485,7 +13947,7 @@ async def test_promotion_failed_reconcile_idempotent(db_session, mocker):
 async def test_non_promotion_failed_status_not_reconciled(db_session, mocker):
     """A version with last_qualification.status='not_promoted' is NOT touched by
     the reconcile loop — only 'promotion_failed' versions are candidates."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     version.last_qualification = {
         "status": "not_promoted",
@@ -14455,7 +14917,7 @@ async def test_resolve_lifecycle_audit_evidence_excludes_other_version(db_sessio
 @pytest.mark.asyncio
 async def test_resolve_lifecycle_audit_evidence_none_when_no_audit(db_session):
     """No release_audit task for the version → explicit none state."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.last_qualification = {"status": "pending", "candidate_sha": "feed" * 10}
     db_session.add(version)
     await db_session.commit()
@@ -14867,7 +15329,7 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
     A project with promotion_target='release' should call get_branch_sha with
     'release' to resolve the promoted merge commit SHA.
     """
-    project, version = await _make_project_and_version_custom_branches(
+    _project, version = await _make_project_and_version_custom_branches(
         db_session,
         integration_branch="trunk",
         promotion_target="release",
@@ -15038,7 +15500,7 @@ async def test_promote_inert_when_integration_equals_promotion_target(
     the promote tail is genuinely inert for this configuration via that explicit
     guard, not merely by accident of the ancestry short-circuit.
     """
-    project, version = await _make_project_and_version_custom_branches(
+    _project, version = await _make_project_and_version_custom_branches(
         db_session,
         integration_branch="main",
         promotion_target="main",
@@ -15112,7 +15574,7 @@ async def test_reconcile_pending_auto_merge_pr_closed_without_merge(db_session, 
     promotion_failed — clearing the promotion_pending sub-state so the normal
     qualification retry machinery re-arms instead of stranding indefinitely.
     """
-    project, version = await _make_project_and_version_custom_branches(
+    _project, version = await _make_project_and_version_custom_branches(
         db_session,
         integration_branch="develop",
         promotion_target="staging",
@@ -15167,7 +15629,7 @@ async def test_reconcile_pending_auto_merge_pr_ci_red(db_session, mocker):
     never fire, so the version must be force-failed (clearing the
     promotion_pending sub-state) rather than left waiting forever.
     """
-    project, version = await _make_project_and_version_custom_branches(
+    _project, version = await _make_project_and_version_custom_branches(
         db_session,
         integration_branch="develop",
         promotion_target="staging",
@@ -15226,7 +15688,7 @@ async def test_reconcile_pending_auto_merge_uses_project_promotion_target(
     A project with promotion_target='release' should call get_branch_sha with
     'release' to resolve the promoted merge commit SHA, not 'main'.
     """
-    project, version = await _make_project_and_version_custom_branches(
+    _project, version = await _make_project_and_version_custom_branches(
         db_session,
         integration_branch="trunk",
         promotion_target="release",
@@ -15494,7 +15956,7 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
     re-qualification that overwrites last_qualification."""
     from app import release_promotion as rp
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     base_record = {
         "candidate_sha": "abc123",
@@ -15587,7 +16049,7 @@ async def test_promotion_failed_attempt_persists_promotion_context(db_session):
     context onto the immutable verdict row alongside migration-safety."""
     from app import release_promotion as rp
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
 
     base_record = {
         "candidate_sha": "abc123",
@@ -16012,7 +16474,7 @@ async def test_acceptance_window_aggregate_legacy_no_verdict_counted(db_session)
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
     """When no tasks land in the version window, fraction is None (not 0 or NaN)."""
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     agg = await rq._compute_acceptance_window_aggregate(db_session, version)
     assert agg["acceptance_window_total"] == 0
     assert agg["acceptance_window_verified"] == 0
