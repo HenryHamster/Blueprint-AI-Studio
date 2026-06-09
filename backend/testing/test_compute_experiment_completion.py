@@ -645,6 +645,57 @@ async def test_backfill_artifact_prerequisites_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_backfill_artifact_prerequisites_stays_within_project(
+    db_session, _quiet_compute_io
+):
+    """Claim-time backfill must not copy artifact metadata across projects."""
+    producer_project = Project(name="BackfillCrossProjectProducer", user_id="test-user")
+    dependent_project = Project(name="BackfillCrossProjectDependent", user_id="test-user")
+    db_session.add_all([producer_project, dependent_project])
+    await db_session.commit()
+    await db_session.refresh(producer_project)
+    await db_session.refresh(dependent_project)
+
+    producer = Task(
+        project_id=producer_project.id,
+        title="compute_experiment: foreign producer",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="foreign-bundle",
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/foreign.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    dependent = Task(
+        project_id=dependent_project.id,
+        title="feat: consume foreign bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(producer.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    await backfill_artifact_prerequisites(dependent, db_session)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    assert (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_compute_completion_spend_cap_kill_is_honest_terminal(
     db_session, _quiet_compute_io
 ):

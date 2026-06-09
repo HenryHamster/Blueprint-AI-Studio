@@ -120,6 +120,22 @@ def _is_durable_compute_citation(value: str) -> bool:
     return "/" in value
 
 
+def _has_durable_compute_citation(citations: tuple[str, ...] | None) -> bool:
+    """True when at least one compute citation is durably resolvable."""
+    for citation in citations or ():
+        if not isinstance(citation, str):
+            continue
+        text = citation.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered.startswith(("http://", "https://")):
+            continue
+        if lowered.startswith(("gs://", "s3://", "az://", "file:")) or "/" in text:
+            return True
+    return False
+
+
 def knowledge_substance_has_durable_compute_grounding(
     substance: KnowledgeSubstance,
 ) -> bool:
@@ -142,7 +158,7 @@ def knowledge_substance_has_durable_compute_grounding(
     citations = [
         c for c in (substance.source_citations or ()) if isinstance(c, str) and c.strip()
     ]
-    if not citations:
+    if not citations or not _has_durable_compute_citation(tuple(citations)):
         return False
 
     # At least one citation must be a durable reference, not merely non-empty.
@@ -151,20 +167,17 @@ def knowledge_substance_has_durable_compute_grounding(
 
     verdict = substance.forward_quality_verdict
     if not isinstance(verdict, dict):
-        return False  # no write-time probe verdict — fail closed
+        return False
     if verdict.get("citation_grounding_miss"):
         return False
     probes = verdict.get("probes")
     if not isinstance(probes, dict):
-        return False  # probe dict absent — fail closed
+        return False
     grounding = probes.get("grounding")
     if not isinstance(grounding, dict):
-        return False  # grounding sub-probe absent — fail closed
-    grounded = grounding.get("grounded")
-    if grounded is None:
-        return False  # grounded count absent — fail closed
+        return False
     try:
-        return int(grounded) > 0
+        return int(grounding.get("grounded") or 0) > 0
     except (TypeError, ValueError):
         return False
 

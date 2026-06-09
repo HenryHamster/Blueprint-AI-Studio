@@ -67,6 +67,7 @@ async def backfill_artifact_prerequisites(task: Task, session) -> None:
         query = select(Task).where(
             Task.id.in_(dep_ids),
             Task.status == TaskStatus.COMPLETED,
+            Task.project_id == task.project_id,
         )
         producers = (await session.execute(query)).scalars().all()
         if not producers:
