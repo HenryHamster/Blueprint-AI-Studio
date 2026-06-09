@@ -477,6 +477,11 @@ export default function App() {
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
 
+  // Catch-Up, Pipeline Health, Pipeline Regressions, and VM Fleet are
+  // home-dashboard furniture; on every other view they pushed the actual
+  // content below the fold.
+  const onDashboardHome = s.viewMode === 'home' && !s.showArchive && !s.showUserManagement && !s.showMessages;
+
   if (s.authLoading) {
     return (
       <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
@@ -832,7 +837,7 @@ export default function App() {
         activeInvestigationTaskIds={srInvestigationTaskIds}
       />
 
-      {!s.showArchive && !s.showUserManagement && (
+      {onDashboardHome && (
         <CatchUpPanel
           selectedProjectId={s.selectedProjectId}
           projects={s.projects}
@@ -854,21 +859,23 @@ export default function App() {
         />
       )}
 
-      <DiagnosticsPanel
-        diagnostics={s.diagnostics}
-        onViewTask={handleViewTask}
-        handleRetry={s.handleRetry}
-        handleCancel={s.handleCancel}
-        setConfirmDialog={s.setConfirmDialog}
-      />
+      {onDashboardHome && (
+        <DiagnosticsPanel
+          diagnostics={s.diagnostics}
+          onViewTask={handleViewTask}
+          handleRetry={s.handleRetry}
+          handleCancel={s.handleCancel}
+          setConfirmDialog={s.setConfirmDialog}
+        />
+      )}
 
-      {s.userRole === 'admin' && s.selectedProjectId && (
+      {onDashboardHome && s.userRole === 'admin' && s.selectedProjectId && (
         <PipelineRegressionsPanel projectId={s.selectedProjectId} />
       )}
 
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
-      <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />
+      {onDashboardHome && <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />}
 
 
       {s.error && (
