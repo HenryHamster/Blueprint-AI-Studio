@@ -387,6 +387,10 @@ async def _resolve_live_release_evidence(
     required_artifacts = [
         artifact for artifact in artifacts if artifact.get("required")
     ]
+    required_artifacts_confirmed = all(
+        artifact.get("serving_status") == "serving_confirmed"
+        for artifact in required_artifacts
+    )
     evidence = {
         "live_proof": requirement,
         "release_version_id": str(version.id),
@@ -399,15 +403,15 @@ async def _resolve_live_release_evidence(
         "aggregate_reason_code": aggregate.get("reason_code"),
         "required_artifacts": required_artifacts,
     }
-    if aggregate.get("serving_status") != "serving_confirmed":
-        gap = summarize_required_artifact_gap(artifacts)
+    if not required_artifacts_confirmed:
+        gap = summarize_required_artifact_gap(required_artifacts)
         raise ComputeLaunchPreconditionFailed(
             {
                 "error": "live_release_precondition_failed",
                 "reason": "release_not_serving_confirmed",
                 "message": (
                     gap
-                    or "live-proof compute launch requires aggregate serving_confirmed"
+                    or "live-proof compute launch requires all required artifacts serving_confirmed"
                 ),
                 "live_proof": requirement,
                 "live_release_evidence": evidence,

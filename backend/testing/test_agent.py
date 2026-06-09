@@ -677,6 +677,7 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     [
         ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
         ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
+        (None, None, "serving_confirmed", "waiting on required artifacts"),
     ],
 )
 async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
@@ -709,14 +710,17 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
                 served_identifier="abc123",
                 served_at=datetime.utcnow(),
             ),
+        ]
+    )
+    if artifact_status is not None:
+        db_session.add(
             ReleaseDeployArtifact(
                 version_id=version.id,
                 artifact_kind="agent_image",
                 serving_status=artifact_status,
                 reason_code=reason_code,
-            ),
-        ]
-    )
+            )
+        )
     task = Task(
         project_id=project.id,
         payloads=[{"type": TaskType.compute_experiment.value}],
