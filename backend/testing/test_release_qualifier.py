@@ -2519,6 +2519,70 @@ class TestRefutedSeverityMatrixReconcile:
         assert refuted[0]["severity"] == finding_sev
 
 
+class TestReconcileAuditSubsetSummarySameSeverity:
+    """Subset-summary refutation must not misbind to the wrong same-severity finding."""
+
+    SHA = "cafebabe"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def _verified(self, severity: str, summary: str) -> dict:
+        return {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+
+    def test_refuted_false_positive_subset_summary_does_not_misbind_same_severity_finding(
+        self,
+    ):
+        """A short subset-summary refutation must remove only its closest finding.
+
+        The refutation tokens are a strict subset of both findings. Under the old
+        min-denominator scorer it would score 1.0 against both and, because it is
+        emitted before the fuzzy confirmation, bind to finding A first. Jaccard
+        keeps finding A below threshold while allowing the closer finding B match.
+        """
+        finding_a = self._verified(
+            "high",
+            "Unbounded SQL query parameter injection via user input search endpoint without sanitization",
+        )
+        finding_b = self._verified(
+            "high",
+            "SQL injection via query parameter search endpoint",
+        )
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "severity": "high",
+                "summary": "SQL injection via query parameter",
+                "reason": "query parameter is sanitized via ORM layer before database execution",
+            },
+            {
+                "verdict": "confirmed",
+                "summary": "Unbounded SQL user input checked",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is not None
+        assert [f["summary"] for f in modified["findings"]] == [
+            "Unbounded SQL query parameter injection via user input search endpoint without sanitization"
+        ]
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == (
+            "SQL injection via query parameter search endpoint"
+        )
+
+
 class TestChallengedVsUnchallengedTelemetry:
     """Tests for compute_challenged_vs_unchallenged_telemetry (pure function)."""
 

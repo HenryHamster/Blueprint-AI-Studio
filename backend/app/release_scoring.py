@@ -1255,14 +1255,27 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     if cv_summary == f_summary:
         return 2.0
 
-    # Tier-2: significant-token fuzzy match (min-denominator, threshold 0.6).
+    # Tier-2: significant-token fuzzy match.
+    # refuted_false_positive uses Jaccard (union denominator) so a subset summary
+    # cannot score 1.0 against every finding that contains its tokens — it only
+    # matches a finding whose token set is close in size to the verdict's.
+    # confirmed/uncertain keep the original min-denominator behaviour.
     f_tokens = _finding_summary_tokens(f_summary)
     cv_tokens = _finding_summary_tokens(cv_summary)
     if f_tokens and cv_tokens:
         overlap = len(f_tokens & cv_tokens)
-        min_size = min(len(f_tokens), len(cv_tokens))
-        if min_size > 0 and overlap / min_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
-            return overlap / min_size
+        is_refutation = (
+            str(verdict_entry.get("verdict") or "").lower().strip()
+            == "refuted_false_positive"
+        )
+        if is_refutation:
+            union_size = len(f_tokens | cv_tokens)
+            if union_size > 0 and overlap / union_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
+                return overlap / union_size
+        else:
+            min_size = min(len(f_tokens), len(cv_tokens))
+            if min_size > 0 and overlap / min_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
+                return overlap / min_size
 
     return None
 
