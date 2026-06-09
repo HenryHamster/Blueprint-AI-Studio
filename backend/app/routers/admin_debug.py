@@ -1132,8 +1132,8 @@ async def reset_circuit_breaker(
         vision_keys_to_clear = {"_strategic_failures", "_pending_strategic_review"}
         if vision_keys_to_clear & project.vision.keys():
             project.vision = {**project.vision}
-            for key in vision_keys_to_clear:
-                project.vision.pop(key, None)
+            for vkey in vision_keys_to_clear:
+                project.vision.pop(vkey, None)
             flag_modified(project, "vision")
             session.add(project)
             await session.commit()

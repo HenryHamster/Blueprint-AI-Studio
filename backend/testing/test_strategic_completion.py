@@ -2103,6 +2103,70 @@ async def test_strategic_completion_persists_recommended_mode_on_create(
 
 
 @pytest.mark.asyncio
+async def test_api_completion_resets_strategic_failures_breaker(db_session, mocker):
+    """A successful API-path strategic cycle resets the _strategic_failures
+    breaker even when it does NOT rewrite the vision.
+
+    Regression: the counter was only cleared on a vision *write* (the
+    set-problem-model API handler and the legacy log-parse merge). A healthy
+    cycle that completes by updating directions / problem_model / running_update
+    without rewriting the vision therefore left the breaker untouched, so
+    _strategic_failures only ever ratcheted up on failures and could be cleared
+    solely by the 48h time-decay — leaving the breaker falsely tripped (and
+    forced/backstop strategic refresh gated) for up to two days while every
+    cycle succeeded.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={
+            "purpose": "test",
+            "revision": 3,
+            "_strategic_failures": 3,
+            "_strategic_failures_at": "2026-06-08T19:49:29",
+        },
+        directions=[{"id": "d1", "text": "x", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 3}}
+        ],
+        # api_was_used -> True via _strategic_api_called, but the cycle does NOT
+        # rewrite the vision (revision unchanged) and carries no cycle_id — the
+        # common "successful cycle without a vision write" shape.
+        context={"_strategic_api_called": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    assert "_strategic_failures" not in vision, (
+        "a successful API-path cycle must clear the _strategic_failures breaker; "
+        f"got {vision.get('_strategic_failures')!r}"
+    )
+    assert "_strategic_failures_at" not in vision
+    # Real vision content is preserved — only the breaker keys are dropped.
+    assert vision.get("purpose") == "test"
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_persists_recommended_mode_on_update(
     db_session, mocker
 ):
