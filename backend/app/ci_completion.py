@@ -976,7 +976,10 @@ async def _attempt_merge_with_retry_and_escalation(
         # Cannot be resolved by retrying — spawn a fix task with rebase instructions,
         # mirroring the CI-failure spawn path below.
         if merge_result.get("conflict") or _ms == "dirty":
-            from app.review_pipeline import _spawn_pipeline_task
+            from app.review_pipeline import (
+                _spawn_pipeline_task,
+                build_merge_conflict_fix_prompt,
+            )
             from app.rollup_state import _is_rollup_parent_awaiting_merge
 
             # Dedup guard: if a fix task for this PR is already active, don't spawn another.
@@ -1035,16 +1038,8 @@ async def _attempt_merge_with_retry_and_escalation(
                     f"[CI] PR #{ci_pr_number} merge conflict, fix already exists → {existing_fix.id} ({source})"
                 )
                 return False
-            conflict_prompt = (
-                f"PR #{ci_pr_number} cannot merge into `{ci_base}` due to a merge conflict "
-                f"(GitHub mergeable_state='dirty'). The code review is already approved — "
-                f"focus only on resolving the conflict.\n\n"
-                f"After cloning:\n"
-                f"  1. Run `git fetch origin {ci_base} && git rebase origin/{ci_base}`.\n"
-                f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
-                f"  3. Re-run lint/type/test suites for the affected files.\n"
-                f"  4. Commit the resolution and force-push with `--force-with-lease`.\n\n"
-                f"Original merge error: {merge_msg[:500]}"
+            conflict_prompt = build_merge_conflict_fix_prompt(
+                ci_pr_number, ci_base, merge_error=merge_msg
             )
             # Defense-in-depth (incident 2026-05-26..28): prefer the PR's
             # actual head ref over our parent-task-derived ``ci_branch`` when

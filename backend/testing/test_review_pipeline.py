@@ -41,6 +41,7 @@ from app.review_pipeline import (
     _repeating_issue_descriptions,
     _format_repeating_issues_section,
     build_ci_failure_fix_prompt,
+    build_merge_conflict_fix_prompt,
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
@@ -59,6 +60,40 @@ from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
 )
 from testing.factories import make_project, make_task
+
+
+# ── merge-conflict fix prompt ───────────────────────────────────────────────
+
+
+class TestMergeConflictFixPrompt:
+    """The conflict-resolution prompt must steer the agent away from the two
+    failure modes that wedged rollup PR #8920: silently dropping a side's hunk,
+    and keeping one side's code against the other side's test for the same
+    feature. It must also set the expectation that ./check now verifies the
+    affected tests so a bad resolution can't pass ./pr open."""
+
+    def test_combines_both_intents_and_forbids_dropping(self):
+        prompt = build_merge_conflict_fix_prompt(8920, "automain")
+        assert "PR #8920" in prompt
+        assert "automain" in prompt
+        low = prompt.lower()
+        # Combine both behaviors on overlapping hunks; don't pick a side.
+        assert "combine both behaviors" in low
+        assert "do not pick one side" in low
+        # Don't silently drop content either side added.
+        assert "do not drop" in low
+        # Set the gate expectation: ./check runs affected tests, ./pr open blocks.
+        assert "./check" in prompt and "./pr open" in prompt
+
+    def test_appends_merge_error_when_provided(self):
+        prompt = build_merge_conflict_fix_prompt(
+            7, "main", merge_error="CONFLICT (content): file.py"
+        )
+        assert "Original merge error: CONFLICT (content): file.py" in prompt
+
+    def test_omits_merge_error_section_when_absent(self):
+        prompt = build_merge_conflict_fix_prompt(7, "main")
+        assert "Original merge error" not in prompt
 
 
 # ── gh-token prompt pattern ────────────────────────────────────────────────────

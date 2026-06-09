@@ -1015,6 +1015,53 @@ async def _spawn_verify_tests_task(
     return (new_task, True)
 
 
+def build_merge_conflict_fix_prompt(
+    pr_number: int | str,
+    base_branch: str,
+    *,
+    merge_error: str | None = None,
+) -> str:
+    """Prompt for a merge-conflict resolution fix task (review already approved).
+
+    Hardened after rollup PR #8920 (research task 72e4b062). Two failure modes
+    shipped a textually-clean resolution green through the agent's standalone
+    gate and only failed in CI — after the 16-iteration review-fix budget was
+    already spent: (a) the resolution silently DROPPED a hunk one side added
+    (`db_session.add(project)` → FK violation), and (b) it kept one side's code
+    against the OTHER side's test for the same feature (a code/test vintage
+    skew). The guidance below tells the agent to COMBINE both intents on
+    overlapping hunks rather than pick a side, and to preserve every side's
+    non-overlapping content. Enforcement is agent-side: a conflict-resolution
+    fix now runs the affected backend test files under Postgres in ``./check``,
+    so ``./pr open`` cannot push until they pass (see the agent's
+    ``buildMergeVerifyBlock``).
+
+    ``merge_error`` (when provided) appends the original GitHub merge message,
+    truncated, for context.
+    """
+    prompt = (
+        f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
+        f"(GitHub mergeable_state='dirty'). The code review is already approved — "
+        f"focus only on resolving the conflict.\n\n"
+        f"The base (`{base_branch}`) has already been fetched and integrated into "
+        f"your working tree by the harness — do NOT re-run git fetch/rebase.\n\n"
+        f"  1. Resolve the conflict markers the integration left.\n"
+        f"  2. When BOTH sides changed the same function or logic, COMBINE both "
+        f"behaviors — do NOT pick one side or delete the "
+        f"other side's change. If `{base_branch}` restructured code this branch "
+        f"also modified, re-apply this branch's intent on top of the new "
+        f"structure so neither side's change is lost; and do NOT drop a hunk "
+        f"either side added in a region the other did not touch.\n"
+        f"  3. Re-run the affected tests. Your `./check` gate runs the affected "
+        f"backend test files under Postgres and `./pr open` will NOT push until "
+        f"they pass — iterate edit → `./check` until green.\n"
+        f"  4. Commit the resolution and force-push with `--force-with-lease`."
+    )
+    if merge_error:
+        prompt += f"\n\nOriginal merge error: {merge_error[:500]}"
+    return prompt
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
