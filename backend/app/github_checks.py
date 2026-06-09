@@ -5,11 +5,46 @@ existing imports keep working.
 """
 
 import asyncio
+import re
 import time
 
 from fastapi import HTTPException, status
 
 from app.github import logger
+
+
+# Pytest emits its authoritative failing-test list as ``FAILED <path>::<test>``
+# lines (the "short test summary info" block). These are the selectors the
+# ci_failure fix loop re-runs locally (agent ``./check`` → ``test-backend.sh
+# --postgres``). The ``\S+::\S+`` shape isolates a real selector from captured
+# log noise such as ``[STRATEGIC] ... FAILED (failure #1)`` (no ``::``).
+_PYTEST_FAILED_SELECTOR_RE = re.compile(r"FAILED\s+(\S+::\S+)")
+
+
+def _extract_pytest_selectors(raw_log: str, cap: int = 50) -> list[str]:
+    """Deduped pytest ``path::test`` selectors from a raw CI job log.
+
+    Scans the WHOLE log, not a trailing window. A test that exercises a failure
+    path floods the job log with captured WARNING/ERROR lines containing
+    ``error``/``failed``; the per-check ``error_lines[-30:]`` slice in
+    :func:`get_check_runs` can be entirely such noise, pushing the real
+    ``FAILED testing/...::test`` summary lines out of the window. When that
+    happens the spawned fix task's ``ci_failure_logs`` carries no selectors, the
+    agent's ci-failure ``./check`` gate (which re-runs the exact failing
+    selectors via the Postgres harness) has nothing to verify, and the fix loop
+    ships blind — the open-loop strand. Collecting selectors across the full log
+    and surfacing them explicitly keeps that loop closed.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _PYTEST_FAILED_SELECTOR_RE.finditer(raw_log or ""):
+        sel = m.group(1)
+        if sel not in seen:
+            seen.add(sel)
+            out.append(sel)
+            if len(out) >= cap:
+                break
+    return out
 
 
 def _github_request(*args, **kwargs):
@@ -382,6 +417,11 @@ async def get_check_runs(
                     if log_response.status_code == 200:
                         raw_log = log_response.text
                         lines = raw_log.strip().split("\n")
+                        # Authoritative pytest selectors first, collected across
+                        # the WHOLE log so they survive the error_lines[-30:]
+                        # truncation below (see _extract_pytest_selectors). The
+                        # fix loop's ci-failure ./check re-runs exactly these.
+                        selectors = _extract_pytest_selectors(raw_log)
                         error_lines = [
                             ln
                             for ln in lines
@@ -390,18 +430,25 @@ async def get_check_runs(
                                 for kw in ["error", "failed", "err!", "✗", "\u00d7"]
                             )
                         ]
+                        block: list[str] = []
+                        if selectors:
+                            block.append(
+                                f"  [{name}] Failing tests:\n"
+                                + "\n".join(f"    FAILED {s}" for s in selectors)
+                            )
                         if error_lines:
-                            log_lines.append(
+                            block.append(
                                 f"  [{name}] Errors:\n"
                                 + "\n".join(
                                     f"    {ln.strip()}" for ln in error_lines[-30:]
                                 )
                             )
-                        else:
-                            log_lines.append(
+                        elif not selectors:
+                            block.append(
                                 f"  [{name}] (last 30 lines):\n"
                                 + "\n".join(f"    {ln.strip()}" for ln in lines[-30:])
                             )
+                        log_lines.append("\n".join(block))
                         got_logs = True
                         break
                 except Exception:  # noqa: BLE001
