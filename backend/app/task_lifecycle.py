@@ -411,7 +411,7 @@ async def _resolve_quality_grader_completion(
 
     ctx = dict(source.context or {})
     if is_adversarial:
-        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+        from app.finding_deduplication import finding_hash as _fh
 
         # Prefer hashes persisted at park time: these include prior_deferred
         # findings that were prepended AFTER plan_output was written. Without
@@ -2547,12 +2547,17 @@ async def _process_post_commit(
                             )
 
                 # ── Default-on second-opinion gate ──────────────────────────
-                # Before a high-stakes ordinary review verdict commits (an
-                # APPROVE→merge or a REQUEST_CHANGES→fix), require an independent
-                # panel_review challenge and reconcile it against this primary
-                # verdict. Default-on; operator rollback via the
-                # ``review_second_opinion_gate_enabled`` runtime flag restores
-                # today's synchronous behavior and records ``unchallenged``.
+                # Before a high-stakes ordinary review verdict commits, require
+                # an independent panel_review challenge and reconcile it against
+                # this primary verdict. High-stakes = an APPROVE on a PR
+                # targeting a trunk branch (integration branch or promotion
+                # target) — the only verdict that commits an irreversible
+                # auto-merge. REQUEST_CHANGES and non-trunk reviews proceed
+                # synchronously (recorded ``unchallenged``): a wrong rejection
+                # self-corrects through the fix loop, and research-branch PRs
+                # are re-reviewed at the rollup boundary. Default-on; operator
+                # rollback via the ``review_second_opinion_gate_enabled``
+                # runtime flag restores fully synchronous behavior.
                 #
                 # Re-entry: once the challenge has reconciled, the review task
                 # carries the reconciliation record. That record (a) overrides
@@ -2585,7 +2590,19 @@ async def _process_post_commit(
                     "review_second_opinion_gate_enabled", True
                 ):
                     if review_is_high_stakes(
-                        verdict, issues, investigated_files, task
+                        verdict,
+                        issues,
+                        investigated_files,
+                        task,
+                        base_branch=base_branch,
+                        trunk_branches=(
+                            _shared_state.get_project_integration_branch(
+                                _review_project
+                            ),
+                            _shared_state.get_project_promotion_target(
+                                _review_project
+                            ),
+                        ),
                     ):
                         _challenger = await spawn_review_second_opinion(
                             task,

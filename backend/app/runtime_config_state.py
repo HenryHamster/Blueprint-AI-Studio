@@ -60,9 +60,11 @@ runtime_config: Dict = {
     # dirty conflicts outlive the window and use the agent path unchanged.
     "rollup_merge_queue_enabled": True,
     # Default-on second-opinion gate for high-stakes ordinary review verdicts.
-    # When True, an APPROVE→merge or REQUEST_CHANGES→fix from an ordinary
-    # ``review`` task does not commit until an independent panel_review challenge
-    # has been recorded and reconciled against the primary verdict. Disabling it
+    # When True, a trunk-targeting APPROVE→merge from an ordinary ``review``
+    # task (PR base = integration branch or promotion target) does not commit
+    # until an independent panel_review challenge has been recorded and
+    # reconciled against the primary verdict. Other verdicts (REQUEST_CHANGES,
+    # non-trunk APPROVEs) proceed synchronously. Disabling it
     # restores today's synchronous review-finalization behavior WITHOUT removing
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -159,34 +160,32 @@ def review_is_high_stakes(
     issues: list | None,
     investigated_files: list | None,
     review_task: Task,
+    *,
+    base_branch: str | None,
+    trunk_branches: Collection[str],
 ) -> bool:
     """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
 
-    Default-broad and fail-safe (the gate is meant to catch single-pass
-    mistakes, so it errs toward challenging):
+    Narrow by design — a panel challenge is a full extra agent run, so it is
+    reserved for the one verdict that commits something irreversible: an
+    APPROVE on a PR targeting a trunk branch (the project's integration branch
+    or promotion target), which hands the PR straight to auto-merge.
 
-    * an APPROVE always qualifies — it hands the PR straight to the auto-merge
-      decision tree, the highest-stakes review outcome;
-    * a REQUEST_CHANGES qualifies when it carries at least one concrete defect
-      (an issue with a description) — verification-only rejections have already
-      been downgraded to APPROVE upstream, so a REQUEST_CHANGES reaching here is
-      a genuine change request — or when the reviewed change touched
-      security-critical files.
+    Everything else self-corrects more cheaply without a challenge:
 
-    Kept as a single function so operators can narrow it (e.g. gate only
-    cross-module or critical-file PRs) without touching the lifecycle wiring.
+    * a REQUEST_CHANGES feeds the fix loop, and the fixed PR is re-reviewed —
+      a wrong rejection costs one fix iteration, not a bad merge;
+    * reviews of PRs targeting non-trunk branches (e.g. ``research/*``) are
+      re-covered by the rollup review at the trunk boundary.
+
+    Kept as a single function so operators can re-broaden or further narrow it
+    without touching the lifecycle wiring.
     """
-    if verdict == "APPROVE":
-        return True
-    if verdict == "REQUEST_CHANGES":
-        if any(
-            isinstance(i, dict) and str(i.get("description") or "").strip()
-            for i in (issues or [])
-        ):
-            return True
-        if (review_task.context or {}).get("touched_critical"):
-            return True
-    return False
+    return (
+        verdict == "APPROVE"
+        and base_branch is not None
+        and base_branch in trunk_branches
+    )
 
 
 async def spawn_review_second_opinion(
@@ -393,7 +392,7 @@ class ForwardQualityStrategy:
         # never disagree on what "parseable" means. Lazy import avoids a module
         # import cycle (task_completion imports this module).
         if task_type == "memo":
-            from app.task_completion import _parse_memo_output  # noqa: PLC0415
+            from app.task_completion import _parse_memo_output
 
             if _parse_memo_output(artifact_text) is None:
                 return EvaluationVerdict(
@@ -549,7 +548,7 @@ class StructuredVerdictStrategy:
                 False, "empty terminal artifact — no structured verdict produced", self.key
             )
 
-        from app.task_completion import _parse_panel_review_output  # noqa: PLC0415
+        from app.task_completion import _parse_panel_review_output
 
         parsed = _parse_panel_review_output(artifact_text)
         if parsed is None:
@@ -661,7 +660,7 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     text = (artifact_text or "").strip()
     if not text:
         return None
-    from app.task_completion import _extract_json_array  # noqa: PLC0415
+    from app.task_completion import _extract_json_array
 
     json_str = _extract_json_array(text, "severity")
     if not json_str:
@@ -916,7 +915,7 @@ def build_adversarial_challenge_manifest(
             )
         if item.get("needs_revalidation"):
             entry["needs_revalidation"] = True
-        candidate = compact + [entry]
+        candidate = [*compact, entry]
         candidate_json = json.dumps(candidate)
         if len(candidate_json) > _ADVERSARIAL_MANIFEST_CHAR_BUDGET:
             break
@@ -980,7 +979,7 @@ def parse_adversarial_finding_verdicts(
     result: dict[str, dict] = {h: dict(_unresolved) for h in finding_hashes}
     if not completed or not logs:
         return result
-    from app.task_completion import _extract_json_array  # noqa: PLC0415
+    from app.task_completion import _extract_json_array
 
     text = (logs or "").strip()
     json_str = _extract_json_array(text, "hash", "verdict")
