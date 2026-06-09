@@ -4158,3 +4158,71 @@ def compute_task_type_cost_adherence(
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Safeguard merge-gate shadow (observe-mode) telemetry
+# ---------------------------------------------------------------------------
+
+# Hard cap on shadow-verdict rows returned per call, to bound memory usage
+# when querying across many tasks.
+_SAFEGUARD_SHADOW_CAP = 200
+
+
+def compute_safeguard_shadow_metrics(
+    security_audit_tasks: "List[Task]",
+) -> Dict[str, Any]:
+    """Compact per-cycle safeguard shadow-challenge telemetry for the strategist.
+
+    Scans ``security_audit_tasks`` (caller supplies the window-filtered rows) for
+    tasks carrying ``safeguard_observe_verdict`` (written in observe mode by
+    ``_maybe_release_safeguard_gate`` after a shadow challenge resolves).  Returns
+    a summary dict so the strategist can measure the false-positive-block rate
+    before enabling enforce mode.
+
+    Fields returned:
+        observed_blocks     — total shadow-challenge verdicts found (capped at
+                              _SAFEGUARD_SHADOW_CAP to bound the scan).
+        would_release       — count whose outcome was "rejected" or "downgraded"
+                              (the gate WOULD have been released in enforce mode).
+        confirmed           — count confirmed as a real critical/high finding.
+        unavailable         — count where the challenge errored/timed out.
+        false_positive_rate — would_release / observed_blocks, or None if zero.
+        cap_reached         — True when the scan hit the hard cap.
+    """
+    from app.task_evaluators import SAFEGUARD_OBSERVE_VERDICT_KEY  # noqa: PLC0415
+
+    observed_blocks = 0
+    would_release = 0
+    confirmed = 0
+    unavailable = 0
+    cap_reached = False
+
+    for task in security_audit_tasks:
+        if observed_blocks >= _SAFEGUARD_SHADOW_CAP:
+            cap_reached = True
+            break
+        ctx = task.context or {}
+        verdict = ctx.get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        if not isinstance(verdict, dict):
+            continue
+        observed_blocks += 1
+        outcome = str(verdict.get("outcome") or "unavailable").lower()
+        if outcome in ("rejected", "downgraded"):
+            would_release += 1
+        elif outcome == "confirmed":
+            confirmed += 1
+        else:
+            unavailable += 1
+
+    false_positive_rate = (
+        round(would_release / observed_blocks, 3) if observed_blocks > 0 else None
+    )
+    return {
+        "observed_blocks": observed_blocks,
+        "would_release": would_release,
+        "confirmed": confirmed,
+        "unavailable": unavailable,
+        "false_positive_rate": false_positive_rate,
+        "cap_reached": cap_reached,
+    }

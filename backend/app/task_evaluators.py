@@ -81,6 +81,13 @@ SAFEGUARD_CHALLENGE_SOURCE_KEY = "safeguard_challenge_for_task_id"
 # decide whether the merge gate is released or held.
 SAFEGUARD_CHALLENGE_VERDICT_KEY = "safeguard_challenge_verdict"
 
+# Context key written on the SAFEGUARD task when it operates in observe/shadow
+# mode. The value mirrors SAFEGUARD_CHALLENGE_VERDICT_KEY (same dict shape) but
+# the gate is NEVER released based on this key — it is a bounded, auditable
+# record of what the challenge WOULD have decided. Consumed by digest_metrics
+# to compute the false-positive-block rate without changing merge behavior.
+SAFEGUARD_OBSERVE_VERDICT_KEY = "safeguard_observe_verdict"
+
 
 # ---------------------------------------------------------------------------
 # Per-finding second-opinion CHALLENGE seam.

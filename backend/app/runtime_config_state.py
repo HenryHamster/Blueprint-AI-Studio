@@ -126,17 +126,26 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
-    # Independent challenge of a safeguard merge-gate blocker: when True, a
-    # safeguard audit's critical/high finding is independently challenged before
-    # the merge gate is held, and a challenger verdict of "rejected" or
-    # "downgraded" automatically releases the gate with an auditable record.
-    # Ships DARK (default OFF) — OFF preserves today's behavior of blocking on
-    # any raw critical/high finding. Fail-closed: if the challenge errors or
-    # times out the gate stays closed.
-    "safeguard_challenge_enabled": os.getenv(
-        "SAFEGUARD_CHALLENGE_ENABLED", "false"
+    # Graduated rollout mode for the safeguard merge-gate challenge.
+    # Mirrors strategic_retirement_challenge_gate_mode.
+    #   "off"     — (default) no challenge; gate held unconditionally on any
+    #               critical/high finding. Preserves today's behavior exactly.
+    #   "observe" — shadow/observe mode: the challenge is spawned and its verdict
+    #               is recorded on the safeguard task as
+    #               ``safeguard_observe_verdict``, but the gate is NEVER released
+    #               by the verdict. Lets operators measure the false-positive rate
+    #               before flipping to enforce. Any challenge error/timeout records
+    #               ``{"outcome": "unavailable"}`` and never blocks.
+    #   "enforce" — full binding mode: a challenger verdict of "rejected" or
+    #               "downgraded" releases the gate with an auditable record.
+    #               Fail-closed: if the challenge errors or times out the gate
+    #               stays closed.
+    "safeguard_challenge_gate_mode": os.getenv(
+        "SAFEGUARD_CHALLENGE_GATE_MODE", "off"
     ).lower()
-    in ("1", "true", "yes"),
+    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "off").lower()
+    in ("off", "observe", "enforce")
+    else "off",
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
@@ -1150,6 +1159,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     ).strip().lower()
                     if raw_mode in ("observe", "advisory", "enforce"):
                         _set("strategic_retirement_challenge_gate_mode", raw_mode)
+                if "safeguard_challenge_gate_mode" in config_json:
+                    raw_mode = str(
+                        config_json["safeguard_challenge_gate_mode"] or ""
+                    ).strip().lower()
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("safeguard_challenge_gate_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",

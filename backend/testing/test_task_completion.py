@@ -3119,10 +3119,11 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_flag_disabled(
+    async def test_safeguard_gate_maintained_when_mode_off(
         self, db_session
     ):
-        """With safeguard_challenge_enabled=False, gate is maintained unconditionally."""
+        """With safeguard_challenge_gate_mode='off', gate is maintained unconditionally."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
 
         orig, safeguard = await self._make_safeguard_pair(db_session)
@@ -3138,12 +3139,13 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
-        # Flag OFF (default) — no challenge spawned, gate maintained.
+        # Mode OFF (default) — no challenge spawned, gate maintained.
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "off"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
         assert orig.requires_approval is True, (
-            "Gate should stay closed when safeguard_challenge_enabled is False"
+            "Gate should stay closed when safeguard_challenge_gate_mode is 'off'"
         )
 
     @pytest.mark.asyncio
@@ -3186,11 +3188,11 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enabled(
+    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enforce(
         self, db_session
     ):
-        """When safeguard_challenge_enabled=True and no verdict exists, a challenge
-        task is created, the safeguard is parked EVALUATING with
+        """When safeguard_challenge_gate_mode='enforce' and no verdict exists, a
+        challenge task is created, the safeguard is parked EVALUATING with
         awaiting_safeguard_challenge set, and the gate remains held."""
         import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
@@ -3209,7 +3211,7 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
-        shared_state.runtime_config["safeguard_challenge_enabled"] = True
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
@@ -3238,6 +3240,170 @@ class TestSafeguardMergeGateChallenge:
             if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
         ]
         assert challenge_tasks, "A challenge task pointing to the safeguard must have been created"
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_spawns_challenge_but_maintains_gate(
+        self, db_session
+    ):
+        """In observe mode, a shadow challenge is spawned for a critical/high finding
+        but the gate is NOT released (requires_approval stays True)."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+        from sqlmodel import select
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "critical",
+                "title": "SQL injection",
+                "description": "Raw query in handler.",
+                "fix_prompt": "Parameterize query.",
+                "file_path": "app/db.py",
+                "line_number": 42,
+            }
+        ]
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        # Gate must NOT be released in observe mode.
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode even when shadow challenge is spawned"
+        )
+        # Safeguard is parked EVALUATING awaiting shadow challenge.
+        assert safeguard.status == TaskStatus.EVALUATING, (
+            "Safeguard should be parked EVALUATING while shadow challenge is in flight"
+        )
+        # awaiting_safeguard_challenge is set.
+        assert (safeguard.context or {}).get("awaiting_safeguard_challenge"), (
+            "awaiting_safeguard_challenge must be set after shadow challenge spawn"
+        )
+        # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY must have been created.
+        all_tasks = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == safeguard.project_id)
+            )
+        ).scalars().all()
+        challenge_tasks = [
+            t for t in all_tasks
+            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
+        ]
+        assert challenge_tasks, "A shadow challenge task must have been created in observe mode"
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_records_shadow_verdict_on_reentry(
+        self, db_session
+    ):
+        """In observe mode, when re-entered with a challenge verdict already present,
+        the verdict is copied to safeguard_observe_verdict, SAFEGUARD_CHALLENGE_VERDICT_KEY
+        is cleared, and the gate stays held."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import (
+            SAFEGUARD_CHALLENGE_VERDICT_KEY,
+            SAFEGUARD_OBSERVE_VERDICT_KEY,
+        )
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "high",
+                "title": "Missing CSRF protection",
+                "description": "Form handler missing CSRF token.",
+                "fix_prompt": "Add CSRF middleware.",
+                "file_path": "app/routers/admin.py",
+                "line_number": 10,
+            }
+        ]
+        # Pre-stamp the binding verdict key — simulates the challenge having returned.
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "rejected",
+                "reasoning": "the cited route is internal-only, not user-facing",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        # Gate must NOT be released even though the shadow verdict is "rejected".
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode regardless of shadow verdict outcome"
+        )
+        # Shadow verdict is recorded under SAFEGUARD_OBSERVE_VERDICT_KEY.
+        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        assert observe_verdict is not None, (
+            "safeguard_observe_verdict must be recorded after shadow challenge resolves"
+        )
+        assert observe_verdict.get("outcome") == "rejected", (
+            "safeguard_observe_verdict outcome must match the original challenge outcome"
+        )
+        # Binding key is cleared so a later upgrade to enforce does not replay a stale verdict.
+        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
+            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_shadow_confirmed_also_maintains_gate(
+        self, db_session
+    ):
+        """In observe mode, even a 'confirmed' shadow verdict keeps the gate held and
+        records the shadow outcome."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import (
+            SAFEGUARD_CHALLENGE_VERDICT_KEY,
+            SAFEGUARD_OBSERVE_VERDICT_KEY,
+        )
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "critical",
+                "title": "RCE via deserialization",
+                "description": "Unsafe pickle load.",
+                "fix_prompt": "Replace with json.loads.",
+                "file_path": "app/utils.py",
+                "line_number": 5,
+            }
+        ]
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "confirmed",
+                "reasoning": "vulnerability is real and exploitable",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode for confirmed findings too"
+        )
+        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        assert observe_verdict is not None, "Shadow verdict must be recorded"
+        assert observe_verdict.get("outcome") == "confirmed"
+        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
+            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
+        )
 
     @pytest.mark.asyncio
     async def test_spawn_safeguard_challenge_returns_none_when_verdict_exists(
