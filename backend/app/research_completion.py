@@ -4245,10 +4245,44 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
     )
     _record_research_survival_signal(task, surviving=_surviving_findings)
+
+    # Flip the parent to EVALUATING ATOMICALLY with the child-task INSERTs in the
+    # commit below, so the durable post-spawn state is never COMPLETED-with-children.
+    # The canonical flip (apply_post_spawn_state -> _apply_terminal_transition) runs
+    # in a LATER commit, after depends_on / foundation wiring; a contention kill
+    # (e.g. a 120s statement_timeout) between this commit and that one used to strand
+    # the parent frozen at the agent-reported COMPLETED with live children — and
+    # _check_and_trigger_rollup early-returns unless the parent is EVALUATING, so the
+    # whole subtree stranded on the research branch (task 98249c8a, 2026-06-09). This
+    # mirrors `plan`, which already flips EVALUATING before its child-spawn commit
+    # (plan_completion.py). Gate on "this pass spawned children OR a prior pass already
+    # owns them" — the same has_existing_children probe _apply_terminal_transition uses
+    # at its terminal commit — so a genuine zero-children cycle still takes the legit
+    # COMPLETED branch there. _apply_terminal_transition re-sets EVALUATING idempotently.
+    _has_prior_children = False
+    if not child_tasks:
+        _has_prior_children = bool(
+            (
+                await session.execute(
+                    select(Task.id).where(Task.parent_task_id == task.id).limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if child_tasks or _has_prior_children:
+        task.status = TaskStatus.EVALUATING
+        task.context = {
+            **(task.context or {}),
+            "research_branch": research_branch,
+            "original_base": original_base,
+        }
     session.add(task)
 
     # This commit flushes the child-task INSERTs — the collision point for the
-    # duplicate-spawn guard when a peer already spawned this batch.
+    # duplicate-spawn guard when a peer already spawned this batch. The
+    # EVALUATING flip above (when children exist) lands in the SAME commit, so
+    # children + EVALUATING are durable together — never COMPLETED-with-children.
     if not await _commit_or_handle_duplicate_spawn(
         session, task, stage="child-task spawn"
     ):
