@@ -1031,6 +1031,78 @@ async def test_compute_success_persists_one_knowledge_document(
     # plan_output mirrors a compact copy WITHOUT clobbering compute_result.
     assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
     assert task.plan_output["knowledge_document"]["source_kind"] == "compute_experiment"
+    # The knowledge document id is recorded so the acceptance criterion is
+    # verifiable from the task record alone (no separate KD query needed).
+    assert "id" in task.plan_output["knowledge_document"]
+    assert task.plan_output["knowledge_document"]["id"] == str(doc.id)
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_persistence_internal_failure_stamps_plan_output(
+    db_session, _quiet_compute_io
+):
+    """When persist_compute_experiment_knowledge raises internally, the best-effort
+    wrapper stamps plan_output with persisted=False and the task stays COMPLETED."""
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+
+    with patch(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        new=AsyncMock(side_effect=RuntimeError("simulated persistence failure")),
+    ):
+        await _handle_compute_experiment_completion(
+            task, _result_artifact(accuracy=0.93), db_session
+        )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+    assert task.plan_output.get("knowledge_document") == {"persisted": False}
+    # No KnowledgeDocument was created.
+    assert await _knowledge_docs_for(db_session, task) == []
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_persistence_db_failure_stamps_plan_output_after_rollback(
+    db_session, _quiet_compute_io
+):
+    """Production-shaped: when persist_compute_experiment_knowledge fails after
+    executing a DB statement (leaving the session in pending-rollback state),
+    the wrapper must rollback the poisoned transaction before stamping
+    plan_output={persisted: false} in a clean transaction.
+
+    Without the rollback, the fallback commit raises PendingRollbackError,
+    is silently swallowed, and the task is left without the failure marker.
+    """
+    from sqlalchemy import text
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+
+    async def _db_level_failing_persist(task_arg, *, session, **_kwargs):
+        # Execute a statement that fails at the DB level, leaving the session
+        # in pending-rollback state without rolling back — this is the
+        # production-shaped failure a flush/commit error would produce.
+        try:
+            await session.execute(text("SELECT 1 FROM table_that_must_not_exist_xyz_abc"))
+        except Exception:
+            pass  # intentionally leave session in pending-rollback state
+        raise RuntimeError("simulated DB-level persistence failure")
+
+    with patch(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        new=_db_level_failing_persist,
+    ):
+        await _handle_compute_experiment_completion(
+            task, _result_artifact(accuracy=0.93), db_session
+        )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output.get("knowledge_document") == {"persisted": False}
+    assert await _knowledge_docs_for(db_session, task) == []
 
 
 @pytest.mark.asyncio

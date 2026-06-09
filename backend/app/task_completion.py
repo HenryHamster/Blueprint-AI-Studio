@@ -2134,6 +2134,21 @@ async def _persist_compute_experiment_knowledge_best_effort(
             task.id,
             exc_info=True,
         )
+        # Record the failure on plan_output so the acceptance criterion
+        # (KnowledgeDocument must exist) is verifiable from the task record.
+        # A flush/commit failure inside persist_compute_experiment_knowledge
+        # leaves the session in pending-rollback state; roll back first so the
+        # fallback write starts from a clean transaction.
+        try:
+            await session.rollback()
+            plan_output = dict(task.plan_output or {})
+            plan_output["knowledge_document"] = {"persisted": False}
+            task.plan_output = plan_output
+            flag_modified(task, "plan_output")
+            session.add(task)
+            await session.commit()
+        except Exception:  # noqa: BLE001
+            pass
         return False
     return True
 
