@@ -7450,7 +7450,12 @@ class TestClearDeployFailed:
 
     @staticmethod
     async def _make_deploy_failed_version(
-        session, project_id, *, promoted_sha="promotedsha123", version_number=1
+        session,
+        project_id,
+        *,
+        promoted_sha="promotedsha123",
+        version_number=1,
+        deploy_failure_reason="no_new_revision",
     ):
         from datetime import datetime, timezone
 
@@ -7465,7 +7470,7 @@ class TestClearDeployFailed:
             promoted_at=promoted_at,
             promoted_sha=promoted_sha,
             serving_status="deploy_failed",
-            deploy_failure_reason="no_new_revision",
+            deploy_failure_reason=deploy_failure_reason,
             deploy_confirm_deadline=datetime(
                 2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
             ),
@@ -7727,10 +7732,27 @@ class TestClearDeployFailed:
     async def test_force_refused_without_override(
         self, client: AsyncClient, db_session
     ):
-        """Unobservable serving SHA + no force → 409, version stays deploy_failed."""
+        """serving_sha_unobservable + no force → 409, version stays deploy_failed."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
         project = await _make_project(db_session)
-        version = await self._make_deploy_failed_version(db_session, project.id)
-        # No DeploymentState → serving SHA cannot be independently observed.
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # A STABLE revision booted after promotion but serving SHA is unobservable
+        # (current_sha="") — re-check must still classify as serving_sha_unobservable.
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -7800,9 +7822,25 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_force_requires_reason(self, client: AsyncClient, db_session):
-        """force=true without a reason → 400."""
+        """force=true without a reason → 400 (only for serving_sha_unobservable)."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
         project = await _make_project(db_session)
-        await self._make_deploy_failed_version(db_session, project.id)
+        await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -7814,12 +7852,29 @@ class TestClearDeployFailed:
     async def test_force_path_clears_and_records_attestation(
         self, client: AsyncClient, db_session
     ):
-        """force=true + reason clears, resolves the alert, flips the verdict."""
-        from app.models import QualificationVerdict
+        """force=true + reason clears for serving_sha_unobservable, resolves alert."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
         from app.release_stall_alerts import _deploy_failed_alert_title
 
         project = await _make_project(db_session)
-        version = await self._make_deploy_failed_version(db_session, project.id)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # A STABLE revision booted after promotion but serving SHA is unobservable
+        # (current_sha="") — re-check must still classify as serving_sha_unobservable
+        # so the force path remains permitted.
+        db_session.add(
+            DeploymentState(
+                current_sha="",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
 
         # Seed the open deploy-failed operator alert that must be resolved.
         alert = Alert(
@@ -7864,6 +7919,124 @@ class TestClearDeployFailed:
             )
         ).scalar_one()
         assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure_reason",
+        ["sha_mismatch", "rolled_back", "halted", "no_new_revision"],
+    )
+    async def test_force_rejected_for_genuine_failure_reason(
+        self, client: AsyncClient, db_session, failure_reason
+    ):
+        """force=true is rejected for known-bad failure reasons that are not
+        serving_sha_unobservable — the deployment genuinely failed and cannot
+        be force-attested as serving."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason=failure_reason,
+        )
+
+        # Seed a DeploymentState that drives _check_backend_revision_serving
+        # to recheck to the intended failure reason.  Without this, ds=None +
+        # now>=deadline always produces "no_new_revision", causing the
+        # assertion on the parametrized reason_code to fail for the other three.
+        after_promotion = datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc)
+        if failure_reason == "sha_mismatch":
+            # STABLE revision booted after promotion, serving a mismatched SHA.
+            db_session.add(
+                DeploymentState(
+                    current_sha="different_sha_456",
+                    status=DeploymentStatus.STABLE,
+                    deployed_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        elif failure_reason == "rolled_back":
+            db_session.add(
+                DeploymentState(
+                    current_sha="",
+                    status=DeploymentStatus.ROLLED_BACK,
+                    deployed_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        elif failure_reason == "halted":
+            db_session.add(
+                DeploymentState(
+                    current_sha="",
+                    status=DeploymentStatus.HALTED,
+                    deployed_at=after_promotion,
+                    halted_at=after_promotion,
+                )
+            )
+            await db_session.commit()
+        # no_new_revision: leave ds=None; deadline already past → no_new_revision
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "I think it worked"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "serving_sha_unobservable" in resp.text
+        assert failure_reason in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == failure_reason
+
+    @pytest.mark.asyncio
+    async def test_force_blocked_when_backend_reason_transitions_to_hard_failure(
+        self, client: AsyncClient, db_session
+    ):
+        """Regression: version scalar latched serving_sha_unobservable but the
+        backend artifact's freshly-rechecked reason_code is sha_mismatch (a hard
+        failure that arose after the latch).  The force path must be rejected even
+        though version.deploy_failure_reason still says serving_sha_unobservable.
+
+        Old code checked the stale version scalar → wrongly allowed attestation.
+        New code checks backend_artifact.reason_code from _refresh_release_artifact_rows
+        → correctly rejects."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus
+
+        project = await _make_project(db_session)
+        # Stale version scalar: latched as serving_sha_unobservable.
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            promoted_sha="promotedsha123",
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        # Fresh backend state: a STABLE revision booted after promotion but is
+        # serving a *different* SHA → sha_mismatch (hard failure).
+        db_session.add(
+            DeploymentState(
+                current_sha="different_sha_456",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "I think it worked"},
+        )
+        # Must be rejected: fresh backend reason is sha_mismatch, not
+        # serving_sha_unobservable — force attestation is not permitted.
+        assert resp.status_code == 409, resp.text
+        assert "serving_sha_unobservable" in resp.text
+        assert "sha_mismatch" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
 
 
 class TestVersionLifecycleInfraFailureFields:

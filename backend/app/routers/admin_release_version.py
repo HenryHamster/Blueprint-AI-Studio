@@ -986,8 +986,35 @@ async def clear_deploy_failed(
         clear_mode = "verified"
         attestation_reason = None
     else:
-        # Live serving SHA is unobservable or does not yet match — refuse unless
-        # the operator explicitly overrides AND records a reason.
+        # Force override is ONLY valid when the failure reason is
+        # serving_sha_unobservable: a revision went STABLE but the live SHA
+        # could not be read, so the deploy may be genuinely live.  For all
+        # other reasons (sha_mismatch, rolled_back, halted, no_new_revision)
+        # the deploy is known to have failed and cannot be force-attested.
+        #
+        # Use backend_artifact.reason_code (freshly rechecked by
+        # _refresh_release_artifact_rows) rather than the stale aggregate scalar
+        # version.deploy_failure_reason, which may not reflect a backend reason
+        # that transitioned after the latch.  Fall back to the scalar only when no
+        # backend artifact row exists.
+        effective_failure_reason = (
+            backend_artifact.reason_code
+            if backend_artifact is not None
+            else version.deploy_failure_reason
+        )
+        if effective_failure_reason != "serving_sha_unobservable":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"force override is not permitted for deploy_failure_reason "
+                    f"'{effective_failure_reason}': the force path only "
+                    "applies when the serving SHA is unobservable "
+                    "(serving_sha_unobservable). A confirmed deployment failure "
+                    "cannot be force-cleared."
+                ),
+            )
+        # Live serving SHA is unobservable — refuse unless the operator
+        # explicitly overrides AND records a reason.
         if not payload.force:
             raise HTTPException(
                 status_code=409,
