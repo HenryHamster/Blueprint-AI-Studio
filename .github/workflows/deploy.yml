@@ -128,7 +128,8 @@ jobs:
             --region ${{ env.REGION }} \
             --min-instances 2 \
             --max-instances 6 \
-            --concurrency 20
+            --concurrency 20 \
+            --update-env-vars DEPLOY_SHA=${{ github.sha }}
 
   run-migrations:
     name: Migrations

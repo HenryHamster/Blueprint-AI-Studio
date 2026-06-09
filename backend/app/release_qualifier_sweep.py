@@ -561,7 +561,9 @@ async def sweep_stuck_qualifications(
             await session.execute(
                 select(release_version.ReleaseVersion.id).where(
                     release_version.ReleaseVersion.status == "promoted",
-                    release_version.ReleaseVersion.serving_status == "deploy_failed",
+                    release_version.ReleaseVersion.serving_status.in_(
+                        ("deploy_failed", "confirmation_timed_out")
+                    ),
                 )
             )
         )
