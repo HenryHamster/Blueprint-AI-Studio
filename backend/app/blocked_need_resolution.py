@@ -370,9 +370,12 @@ def knowledge_substance_satisfies_need(
     if not ref:
         return False
     ref = str(ref).strip()
+    from app.knowledge_query import knowledge_substance_has_durable_compute_grounding
+
     for record in substance_index:
-        if require_acceptance_evidence and not getattr(
-            record, "knowledge_acceptance_evidence", True
+        source_kind = getattr(record, "source_kind", None)
+        if source_kind == "compute_experiment" and (
+            not knowledge_substance_has_durable_compute_grounding(record)
         ):
             continue
         if record.finding_hash and record.finding_hash == ref:

@@ -56,6 +56,7 @@ from app.task_capabilities import (
     COMPLETION_HANDLER_BY_TASK_TYPE,
     get_task_capability,
 )
+from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
 from app.task_completion import _handle_compute_experiment_completion
 
 
@@ -296,6 +297,147 @@ async def test_compute_result_artifact_logical_key_delivered_to_dependent(
             "storage_uri": result_reference,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_hollow_compute_knowledge_does_not_deliver_to_dependents(
+    db_session, _quiet_compute_io
+):
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="HollowComputeDelivery", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: hollow doc",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        context={"finding_hash": "compute-hollow-delivery"},
+    )
+    dependent = Task(
+        project_id=project.id,
+        title="feat: wait on compute knowledge",
+        status=TaskStatus.BLOCKED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "compute-hollow-delivery",
+                "reason": "BLOCKER: waiting on compute knowledge",
+                "need": {"kind": "task", "ref": "compute-hollow-delivery"},
+            }
+        },
+    )
+    db_session.add_all([task, dependent])
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.11,
+            criterion=None,
+            result_reference="https://signed.example.com/jobs/result.json",
+            session=db_session,
+            logs=None,
+        )
+
+    assert doc is not None
+    await db_session.refresh(dependent)
+    assert (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
+    assert dependent.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_grounded_negative_compute_knowledge_delivers_to_dependents(
+    db_session, _quiet_compute_io
+):
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="NegativeComputeDelivery", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: negative result",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        context={"finding_hash": "compute-negative-delivery"},
+    )
+    dependent = Task(
+        project_id=project.id,
+        title="feat: consume negative compute result",
+        status=TaskStatus.BLOCKED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "compute-negative-delivery",
+                "reason": "BLOCKER: waiting on compute knowledge",
+                "need": {"kind": "task", "ref": "compute-negative-delivery"},
+            }
+        },
+    )
+    artifact_uri = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="experiment-result-bundle",
+        storage_uri=artifact_uri,
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=None,
+        result_reference=artifact_uri,
+    )
+    db_session.add_all([task, dependent, artifact, job])
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+    await db_session.refresh(artifact)
+    await db_session.refresh(job)
+    job.artifact_id = artifact.id
+    job.outcome = ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    logs_json = json.dumps({"job_id": str(job.id), "outcome": "SPEND_CAP_EXCEEDED"})
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SPEND_CAP_EXCEEDED",
+            cost=0.37,
+            criterion={"metric": "accuracy", "op": ">=", "value": 0.9},
+            result_reference=artifact_uri,
+            session=db_session,
+            logs=logs_json,
+        )
+
+    assert doc is not None
+    assert doc.forward_quality_verdict["analysis_mode"] == "fallback"
+    assert artifact_uri in doc.source_citations
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
+    assert prereqs and prereqs[0]["source_task_id"] == str(task.id)
+    assert dependent.status == TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio
@@ -729,6 +871,21 @@ async def test_compute_knowledge_delivered_to_queued_dependent(
     task = await _make_compute_task_with_identity(
         db_session, metric="accuracy", op=">=", threshold=0.9
     )
+    artifact_uri = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="experiment-result-bundle",
+        storage_uri=artifact_uri,
+    )
+    job = ComputeJob(
+        project_id=task.project_id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=None,
+        result_reference=artifact_uri,
+    )
     dependent = Task(
         project_id=task.project_id,
         title="feat: act on the experiment result",
@@ -736,13 +893,28 @@ async def test_compute_knowledge_delivered_to_queued_dependent(
         payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
         depends_on=[str(task.id)],
     )
-    db_session.add(dependent)
+    db_session.add_all([artifact, job, dependent])
     await db_session.commit()
+    await db_session.refresh(artifact)
+    job.artifact_id = artifact.id
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
     await db_session.refresh(dependent)
 
-    await _handle_compute_experiment_completion(
-        task, _result_artifact(accuracy=0.93), db_session
-    )
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(
+            task,
+            _result_artifact(
+                accuracy=0.93,
+                job_id=str(job.id),
+                result_reference=artifact_uri,
+            ),
+            db_session,
+        )
 
     await db_session.refresh(dependent)
     prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
@@ -771,6 +943,21 @@ async def test_prerequisite_measured_negative_completes_and_delivers_while_broke
             COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
         ),
     }
+    neg_artifact_uri = "gs://blueprint-agent-artifacts/compute-jobs/negative-result.json"
+    neg_artifact = Artifact(
+        task_id=negative.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="negative-result-bundle",
+        storage_uri=neg_artifact_uri,
+    )
+    neg_job = ComputeJob(
+        project_id=negative.project_id,
+        task_id=negative.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=None,
+        result_reference=neg_artifact_uri,
+    )
     negative_dependent = Task(
         project_id=negative.project_id,
         title="act on negative measurement",
@@ -779,14 +966,29 @@ async def test_prerequisite_measured_negative_completes_and_delivers_while_broke
         depends_on=[str(negative.id)],
     )
     db_session.add(negative)
-    db_session.add(negative_dependent)
+    db_session.add_all([neg_artifact, neg_job, negative_dependent])
     await db_session.commit()
     await db_session.refresh(negative)
+    await db_session.refresh(neg_artifact)
+    neg_job.artifact_id = neg_artifact.id
+    neg_job.outcome = ComputeJobOutcome.SUCCESS
+    neg_job.accrued_cost_usd = 0.37
+    neg_job.final_cost_usd = 0.37
+    db_session.add(neg_job)
+    await db_session.commit()
+    await db_session.refresh(neg_job)
     await db_session.refresh(negative_dependent)
 
-    await _handle_compute_experiment_completion(
-        negative, _result_artifact(accuracy=0.42), db_session
-    )
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(
+            negative,
+            _result_artifact(
+                accuracy=0.42,
+                job_id=str(neg_job.id),
+                result_reference=neg_artifact_uri,
+            ),
+            db_session,
+        )
 
     await db_session.refresh(negative)
     await db_session.refresh(negative_dependent)
@@ -1249,8 +1451,8 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert index[0]["knowledge_acceptance_evidence"] is True
     assert index[0]["compute_acceptance_grade"] == "acceptance"
     substance = await fetch_knowledge_substance_index(db_session, task.project_id)
-    assert substance[0].knowledge_acceptance_evidence is True
-    assert substance[0].compute_acceptance_grade == "acceptance"
+    assert substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is True
+    assert substance[0].forward_quality_verdict["compute_acceptance_grade"] == "acceptance"
 
     fallback_task = await _make_compute_task_with_identity(
         db_session, metric="accuracy", op=">=", threshold=0.9
@@ -1284,8 +1486,8 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     fallback_substance = await fetch_knowledge_substance_index(
         db_session, fallback_task.project_id
     )
-    assert fallback_substance[0].knowledge_acceptance_evidence is False
-    assert fallback_substance[0].compute_acceptance_grade == "measured_only"
+    assert fallback_substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is False
+    assert fallback_substance[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
     assert (
         fallback_task.plan_output["knowledge_document"][
             "knowledge_acceptance_evidence"
@@ -1932,4 +2134,78 @@ async def test_fallback_grounding_mismatched_result_reference_unresolved(
     grounding = (doc.forward_quality_verdict.get("probes") or {}).get("grounding") or {}
     assert grounding.get("grounded", 0) == 0, (
         "grounded must be 0 when result_reference doesn't match the artifact URI"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_evidence_rejects_http_artifact_location(
+    db_session, _quiet_compute_io
+):
+    """HTTP(s) URLs are never admitted to the real_evidence set, even when
+    returned as the resolved artifact location. The durable citation filter
+    must reject transient signed URLs and bare http(s) result URLs."""
+    from app.knowledge_completion import _gather_compute_evidence
+
+    project = Project(name="HTTPArtifactTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: http artifact test",
+        status=TaskStatus.COMPLETED,
+        payloads=[{
+            "type": "compute_experiment",
+            "experiment": "http-test",
+            "base_branch": "main",
+        }],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Create an artifact with http:// storage_uri (the fallback for artifact_uri).
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="https://signed-download.example.com/result.tar.gz?token=xyz",
+        logs=json.dumps({
+            "artifact_uri": None,
+            "file_count": 2,
+        }),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Job references the artifact but result_reference is also http://.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference="https://example.com/jobs/result.json",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps({"job_id": str(job.id)})
+
+    # _gather_compute_evidence should return None because there is no
+    # durable artifact location — all URIs are http(s) and thus rejected
+    # by _is_durable_citation.
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs_json,
+        result_reference="https://example.com/signed-download",
+        criterion=None,
+        session=db_session,
+    )
+
+    assert evidence is None, (
+        "http(s) URLs must be rejected from durable evidence set; "
+        "_gather_compute_evidence should return None (fallback)"
     )

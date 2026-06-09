@@ -48,7 +48,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
-from app.knowledge_query import classify_knowledge_acceptance
+from app.knowledge_query import (
+    KnowledgeSubstance,
+    classify_knowledge_acceptance,
+    knowledge_substance_has_durable_compute_grounding,
+)
 from app.models import (
     Artifact,
     ComputeJob,
@@ -566,6 +570,21 @@ async def _deliver_knowledge_to_dependents(
     is swallowed so delivery can never break the producing task's completion.
     """
     task_id_str = str(task.id)
+    if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value:
+        substance = KnowledgeSubstance(
+            finding_hash=(task.context or {}).get("finding_hash"),
+            topic=doc.topic,
+            source_kind=doc.source_kind,
+            source_citations=tuple(doc.source_citations or ()),
+            forward_quality_verdict=doc.forward_quality_verdict,
+        )
+        if not knowledge_substance_has_durable_compute_grounding(substance):
+            logger.info(
+                "[%s] Skipping dependent delivery for hollow compute document %s",
+                _kind_tag(doc.source_kind),
+                doc.id,
+            )
+            return
     try:
         dependents = (
             (
@@ -1215,7 +1234,7 @@ async def _gather_compute_evidence(
     # location at all (empty / failed job) ⇒ nothing to analyse; fall back.
     job_reference = (job.result_reference or "").strip() or None
     artifact_uri = artifact_uri or job_reference or storage_uri
-    if artifact_uri is None or not _is_usable_citation(artifact_uri):
+    if artifact_uri is None or not _is_durable_citation(artifact_uri):
         return None
     if file_count <= 0 and not metrics:
         # No durable files survived AND no preserved metric — nothing the LLM can
@@ -1232,7 +1251,7 @@ async def _gather_compute_evidence(
     seen: set[str] = set()
 
     def _add_real(value: str | None) -> None:
-        if value and _is_usable_citation(value) and value not in seen:
+        if value and _is_durable_citation(value) and value not in seen:
             seen.add(value)
             real_evidence.append(value)
 

@@ -205,6 +205,96 @@ async def test_collect_not_reported_when_foundation_completed(db_session):
 
 
 @pytest.mark.asyncio
+async def test_collect_hollow_compute_doc_stays_visible_but_grounded_doc_suppresses(
+    db_session,
+):
+    from app.models import KnowledgeDocument
+
+    # Task ref must be a 16-hex finding hash for normalize_prerequisite to accept it.
+    task_ref = "cafe0123deadbeef"
+    need = {"kind": "task", "ref": task_ref}
+
+    hollow_project = await _make_project(db_session)
+    hollow_producer = make_task(
+        project_id=hollow_project.id,
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": task_ref},
+    )
+    hollow_dependent = _blocked(hollow_project.id, need)
+    hollow_doc = KnowledgeDocument(
+        project_id=hollow_project.id,
+        source_task_id=hollow_producer.id,
+        source_kind="compute_experiment",
+        title="hollow compute",
+        summary="hollow compute",
+        body="hollow compute",
+        topic=task_ref,
+        source_citations=[],
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "citation_grounding_miss": True,
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 0,
+                    "unresolved": ["https://signed.example.com/jobs/result.json"],
+                }
+            },
+        },
+    )
+
+    grounded_project = await _make_project(db_session)
+    grounded_producer = make_task(
+        project_id=grounded_project.id,
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": task_ref},
+    )
+    grounded_dependent = _blocked(grounded_project.id, need)
+    grounded_doc = KnowledgeDocument(
+        project_id=grounded_project.id,
+        source_task_id=grounded_producer.id,
+        source_kind="compute_experiment",
+        title="grounded compute",
+        summary="grounded compute",
+        body="grounded compute",
+        topic=task_ref,
+        source_citations=["gs://bucket/jobs/result.json"],
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "outcome": "SPEND_CAP_EXCEEDED",
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 1,
+                    "unresolved": [],
+                }
+            },
+        },
+    )
+
+    db_session.add_all(
+        [hollow_producer, hollow_dependent, grounded_producer, grounded_dependent]
+    )
+    await db_session.commit()
+    db_session.add_all([hollow_doc, grounded_doc])
+    await db_session.commit()
+
+    hollow_result = await collect_missing_capability_demand(
+        db_session, hollow_project.id
+    )
+    assert hollow_result["total"] == 1
+    assert hollow_result["demands"][0]["ref"] == task_ref
+
+    grounded_result = await collect_missing_capability_demand(
+        db_session, grounded_project.id
+    )
+    assert grounded_result["total"] == 0
+    assert grounded_result["demands"] == []
+
+
+@pytest.mark.asyncio
 async def test_collect_is_project_scoped(db_session):
     """Blocked dependents in another project never leak into the demand."""
     project = await _make_project(db_session)

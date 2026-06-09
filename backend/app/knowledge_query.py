@@ -20,7 +20,7 @@ from sqlalchemy import String, cast, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import KnowledgeDocument
+from app.models import KnowledgeDocument, SourceKind
 
 
 COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
@@ -98,8 +98,44 @@ class KnowledgeSubstance(NamedTuple):
 
     finding_hash: str | None
     topic: str | None
-    knowledge_acceptance_evidence: bool = True
-    compute_acceptance_grade: str | None = None
+    source_kind: str | None = None
+    source_citations: tuple[str, ...] | None = None
+    forward_quality_verdict: dict[str, Any] | None = None
+
+
+def knowledge_substance_has_durable_compute_grounding(
+    substance: KnowledgeSubstance,
+) -> bool:
+    """True when a compute_experiment substance carries durable grounded evidence.
+
+    This is a consumer-side predicate over stored knowledge-document signals. It
+    does not re-derive artifact durability; it only inspects the persisted
+    compute-experiment fields that write-time already stamped.
+    """
+    if substance.source_kind != SourceKind.COMPUTE_EXPERIMENT.value:
+        return False
+
+    citations = [
+        c for c in (substance.source_citations or ()) if isinstance(c, str) and c.strip()
+    ]
+    if not citations:
+        return False
+
+    verdict = substance.forward_quality_verdict
+    if isinstance(verdict, dict):
+        if verdict.get("citation_grounding_miss"):
+            return False
+        probes = verdict.get("probes")
+        if isinstance(probes, dict):
+            grounding = probes.get("grounding")
+            if isinstance(grounding, dict):
+                grounded = grounding.get("grounded")
+                if grounded is not None:
+                    try:
+                        return int(grounded) > 0
+                    except (TypeError, ValueError):
+                        return False
+    return True
 
 
 async def fetch_knowledge_substance_index(
@@ -125,29 +161,27 @@ async def fetch_knowledge_substance_index(
                 KnowledgeDocument.topic,
                 Task.context,
                 KnowledgeDocument.source_kind,
-                KnowledgeDocument.forward_quality_verdict,
                 KnowledgeDocument.source_citations,
+                KnowledgeDocument.forward_quality_verdict,
             )
             .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
             .where(KnowledgeDocument.project_id == project_id)
         )
     ).all()
     result: list[KnowledgeSubstance] = []
-    for topic, context, source_kind, verdict, citations in rows:
+    for topic, context, source_kind, source_citations, verdict in rows:
         fh = (context or {}).get("finding_hash") if context is not None else None
-        acceptance = classify_knowledge_acceptance(
-            source_kind=source_kind,
-            forward_quality_verdict=verdict,
-            source_citations=citations,
-        )
         result.append(
             KnowledgeSubstance(
                 finding_hash=str(fh).strip() if fh else None,
                 topic=str(topic).strip() if topic else None,
-                knowledge_acceptance_evidence=bool(
-                    acceptance["knowledge_acceptance_evidence"]
+                source_kind=str(source_kind).strip() if source_kind else None,
+                source_citations=tuple(
+                    c.strip()
+                    for c in (source_citations or [])
+                    if isinstance(c, str) and c.strip()
                 ),
-                compute_acceptance_grade=acceptance["compute_acceptance_grade"],
+                forward_quality_verdict=verdict if isinstance(verdict, dict) else None,
             )
         )
     return result

@@ -595,23 +595,26 @@ def test_knowledge_topic_equality_satisfies_need():
     assert knowledge_substance_satisfies_need(need, substance) is True
 
 
-def test_measured_only_compute_knowledge_does_not_satisfy_strict_acceptance_need():
+def test_ungrounded_compute_knowledge_does_not_satisfy_need():
+    """Compute substance with no durable citations is filtered out regardless of flags."""
     from app.blocked_need_resolution import knowledge_substance_satisfies_need
     from app.knowledge_query import KnowledgeSubstance
 
     need = {"kind": "task", "ref": "gpu-proof"}
-    measured_only = [
+    ungrounded = [
         KnowledgeSubstance(
             finding_hash=None,
             topic="gpu-proof",
-            knowledge_acceptance_evidence=False,
-            compute_acceptance_grade="measured_only",
+            source_kind="compute_experiment",
+            source_citations=(),
+            forward_quality_verdict={"analysis_mode": "fallback"},
         )
     ]
-    assert knowledge_substance_satisfies_need(need, measured_only) is True
+    # Ungrounded compute does not satisfy the need — the grounding gate always fires.
+    assert knowledge_substance_satisfies_need(need, ungrounded) is False
     assert (
         knowledge_substance_satisfies_need(
-            need, measured_only, require_acceptance_evidence=True
+            need, ungrounded, require_acceptance_evidence=True
         )
         is False
     )
@@ -624,6 +627,90 @@ def test_knowledge_finding_hash_mismatch_returns_false():
     substance = [KnowledgeSubstance(finding_hash="aaaa1111", topic="some-topic")]
     need = {"kind": "task", "ref": "bbbb2222"}
     assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_ungrounded_compute_doc_does_not_satisfy_prereq():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-1",
+            topic="compute-need-1",
+            source_kind="compute_experiment",
+            source_citations=(),
+            forward_quality_verdict={
+                "analysis_mode": "fallback",
+                "citation_grounding_miss": True,
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 0,
+                        "unresolved": ["https://signed.example.com/jobs/result.json"],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_grounded_compute_negative_result_satisfies_prereq():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-2",
+            topic="compute-need-2",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={
+                "analysis_mode": "llm",
+                "outcome": "SPEND_CAP_EXCEEDED",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-2"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_grounded_fallback_compute_doc_satisfies_prereq():
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-need-3",
+            topic="compute-need-3",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={
+                "analysis_mode": "fallback",
+                "outcome": "SUCCESS",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-need-3"}
+    assert knowledge_substance_satisfies_need(need, substance) is True
 
 
 def test_knowledge_topic_near_miss_not_fuzzy():

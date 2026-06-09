@@ -12175,6 +12175,89 @@ async def test_knowledge_completion_unblocks_waiter_with_document_pointer(
 
 
 @pytest.mark.asyncio
+async def test_hollow_compute_doc_leaves_waiter_blocked(
+    reaper_db, mocker
+):
+    """A hollow compute KnowledgeDocument must not event-unblock a waiting task.
+
+    The durable compute predicate rejects the doc, so the BLOCKED waiter stays
+    blocked and no knowledge-prerequisite pointer is stamped.
+    """
+    from app.models import KnowledgeDocument
+    from app.reaper_sweeps import event_driven_unblock_on_knowledge
+    from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    producer = Task(
+        project_id=project.id,
+        title="compute producer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "compute_experiment"}],
+        context={"finding_hash": "compute-hollow-need"},
+        status_log=[],
+    )
+    reaper_db.add(producer)
+    await reaper_db.commit()
+    await reaper_db.refresh(producer)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_kind="compute_experiment",
+        title="hollow compute doc",
+        summary="hollow compute doc",
+        body="hollow compute doc",
+        topic="compute-hollow-need",
+        source_citations=[],
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "citation_grounding_miss": True,
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 0,
+                    "unresolved": ["https://signed.example.com/jobs/result.json"],
+                }
+            },
+        },
+    )
+    reaper_db.add(doc)
+    await reaper_db.commit()
+    await reaper_db.refresh(doc)
+
+    waiter = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on compute knowledge",
+        depends_on=[str(producer.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "compute-hollow-need",
+                "reason": "BLOCKER: waiting on compute knowledge",
+                "need": {"kind": "task", "ref": "compute-hollow-need"},
+            }
+        },
+        recheck_after=now + timedelta(hours=6),
+    )
+
+    resumed = await event_driven_unblock_on_knowledge(project.id, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(waiter)
+    assert waiter.status == TaskStatus.BLOCKED
+    assert (waiter.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monkeypatch):
     """If the event-driven unblock raises, the knowledge-completion chokepoint
     swallows it — document delivery must never break the producing task."""
