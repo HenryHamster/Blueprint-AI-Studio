@@ -4555,7 +4555,7 @@ async def _spawn_strategic_review(
                 f"v{_prior_n} live until serving is confirmed, and do NOT "
                 f"re-promote/re-qualify v{_prior_n}.{_artifact_txt}"
             )
-        else:
+        elif _prior_serving_status == "serving_confirmed":
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
                 f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now "
@@ -4577,6 +4577,21 @@ async def _spawn_strategic_review(
                 f"`intent.current_focus` to state what v{_cur_n} is for (not what "
                 f"v{_prior_n} achieved), retire directions v{_prior_n} already "
                 f"satisfied, and propose the directions the next milestone needs."
+            )
+        else:
+            _status_txt = (
+                f" serving_status={_prior_serving_status!r}"
+                if _prior_serving_status is not None
+                else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
+                f"to {_target}{_promoted_when}{_verdict_txt}, but its prior "
+                f"serving evidence is unknown or unreadable{_status_txt}. Do "
+                f"NOT treat v{_prior_n} as live yet. Verify lifecycle/deploy "
+                f"state before treating the previous version as live, and only "
+                f"treat it as shipped once aggregate serving evidence is "
+                f"explicitly `serving_confirmed`."
             )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"

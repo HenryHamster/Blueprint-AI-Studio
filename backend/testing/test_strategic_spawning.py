@@ -6045,6 +6045,62 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
 
 
 @pytest.mark.asyncio
+async def test_post_promote_handoff_unknown_serving_status_is_not_live(
+    db_session, mocker, _lts_split_active
+):
+    """If the prior promoted record cannot be read, the handoff must fail
+    closed instead of implying the previous version is live."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+            goal="carry-over promotion narrative",
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.release_version.recent_closed_versions",
+        side_effect=RuntimeError("lookup failed"),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "Version handoff" in suffix
+    assert "is now live" not in suffix
+    assert "serving evidence is unknown or unreadable" in suffix
+    assert "Verify lifecycle/deploy state before treating the previous version as live" in suffix
+    assert "serving_confirmed" in suffix
+
+
+@pytest.mark.asyncio
 async def test_failed_deploy_directive_renders_after_next_version_qualification_started(
     db_session, mocker, _lts_split_active
 ):
