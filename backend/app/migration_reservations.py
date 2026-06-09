@@ -129,6 +129,29 @@ async def get_migration_reservation_for_task(
     return result.scalars().first()
 
 
+async def get_migration_reservation_for_task_chain(
+    session, *, task_ids: list[uuid.UUID]
+) -> MigrationReservation | None:
+    """Return the first ACTIVE reservation matching any id in the ancestor chain.
+
+    Fix and review tasks inherit the reservation allocated for the original
+    task: the list should be ordered from the claiming task's id to the root
+    ancestor (i.e. [task.id, parent.id, grandparent.id, ...]).  The most
+    recently created reservation among those ids is returned.
+    """
+    if not task_ids:
+        return None
+    result = await session.execute(
+        select(MigrationReservation)
+        .where(
+            MigrationReservation.task_id.in_(task_ids),
+            MigrationReservation.status == MigrationReservationStatus.ACTIVE,
+        )
+        .order_by(MigrationReservation.created_at.desc())
+    )
+    return result.scalars().first()
+
+
 async def _active_reservations_for_project(
     session, *, project_id: uuid.UUID
 ) -> list[MigrationReservation]:

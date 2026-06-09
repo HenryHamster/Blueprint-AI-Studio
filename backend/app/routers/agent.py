@@ -873,12 +873,53 @@ async def claim_task(
     # chain. Additive: a claim with no reservation simply omits the key and the
     # agent falls back to local numbering, preserving backward compatibility for
     # tasks queued before the reservation rollout.
+    #
+    # Fix and review tasks have their own task.id but no reservation of their
+    # own; they inherit the reservation allocated to the original (create) task.
+    #
+    # The parent_task_id chain alone is NOT sufficient: fix/review tasks are
+    # spawned as SIBLINGS of the create task (review_pipeline sets their
+    # parent_task_id to the create task's plan/research parent, not the create
+    # task itself), so walking parents never reaches the reservation holder. The
+    # authoritative link is the original_task_id carried in the payload /
+    # review_loop context, which always points at the create task that holds the
+    # reservation. Seed the ancestor set with it first, then still walk the
+    # parent chain to cover the rare no-plan-parent topology where the create
+    # task IS the direct parent.
     from app.migration_reservations import (
-        get_migration_reservation_for_task,
+        get_migration_reservation_for_task_chain,
     )
 
-    _migration_reservation = await get_migration_reservation_for_task(
-        session, task_id=task.id
+    _ancestor_ids: list = [task.id]
+
+    def _seed_original_task_id(raw: object) -> None:
+        if not raw:
+            return
+        try:
+            parsed = uuid.UUID(str(raw))
+        except (ValueError, AttributeError, TypeError):
+            return
+        if parsed not in _ancestor_ids:
+            _ancestor_ids.append(parsed)
+
+    _seed_original_task_id(_claimed_first_payload.get("original_task_id"))
+    _seed_original_task_id(
+        (_claimed_context.get("review_loop") or {}).get("original_task_id")
+    )
+
+    _cursor = task
+    _MAX_ANCESTOR_DEPTH = 5
+    for _ in range(_MAX_ANCESTOR_DEPTH):
+        if _cursor.parent_task_id is None:
+            break
+        _cursor = await session.get(Task, _cursor.parent_task_id)
+        if _cursor is None:
+            break
+        if _cursor.id not in _ancestor_ids:
+            _ancestor_ids.append(_cursor.id)
+
+    _migration_reservation = await get_migration_reservation_for_task_chain(
+        session, task_ids=_ancestor_ids
     )
     if _migration_reservation is not None:
         response["migration_reservation"] = {

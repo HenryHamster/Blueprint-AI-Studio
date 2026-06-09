@@ -267,6 +267,150 @@ async def test_agent_claim_surfaces_reserved_migration_revision(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
+    client: AsyncClient, db_session
+):
+    """A fix task inherits the create task's reservation in the real spawn topology.
+
+    Regression for the sibling-topology bug: review/fix tasks are spawned with
+    ``parent_task_id`` set to the create task's plan/research parent (so they are
+    SIBLINGS of the create task, not its children). The parent-walk therefore
+    never reaches the create task that holds the MigrationReservation; inheritance
+    must come from ``payload.original_task_id``. This exercises the full claim
+    handler end to end so a regression in the seeding logic is caught.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Fix Inherit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Plan/research parent that both the create and fix task hang off of.
+    plan_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    # The original create task: child of the plan, holds the reservation.
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=plan_task.id,
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=create_task.id,
+        provisional_revision="0207",
+        provisional_down_revision="0205",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    # The fix task: SIBLING of the create task (parent is the plan, NOT the
+    # create task), carrying original_task_id pointing at the create task.
+    fix_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 42,
+                "original_task_id": str(create_task.id),
+            }
+        ],
+        parent_task_id=plan_task.id,
+        vm_instance_id="agent-vm-fix-inherit",
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    # Sanity: the parent walk alone never reaches the reservation holder, and the
+    # fix task has no reservation of its own.
+    assert fix_task.parent_task_id == plan_task.id
+    assert fix_task.parent_task_id != create_task.id
+
+    token = create_agent_token(str(fix_task.id), "agent-vm-fix-inherit")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0207",
+        "provisional_down_revision": "0205",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_review_task_inherits_reservation_via_review_loop_context(
+    client: AsyncClient, db_session
+):
+    """A review task inherits the reservation via context.review_loop.original_task_id.
+
+    Complements the fix-task test: the original_task_id is carried in
+    ``context['review_loop']`` (as review_pipeline propagates it) rather than the
+    payload, and the review task is again a sibling of the create task.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Review Inherit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = Task(project_id=project.id, payloads=[{"type": "plan"}])
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=plan_task.id,
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=create_task.id,
+        provisional_revision="0211",
+        provisional_down_revision="0209",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 7}],
+        context={"review_loop": {"original_task_id": str(create_task.id)}},
+        parent_task_id=plan_task.id,
+        vm_instance_id="agent-vm-review-inherit",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    token = create_agent_token(str(review_task.id), "agent-vm-review-inherit")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0211",
+        "provisional_down_revision": "0209",
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_session):
     """A task with no reservation omits the key (backward-compatible claim)."""
     project = Project(name="Agent Claim No Reservation", user_id="test-user-123")

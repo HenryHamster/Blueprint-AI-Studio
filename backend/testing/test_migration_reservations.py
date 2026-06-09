@@ -20,6 +20,7 @@ from app.migration_reservations import (
     finalize_migration_reservation,
     expire_migration_reservation,
     get_migration_reservation_for_task,
+    get_migration_reservation_for_task_chain,
 )
 from app.models import (
     MigrationReservation,
@@ -380,3 +381,144 @@ async def test_rejects_terminal_task(db_session):
 
     with pytest.raises(ValueError):
         await allocate_migration_reservation(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_chain_lookup_inherits_reservation_from_parent(db_session):
+    """A fix/review task with no reservation of its own inherits the parent's reservation."""
+    project = await _make_project(db_session)
+    original = await _make_task(db_session, project.id)
+    reservation = await allocate_migration_reservation(db_session, original)
+
+    # Simulate a fix task spawned from the original (parent_task_id -> original).
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=original.id,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    # Direct lookup by fix_task.id finds nothing (no reservation for fix task).
+    assert await get_migration_reservation_for_task(db_session, task_id=fix_task.id) is None
+
+    # Chain lookup finds the parent's reservation.
+    found = await get_migration_reservation_for_task_chain(
+        db_session, task_ids=[fix_task.id, original.id]
+    )
+    assert found is not None
+    assert found.id == reservation.id
+    assert found.provisional_revision == reservation.provisional_revision
+
+
+@pytest.mark.asyncio
+async def test_chain_lookup_prefers_own_reservation_over_parent(db_session):
+    """If the fix task itself has a reservation, it is returned (not the parent's)."""
+    project = await _make_project(db_session)
+    original = await _make_task(db_session, project.id)
+    await allocate_migration_reservation(db_session, original)
+
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=original.id,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    own_reservation = await allocate_migration_reservation(db_session, fix_task)
+
+    found = await get_migration_reservation_for_task_chain(
+        db_session, task_ids=[fix_task.id, original.id]
+    )
+    assert found is not None
+    assert found.id == own_reservation.id
+
+
+@pytest.mark.asyncio
+async def test_chain_lookup_sibling_topology_needs_original_task_id(db_session):
+    """The real spawn topology: fix task is a SIBLING of the create task.
+
+    review_pipeline spawns fix/review tasks with parent_task_id = the create
+    task's plan/research parent, so the create task (which holds the reservation)
+    is NOT on the fix task's parent chain. A parent-walk-only ancestor list
+    ([fix, plan]) therefore MUST miss the reservation; only seeding the list with
+    the create task's id (the agent.py claim handler does this from
+    payload.original_task_id) recovers it. This guards against the prior
+    false-confidence test that wired parent_task_id=original directly.
+    """
+    project = await _make_project(db_session)
+
+    plan = await _make_task(db_session, project.id)
+    create = await _make_task(db_session, project.id)
+    create.parent_task_id = plan.id
+    db_session.add(create)
+    await db_session.commit()
+
+    reservation = await allocate_migration_reservation(db_session, create)
+
+    # Fix task: parent is the PLAN (sibling of create), not the create task.
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=plan.id,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    # Parent-walk-only ancestor list [fix, plan] misses the reservation entirely.
+    assert (
+        await get_migration_reservation_for_task_chain(
+            db_session, task_ids=[fix_task.id, plan.id]
+        )
+        is None
+    )
+
+    # Seeding with the create task's id (via original_task_id) recovers it.
+    found = await get_migration_reservation_for_task_chain(
+        db_session, task_ids=[fix_task.id, create.id, plan.id]
+    )
+    assert found is not None
+    assert found.id == reservation.id
+
+
+@pytest.mark.asyncio
+async def test_chain_lookup_returns_none_for_empty_ids(db_session):
+    found = await get_migration_reservation_for_task_chain(db_session, task_ids=[])
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_chain_lookup_walks_grandparent_chain(db_session):
+    """A second fix iteration (grandparent reservation) is also inherited."""
+    project = await _make_project(db_session)
+    original = await _make_task(db_session, project.id)
+    reservation = await allocate_migration_reservation(db_session, original)
+
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=original.id,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    fix2_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=fix_task.id,
+    )
+    db_session.add(fix2_task)
+    await db_session.commit()
+    await db_session.refresh(fix2_task)
+
+    # Chain: [fix2, fix, original]
+    found = await get_migration_reservation_for_task_chain(
+        db_session, task_ids=[fix2_task.id, fix_task.id, original.id]
+    )
+    assert found is not None
+    assert found.id == reservation.id
