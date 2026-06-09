@@ -3171,3 +3171,77 @@ def test_summarize_skips_absent_required_non_backend_provider():
     )
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["serving_status"] is None
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["required"] is True
+
+
+def test_summarize_unarmed_promotion_is_na_not_phantom_unconfirmed():
+    """A promoted version that was NEVER armed for serving confirmation must NOT
+    be projected ``unconfirmed`` — it reads as plain ``promoted`` (NA).
+
+    The real v3..v7 wedge: serving-confirmation arming (scalar
+    ``serving_status="unconfirmed"`` + the backend/agent artifact ROWS) only
+    runs for promotions whose deploy is observable.  An un-armed promotion has
+    ``serving_status`` NULL and NO artifact rows.  The prior projection
+    synthesized ``unconfirmed`` from ``status=="promoted"`` alone, manufacturing
+    a pending serving state with NO resolution path: the serving-confirmation
+    sweep only selects versions whose scalar is ``"unconfirmed"`` OR that have a
+    real pending artifact row, so an un-armed promotion sat falsely
+    ``unconfirmed`` forever and the strategist held the next version on it.
+
+    With the fix the scalar is projected as-is (NULL -> NA), so the aggregate is
+    NA and ``summarize_qualification_state`` returns the truthful plain
+    ``promoted`` — the version shipped; there is simply no serving signal being
+    tracked for it.
+    """
+    version = ReleaseVersion(
+        project_id=1,
+        version_number=7,
+        status="promoted",
+        # The corruption shape: un-armed promotion — no scalar, no rows.
+        serving_status=None,
+        promoted_sha=None,
+    )
+
+    # No artifact rows exist at all (the un-armed case).
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(version, [])
+
+    # The aggregate is NA — NOT a phantom "unconfirmed" that nothing can resolve.
+    assert aggregate["serving_status"] is None
+    assert aggregate["reason_code"] is None
+
+    by_kind = {entry["artifact_kind"]: entry for entry in evidence}
+    # The backend_revision projection no longer manufactures "unconfirmed" from
+    # status=="promoted"; it projects the (NULL) scalar directly.
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] is None
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["serving_status"] is None
+
+    # End-to-end: the qualification state is the truthful plain "promoted",
+    # NOT "promoted_unconfirmed" (which would wedge the next version).
+    state = rv.summarize_qualification_state(
+        {"status": "promoted"},
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate["serving_status"],
+        aggregate_deploy_failure_reason=aggregate["reason_code"],
+        artifact_evidence=evidence,
+    )
+    assert state["state"] == "promoted"
+
+
+def test_summarize_armed_unconfirmed_promotion_still_gates():
+    """The fix must NOT weaken the legitimate pending case: an ARMED promotion
+    (scalar ``unconfirmed``, no row yet) still projects ``unconfirmed`` so a
+    real in-window deploy continues to gate.
+    """
+    version = ReleaseVersion(
+        project_id=1,
+        version_number=8,
+        status="promoted",
+        serving_status="unconfirmed",
+        promoted_sha=_SHA_A,
+    )
+
+    aggregate, evidence = artifact_registry.summarize_release_artifacts(version, [])
+
+    assert aggregate["serving_status"] == "unconfirmed"
+    by_kind = {entry["artifact_kind"]: entry for entry in evidence}
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] == "unconfirmed"
