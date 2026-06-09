@@ -432,6 +432,151 @@ async def test_apply_synthesized_memo_creates_completed_task_with_artifact(
     assert task.plan_output["memo"]["tags"] == ["regression-false-positive"]
 
 
+@pytest.mark.asyncio
+async def test_inline_memo_carries_no_vm_attribution(db_session, _quiet_broadcast):
+    """_apply_synthesized_memo clears vm_instance_id and vm_provisioned_at so
+    orchestrator-synthesized memos never show a phantom agent-VM in the UI.
+    Covers deferred_finding, direction_retirement, and outcome_scaffolding kinds.
+    """
+    from datetime import datetime, timezone
+
+    project = make_project(name="NoVmAttrProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    memo_content = {
+        "summary": "Test memo",
+        "reasoning": "Inline synthesis — no VM required.",
+        "citations": [],
+        "tags": ["vm-free"],
+    }
+
+    for reasoning_kind in ("deferred_finding", "direction_retirement", "outcome_scaffolding"):
+        task = make_task(
+            project_id=project.id,
+            title=f"Memo: {reasoning_kind}",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "memo", "reasoning_kind": reasoning_kind, "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-placeholder-{reasoning_kind}",
+            vm_provisioned_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        _apply_synthesized_memo(task, memo_content, db_session)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.COMPLETED, f"{reasoning_kind}: expected COMPLETED"
+        assert task.vm_instance_id is None, (
+            f"{reasoning_kind}: vm_instance_id should be cleared; got {task.vm_instance_id!r}"
+        )
+        assert task.vm_provisioned_at is None, (
+            f"{reasoning_kind}: vm_provisioned_at should be None; got {task.vm_provisioned_at!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_memo_synthesis_failure_leaves_no_queued_task(
+    db_session, _quiet_broadcast, mocker
+):
+    """When _apply_synthesized_memo raises inside the outcome-scaffolding try/except,
+    the memo task must be marked FAILED (not QUEUED) so the dispatcher never provisions
+    a VM for it.
+    """
+    from datetime import datetime
+
+    from app.direction_lifecycle import _process_direction_lifecycle
+    from app.models import Project as ProjectModel
+
+    # Patch _check_outcome_scaffolding to trigger the first-detection scaffolding path.
+    _fake_evidence = {
+        "total_cycles": 12,
+        "stall_run_cycles": 6,
+        "tasks_completed": 20,
+        "tasks_failed": 0,
+        "lifetime_merged": 10,
+        "lifetime_merge_rate": 0.80,
+        "last_cycle_at": "2024-01-01T00:00:00Z",
+    }
+    mocker.patch(
+        "app.strategic_completion._check_outcome_scaffolding",
+        return_value=_fake_evidence,
+    )
+    # Patch _apply_synthesized_memo to simulate a synthesis failure.
+    mocker.patch(
+        "app.task_completion._apply_synthesized_memo",
+        side_effect=RuntimeError("simulated synthesis failure"),
+    )
+    # Silence unrelated async calls in the lifecycle function.
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    project = ProjectModel(
+        name="ScaffoldFailProj",
+        user_id="u-scaffold-fail",
+        autonomous_enabled=True,
+        directions=[
+            {
+                "id": "d-scaffold-fail",
+                "text": "Test direction for scaffolding failure",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2024-01-01T00:00:00",
+                # outcome_scaffolding_flagged absent = first detection triggers memo creation
+            }
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    import app.shared_state as _ss
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.commit()
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    queued_memos = [t for t in memo_tasks if t.status == TaskStatus.QUEUED]
+    assert queued_memos == [], (
+        f"Expected no QUEUED memo tasks after synthesis failure; got {[t.title for t in queued_memos]}"
+    )
+    failed_memos = [t for t in memo_tasks if t.status == TaskStatus.FAILED]
+    assert len(failed_memos) >= 1, (
+        "Expected at least one FAILED memo task after synthesis failure"
+    )
+
+
 # ── _try_recover_memo_from_parse_failure ────────────────────────────────────
 
 

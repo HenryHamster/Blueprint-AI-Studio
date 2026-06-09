@@ -4123,34 +4123,37 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "memo_source_finding_hash": _mf_hash,
                 **({"direction_id": _memo_dir_id} if _memo_dir_id else {}),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(_memo_task)
-        _synth = _synthesize_deferred_finding_memo(
-            _memo_payload.get("source_finding") or {},
-            _drop_reason,
-            str(task.id),
-        )
-        if _synth:
-            _apply_synthesized_memo(_memo_task, _synth, session)
-        else:
-            # Finding has no title or description — synthesize a minimal memo so
-            # the task never provisions a VM for an effectively-empty payload.
-            _fallback_memo = {
-                "summary": "Dropped finding (no identifying data)",
-                "reasoning": (
-                    f"Reason: {_drop_reason}\n\n"
-                    f"Source task: {task.id}\n\n"
-                    "Finding had no title or description to synthesize from."
-                ),
-                "citations": [f"task:{task.id}"],
-                "tags": ["deferred-finding", _drop_reason],
-            }
-            _apply_synthesized_memo(_memo_task, _fallback_memo, session)
+        try:
+            _synth = _synthesize_deferred_finding_memo(
+                _memo_payload.get("source_finding") or {},
+                _drop_reason,
+                str(task.id),
+            )
+            if _synth:
+                _apply_synthesized_memo(_memo_task, _synth, session)
+            else:
+                # Finding has no title or description — synthesize a minimal memo so
+                # the task never provisions a VM for an effectively-empty payload.
+                _fallback_memo = {
+                    "summary": "Dropped finding (no identifying data)",
+                    "reasoning": (
+                        f"Reason: {_drop_reason}\n\n"
+                        f"Source task: {task.id}\n\n"
+                        "Finding had no title or description to synthesize from."
+                    ),
+                    "citations": [f"task:{task.id}"],
+                    "tags": ["deferred-finding", _drop_reason],
+                }
+                _apply_synthesized_memo(_memo_task, _fallback_memo, session)
+        except Exception:
+            _memo_task.status = TaskStatus.FAILED
+            raise
         _spawned_memo_ids.append(str(_memo_task.id))
     if _spawned_memo_ids:
         logger.info(

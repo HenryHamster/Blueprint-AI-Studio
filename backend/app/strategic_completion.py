@@ -959,7 +959,6 @@ async def _spawn_retirement_memos(
             parent_task_id=task.id,
             payloads=[memo_payload],
             context=context,
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             priority=TASK_PRIORITY_MAP.get("low", 0),
@@ -970,87 +969,91 @@ async def _spawn_retirement_memos(
         # The source_finding snapshot carries all decision context so synthesis
         # is substantive even on auto-retirement paths with no rationale note.
         synthesized = False
-        if rationale:
-            parts = []
-            if direction_text:
-                parts.append(f"Direction: {direction_text}")
-            parts.append(f"Retirement rationale: {rationale}")
-            if success_evidence:
-                parts.append(f"Success evidence: {success_evidence}")
-            if retirement_condition:
-                parts.append(f"Retirement condition: {retirement_condition}")
-            metrics = snapshot.get("retirement_metrics") or {}
-            if metrics:
-                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
-                parts.append(f"Final metrics: {metrics_str}")
-            history = snapshot.get("recent_history_summary") or []
-            if history:
-                history_lines = [
-                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
-                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
-                    for i, h in enumerate(history)
-                ]
-                parts.append("Recent history:\n" + "\n".join(history_lines))
-            tags = ["direction-retirement"]
-            if success_evidence:
-                tags.append("success-evidence")
-            if retirement_condition:
-                tags.append("retirement-condition")
-            citations = [f"direction:{did}", f"task:{task.id}"]
-            synth_memo = {
-                "summary": rationale[:200],
-                "reasoning": "\n\n".join(parts),
-                "citations": citations,
-                "tags": tags,
-            }
-            _apply_synthesized_memo(memo_task, synth_memo, session)
-            synthesized = True
-        elif _snapshot_has_substantive_context(snapshot):
-            parts = []
-            if direction_text:
-                parts.append(f"Direction: {direction_text}")
-            if success_evidence:
-                parts.append(f"Success evidence: {success_evidence}")
-            if retirement_condition:
-                parts.append(f"Retirement condition: {retirement_condition}")
-            metrics = snapshot.get("retirement_metrics") or {}
-            if metrics:
-                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
-                parts.append(f"Final metrics: {metrics_str}")
-            history = snapshot.get("recent_history_summary") or []
-            if history:
-                history_lines = [
-                    f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
-                    f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
-                    for i, h in enumerate(history)
-                ]
-                parts.append("Recent history:\n" + "\n".join(history_lines))
-            tags = ["direction-retirement"]
-            if success_evidence:
-                tags.append("success-evidence")
-            if retirement_condition:
-                tags.append("retirement-condition")
-            citations = [f"direction:{did}", f"task:{task.id}"]
-            summary = direction_text[:200] or f"Direction {did} retired"
-            synth_memo = {
-                "summary": summary,
-                "reasoning": "\n\n".join(parts),
-                "citations": citations,
-                "tags": tags,
-            }
-            _apply_synthesized_memo(memo_task, synth_memo, session)
-            synthesized = True
-        else:
-            # No rationale and no substantive snapshot context. Synthesize a
-            # minimal memo so the task never provisions a VM for an empty payload.
-            minimal_memo = {
-                "summary": f"Direction {did} retired",
-                "reasoning": "Retirement recorded with no additional context.",
-                "citations": [f"direction:{did}", f"task:{task.id}"],
-                "tags": ["direction-retirement"],
-            }
-            _apply_synthesized_memo(memo_task, minimal_memo, session)
-            synthesized = True
+        try:
+            if rationale:
+                parts = []
+                if direction_text:
+                    parts.append(f"Direction: {direction_text}")
+                parts.append(f"Retirement rationale: {rationale}")
+                if success_evidence:
+                    parts.append(f"Success evidence: {success_evidence}")
+                if retirement_condition:
+                    parts.append(f"Retirement condition: {retirement_condition}")
+                metrics = snapshot.get("retirement_metrics") or {}
+                if metrics:
+                    metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                    parts.append(f"Final metrics: {metrics_str}")
+                history = snapshot.get("recent_history_summary") or []
+                if history:
+                    history_lines = [
+                        f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                        f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                        for i, h in enumerate(history)
+                    ]
+                    parts.append("Recent history:\n" + "\n".join(history_lines))
+                tags = ["direction-retirement"]
+                if success_evidence:
+                    tags.append("success-evidence")
+                if retirement_condition:
+                    tags.append("retirement-condition")
+                citations = [f"direction:{did}", f"task:{task.id}"]
+                synth_memo = {
+                    "summary": rationale[:200],
+                    "reasoning": "\n\n".join(parts),
+                    "citations": citations,
+                    "tags": tags,
+                }
+                _apply_synthesized_memo(memo_task, synth_memo, session)
+                synthesized = True
+            elif _snapshot_has_substantive_context(snapshot):
+                parts = []
+                if direction_text:
+                    parts.append(f"Direction: {direction_text}")
+                if success_evidence:
+                    parts.append(f"Success evidence: {success_evidence}")
+                if retirement_condition:
+                    parts.append(f"Retirement condition: {retirement_condition}")
+                metrics = snapshot.get("retirement_metrics") or {}
+                if metrics:
+                    metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                    parts.append(f"Final metrics: {metrics_str}")
+                history = snapshot.get("recent_history_summary") or []
+                if history:
+                    history_lines = [
+                        f"- Cycle {i + 1}: {h['prs_merged']} PRs merged, "
+                        f"{h['tasks_completed']} completed, {h['tasks_failed']} failed"
+                        for i, h in enumerate(history)
+                    ]
+                    parts.append("Recent history:\n" + "\n".join(history_lines))
+                tags = ["direction-retirement"]
+                if success_evidence:
+                    tags.append("success-evidence")
+                if retirement_condition:
+                    tags.append("retirement-condition")
+                citations = [f"direction:{did}", f"task:{task.id}"]
+                summary = direction_text[:200] or f"Direction {did} retired"
+                synth_memo = {
+                    "summary": summary,
+                    "reasoning": "\n\n".join(parts),
+                    "citations": citations,
+                    "tags": tags,
+                }
+                _apply_synthesized_memo(memo_task, synth_memo, session)
+                synthesized = True
+            else:
+                # No rationale and no substantive snapshot context. Synthesize a
+                # minimal memo so the task never provisions a VM for an empty payload.
+                minimal_memo = {
+                    "summary": f"Direction {did} retired",
+                    "reasoning": "Retirement recorded with no additional context.",
+                    "citations": [f"direction:{did}", f"task:{task.id}"],
+                    "tags": ["direction-retirement"],
+                }
+                _apply_synthesized_memo(memo_task, minimal_memo, session)
+                synthesized = True
+        except Exception:
+            memo_task.status = TaskStatus.FAILED
+            raise
         spawned += 1
         logger.info(
             "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",

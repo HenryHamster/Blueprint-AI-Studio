@@ -1083,7 +1083,6 @@ async def _process_direction_lifecycle_locked(
                             "memo_source_direction_id": did,
                             "outcome_scaffolding_evidence": scaffolding_ev,
                         },
-                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                         status=TaskStatus.QUEUED,
                         created_by="ORCHESTRATOR",
                         priority=TASK_PRIORITY_MAP.get("low", 0),
@@ -1099,6 +1098,10 @@ async def _process_direction_lifecycle_locked(
                         did,
                     )
                 except Exception:
+                    try:
+                        _scaffolding_memo.status = TaskStatus.FAILED
+                    except Exception:
+                        pass
                     logger.warning(
                         f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
                         exc_info=True,

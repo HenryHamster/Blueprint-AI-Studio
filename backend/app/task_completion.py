@@ -2944,6 +2944,8 @@ def _apply_synthesized_memo(
     po["memo"] = normalized
     memo_task.plan_output = po
     flag_modified(memo_task, "plan_output")
+    memo_task.vm_instance_id = None
+    memo_task.vm_provisioned_at = None
     memo_task.status = TaskStatus.COMPLETED
     memo_task.latest_status_message = (
         f"Memo recorded ({len(normalized['citations'])} citation(s), "
