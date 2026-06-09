@@ -2091,6 +2091,52 @@ class TestChallengedVsUnchallengedTelemetry:
         assert ch["wrong_decision_resolved_sample"] == 0
 
 
+def test_challenge_telemetry_counts_binding_challenge_as_challenged():
+    """Binding challenge synthesis (status=available, binding=True) lands in challenged cohort.
+
+    Acceptance proof: after _finalize_qualification where the binding
+    RELEASE_AUDIT_CHALLENGE ran, the resulting QualificationVerdict is counted in
+    the challenged cohort by compute_challenged_vs_unchallenged_telemetry
+    (challenged.sample_size > 0).
+    """
+    # Build verdict dicts with the binding synthesis shape produced by
+    # _compute_challenge_synthesis_from_binding_verdicts.
+    binding_synthesis = {
+        "status": "available",
+        "binding": True,
+        "reason": None,
+        "confirmed_count": 2,
+        "refuted_count": 1,
+        "uncertain_count": 0,
+        "reported_agreement": "partial",
+    }
+    verdicts = [
+        {
+            "audit_reconciliation": {
+                "model_reported_score": 1.0,
+                "findings_derived_score": 1.0,
+                "score_delta": 0.0,
+                "excluded_findings_count": 0,
+                "audit_challenge": binding_synthesis,
+            },
+            "would_promote": False,
+            "terminal_status": "not_promoted",
+            "post_promotion_outcome": None,
+            "excluded_audit_findings": None,
+        }
+        for _ in range(3)
+    ]
+    result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+    assert result["total_verdicts"] == 3
+    # All 3 verdicts carry a binding challenge with status=available → challenged cohort.
+    assert result["challenged"]["sample_size"] == 3
+    assert result["challenged"]["insufficient_sample"] is False
+    assert result["unchallenged"]["sample_size"] == 0
+    # Disagreement rate: reported_agreement="partial" ≠ "agree" → all 3 disagree.
+    assert result["challenged"]["disagreement_count"] == 3
+    assert result["challenged"]["disagreement_rate"] == pytest.approx(1.0)
+
+
 class TestScoreSmoketest:
     def test_all_tests_pass(self):
         """A fully-passing smoketest yields a 1.0 score."""
@@ -3979,16 +4025,13 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(
     assert result["would_promote"] is True
 
     await db_session.refresh(version)
+    # The advisory RELEASE_AUDIT_CHALLENGE_REPORT no longer drives the synthesis.
+    # Only the binding RELEASE_AUDIT_CHALLENGE artifact does; since none was produced
+    # here (legacy advisory path), the synthesis is unavailable.
     synthesis = version.last_qualification["audit_reconciliation"]["audit_challenge"]
-    assert synthesis["status"] == "available"
-    assert synthesis["reported_agreement"] == "partial"
-    assert synthesis["challenge_severity"] == "medium"
-    assert synthesis["disagreement"]["challenger_only"][0]["summary"] == (
-        "Missed rollout-risk finding."
-    )
-    assert synthesis["disagreement"]["overstated_findings"][0]["summary"] == (
-        "Primary migration concern."
-    )
+    assert synthesis["status"] == "unavailable"
+    assert synthesis["reason"] == "challenge_absent"
+    assert synthesis["binding"] is True
 
     verdict = (
         (
@@ -5039,6 +5082,70 @@ async def test_challenger_refuted_finding_excluded_from_audit_score(
     promote_spy.assert_not_called()
     await db_session.refresh(version2)
     assert version2.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_finalize_confirmed_finding_with_severity_drift_still_deducts(
+    db_session, mocker
+):
+    """A challenger-confirmed finding still deducts when severity labels drift."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL injection vulnerability in authentication endpoint",
+                    "file": "app/auth.py",
+                    "verification_note": "User input reaches the query without escaping.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "medium",
+                "summary": "SQL injection vulnerability in authentication endpoint",
+                "file": "app/auth.py",
+                "verdict": "confirmed",
+                "reason": "Independent review confirms the same issue even though severity was bucketed lower.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01)
+    assert lq.get("challenger_refuted_audit_findings") == []
 
 
 @pytest.mark.asyncio

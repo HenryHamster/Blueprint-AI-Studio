@@ -799,6 +799,73 @@ def _compute_audit_challenge_synthesis(
     }
 
 
+def _compute_challenge_synthesis_from_binding_verdicts(
+    primary_report: dict[str, Any] | None,
+    challenge_verdicts: dict[str, Any] | None,
+    *,
+    challenge_reason: str | None = None,
+) -> dict[str, Any]:
+    """Compute audit-challenge synthesis from the binding RELEASE_AUDIT_CHALLENGE artifact.
+
+    Unlike _compute_audit_challenge_synthesis (advisory format), this function
+    derives its synthesis from the binding verdict artifact emitted by the live
+    audit-challenge handler (challenged_candidate_sha + verdicts[]).
+    """
+    if challenge_reason or not isinstance(challenge_verdicts, dict):
+        return {
+            "status": "unavailable",
+            "reason": challenge_reason or "challenge_absent",
+            "binding": True,
+            "confirmed_count": 0,
+            "refuted_count": 0,
+            "uncertain_count": 0,
+            "reported_agreement": None,
+        }
+    verdicts_list = challenge_verdicts.get("verdicts")
+    if not isinstance(verdicts_list, list):
+        return {
+            "status": "unavailable",
+            "reason": "challenge_absent",
+            "binding": True,
+            "confirmed_count": 0,
+            "refuted_count": 0,
+            "uncertain_count": 0,
+            "reported_agreement": None,
+        }
+    confirmed = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict) and str(v.get("verdict") or "").lower() == "confirmed"
+    )
+    refuted = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict)
+        and str(v.get("verdict") or "").lower() == "refuted_false_positive"
+    )
+    uncertain = sum(
+        1
+        for v in verdicts_list
+        if isinstance(v, dict) and str(v.get("verdict") or "").lower() == "uncertain"
+    )
+    total = confirmed + refuted + uncertain
+    if total == 0 or refuted == 0:
+        reported_agreement = "agree"
+    elif refuted > total / 2:
+        reported_agreement = "disagree"
+    else:
+        reported_agreement = "partial"
+    return {
+        "status": "available",
+        "binding": True,
+        "reason": None,
+        "confirmed_count": confirmed,
+        "refuted_count": refuted,
+        "uncertain_count": uncertain,
+        "reported_agreement": reported_agreement,
+    }
+
+
 def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
     """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
 
@@ -1120,9 +1187,12 @@ def _match_finding_to_challenge(
 ) -> dict | None:
     """Return the first challenge verdict that matches this finding, or None.
 
-    Matching is by severity + summary + file (file is optional — two empty
-    file fields are treated as equal so challenge verdicts without a ``file``
-    key match audit findings that also omit it).
+    Matching is by summary + file; severity is advisory metadata and is not
+    used for binding.  The primary audit and the challenger may independently
+    bucket the same issue at different severities, so content must win even
+    when the labels drift.  (file is optional — two empty file fields are
+    treated as equal so challenge verdicts without a ``file`` key match audit
+    findings that also omit it).
 
     Summary matching uses two passes:
     1. Exact text match (fast path — covers the case where the challenger was
@@ -1133,7 +1203,6 @@ def _match_finding_to_challenge(
        share at least ``_FINDING_MATCH_TOKEN_THRESHOLD`` fraction of their
        significant-token union (tokens of length >= 3) for a match to fire.
     """
-    f_sev = str(finding.get("severity") or finding.get("level") or "").lower().strip()
     f_summary = str(
         finding.get("summary")
         or finding.get("description")
@@ -1147,11 +1216,8 @@ def _match_finding_to_challenge(
     for cv in challenge_verdicts_list:
         if not isinstance(cv, dict):
             continue
-        cv_sev = str(cv.get("severity") or "").lower().strip()
         cv_summary = str(cv.get("summary") or "").strip()
         cv_file = str(cv.get("file") or "").strip()
-        if cv_sev != f_sev:
-            continue
         summary_matches = cv_summary == f_summary
         if not summary_matches:
             cv_tokens = _finding_summary_tokens(cv_summary)

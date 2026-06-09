@@ -159,7 +159,8 @@ from app.release_scoring import (
     _clamp01,  # noqa: F401
     _classify_check_runs,
     _compute_audit_reconciliation,
-    _compute_audit_challenge_synthesis,
+    _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
+    _compute_challenge_synthesis_from_binding_verdicts,
     _extract_audit_findings,
     _extract_excluded_audit_findings,
     _extract_smoketest_detail,
@@ -1894,15 +1895,6 @@ async def _finalize_qualification(
         audit_challenge_reason = "challenge_spawn_failed"
 
     audit_score, test_erosion_score = _score_audit(audit_report)
-    # Pre-compute challenge synthesis now (uses original reports — correct for
-    # synthesis observability).  The reconciliation record is deferred until AFTER
-    # _reconcile_audit_with_challenge so findings_derived_score is computed on the
-    # reconciled report and agrees with the applied audit_score.
-    _audit_challenge_synthesis = _compute_audit_challenge_synthesis(
-        audit_report,
-        audit_challenge_report,
-        challenge_reason=audit_challenge_reason,
-    )
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
@@ -2037,12 +2029,21 @@ async def _finalize_qualification(
     audit_findings = _extract_audit_findings(_audit_report_scored)
     # Build the reconciliation record on the RECONCILED report so
     # findings_derived_score agrees with the applied audit_score.  The challenge
-    # synthesis (computed above on original reports) is merged in, plus a distinct
-    # count of challenge-driven exclusions — kept separate from excluded_findings_count
+    # synthesis is derived from the binding verdict artifact (new gate) or the
+    # advisory reason (legacy path) — kept separate from excluded_findings_count
     # (verification-gate drops) so they are never double-counted.
+    _synthesis_reason: str | None = (
+        None  # binding gate ran — derive from challenge_verdicts
+        if (challenge_task_id or not audit_challenge_task_id)
+        else audit_challenge_reason  # legacy advisory path only
+    )
     audit_reconciliation = {
         **_compute_audit_reconciliation(_audit_report_scored),
-        "audit_challenge": _audit_challenge_synthesis,
+        "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
+            audit_report,
+            challenge_verdicts,
+            challenge_reason=_synthesis_reason,
+        ),
         "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
     }
 
