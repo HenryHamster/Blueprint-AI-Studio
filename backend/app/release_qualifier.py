@@ -122,6 +122,7 @@ from app.release_qualifier_audit import (
     # for the qualifier's audit/spawn and infra-failure seam.
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
     _enrich_infra_error,
+    _handle_independent_blocker,  # noqa: F401 — re-exported for callers/tests
     _handle_infra_failure,
     _latest_artifact_logs,
     _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
@@ -2158,6 +2159,10 @@ async def _finalize_qualification(
                     "respawn_count": new_respawn_count,
                     "challenge_task_id": str(retry_task.id),
                 }
+            if _challenge_hold == "audit_challenge_independent_blocker":
+                return await _handle_independent_blocker(
+                    session, version, qual, _challenge_binding_record
+                )
             return await _handle_infra_failure(session, version, qual, _challenge_hold)
 
     # Score using the reconciled report (refuted findings removed when challenge ran).

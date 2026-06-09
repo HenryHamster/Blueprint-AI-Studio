@@ -560,6 +560,15 @@ class Project(SQLModel, table=True):
     capability_proof_records: Dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
     )
+    # Durable adopt-or-reject verdicts for capability trials.
+    # Shape: {normalized_cap_name: {verdict, lift, n_with, n_without, window_hours,
+    # evaluated_at, thresholds}} — newest verdict supersedes the prior one.
+    # Written by capability_trial_verdict.record_trial_verdict during digest
+    # computation when a trial has accumulated enough measurement data.
+    # NULL / absent key = trial still running or not yet measured.
+    capability_adoption_verdicts: Dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
+    )
     # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
     # identical semantics to integration_branch.
     # Like integration_branch, this is operator-managed and preserved once set.

@@ -1335,7 +1335,19 @@ def _reconcile_audit_with_challenge(
                                 "audit_challenge_independent_blocker",
                                 None,
                                 [],
-                                [],
+                                [
+                                    {
+                                        "severity": _sev,
+                                        "summary": str(
+                                            _cv.get("summary") or ""
+                                        ).strip()[:_FINDING_SUMMARY_MAX],
+                                        "file": str(_cv.get("file") or "").strip(),
+                                        "reason": str(
+                                            _cv.get("reason") or ""
+                                        ).strip()[:_FINDING_SUMMARY_MAX],
+                                        "source": "challenger_independent",
+                                    }
+                                ],
                             )
         return None, report, [], []
 
@@ -1494,7 +1506,24 @@ def _reconcile_audit_with_challenge(
         sev = str(cv.get("severity") or "").lower().strip()
         rank = _SEVERITY_RANK.get(sev, 99)
         if rank != 99 and rank <= 1:
-            return "audit_challenge_independent_blocker", None, [], []
+            return (
+                "audit_challenge_independent_blocker",
+                None,
+                [],
+                [
+                    {
+                        "severity": sev,
+                        "summary": str(cv.get("summary") or "").strip()[
+                            :_FINDING_SUMMARY_MAX
+                        ],
+                        "file": str(cv.get("file") or "").strip(),
+                        "reason": str(cv.get("reason") or "").strip()[
+                            :_FINDING_SUMMARY_MAX
+                        ],
+                        "source": "challenger_independent",
+                    }
+                ],
+            )
 
     if not remove_idxs:
         return None, report, [], binding_record

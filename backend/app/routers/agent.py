@@ -880,6 +880,9 @@ async def claim_task(
             "enable_self_improvement": project.enable_self_improvement,
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
+            "repo_map_holdback_fraction": float(
+                _shared_state.runtime_config.get("repo_map_holdback_fraction", 0.0)
+            ),
         }
 
     task_type = _claimed_first_payload.get("type", "")

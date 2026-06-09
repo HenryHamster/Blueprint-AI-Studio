@@ -40,6 +40,11 @@ from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SP
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
+from app.capability_trial_verdict import (
+    evaluate_trial_verdict,
+    get_trial_verdicts,
+    record_trial_verdict,
+)
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
     _compute_first_attempt_breakdowns,
@@ -543,9 +548,11 @@ async def _compute_digest(
         "composition": [],
     }
 
+    _digest_project: Optional[Project] = None
     if project_id:
         project = await session.get(Project, project_id)
         if project:
+            _digest_project = project
             (
                 direction_progress_list,
                 scope_conversion_rates,
@@ -1360,6 +1367,26 @@ async def _compute_digest(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
+
+    # --- Capability trial verdict (write-through side-effect) ---
+    # Evaluate the repo-map trial based on current arm measurements and persist a
+    # durable adopt/reject/continue-trial verdict on the project.  Only runs when
+    # a specific project is in scope (no-op for cross-project digests).
+    if _digest_project is not None:
+        from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
+        _rm_verdict_entry = evaluate_trial_verdict(
+            lift=_first_attempt_success_rate.get("repo_map_lift"),
+            n_with=_first_attempt_success_rate.get("with_repo_map_n", 0),
+            n_without=_first_attempt_success_rate.get("without_repo_map_n", 0),
+            window_hours=hours,
+            evaluated_at=_tv_utcnow().isoformat(),
+        )
+        record_trial_verdict(_digest_project, "repo_map", _rm_verdict_entry)
+        try:
+            await session.flush()
+        except Exception:
+            logger.warning("[CAPABILITY_TRIAL] failed to flush verdict for repo_map", exc_info=True)
+
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
     )
@@ -1508,4 +1535,7 @@ async def _compute_digest(
         if prediction_calibration
         else None,
         "release_qualifier_infra_metrics": release_qualifier_infra_metrics,
+        "capability_adoption_verdicts": get_trial_verdicts(_digest_project)
+        if _digest_project is not None
+        else {},
     }

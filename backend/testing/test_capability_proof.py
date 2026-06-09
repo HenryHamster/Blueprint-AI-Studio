@@ -19,6 +19,11 @@ from app.capability_proof import (
     should_record_capability_proof,
 )
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+from app.capability_trial_verdict import (
+    evaluate_trial_verdict,
+    get_trial_verdicts,
+    record_trial_verdict,
+)
 
 
 def _make_task(
@@ -246,3 +251,91 @@ class TestRecordCapabilityProof:
         assert "cap-alpha" in recorded
         assert "cap-beta" in recorded
         assert len(project.capability_proof_records) == 2
+
+
+# ── trial measurement → durable adoption verdict ──────────────────────────────
+
+
+class TestTrialMeasurementProducesDurableAdoptionVerdict:
+    """Acceptance test: the full measurement → verdict → persistence pipeline."""
+
+    def test_trial_measurement_produces_durable_adoption_verdict(self):
+        """A merge-test verdict: a digest measurement with enough samples and a
+        positive lift evaluates to 'adopt' and is durably stored on the project."""
+        project = MagicMock()
+        project.capability_adoption_verdicts = {}
+
+        # Simulate the measurement data that _compute_first_attempt_breakdowns returns.
+        lift = 0.08
+        n_with = 35
+        n_without = 32
+
+        # Evaluate the verdict from the measurement.
+        verdict_entry = evaluate_trial_verdict(
+            lift=lift,
+            n_with=n_with,
+            n_without=n_without,
+            window_hours=72,
+            evaluated_at="2026-06-09T12:00:00",
+        )
+
+        # Verify the verdict is correct before persisting.
+        assert verdict_entry["verdict"] == "adopt"
+        assert verdict_entry["lift"] == lift
+        assert verdict_entry["n_with"] == n_with
+        assert verdict_entry["n_without"] == n_without
+        assert verdict_entry["window_hours"] == 72
+
+        # Persist the verdict on the project.
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", verdict_entry)
+
+        # Verify the verdict is durably stored and retrievable.
+        stored = get_trial_verdicts(project)
+        assert "repo_map" in stored
+        assert stored["repo_map"]["verdict"] == "adopt"
+        assert stored["repo_map"]["lift"] == lift
+
+    def test_insufficient_samples_produces_continue_trial(self):
+        """Below the minimum sample threshold the verdict is always continue-trial."""
+        project = MagicMock()
+        project.capability_adoption_verdicts = {}
+
+        verdict_entry = evaluate_trial_verdict(
+            lift=0.15,  # high lift but not enough samples
+            n_with=5,
+            n_without=5,
+            evaluated_at="2026-06-09T12:00:00",
+        )
+        assert verdict_entry["verdict"] == "continue-trial"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", verdict_entry)
+
+        stored = get_trial_verdicts(project)
+        assert stored["repo_map"]["verdict"] == "continue-trial"
+
+    def test_later_verdict_supersedes_earlier(self):
+        """A newer measurement supersedes the prior durable verdict."""
+        project = MagicMock()
+        project.capability_adoption_verdicts = {
+            "repo_map": {
+                "verdict": "continue-trial",
+                "lift": 0.01,
+                "n_with": 10,
+                "n_without": 10,
+            }
+        }
+
+        # New measurement with enough data and a positive lift.
+        new_entry = evaluate_trial_verdict(
+            lift=0.09, n_with=40, n_without=38, evaluated_at="2026-06-09T18:00:00"
+        )
+        assert new_entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", new_entry)
+
+        stored = get_trial_verdicts(project)
+        assert stored["repo_map"]["verdict"] == "adopt"
+        assert stored["repo_map"]["n_with"] == 40

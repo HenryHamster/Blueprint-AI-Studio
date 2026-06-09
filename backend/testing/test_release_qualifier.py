@@ -2633,12 +2633,16 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, blocker_findings = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
         assert modified is None
         assert refuted == []
+        assert len(blocker_findings) == 1
+        assert blocker_findings[0]["severity"] == "high"
+        assert "SQL injection" in blocker_findings[0]["summary"]
+        assert blocker_findings[0]["source"] == "challenger_independent"
 
     def test_challenger_only_critical_confirmed_verdict_holds(self):
         """Unmatched confirmed CRITICAL verdict returns hold."""
@@ -2653,12 +2657,15 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, blocker_findings = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
         assert modified is None
         assert refuted == []
+        assert len(blocker_findings) == 1
+        assert blocker_findings[0]["severity"] == "critical"
+        assert blocker_findings[0]["source"] == "challenger_independent"
 
     def test_challenger_only_blocker_confirmed_verdict_holds(self):
         """Unmatched confirmed BLOCKER severity returns hold."""
@@ -2673,12 +2680,15 @@ class TestChallengerIndependentBlocker:
                 }
             ],
         )
-        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, blocker_findings = rq._reconcile_audit_with_challenge(
             self._report([]), envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
         assert modified is None
         assert refuted == []
+        assert len(blocker_findings) == 1
+        assert blocker_findings[0]["severity"] == "blocker"
+        assert blocker_findings[0]["source"] == "challenger_independent"
 
     def test_challenger_only_medium_confirmed_no_hold(self):
         """Unmatched confirmed MEDIUM verdict does not trigger independent blocker hold."""
@@ -2780,12 +2790,16 @@ class TestChallengerIndependentBlocker:
                 },
             ],
         )
-        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+        hold, modified, refuted, blocker_findings = rq._reconcile_audit_with_challenge(
             report, envelope, self.SHA
         )
         assert hold == "audit_challenge_independent_blocker"
         assert modified is None
         assert refuted == []
+        assert len(blocker_findings) == 1
+        assert blocker_findings[0]["severity"] == "high"
+        assert "SQL injection" in blocker_findings[0]["summary"]
+        assert blocker_findings[0]["source"] == "challenger_independent"
 
     def test_all_matched_confirmed_high_no_independent_hold(self):
         """When vi_assigned covers the confirmed HIGH verdict, no independent hold fires."""
@@ -2813,6 +2827,200 @@ class TestChallengerIndependentBlocker:
         assert hold is None
         assert modified == report
         assert refuted == []
+
+
+# ---------------------------------------------------------------------------
+# _finalize_qualification — independent blocker hold routes to quality outcome
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_independent_blocker_hold_records_quality_outcome_not_infra_failure(
+    db_session, mocker
+):
+    """Acceptance test: an independent-blocker hold is a quality finding.
+
+    When the challenger confirms a >=HIGH severity issue not present in the
+    primary audit findings, _finalize_qualification must:
+    - return status='not_promoted' (not 'infra_failure')
+    - set version.last_qualification["status"] == 'not_promoted'
+    - record a QualificationVerdict row with terminal_status='not_promoted'
+    - NOT set 'consecutive_infra_errors' in last_qualification
+    - NOT raise an infra Alert row
+    - carry the challenger finding in last_qualification['audit_findings']
+    """
+    from app import shared_state
+    from app.models import Alert
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    # Audit has no deductible (empty findings), so the independent-blocker branch
+    # in _reconcile_audit_with_challenge fires on the challenger's confirmed HIGH.
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Challenge confirms an independent HIGH finding the primary audit missed.
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "SQL injection in admin search endpoint missed by primary audit",
+                "reason": "user-supplied data flows into a raw SQL query without sanitisation",
+            }
+        ],
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Must return quality-finding outcome, NOT infra_failure.
+    assert result["status"] == "not_promoted", (
+        f"expected not_promoted but got {result['status']!r} — "
+        "independent blocker should be classified as a quality finding"
+    )
+    assert result["blocker"] == "audit_challenge_independent_blocker"
+
+    # last_qualification reflects the quality outcome.
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "audit_challenge_independent_blocker"
+    # Infra streak must not be set — this is not an infrastructure failure.
+    assert "consecutive_infra_errors" not in lq or lq.get("consecutive_infra_errors") is None
+    # Challenger finding detail must be persisted for the strategic loop.
+    assert lq.get("audit_findings"), "audit_findings must be populated with the blocker detail"
+    assert lq["audit_findings"][0]["severity"] == "high"
+    assert "SQL injection" in lq["audit_findings"][0]["summary"]
+
+    # A durable QualificationVerdict row must exist (unlike _handle_infra_failure).
+    count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert count == 1, (
+        f"expected 1 QualificationVerdict row but found {count} — "
+        "independent blocker must record a durable quality verdict"
+    )
+
+    # No infra Alert should have been raised.
+    alert_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                Alert.project_id == project.id
+            )
+        )
+    ).scalar()
+    assert alert_count == 0, (
+        f"expected 0 Alert rows but found {alert_count} — "
+        "an independent quality blocker must not raise an infra alert"
+    )
+
+    # Version returned to stabilize, not promoted.
+    assert version.phase == "stabilize"
+    assert version.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_independent_blocker_does_not_increment_infra_streak(
+    db_session, mocker
+):
+    """Repeated independent-blocker holds do not accumulate infra_error streak.
+
+    Unlike infra failures, each independent-blocker hold is a quality verdict.
+    The infra-error counter must not grow across multiple runs — otherwise the
+    backstop alert fires and misleads the operator about the agent infrastructure.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+
+    async def _run_independent_blocker():
+        audit_task, _smoke = await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 1.0,
+                "findings": [],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "a", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        await _seed_challenge_artifact(
+            db_session,
+            project,
+            version,
+            audit_task=audit_task,
+            verdicts=[
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "Auth bypass in admin panel",
+                    "reason": "session token not validated server-side",
+                }
+            ],
+        )
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        return result
+
+    # Run three independent-blocker holds (matches _MIN_INFRA_ERROR_STREAK).
+    for _ in range(3):
+        result = await _run_independent_blocker()
+        assert result["status"] == "not_promoted"
+        lq = version.last_qualification
+        assert "consecutive_infra_errors" not in lq or lq.get("consecutive_infra_errors") is None
+
+    # No infra Alert should have been raised despite three runs.
+    from app.models import Alert
+
+    alert_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(Alert.project_id == project.id)
+        )
+    ).scalar()
+    assert alert_count == 0, (
+        f"expected 0 Alert rows but found {alert_count} after 3 independent-blocker "
+        "holds — must not trigger infra backstop alert"
+    )
 
 
 class TestReconcileRefutedJustificationGate:

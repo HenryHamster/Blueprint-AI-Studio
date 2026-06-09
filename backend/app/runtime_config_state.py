@@ -802,6 +802,14 @@ runtime_config: Dict = {
         "plan",
         "security_audit",
     ],
+    # Deterministic holdback fraction for the language-aware repo-map trial.
+    # Tasks whose stable per-task hash falls below this threshold run WITHOUT
+    # the repo map, allowing digest_metrics' without_repo_map arm to be
+    # populated by real holdback runs rather than map-build failures only.
+    # Default 0.0 = unconditional injection (trial off); set to e.g. 0.1 for
+    # a 10% holdback arm. Setting back to 0.0 restores always-on injection
+    # once a verdict is reached. Operator-adjustable via runtime_config_json.
+    "repo_map_holdback_fraction": 0.0,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -1316,6 +1324,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 for float_key in (
                     "direction_churn_min_merge_rate",
                     "direction_lifetime_min_merge_rate",
+                    "repo_map_holdback_fraction",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))

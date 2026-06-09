@@ -270,6 +270,8 @@ def _compute_first_attempt_breakdowns(
         "arch_context_lift_trend": arch_context_lift_trend,
         "with_repo_map": with_rm_rate,
         "without_repo_map": without_rm_rate,
+        "with_repo_map_n": len(with_rm),
+        "without_repo_map_n": len(without_rm),
         "repo_map_lift": repo_map_lift,
         "sample_size": sample_size,
         "by_type": by_type,

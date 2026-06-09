@@ -386,7 +386,30 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const fileTree = buildFileTree(ws);
-  const repoMap = buildRepoMap(ws);
+  let repoMap = buildRepoMap(ws);
+
+  // ── Deterministic repo-map holdback arm ──────────────────────────────────
+  // A fraction of tasks (configurable via runtime_config.repo_map_holdback_fraction,
+  // injected into project_metadata at claim time) are assigned to the "without repo
+  // map" arm. The assignment is stable per-task (same taskId always maps to the same
+  // arm) so retries stay in the same arm and the trial is not confounded by per-attempt
+  // randomness. Setting the fraction to 0.0 restores unconditional injection.
+  const projectMetaForHoldback = task.project_metadata as Record<string, unknown> | undefined;
+  const holdbackFraction = typeof projectMetaForHoldback?.repo_map_holdback_fraction === 'number'
+    ? projectMetaForHoldback.repo_map_holdback_fraction
+    : 0.0;
+  if (holdbackFraction > 0 && repoMap !== '') {
+    // djb2 hash of the taskId string → stable float in [0, 1)
+    let h = 5381;
+    for (let i = 0; i < taskId.length; i++) {
+      h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
+    }
+    const taskHash = h / 0xffffffff;
+    if (taskHash < holdbackFraction) {
+      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
+      repoMap = '';
+    }
+  }
 
   // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
   // Runs a read-only pass to map module interfaces and dependencies before coding.
