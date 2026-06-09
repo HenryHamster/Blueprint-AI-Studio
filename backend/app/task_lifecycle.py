@@ -1177,7 +1177,6 @@ async def _process_post_commit(
         if (task.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY):
             await _resolve_review_second_opinion(task, payload, session)
             return {"status": "accepted"}
-            return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
