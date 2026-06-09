@@ -816,17 +816,20 @@ async def _check_evaluating_timeouts(progress_cb=None):
     except (ValueError, TypeError):
         _spend_hours = 24
     SPEND_APPROVAL_FAIL_SECONDS = _spend_hours * 3600
-    # BLOCKED is treated as terminal-for-now in this EVALUATING-timeout sweep:
-    # (a) a BLOCKED child must NOT be cascade-CANCELLED on a CI-backstop timeout
-    # (that would destroy its durable blocked state — it stays parked exactly as
-    # a FAILED child would have stayed terminal), and (b) a parent whose
-    # remaining children are all BLOCKED must still count as all-children-settled
-    # so the missed-rollup recovery fires instead of pinning EVALUATING forever.
+    # BLOCKED and PARKED are treated as terminal-for-now in this EVALUATING-timeout
+    # sweep: both are durable non-terminal states that must NOT be cascade-CANCELLED
+    # on a timeout. (a) Cancelling them destroys durable child state — a BLOCKED
+    # child's blocked state, or a PARKED child's in-flight wake registration and
+    # compute-job result — when each would have stayed put exactly as a FAILED child
+    # stays terminal. (b) A parent whose remaining children are all BLOCKED/PARKED
+    # must still count as all-children-settled so the missed-rollup recovery fires
+    # instead of pinning EVALUATING forever.
     TERMINAL = {
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
         TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
     }
 
     try:

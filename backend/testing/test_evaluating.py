@@ -193,6 +193,77 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_evaluating_hard_timeout_preserves_parked_child(eval_db, mocker):
+    """Regression: a PARKED child of a hard-timed-out EVALUATING parent must NOT be
+    cascade-CANCELLED. PARKED is a durable non-terminal state (in-flight wake
+    registration / compute-job result) and belongs in the sweep's TERMINAL preserve
+    set alongside BLOCKED. An IN_PROGRESS sibling drives the hard-timeout cascade so
+    we can assert the parked child survives while the active one is cancelled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    project = Project(name="Parked Preserve Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-running task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # An IN_PROGRESS sibling keeps not-all-children-settled so the hard-timeout
+    # cascade path runs (rather than missed-rollup recovery).
+    active_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    parked_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "compute_experiment", "prompt": "parked on compute wake"}],
+        status=TaskStatus.PARKED,
+    )
+    eval_db.add_all([active_child, parked_child])
+    await eval_db.commit()
+    await eval_db.refresh(active_child)
+    await eval_db.refresh(parked_child)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    await eval_db.refresh(active_child)
+    await eval_db.refresh(parked_child)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected parent FAILED but got {parent.status}"
+    )
+    assert active_child.status == TaskStatus.CANCELLED, (
+        f"Expected IN_PROGRESS sibling CANCELLED but got {active_child.status}"
+    )
+    assert parked_child.status == TaskStatus.PARKED, (
+        f"PARKED child must be preserved from cascade-cancel, got {parked_child.status}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired(
     eval_db, mocker
 ):
