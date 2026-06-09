@@ -1096,6 +1096,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     #     so the active-only check at (a) returns 0 — and the next tick
     #     spawns a new strategic instantly. Same for FAILED outcomes.
     #     Cooldown gates this regardless of force_strategic.
+    # Cross-instance double-spawn guard. Two orchestrator instances — or two idle
+    # ticks racing — can both pass the unlocked has_active_strategic check below
+    # before either's spawn commits, double-spawning a strategic cycle. That burns
+    # a redundant agent run and races the two cycles through the phase state
+    # machine into false failures. Hold the per-project research-spawn advisory
+    # lock across the whole check-and-spawn: on the strategic path there is no
+    # intermediate commit before the spawn commit, so the lock spans the entire
+    # critical section. If a peer instance holds it, skip strategic this tick — the
+    # peer is already spawning, and the operator-refresh marker survives an
+    # un-spawned tick (consumed on the follow-up tick). Best-effort but no-op in
+    # tests (the advisory lock reports no contention on non-Postgres dialects).
+    if is_strategic and not await _try_research_spawn_advisory_lock(
+        session, project.id
+    ):
+        logger.debug(
+            f"[STRATEGIC] Skipping strategic spawn — another worker holds the "
+            f"research-spawn lock for project {project.id}; retrying next tick"
+        )
+        is_strategic = False
+
     if is_strategic:
         from sqlalchemy import func as _strat_func
 

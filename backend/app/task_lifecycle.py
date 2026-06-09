@@ -4775,12 +4775,26 @@ async def _process_post_commit(
                 from app import strategic_cycle
 
                 cycle_row = await strategic_cycle.get(session, cycle_id)
-                if (
-                    cycle_row is not None
-                    and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES
-                ):
-                    task_type = task.first_payload.get("type", "")
-                    failed_phase = strategic_phase_for(task_type) or "phase2"
+                task_type = task.first_payload.get("type", "")
+                failed_phase = strategic_phase_for(task_type) or "phase2"
+                # Only backstop when the cycle is still stuck in THIS task's OWN
+                # phase — i.e. the completion handler genuinely failed to advance
+                # it. A successful phase-1 (design_doc_update) chains phase-2 and
+                # leaves the cycle in phase2_running; that is success, not a stall,
+                # and must NOT be marked failed_phase1. Marking it failed inflated
+                # _strategic_failures toward the circuit breaker and polluted the
+                # success metric — the source of the false "strategic review
+                # complete … but FAILED" reports. (The genuine catch — a task that
+                # went terminal while its OWN phase's running outcome never
+                # advanced — is preserved.)
+                _stuck_outcomes = {
+                    "phase1": {
+                        strategic_cycle.OUTCOME_IN_PROGRESS,
+                        strategic_cycle.OUTCOME_PHASE1_RUNNING,
+                    },
+                    "phase2": {strategic_cycle.OUTCOME_PHASE2_RUNNING},
+                }.get(failed_phase, frozenset())
+                if cycle_row is not None and cycle_row.outcome in _stuck_outcomes:
                     logger.warning(
                         f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
                         f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"

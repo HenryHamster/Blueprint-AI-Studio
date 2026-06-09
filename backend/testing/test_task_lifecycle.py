@@ -6550,6 +6550,63 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
     assert captured["session"] is not session
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cycle_outcome,expect_failure",
+    [
+        # Phase-1 chained phase-2 successfully → cycle advanced → NOT a stall.
+        ("phase2_running", False),
+        # Phase-1 genuinely stuck in its own running outcome → still caught.
+        ("phase1_running", True),
+    ],
+)
+async def test_strategic_backstop_skips_advanced_cycle(
+    tl_db, mocker, cycle_outcome, expect_failure
+):
+    """Regression: the lifecycle backstop must only mark a strategic phase failed
+    when the cycle is still stuck in THAT phase. A phase-1 (design_doc_update)
+    task whose cycle has advanced to phase2_running succeeded (it chained phase-2)
+    and must NOT be marked failed_phase1 — that false failure inflated
+    _strategic_failures toward the circuit breaker and produced the bogus
+    'strategic review complete … but FAILED' reports. A cycle still in
+    phase1_running IS a genuine stall and must still be caught."""
+    session, factory = tl_db
+    mocker.patch(
+        "app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    # Force the phase-1 label regardless of task type (a real design_doc_update
+    # would take the strategic pair-lock path the SQLite harness can't honor).
+    mocker.patch("app.task_lifecycle.strategic_phase_for", return_value="phase1")
+
+    class _Cycle:
+        outcome = cycle_outcome
+
+    mocker.patch(
+        "app.strategic_cycle.get", new_callable=AsyncMock, return_value=_Cycle()
+    )
+    mark = mocker.patch(
+        "app.strategic_cycle.mark_failure", new_callable=AsyncMock
+    )
+
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.FAILED,
+        context={"strategic_cycle_id": str(uuid.uuid4())},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    if expect_failure:
+        mark.assert_awaited_once()
+        assert mark.await_args.kwargs.get("phase") == "phase1"
+    else:
+        mark.assert_not_awaited()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Cluster C5 — FAILED safeguard releases the cross-cutting merge gate.
 # Pre-fix: the gate was released ONLY on the security_audit COMPLETED branch

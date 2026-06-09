@@ -584,6 +584,61 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(db_session
 
 
 @pytest.mark.asyncio
+async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocker):
+    """Regression (strategic double-spawn): when a peer orchestrator instance holds
+    the per-project research-spawn advisory lock, the strategic-spawn path must be
+    skipped this tick rather than racing a second strategic cycle. Two instances
+    both passing the unlocked has_active_strategic check double-spawned strategic
+    reviews ~30s apart (and tripped the phase backstop into false failures); the
+    cross-instance lock guard closes that window. Complements
+    test_all_paused_directions_still_get_strategic_via_backstop, which proves the
+    same setup DOES spawn when the lock is free (its default in the test harness)."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    # Simulate a peer instance already holding the per-project spawn lock.
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=False),
+    )
+    project = Project(
+        name="Lock Held — No Double Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction("d-paused03", "Paused A"), "recommended_mode": "pause"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A stale strategic task makes the wall-clock backstop due (force_strategic).
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=200),
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not design_doc_mock.called and not strategic_review_mock.called, (
+        "strategic spawn must be skipped while a peer holds the research-spawn lock"
+    )
+
+
+@pytest.mark.asyncio
 async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mocker):
     """Companion: with no strategic cycle due (backstop not firing, force_strategic
     stays False), an all-paused direction set is correctly skipped — the guard only
