@@ -1,13 +1,17 @@
 """Agent-facing compute-job launch and polling endpoints."""
 
 import uuid
-from typing import Dict
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.compute_jobs import create_compute_job, get_compute_job_for_task
+from app.compute_jobs import (
+    ComputeLaunchPreconditionFailed,
+    create_compute_job,
+    get_compute_job_for_task,
+)
 from app.database import get_session
 from app.models import Task
 from app.routers.agent import verify_agent_token
@@ -35,6 +39,11 @@ class LaunchComputeJobRequest(BaseModel):
     # the accelerator's canonical single-GPU shape and still rejects
     # A100/over-quota, count!=1, local backend, and explicit mismatches.
     accelerator: str | None = Field(default=None, max_length=32)
+    # Optional marker for compute_experiment launches that claim to prove the
+    # promoted/live system. Marked launches require aggregate release deploy
+    # artifacts to be serving_confirmed before any job is created or reused.
+    live_proof: bool | str | Dict[str, Any] | None = None
+    live_proof_marker: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/compute-jobs")
@@ -100,7 +109,11 @@ async def launch_compute_job(
             backend_name=req.backend_name,
             provisioning_model=req.provisioning_model,
             accelerator=req.accelerator,
+            live_proof=req.live_proof,
+            live_proof_marker=req.live_proof_marker,
         )
+    except ComputeLaunchPreconditionFailed as exc:
+        raise HTTPException(status_code=412, detail=exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

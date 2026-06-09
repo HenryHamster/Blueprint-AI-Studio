@@ -4485,6 +4485,12 @@ async def _spawn_strategic_review(
         _prior_serving_status: str | None = None
         _prior_deploy_reason: str | None = None
         _prior_artifact_gap: str | None = None
+        # When the prior-version record genuinely cannot be READ (the lookup
+        # raised), fail closed below: do NOT imply the previous version is live.
+        # A lookup that simply finds no matching promoted record is a different,
+        # optimistic case — version_number > 1 is only reachable via a
+        # promotion, so the positive "it promoted" framing still holds there.
+        _prior_lookup_failed = False
         try:
             from app.release_version import recent_closed_versions as _rcv
 
@@ -4508,10 +4514,28 @@ async def _spawn_strategic_review(
                     )
                     break
         except Exception:
+            _prior_lookup_failed = True
             logger.exception(
                 "[STRATEGIC] post-promote prior-version lookup failed; continuing"
             )
-        if _prior_serving_status == "deploy_failed":
+        if _prior_lookup_failed:
+            # Fail closed: the prior promoted record is unreadable, so we cannot
+            # assert it is serving. Do NOT imply it is live.
+            _status_txt = (
+                f" serving_status={_prior_serving_status!r}"
+                if _prior_serving_status is not None
+                else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
+                f"to {_target}{_promoted_when}{_verdict_txt}, but its prior "
+                f"serving evidence is unknown or unreadable{_status_txt}. Do "
+                f"NOT treat v{_prior_n} as live yet. Verify lifecycle/deploy "
+                f"state before treating the previous version as live, and only "
+                f"treat it as shipped once aggregate serving evidence is "
+                f"explicitly `serving_confirmed`."
+            )
+        elif _prior_serving_status == "deploy_failed":
             # The prior promotion MERGED but never shipped — do NOT advance focus
             # as if it succeeded.  This is the focus-advancement gate honoring the
             # serving signal: the strategist must treat the milestone as NOT

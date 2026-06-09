@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app import compute_jobs
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
+    backfill_artifact_prerequisites,
     deliver_artifact_to_dependents,
 )
 from app.compute_experiment_contract import (
@@ -172,6 +173,83 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+    # An https:// reference must not create an Artifact row even when the task
+    # carries no downstream_artifact acceptance_evidence.
+    assert job.artifact_id is None
+
+
+@pytest.mark.asyncio
+async def test_compute_downstream_artifact_rejects_transient_result_reference(
+    db_session, _quiet_compute_io
+):
+    """A transient https:// result_reference must not create an Artifact row or
+    deliver a prerequisite pointer to dependents, even when the task declares a
+    downstream_artifact logical key.  The reference is still recorded on
+    job.result_reference for diagnostics.
+    """
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    transient_ref = "https://signed.example.com/jobs/abc/result.json?token=xyz"
+    await compute_jobs.stamp_compute_job_result_reference(
+        db_session,
+        task_id=task.id,
+        job_id=job.id,
+        result_reference=transient_ref,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(job)
+    # Diagnostic reference is always recorded.
+    assert job.result_reference == transient_ref
+    # No Artifact row created for a transient https:// reference.
+    assert job.artifact_id is None
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs is None, (
+        "transient https:// result_reference must not deliver artifact prerequisites "
+        "to dependents"
+    )
 
 
 @pytest.mark.asyncio
@@ -438,6 +516,187 @@ async def test_grounded_negative_compute_knowledge_delivers_to_dependents(
     prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
     assert prereqs and prereqs[0]["source_task_id"] == str(task.id)
     assert dependent.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_late_compute_artifact_dependent_is_hydrated_before_launch(
+    db_session, _quiet_compute_io
+):
+    """A dependent task queued AFTER its producer completed must receive artifact
+    prerequisite pointers via backfill_artifact_prerequisites at claim time.
+
+    Acceptance gate: the test must call backfill_artifact_prerequisites against
+    a completed producer and assert the pointer lands in the dependent's context
+    with the correct shape.  This exercises the production code path that fires
+    during claim_task for late-arriving dependents.
+    """
+    project = Project(name="BackfillTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        title="compute_experiment: measure GPU",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "acceptance_evidence": {
+                    "kind": "downstream_artifact",
+                    "artifact_id": "experiment-result-bundle",
+                },
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="experiment-result-bundle",
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/result.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Dependent created AFTER producer completion — push path never fired.
+    dependent = Task(
+        project_id=project.id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(producer.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    # Confirm no prerequisites exist yet (push path did not fire).
+    assert (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY) is None
+
+    # Backfill fires at claim time.
+    await backfill_artifact_prerequisites(dependent, db_session)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs is not None, "backfill must populate artifact_prerequisites"
+    assert len(prereqs) == 1
+    assert prereqs[0]["artifact_id"] == str(artifact.id)
+    assert prereqs[0]["logical_key"] == "experiment-result-bundle"
+    assert prereqs[0]["artifact_type"] == ArtifactType.COMPUTE_RESULT.value
+    assert prereqs[0]["source_task_id"] == str(producer.id)
+    assert prereqs[0]["storage_uri"] == "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+
+
+@pytest.mark.asyncio
+async def test_backfill_artifact_prerequisites_idempotent(
+    db_session, _quiet_compute_io
+):
+    """Calling backfill_artifact_prerequisites twice must not duplicate pointers."""
+    project = Project(name="BackfillIdempotent", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        title="compute_experiment: measure GPU",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="idempotent-bundle",
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/result.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    dependent = Task(
+        project_id=project.id,
+        title="feat: consume bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(producer.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    await backfill_artifact_prerequisites(dependent, db_session)
+    await db_session.commit()
+    await backfill_artifact_prerequisites(dependent, db_session)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs is not None
+    assert len(prereqs) == 1, "second backfill must not add a duplicate pointer"
+
+
+@pytest.mark.asyncio
+async def test_backfill_artifact_prerequisites_stays_within_project(
+    db_session, _quiet_compute_io
+):
+    """Claim-time backfill must not copy artifact metadata across projects."""
+    producer_project = Project(name="BackfillCrossProjectProducer", user_id="test-user")
+    dependent_project = Project(name="BackfillCrossProjectDependent", user_id="test-user")
+    db_session.add_all([producer_project, dependent_project])
+    await db_session.commit()
+    await db_session.refresh(producer_project)
+    await db_session.refresh(dependent_project)
+
+    producer = Task(
+        project_id=producer_project.id,
+        title="compute_experiment: foreign producer",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+    await db_session.refresh(producer)
+
+    artifact = Artifact(
+        task_id=producer.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        logical_key="foreign-bundle",
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/foreign.json",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    dependent = Task(
+        project_id=dependent_project.id,
+        title="feat: consume foreign bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(producer.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    await backfill_artifact_prerequisites(dependent, db_session)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    assert (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY) is None
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,11 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "env",
         "accelerator",
         "provisioning_model",
+        "live_proof",
+        "live_proof_marker",
+        "live_release_proof",
+        "live_release_proof_marker",
+        "requires_live_release",
     ):
         val = _pick(opt_key)
         if val is not None:

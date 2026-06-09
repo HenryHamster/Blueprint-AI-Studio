@@ -682,6 +682,11 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     env: dict[str, str] | None = None
     backend_name: str | None = None
     provisioning_model: str | None = None
+    # Optional live-release proof marker. When present/truthy, compute-job launch
+    # is held until the latest promoted release has aggregate required deploy
+    # artifacts serving_confirmed; ordinary compute omits this and is unchanged.
+    live_proof: bool | str | dict[str, Any] | None = None
+    live_proof_marker: str | None = None
     # Optional single-GPU accelerator (canonical short name "T4"/"L4"/"V100").
     # Absent ⇒ a CPU job, unchanged. When set it must be paired with a matching
     # GPU machine_type; the backend rejects A100/over-quota and mismatches loudly.
@@ -1112,12 +1117,15 @@ def pack_under_budget(
             continue
         included = False
         candidate = floors.get(key)
-        if candidate is not None and candidate.get("source") == "summarized":
-            if candidate["size"] <= remaining:
-                packed[key] = candidate["value"]
-                used += candidate["size"]
-                trimmed.append(candidate["meta"])
-                included = True
+        if (
+            candidate is not None
+            and candidate.get("source") == "summarized"
+            and candidate["size"] <= remaining
+        ):
+            packed[key] = candidate["value"]
+            used += candidate["size"]
+            trimmed.append(candidate["meta"])
+            included = True
         if not included:
             summarized = _compute_summarized_candidate(p)
             if summarized is not None and summarized["size"] <= remaining:

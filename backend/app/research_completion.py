@@ -3527,6 +3527,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "env",
                             "accelerator",
                             "provisioning_model",
+                            "live_proof",
+                            "live_proof_marker",
+                            "live_release_proof",
+                            "live_release_proof_marker",
+                            "requires_live_release",
                         )
                         if _cc.get(k) is not None
                     },

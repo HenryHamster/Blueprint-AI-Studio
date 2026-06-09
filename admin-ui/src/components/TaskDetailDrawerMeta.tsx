@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
-import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle } from 'lucide-react';
+import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle, HelpCircle } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, ResolvedReferenceLink, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
@@ -376,6 +376,8 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
     source_kind?: string;
     analysis_mode?: string;
     forward_quality_verdict?: { passed?: boolean; reason?: string } | null;
+    compute_acceptance_grade?: string | null;
+    compute_acceptance_reason?: string;
   } | undefined;
   const [expanded, setExpanded] = useState(false);
   const [body, setBody] = useState<string | null>(null);
@@ -419,6 +421,32 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
               {doc.analysis_mode}
             </span>
           )}
+          {doc.source_kind === 'compute_experiment' && (doc.compute_acceptance_grade === 'acceptance' || doc.compute_acceptance_grade === 'measured_only') && (() => {
+            const isAcceptance = doc.compute_acceptance_grade === 'acceptance';
+            const ACCEPTANCE_REASON_LABELS: Record<string, string> = {
+              llm_artifact_cited: 'LLM-grounded, artifact-cited analysis — qualifies as acceptance evidence',
+              analysis_mode_not_llm: 'Deterministic fallback summary (analysis mode is not LLM) — measured only',
+              citation_grounding_miss: 'Citation grounding miss — measured only',
+              no_source_citations: 'No source citations — measured only',
+              missing_grounding_probe: 'No grounding probe recorded — measured only',
+              no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
+            };
+            const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
+            const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
+              ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
+            const cls = isAcceptance
+              ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
+              : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
+            return (
+              <span
+                className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+                title={tooltip}
+              >
+                {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
+                {isAcceptance ? 'Acceptance' : 'Measured only'}
+              </span>
+            );
+          })()}
           {doc.source_kind && (
             <span className="text-[11px] text-neutral-500">{doc.source_kind.replace(/_/g, ' ')}</span>
           )}

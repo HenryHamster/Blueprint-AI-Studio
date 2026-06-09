@@ -10,6 +10,7 @@ upstream ``status`` / ``outcome`` / ``terminal_reason`` columns.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -19,15 +20,21 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func
+from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.compute_backends import (
     LOCAL_BACKEND_NAME,
     ComputeLaunchSpec,
+    ComputeStatusResult,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
     get_compute_backend,
     validate_backend_name,
+)
+from app.release_artifacts import (
+    summarize_release_artifacts,
+    summarize_required_artifact_gap,
 )
 from app.artifact_prerequisites import (
     deliver_artifact_to_dependents,
@@ -41,6 +48,7 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    ReleaseVersion,
     Task,
     TaskStatus,
 )
@@ -95,6 +103,14 @@ _COMPUTE_JOB_PRELAUNCH_STATUSES = {
     ComputeJobStatus.QUEUED,
     ComputeJobStatus.STARTING,
 }
+_LIVE_PROOF_METADATA_KEY = "live_release_evidence"
+_LIVE_PROOF_MARKER_KEYS = (
+    "live_proof",
+    "live_proof_marker",
+    "live_release_proof",
+    "live_release_proof_marker",
+    "requires_live_release",
+)
 
 # Wake-source kind for the task park-and-wake primitive. A compute_experiment
 # task parks on this kind with ``wake_source_ref=str(job.id)`` after launching
@@ -116,6 +132,14 @@ _COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] =
     ComputeJobOutcome.SPEND_CAP_EXCEEDED: (True, "budget"),
     ComputeJobOutcome.FAILURE: (False, None),
 }
+
+
+class ComputeLaunchPreconditionFailed(Exception):
+    """Structured launch precondition failure safe to return to agents."""
+
+    def __init__(self, detail: dict[str, Any]):
+        self.detail = detail
+        super().__init__(str(detail.get("message") or detail.get("error") or detail))
 
 
 def clamp_spend_cap_usd(raw_value: float) -> float:
@@ -153,6 +177,8 @@ async def create_compute_job(
     provisioning_model: str | None = None,
     accelerator: str | None = None,
     accelerator_count: int = 1,
+    live_proof: Any | None = None,
+    live_proof_marker: Any | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -187,6 +213,22 @@ async def create_compute_job(
     # cost rate, and provisioning path all resolve the same supported shape.
     persisted_accelerator = accel_spec.name if accel_spec is not None else None
     persisted_accelerator_count = accelerator_count if accel_spec is not None else None
+    locked_task = await _lock_task_for_compute_job(session, task.id)
+    if locked_task is None:
+        raise ValueError("task not found")
+    if locked_task.status in _TASK_TERMINAL_STATUSES:
+        raise ValueError("cannot launch a compute job for a terminal task")
+    live_proof_requirement = _resolve_live_proof_requirement(
+        locked_task,
+        explicit_values=(live_proof_marker, live_proof),
+    )
+    live_release_evidence = None
+    if live_proof_requirement is not None:
+        live_release_evidence = await _resolve_live_release_evidence(
+            session,
+            project_id=locked_task.project_id,
+            requirement=live_proof_requirement,
+        )
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=resolved_machine_type,
@@ -198,15 +240,19 @@ async def create_compute_job(
         provisioning_model=normalized_provisioning,
         accelerator=persisted_accelerator,
         accelerator_count=persisted_accelerator_count,
+        live_proof_requirement=live_proof_requirement,
     )
-    locked_task = await _lock_task_for_compute_job(session, task.id)
-    if locked_task is None:
-        raise ValueError("task not found")
-    if locked_task.status in _TASK_TERMINAL_STATUSES:
-        raise ValueError("cannot launch a compute job for a terminal task")
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
         if _launch_request_matches(existing, launch_request_fingerprint):
+            if live_release_evidence is not None:
+                metadata = dict(existing.polling_metadata or {})
+                metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
+                existing.polling_metadata = metadata
+                existing.updated_at = _utcnow()
+                session.add(existing)
+                await session.commit()
+                await session.refresh(existing)
             return existing
         raise ValueError("task already has an active compute job")
     deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
@@ -218,6 +264,18 @@ async def create_compute_job(
         count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
     )
+    polling_metadata = {
+        "command": command,
+        "cwd": cwd,
+        "env": {str(k): str(v) for k, v in (env or {}).items()},
+        "provisioning_model": normalized_provisioning,
+        "cost_rate_per_second": rate,
+        "requested_deadline_seconds": capped_deadline,
+        "launch_request_fingerprint": launch_request_fingerprint,
+        "status_message": "queued for compute-job launch",
+    }
+    if live_release_evidence is not None:
+        polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -230,20 +288,136 @@ async def create_compute_job(
         accrued_cost_usd=0.0,
         wall_clock_deadline=deadline_at,
         polling_metadata={
-            "command": command,
-            "cwd": cwd,
-            "env": {str(k): str(v) for k, v in (env or {}).items()},
-            "provisioning_model": normalized_provisioning,
-            "cost_rate_per_second": rate,
-            "requested_deadline_seconds": capped_deadline,
-            "launch_request_fingerprint": launch_request_fingerprint,
-            "status_message": "queued for compute-job launch",
+            **polling_metadata,
+            "provisioning_deadline_at": deadline_at.isoformat(),
+            "runtime_deadline_seconds": capped_deadline,
         },
     )
     session.add(job)
     await session.commit()
     await session.refresh(job)
     return job
+
+
+def _marker_from_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "live_proof" if value else None
+    if isinstance(value, str):
+        marker = value.strip()
+        if not marker or marker.lower() in {"0", "false", "no", "off", "none"}:
+            return None
+        return marker
+    if isinstance(value, dict):
+        enabled = value.get("enabled")
+        if enabled is False:
+            return None
+        for key in ("marker", "name", "kind", "target", "reason"):
+            marker = _marker_from_value(value.get(key))
+            if marker:
+                return marker
+        return "live_proof"
+    return None
+
+
+def _resolve_live_proof_requirement(
+    task: Task,
+    *,
+    explicit_values: tuple[Any, ...] = (),
+) -> dict[str, str] | None:
+    for value in explicit_values:
+        marker = _marker_from_value(value)
+        if marker:
+            return {"marker": marker}
+
+    containers: list[dict[str, Any]] = []
+    payload = task.first_payload or {}
+    context = task.context or {}
+    if isinstance(payload, dict):
+        containers.append(payload)
+        for key in ("compute_experiment", "launch_contract"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+    if isinstance(context, dict):
+        containers.append(context)
+        for key in ("compute_experiment", "launch_contract"):
+            nested = context.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+    for container in containers:
+        for key in _LIVE_PROOF_MARKER_KEYS:
+            marker = _marker_from_value(container.get(key))
+            if marker:
+                return {"marker": marker}
+    return None
+
+
+async def _resolve_live_release_evidence(
+    session,
+    *,
+    project_id: uuid.UUID,
+    requirement: dict[str, str],
+) -> dict[str, Any]:
+    result = await session.execute(
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.status == "promoted",
+        )
+        .options(selectinload(ReleaseVersion.deploy_artifacts))
+        .order_by(ReleaseVersion.promoted_at.desc(), ReleaseVersion.version_number.desc())
+    )
+    version = result.scalars().first()
+    if version is None:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "live_release_precondition_failed",
+                "reason": "no_promoted_release",
+                "message": "live-proof compute launch requires a promoted release",
+                "live_proof": requirement,
+            }
+        )
+    aggregate, artifacts = summarize_release_artifacts(
+        version,
+        version.deploy_artifacts,
+    )
+    required_artifacts = [
+        artifact for artifact in artifacts if artifact.get("required")
+    ]
+    required_artifacts_confirmed = all(
+        artifact.get("serving_status") == "serving_confirmed"
+        for artifact in required_artifacts
+    )
+    evidence = {
+        "live_proof": requirement,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "promoted_sha": version.promoted_sha,
+        "promoted_at": version.promoted_at.isoformat()
+        if version.promoted_at
+        else None,
+        "aggregate_serving_status": aggregate.get("serving_status"),
+        "aggregate_reason_code": aggregate.get("reason_code"),
+        "required_artifacts": required_artifacts,
+    }
+    if not required_artifacts_confirmed:
+        gap = summarize_required_artifact_gap(required_artifacts)
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "live_release_precondition_failed",
+                "reason": "release_not_serving_confirmed",
+                "message": (
+                    gap
+                    or "live-proof compute launch requires all required artifacts serving_confirmed"
+                ),
+                "live_proof": requirement,
+                "live_release_evidence": evidence,
+            }
+        )
+    return evidence
 
 
 async def _lock_task_for_compute_job(session, task_id: uuid.UUID | None) -> Task | None:
@@ -284,6 +458,7 @@ def _build_launch_request_fingerprint(
     provisioning_model: str,
     accelerator: str | None = None,
     accelerator_count: int | None = None,
+    live_proof_requirement: dict[str, str] | None = None,
 ) -> str:
     payload = {
         "accelerator": accelerator,
@@ -296,6 +471,7 @@ def _build_launch_request_fingerprint(
         "machine_type": machine_type,
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
+        "live_proof_requirement": live_proof_requirement,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -307,6 +483,57 @@ def _launch_request_matches(job: ComputeJob, request_fingerprint: str) -> bool:
         (job.polling_metadata or {}).get("launch_request_fingerprint") or ""
     ).strip()
     return bool(existing) and existing == request_fingerprint
+
+
+def _requested_deadline_seconds(job: ComputeJob) -> int | None:
+    raw = (job.polling_metadata or {}).get("requested_deadline_seconds")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _parse_naive_iso_datetime(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    return None
+
+
+def _runtime_deadline_at(job: ComputeJob) -> datetime | None:
+    meta_deadline = _parse_naive_iso_datetime(
+        (job.polling_metadata or {}).get("runtime_deadline_at")
+    )
+    if meta_deadline is not None:
+        return meta_deadline
+    if job.started_at is None:
+        return None
+    requested = _requested_deadline_seconds(job)
+    if requested is None:
+        return None
+    return job.started_at + timedelta(seconds=requested)
+
+
+def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
+    if job.wall_clock_deadline is None:
+        return None
+    return max(0.0, (job.wall_clock_deadline - now).total_seconds())
+
+
+def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
+    message = (status.message or "").strip().lower()
+    if message in {"runtime_ttl", "runtime_timeout", "command_runtime_timeout"}:
+        return True
+    return status.exit_code == 124
 
 
 async def get_compute_job_for_task(
@@ -348,10 +575,10 @@ async def stamp_compute_job_result_reference(
         artifact = await session.get(Artifact, job.artifact_id)
         if artifact is not None and logical_key:
             artifact.logical_key = logical_key
-            if not artifact.storage_uri:
+            if not artifact.storage_uri and _is_durable_artifact_uri(reference):
                 artifact.storage_uri = reference
             session.add(artifact)
-    elif logical_key:
+    elif logical_key and _is_durable_artifact_uri(reference):
         artifact = Artifact(
             task_id=task_id,
             artifact_type=ArtifactType.COMPUTE_RESULT,
@@ -587,7 +814,7 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
     for job in jobs:
         try:
             await _process_single_compute_job(job, session_factory=session_factory)
-        except Exception as exc:
+        except Exception as exc:  # noqa: PERF203
             logger.exception(
                 "[COMPUTE_JOB] monitor failed for job=%s: %s",
                 job.id,
@@ -654,9 +881,111 @@ async def _process_single_compute_job(
         )
         if reserved is None:
             return
+        provisioning_timeout_seconds = _provisioning_timeout_seconds(job, now=now)
+        if provisioning_timeout_seconds == 0.0:
+            started_at = _utcnow()
+            terminate_diagnostic = None
+            try:
+                terminated = await backend.terminate(reserved, reason="provisioning")
+            except Exception as exc:
+                failed_at = _utcnow()
+                logger.exception(
+                    "[COMPUTE_JOB] provisioning deadline terminate failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+                terminated = False
+                terminate_diagnostic = _build_compute_rpc_diagnostic(
+                    job,
+                    operation="terminate",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning",
+                )
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason="compute job timed out while provisioning",
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic
+                or _build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=TimeoutError("compute job provisioning deadline exceeded"),
+                    started_at=now,
+                    failed_at=now,
+                    next_retry_at=None,
+                    reason="provisioning_timeout",
+                ),
+            )
+            return
         started_at = _utcnow()
         try:
-            result = await backend.launch(_build_launch_spec(reserved))
+            launch_coro = backend.launch(_build_launch_spec(reserved))
+            if provisioning_timeout_seconds is not None:
+                result = await asyncio.wait_for(
+                    launch_coro, timeout=provisioning_timeout_seconds
+                )
+            else:
+                result = await launch_coro
+        except asyncio.TimeoutError:
+            failed_at = _utcnow()
+            logger.warning(
+                "[COMPUTE_JOB] launch provisioning timed out for job=%s", job.id
+            )
+            terminate_diagnostic = None
+            try:
+                terminated = await backend.terminate(reserved, reason="provisioning")
+            except Exception as exc:
+                failed_at = _utcnow()
+                logger.exception(
+                    "[COMPUTE_JOB] provisioning deadline terminate failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+                terminated = False
+                terminate_diagnostic = _build_compute_rpc_diagnostic(
+                    job,
+                    operation="terminate",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning",
+                )
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason="compute job timed out while provisioning",
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic
+                or _build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=TimeoutError("compute job provisioning deadline exceeded"),
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="provisioning_timeout",
+                ),
+            )
+            return
         except Exception as exc:
             failed_at = _utcnow()
             logger.exception(
@@ -736,10 +1065,15 @@ async def _process_single_compute_job(
         accrued_cost_usd = max(
             float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
         )
+        timeout_like = _status_is_runtime_timeout(status)
         outcome = (
-            ComputeJobOutcome.SUCCESS
-            if status.status == ComputeJobStatus.SUCCEEDED
-            else ComputeJobOutcome.FAILURE
+            ComputeJobOutcome.TIMED_OUT
+            if timeout_like
+            else (
+                ComputeJobOutcome.SUCCESS
+                if status.status == ComputeJobStatus.SUCCEEDED
+                else ComputeJobOutcome.FAILURE
+            )
         )
         await _apply_polled_compute_job_result(
             session_factory,
@@ -749,11 +1083,15 @@ async def _process_single_compute_job(
             next_poll_at=next_poll_at,
             status=status,
             accrued_cost_usd=accrued_cost_usd,
-            terminal_status=status.status,
+            terminal_status=ComputeJobStatus.TIMED_OUT
+            if timeout_like
+            else status.status,
             outcome=outcome,
-            terminal_reason=status.message
-            or _meta_message(job)
-            or "compute job finished",
+            terminal_reason=(
+                "compute job exceeded runtime deadline"
+                if timeout_like
+                else status.message or _meta_message(job) or "compute job finished"
+            ),
             exit_code=status.exit_code,
         )
         return
@@ -782,7 +1120,8 @@ async def _process_single_compute_job(
         return
     accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
 
-    if job.wall_clock_deadline is not None and job.wall_clock_deadline <= now:
+    runtime_deadline_at = _runtime_deadline_at(job)
+    if runtime_deadline_at is not None and runtime_deadline_at <= now:
         started_at = _utcnow()
         terminate_diagnostic = None
         try:
@@ -790,7 +1129,7 @@ async def _process_single_compute_job(
         except Exception as exc:
             failed_at = _utcnow()
             logger.exception(
-                "[COMPUTE_JOB] deadline terminate failed for job=%s: %s",
+                "[COMPUTE_JOB] runtime deadline terminate failed for job=%s: %s",
                 job.id,
                 exc,
             )
@@ -814,7 +1153,7 @@ async def _process_single_compute_job(
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
-            terminal_reason="compute job terminated at deadline",
+            terminal_reason="compute job exceeded runtime deadline",
             terminate_ok=terminated,
             compute_rpc_diagnostic=terminate_diagnostic,
         )
@@ -911,6 +1250,13 @@ async def _apply_launch_result(
             seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS
         )
         extra: dict[str, Any] = dict(result.metadata or {})
+        runtime_seconds = _requested_deadline_seconds(live)
+        if runtime_seconds is not None:
+            extra.setdefault("runtime_deadline_seconds", runtime_seconds)
+            extra["runtime_deadline_at"] = (
+                (live.started_at or result.started_at)
+                + timedelta(seconds=runtime_seconds)
+            ).isoformat()
         if result.cost_rate_per_second and result.cost_rate_per_second > 0:
             extra["cost_rate_per_second"] = result.cost_rate_per_second
         extra["status_message"] = result.message or "compute job launched"
@@ -1034,6 +1380,9 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         machine_type=job.machine_type or "",
         spend_cap_usd=float(job.spend_cap_usd or 0.0),
         deadline_at=job.wall_clock_deadline,
+        provisioning_deadline_at=job.wall_clock_deadline,
+        runtime_deadline_seconds=int(meta.get("requested_deadline_seconds") or 0)
+        or None,
         cwd=meta.get("cwd"),
         env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
@@ -1199,6 +1548,26 @@ def _finalize_terminal_job(
     _set_meta(job, status_message=terminal_reason, **extra)
 
 
+def _is_durable_artifact_uri(reference: str) -> bool:
+    """True only for references that are durable cloud-storage or file URIs.
+
+    Rejects bare http:// / https:// references (transient signed URLs, arbitrary
+    web endpoints) so they cannot create Artifact rows or trigger downstream
+    delivery. Accepts gs://, s3://, az://, file: URIs and path-like strings
+    containing a ``/`` separator (including metric fragment refs such as
+    ``gs://...#metric:name=value``). Empty strings are rejected.
+    """
+    text = reference.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in text
+
+
 def _coerce_metric_number(value: Any) -> float | int | None:
     """Numeric coercion mirroring the agent's ``numOrNull`` for reported metrics.
 
@@ -1341,7 +1710,7 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
         session.add(job)
         if task is not None:
             await deliver_artifact_to_dependents(task, artifact, session)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[COMPUTE_JOB] durable-artifact linkage failed for job=%s; "
             "completing without an artifact link",

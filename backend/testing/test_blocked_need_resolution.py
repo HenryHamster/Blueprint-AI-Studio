@@ -761,6 +761,48 @@ def test_require_acceptance_evidence_matches_documented_contract_for_grounded_fa
     assert knowledge_substance_satisfies_need(need, [grounded_fallback]) is True
 
 
+def test_compute_experiment_without_durable_grounding_stays_blocked():
+    """Compute knowledge only unblocks dependents when the stored evidence is durable."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import (
+        KnowledgeSubstance,
+        knowledge_substance_has_durable_compute_grounding,
+    )
+
+    need = {"kind": "task", "ref": "blocked-compute-doc"}
+    missing_probe = KnowledgeSubstance(
+        finding_hash="blocked-compute-doc",
+        topic="blocked-compute-doc",
+        source_kind="compute_experiment",
+        source_citations=("gs://bucket/jobs/result.json",),
+        forward_quality_verdict={"analysis_mode": "fallback"},
+    )
+    transient_citation = KnowledgeSubstance(
+        finding_hash="blocked-compute-doc",
+        topic="blocked-compute-doc",
+        source_kind="compute_experiment",
+        source_citations=("https://signed.example.com/jobs/result.json",),
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 1,
+                    "unresolved": [],
+                }
+            },
+        },
+    )
+
+    assert knowledge_substance_has_durable_compute_grounding(missing_probe) is False
+    assert knowledge_substance_satisfies_need(need, [missing_probe]) is False
+    assert knowledge_substance_has_durable_compute_grounding(
+        transient_citation
+    ) is False
+    assert knowledge_substance_satisfies_need(need, [transient_citation]) is False
+
+
 def test_knowledge_topic_near_miss_not_fuzzy():
     """Substring/prefix matches must NOT satisfy — exact equality only."""
     from app.blocked_need_resolution import knowledge_substance_satisfies_need

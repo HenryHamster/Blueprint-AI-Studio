@@ -44,6 +44,8 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -1131,6 +1133,7 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_at=None,
+        runtime_deadline_seconds=300,
     )
     script = compute_backends_module._build_gcp_startup_script(
         spec, artifact_upload_url="https://storage.example.com/upload"
@@ -1145,6 +1148,8 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     assert "curl --fail --silent --show-error" in script
     assert "python3 - " in script
     assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in script
+    assert "TTL_SECONDS=330" in script
+    assert "runtime_ttl" in script
     assert (
         f"timeout {compute_backends_module._GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS}"
         in script
@@ -1484,6 +1489,159 @@ async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_s
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
     assert "compute_rpc_diagnostic" not in job.polling_metadata
+
+
+@pytest.mark.asyncio
+async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypatch):
+    project = Project(name="Compute Runtime Deadline", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "runtime-deadline-job"
+
+        async def launch(self, spec):
+            await asyncio.sleep(0.05)
+            return ComputeLaunchResult(
+                external_id="runtime-deadline-job",
+                started_at=datetime.utcnow(),
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert terminate_reasons == []
+    assert job.started_at is not None
+    assert job.polling_metadata["runtime_deadline_at"] is not None
+    assert job.polling_metadata["runtime_deadline_seconds"] == 60
+
+    # Launch delay is no longer consumed by the runtime deadline: even if the
+    # prelaunch wall clock is now in the past, the running job stays alive until
+    # its launch-time runtime window expires.
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    await db_session.commit()
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert terminate_reasons == []
+
+    job.started_at = datetime.utcnow() - timedelta(seconds=61)
+    job.polling_metadata = {
+        **job.polling_metadata,
+        "runtime_deadline_at": (datetime.utcnow() - timedelta(seconds=1)).isoformat(),
+    }
+    await db_session.commit()
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert terminate_reasons == ["deadline"]
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "runtime deadline" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
+    db_session, monkeypatch
+):
+    project = Project(name="Compute Provisioning Timeout", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    job.wall_clock_deadline = datetime.utcnow() + timedelta(milliseconds=200)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+    launch_started = asyncio.Event()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "slow-launch-job"
+
+        async def launch(self, spec):
+            launch_started.set()
+            await asyncio.sleep(0.5)
+            return ComputeLaunchResult(
+                external_id="slow-launch-job",
+                started_at=datetime.utcnow(),
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    assert launch_started.is_set()
+
+    await db_session.refresh(job)
+    assert terminate_reasons == ["provisioning"]
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "provisioning" in (job.terminal_reason or "")
+    diagnostic = job.polling_metadata["compute_rpc_diagnostic"]
+    assert diagnostic["operation"] == "launch"
+    assert diagnostic["reason"] == "provisioning_timeout"
 
 
 @pytest.mark.asyncio
@@ -2028,6 +2186,168 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     assert len(jobs) == 1
 
 
+@pytest.mark.asyncio
+async def test_live_proof_compute_job_requires_promoted_release(db_session):
+    project = Project(name="Live Proof No Promotion", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo live",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            live_proof_marker="v8-live-proof",
+        )
+
+    assert exc.value.detail["reason"] == "no_promoted_release"
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_compute_job_ignores_unconfirmed_release(db_session):
+    project = Project(name="Ordinary Before Serving", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="unconfirmed",
+        )
+    )
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ordinary",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+    assert "live_release_evidence" not in job.polling_metadata
+
+
+@pytest.mark.asyncio
+async def test_live_proof_compute_job_records_serving_evidence_and_idempotency(
+    db_session,
+):
+    project = Project(name="Live Proof Serving", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    served_at = datetime.utcnow()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=7,
+        status="promoted",
+        promoted_sha="def456",
+        promoted_at=served_at,
+        serving_status="serving_confirmed",
+        served_sha="def456",
+        served_at=served_at,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="backend_revision",
+                serving_status="serving_confirmed",
+                served_identifier="def456",
+                served_at=served_at,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="agent_image",
+                serving_status="serving_confirmed",
+                served_identifier="def456",
+                served_at=served_at,
+            ),
+        ]
+    )
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ordinary = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    with pytest.raises(ValueError, match="already has an active compute job"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo proof",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            live_proof_marker="v8-live-proof",
+        )
+    ordinary.status = ComputeJobStatus.SUCCEEDED
+    db_session.add(ordinary)
+    await db_session.commit()
+
+    live = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        live_proof_marker="v8-live-proof",
+    )
+    reused = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        live_proof_marker="v8-live-proof",
+    )
+
+    evidence = reused.polling_metadata["live_release_evidence"]
+    assert live.id == reused.id
+    assert evidence["release_version_number"] == 7
+    assert evidence["promoted_sha"] == "def456"
+    assert evidence["aggregate_serving_status"] == "serving_confirmed"
+    assert {
+        artifact["artifact_kind"] for artifact in evidence["required_artifacts"]
+    } == {"backend_revision", "agent_image"}
+
+
 async def _make_compute_task(db_session):
     project = Project(name="GPU Compute Job", user_id="test-user")
     db_session.add(project)
@@ -2295,7 +2615,7 @@ async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypat
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-job-3"
     job.started_at = datetime.utcnow() - timedelta(seconds=60)
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.wall_clock_deadline = datetime.utcnow() + timedelta(seconds=60)
     db_session.add(job)
     await db_session.commit()
 
@@ -2333,7 +2653,7 @@ async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypat
     assert terminate_reasons == ["deadline"]
     assert job.status == ComputeJobStatus.TIMED_OUT
     assert job.outcome == ComputeJobOutcome.TIMED_OUT
-    assert "deadline" in (job.terminal_reason or "")
+    assert "runtime deadline" in (job.terminal_reason or "")
 
 
 @pytest.mark.asyncio
