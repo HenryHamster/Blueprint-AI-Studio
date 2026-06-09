@@ -139,14 +139,16 @@ See `.env.example` for the complete template with all variables.
 
 ## Task Types
 
-Blueprint supports 20 task types, each handled by a dedicated agent handler:
+Blueprint supports 26 task types, each handled by a dedicated agent handler:
 
 | Type | Description |
 |---|---|
 | `create` | Implement a new feature from a prompt |
 | `refactor` | Refactor existing code |
 | `review` | Review a PR and leave comments |
+| `panel_review` | Run a fixed multi-agent review workflow over a PR and persist a structured verdict |
 | `fix` | Fix issues identified in a review |
+| `verify_tests` | Clone a PR head, run the detected test suite, and post a pass/fail verdict |
 | `plan` | Generate an implementation plan |
 | `research` | Research a codebase area and produce findings |
 | `strategic_review` | Generate strategic directions based on research findings |
@@ -162,7 +164,11 @@ Blueprint supports 20 task types, each handled by a dedicated agent handler:
 | `investigate` | Open-ended investigation of an issue |
 | `self_audit` | Audit system maturity and recommend operating mode |
 | `release_audit` | Audit the release qualifier diff |
+| `release_audit_challenge` | Independently re-examine release-audit findings and emit structured verdicts |
 | `memo` | Produce a structured reasoning artifact without opening a PR |
+| `compute_experiment` | Launch a budgeted compute job and monitor it to a terminal state |
+| `web_research` | Web-first research that produces a cited knowledge document |
+| `design` | Codebase-grounded design work that produces a durable design document |
 
 ## Autonomous Research Mode
 
