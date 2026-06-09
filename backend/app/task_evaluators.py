@@ -129,6 +129,12 @@ CHALLENGE_AGREES = "agrees"
 CHALLENGE_DISAGREES = "disagrees"
 CHALLENGE_INDETERMINATE = "indeterminate"
 
+# Schema version stamped on every FindingChallengeRecord.  Increment when the
+# record shape changes in a way that would break a consumer expecting the old
+# layout.  Version 1 is the first versioned shape; legacy records (missing the
+# key) pre-date versioning and should be treated as version 0 by consumers.
+FINDING_CHALLENGE_RECORD_SCHEMA_VERSION = 1
+
 # ── Review second-opinion gate (default-on adversarial challenge) ──────────
 # Context key written on the spawned panel_review CHALLENGER task, pointing at
 # the ordinary ``review`` task whose verdict it challenges. ``_process_post_commit``
@@ -1376,6 +1382,13 @@ class FindingChallengeRecord:
     ambiguous second opinion never overturns the original verdict). ``reason`` is
     a human-readable justification; ``sidecar_task_id`` is the challenge task's
     id for observability and audit.
+
+    ``schema_version`` is the record schema version (always
+    ``FINDING_CHALLENGE_RECORD_SCHEMA_VERSION`` for newly created records; absent
+    on legacy records pre-dating versioning). ``source_task_id`` is the id of the
+    research task whose finding was challenged; ``produced_by`` identifies the
+    pipeline stage that created this record (always ``"challenge_sidecar"`` for
+    records created through the normal challenge path).
     """
 
     challenged_boundary: str
@@ -1384,6 +1397,9 @@ class FindingChallengeRecord:
     agreement: str
     reason: str
     sidecar_task_id: str | None
+    schema_version: int = FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    source_task_id: str | None = None
+    produced_by: str = "challenge_sidecar"
 
     def to_context(self) -> dict[str, Any]:
         """Plain-dict form for stamping under ``FINDING_CHALLENGE_VERDICT_KEY``."""
@@ -1394,6 +1410,9 @@ class FindingChallengeRecord:
             "agreement": self.agreement,
             "reason": self.reason,
             "sidecar_task_id": self.sidecar_task_id,
+            "schema_version": self.schema_version,
+            "source_task_id": self.source_task_id,
+            "produced_by": self.produced_by,
         }
 
 
@@ -1603,6 +1622,8 @@ def parse_finding_challenge_verdict(
     boundary: str,
     sidecar_task_id: str | None,
     completed: bool = True,
+    *,
+    source_task_id: str | None = None,
 ) -> FindingChallengeRecord:
     """Parse a challenge side-car's second opinion into a FindingChallengeRecord.
 
@@ -1611,6 +1632,9 @@ def parse_finding_challenge_verdict(
     ``agreement="indeterminate"`` with a recorded reason, so an unparseable or
     incomplete second opinion never overturns the original verdict. A parsed
     ``agreement`` outside the recognized set also collapses to indeterminate.
+
+    ``source_task_id`` is the id of the research task whose finding was
+    challenged; it is stamped onto the returned record for provenance.
     """
     if not completed:
         return FindingChallengeRecord(
@@ -1620,6 +1644,7 @@ def parse_finding_challenge_verdict(
             agreement=CHALLENGE_INDETERMINATE,
             reason="challenge side-car did not complete; verdict unchallenged",
             sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
         )
 
     text = (logs or "").strip()
@@ -1631,6 +1656,7 @@ def parse_finding_challenge_verdict(
             agreement=CHALLENGE_INDETERMINATE,
             reason="challenge side-car produced no output",
             sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
         )
 
     obj = _extract_verdict_object(text)
@@ -1642,6 +1668,7 @@ def parse_finding_challenge_verdict(
             agreement=CHALLENGE_INDETERMINATE,
             reason="challenge verdict unparseable; failing closed",
             sidecar_task_id=sidecar_task_id,
+            source_task_id=source_task_id,
         )
 
     second = str(obj.get("verdict") or "").strip()
@@ -1658,4 +1685,5 @@ def parse_finding_challenge_verdict(
         agreement=agreement,
         reason=reason or f"second opinion {agreement} with the {boundary} verdict",
         sidecar_task_id=sidecar_task_id,
+        source_task_id=source_task_id,
     )

@@ -3110,6 +3110,32 @@ class KnowledgeDocument(SQLModel, table=True):
     )
     head_sha: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
+    # Origin provenance for design/web_research documents spawned from research
+    # findings. Nullable so legacy rows remain readable; read paths derive the
+    # legacy/unknown state when older rows have no stamp.
+    origin_state: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_research_task_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_parent_research_task_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_finding_index: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    origin_finding_hash: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    origin_challenge_state: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    origin_challenge_record: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3144,6 +3170,9 @@ class KnowledgeDocument(SQLModel, table=True):
         ),
         Index("ix_knowledge_document_topic", "topic"),
         Index("ix_knowledge_document_direction", "direction_id"),
+        Index("ix_knowledge_document_origin_state", "origin_state"),
+        Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
+        Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
     )
 
 

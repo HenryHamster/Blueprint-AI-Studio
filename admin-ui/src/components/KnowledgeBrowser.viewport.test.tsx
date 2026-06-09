@@ -25,6 +25,22 @@ const sampleDocs = [
     created_at: '2026-06-01T00:00:00Z',
     updated_at: '2026-06-01T00:00:00Z',
     forward_quality_verdict: { passed: true, reason: 'Well-cited, actionable, verified against current docs.', strategy: 'forward_quality' },
+    origin_provenance: {
+      origin_state: 'research_finding',
+      challenge_state: 'overturned',
+      research_task_id: 'task-research-0000-1111-2222-3333-4444',
+      finding_index: 3,
+      finding_hash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef',
+      direction_id: 'd-1a2b3c4d',
+      finding_challenge: {
+        challenged_boundary: 'reproduces_on_head_with_a_very_long_boundary_label_for_overflow',
+        first_verdict: 'actionable',
+        second_opinion_verdict: 'not_actionable',
+        agreement: 'disagrees',
+        reason: 'The second reviewer could not reproduce the reported behaviour on HEAD after a careful end-to-end trace.',
+        sidecar_task_id: 'task-challenge-aaaa-bbbb-cccc-dddd-eeee',
+      },
+    },
   },
   {
     id: 'doc-4444-5555-6666-7777',
@@ -179,6 +195,40 @@ describe('KnowledgeBrowser — viewport regression', () => {
       'project-test',
       expect.objectContaining({ source_kind: 'design' }),
     );
+  });
+
+  test('selecting a challenge-state filter forwards challenge_state to fetchKnowledgeDocuments', async () => {
+    const mock = vi.mocked(fetchKnowledgeDocuments);
+    await renderList();
+    mock.mockClear();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const overturnedFilter = Array.from(buttons).find(
+      b => b.textContent?.trim() === 'Overturned' && b.hasAttribute('data-viewport-allow-small-target'),
+    );
+    expect(overturnedFilter).toBeTruthy();
+    if (!overturnedFilter) throw new Error('expected Overturned filter button');
+    await act(async () => { overturnedFilter.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    expect(mock).toHaveBeenCalledWith(
+      'project-test',
+      expect.objectContaining({ challenge_state: 'overturned' }),
+    );
+  });
+
+  test('detail view with finding-origin provenance renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderList();
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('Resilient connection pooling'),
+      );
+      if (docButton) {
+        await act(async () => { docButton.click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+    });
+    // The finding-origin block and its second-opinion record rendered in the detail view.
+    expect((host as HTMLDivElement).textContent).toContain('Finding origin');
+    expect((host as HTMLDivElement).textContent).toContain('Second opinion');
   });
 
   test('detail view renders provenance branch and sha when present', async () => {

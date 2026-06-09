@@ -114,6 +114,13 @@ async def query_findings_index(
 
     Bounded by ``days`` recency and ``limit`` total rows so prompt budgets are
     predictable.  Ordered newest-task-first, then by finding_index within task.
+
+    When a finding carries a ``finding_challenge`` dict (recorded by the
+    challenge side-car resolver), the returned row also includes a bounded
+    ``challenge_summary`` key with fields: ``challenged_boundary``,
+    ``agreement`` (one of ``"agrees"`` | ``"disagrees"`` | ``"indeterminate"``),
+    ``second_opinion_verdict``, and ``reason`` (truncated to 200 chars).
+    Unchallenged findings have no ``challenge_summary`` key.
     """
     since = _utcnow() - timedelta(days=days)
     stmt = (
@@ -146,30 +153,43 @@ async def query_findings_index(
         for idx, finding in enumerate(plan):
             if not isinstance(finding, dict):
                 continue
-            rows.append(
-                {
-                    "task_id": str(task.id),
-                    "direction_id": task_dir,
-                    "completed_at": task.created_at.isoformat()
-                    if task.created_at
-                    else None,
-                    "finding_index": idx,
-                    "finding_title": finding.get("title", ""),
-                    "finding_description": finding.get("description", ""),
-                    "actionability_grade": finding.get("actionability_grade", "MEDIUM"),
-                    "verification_basis": finding.get(
-                        "verification_basis", "pattern_inferred"
-                    ),
-                    "verification_basis_downgraded_from": finding.get(
-                        "verification_basis_downgraded_from"
-                    ),
-                    "verification_basis_downgrade_reason": finding.get(
-                        "verification_basis_downgrade_reason"
-                    ),
-                    "claims": finding.get("claims") or [],
-                    "sources": finding.get("sources") or [],
+            row: Dict[str, Any] = {
+                "task_id": str(task.id),
+                "direction_id": task_dir,
+                "completed_at": task.created_at.isoformat()
+                if task.created_at
+                else None,
+                "finding_index": idx,
+                "finding_title": finding.get("title", ""),
+                "finding_description": finding.get("description", ""),
+                "actionability_grade": finding.get("actionability_grade", "MEDIUM"),
+                "verification_basis": finding.get(
+                    "verification_basis", "pattern_inferred"
+                ),
+                "verification_basis_downgraded_from": finding.get(
+                    "verification_basis_downgraded_from"
+                ),
+                "verification_basis_downgrade_reason": finding.get(
+                    "verification_basis_downgrade_reason"
+                ),
+                "claims": finding.get("claims") or [],
+                "sources": finding.get("sources") or [],
+            }
+            challenge = finding.get("finding_challenge")
+            if isinstance(challenge, dict):
+                raw_agreement = str(challenge.get("agreement") or "").lower()
+                if raw_agreement in ("agrees", "disagrees"):
+                    agreement = raw_agreement
+                else:
+                    agreement = "indeterminate"
+                row["challenge_summary"] = {
+                    "challenged_boundary": challenge.get("challenged_boundary"),
+                    "agreement": agreement,
+                    "second_opinion_verdict": challenge.get("second_opinion_verdict")
+                    or challenge.get("verdict"),
+                    "reason": (str(challenge.get("reason") or challenge.get("reasoning") or ""))[:200],
                 }
-            )
+            rows.append(row)
             if len(rows) >= limit:
                 return rows
     return rows

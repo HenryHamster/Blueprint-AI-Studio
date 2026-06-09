@@ -578,6 +578,12 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     }
     parent_direction_id = (task.context or {}).get("direction_id")
     parent_research_task_id = (task.context or {}).get("research_task_id")
+    parent_parent_research_task_id = (task.context or {}).get(
+        "parent_research_task_id"
+    )
+    parent_finding_index = (task.context or {}).get("finding_index")
+    parent_finding_hash = (task.context or {}).get("finding_hash")
+    parent_finding_challenge = (task.context or {}).get("finding_challenge")
 
     # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
     # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
@@ -915,6 +921,26 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 **(
                     {"research_task_id": parent_research_task_id}
                     if parent_research_task_id
+                    else {}
+                ),
+                **(
+                    {"parent_research_task_id": parent_parent_research_task_id}
+                    if parent_parent_research_task_id
+                    else {}
+                ),
+                **(
+                    {"finding_index": parent_finding_index}
+                    if parent_finding_index is not None
+                    else {}
+                ),
+                **(
+                    {"finding_hash": parent_finding_hash}
+                    if parent_finding_hash
+                    else {}
+                ),
+                **(
+                    {"finding_challenge": parent_finding_challenge}
+                    if parent_finding_challenge
                     else {}
                 ),
                 **({"provides_capability": _child_provides} if _child_provides else {}),

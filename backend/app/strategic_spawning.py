@@ -63,6 +63,14 @@ from app.strategic_trigger import (
     strategic_refresh_origin,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -73,6 +81,51 @@ from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
+
+_CHALLENGE_BOUNDARY_BUCKETS = (
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+)
+_CHALLENGE_AGREEMENT_BUCKETS = (
+    CHALLENGE_AGREES,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
+
+
+def _empty_finding_challenge_summary() -> dict[str, Any]:
+    return {
+        "challenged_findings": 0,
+        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
+        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "fail_closed_unparseable": 0,
+    }
+
+
+def _positive_int(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    target["challenged_findings"] += _positive_int(source.get("challenged_findings"))
+    target["fail_closed_unparseable"] += _positive_int(
+        source.get("fail_closed_unparseable")
+    )
+    source_agreements = source.get("agreement_distribution") or {}
+    if isinstance(source_agreements, dict):
+        for key in _CHALLENGE_AGREEMENT_BUCKETS:
+            target["agreement_distribution"][key] += _positive_int(
+                source_agreements.get(key)
+            )
+    source_boundaries = source.get("boundary_distribution") or {}
+    if isinstance(source_boundaries, dict):
+        for key in _CHALLENGE_BOUNDARY_BUCKETS:
+            target["boundary_distribution"][key] += _positive_int(
+                source_boundaries.get(key)
+            )
 
 
 def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -3631,6 +3684,7 @@ async def _spawn_strategic_review(
             "pattern_inferred": 0,
             "deduced": 0,
         }
+        _agg_challenge = _empty_finding_challenge_summary()
         for h in recent_history:
             for desc in h.get("key_finding_descriptions") or []:
                 if desc and desc not in recent_findings:
@@ -3644,6 +3698,9 @@ async def _spawn_strategic_review(
             for _bk, _bv in (h.get("verification_basis_distribution") or {}).items():
                 if _bk in _agg_basis:
                     _agg_basis[_bk] = _agg_basis.get(_bk, 0) + int(_bv or 0)
+            _merge_finding_challenge_summary(
+                _agg_challenge, h.get("finding_challenge_summary")
+            )
         total_prs = total_merged + total_rejected
         operator_rejection_rate = (
             round(total_rejected / total_prs, 2) if total_prs > 0 else None
@@ -3732,6 +3789,8 @@ async def _spawn_strategic_review(
             stat_entry["recent_findings_grade_distribution"] = _agg_grade
         if any(_agg_basis.values()):
             stat_entry["recent_findings_verification_basis"] = _agg_basis
+        if _agg_challenge["challenged_findings"] > 0:
+            stat_entry["recent_findings_challenge_summary"] = _agg_challenge
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
         # Surface cumulative confirmed-finding count and trend from

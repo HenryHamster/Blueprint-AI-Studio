@@ -126,7 +126,7 @@ export function resolveHandler(
     reason:
       `Unknown task type "${taskType}" with no generic runner for run_shape=${contract.run_shape}, ` +
       `agent_mode=${contract.agent_mode}, output_kind=${contract.output_kind}. ` +
-      `Generic dispatch supports single_agent read_only→knowledge/none/verdict ` +
+      `Generic dispatch supports single_agent read_only→knowledge/none ` +
       `and workflow write→pr. Bespoke handlers: ${supported}`,
   };
 }

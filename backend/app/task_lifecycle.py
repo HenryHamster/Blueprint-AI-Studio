@@ -810,19 +810,20 @@ async def _resolve_finding_challenge_completion(
     cctx = challenge.context or {}
     boundary = str(cctx.get("challenged_boundary") or "")
     first_verdict = str(cctx.get("challenged_first_verdict") or "")
+    source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
     record = parse_finding_challenge_verdict(
         challenge_logs,
         first_verdict,
         boundary,
         str(challenge.id),
         completed=completed,
+        source_task_id=str(source_id) if source_id else None,
     )
     challenge.latest_status_message = (
         f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
     )[:500]
     session.add(challenge)
 
-    source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
     try:
         source_uuid = uuid.UUID(str(source_id))
     except (ValueError, TypeError):

@@ -162,9 +162,7 @@ async def _make_web_research_task(db_session, *, project_name="WR", context=None
         project_id=project.id,
         title="Web Research: X",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {"type": "web_research", "topic": "X", "base_branch": "main"}
-        ],
+        payloads=[{"type": "web_research", "topic": "X", "base_branch": "main"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     if context is not None:
@@ -485,9 +483,7 @@ async def test_on_topic_document_passes_acceptance_probe(db_session, _quiet_broa
 async def test_thin_topic_signal_errs_toward_acceptance(db_session, _quiet_broadcast):
     """When the requested topic carries too little signal (few content keywords)
     the probe cannot judge and accepts — uncertainty errs toward acceptance."""
-    project, task = await _make_topic_task(
-        db_session, "X", project_name="WRthin"
-    )
+    project, task = await _make_topic_task(db_session, "X", project_name="WRthin")
 
     document = {
         "title": "A guide to organic vegetable gardening",
@@ -560,9 +556,7 @@ async def _make_design_task(db_session, *, project_name="DSGN"):
 
 
 @pytest.mark.asyncio
-async def test_web_research_completion_sets_source_kind(
-    db_session, _quiet_broadcast
-):
+async def test_web_research_completion_sets_source_kind(db_session, _quiet_broadcast):
     """A persisted web_research document records source_kind == 'web_research'."""
     project, task = await _make_web_research_task(db_session, project_name="WRkind")
 
@@ -765,7 +759,9 @@ async def test_compute_fallback_stamps_grounding_when_artifact_resolves(
         task_id=task.id,
         artifact_type=ArtifactType.COMPUTE_RESULT,
         storage_uri="gs://bucket/jobs/real-job/",
-        logs=_json.dumps({"artifact_uri": "gs://bucket/jobs/real-job/", "file_count": 3}),
+        logs=_json.dumps(
+            {"artifact_uri": "gs://bucket/jobs/real-job/", "file_count": 3}
+        ),
     )
     db_session.add(artifact)
     await db_session.commit()
@@ -866,7 +862,9 @@ async def test_compute_persist_attaches_grounding_probe_to_verdict(
         },
     }
 
-    doc = await _persist_compute_knowledge_document(task, document, "fallback", db_session)
+    doc = await _persist_compute_knowledge_document(
+        task, document, "fallback", db_session
+    )
 
     verdict = doc.forward_quality_verdict
     grounding = verdict["probes"]["grounding"]
@@ -1020,9 +1018,7 @@ async def test_design_completion_also_delivers(db_session, _quiet_broadcast):
 
 
 @pytest.mark.asyncio
-async def test_design_all_file_citations_resolve_passes(
-    db_session, _quiet_broadcast
-):
+async def test_design_all_file_citations_resolve_passes(db_session, _quiet_broadcast):
     """A design doc whose file citations ALL resolve to real paths is grounded:
     the probe accepts and persists exactly one KnowledgeDocument."""
     project, task = await _make_design_task(db_session, project_name="DSGNgrounded")
@@ -1034,9 +1030,7 @@ async def test_design_all_file_citations_resolve_passes(
         "citations": ["backend/app/models.py", "file:backend/app/reaper.py"],
         "tags": ["design"],
         "topic": "X",
-        "_citation_grounding": {
-            "file_citations": 2, "grounded": 2, "checked": True
-        },
+        "_citation_grounding": {"file_citations": 2, "grounded": 2, "checked": True},
     }
     await _handle_design_completion(task, json.dumps(document), db_session)
 
@@ -1061,9 +1055,7 @@ async def test_design_ungrounded_citations_fail_with_distinct_reason(
         "citations": ["backend/app/made_up.py", "file:agent/src/hallucinated.ts"],
         "tags": ["design"],
         "topic": "X",
-        "_citation_grounding": {
-            "file_citations": 2, "grounded": 0, "checked": True
-        },
+        "_citation_grounding": {"file_citations": 2, "grounded": 0, "checked": True},
     }
     await _handle_design_completion(task, json.dumps(document), db_session)
 
@@ -1096,9 +1088,7 @@ async def test_design_mix_of_real_and_proposed_paths_passes(
         ],
         "tags": ["design"],
         "topic": "X",
-        "_citation_grounding": {
-            "file_citations": 3, "grounded": 1, "checked": True
-        },
+        "_citation_grounding": {"file_citations": 3, "grounded": 1, "checked": True},
     }
     await _handle_design_completion(task, json.dumps(document), db_session)
 
@@ -1136,9 +1126,7 @@ async def test_web_research_all_urls_dead_fails_with_url_reason(
         "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
         "citations": ["https://example.com/dead-one", "https://example.com/dead-two"],
         "tags": ["quantum"],
-        "_citation_grounding": {
-            "file_citations": 2, "grounded": 0, "checked": True
-        },
+        "_citation_grounding": {"file_citations": 2, "grounded": 0, "checked": True},
     }
     await _handle_web_research_completion(task, json.dumps(document), db_session)
 
@@ -1167,9 +1155,7 @@ async def test_web_research_one_url_reachable_passes(db_session, _quiet_broadcas
         "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
         "citations": ["https://example.com/live", "https://example.com/dead"],
         "tags": ["quantum"],
-        "_citation_grounding": {
-            "file_citations": 2, "grounded": 1, "checked": True
-        },
+        "_citation_grounding": {"file_citations": 2, "grounded": 1, "checked": True},
     }
     await _handle_web_research_completion(task, json.dumps(document), db_session)
 
@@ -1196,9 +1182,7 @@ async def test_web_research_unchecked_grounding_stamp_passes(
         "citations": ["https://example.com/qec"],
         "tags": ["quantum"],
         # checked is falsy → stamp ignored even though grounded is 0.
-        "_citation_grounding": {
-            "file_citations": 1, "grounded": 0, "checked": False
-        },
+        "_citation_grounding": {"file_citations": 1, "grounded": 0, "checked": False},
     }
     await _handle_web_research_completion(task, json.dumps(document), db_session)
 
@@ -1386,7 +1370,10 @@ async def test_off_topic_design_probe_detail_records_failed_topic_flag(
         "tags": ["gardening"],
         "topic": "gardening",
         "_citation_grounding": {
-            "file_citations": 1, "grounded": 1, "checked": True, "unresolved": []
+            "file_citations": 1,
+            "grounded": 1,
+            "checked": True,
+            "unresolved": [],
         },
     }
     await _handle_design_completion(task, json.dumps(document), db_session)
@@ -1428,9 +1415,7 @@ def _well_formed_document() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_grader_enabled_escalates_and_parks(
-    db_session, _quiet_broadcast, mocker
-):
+async def test_grader_enabled_escalates_and_parks(db_session, _quiet_broadcast, mocker):
     """With the grader flag ON, a valid cited document does NOT persist on the
     first pass: the task parks EVALUATING behind exactly one independent grader,
     the parsed document is stashed in context, and no KnowledgeDocument yet."""
@@ -1533,7 +1518,9 @@ async def test_grader_fail_marks_failed_and_persists_no_document(
 ):
     """RESUME pass with a FAIL verdict marks the source FAILED and persists no
     document — a failing independent grade never completes clean."""
-    project, task = await _make_web_research_task(db_session, project_name="WRfailgrade")
+    project, task = await _make_web_research_task(
+        db_session, project_name="WRfailgrade"
+    )
 
     document = _well_formed_document()
     ctx = dict(task.context or {})
@@ -1644,12 +1631,10 @@ async def test_grader_resume_reconstructs_document_from_stash_body_intact(
 
 
 @pytest.mark.asyncio
-async def test_direction_id_persisted_from_task_context(
-    db_session, _quiet_broadcast
-):
+async def test_direction_id_persisted_from_task_context(db_session, _quiet_broadcast):
     """A direction-tagged web_research task records its direction on the
     persisted document and mirrors it into plan_output."""
-    project, task = await _make_web_research_task(
+    _project, task = await _make_web_research_task(
         db_session, project_name="WRdir", context={"direction_id": "d-abc123"}
     )
 
@@ -1679,13 +1664,9 @@ async def test_direction_id_persisted_from_task_context(
 
 
 @pytest.mark.asyncio
-async def test_direction_id_null_when_context_lacks_it(
-    db_session, _quiet_broadcast
-):
+async def test_direction_id_null_when_context_lacks_it(db_session, _quiet_broadcast):
     """A web_research task with no direction in context persists a null direction."""
-    project, task = await _make_web_research_task(
-        db_session, project_name="WRnodir"
-    )
+    project, task = await _make_web_research_task(db_session, project_name="WRnodir")
 
     document = {
         "title": "T",
@@ -1760,9 +1741,7 @@ async def test_list_is_project_scoped(client: AsyncClient, db_session):
     await _seed_doc(db_session, proj_a.id, task_a.id, title="Alpha doc in A")
     await _seed_doc(db_session, proj_b.id, task_b.id, title="Beta doc in B")
 
-    resp = await client.get(
-        f"/api/admin/projects/{proj_a.id}/knowledge-documents"
-    )
+    resp = await client.get(f"/api/admin/projects/{proj_a.id}/knowledge-documents")
     assert resp.status_code == 200
     body = resp.json()
     assert body["total"] == 1
@@ -1856,9 +1835,7 @@ async def test_direction_filter_and_serialization(client: AsyncClient, db_sessio
 
 
 @pytest.mark.asyncio
-async def test_list_and_get_serialize_source_kind(
-    client: AsyncClient, db_session
-):
+async def test_list_and_get_serialize_source_kind(client: AsyncClient, db_session):
     """Both the list and get-by-id endpoints return the source_kind field."""
     proj = await _seed_project_with_membership(db_session, "KDkindserial")
     task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
@@ -1870,9 +1847,7 @@ async def test_list_and_get_serialize_source_kind(
         db_session, proj.id, task.id, title="Design doc", source_kind="design"
     )
 
-    listed = await client.get(
-        f"/api/admin/projects/{proj.id}/knowledge-documents"
-    )
+    listed = await client.get(f"/api/admin/projects/{proj.id}/knowledge-documents")
     assert listed.status_code == 200
     docs = listed.json()["documents"]
     assert len(docs) == 1
@@ -2022,6 +1997,198 @@ async def test_persist_document_provenance_absent_stores_null(
     assert doc.head_sha is None
 
 
+@pytest.mark.asyncio
+async def test_knowledge_document_persists_finding_challenge_origin(
+    db_session, _quiet_broadcast
+):
+    """A challenged research-spawned knowledge task persists durable origin."""
+    research_task_id = str(uuid.uuid4())
+    project, task = await _make_web_research_task(
+        db_session,
+        project_name="WRchallengeorigin",
+        context={
+            "research_task_id": research_task_id,
+            "parent_research_task_id": research_task_id,
+            "finding_index": 3,
+            "finding_hash": "finding-hash-abc123",
+            "direction_id": "d-origin123",
+            "finding_challenge": {
+                "challenged_boundary": "reproduce_absent",
+                "first_verdict": "absent",
+                "second_opinion_verdict": "present",
+                "agreement": "disagrees",
+                "reason": "The cited behavior moved but still reproduces.",
+                "sidecar_task_id": "sidecar-1",
+                "unbounded_extra": "not persisted",
+            },
+        },
+    )
+    document = {
+        "title": "Origin challenge doc",
+        "summary": "Challenge-aware origin capture.",
+        "body": "# Body\n\nOrigin details.",
+        "citations": ["https://example.com/origin"],
+        "tags": ["origin"],
+        "topic": "origin",
+    }
+
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.origin_state == "research_finding"
+    assert doc.origin_research_task_id == research_task_id
+    assert doc.origin_parent_research_task_id == research_task_id
+    assert doc.origin_finding_index == 3
+    assert doc.origin_finding_hash == "finding-hash-abc123"
+    assert doc.direction_id == "d-origin123"
+    assert doc.origin_challenge_state == "overturned"
+    assert doc.origin_challenge_record == {
+        "challenged_boundary": "reproduce_absent",
+        "first_verdict": "absent",
+        "second_opinion_verdict": "present",
+        "agreement": "disagrees",
+        "reason": "The cited behavior moved but still reproduces.",
+        "sidecar_task_id": "sidecar-1",
+    }
+
+    await db_session.refresh(task)
+    mirror = task.plan_output["knowledge_document"]["origin_provenance"]
+    assert mirror["origin_state"] == "research_finding"
+    assert mirror["finding_hash"] == "finding-hash-abc123"
+    assert mirror["challenge_state"] == "overturned"
+
+
+@pytest.mark.asyncio
+async def test_origin_provenance_legacy_null_serialization(
+    client: AsyncClient, db_session
+):
+    """Legacy knowledge rows with NULL origin columns remain readable."""
+    proj = await _seed_project_with_membership(db_session, "KDoriginlegacy")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await _seed_doc(
+        db_session, proj.id, task.id, title="Legacy design", source_kind="design"
+    )
+
+    listed = await client.get(f"/api/admin/projects/{proj.id}/knowledge-documents")
+    assert listed.status_code == 200
+    origin = listed.json()["documents"][0]["origin_provenance"]
+    assert origin["origin_state"] == "legacy_unknown"
+    assert origin["challenge_state"] == "legacy_unknown"
+    assert origin["finding_hash"] is None
+
+    detail = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents/{doc.id}"
+    )
+    assert detail.status_code == 200
+    assert detail.json()["origin_provenance"] == origin
+
+
+@pytest.mark.asyncio
+async def test_origin_provenance_unknown_null_serialization(
+    client: AsyncClient, db_session
+):
+    """Rows with source_kind='unknown' and NULL origin columns stay legacy."""
+    proj = await _seed_project_with_membership(db_session, "KDoriginunknown")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await _seed_doc(
+        db_session, proj.id, task.id, title="Legacy unknown", source_kind="unknown"
+    )
+
+    listed = await client.get(f"/api/admin/projects/{proj.id}/knowledge-documents")
+    assert listed.status_code == 200
+    origin = listed.json()["documents"][0]["origin_provenance"]
+    assert origin["origin_state"] == "legacy_unknown"
+    assert origin["challenge_state"] == "legacy_unknown"
+
+    legacy = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"origin_state": "legacy_unknown"},
+    )
+    assert legacy.status_code == 200
+    assert legacy.json()["total"] == 1
+    assert legacy.json()["documents"][0]["id"] == str(doc.id)
+
+    challenge = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"challenge_state": "legacy_unknown"},
+    )
+    assert challenge.status_code == 200
+    assert challenge.json()["total"] == 1
+    assert challenge.json()["documents"][0]["id"] == str(doc.id)
+
+    non_derived = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"origin_state": "not_research_finding_derived"},
+    )
+    assert non_derived.status_code == 200
+    assert non_derived.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_origin_challenge_and_finding_hash(
+    client: AsyncClient, db_session
+):
+    """Origin/challenge/finding-hash filters are applied by the shared API."""
+    proj = await _seed_project_with_membership(db_session, "KDoriginfilters")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _seed_doc(
+        db_session,
+        proj.id,
+        task.id,
+        title="Overturned origin",
+        origin_state="research_finding",
+        origin_challenge_state="overturned",
+        origin_finding_hash="fh-overturned",
+    )
+    await _seed_doc(
+        db_session,
+        proj.id,
+        task.id,
+        title="Unchallenged origin",
+        origin_state="research_finding",
+        origin_challenge_state="unchallenged",
+        origin_finding_hash="fh-unchallenged",
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={
+            "origin_state": "research_finding",
+            "challenge_state": "overturned",
+            "finding_hash": "fh-overturned",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["documents"][0]["title"] == "Overturned origin"
+    assert body["documents"][0]["origin_provenance"]["finding_hash"] == (
+        "fh-overturned"
+    )
+
+
 # ── build_knowledge_index: compact, bounded, scoped index ────────────────────
 
 
@@ -2087,10 +2254,13 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "origin_provenance",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
     assert entry["compute_acceptance_grade"] is None  # non-compute doc
+    assert entry["origin_provenance"]["origin_state"] == "legacy_unknown"
+    assert entry["origin_provenance"]["challenge_state"] == "legacy_unknown"
     assert entry["title"] == "Doc A"
     assert entry["summary"] == "Summary A"
     assert entry["topic"] == "auth"

@@ -1,7 +1,6 @@
 """Activity feed endpoint: recent system events in reverse chronological order."""
 
 import uuid
-import json
 import logging
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
@@ -23,6 +22,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _user_project_ids
 from app.failure_classification import classify_failure, classify_failure_taxonomy
+from app.research_completion import resolve_research_findings_for_surface
 
 logger = logging.getLogger(__name__)
 
@@ -31,23 +31,6 @@ router = APIRouter(
     tags=["admin-activity"],
     dependencies=[Depends(get_current_user)],
 )
-
-
-def _count_research_findings(logs: str | None) -> int:
-    """Parse research findings artifact logs and return finding count."""
-    if not logs:
-        return 0
-    try:
-        parsed = json.loads(logs[:100000])
-        if isinstance(parsed, list):
-            return len(parsed)
-        if isinstance(parsed, dict):
-            inner = parsed.get("logs", [])
-            if isinstance(inner, list):
-                return len(inner)
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    return 0
 
 
 @router.get("/activity")
@@ -89,6 +72,7 @@ async def get_activity(
                 Task.started_at,
                 Task.context,
                 Task.latest_status_message,
+                Task.plan_output,
             )
         )
         .order_by(Task.created_at.desc())
@@ -139,7 +123,7 @@ async def get_activity(
             elif a.artifact_type == ArtifactType.RESEARCH_FINDINGS:
                 research_artifact_map[tid] = {
                     "artifact_created_at": a.created_at,
-                    "finding_count": _count_research_findings(a.logs),
+                    "artifact_logs": a.logs[:100000] if a.logs else None,
                 }
             elif a.artifact_type == ArtifactType.INVESTIGATION_REPORT and a.logs:
                 investigation_report_map[tid] = a.logs[:2000]
@@ -248,7 +232,12 @@ async def get_activity(
                     "repo_url": None,
                     "commit_hash": None,
                     "error_summary": None,
-                    "finding_count": ra["finding_count"],
+                    "finding_count": len(
+                        resolve_research_findings_for_surface(
+                            t.plan_output, ra.get("artifact_logs")
+                        )
+                        or []
+                    ),
                     "investigation_summary": investigation_report_map.get(tid),
                     "deploy_sha": None,
                     "deploy_status": None,

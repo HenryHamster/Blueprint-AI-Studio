@@ -863,3 +863,108 @@ def test_parse_finding_challenge_unknown_agreement_collapses_to_indeterminate():
         logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "s5"
     )
     assert rec.agreement == "indeterminate"
+
+
+# ── FindingChallengeRecord: schema version and provenance ────────────────────
+
+
+def test_finding_challenge_record_schema_version_default():
+    """Newly constructed records carry schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        FindingChallengeRecord,
+    )
+
+    rec = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="code was renamed",
+        sidecar_task_id="sc-1",
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.schema_version == 1
+    assert rec.source_task_id is None
+    assert rec.produced_by == "challenge_sidecar"
+
+
+def test_finding_challenge_record_to_context_includes_version_and_provenance():
+    """to_context() emits schema_version, source_task_id, and produced_by."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        FindingChallengeRecord,
+    )
+
+    rec = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="code was renamed",
+        sidecar_task_id="sc-1",
+        source_task_id="src-task-abc",
+    )
+    ctx = rec.to_context()
+    assert ctx["schema_version"] == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert ctx["source_task_id"] == "src-task-abc"
+    assert ctx["produced_by"] == "challenge_sidecar"
+    # Existing fields preserved.
+    assert ctx["challenged_boundary"] == CHALLENGE_BOUNDARY_REPRODUCE_ABSENT
+    assert ctx["first_verdict"] == "absent"
+    assert ctx["agreement"] == "disagrees"
+    assert ctx["sidecar_task_id"] == "sc-1"
+
+
+def test_parse_finding_challenge_stamps_versioned_record():
+    """parse_finding_challenge_verdict stamps schema_version and source_task_id
+    on a successfully parsed (merged) record so downstream consumers can
+    distinguish versioned first-class output from legacy fallback records."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = (
+        'I checked git log; foo() moved to bar.py.\n'
+        '{"verdict": "present", "agreement": "disagrees", '
+        '"reasoning": "code was renamed, not deleted"}'
+    )
+    rec = parse_finding_challenge_verdict(
+        logs,
+        "absent",
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        "sidecar-99",
+        completed=True,
+        source_task_id="research-task-xyz",
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id == "research-task-xyz"
+    assert rec.produced_by == "challenge_sidecar"
+    assert rec.agreement == "disagrees"
+    # Verify to_context() carries the versioned fields through.
+    ctx = rec.to_context()
+    assert ctx["schema_version"] == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert ctx["source_task_id"] == "research-task-xyz"
+    assert ctx["produced_by"] == "challenge_sidecar"
+
+
+def test_parse_finding_challenge_backward_compat_no_source_task_id():
+    """Callers that omit source_task_id still produce a valid versioned record
+    with source_task_id=None — existing call sites are unaffected."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "actionable", "agreement": "disagrees", "reasoning": "finding is specific"}'
+    rec = parse_finding_challenge_verdict(
+        logs, "LOW", CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY, "sc-legacy"
+    )
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id is None
+    assert rec.produced_by == "challenge_sidecar"

@@ -257,11 +257,24 @@ describe('contract-driven generic dispatch', () => {
     });
   });
 
-  it('treats output_kind in {none, verdict} as generic knowledge too', () => {
-    for (const output_kind of ['none', 'verdict']) {
-      const task = { task_capability: { ...knowledgeContract, output_kind } };
-      const resolution = resolveHandler('probe_' + output_kind, task, { type: 'probe_' + output_kind, prompt: 'x' });
-      expect(resolution.handler, `output_kind=${output_kind} should route to generic knowledge`).toBe(handlers.investigate);
+  it('treats output_kind=none as generic knowledge too', () => {
+    const task = { task_capability: { ...knowledgeContract, output_kind: 'none' } };
+    const resolution = resolveHandler('probe_none', task, { type: 'probe_none', prompt: 'x' });
+    expect(resolution.handler, 'output_kind=none should route to generic knowledge').toBe(handlers.investigate);
+  });
+
+  it('rejects_generic_read_only_verdict_without_explicit_runner', () => {
+    const task = { task_capability: { ...knowledgeContract, output_kind: 'verdict' } };
+    const resolution = resolveHandler('merge_test_verdict_probe', task, {
+      type: 'merge_test_verdict_probe',
+      prompt: 'produce a real merge-test verdict',
+    });
+    expect(resolution.handler).toBeNull();
+    if (resolution.handler === null) {
+      expect(resolution.dispatch).toBe('none');
+      expect(resolution.reason).toContain('merge_test_verdict_probe');
+      expect(resolution.reason).toContain('output_kind=verdict');
+      expect(resolution.reason).toContain('Generic dispatch supports single_agent read_only→knowledge/none');
     }
   });
 
@@ -272,6 +285,16 @@ describe('contract-driven generic dispatch', () => {
     const resolution = resolveHandler('create', task, { type: 'create', prompt: 'x' });
     expect(resolution.dispatch).toBe('bespoke');
     expect(resolution.handler).toBe(handlers.create);
+  });
+
+  it('a BESPOKE verdict handler still wins over a verdict contract', () => {
+    const task = { task_capability: { ...knowledgeContract, id: 'verify_tests', output_kind: 'verdict' } };
+    const resolution = resolveHandler('verify_tests', task, {
+      type: 'verify_tests',
+      prompt: 'produce a real merge-test verdict',
+    });
+    expect(resolution.dispatch).toBe('bespoke');
+    expect(resolution.handler).toBe(handlers.verify_tests);
   });
 
   it('fails LOUDLY (clear message, no silent wrong work) for a run-shape with no generic runner yet', () => {

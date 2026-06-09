@@ -200,3 +200,130 @@ class TestQueryFindingsIndexSmoke:
         assert rows[0]["verification_basis_downgrade_reason"] == (
             "HEAD validation failed: 2 broken source refs, 1 ungrounded claim"
         )
+
+    @pytest.mark.asyncio
+    async def test_query_findings_index_includes_bounded_finding_challenge(self):
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        task = MagicMock()
+        task.id = "t-ch1"
+        task.status = TaskStatus.COMPLETED
+        task.context = {"direction_id": "d-ch"}
+        task.created_at = None
+        task.first_payload = {"type": "research"}
+        task.plan_output = [
+            {
+                "title": "Challenged Finding",
+                "description": "desc",
+                "actionability_grade": "HIGH",
+                "finding_challenge": {
+                    "challenged_boundary": "actionability",
+                    "agreement": "agrees",
+                    "second_opinion_verdict": "CONFIRMED",
+                    "reason": "The challenger independently verified the finding and agrees it is actionable.",
+                },
+            }
+        ]
+
+        session = self._mock_session([task])
+        rows = await query_findings_index(session, "proj-ch")
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert "challenge_summary" in row
+        cs = row["challenge_summary"]
+        assert cs["challenged_boundary"] == "actionability"
+        assert cs["agreement"] == "agrees"
+        assert cs["second_opinion_verdict"] == "CONFIRMED"
+        assert "challenger independently verified" in cs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_challenge_summary_omitted_when_absent(self):
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        task = MagicMock()
+        task.id = "t-no-ch"
+        task.status = TaskStatus.COMPLETED
+        task.context = {"direction_id": "d-no-ch"}
+        task.created_at = None
+        task.first_payload = {"type": "research"}
+        task.plan_output = [
+            {"title": "Unchallenged Finding", "description": "desc", "actionability_grade": "MEDIUM"}
+        ]
+
+        session = self._mock_session([task])
+        rows = await query_findings_index(session, "proj-no-ch")
+
+        assert len(rows) == 1
+        assert "challenge_summary" not in rows[0]
+
+    @pytest.mark.asyncio
+    async def test_challenge_summary_agreement_values(self):
+        """Verify agrees/disagrees/indeterminate normalization."""
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        def _make_task(task_id, agreement_val):
+            t = MagicMock()
+            t.id = task_id
+            t.status = TaskStatus.COMPLETED
+            t.context = {"direction_id": "d-agr"}
+            t.created_at = None
+            t.first_payload = {"type": "research"}
+            t.plan_output = [
+                {
+                    "title": "F",
+                    "description": "d",
+                    "actionability_grade": "MEDIUM",
+                    "finding_challenge": {"agreement": agreement_val, "reason": "r"},
+                }
+            ]
+            return t
+
+        for val, expected in [
+            ("agrees", "agrees"),
+            ("disagrees", "disagrees"),
+            ("AGREES", "agrees"),
+            ("DISAGREES", "disagrees"),
+            ("unknown", "indeterminate"),
+            ("", "indeterminate"),
+            (None, "indeterminate"),
+        ]:
+            task = _make_task(f"t-agr-{val}", val)
+            session = self._mock_session([task])
+            rows = await query_findings_index(session, "proj-agr")
+            assert len(rows) == 1
+            cs = rows[0]["challenge_summary"]
+            assert cs["agreement"] == expected, f"agreement={val!r} → expected {expected!r}, got {cs['agreement']!r}"
+
+    @pytest.mark.asyncio
+    async def test_challenge_reason_truncated_to_200_chars(self):
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        long_reason = "x" * 300
+
+        task = MagicMock()
+        task.id = "t-trunc"
+        task.status = TaskStatus.COMPLETED
+        task.context = {"direction_id": "d-trunc"}
+        task.created_at = None
+        task.first_payload = {"type": "research"}
+        task.plan_output = [
+            {
+                "title": "F",
+                "description": "d",
+                "actionability_grade": "MEDIUM",
+                "finding_challenge": {
+                    "agreement": "disagrees",
+                    "reason": long_reason,
+                },
+            }
+        ]
+
+        session = self._mock_session([task])
+        rows = await query_findings_index(session, "proj-trunc")
+        assert len(rows) == 1
+        assert len(rows[0]["challenge_summary"]["reason"]) == 200

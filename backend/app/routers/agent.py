@@ -3506,11 +3506,15 @@ async def get_agent_artifact_download_url(
         raise HTTPException(status_code=404, detail="Task not found")
 
     delivered = (task.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
-    allowed_ids = {
-        str(p.get("artifact_id"))
-        for p in delivered
-        if isinstance(p, dict) and p.get("artifact_id")
-    } if isinstance(delivered, list) else set()
+    allowed_ids = (
+        {
+            str(p.get("artifact_id"))
+            for p in delivered
+            if isinstance(p, dict) and p.get("artifact_id")
+        }
+        if isinstance(delivered, list)
+        else set()
+    )
     if str(artifact_id) not in allowed_ids:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
@@ -4378,6 +4382,15 @@ async def agent_list_knowledge_documents(
     source_kind: str | None = Query(
         default=None, description="Exact source_kind filter"
     ),
+    origin_state: str | None = Query(
+        default=None, description="Exact origin provenance state filter"
+    ),
+    challenge_state: str | None = Query(
+        default=None, description="Exact origin challenge state filter"
+    ),
+    finding_hash: str | None = Query(
+        default=None, description="Exact originating research finding hash filter"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -4402,6 +4415,9 @@ async def agent_list_knowledge_documents(
         tag=tag,
         direction=direction,
         source_kind=source_kind,
+        origin_state=origin_state,
+        challenge_state=challenge_state,
+        finding_hash=finding_hash,
         limit=limit,
         offset=offset,
     )

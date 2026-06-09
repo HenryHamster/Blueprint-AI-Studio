@@ -50,6 +50,14 @@ from app.strategic_spawning import (
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 
 
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
@@ -595,6 +603,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "origin_provenance",
     }
 
 
@@ -780,6 +789,100 @@ async def test_success_evidence_present_in_direction_stats(db_session):
     assert d_stat["retirement_condition"] == "retire when X happens", (
         "retirement_condition should be stripped and surfaced"
     )
+
+
+@pytest.mark.asyncio
+async def test_recent_challenge_summary_present_in_direction_stats(db_session):
+    """Strategic direction stats include bounded recent challenge telemetry."""
+    old_summary = {
+        "challenged_findings": 99,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 99,
+            CHALLENGE_DISAGREES: 99,
+            CHALLENGE_INDETERMINATE: 99,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 99,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 99,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 99,
+        },
+        "fail_closed_unparseable": 99,
+    }
+    recent_summary = {
+        "challenged_findings": 2,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 1,
+            CHALLENGE_DISAGREES: 0,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 0,
+        },
+        "fail_closed_unparseable": 1,
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-challenge",
+                "status": "active",
+                "text": "Direction with challenge telemetry",
+                "priority": "medium",
+                "research_history": [
+                    {"finding_challenge_summary": old_summary},
+                    {},
+                    {"finding_challenge_summary": recent_summary},
+                    {},
+                    {},
+                    {
+                        "finding_challenge_summary": {
+                            "challenged_findings": 1,
+                            "agreement_distribution": {
+                                CHALLENGE_AGREES: 0,
+                                CHALLENGE_DISAGREES: 1,
+                                CHALLENGE_INDETERMINATE: 0,
+                            },
+                            "boundary_distribution": {
+                                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 0,
+                                CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 0,
+                                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+                            },
+                            "fail_closed_unparseable": 0,
+                        }
+                    },
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-challenge"
+    )
+    assert d_stat["recent_findings_challenge_summary"] == {
+        "challenged_findings": 3,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 1,
+            CHALLENGE_DISAGREES: 1,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+        },
+        "fail_closed_unparseable": 1,
+    }
 
 
 @pytest.mark.asyncio

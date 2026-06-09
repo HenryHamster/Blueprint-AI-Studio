@@ -83,6 +83,7 @@ from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
 )
+from app.research_completion import resolve_research_findings_for_surface
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
@@ -268,7 +269,7 @@ async def get_all_tasks(
     artifacts_map: Dict[str, List[Dict[str, Any]]] = {}
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
-    research_map: Dict[str, str] = {}
+    research_artifact_logs_map: Dict[str, str] = {}
     merge_test_map: Dict[str, Dict[str, Any]] = {}
     commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
@@ -337,16 +338,7 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[tid] = a.logs[:2000]
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                try:
-                    parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
-                    if isinstance(parsed, list):
-                        research_map[tid] = parsed
-                    elif isinstance(parsed, dict):
-                        logs = parsed.get("logs", [])
-                        if isinstance(logs, list):
-                            research_map[tid] = logs
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+                research_artifact_logs_map[tid] = a.logs[:100000]
             if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
                 try:
                     parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
@@ -457,7 +449,11 @@ async def get_all_tasks(
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
-            "research_findings": research_map.get(str(t.id)),
+            "research_findings": resolve_research_findings_for_surface(
+                t.plan_output, research_artifact_logs_map.get(str(t.id))
+            )
+            if task_type == "research"
+            else None,
             "evaluation_summary": _build_task_evaluation_summary(
                 t, merge_test_result=merge_test_map.get(str(t.id))
             ),
@@ -1027,7 +1023,7 @@ async def get_task(
         if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
             error_logs = a.logs
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-            research_findings = a.logs[:100000]
+            research_findings = a.logs[:100000]  # raw logs; resolved below
         if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
             try:
                 parsed = json.loads(a.logs[:100000])
@@ -1129,7 +1125,11 @@ async def get_task(
         "error_logs": error_logs,
         "commit_hash": commit_hash,
         "repo_url": repo_url,
-        "research_findings": research_findings,
+        "research_findings": resolve_research_findings_for_surface(
+            task.plan_output, research_findings
+        )
+        if task_type == "research"
+        else None,
         "evaluation_summary": _build_task_evaluation_summary(
             task, merge_test_result=merge_test_result
         ),

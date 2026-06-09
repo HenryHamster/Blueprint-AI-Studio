@@ -5,6 +5,7 @@ import logging
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 import pytest as _pytest
 from sqlmodel import select as _select
@@ -38,8 +39,12 @@ from app.research_completion import (
 )
 from app.finding_deduplication import resolve_prerequisite_task
 from app.task_evaluators import (
+    CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
     FINDING_CHALLENGE_SOURCE_KEY,
     FINDING_CHALLENGE_VERDICT_KEY,
     ADVERSARIAL_GATE_VERDICT_KEY,
@@ -2675,6 +2680,90 @@ async def test_low_actionability_challenge_indeterminate_redefers(
         c.context and c.context.get("memo_drop_reason") == "low_actionability_decay"
         for c in children
     )
+
+
+@_pytest.mark.asyncio
+async def test_research_history_records_finding_challenge_summary(db_session):
+    """Post-spawn direction history records bounded challenge telemetry for the cycle."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, "d-challenge-summary"
+    )
+    child = _Task(
+        project_id=project.id,
+        title="Dispatch challenged finding",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=task.id,
+        created_by="ORCHESTRATOR",
+        context={"direction_id": direction["id"]},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    dispatched = {
+        **_make_finding("Dispatched challenged finding", direction_id=direction["id"]),
+        "finding_challenge": {
+            "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+            "first_verdict": "absent",
+            "second_opinion_verdict": "present",
+            "agreement": CHALLENGE_DISAGREES,
+            "reason": "head now reproduces",
+            "sidecar_task_id": "sidecar-dispatch",
+        },
+    }
+    dropped = {
+        **_make_finding("Dropped challenged finding", direction_id=direction["id"]),
+        "finding_challenge": {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "",
+            "agreement": CHALLENGE_INDETERMINATE,
+            "reason": "unparseable sidecar output",
+            "sidecar_task_id": "sidecar-drop",
+        },
+    }
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [dispatched, dropped],
+        [child],
+        [(0, dispatched, "hash-dispatched")],
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "base",
+        0,
+        None,
+    )
+    await db_session.refresh(project)
+
+    history = project.directions[0]["research_history"]
+    assert history[-1]["finding_challenge_summary"] == {
+        "challenged_findings": 2,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 0,
+            CHALLENGE_DISAGREES: 1,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 0,
+        },
+        "fail_closed_unparseable": 1,
+    }
 
 
 @_pytest.mark.asyncio
@@ -6282,7 +6371,6 @@ def test_annotate_capability_declarations_clears_stale_markers_and_skips_non_dic
     assert "_off_registry_capabilities" not in findings[0]
     assert findings[0]["_provides_capability"] == "seeded-eval-harness"
 
-
 # ---------------------------------------------------------------------------
 # Adversarial spawn-gate: _is_high_stakes_finding predicate (pure unit tests)
 # ---------------------------------------------------------------------------
@@ -7314,3 +7402,261 @@ async def test_high_stakes_finding_default_on_adversarial_rejudgment(
     ), "Phase 2b (FAIL): failed finding must appear in deferred_findings"
     for d in deferred:
         assert "_adversarial_verdict" not in d, "Phase 2b: _adversarial_verdict must be cleared"
+
+class TestResolveResearchFindingsForSurface:
+    """resolve_research_findings_for_surface: canonical challenge-enriched findings
+    for surface rendering — prefers plan_output over artifact logs, trims challenge
+    records to the bounded vocabulary, and falls back gracefully."""
+
+    from app.research_completion import resolve_research_findings_for_surface
+
+    def _finding(self, title: str = "F1", **kwargs):
+        return {"title": title, "description": "desc", **kwargs}
+
+    def _challenge(self, **overrides):
+        base = {
+            "challenged_boundary": "reproduce_absent",
+            "first_verdict": "absent",
+            "second_opinion_verdict": "present",
+            "agreement": "disagrees",
+            "reason": "code still present at HEAD",
+            "sidecar_task_id": "task-abc",
+            "extra_internal_key": "should_be_trimmed",
+        }
+        base.update(overrides)
+        return base
+
+    def test_challenge_enriched_findings_surface_through_serializer(self):
+        """A finding in plan_output with a finding_challenge surfaces the bounded
+        challenge fields and strips internal-only keys."""
+        from app.research_completion import (
+            _FINDING_CHALLENGE_RECORD_KEY,
+            resolve_research_findings_for_surface,
+        )
+
+        challenge = self._challenge()
+        finding = self._finding(title="Bug with challenge")
+        finding[_FINDING_CHALLENGE_RECORD_KEY] = challenge
+
+        result = resolve_research_findings_for_surface([finding], None)
+
+        assert result is not None
+        assert len(result) == 1
+        surfaced = result[0]
+        assert surfaced["title"] == "Bug with challenge"
+
+        rc = surfaced[_FINDING_CHALLENGE_RECORD_KEY]
+        assert isinstance(rc, dict)
+        # All bounded fields must be present
+        assert rc["challenged_boundary"] == "reproduce_absent"
+        assert rc["first_verdict"] == "absent"
+        assert rc["second_opinion_verdict"] == "present"
+        assert rc["agreement"] == "disagrees"
+        assert rc["reason"] == "code still present at HEAD"
+        assert rc["sidecar_task_id"] == "task-abc"
+        # Internal key must not leak out
+        assert "extra_internal_key" not in rc
+
+    def test_plan_output_returned_unchanged_when_no_challenge(self):
+        """Findings without a challenge record serialize exactly as before."""
+        from app.research_completion import resolve_research_findings_for_surface
+
+        finding = self._finding(title="No challenge finding", actionability_grade="HIGH")
+        result = resolve_research_findings_for_surface([finding], None)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["title"] == "No challenge finding"
+        assert result[0]["actionability_grade"] == "HIGH"
+        assert "finding_challenge" not in result[0]
+
+    def test_plan_output_preferred_over_artifact_logs(self):
+        """When both plan_output and artifact_logs are present, plan_output wins."""
+        from app.research_completion import resolve_research_findings_for_surface
+        import json
+
+        plan_finding = self._finding(title="From plan_output")
+        artifact_finding = self._finding(title="From artifact_logs")
+        artifact_logs = json.dumps([artifact_finding])
+
+        result = resolve_research_findings_for_surface([plan_finding], artifact_logs)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["title"] == "From plan_output"
+
+    def test_falls_back_to_artifact_logs_when_plan_output_absent(self):
+        """When plan_output is None, artifact_logs (list shape) is parsed."""
+        from app.research_completion import resolve_research_findings_for_surface
+        import json
+
+        artifact_finding = self._finding(title="From artifact list logs")
+        artifact_logs = json.dumps([artifact_finding])
+
+        result = resolve_research_findings_for_surface(None, artifact_logs)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["title"] == "From artifact list logs"
+
+    def test_falls_back_to_artifact_logs_when_plan_output_empty(self):
+        """When plan_output is an empty list, artifact_logs is used as fallback."""
+        from app.research_completion import resolve_research_findings_for_surface
+        import json
+
+        artifact_finding = self._finding(title="From fallback logs")
+        artifact_logs = json.dumps([artifact_finding])
+
+        result = resolve_research_findings_for_surface([], artifact_logs)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["title"] == "From fallback logs"
+
+    def test_artifact_logs_legacy_dict_shape_unwrapped(self):
+        """Artifact logs in the legacy {"logs": [...]} dict shape are unwrapped."""
+        from app.research_completion import resolve_research_findings_for_surface
+        import json
+
+        artifact_finding = self._finding(title="Inside dict logs")
+        artifact_logs = json.dumps({"logs": [artifact_finding]})
+
+        result = resolve_research_findings_for_surface(None, artifact_logs)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["title"] == "Inside dict logs"
+
+    def test_both_absent_returns_none(self):
+        """Returns None when both plan_output and artifact_logs are absent."""
+        from app.research_completion import resolve_research_findings_for_surface
+
+        assert resolve_research_findings_for_surface(None, None) is None
+        assert resolve_research_findings_for_surface([], None) is None
+        assert resolve_research_findings_for_surface(None, "") is None
+
+    def test_malformed_artifact_logs_returns_none(self):
+        """Malformed JSON in artifact logs does not raise — returns None."""
+        from app.research_completion import resolve_research_findings_for_surface
+
+        result = resolve_research_findings_for_surface(None, "not valid json {{{")
+        assert result is None
+
+    def test_activity_pending_count_reflects_canonical_finding_set(self):
+        """The count derived from the helper reflects the canonical (plan_output)
+        finding set, not the stale artifact count, when they differ."""
+        from app.research_completion import resolve_research_findings_for_surface
+        import json
+
+        # plan_output has 3 findings (canonical after challenge resolution)
+        plan_findings = [
+            self._finding(title=f"Finding {i}") for i in range(3)
+        ]
+        # artifact logs only have 2 (written before challenge resolution)
+        artifact_logs = json.dumps([self._finding(title=f"Old {i}") for i in range(2)])
+
+        result = resolve_research_findings_for_surface(plan_findings, artifact_logs)
+
+        assert result is not None
+        assert len(result) == 3  # canonical count wins
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_payload_uses_hash_field(db_session, mocker):
+    """The adversarial grader payload must expose the contract hash under `hash`."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-hash01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Hash payload contract")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _capture_spawn(source_task, artifact_text, session, **_kwargs):
+        captured["artifact_text"] = artifact_text
+        source_task.status = TaskStatus.EVALUATING
+        source_task.context = {
+            **(source_task.context or {}),
+            "awaiting_adversarial_grader": True,
+        }
+        return SimpleNamespace(id="grade-hash-001")
+
+    mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        new=_capture_spawn,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    payload = json.loads(captured["artifact_text"])
+    assert payload[0]["hash"]
+    assert "_adversarial_hash" not in payload[0]
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_rechecks_prior_deferred_high_stakes_findings(
+    db_session, mocker
+):
+    """Recovered high-stakes findings must still pass through the adversarial gate."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-recover01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    recovered = _high_stakes_finding(direction["id"], "Recovered risky finding")
+    current = _make_finding(direction_id=direction["id"], title="Current low-stakes finding")
+    task.plan_output = [current]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [
+            {
+                **recovered,
+                "deferred_reason": "adversarial_gate",
+                "deferred_count": 1,
+            }
+        ],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[current],
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _capture_spawn(source_task, artifact_text, session, **_kwargs):
+        captured["artifact_text"] = artifact_text
+        source_task.status = TaskStatus.EVALUATING
+        source_task.context = {
+            **(source_task.context or {}),
+            "awaiting_adversarial_grader": True,
+        }
+        return SimpleNamespace(id="grade-recovered-001")
+
+    mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        new=_capture_spawn,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    payload = json.loads(captured["artifact_text"])
+    assert payload[0]["title"] == recovered["title"]
+    assert payload[0]["hash"]
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_adversarial_grader") is True

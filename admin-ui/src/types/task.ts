@@ -15,6 +15,15 @@ export interface TaskWakeRegistration {
   result_detail?: string | null;
 }
 
+export interface FindingChallenge {
+  challenged_boundary?: string;
+  first_verdict?: string;
+  second_opinion_verdict?: string;
+  agreement?: 'agrees' | 'disagrees' | 'indeterminate' | string;
+  reason?: string;
+  sidecar_task_id?: string;
+}
+
 export interface ResearchFinding {
   type?: string;
   title: string;
@@ -29,6 +38,7 @@ export interface ResearchFinding {
   sources?: Array<{ type?: string; ref: string; excerpt?: string }>;
   _provenance_warnings?: { broken_source_ref_count: number; broken_refs: string[] };
   finding_hash?: string;
+  finding_challenge?: FindingChallenge;
 }
 
 export interface TaskEvaluationSummaryItem {

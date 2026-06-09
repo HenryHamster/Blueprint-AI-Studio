@@ -27,6 +27,52 @@ COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
 COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_MEASURED_ONLY = "measured_only"
 COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY = "compute_acceptance_grade"
 KNOWLEDGE_ACCEPTANCE_EVIDENCE_KEY = "knowledge_acceptance_evidence"
+ORIGIN_STATE_LEGACY_UNKNOWN = "legacy_unknown"
+ORIGIN_STATE_RESEARCH_FINDING = "research_finding"
+ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED = "not_research_finding_derived"
+ORIGIN_CHALLENGE_UNCHALLENGED = "unchallenged"
+ORIGIN_CHALLENGE_NOT_APPLICABLE = "not_applicable"
+_LEGACY_UNKNOWN_SOURCE_KINDS = {
+    SourceKind.DESIGN.value,
+    SourceKind.WEB_RESEARCH.value,
+    SourceKind.UNKNOWN.value,
+}
+
+
+def _stored_origin_state(doc: KnowledgeDocument) -> str:
+    if doc.origin_state:
+        return str(doc.origin_state)
+    if doc.source_kind in _LEGACY_UNKNOWN_SOURCE_KINDS:
+        return ORIGIN_STATE_LEGACY_UNKNOWN
+    return ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+
+
+def _stored_challenge_state(doc: KnowledgeDocument, origin_state: str) -> str:
+    if origin_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+        return ORIGIN_STATE_LEGACY_UNKNOWN
+    if origin_state != ORIGIN_STATE_RESEARCH_FINDING:
+        return ORIGIN_CHALLENGE_NOT_APPLICABLE
+    return str(doc.origin_challenge_state or ORIGIN_CHALLENGE_UNCHALLENGED)
+
+
+def serialize_origin_provenance(doc: KnowledgeDocument) -> dict[str, Any]:
+    """Return compact, bounded origin provenance for list/get/index surfaces."""
+    origin_state = _stored_origin_state(doc)
+    challenge_state = _stored_challenge_state(doc, origin_state)
+    return {
+        "origin_state": origin_state,
+        "research_task_id": doc.origin_research_task_id,
+        "parent_research_task_id": doc.origin_parent_research_task_id,
+        "finding_index": doc.origin_finding_index,
+        "finding_hash": doc.origin_finding_hash,
+        "direction_id": doc.direction_id,
+        "challenge_state": challenge_state,
+        "finding_challenge": (
+            doc.origin_challenge_record
+            if isinstance(doc.origin_challenge_record, dict)
+            else None
+        ),
+    }
 
 
 def classify_knowledge_acceptance(
@@ -156,7 +202,9 @@ def knowledge_substance_has_durable_compute_grounding(
         return False
 
     citations = [
-        c for c in (substance.source_citations or ()) if isinstance(c, str) and c.strip()
+        c
+        for c in (substance.source_citations or ())
+        if isinstance(c, str) and c.strip()
     ]
     if not citations or not _has_durable_compute_citation(tuple(citations)):
         return False
@@ -262,6 +310,7 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
+        "origin_provenance": serialize_origin_provenance(doc),
     }
     if include_body:
         out["body"] = doc.body
@@ -276,6 +325,9 @@ def build_knowledge_documents_stmt(
     tag: str | None = None,
     direction: str | None = None,
     source_kind: str | None = None,
+    origin_state: str | None = None,
+    challenge_state: str | None = None,
+    finding_hash: str | None = None,
 ):
     """Build the project-scoped ``select`` for knowledge documents.
 
@@ -284,15 +336,53 @@ def build_knowledge_documents_stmt(
     cast-to-text scan of the tag list. Ordering / pagination are applied by the
     caller (or by ``list_knowledge_documents``).
     """
-    stmt = select(KnowledgeDocument).where(
-        KnowledgeDocument.project_id == project_id
-    )
+    stmt = select(KnowledgeDocument).where(KnowledgeDocument.project_id == project_id)
     if topic:
         stmt = stmt.where(KnowledgeDocument.topic == topic)
     if source_kind:
         stmt = stmt.where(KnowledgeDocument.source_kind == source_kind)
     if direction:
         stmt = stmt.where(KnowledgeDocument.direction_id == direction)
+    if origin_state:
+        if origin_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_state.is_(None),
+                KnowledgeDocument.source_kind.in_(_LEGACY_UNKNOWN_SOURCE_KINDS),
+            )
+        elif origin_state == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED:
+            stmt = stmt.where(
+                or_(
+                    KnowledgeDocument.origin_state
+                    == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
+                    KnowledgeDocument.source_kind.not_in(
+                        _LEGACY_UNKNOWN_SOURCE_KINDS
+                    ),
+                )
+            )
+        else:
+            stmt = stmt.where(KnowledgeDocument.origin_state == origin_state)
+    if challenge_state:
+        if challenge_state == ORIGIN_STATE_LEGACY_UNKNOWN:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_state.is_(None),
+                KnowledgeDocument.source_kind.in_(_LEGACY_UNKNOWN_SOURCE_KINDS),
+            )
+        elif challenge_state == ORIGIN_CHALLENGE_NOT_APPLICABLE:
+            stmt = stmt.where(
+                or_(
+                    KnowledgeDocument.origin_state
+                    == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
+                    KnowledgeDocument.source_kind.not_in(
+                        _LEGACY_UNKNOWN_SOURCE_KINDS
+                    ),
+                )
+            )
+        else:
+            stmt = stmt.where(
+                KnowledgeDocument.origin_challenge_state == challenge_state
+            )
+    if finding_hash:
+        stmt = stmt.where(KnowledgeDocument.origin_finding_hash == finding_hash)
     if tag:
         # tags is a JSON list; match the exact element via a cast-to-text scan
         # so it works on both Postgres (JSONB) and the SQLite test backend.
@@ -320,6 +410,9 @@ async def list_knowledge_documents(
     tag: str | None = None,
     direction: str | None = None,
     source_kind: str | None = None,
+    origin_state: str | None = None,
+    challenge_state: str | None = None,
+    finding_hash: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -335,6 +428,9 @@ async def list_knowledge_documents(
         tag=tag,
         direction=direction,
         source_kind=source_kind,
+        origin_state=origin_state,
+        challenge_state=challenge_state,
+        finding_hash=finding_hash,
     )
 
     total = (
@@ -399,6 +495,7 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "source_kind": doc.source_kind,
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
 

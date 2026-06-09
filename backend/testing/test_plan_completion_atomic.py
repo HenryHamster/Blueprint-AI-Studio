@@ -18,6 +18,11 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import select
 
+from app.knowledge_completion import (
+    _handle_design_completion,
+    _handle_web_research_completion,
+)
+from app.models import KnowledgeDocument
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -532,6 +537,110 @@ async def test_knowledge_prereq_subtype_spawns_as_itself(
     # Direction context threaded to the child like every other plan child.
     assert (child.context or {}).get("direction_id") == "dir-knowledge-1"
     assert (child.context or {}).get("research_task_id") == "res-knowledge-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES - {"compute_experiment"}))
+async def test_plan_knowledge_child_carries_finding_provenance(
+    db_session, mocker, _quiet_mocks, knowledge_type
+):
+    """Plan-spawned knowledge subtasks preserve research-finding provenance.
+
+    The child must inherit the parent plan's finding metadata so the durable
+    KnowledgeDocument can retain the research/challenge origin instead of
+    collapsing to unchallenged.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": f"Knowledge {knowledge_type}",
+                    "prompt": "gather the prerequisite knowledge",
+                    "type": knowledge_type,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    task.context = {
+        **(task.context or {}),
+        "direction_id": "dir-finding-1",
+        "research_task_id": "res-plan-1",
+        "parent_research_task_id": "res-origin-1",
+        "finding_index": 3,
+        "finding_hash": "finding-hash-abc123",
+        "finding_challenge": {
+            "challenged_boundary": "reproduce_absent",
+            "first_verdict": "absent",
+            "second_opinion_verdict": "present",
+            "agreement": "disagrees",
+            "reason": "The cited behavior moved but still reproduces.",
+            "sidecar_task_id": "sidecar-1",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    child = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert (child.context or {}).get("research_task_id") == "res-plan-1"
+    assert (child.context or {}).get("parent_research_task_id") == "res-origin-1"
+    assert (child.context or {}).get("finding_index") == 3
+    assert (child.context or {}).get("finding_hash") == "finding-hash-abc123"
+    assert (child.context or {}).get("finding_challenge", {}).get("agreement") == (
+        "disagrees"
+    )
+
+    if knowledge_type == "design":
+        document = {
+            "title": "Design prerequisite doc",
+            "summary": "Challenge-aware design context.",
+            "body": "# Body\n\nOrigin details.",
+            "citations": ["docs/design-prereq.md"],
+            "tags": ["origin"],
+            "topic": "origin",
+        }
+        handler = _handle_design_completion
+    else:
+        document = {
+            "title": "Research prerequisite doc",
+            "summary": "Challenge-aware research context.",
+            "body": "# Body\n\nOrigin details.",
+            "citations": ["https://example.com/origin"],
+            "tags": ["origin"],
+            "topic": "origin",
+        }
+        handler = _handle_web_research_completion
+
+    await handler(child, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == child.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.origin_state == "research_finding"
+    assert doc.origin_research_task_id == "res-plan-1"
+    assert doc.origin_parent_research_task_id == "res-origin-1"
+    assert doc.origin_finding_index == 3
+    assert doc.origin_finding_hash == "finding-hash-abc123"
+    assert doc.origin_challenge_state == "overturned"
 
 
 @pytest.mark.asyncio

@@ -554,3 +554,192 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     expect(card && findBadge(card, 'Measured only')).toBeFalsy();
   });
 });
+
+describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  function findBadge(scope: ParentNode, label: string): Element | undefined {
+    return Array.from(scope.querySelectorAll('span')).find(
+      s => s.textContent?.trim() === label,
+    );
+  }
+
+  // Knowledge documents spawned from research findings, each carrying the backend
+  // origin-provenance object (serialize_origin_provenance) with a distinct resolved
+  // second-opinion challenge state.
+  const findingDoc = (overrides: Record<string, unknown>) => ({
+    id: 'doc-finding',
+    title: 'Finding-derived design',
+    summary: 'A design doc spawned from a challenged research finding.',
+    topic: 'resilience',
+    direction_id: 'd-finding-1',
+    tags: ['origin'],
+    source_citations: [],
+    source_task_id: 'task-design-1',
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'design',
+    created_at: '2026-06-01T00:00:00Z',
+    updated_at: '2026-06-01T00:00:00Z',
+    forward_quality_verdict: { passed: true, reason: 'ok', strategy: 'forward-quality' },
+    ...overrides,
+  });
+
+  const confirmedDoc = findingDoc({
+    id: 'doc-confirmed', title: 'Confirmed finding design',
+    origin_provenance: {
+      origin_state: 'research_finding',
+      challenge_state: 'challenger_confirmed',
+      research_task_id: 'task-research-abcdef12',
+      parent_research_task_id: 'task-research-parent-9',
+      finding_index: 2,
+      finding_hash: 'sha256:deadbeefcafe',
+      direction_id: 'd-finding-1',
+      finding_challenge: {
+        challenged_boundary: 'reproduces_on_head',
+        first_verdict: 'actionable',
+        second_opinion_verdict: 'actionable',
+        agreement: 'agrees',
+        reason: 'Second reviewer reproduced the finding on HEAD.',
+        sidecar_task_id: 'task-challenge-77',
+      },
+    },
+  });
+  const overturnedDoc = findingDoc({
+    id: 'doc-overturned', title: 'Overturned finding design',
+    origin_provenance: {
+      origin_state: 'research_finding', challenge_state: 'overturned',
+      research_task_id: 'task-research-2',
+      finding_challenge: { agreement: 'disagrees', first_verdict: 'actionable', second_opinion_verdict: 'not_actionable', reason: 'Could not reproduce.' },
+    },
+  });
+  const indeterminateDoc = findingDoc({
+    id: 'doc-indeterminate', title: 'Indeterminate finding design',
+    origin_provenance: {
+      origin_state: 'research_finding', challenge_state: 'indeterminate_fail_closed',
+      research_task_id: 'task-research-3',
+      finding_challenge: { agreement: 'agrees', second_opinion_verdict: 'indeterminate' },
+    },
+  });
+  const unchallengedDoc = findingDoc({
+    id: 'doc-unchallenged', title: 'Unchallenged finding design',
+    origin_provenance: { origin_state: 'research_finding', challenge_state: 'unchallenged', research_task_id: 'task-research-4' },
+  });
+  // A document with no origin provenance at all — older backend / legacy doc.
+  const legacyDoc = findingDoc({ id: 'doc-legacy', title: 'Legacy design without provenance' });
+  // A non-finding-derived document — provenance present but the challenge axis does not apply.
+  const nonFindingDoc = findingDoc({
+    id: 'doc-non-finding', title: 'Non-finding derived design',
+    origin_provenance: { origin_state: 'not_research_finding_derived', challenge_state: 'not_applicable' },
+  });
+
+  async function renderList(documents: unknown[]) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: documents as never,
+      total: documents.length,
+      limit: 50,
+      offset: 0,
+    });
+    vi.mocked(fetchKnowledgeDocument).mockImplementation((_pid, id) =>
+      Promise.resolve({
+        ...(documents.find(d => (d as { id: string }).id === id) as object),
+        body: '# Body\n\nMarkdown body.',
+      } as never),
+    );
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+  }
+
+  function cardFor(title: string): Element | undefined {
+    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(title),
+    );
+  }
+
+  test('renders_finding_challenge_origin_provenance', async () => {
+    await renderList([confirmedDoc, overturnedDoc, indeterminateDoc, unchallengedDoc, legacyDoc, nonFindingDoc]);
+
+    // Each finding-derived card carries the challenge-state badge matching its
+    // resolved second-opinion outcome.
+    const confirmedCard = cardFor('Confirmed finding design');
+    const overturnedCard = cardFor('Overturned finding design');
+    const indeterminateCard = cardFor('Indeterminate finding design');
+    const unchallengedCard = cardFor('Unchallenged finding design');
+    const legacyCard = cardFor('Legacy design without provenance');
+    const nonFindingCard = cardFor('Non-finding derived design');
+    expect(confirmedCard && findBadge(confirmedCard, 'Confirmed')).toBeTruthy();
+    expect(overturnedCard && findBadge(overturnedCard, 'Overturned')).toBeTruthy();
+    expect(indeterminateCard && findBadge(indeterminateCard, 'Indeterminate')).toBeTruthy();
+    expect(unchallengedCard && findBadge(unchallengedCard, 'Unchallenged')).toBeTruthy();
+
+    // Legacy (no provenance) and not-research-finding-derived docs carry no
+    // challenge badge in the list — they stay visible and clean.
+    for (const label of ['Confirmed', 'Overturned', 'Indeterminate', 'Unchallenged']) {
+      expect(legacyCard && findBadge(legacyCard, label)).toBeFalsy();
+      expect(nonFindingCard && findBadge(nonFindingCard, label)).toBeFalsy();
+    }
+
+    // Open the confirmed document — the detail block exposes the source research
+    // task / finding identity and the second-opinion decision record.
+    if (!confirmedCard) throw new Error('expected confirmed finding card');
+    await act(async () => { (confirmedCard as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const detailText = (host as HTMLDivElement).textContent ?? '';
+    expect(detailText).toContain('Finding origin');
+    expect(detailText).toContain('Research finding');
+    expect(detailText).toContain('task-res'); // research task id (truncated link prefix)
+    expect(detailText).toContain('Second opinion');
+    expect(detailText).toContain('reproduces_on_head'); // challenged boundary
+    expect(detailText).toContain('agrees'); // agreement
+    expect(detailText).toContain('Second reviewer reproduced the finding on HEAD.'); // reason
+  });
+
+  test('legacy document detail view omits the finding-origin block when provenance is absent', async () => {
+    await renderList([legacyDoc]);
+    const card = cardFor('Legacy design without provenance');
+    if (!card) throw new Error('expected legacy card');
+    await act(async () => { (card as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    // No origin_provenance → no finding-origin block, but the document still renders.
+    expect((host as HTMLDivElement).textContent).not.toContain('Finding origin');
+    expect((host as HTMLDivElement).textContent).toContain('Legacy design without provenance');
+  });
+
+  test('challenge-state filter forwards challenge_state to fetchKnowledgeDocuments', async () => {
+    await renderList([confirmedDoc]);
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockClear();
+    const overturnedFilter = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(
+      b => b.textContent?.trim() === 'Overturned',
+    );
+    expect(overturnedFilter).toBeTruthy();
+    if (!overturnedFilter) throw new Error('expected Overturned filter button');
+    await act(async () => { overturnedFilter.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]?.offset).toBe(0);
+    expect(lastCall[1]?.challenge_state).toBe('overturned');
+  });
+});

@@ -111,6 +111,114 @@ def _source_kind(kind: str) -> str:
         return SourceKind.UNKNOWN.value
 
 
+_ORIGIN_STATE_RESEARCH_FINDING = "research_finding"
+_ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED = "not_research_finding_derived"
+_ORIGIN_CHALLENGE_UNCHALLENGED = "unchallenged"
+_ORIGIN_CHALLENGE_CONFIRMED = "challenger_confirmed"
+_ORIGIN_CHALLENGE_OVERTURNED = "overturned"
+_ORIGIN_CHALLENGE_INDETERMINATE = "indeterminate_fail_closed"
+_FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
+_CHALLENGE_KEYS = {
+    "challenged_boundary",
+    "first_verdict",
+    "second_opinion_verdict",
+    "agreement",
+    "reason",
+    "sidecar_task_id",
+}
+
+
+def _bounded_context_str(value: Any, *, limit: int = 128) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
+def _bounded_finding_index(value: Any) -> int | None:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
+def _bounded_challenge_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    record: dict[str, Any] = {}
+    for key in _CHALLENGE_KEYS:
+        item = value.get(key)
+        if item is None:
+            continue
+        if key == "reason":
+            record[key] = str(item)[:1000]
+        else:
+            record[key] = str(item)[:200]
+    return record or None
+
+
+def _challenge_state(record: dict[str, Any] | None) -> str:
+    if not record:
+        return _ORIGIN_CHALLENGE_UNCHALLENGED
+    agreement = str(record.get("agreement") or "").strip().lower()
+    second = str(record.get("second_opinion_verdict") or "").strip().lower()
+    if agreement == "disagrees":
+        return _ORIGIN_CHALLENGE_OVERTURNED
+    if agreement == "agrees" and second not in {"", "unknown", "indeterminate"}:
+        return _ORIGIN_CHALLENGE_CONFIRMED
+    return _ORIGIN_CHALLENGE_INDETERMINATE
+
+
+def _derive_origin_provenance(
+    task: Task,
+    *,
+    source_kind: str,
+) -> dict[str, Any]:
+    """Derive durable, bounded research-finding origin from producer context."""
+    ctx = task.context if isinstance(task.context, dict) else {}
+    research_task_id = _bounded_context_str(
+        ctx.get("research_task_id") or ctx.get("parent_research_task_id"), limit=64
+    )
+    parent_research_task_id = _bounded_context_str(
+        ctx.get("parent_research_task_id") or ctx.get("research_task_id"), limit=64
+    )
+    finding_hash = _bounded_context_str(ctx.get("finding_hash"), limit=128)
+    finding_index = _bounded_finding_index(ctx.get("finding_index"))
+    has_research_origin = bool(
+        research_task_id
+        or parent_research_task_id
+        or finding_hash
+        or finding_index is not None
+    )
+    if source_kind not in {
+        SourceKind.DESIGN.value,
+        SourceKind.WEB_RESEARCH.value,
+    }:
+        origin_state = _ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+    else:
+        origin_state = (
+            _ORIGIN_STATE_RESEARCH_FINDING
+            if has_research_origin
+            else _ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED
+        )
+    challenge_record = _bounded_challenge_record(ctx.get(_FINDING_CHALLENGE_RECORD_KEY))
+    challenge_state = (
+        _challenge_state(challenge_record)
+        if origin_state == _ORIGIN_STATE_RESEARCH_FINDING
+        else None
+    )
+    return {
+        "origin_state": origin_state,
+        "origin_research_task_id": research_task_id,
+        "origin_parent_research_task_id": parent_research_task_id,
+        "origin_finding_index": finding_index,
+        "origin_finding_hash": finding_hash,
+        "origin_challenge_state": challenge_state,
+        "origin_challenge_record": challenge_record,
+    }
+
+
 def _citation_hint(kind: str) -> str:
     meta = _KIND_META.get(kind)
     return (
@@ -118,6 +226,7 @@ def _citation_hint(kind: str) -> str:
         if meta
         else "at least one web URL or file reference is required"
     )
+
 
 # Required structural keys for a knowledge document. tags / topic are optional
 # and normalized to safe defaults. At least one *usable* source citation is
@@ -190,13 +299,55 @@ def _usable_citations(obj: dict[str, Any]) -> list[str]:
 # Common words carry no topical signal; drop them before measuring overlap.
 _PROBE_STOPWORDS = frozenset(
     {
-        "about", "above", "across", "after", "against", "research", "current",
-        "state", "their", "these", "those", "which", "while", "would", "could",
-        "should", "there", "where", "what", "when", "with", "from", "that",
-        "this", "into", "over", "under", "between", "your", "have", "been",
-        "being", "does", "using", "used", "make", "made", "such", "than",
-        "then", "they", "them", "will", "shall", "topic", "prompt", "report",
-        "document", "summary",
+        "about",
+        "above",
+        "across",
+        "after",
+        "against",
+        "research",
+        "current",
+        "state",
+        "their",
+        "these",
+        "those",
+        "which",
+        "while",
+        "would",
+        "could",
+        "should",
+        "there",
+        "where",
+        "what",
+        "when",
+        "with",
+        "from",
+        "that",
+        "this",
+        "into",
+        "over",
+        "under",
+        "between",
+        "your",
+        "have",
+        "been",
+        "being",
+        "does",
+        "using",
+        "used",
+        "make",
+        "made",
+        "such",
+        "than",
+        "then",
+        "they",
+        "them",
+        "will",
+        "shall",
+        "topic",
+        "prompt",
+        "report",
+        "document",
+        "summary",
     }
 )
 
@@ -507,13 +658,18 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
         "topic": str(topic)[:200] if topic is not None else None,
         "tags": tags,
         "source_citations": citations[:100],
-        "authoring_branch": str(authoring_branch)[:255] if authoring_branch is not None else None,
+        "authoring_branch": str(authoring_branch)[:255]
+        if authoring_branch is not None
+        else None,
         "head_sha": str(head_sha)[:40] if head_sha is not None else None,
     }
 
 
 async def _fail_gate(
-    task: Task, verdict: EvaluationVerdict, session: AsyncSession, kind: str = "web_research"
+    task: Task,
+    verdict: EvaluationVerdict,
+    session: AsyncSession,
+    kind: str = "web_research",
 ):
     """Mark ``task`` FAILED on a failing forward-quality verdict and broadcast."""
     record_failed_gate(task, verdict)
@@ -591,9 +747,7 @@ async def _deliver_knowledge_to_dependents(
                 await session.execute(
                     select(Task)
                     .where(
-                        Task.status.in_(
-                            [TaskStatus.QUEUED, TaskStatus.BLOCKED]
-                        ),
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.BLOCKED]),
                         Task.project_id == task.project_id,
                         Task.depends_on.isnot(None),
                     )
@@ -689,12 +843,14 @@ async def _persist_document(
     # is stored — and lets a direction's accumulated knowledge be discovered.
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
+    source_kind = _source_kind(kind)
+    origin = _derive_origin_provenance(task, source_kind=source_kind)
 
     doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
         direction_id=direction_id,
-        source_kind=_source_kind(kind),
+        source_kind=source_kind,
         title=normalized["title"],
         summary=normalized["summary"],
         body=normalized["body"],
@@ -704,6 +860,7 @@ async def _persist_document(
         forward_quality_verdict=verdict_record,
         authoring_branch=normalized.get("authoring_branch"),
         head_sha=normalized.get("head_sha"),
+        **origin,
     )
     session.add(doc)
 
@@ -723,6 +880,16 @@ async def _persist_document(
         "direction_id": direction_id,
         "citation_count": len(normalized["source_citations"]),
         "forward_quality_verdict": verdict_record,
+        "origin_provenance": {
+            "origin_state": origin["origin_state"],
+            "research_task_id": origin["origin_research_task_id"],
+            "parent_research_task_id": origin["origin_parent_research_task_id"],
+            "finding_index": origin["origin_finding_index"],
+            "finding_hash": origin["origin_finding_hash"],
+            "direction_id": direction_id,
+            "challenge_state": origin["origin_challenge_state"],
+            "finding_challenge": origin["origin_challenge_record"],
+        },
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -859,8 +1026,7 @@ async def _handle_knowledge_document_completion(
             task,
             EvaluationVerdict(
                 False,
-                f"{kind} output has no usable source citation "
-                f"({_citation_hint(kind)})",
+                f"{kind} output has no usable source citation ({_citation_hint(kind)})",
                 "forward-quality",
             ),
             session,
@@ -879,9 +1045,7 @@ async def _handle_knowledge_document_completion(
         if grounding_miss is not None:
             await _fail_gate(
                 task,
-                EvaluationVerdict(
-                    False, f"{kind} {grounding_miss}", "forward-quality"
-                ),
+                EvaluationVerdict(False, f"{kind} {grounding_miss}", "forward-quality"),
                 session,
                 kind,
             )
@@ -896,9 +1060,7 @@ async def _handle_knowledge_document_completion(
         if grounding_miss is not None:
             await _fail_gate(
                 task,
-                EvaluationVerdict(
-                    False, f"{kind} {grounding_miss}", "forward-quality"
-                ),
+                EvaluationVerdict(False, f"{kind} {grounding_miss}", "forward-quality"),
                 session,
                 kind,
             )
@@ -1025,8 +1187,7 @@ def _build_compute_experiment_document(
         value = criterion.get("value")
         if crit_met is True:
             summary_parts.append(
-                f"Success criterion MET: {metric}={value} "
-                f"(required {op} {threshold})."
+                f"Success criterion MET: {metric}={value} (required {op} {threshold})."
             )
         elif criterion.get("measurable"):
             summary_parts.append(
@@ -1289,7 +1450,11 @@ async def _gather_compute_evidence(
         return None
 
     citations = list(real_evidence) + supplementary
-    if result_reference and _is_usable_citation(result_reference) and result_reference not in seen:
+    if (
+        result_reference
+        and _is_usable_citation(result_reference)
+        and result_reference not in seen
+    ):
         citations.append(result_reference)
 
     log_excerpt = (logs or "")[:_COMPUTE_LOG_TEXT_CAP]
@@ -1327,7 +1492,9 @@ def _build_compute_analysis_prompt(
         or "  (no command-reported numeric metrics)"
     )
     criterion_line = (
-        json.dumps(criterion, sort_keys=True) if criterion is not None else "(none declared)"
+        json.dumps(criterion, sort_keys=True)
+        if criterion is not None
+        else "(none declared)"
     )
     return (
         "You are analysing the durable outputs of a finished compute experiment. "
@@ -1375,7 +1542,9 @@ def _parse_compute_analysis_json(raw: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-async def _call_compute_analysis_llm(api_key: str, prompt: str) -> dict[str, Any] | None:
+async def _call_compute_analysis_llm(
+    api_key: str, prompt: str
+) -> dict[str, Any] | None:
     """Call the Anthropic API for the analysis, with a single JSON-parse retry.
 
     Returns the parsed JSON object on success, or ``None`` on a persistent parse
@@ -1402,9 +1571,7 @@ async def _call_compute_analysis_llm(api_key: str, prompt: str) -> dict[str, Any
             return data
         except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
             if attempt == 0:
-                logger.info(
-                    "[COMPUTE] analysis parse error %s, retrying once", exc
-                )
+                logger.info("[COMPUTE] analysis parse error %s, retrying once", exc)
                 continue
             logger.info(
                 "[COMPUTE] analysis parse error on retry, using deterministic fallback"
@@ -1485,9 +1652,7 @@ async def _analyze_compute_experiment_with_llm(
     if not isinstance(raw_citations, list):
         return None, "llm-error"
     grounded = [
-        c.strip()
-        for c in raw_citations
-        if isinstance(c, str) and c.strip() in allowed
+        c.strip() for c in raw_citations if isinstance(c, str) and c.strip() in allowed
     ]
     usable = [c for c in grounded if _is_usable_citation(c)]
     # Defence-in-depth: require at least one usable citation AND that at least one
@@ -1505,9 +1670,7 @@ async def _analyze_compute_experiment_with_llm(
     if not summary.strip() or not body.strip():
         return None, "llm-error"
     title = (
-        str(document.get("title"))[:500]
-        if document.get("title")
-        else fallback["title"]
+        str(document.get("title"))[:500] if document.get("title") else fallback["title"]
     )
 
     verdict_record = dict(fallback["verdict_record"])
@@ -1543,7 +1706,9 @@ async def _analyze_compute_experiment_with_llm(
 _ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "llm": 1}
 
 
-def _incoming_mode_is_upgrade(existing_doc: KnowledgeDocument, incoming_mode: str) -> bool:
+def _incoming_mode_is_upgrade(
+    existing_doc: KnowledgeDocument, incoming_mode: str
+) -> bool:
     """True when ``incoming_mode`` is strictly stronger than the existing doc's mode.
 
     Reads ``analysis_mode`` from the existing doc's ``forward_quality_verdict``
@@ -1611,9 +1776,7 @@ async def _persist_compute_knowledge_document(
     verdict_record["knowledge_acceptance_evidence"] = acceptance[
         "knowledge_acceptance_evidence"
     ]
-    verdict_record["compute_acceptance_grade"] = acceptance[
-        "compute_acceptance_grade"
-    ]
+    verdict_record["compute_acceptance_grade"] = acceptance["compute_acceptance_grade"]
     verdict_record["compute_acceptance_reason"] = acceptance[
         "compute_acceptance_reason"
     ]
@@ -1681,9 +1844,7 @@ async def _persist_compute_knowledge_document(
         "citation_count": len(doc.source_citations or citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
         "analysis_mode": stored_verdict.get("analysis_mode", mode),
-        "knowledge_acceptance_evidence": acceptance[
-            "knowledge_acceptance_evidence"
-        ],
+        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
     }

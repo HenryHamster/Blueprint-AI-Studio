@@ -412,6 +412,9 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
                 "agreement",
                 "reason",
                 "sidecar_task_id",
+                "schema_version",
+                "source_task_id",
+                "produced_by",
             }
         }
     return trimmed
@@ -1847,6 +1850,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             return
 
+    # Separate direction proposals and notes from actionable findings — these are processed
+    # separately and must not enter the hash-based deduplication loop (they never create tasks,
+    # so their hashes would never be stored, allowing identical entries to accumulate).
+    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
+    direction_notes = [f for f in findings if f.get("type") == "direction_note"]
+    findings = [
+        f
+        for f in findings
+        if f.get("type") not in ("direction_proposal", "direction_note")
+    ]
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
@@ -2066,23 +2079,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # refute-first per-finding adversarial challenger. The source parks
     # EVALUATING until the challenger returns, then re-enters this handler with
     # ADVERSARIAL_GATE_VERDICT_KEY in context. On re-entry the per-finding
-    # verdicts are stamped onto findings below, and the spawn loop defers any
-    # finding marked failed (not dropped — deferred to the next cycle).
+    # verdicts are stamped onto the findings actually challenged below, and the
+    # spawn loop defers any finding marked failed (not dropped — deferred to the
+    # next cycle).
     # FAIL-OPEN: a crashed or absent grader writes no failing verdicts, so the
     # gate never blocks spawning on infrastructure failure. Low-stakes findings
     # keep the cheap synchronous path and are never escalated.
+    _spawn_gate_challenged_count = 0
+    _spawn_gate_refuted_count = 0
+    _spawn_gate_survived_count = 0
+    _spawn_gate_findings: list[dict] = []
     if _adversarial_verdict_raw is None and _runtime_config.get(
         "adversarial_spawn_gate_enabled", True
     ):
-        _high_stakes = [f for f in findings if _is_high_stakes_finding(f)]
-        if _high_stakes:
+        _spawn_gate_findings = [f for f in findings if _is_high_stakes_finding(f)]
+        if _spawn_gate_findings:
             # Build a compact payload for the adversarial grader: include hash
             # identifiers so the per-finding verdict response can be matched back.
             from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
 
             _hs_with_hash = []
-            for _f in _high_stakes:
-                _h = _fh(str(_f.get("title", "")), str(_f.get("description", "") or _f.get("prompt", "")))
+            for _f in _spawn_gate_findings:
+                _h = _fh(
+                    str(_f.get("title", "")),
+                    str(_f.get("description", "") or _f.get("prompt", "")),
+                )
                 _hs_with_hash.append({**_f, "hash": _h})
             adv_grader = await spawn_forward_quality_grader(
                 task,
@@ -2110,23 +2131,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "(grader %s, %d high-stakes finding(s))",
                     task.id,
                     adv_grader.id,
-                    len(_high_stakes),
+                    len(_spawn_gate_findings),
                 )
                 return
 
     # Adversarial re-entry: stamp per-finding verdicts so the spawn loop can
     # skip challenged-and-failed findings. The gate is fail-open: any finding
     # whose hash is absent from the verdict dict was passed by default.
-    _spawn_gate_challenged_count = 0
-    _spawn_gate_refuted_count = 0
-    _spawn_gate_survived_count = 0
     if _adversarial_verdict_raw is not None:
         _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
         from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
 
-        for _f in findings:
+        _spawn_gate_findings = [f for f in findings if _is_high_stakes_finding(f)]
+        for _f in _spawn_gate_findings:
             _fhash = _fh(
                 str(_f.get("title", "")),
                 str(_f.get("description", "") or _f.get("prompt", "")),
@@ -2150,26 +2169,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _f["_adversarial_verdict"] = "fail"
             _f["_adversarial_verdict_reason"] = _reason
             _f["_adversarial_verdict_explicit"] = _explicit
-        _spawn_gate_challenged_count = sum(
-            1 for _f in findings if _is_high_stakes_finding(_f)
-        )
+        _spawn_gate_challenged_count = len(_spawn_gate_findings)
         _spawn_gate_refuted_count = sum(
-            1 for _f in findings if _f.get("_adversarial_verdict") == "fail"
+            1 for _f in _spawn_gate_findings if _f.get("_adversarial_verdict") == "fail"
         )
         _spawn_gate_survived_count = (
             _spawn_gate_challenged_count - _spawn_gate_refuted_count
         )
 
-    # Separate direction proposals and notes from actionable findings — these are processed
-    # separately and must not enter the hash-based deduplication loop (they never create tasks,
-    # so their hashes would never be stored, allowing identical entries to accumulate).
-    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
-    direction_notes = [f for f in findings if f.get("type") == "direction_note"]
-    findings = [
-        f
-        for f in findings
-        if f.get("type") not in ("direction_proposal", "direction_note")
-    ]
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
     from app import shared_state as _ss  # noqa: PLC0415
     from app import max_plan_pool as _pool_mod  # noqa: PLC0415
@@ -4783,3 +4790,71 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             f"[RESEARCH] Recorded failed research task {task.id} on direction "
             f"{direction_id} ({failure_category})"
         )
+
+
+_BOUNDED_CHALLENGE_SURFACE_KEYS: frozenset = frozenset(
+    {
+        "challenged_boundary",
+        "first_verdict",
+        "second_opinion_verdict",
+        "agreement",
+        "reason",
+        "sidecar_task_id",
+    }
+)
+
+
+def resolve_research_findings_for_surface(
+    plan_output: Optional[List[Any]],
+    artifact_logs: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """Return the canonical challenge-enriched finding list for surface rendering.
+
+    Prefers task.plan_output (which carries attached finding_challenge records)
+    over the legacy RESEARCH_FINDINGS artifact log stream (written at agent-
+    submission time, before challenge resolution). Falls back to parsing
+    artifact_logs for tasks that completed before challenge records were added.
+
+    The finding_challenge record on each returned finding is bounded to
+    {challenged_boundary, first_verdict, second_opinion_verdict, agreement,
+    reason, sidecar_task_id} so consumers receive a stable, bounded contract.
+    Findings without a challenge record are returned unchanged.
+
+    Returns None when neither source yields a non-empty list of dicts.
+    """
+
+    def _trim_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
+        challenge = finding.get(_FINDING_CHALLENGE_RECORD_KEY)
+        if not isinstance(challenge, dict):
+            return finding
+        bounded = {k: v for k, v in challenge.items() if k in _BOUNDED_CHALLENGE_SURFACE_KEYS}
+        if bounded == challenge:
+            return finding
+        out = dict(finding)
+        out[_FINDING_CHALLENGE_RECORD_KEY] = bounded
+        return out
+
+    # Prefer plan_output: non-empty list of dicts carries challenge records
+    if isinstance(plan_output, list) and plan_output:
+        findings = [f for f in plan_output if isinstance(f, dict)]
+        if findings:
+            return [_trim_finding(f) for f in findings]
+
+    # Fall back to artifact logs; support both [list] and {"logs": [...]} shapes
+    if artifact_logs:
+        try:
+            parsed = json.loads(artifact_logs[:100000])
+            if isinstance(parsed, list):
+                findings = [f for f in parsed if isinstance(f, dict)]
+                if findings:
+                    return findings
+            elif isinstance(parsed, dict):
+                inner = parsed.get("logs", [])
+                if isinstance(inner, list):
+                    findings = [f for f in inner if isinstance(f, dict)]
+                    if findings:
+                        return findings
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    return None

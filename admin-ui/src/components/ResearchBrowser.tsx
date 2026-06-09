@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
-import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2 } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2, GitBranch } from 'lucide-react';
 import type { ResearchFinding } from './TaskCard';
+import type { FindingChallenge } from '../types/task';
 import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
@@ -121,6 +122,53 @@ function classifySourceRef(ref: string, repoUrl: string | null): SourceLink {
     }
   }
   return { kind: 'text', label: ref };
+}
+
+const AGREEMENT_STYLES: Record<string, { label: string; cls: string }> = {
+  agrees: { label: 'Confirmed', cls: 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40' },
+  disagrees: { label: 'Challenged', cls: 'bg-red-900/40 text-red-400 border-red-700/40' },
+  indeterminate: { label: 'Indeterminate', cls: 'bg-neutral-800 text-neutral-400 border-neutral-700/40' },
+};
+
+function ChallengePanel({ challenge, onNavigateToTask }: { challenge: FindingChallenge; onNavigateToTask?: (id: string) => void }) {
+  const agreement = challenge.agreement ?? 'indeterminate';
+  const style = AGREEMENT_STYLES[agreement] ?? AGREEMENT_STYLES.indeterminate;
+  return (
+    <div className="mt-1.5 border border-neutral-800 rounded p-2 space-y-1 bg-neutral-900/40">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <GitBranch className="w-3 h-3 text-neutral-500 shrink-0" />
+        <span className="text-[10px] uppercase tracking-wide text-neutral-500">Second opinion</span>
+        <span className={`text-[10px] border px-1.5 py-0.5 rounded font-medium ${style.cls}`}>{style.label}</span>
+        {challenge.challenged_boundary && (
+          <span className="text-[10px] text-neutral-500">on <span className="font-mono text-neutral-400">{challenge.challenged_boundary}</span></span>
+        )}
+      </div>
+      {challenge.second_opinion_verdict && (
+        <div className="text-[10px] text-neutral-400">
+          <span className="text-neutral-600">Second verdict:</span> {challenge.second_opinion_verdict}
+        </div>
+      )}
+      {challenge.reason && (
+        <div className="text-[10px] text-neutral-400 leading-relaxed">{challenge.reason}</div>
+      )}
+      {challenge.sidecar_task_id && (
+        <div className="text-[10px] text-neutral-500 flex items-center gap-1">
+          <span>Challenger task:</span>
+          {onNavigateToTask ? (
+            <button
+              data-viewport-allow-small-target
+              onClick={e => { e.stopPropagation(); onNavigateToTask(challenge.sidecar_task_id ?? ''); }}
+              className="font-mono text-cyan-500 hover:text-cyan-300 transition-colors"
+            >
+              {challenge.sidecar_task_id.slice(0, 8)}…
+            </button>
+          ) : (
+            <span className="font-mono">{challenge.sidecar_task_id.slice(0, 8)}…</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl: string | null }) {
@@ -746,6 +794,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 <OutcomeSummaryPills summary={ef.outcome.evaluationSummary} />
                               )}
                               <EvidencePanel finding={ef.finding} repoUrl={repoUrl} />
+                              {ef.finding.finding_challenge && (
+                                <ChallengePanel challenge={ef.finding.finding_challenge} onNavigateToTask={onNavigateToTask} />
+                              )}
                               {/* Downstream task chain */}
                               {ef.outcome && (
                                 <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">

@@ -8,6 +8,14 @@ from httpx import AsyncClient
 from app.models import (
     TaskStatus,
 )
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 from testing.factories import make_project, make_task, make_membership, _utcnow
 
 
@@ -1883,6 +1891,112 @@ async def test_digest_direction_progress_filter_funnel(client: AsyncClient, db_s
     assert pff["hash_dedup"] == 2
     assert pff["batch_cap"] == 2
     assert pff["tasks_created"] == 5
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_challenge_summary(
+    client: AsyncClient, db_session
+):
+    """finding_challenge_summary aggregates bounded in-window challenge telemetry."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction 1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "finding_challenge_summary": {
+                            "challenged_findings": 2,
+                            "agreement_distribution": {
+                                CHALLENGE_AGREES: 1,
+                                CHALLENGE_DISAGREES: 0,
+                                CHALLENGE_INDETERMINATE: 1,
+                            },
+                            "boundary_distribution": {
+                                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+                                CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+                                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 0,
+                            },
+                            "fail_closed_unparseable": 1,
+                        },
+                    },
+                    {
+                        "timestamp": recent_ts,
+                        "finding_challenge_summary": {
+                            "challenged_findings": 1,
+                            "agreement_distribution": {
+                                CHALLENGE_AGREES: 0,
+                                CHALLENGE_DISAGREES: 1,
+                                CHALLENGE_INDETERMINATE: 0,
+                            },
+                            "boundary_distribution": {
+                                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 0,
+                                CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 0,
+                                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+                            },
+                            "fail_closed_unparseable": 0,
+                        },
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "finding_challenge_summary": {
+                            "challenged_findings": 99,
+                            "agreement_distribution": {
+                                CHALLENGE_AGREES: 99,
+                                CHALLENGE_DISAGREES: 99,
+                                CHALLENGE_INDETERMINATE: 99,
+                            },
+                            "boundary_distribution": {
+                                CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 99,
+                                CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 99,
+                                CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 99,
+                            },
+                            "fail_closed_unparseable": 99,
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    summary = data["direction_progress"][0]["finding_challenge_summary"]
+    assert summary == {
+        "challenged_findings": 3,
+        "agreement_distribution": {
+            CHALLENGE_AGREES: 1,
+            CHALLENGE_DISAGREES: 1,
+            CHALLENGE_INDETERMINATE: 1,
+        },
+        "boundary_distribution": {
+            CHALLENGE_BOUNDARY_REPRODUCE_ABSENT: 1,
+            CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY: 1,
+            CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH: 1,
+        },
+        "fail_closed_unparseable": 1,
+    }
 
 
 @pytest.mark.asyncio

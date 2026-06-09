@@ -134,6 +134,13 @@ export interface DirectionPortfolio {
   composition: DirectionPortfolioCompositionEntry[];
 }
 
+export interface DirectionFindingChallengeSummary {
+  challenged_findings: number;
+  agreement_distribution: { agrees?: number; disagrees?: number; indeterminate?: number };
+  boundary_distribution: { reproduce_absent?: number; low_actionability_decay?: number; reproduce_indeterminate_dispatch?: number };
+  fail_closed_unparseable?: number;
+}
+
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
 
 /**

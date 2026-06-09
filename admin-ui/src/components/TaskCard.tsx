@@ -449,6 +449,17 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
         {items.map((f, i) => (
           <div key={i} className="text-neutral-300">
             <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+            {f.finding_challenge && (
+              <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 border ${
+                f.finding_challenge.agreement === 'agrees' ? 'bg-emerald-900/30 text-emerald-500 border-emerald-700/30' :
+                f.finding_challenge.agreement === 'disagrees' ? 'bg-red-900/30 text-red-400 border-red-700/30' :
+                'bg-neutral-800 text-neutral-500 border-neutral-700/30'
+              }`} title={f.finding_challenge.reason}>
+                {f.finding_challenge.agreement === 'agrees' ? '✓ confirmed' :
+                 f.finding_challenge.agreement === 'disagrees' ? '✗ challenged' :
+                 '? indeterminate'}
+              </span>
+            )}
             {f.title}
             {expanded && f.description ? (
               <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>

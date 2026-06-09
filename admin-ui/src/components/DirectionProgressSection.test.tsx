@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 
 import { DirectionProgressSection, type DirectionProgress } from './DirectionProgressSection';
 
@@ -37,6 +37,19 @@ describe('DirectionProgressSection proof split', () => {
 
     expect(screen.queryByText('0 proven')).not.toBeInTheDocument();
     expect(screen.queryByText('0 consumed')).not.toBeInTheDocument();
+  });
+});
+
+describe('DirectionProgressSection challenge telemetry', () => {
+  it('renders bounded challenge telemetry and hides empty/absent payloads', () => {
+    const { rerender } = render(<DirectionProgressSection directions={[makeDirection({ finding_challenge_summary: { challenged_findings: 3, agreement_distribution: { agrees: 1, disagrees: 1, indeterminate: 1 }, boundary_distribution: { reproduce_absent: 2, low_actionability_decay: 1, reproduce_indeterminate_dispatch: 0 }, fail_closed_unparseable: 1 } })]} />);
+    fireEvent.click(screen.getByRole('button', { name: /improve proof visibility/i }));
+    expect(screen.getByText(/Challenge: 3 findings/)).toBeInTheDocument();
+    expect(screen.getByText(/boundaries: reproduce_absent 2 · low_actionability_decay 1/)).toBeInTheDocument();
+    expect(screen.getByText(/confirmed\/not-confirmed\/indeterminate: 1\/1\/1/)).toBeInTheDocument();
+    expect(screen.getByText(/fail-closed 1/)).toBeInTheDocument();
+    rerender(<DirectionProgressSection directions={[makeDirection({ finding_challenge_summary: null }), makeDirection({ direction_id: 'dir-2', finding_challenge_summary: { challenged_findings: 0, agreement_distribution: { agrees: 0, disagrees: 0, indeterminate: 0 }, boundary_distribution: { reproduce_absent: 0, low_actionability_decay: 0, reproduce_indeterminate_dispatch: 0 }, fail_closed_unparseable: 0 } })]} />);
+    expect(screen.queryByText(/Challenge:/)).toBeNull();
   });
 });
 

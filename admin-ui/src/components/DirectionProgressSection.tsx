@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
+import type { DirectionFindingChallengeSummary } from '../types/digest';
 import {
   hasNonCodeMergeOutcomes,
   healthRateColorClass,
@@ -87,6 +88,7 @@ export interface DirectionProgress {
     batch_cap?: number;
     tasks_created?: number;
   } | null;
+  finding_challenge_summary?: DirectionFindingChallengeSummary | null;
   research_spawn_gate?: {
     challenged_count?: number;
     refuted_count?: number;
@@ -514,6 +516,22 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                       Review feedback: {parts.join(' · ')}
                     </span>
                   );
+                })()}
+                {(() => {
+                  const ch = dp.finding_challenge_summary;
+                  if (!ch) return null;
+                  const challenged = ch.challenged_findings ?? 0;
+                  const agrees = ch.agreement_distribution?.agrees ?? 0;
+                  const disagrees = ch.agreement_distribution?.disagrees ?? 0;
+                  const indeterminate = ch.agreement_distribution?.indeterminate ?? 0;
+                  const boundaries: { name: string; count: number }[] = [
+                    { name: 'reproduce_absent', count: ch.boundary_distribution?.reproduce_absent ?? 0 },
+                    { name: 'low_actionability_decay', count: ch.boundary_distribution?.low_actionability_decay ?? 0 },
+                    { name: 'reproduce_indeterminate_dispatch', count: ch.boundary_distribution?.reproduce_indeterminate_dispatch ?? 0 },
+                  ].filter(boundary => boundary.count > 0);
+                  const failClosed = ch.fail_closed_unparseable ?? 0;
+                  if (!challenged && !agrees && !disagrees && !indeterminate && boundaries.length === 0 && !failClosed) return null;
+                  return <span className="text-[9px] text-neutral-500">Challenge: {challenged} findings{boundaries.length > 0 ? ` · boundaries: ${boundaries.map(boundary => `${boundary.name} ${boundary.count}`).join(' · ')}` : ''}{` · confirmed/not-confirmed/indeterminate: ${agrees}/${disagrees}/${indeterminate}`}{failClosed > 0 ? ` · fail-closed ${failClosed}` : ''}</span>;
                 })()}
                 {(() => {
                   const ff = dp.filter_funnel;

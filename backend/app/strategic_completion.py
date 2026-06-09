@@ -1405,6 +1405,12 @@ def format_findings_for_prompt(
             line += f" | claims: {'; '.join(claims)}"
         if refs:
             line += f" | sources: {', '.join(refs)}"
+        challenge_summary = r.get("challenge_summary")
+        if isinstance(challenge_summary, dict):
+            agreement = challenge_summary.get("agreement") or "indeterminate"
+            second_verdict = challenge_summary.get("second_opinion_verdict") or ""
+            token = f"{agreement}/{second_verdict}" if second_verdict else agreement
+            line += f" | challenge: {token}"
         lines.append(line)
     return "\n".join(lines)
 

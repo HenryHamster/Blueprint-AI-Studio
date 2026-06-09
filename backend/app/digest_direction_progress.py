@@ -18,12 +18,64 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.models import Project, Task, TaskStatus
+from app.task_evaluators import (
+    CHALLENGE_AGREES,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
 # Task types that never open a PR. These are excluded from the
 # conversion_rate denominator so the metric means the same thing on every
 # surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
 PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
+_CHALLENGE_BOUNDARY_BUCKETS = (
+    CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+    CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+    CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH,
+)
+_CHALLENGE_AGREEMENT_BUCKETS = (
+    CHALLENGE_AGREES,
+    CHALLENGE_DISAGREES,
+    CHALLENGE_INDETERMINATE,
+)
+
+
+def _empty_finding_challenge_summary() -> dict[str, Any]:
+    return {
+        "challenged_findings": 0,
+        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
+        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "fail_closed_unparseable": 0,
+    }
+
+
+def _add_count(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    target["challenged_findings"] += _add_count(source.get("challenged_findings"))
+    target["fail_closed_unparseable"] += _add_count(
+        source.get("fail_closed_unparseable")
+    )
+    source_agreements = source.get("agreement_distribution") or {}
+    if isinstance(source_agreements, dict):
+        for key in _CHALLENGE_AGREEMENT_BUCKETS:
+            target["agreement_distribution"][key] += _add_count(
+                source_agreements.get(key)
+            )
+    source_boundaries = source.get("boundary_distribution") or {}
+    if isinstance(source_boundaries, dict):
+        for key in _CHALLENGE_BOUNDARY_BUCKETS:
+            target["boundary_distribution"][key] += _add_count(
+                source_boundaries.get(key)
+            )
 
 
 def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
@@ -214,6 +266,7 @@ async def compute_direction_progress(
         dir_findings_produced = 0
         dir_batch_cap_applied = 0
         dir_filter_breakdown_agg: Dict[str, int] = {}
+        dir_challenge_summary = _empty_finding_challenge_summary()
         dq_plans = 0
         dq_merge_rate_sum = 0.0
         dq_merge_rate_count = 0
@@ -272,6 +325,9 @@ async def compute_direction_progress(
                     dir_filter_breakdown_agg[_fk] = dir_filter_breakdown_agg.get(
                         _fk, 0
                     ) + (_fv or 0)
+                _merge_finding_challenge_summary(
+                    dir_challenge_summary, entry.get("finding_challenge_summary")
+                )
                 atm = entry.get("avg_time_to_merge_hours")
                 if atm is not None:
                     merge_time_values.append(float(atm))
@@ -674,6 +730,12 @@ async def compute_direction_progress(
                 "tasks_created": findings_tasks_created,
             }
 
+        finding_challenge_summary = (
+            dir_challenge_summary
+            if dir_challenge_summary["challenged_findings"] > 0
+            else None
+        )
+
         for _sk, _agg in dir_scope_agg.items():
             for _field in (
                 "avg_expansion_ratio_merged",
@@ -830,6 +892,7 @@ async def compute_direction_progress(
                     "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
                     "filter_funnel": filter_funnel,
+                    "finding_challenge_summary": finding_challenge_summary,
                     "decomposition_summary": decomposition_summary,
                     "first_attempt_success_rate": dir_fa_rate,
                     "first_attempt_sample_size": dir_fa_sample_size,

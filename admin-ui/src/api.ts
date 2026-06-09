@@ -1703,6 +1703,13 @@ export async function fetchRecentFindings(
   return res.json();
 }
 
+export interface ChallengeSummary {
+  challenged_boundary: string | null;
+  agreement: 'agrees' | 'disagrees' | 'indeterminate';
+  second_opinion_verdict: string | null;
+  reason: string;
+}
+
 export interface ProjectFinding {
   task_id: string;
   direction_id: string | null;
@@ -1713,6 +1720,7 @@ export interface ProjectFinding {
   actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
   claims: string[];
   sources: Array<{ ref: string; type?: string | null; excerpt?: string | null }>;
+  challenge_summary?: ChallengeSummary | null;
 }
 
 export interface ProjectFindingsResponse {
@@ -2224,6 +2232,58 @@ export interface KnowledgeCitationRecord {
 
 export type KnowledgeCitation = string | KnowledgeCitationRecord;
 
+/** Origin provenance state for a knowledge document's producing task (backend
+ *  `serialize_origin_provenance`). `research_finding` documents were spawned from a
+ *  research finding (and may carry a challenge); `not_research_finding_derived`
+ *  documents came from a non-finding source; `legacy_unknown` documents predate the
+ *  provenance contract. `string` keeps it forward-compatible. */
+export type KnowledgeOriginState =
+  | 'research_finding'
+  | 'not_research_finding_derived'
+  | 'legacy_unknown'
+  | string;
+
+/** Second-opinion decision on the originating research finding (backend
+ *  `_challenge_state`). `challenger_confirmed` / `overturned` /
+ *  `indeterminate_fail_closed` describe the resolved challenge; `unchallenged` means
+ *  a finding origin with no challenge; `not_applicable` / `legacy_unknown` mean the
+ *  challenge axis does not apply. */
+export type KnowledgeChallengeState =
+  | 'unchallenged'
+  | 'challenger_confirmed'
+  | 'overturned'
+  | 'indeterminate_fail_closed'
+  | 'not_applicable'
+  | 'legacy_unknown'
+  | string;
+
+/** Bounded second-opinion decision record for the originating research finding. */
+export interface KnowledgeFindingChallenge {
+  challenged_boundary?: string | null;
+  first_verdict?: string | null;
+  second_opinion_verdict?: string | null;
+  agreement?: 'agrees' | 'disagrees' | 'indeterminate' | string | null;
+  reason?: string | null;
+  sidecar_task_id?: string | null;
+  [key: string]: unknown;
+}
+
+/** Durable, bounded origin provenance attached by the backend to design /
+ *  web_research knowledge documents. All fields optional/nullable so legacy
+ *  documents and older backend responses (where the object is absent) render
+ *  cleanly. */
+export interface KnowledgeOriginProvenance {
+  origin_state?: KnowledgeOriginState;
+  research_task_id?: string | null;
+  parent_research_task_id?: string | null;
+  finding_index?: number | null;
+  finding_hash?: string | null;
+  direction_id?: string | null;
+  challenge_state?: KnowledgeChallengeState | null;
+  finding_challenge?: KnowledgeFindingChallenge | null;
+  [key: string]: unknown;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -2253,6 +2313,11 @@ export interface KnowledgeDocument {
   knowledge_acceptance_evidence?: boolean;
   compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
   compute_acceptance_reason?: string;
+  /** Durable origin provenance (backend `serialize_origin_provenance`): whether the
+   *  producing task came from a research finding, and the second-opinion decision that
+   *  allowed or rejected its dispatch. Absent on older backend responses — treat a
+   *  missing object as legacy/unknown. */
+  origin_provenance?: KnowledgeOriginProvenance | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -2267,7 +2332,7 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
@@ -2275,6 +2340,9 @@ export async function fetchKnowledgeDocuments(
   if (params?.tag) sp.set('tag', params.tag);
   if (params?.direction) sp.set('direction', params.direction);
   if (params?.source_kind) sp.set('source_kind', params.source_kind);
+  if (params?.origin_state) sp.set('origin_state', params.origin_state);
+  if (params?.challenge_state) sp.set('challenge_state', params.challenge_state);
+  if (params?.finding_hash) sp.set('finding_hash', params.finding_hash);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();
