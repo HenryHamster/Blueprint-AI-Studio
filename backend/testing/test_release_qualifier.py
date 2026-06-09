@@ -4796,6 +4796,146 @@ async def test_finalize_challenge_matches_nonverbatim_challenger_summary(
 
 
 @pytest.mark.asyncio
+async def test_challenger_refuted_finding_excluded_from_audit_score(
+    db_session, mocker
+):
+    """Acceptance criterion: a challenger-refuted HIGH finding does not deduct
+    from the audit sub-score and is recorded in challenger_refuted_audit_findings.
+    Fail-closed companion: when the challenge is absent, the deduction stands.
+
+    Part 1 — refuted path: audit reports one verified HIGH finding; the
+    independent challenge marks it refuted_false_positive.  The audit sub-score
+    must be 1.0 (no deduction) and the finding must appear in
+    challenger_refuted_audit_findings with its auditable reason.
+
+    Part 2 — fail-closed path: same audit finding, but no challenge artifact
+    seeded.  The qualifier must HOLD as infra_failure (audit_challenge_missing)
+    so the deduction is not silently erased.
+    """
+    from app import shared_state
+
+    # ── Part 1: refuted finding → no deduction, recorded as challenger-refuted ──
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Unvalidated redirect in OAuth callback handler.",
+                    "file": "app/oauth.py",
+                    "verification_note": "Reviewed callback handler — no destination validation.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "high",
+                "summary": "Unvalidated redirect in OAuth callback handler.",
+                "file": "app/oauth.py",
+                "verdict": "refuted_false_positive",
+                "reason": "The destination is validated by the allow-list middleware — auditor missed it.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", (
+        f"Expected dry_run but got {result['status']} (error={result.get('error')!r})"
+    )
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # Refuted finding must NOT deduct → audit_score is 1.0.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01), (
+        f"Expected audit score 1.0 but got {lq['sub_scores']['audit']} — "
+        "refuted finding should not deduct"
+    )
+    # Must be recorded in challenger_refuted_audit_findings with auditable reason.
+    refuted = lq.get("challenger_refuted_audit_findings", [])
+    assert len(refuted) == 1, f"Expected 1 refuted finding, got {refuted!r}"
+    assert refuted[0]["severity"] == "high"
+    assert "allow-list" in refuted[0]["challenger_reason"].lower() or "allow_list" in refuted[0]["challenger_reason"].lower() or "middleware" in refuted[0]["challenger_reason"].lower()
+    # Must NOT appear in excluded_audit_findings (different exclusion concept).
+    excluded = lq.get("excluded_audit_findings", [])
+    assert not any("oauth" in f.get("summary", "").lower() or "redirect" in f.get("summary", "").lower() for f in excluded)
+
+    # ── Part 2: absent challenge → fail-closed, deduction preserved ──
+    project2, version2 = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project2,
+        version2,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Unvalidated redirect in OAuth callback handler.",
+                    "file": "app/oauth.py",
+                    "verification_note": "Reviewed callback handler — no destination validation.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # No challenge artifact seeded — challenge_task_id absent from last_qualification.
+    version2.last_qualification = {
+        **(version2.last_qualification or {}),
+        "candidate_sha": _CANDIDATE_SHA,
+    }
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result2 = await rq._finalize_qualification(db_session, version2)
+    await db_session.commit()
+
+    # Must hold as infra_failure — no silent erasure of the deduction.
+    assert result2["status"] == "infra_failure", (
+        f"Expected infra_failure (fail-closed) but got {result2['status']}"
+    )
+    assert result2.get("error") in {"audit_challenge_missing", "audit_challenge_sha_mismatch"}
+    promote_spy.assert_not_called()
+    await db_session.refresh(version2)
+    assert version2.phase == "stabilize"
+
+
+@pytest.mark.asyncio
 async def test_finalize_apply_gate_ok_does_not_block_promotion(db_session, mocker):
     """When the apply gate returns 'ok' (the autouse default) qualification
     proceeds normally — the new dimension is inert on a clean candidate and the
