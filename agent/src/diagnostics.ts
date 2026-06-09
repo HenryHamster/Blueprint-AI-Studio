@@ -60,7 +60,7 @@ export function traceHeartbeat(
   attemptKind: 'initial' | 'periodic' | 'retry-409' | 'sync',
   startMs: number,
   endMs: number,
-  status: 'ok' | 'err' | 'skip-in-flight',
+  status: 'ok' | 'err' | 'skip-in-flight' | 'reclaim-wedged',
   detail?: string,
 ): void {
   const dur = endMs - startMs;
