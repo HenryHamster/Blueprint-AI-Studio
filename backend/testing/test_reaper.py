@@ -7267,32 +7267,32 @@ class TestMarkLandedParentDependents:
 
 # ── Step 12: BLOCKED-task auto-unblock / escalation sweep ─────────────────────
 
-from app.reaper_sweeps import (  # noqa: E402
+from app.reaper_sweeps import (
     sweep_unblock_blocked_tasks,
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
 )
-from app.time_utils import _utcnow  # noqa: E402
+from app.time_utils import _utcnow
 
 
 async def _blocked_task(db, project, **kwargs):
-    defaults = dict(
-        project_id=project.id,
-        title="blocked-unit",
-        description="x",
-        status=TaskStatus.BLOCKED,
-        created_by="test-user",
-        requires_approval=False,
-        payloads=[{"type": "fix"}],
-        context={},
-        status_log=[],
-        blocker_kind="file_conflict",
-        blocked_reason="Waiting: file conflict on a.py",
-        blocked_at=_utcnow(),
-        recheck_after=_utcnow() - timedelta(minutes=1),  # due
-    )
+    defaults = {
+        "project_id": project.id,
+        "title": "blocked-unit",
+        "description": "x",
+        "status": TaskStatus.BLOCKED,
+        "created_by": "test-user",
+        "requires_approval": False,
+        "payloads": [{"type": "fix"}],
+        "context": {},
+        "status_log": [],
+        "blocker_kind": "file_conflict",
+        "blocked_reason": "Waiting: file conflict on a.py",
+        "blocked_at": _utcnow(),
+        "recheck_after": _utcnow() - timedelta(minutes=1),  # due
+    }
     defaults.update(kwargs)
     t = Task(**defaults)
     db.add(t)
@@ -8917,6 +8917,147 @@ async def test_unblock_sweep_resumes_research_prerequisite_when_foundation_lande
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resumes_capability_need_registry_marks_working(
+    reaper_db, mocker
+):
+    """A dependent BLOCKED on a capability need that the project's problem_model
+    registry already declares ``working`` resumes with no edge: the capability
+    exists in the codebase itself, so no provider task will ever advertise it —
+    without the registry step the need sits residual until the escalation
+    deadline for work that was runnable all along."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    project.problem_model = {
+        "capabilities": [
+            {"name": "Budgeted compute job substrate", "status": "working"},
+        ]
+    }
+    reaper_db.add(project)
+    await reaper_db.commit()
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="foundation capability:budgeted-compute-job-substrate",
+        reason="Finding declared 1 unresolved prerequisite(s)",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        need={"kind": "capability", "ref": "budgeted-compute-job-substrate"},
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert not (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_working_capability_trumps_dead_provider(
+    reaper_db, mocker
+):
+    """The registry step runs BEFORE the dead-foundation check: a stale terminal
+    task that once advertised a capability the registry now declares ``working``
+    must not cancel the dependent — the capability survives the provider."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    project.problem_model = {
+        "capabilities": [
+            {"name": "budgeted-compute-job-substrate", "status": "working"},
+        ]
+    }
+    reaper_db.add(project)
+    await reaper_db.commit()
+    now = _utcnow()
+    dead_provider = Task(
+        project_id=project.id, title="old substrate build", description="x",
+        status=TaskStatus.FAILED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "budgeted-compute-job-substrate"},
+        status_log=[],
+    )
+    reaper_db.add(dead_provider)
+    await reaper_db.commit()
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="foundation capability:budgeted-compute-job-substrate",
+        reason="Finding declared 1 unresolved prerequisite(s)",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        need={"kind": "capability", "ref": "budgeted-compute-job-substrate"},
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED, (
+        "a working registry capability must rescue the need before the "
+        "dead-foundation path can cancel the dependent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_capability_need_without_registry_stays_blocked(
+    reaper_db, mocker
+):
+    """Control: a capability need with NO registry entry (and no provider task)
+    keeps gating exactly as before — the registry step is a bypass only for
+    declared-working capabilities."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="foundation capability:not-yet-built-substrate",
+        reason="Finding declared 1 unresolved prerequisite(s)",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        need={"kind": "capability", "ref": "not-yet-built-substrate"},
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_wires_recorded_need_alongside_existing_edge(
     reaper_db, mocker
 ):
@@ -10194,10 +10335,10 @@ async def test_full_reaper_cycle_does_not_reap_blocked_task(
 
 # ── Step 15: linked bug-class message convergence / resurfacing sweep ─────────
 
-from app.reaper_sweeps import sweep_converge_linked_bug_messages  # noqa: E402
-from app.models import MessageType, ProjectMessage  # noqa: E402
-from app.models import Direction  # noqa: E402
-from app.message_convergence import link_message_to_outcome  # noqa: E402
+from app.reaper_sweeps import sweep_converge_linked_bug_messages
+from app.models import MessageType, ProjectMessage
+from app.models import Direction
+from app.message_convergence import link_message_to_outcome
 
 
 async def _make_bug_message(
@@ -10870,7 +11011,7 @@ async def test_spawn_converge_refuses_cycle_for_coordinated_siblings(reaper_db):
 
 # ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ───────
 
-from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages  # noqa: E402
+from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages
 
 
 async def _make_landed_task(db, project, *, status=TaskStatus.COMPLETED, landed=True):
@@ -11164,7 +11305,7 @@ async def test_open_owned_one_bad_row_does_not_abort_batch(reaper_db):
 
 # ── Step 18: negatively resolve OPEN bug-class messages confirmed stale on HEAD ─
 
-from app.reaper_sweeps import sweep_resolve_stale_open_bug_messages  # noqa: E402
+from app.reaper_sweeps import sweep_resolve_stale_open_bug_messages
 
 
 @pytest.mark.asyncio
@@ -11572,7 +11713,7 @@ async def test_migration_slot_contention_sweep_silent_with_no_waiters(reaper_db,
 
 # ── event_driven_unblock_dependents ──────────────────────────────────────────
 
-from app.reaper_sweeps import event_driven_unblock_dependents  # noqa: E402
+from app.reaper_sweeps import event_driven_unblock_dependents
 
 
 @pytest.mark.asyncio
@@ -12303,7 +12444,7 @@ async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monk
 #           need-less parked transient blockers re-evaluate and requeue when cleared
 #   Fix 3: recovery sweep resets already-parked transient blockers to bounded re-eval
 
-from app.reaper_sweeps import (  # noqa: E402
+from app.reaper_sweeps import (
     sweep_recover_stranded_transient_blockers,
     _BLOCKED_PARKED_REEVAL_INTERVAL,
     _TRANSIENT_BLOCKER_PARK_SENTINEL,
