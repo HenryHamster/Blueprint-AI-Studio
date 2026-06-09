@@ -72,27 +72,6 @@ function _synthesizeDispatcherMemo(
     directionId ? `direction:${directionId}` : null,
     sourceTaskId ? `task:${sourceTaskId}` : null,
   ].filter((x): x is string => x !== null);
-  if (reasoningKind === 'regression_false_positive') {
-    const verdictReason = sv(sf.verdict_reason);
-    if (!verdictReason) return null;
-    const parts = [`Verdict reason: ${verdictReason}`];
-    const invSummary = sv(sf.investigation_summary);
-    if (invSummary) parts.push(`Investigation summary: ${invSummary}`);
-    const rc = sv(sf.regression_class);
-    return { summary: verdictReason.slice(0, 200), reasoning: parts.join('\n\n'), citations: cite, tags: ['regression-false-positive', ...(rc ? [rc] : [])] };
-  }
-  if (reasoningKind === 'investigation_unactionable') {
-    const rootCause = sv(sf.root_cause);
-    const summary = sv(sf.summary);
-    if (!rootCause && !summary) return null;
-    const parts: string[] = [];
-    if (rootCause) parts.push(`Root cause: ${rootCause}`);
-    const fix = sv(sf.recommended_fix);
-    if (fix) parts.push(`Recommended fix: ${fix}`);
-    const outcome = sv(sf.outcome);
-    if (outcome) parts.push(`Outcome: ${outcome}`);
-    return { summary: summary.slice(0, 200) || `Investigation concluded: ${outcome}`, reasoning: parts.join('\n\n'), citations: cite, tags: ['investigation-unactionable', ...(outcome ? [outcome] : [])] };
-  }
   if (reasoningKind === 'direction_retirement') {
     const directionText = sv(sf.direction_text);
     const rationale = sv(sf.rationale);

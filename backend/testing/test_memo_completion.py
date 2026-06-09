@@ -21,7 +21,6 @@ from app.task_completion import (
     _handle_memo_completion,
     _normalize_memo,
     _parse_memo_output,
-    _synthesize_memo_from_source_finding,
     _try_recover_memo_from_parse_failure,
 )
 from testing.factories import make_project, make_task
@@ -431,35 +430,6 @@ async def test_apply_synthesized_memo_creates_completed_task_with_artifact(
     assert isinstance(task.plan_output, dict)
     assert task.plan_output["memo"]["summary"] == "Synthesized at spawn"
     assert task.plan_output["memo"]["tags"] == ["regression-false-positive"]
-
-
-def test_synthesize_memo_from_source_finding_regression_false_positive():
-    """_synthesize_memo_from_source_finding produces a valid memo dict for
-    regression_false_positive when verdict_reason is present."""
-    sf = {
-        "verdict_reason": "Pattern is a false positive: noise",
-        "investigation_summary": "Investigated 3 occurrences, all benign.",
-        "regression_class": "rate_limit",
-    }
-    result = _synthesize_memo_from_source_finding(
-        "regression_false_positive", sf, "task-abc"
-    )
-    assert result is not None
-    assert result["summary"] == sf["verdict_reason"][:200]
-    assert "rate_limit" in result["tags"]
-    assert "task:task-abc" in result["citations"]
-
-
-def test_synthesize_memo_from_source_finding_returns_none_without_key_data():
-    """Returns None when the required reasoning field is absent — falls back to VM."""
-    assert (
-        _synthesize_memo_from_source_finding("regression_false_positive", {}, "t-1")
-        is None
-    )
-    assert (
-        _synthesize_memo_from_source_finding("investigation_unactionable", {}, "t-2")
-        is None
-    )
 
 
 # ── _try_recover_memo_from_parse_failure ────────────────────────────────────

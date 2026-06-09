@@ -10,7 +10,7 @@ Covers:
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 - _record_remediation_outcome / _record_remediation_if_terminal: remediation
   outcome propagation
-- _synthesize_memo_from_source_finding, build_blueprint_pr_* helpers
+- build_blueprint_pr_* helpers
 """
 
 import json
@@ -40,7 +40,6 @@ from app.task_completion import (
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
-    _synthesize_memo_from_source_finding,
 )
 from app.models import PoolVmState, Task, TaskStatus
 from testing.factories import make_project, make_task
@@ -2246,68 +2245,6 @@ class TestReleasePoolMemberIfTerminal:
             assert member.state == PoolVmState.IDLE
         finally:
             shared_state.runtime_config["warm_pool_enabled"] = prev
-
-
-# ── _synthesize_memo_from_source_finding ────────────────────────────────────
-
-
-class TestSynthesizeMemoFromSourceFinding:
-    """Pure-function tests for the backend-side memo synthesis helper."""
-
-    def test_regression_false_positive_full_data(self):
-        sf = {
-            "verdict_reason": "design_doc says this is intentional",
-            "investigation_summary": "trace confirms the behavior",
-            "regression_class": "sr_catch_rate:correctness",
-        }
-        result = _synthesize_memo_from_source_finding(
-            "regression_false_positive", sf, "task-1"
-        )
-        assert result is not None
-        assert "design_doc" in result["summary"]
-        assert "trace confirms" in result["reasoning"]
-        assert "task:task-1" in result["citations"]
-        assert "regression-false-positive" in result["tags"]
-        assert "sr_catch_rate:correctness" in result["tags"]
-
-    def test_regression_false_positive_missing_verdict_reason_returns_none(self):
-        assert (
-            _synthesize_memo_from_source_finding("regression_false_positive", {}, "t")
-            is None
-        )
-
-    def test_investigation_unactionable_with_root_cause(self):
-        sf = {
-            "root_cause": "workers acquire locks in opposite order",
-            "summary": "deadlock in rollup coordinator",
-            "recommended_fix": "fix lock order",
-            "outcome": "structural",
-        }
-        result = _synthesize_memo_from_source_finding(
-            "investigation_unactionable", sf, "task-2"
-        )
-        assert result is not None
-        assert "workers acquire locks" in result["reasoning"]
-        assert "fix lock order" in result["reasoning"]
-        assert "investigation-unactionable" in result["tags"]
-        assert "structural" in result["tags"]
-        assert "task:task-2" in result["citations"]
-
-    def test_investigation_unactionable_missing_root_cause_and_summary_returns_none(
-        self,
-    ):
-        assert (
-            _synthesize_memo_from_source_finding(
-                "investigation_unactionable", {"outcome": "x"}, "t"
-            )
-            is None
-        )
-
-    def test_unknown_reasoning_kind_returns_none(self):
-        assert (
-            _synthesize_memo_from_source_finding("deferred_finding", {"body": "x"}, "t")
-            is None
-        )
 
 
 # ── _handle_plan_completion — scope-aware subtask effort ──────────────────────

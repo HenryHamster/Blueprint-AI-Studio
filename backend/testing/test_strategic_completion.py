@@ -10915,11 +10915,11 @@ async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_retirement_memo_empty_snapshot_stays_queued(db_session):
-    """A direction with no text, context, history, or rationale leaves the memo QUEUED.
+async def test_spawn_retirement_memo_empty_snapshot_completes_inline_no_vm(db_session):
+    """A direction with no text, context, history, or rationale still completes inline.
 
-    When the snapshot is entirely empty, there is no substantive context to synthesize
-    from, so the memo task must remain QUEUED for an agent VM to handle.
+    Even when the snapshot is entirely empty, the memo must reach COMPLETED at spawn
+    time with a minimal citable artifact — no dedicated agent VM is provisioned.
     """
     from app.models import TaskStatus, Artifact
     from app.models import Task as TaskModel
@@ -10986,18 +10986,24 @@ async def test_spawn_retirement_memo_empty_snapshot_stays_queued(db_session):
     assert len(retirement_memos) == 1
     memo = retirement_memos[0]
 
-    # Genuinely empty snapshot — no substantive context → must stay QUEUED
-    assert memo.status == TaskStatus.QUEUED, (
-        f"expected QUEUED (no substantive context), got {memo.status}"
+    # Even with an entirely empty snapshot, the memo must be completed inline.
+    assert memo.status == TaskStatus.COMPLETED, (
+        f"expected COMPLETED (inline synthesis with minimal memo), got {memo.status}"
     )
 
-    # No artifact should be created at spawn time
+    # A MEMO artifact must be created at spawn time
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 0, "empty-snapshot memo must not have a pre-baked artifact"
+    assert len(artifacts) == 1, "empty-snapshot memo must have exactly one pre-baked artifact"
+    import json
+    artifact_data = json.loads(artifacts[0].logs)
+    assert artifact_data.get("summary"), "memo artifact must have a non-empty summary"
+    assert memo.plan_output and memo.plan_output.get("memo"), (
+        "plan_output['memo'] must be set for inline-completed memo"
+    )
 
 
 # ===========================================================================

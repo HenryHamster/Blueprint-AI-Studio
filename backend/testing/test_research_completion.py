@@ -2152,6 +2152,77 @@ class TestReproduceOnHeadGate:
         memo_reasoning = (memo.plan_output or {}).get("memo", {}).get("reasoning", "")
         assert "backend/app/gone.py" in memo_reasoning
 
+    @_pytest.mark.asyncio
+    async def test_deferred_finding_no_title_no_description_spawns_completed_memo(
+        self, db_session, mocker
+    ):
+        """A deferred finding with no title and no description still completes inline.
+
+        When _synthesize_deferred_finding_memo returns None (sparse finding), the
+        caller must synthesize a minimal fallback memo so the task reaches COMPLETED
+        at spawn time and never provisions a VM.
+        """
+        # Finding with neither title nor description — triggers the None path in
+        # _synthesize_deferred_finding_memo. Setting actionability_grade=LOW routes
+        # it through the low_actionability deferral path so it reaches the memo loop.
+        sparse_finding = {
+            "prompt": "implement something",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": "d-sparse-memo01",
+            "title": "",
+            "description": "",
+            "actionability_grade": "LOW",
+        }
+
+        task, _titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-sparse-memo01",
+            parsed_findings=[sparse_finding],
+        )
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memos = [
+            c
+            for c in children
+            if (c.context or {}).get("memo_reasoning_kind") == "deferred_finding"
+        ]
+        # Memo must exist (sparse finding still produces a dropped-finding memo)
+        assert len(memos) >= 1
+        memo = memos[0]
+        # Must be COMPLETED at spawn — no VM provisioned
+        assert memo.status == TaskStatus.COMPLETED, (
+            f"expected COMPLETED (fallback inline synthesis), got {memo.status}"
+        )
+        # Must carry a MEMO artifact
+        from app.models import Artifact, ArtifactType
+        artifacts = (
+            (
+                await db_session.execute(
+                    _select(Artifact).where(Artifact.task_id == memo.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(artifacts) == 1
+        memo_artifact = artifacts[0]
+        assert memo_artifact.artifact_type == ArtifactType.MEMO
+        assert memo.plan_output and memo.plan_output.get("memo"), (
+            "plan_output['memo'] must be set for inline-completed memo"
+        )
+
 
 class TestKnowledgeFindingRouting:
     """web_research / design findings route to the matching knowledge child.

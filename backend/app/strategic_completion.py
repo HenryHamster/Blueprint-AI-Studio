@@ -1040,6 +1040,17 @@ async def _spawn_retirement_memos(
             }
             _apply_synthesized_memo(memo_task, synth_memo, session)
             synthesized = True
+        else:
+            # No rationale and no substantive snapshot context. Synthesize a
+            # minimal memo so the task never provisions a VM for an empty payload.
+            minimal_memo = {
+                "summary": f"Direction {did} retired",
+                "reasoning": "Retirement recorded with no additional context.",
+                "citations": [f"direction:{did}", f"task:{task.id}"],
+                "tags": ["direction-retirement"],
+            }
+            _apply_synthesized_memo(memo_task, minimal_memo, session)
+            synthesized = True
         spawned += 1
         logger.info(
             "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",

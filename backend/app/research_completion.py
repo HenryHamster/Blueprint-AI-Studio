@@ -3601,6 +3601,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         if _synth:
             _apply_synthesized_memo(_memo_task, _synth, session)
+        else:
+            # Finding has no title or description — synthesize a minimal memo so
+            # the task never provisions a VM for an effectively-empty payload.
+            _fallback_memo = {
+                "summary": "Dropped finding (no identifying data)",
+                "reasoning": (
+                    f"Reason: {_drop_reason}\n\n"
+                    f"Source task: {task.id}\n\n"
+                    "Finding had no title or description to synthesize from."
+                ),
+                "citations": [f"task:{task.id}"],
+                "tags": ["deferred-finding", _drop_reason],
+            }
+            _apply_synthesized_memo(_memo_task, _fallback_memo, session)
         _spawned_memo_ids.append(str(_memo_task.id))
     if _spawned_memo_ids:
         logger.info(

@@ -2878,53 +2878,6 @@ def _normalize_memo(obj: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _synthesize_memo_from_source_finding(
-    reasoning_kind: str,
-    sf: Dict[str, Any],
-    source_task_id: str,
-) -> Optional[Dict[str, Any]]:
-    """Synthesize a memo dict from dispatcher-provided source_finding without a model call.
-
-    Mirrors the agent-side _synthesizeDispatcherMemo logic. Returns None if
-    there is insufficient data to synthesize (falls back to VM path).
-    """
-    cite = [f"task:{source_task_id}"] if source_task_id else []
-    if reasoning_kind == "regression_false_positive":
-        vr = str(sf.get("verdict_reason") or "")
-        if not vr:
-            return None
-        parts = [f"Verdict reason: {vr}"]
-        inv = str(sf.get("investigation_summary") or "")
-        if inv:
-            parts.append(f"Investigation summary: {inv}")
-        rc = str(sf.get("regression_class") or "")
-        return {
-            "summary": vr[:200],
-            "reasoning": "\n\n".join(parts),
-            "citations": cite,
-            "tags": ["regression-false-positive"] + ([rc] if rc else []),
-        }
-    if reasoning_kind == "investigation_unactionable":
-        rc = str(sf.get("root_cause") or "")
-        sm = str(sf.get("summary") or "")
-        if not rc and not sm:
-            return None
-        parts = [f"Root cause: {rc}"] if rc else []
-        fx = str(sf.get("recommended_fix") or "")
-        if fx:
-            parts.append(f"Recommended fix: {fx}")
-        oc = str(sf.get("outcome") or "")
-        if oc:
-            parts.append(f"Outcome: {oc}")
-        return {
-            "summary": sm[:200] or f"Investigation concluded: {oc}",
-            "reasoning": "\n\n".join(parts),
-            "citations": cite,
-            "tags": ["investigation-unactionable"] + ([oc] if oc else []),
-        }
-    return None
-
-
 def _apply_synthesized_memo(
     memo_task: Task,
     memo: Dict[str, Any],
