@@ -2024,17 +2024,26 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
   research
 
 **Knowledge findings** — these spawn a knowledge agent that produces a durable, queryable
-knowledge document (NOT a code PR). Emit ONLY when genuinely warranted, never by default:
-  web_research — emit when the work hinges on FACTS or BEST-PRACTICES that live OUTSIDE this
-    repo (an external API contract, a library's correct usage, a security/standards reference,
-    a comparison of approaches you cannot settle from the codebase alone). The deliverable is
-    sourced knowledge the implementer needs before code can be written correctly.
-  design — emit when the work needs a FILE-GROUNDED design document before implementation can
-    safely begin: the change is cross-cutting or architecturally risky enough that an implementer
-    starting straight from a prompt would likely get the structure wrong. The deliverable is a
-    design doc grounded in the actual repo files, not external facts.
-  Prefer a plain implementation finding when the work can land safely without either. Use
-  web_research vs design by SOURCE OF TRUTH: outside the repo → web_research; inside the repo → design.
+knowledge document (NOT a code PR). These are HIGH-ROI and chronically under-used: one good
+knowledge document de-risks every later implementer that touches the area, and the index of
+existing documents is queryable by all future agents. Emit one whenever it would genuinely
+raise the success rate of downstream work — err toward emitting:
+  web_research — emit when the work touches FACTS or BEST-PRACTICES that live OUTSIDE this
+    repo. Concrete triggers: integrating or upgrading an external API, library, SDK, or
+    provider; pricing/quota/limit facts; a security/standards reference; how mature OSS
+    projects solve a problem this repo is about to solve; a comparison of approaches you
+    cannot settle from the codebase alone. The deliverable is sourced knowledge the
+    implementer needs before code can be written correctly.
+  design — emit when implementation quality hinges on structure decided up front: the change
+    is cross-cutting, architecturally risky, or has 2+ plausible shapes an implementer
+    starting straight from a prompt would likely get wrong. The deliverable is a
+    FILE-GROUNDED design document, grounded in the actual repo files, not external facts.
+  A knowledge finding does NOT replace the implementation finding — emit both and declare the
+  implementation finding's dependency on it via depends_on_indices, so the implementer launches
+  with the document delivered into its context. Skip the knowledge finding only when the area is
+  already covered (see "Existing knowledge documents" in your context) or the work is genuinely
+  routine. Use web_research vs design by SOURCE OF TRUTH: outside the repo → web_research;
+  inside the repo → design.
 
 **Metadata** — these update the system's knowledge but do not produce code changes:
   direction_note, direction_update, direction_proposal, design_doc_observation

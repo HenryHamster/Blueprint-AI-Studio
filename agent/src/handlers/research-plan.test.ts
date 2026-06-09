@@ -2428,6 +2428,13 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     // Rubric must distinguish the two by source of truth (outside vs inside the repo).
     expect(p).toContain('OUTSIDE this');
     expect(p).toContain('FILE-GROUNDED design');
+    // Liberal-usage framing (operator steer 2026-06-09): knowledge tasks are
+    // high-ROI and the rubric must encourage emitting them, not gate them.
+    expect(p).toContain('HIGH-ROI');
+    expect(p).toContain('err toward emitting');
+    // Pairing contract: knowledge findings gate the implementation finding via
+    // depends_on_indices instead of replacing it.
+    expect(p).toContain('does NOT replace the implementation finding');
   });
 
   it('handleResearch prompt teaches the compute_experiment finding type with a when-to-use rubric and launch contract', async () => {
