@@ -2356,6 +2356,35 @@ async def _handle_strategic_completion(
                 f"evidence_progress verdict(s) to directions"
             )
         await _check_direction_starvation(project, dirs_created, session)
+        # Reset the consecutive-failure breaker on a successful cycle. The
+        # counter is otherwise only cleared on a vision *write* (the
+        # set-problem-model API path at admin_agent_ops and the legacy
+        # log-parse merge below), but a healthy cycle now commonly completes by
+        # updating directions / problem_model / running_update WITHOUT rewriting
+        # the vision. Without this reset, _strategic_failures only ever ratchets
+        # UP (failures increment it) and can be cleared solely by the 48h
+        # time-decay — so 3 failures in any 48h window leave the breaker falsely
+        # tripped, gating forced/backstop strategic refresh for up to two days
+        # even while every subsequent cycle succeeds. "Consecutive" failures
+        # means: reset to zero on any success.
+        # Mutate the vision dict in place (then flag_modified) rather than
+        # reassigning ``project.vision``: this write runs under the project lock
+        # the caller pre-acquired (lock_project_then_task), but the vision-lock
+        # ratchet (test_invariants.TestVisionLockInvariant) is decrease-only, so
+        # a fresh ``project.vision = …`` assignment would trip it. A ``.pop()``
+        # is a call, not an assignment node, so it adds no counted write.
+        _cur_vision = project.vision
+        if _cur_vision and (
+            "_strategic_failures" in _cur_vision
+            or "_strategic_failures_at" in _cur_vision
+        ):
+            _cur_vision.pop("_strategic_failures", None)
+            _cur_vision.pop("_strategic_failures_at", None)
+            flag_modified(project, "vision")
+            logger.info(
+                f"[STRATEGIC] Task {task.id}: reset _strategic_failures breaker "
+                f"on successful cycle (project {project.id})"
+            )
         session.add(project)
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired{_spawn_suffix_msg}"
