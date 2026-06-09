@@ -347,8 +347,6 @@ def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool
 def knowledge_substance_satisfies_need(
     need: Dict[str, Any],
     substance_index,
-    *,
-    require_acceptance_evidence: bool = False,
 ) -> bool:
     """True iff a durable KnowledgeDocument already holds the substance of this need.
 
@@ -358,9 +356,17 @@ def knowledge_substance_satisfies_need(
     ``topic`` (no fuzzy/substring/keyword heuristics), so independent work is never
     falsely satisfied. ``substance_index`` is a pre-fetched list of
     ``KnowledgeSubstance`` records (or any objects with ``.finding_hash`` and
-    ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``. When
-    ``require_acceptance_evidence`` is true, measured-only compute knowledge can
-    still be discovered elsewhere but does not satisfy the strict need.
+    ``.topic`` attributes); pass ``[]`` to short-circuit with ``False``.
+
+    For ``compute_experiment`` records the gate is the durable-grounding predicate
+    (durable citation present, no grounding miss, grounded > 0 when the probe ran) —
+    NOT the stricter acceptance-evidence gate (``classify_knowledge_acceptance``,
+    which further requires ``analysis_mode=='llm'``). Using the acceptance gate would
+    permanently starve dependents whenever LLM analysis is unavailable (no
+    ANTHROPIC_API_KEY or LLM disabled), since every compute document becomes a
+    fallback in that environment. A grounded measured-only (``analysis_mode=fallback``)
+    document therefore still satisfies a prerequisite need; it only fails the
+    task-success scoring gate, not the dependency-unblock gate.
     """
     if not isinstance(need, dict):
         return False

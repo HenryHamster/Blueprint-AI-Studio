@@ -596,7 +596,7 @@ def test_knowledge_topic_equality_satisfies_need():
 
 
 def test_ungrounded_compute_knowledge_does_not_satisfy_need():
-    """Compute substance with no durable citations is filtered out regardless of flags."""
+    """Compute substance with no durable citations is filtered out."""
     from app.blocked_need_resolution import knowledge_substance_satisfies_need
     from app.knowledge_query import KnowledgeSubstance
 
@@ -612,12 +612,6 @@ def test_ungrounded_compute_knowledge_does_not_satisfy_need():
     ]
     # Ungrounded compute does not satisfy the need — the grounding gate always fires.
     assert knowledge_substance_satisfies_need(need, ungrounded) is False
-    assert (
-        knowledge_substance_satisfies_need(
-            need, ungrounded, require_acceptance_evidence=True
-        )
-        is False
-    )
 
 
 def test_knowledge_finding_hash_mismatch_returns_false():
@@ -686,6 +680,11 @@ def test_grounded_compute_negative_result_satisfies_prereq():
 
 
 def test_grounded_fallback_compute_doc_satisfies_prereq():
+    # Deliberate contract: the prerequisite gate uses the LOOSE grounding predicate,
+    # not the strict acceptance-evidence gate. A grounded fallback doc (analysis_mode
+    # != 'llm') still unblocks dependents — requiring LLM mode would permanently starve
+    # dependents when ANTHROPIC_API_KEY is absent. See also
+    # test_require_acceptance_evidence_matches_documented_contract_for_grounded_fallback_doc.
     from app.blocked_need_resolution import knowledge_substance_satisfies_need
     from app.knowledge_query import KnowledgeSubstance
 
@@ -711,6 +710,55 @@ def test_grounded_fallback_compute_doc_satisfies_prereq():
     ]
     need = {"kind": "task", "ref": "compute-need-3"}
     assert knowledge_substance_satisfies_need(need, substance) is True
+
+
+def test_require_acceptance_evidence_matches_documented_contract_for_grounded_fallback_doc():
+    """Pin the deliberate contract: a grounded analysis_mode=fallback compute document
+    satisfies a prerequisite need even though it would NOT pass the strict acceptance-
+    evidence gate (classify_knowledge_acceptance returns knowledge_acceptance_evidence=False
+    for fallback mode). The prerequisite gate uses the LOOSE durable-grounding predicate,
+    not the strict acceptance gate, so dependent tasks are never permanently starved when
+    LLM analysis is unavailable.
+
+    This test is the acceptance-requirement pin: it exercises the production code
+    (knowledge_substance_satisfies_need) that both reaper_sweeps and capability_demand
+    call, and explicitly documents the deliberate looser-than-acceptance behavior.
+    """
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance, classify_knowledge_acceptance
+
+    grounded_fallback = KnowledgeSubstance(
+        finding_hash="fallback-grounded-doc",
+        topic="fallback-grounded-doc",
+        source_kind="compute_experiment",
+        source_citations=("gs://bucket/jobs/metrics.json",),
+        forward_quality_verdict={
+            "analysis_mode": "fallback",
+            "outcome": "SUCCESS",
+            "probes": {
+                "grounding": {
+                    "checked": True,
+                    "file_citations": 1,
+                    "grounded": 1,
+                    "unresolved": [],
+                }
+            },
+        },
+    )
+
+    # Confirm the strict acceptance gate REJECTS this document (analysis_mode != 'llm').
+    acceptance = classify_knowledge_acceptance(
+        source_kind=grounded_fallback.source_kind,
+        forward_quality_verdict=grounded_fallback.forward_quality_verdict,
+        source_citations=list(grounded_fallback.source_citations or ()),
+    )
+    assert acceptance["knowledge_acceptance_evidence"] is False
+    assert acceptance["compute_acceptance_grade"] == "measured_only"
+
+    # But the prerequisite gate ACCEPTS it — the durable-grounding predicate passes
+    # because there is a durable gs:// citation with grounded > 0 and no miss flag.
+    need = {"kind": "task", "ref": "fallback-grounded-doc"}
+    assert knowledge_substance_satisfies_need(need, [grounded_fallback]) is True
 
 
 def test_knowledge_topic_near_miss_not_fuzzy():

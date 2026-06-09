@@ -887,7 +887,7 @@ async def _classify_blocker_needs(
         # Durable-knowledge fallback: a dangling kind='task' need whose originating
         # task is CANCELLED but whose substance persists as a KnowledgeDocument is
         # satisfied — do NOT route it to the dead-foundation path.
-        if knowledge_substance_satisfies_need(need, knowledge, require_acceptance_evidence=True):
+        if knowledge_substance_satisfies_need(need, knowledge):
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
