@@ -1929,6 +1929,7 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         verdicts = [
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "SQL injection in query builder module",
                 "reason": "not present in current HEAD",
             }
@@ -2001,6 +2002,7 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         verdicts = [
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "Path traversal vulnerability in file server",
                 "reason": "no user input reaches the file path",
             },
@@ -2096,6 +2098,7 @@ class TestReconcileAuditBestMatchAssignment:
         verdicts = [
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "File read path traversal in upload module",
                 "reason": "no actual arbitrary file access possible",
             },
@@ -2138,6 +2141,7 @@ class TestReconcileAuditBestMatchAssignment:
             },
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "SQL injection via header param in user endpoint",
                 "reason": "header param is sanitized before use",
             },
@@ -2173,6 +2177,7 @@ class TestReconcileAuditBestMatchAssignment:
         verdicts = [
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "SQL injection endpoint",
                 "reason": "irrelevant finding",
             }
@@ -2206,6 +2211,7 @@ class TestReconcileAuditBestMatchAssignment:
             },
             {
                 "verdict": "refuted_false_positive",
+                "severity": "high",
                 "summary": "Race condition in cache invalidation logic",
                 "reason": "lock acquired before shared state access",
             },
@@ -2223,6 +2229,100 @@ class TestReconcileAuditBestMatchAssignment:
         assert "rate limit" in modified["findings"][0]["summary"]
         assert len(refuted) == 1
         assert "Race condition" in refuted[0]["summary"]
+
+
+class TestReconcileAuditChallengeRefutedSeverityCeiling:
+    """Refuted verdict binding is severity-gated because it removes deductions."""
+
+    SHA = "facefeed"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def _verified(self, severity: str, summary: str) -> dict:
+        return {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+
+    def test_low_refutation_does_not_cancel_critical_finding(self):
+        finding = self._verified(
+            "critical",
+            "Remote code execution in artifact extraction path",
+        )
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "low",
+                    "summary": "Remote code execution in artifact extraction path",
+                    "reason": "only assessed a low-risk extraction warning",
+                }
+            ],
+        )
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+
+        assert hold == "audit_challenge_missing"
+        assert modified is None
+        assert refuted == []
+
+    @pytest.mark.parametrize("verdict_severity", ["high", "critical"])
+    def test_equal_or_higher_refutation_can_cancel_finding(self, verdict_severity):
+        finding = self._verified(
+            "high",
+            "Privilege escalation through workspace role mutation",
+        )
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": verdict_severity,
+                    "summary": "Privilege escalation through workspace role mutation",
+                    "reason": "role mutation is guarded by an existing admin check",
+                }
+            ],
+        )
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is not None
+        assert modified["findings"] == []
+        assert len(refuted) == 1
+        assert refuted[0]["severity"] == "high"
+
+    def test_confirmed_verdict_still_ignores_lower_severity(self):
+        finding = self._verified(
+            "critical",
+            "Tenant isolation bypass in project membership checks",
+        )
+        report = self._report([finding])
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "info",
+                    "summary": "Tenant isolation bypass in project membership checks",
+                }
+            ],
+        )
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
 
 
 class TestChallengedVsUnchallengedTelemetry:

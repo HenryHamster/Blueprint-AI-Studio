@@ -1220,9 +1220,12 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
       ``primary_findings`` and independently re-describes the same issue.
     * ``None`` — no match (file-path conflict or similarity below threshold).
 
-    Severity is deliberately NOT used for scoring: the primary audit and the
-    challenger may independently re-bucket the same issue at different severities,
-    so content must win even when the labels drift.
+    Confirmed/uncertain verdict severity is deliberately NOT used for scoring:
+    the primary audit and the challenger may independently re-bucket the same
+    issue at different severities, so content must win even when the labels
+    drift.  Refuted false positives are different because they remove a finding
+    from scoring; those verdicts must be at least as severe as the finding they
+    bind to.
     """
     if not isinstance(verdict_entry, dict):
         return None
@@ -1239,6 +1242,14 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
 
     if f_file and cv_file and f_file != cv_file:
         return None
+
+    if str(verdict_entry.get("verdict") or "").lower().strip() == "refuted_false_positive":
+        f_severity = str(finding.get("severity") or finding.get("level") or "").lower()
+        cv_severity = str(verdict_entry.get("severity") or "").lower()
+        finding_rank = _SEVERITY_RANK.get(f_severity, 99)
+        verdict_rank = _SEVERITY_RANK.get(cv_severity, 99)
+        if verdict_rank > finding_rank:
+            return None
 
     # Tier-1: exact summary match always beats any fuzzy score.
     if cv_summary == f_summary:
@@ -1262,12 +1273,14 @@ def _match_finding_to_challenge(
 ) -> dict | None:
     """Return the best-scoring challenge verdict that matches this finding, or None.
 
-    Matching is by summary + file; severity is advisory metadata and is not
-    used for binding.  The primary audit and the challenger may independently
-    bucket the same issue at different severities, so content must win even
-    when the labels drift.  (file is optional — two empty file fields are
-    treated as equal so challenge verdicts without a ``file`` key match audit
-    findings that also omit it).
+    Matching is by summary + file.  Severity is advisory metadata for
+    confirmed/uncertain verdicts, but refuted_false_positive verdicts must carry
+    at least the finding's severity rank before they are eligible to bind.  The
+    primary audit and the challenger may independently bucket the same issue at
+    different severities, so content still wins for verdicts that do not remove
+    findings from scoring.  (file is optional — two empty file fields are treated
+    as equal so challenge verdicts without a ``file`` key match audit findings
+    that also omit it).
 
     Summary matching uses two passes:
     1. Exact text match (fast path — covers the case where the challenger was
