@@ -342,6 +342,16 @@ def apply_merged_landed_signal(
                 getattr(task, "id", None),
                 exc_info=True,
             )
+        try:
+            from app.capability_proof import record_capability_proof
+
+            record_capability_proof(task, project)
+        except Exception:  # noqa: BLE001 — proof recording must never undo a real merge
+            logger.warning(
+                "[LANDED] capability proof recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration

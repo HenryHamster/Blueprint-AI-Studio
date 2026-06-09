@@ -8283,6 +8283,92 @@ class TestGetProjectIntegrationBranch:
         assert _shared_state.get_project_integration_branch(project) == "release"
 
 
+# ── _annotate_capability_proof_status: proof status annotation ────────────────
+
+
+class TestAnnotateCapabilityProofStatus:
+    """_annotate_capability_proof_status decorates the vocab list with
+    ``proof_status: 'proven'`` when the project has a proof record for that
+    capability and ``'unproven'`` when it does not.
+
+    This is the production code path exercised when a task with
+    ``provides_capability`` lands a verified acceptance-evidence verdict and
+    ``record_capability_proof`` stamps a durable entry on
+    ``project.capability_proof_records``.
+    """
+
+    def test_proven_capability_gets_proven_status(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "language-aware-repo-map", "status": "working"}]
+        proof_records = {
+            "language-aware-repo-map": [
+                {
+                    "task_id": "task-abc",
+                    "proved_at": "2026-06-09T00:00:00",
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_prompt.py::test_map",
+                    "commit_sha": "abc123",
+                }
+            ]
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records)
+        assert out[0]["proof_status"] == "proven"
+        assert out[0]["name"] == "language-aware-repo-map"
+
+    def test_unproven_capability_gets_unproven_status(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "language-aware-repo-map", "status": "working"}]
+        out = _annotate_capability_proof_status(vocab, {})
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_none_proof_records_yields_unproven(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "cap-a", "status": "planned"}]
+        out = _annotate_capability_proof_status(vocab, None)
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_does_not_mutate_input(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        original = [{"name": "cap-a", "status": "working"}]
+        proof_records = {"cap-a": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]}
+        out = _annotate_capability_proof_status(original, proof_records)
+        # Input dict must not have been mutated.
+        assert "proof_status" not in original[0]
+        assert out[0]["proof_status"] == "proven"
+
+    def test_empty_proof_list_is_unproven(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "cap-a", "status": "working"}]
+        out = _annotate_capability_proof_status(vocab, {"cap-a": []})
+        # An empty list means the key exists but has no proof entries.
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_multiple_capabilities_mixed_proof(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [
+            {"name": "cap-proven", "status": "working"},
+            {"name": "cap-claimed", "status": "partial"},
+        ]
+        proof_records = {
+            "cap-proven": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records)
+        assert out[0]["proof_status"] == "proven"
+        assert out[1]["proof_status"] == "unproven"
+
+    def test_non_list_passthrough(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        assert _annotate_capability_proof_status(None, {}) is None  # type: ignore[arg-type]
+        assert _annotate_capability_proof_status("invalid", {}) == "invalid"  # type: ignore[arg-type]
+
+
 # ── _verify_capability_backing_paths: advisory capability verification ────────
 
 

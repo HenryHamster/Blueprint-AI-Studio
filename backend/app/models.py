@@ -550,6 +550,16 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Durable evidence-grounded capability proof records.
+    # Shape: {normalized_cap_name: [{task_id, proved_at, proof_kind,
+    #   proof_ref, commit_sha}]} (capped at 10 entries per capability).
+    # Written by capability_proof.record_capability_proof when a task that
+    # advertises provides_capability completes with verified acceptance evidence
+    # (named_test proven=True or downstream_artifact consumed=True).
+    # NULL / absent key = capability is claimed but never proven.
+    capability_proof_records: Dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
+    )
     # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
     # identical semantics to integration_branch.
     # Like integration_branch, this is operator-managed and preserved once set.

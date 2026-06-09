@@ -13,7 +13,7 @@ import {
   buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
-  readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
+  readClaudeMd, buildContextPrefix, buildFileTree, buildRepoMap, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
@@ -386,6 +386,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const fileTree = buildFileTree(ws);
+  const repoMap = buildRepoMap(ws);
 
   // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
   // Runs a read-only pass to map module interfaces and dependencies before coding.
@@ -588,7 +589,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedUrls.size} signed URL(s).\n`);
   }
 
-  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
+  const finalPromptWithTree = fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });

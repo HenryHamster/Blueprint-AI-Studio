@@ -612,6 +612,105 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
 }
 
 /**
+ * Scans all tracked Python/TypeScript source files to build a language-aware
+ * repo map: ranks modules by import-graph centrality (in-degree — how many
+ * other tracked files import them), lists each hub's exported symbols, and
+ * returns a compact markdown section capped at 3 000 chars.
+ *
+ * Fail-soft: returns '' on any error so the caller never blocks on missing
+ * tooling. The natural stdlib/third-party filter comes for free — only modules
+ * whose basename matches a tracked file appear in the output.
+ */
+export function buildRepoMap(ws: WebSocket | null): string {
+  const CAP = 3000;
+  try {
+    const allFiles = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' })
+      .split('\n')
+      .filter(f => f &&
+        /\.(py|ts|tsx)$/.test(f) &&
+        !f.includes('node_modules/') &&
+        !f.includes('/dist/') &&
+        !f.includes('.test.') &&
+        !f.includes('.spec.') &&
+        !f.includes('/test_') &&
+        !f.includes('/testing/') &&
+        !f.includes('/tests/')
+      );
+
+    if (allFiles.length === 0) return '';
+
+    const inDegree = new Map<string, number>();
+
+    for (const file of allFiles) {
+      let lines: string[];
+      try {
+        lines = fs.readFileSync(`${WORKSPACE}/${file}`, 'utf-8').split('\n').slice(0, 100);
+      } catch { continue; }
+
+      const isPython = file.endsWith('.py');
+      for (const line of lines) {
+        let stem: string | null = null;
+        if (isPython) {
+          const m = line.match(/^from\s+\.*([\w.]+)\s+import\s+/);
+          if (m) stem = m[1].split('.').pop() || null;
+          else {
+            const m2 = line.match(/^import\s+([\w.]+)/);
+            if (m2) stem = m2[1].split('.').pop() || null;
+          }
+        } else {
+          const m = line.match(/from\s+['"]([^'"]+)['"]/);
+          if (m) {
+            const parts = m[1].replace(/\.(js|ts|tsx|jsx|mjs)$/, '').split('/');
+            stem = parts[parts.length - 1] || null;
+          }
+        }
+        if (stem && stem.length > 1) inDegree.set(stem, (inDegree.get(stem) ?? 0) + 1);
+      }
+    }
+
+    if (inDegree.size === 0) return '';
+
+    const hubs = [...inDegree.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([stem]) => stem);
+
+    // Build stem → file lookup (first tracked file with matching basename wins)
+    const stemToFile = new Map<string, string>();
+    for (const file of allFiles) {
+      const base = file.split('/').pop()?.replace(/\.(py|ts|tsx|js|jsx)$/, '');
+      if (base && !stemToFile.has(base)) stemToFile.set(base, file);
+    }
+
+    const sections: string[] = [];
+    for (const stem of hubs) {
+      const relFile = stemToFile.get(stem);
+      if (!relFile) continue;
+      let content: string;
+      try {
+        content = fs.readFileSync(`${WORKSPACE}/${relFile}`, 'utf-8');
+      } catch { continue; }
+
+      const exports = relFile.endsWith('.py')
+        ? extractPythonExports(content)
+        : extractTypeScriptExports(content);
+      if (exports.length === 0) continue;
+
+      const count = inDegree.get(stem) ?? 0;
+      sections.push(`**${relFile}** (imported by ${count}): ${exports.slice(0, 10).join(', ')}`);
+    }
+
+    if (sections.length === 0) return '';
+
+    const body = `## Repo Map (most-imported modules)\n${sections.join('\n')}\n\n`;
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: repo map generation failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
+/**
  * Finds production source files that import from the given related_files.
  * Returns a compact markdown section listing each changed module alongside the
  * consumers that import from it (with the specific symbols they import), capped

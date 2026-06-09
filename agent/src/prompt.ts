@@ -13,6 +13,7 @@ import { parseBackendTimestamp } from './utils/time.js';
 // './prompt.js' unchanged.
 export {
   buildFileTree,
+  buildRepoMap,
   countSourceFiles,
   detectGreenfield,
   isGreenfieldRepo,
