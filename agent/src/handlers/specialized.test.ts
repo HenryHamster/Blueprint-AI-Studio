@@ -708,6 +708,79 @@ describe('handleInvestigate — adversarial grader', () => {
   });
 });
 
+// ── handleInvestigate — adversarial grader self-repair ────────────────────────
+describe('handleInvestigate — adversarial grader self-repair', () => {
+  const ADVERSARIAL_TASK_WITH_HASHES = {
+    ...BASE_TASK,
+    context: { adversarial_grader: true, _adversarial_challenged_hashes: ['abc123', 'def456'] },
+  };
+  const VERDICT_ARRAY = '[{"hash":"abc123","verdict":"agree","reason":"still holds at HEAD"},{"hash":"def456","verdict":"disagree","reason":"premise no longer present"}]';
+  const VERDICT_ARRAY_PARSED: unknown[] = JSON.parse(VERDICT_ARRAY) as unknown[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('repairs a malformed challenger response into a [{hash, verdict, reason}] array via focused re-ask', async () => {
+    // First call: clean exit but only prose — no JSON array.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I reviewed the findings. abc123 still holds, def456 is not present anymore.', lastResultText: '' });
+    // Second call (repair re-ask): valid verdict array in lastResultText.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Repair should have triggered exactly one re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    // logs carry the repaired [{hash, verdict, reason}] array.
+    expect(JSON.parse(call.logs as string)).toEqual(VERDICT_ARRAY_PARSED);
+  });
+
+  it('includes the challenged hashes from context in the re-ask prompt', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The repair re-ask (second call) must mention each challenged hash so the
+    // model can re-emit a complete array.
+    const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reaskPrompt).toContain('abc123');
+    expect(reaskPrompt).toContain('def456');
+  });
+
+  it('posts COMPLETED with raw output when repair also fails to produce a parseable array', async () => {
+    const prose = 'abc123 is still valid, def456 is not present.';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: prose, lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Still no JSON array.', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    // Raw output preserved — backend parser will fail-close findings gracefully.
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain(prose);
+  });
+
+  it('skips repair and posts FAILED when exitCode is non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 1, allOutput: 'crashed', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // A CLI crash should not trigger a repair re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
+});
+
 // ── handleInvestigate — bounded self-repair on a clean-exit-but-unparseable run ─
 describe('handleInvestigate — bounded self-repair on format miss', () => {
   const RECOVERED = {

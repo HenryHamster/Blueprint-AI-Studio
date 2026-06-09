@@ -341,6 +341,7 @@ _last_regression_dispatch: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_post_commit_sweep: datetime = _utcnow()
+_last_sidecar_sweep: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
@@ -1335,6 +1336,7 @@ async def orchestrator_worker():
     from app.services import (
         _recover_orphaned_tasks,
         _sweep_post_commit_pending,
+        _sweep_stranded_sidecar_sources,
     )
     from app.routers.agent import get_github_token_for_task
     from app.github import (
@@ -1348,7 +1350,7 @@ async def orchestrator_worker():
 
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
-    global _last_orphan_check, _last_post_commit_sweep
+    global _last_orphan_check, _last_post_commit_sweep, _last_sidecar_sweep
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -6175,6 +6177,13 @@ async def orchestrator_worker():
             if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
                 _last_post_commit_sweep = _utcnow()
                 await _sweep_post_commit_pending()
+            # Stranded-sidecar sweep — every 120s. Resolves EVALUATING source
+            # tasks whose side-car challenger died without posting status (reaper
+            # kill, VM death with retries exhausted, cancellation). Calls the
+            # lane resolver with a synthetic FAILED payload for fail-closed semantics.
+            if (_utcnow() - _last_sidecar_sweep).total_seconds() >= 120:
+                _last_sidecar_sweep = _utcnow()
+                await _sweep_stranded_sidecar_sources()
             # Drain the deferred missing-branch alert queue into durable,
             # idempotent operator Alerts. The synchronous branch resolvers
             # record intent off the hot path (no DB I/O); the durable persist

@@ -2369,7 +2369,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _f["_adversarial_verdict"] = "fail"
             _f["_adversarial_verdict_reason"] = _reason
             _f["_adversarial_verdict_explicit"] = _explicit
-        _high_stakes_challenged = [_f for _f in findings if _is_high_stakes_finding(_f)]
+        # Bound counters to findings that were actually in the challenge manifest.
+        # Without this, manifest-excluded high-stakes findings (budget-capped) inflate
+        # the refuted bucket while missing from the challenged count, causing
+        # survived = challenged - refuted to go negative.
+        if _challenged_hashes_set:
+            _high_stakes_challenged = [
+                _f for _f in findings
+                if _fh(
+                    str(_f.get("title", "")),
+                    str(_f.get("description", "") or _f.get("prompt", "")),
+                ) in _challenged_hashes_set
+            ]
+        else:
+            _high_stakes_challenged = [_f for _f in findings if _is_high_stakes_finding(_f)]
         _spawn_gate_challenged_count = len(_challenged_hashes_ctx) or len(_high_stakes_challenged)
         _spawn_gate_refuted_count = sum(
             1

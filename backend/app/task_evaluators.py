@@ -968,47 +968,77 @@ def parse_adversarial_finding_verdicts(
     logs: str | None,
     finding_hashes: list[str],
     completed: bool = True,
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], str]:
     """Parse per-finding pass/fail verdicts from adversarial grader output.
 
-    Returns a dict mapping finding_hash → {passed: bool, reason: str, explicit: bool}.
-    FAIL-CLOSED: any finding whose hash is absent from the output defaults to
-    passed=False with explicit=False so a crashed or truncated adversarial grader
-    leaves findings unspawned and auditable as unresolved. ``explicit=False``
-    distinguishes an unresolved finding from a clean challenger pass (``explicit=True``).
-    Only an explicit ``verdict: pass`` from the challenger produces passed=True.
+    Returns ``(verdicts, parse_outcome)`` where ``verdicts`` maps
+    finding_hash → {passed, reason, explicit, unresolved_reason?} and
+    ``parse_outcome`` is a compact machine-readable classification of the
+    parse pipeline's highest-level failure:
+
+    * ``"ok"``                - at least one finding received an explicit verdict
+    * ``"challenger_failed"`` - the challenger task itself failed (completed=False)
+    * ``"empty_logs"``        - the challenger posted no output
+    * ``"no_json_array"``     - logs contain no JSON array with the expected anchor keys
+    * ``"invalid_json"``      - a JSON array was found but could not be parsed
+    * ``"no_hash_matches"``   - array parsed but no known finding hash matched
+
+    FAIL-CLOSED: any finding with no explicit verdict defaults to
+    passed=False/explicit=False. ``unresolved_reason`` on those entries carries
+    the per-finding classification so operators can distinguish the failure mode
+    without reading raw logs.
     """
-    _unresolved: dict = {
-        "passed": False,
-        "reason": "fail-closed: no verdict returned for this finding",
-        "explicit": False,
-    }
-    result: dict[str, dict] = {h: dict(_unresolved) for h in finding_hashes}
-    if not completed or not logs:
-        return result
+
+    def _default_entry(unresolved_reason: str) -> dict:
+        return {
+            "passed": False,
+            "reason": "fail-closed: no verdict returned for this finding",
+            "explicit": False,
+            "unresolved_reason": unresolved_reason,
+        }
+
+    if not completed:
+        return {h: _default_entry("challenger_failed") for h in finding_hashes}, "challenger_failed"
+    if not logs or not logs.strip():
+        return {h: _default_entry("empty_logs") for h in finding_hashes}, "empty_logs"
+
     from app.task_completion import _extract_json_array
 
-    text = (logs or "").strip()
+    text = logs.strip()
     json_str = _extract_json_array(text, "hash", "verdict")
-    if json_str:
-        try:
-            parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if not isinstance(item, dict):
-                        continue
-                    h = str(item.get("hash") or "").strip()
-                    if h not in result:
-                        continue
-                    v = str(item.get("verdict") or "").strip().lower()
-                    reason = str(item.get("reason") or "")[:480]
-                    if v in ("pass", "passed", "approve", "approved"):
-                        result[h] = {"passed": True, "reason": reason, "explicit": True}
-                    elif v in ("fail", "failed", "reject", "rejected"):
-                        result[h] = {"passed": False, "reason": reason, "explicit": True}
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return result
+    if not json_str:
+        return {h: _default_entry("no_json_array") for h in finding_hashes}, "no_json_array"
+
+    try:
+        parsed = json.loads(json_str)
+        if not isinstance(parsed, list):
+            raise ValueError("not a list")
+    except (json.JSONDecodeError, ValueError):
+        return {h: _default_entry("invalid_json") for h in finding_hashes}, "invalid_json"
+
+    result: dict[str, dict] = {h: _default_entry("no_hash_matches") for h in finding_hashes}
+    matched_any = False
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        h = str(item.get("hash") or "").strip()
+        if h not in result:
+            continue
+        v = str(item.get("verdict") or "").strip().lower()
+        reason = str(item.get("reason") or "")[:480]
+        if v in ("pass", "passed", "approve", "approved"):
+            result[h] = {"passed": True, "reason": reason, "explicit": True}
+            matched_any = True
+        elif v in ("fail", "failed", "reject", "rejected"):
+            result[h] = {"passed": False, "reason": reason, "explicit": True}
+            matched_any = True
+        else:
+            result[h]["unresolved_reason"] = "verdict_unrecognized"
+            matched_any = True
+
+    if not matched_any:
+        return result, "no_hash_matches"
+    return result, "ok"
 
 
 def build_forward_quality_grader_prompt(

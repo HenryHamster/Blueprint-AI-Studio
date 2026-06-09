@@ -6935,47 +6935,58 @@ class TestParseAdversarialFindingVerdicts:
 
     def test_extracts_fail_verdict(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "premise wrong"}]'
-        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
         assert result["abc123"]["passed"] is False
         assert result["abc123"]["reason"] == "premise wrong"
         assert result["abc123"]["explicit"] is True
+        assert outcome == "ok"
 
     def test_extracts_pass_verdict(self):
         logs = '[{"hash": "abc123", "verdict": "pass", "reason": "well-grounded"}]'
-        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
         assert result["abc123"]["passed"] is True
         assert result["abc123"]["reason"] == "well-grounded"
         assert result["abc123"]["explicit"] is True
+        assert outcome == "ok"
 
     def test_missing_hash_defaults_to_fail_closed(self):
         logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
-        result = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
         # fail-closed: absent hash → passed=False, not an implicit pass
         assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
+        # The array was parsed but no known hash matched
+        assert outcome == "no_hash_matches"
+        assert result["abc123"]["unresolved_reason"] == "no_hash_matches"
 
     def test_not_completed_defaults_all_to_fail_closed(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
-        result = parse_adversarial_finding_verdicts(logs, ["abc123"], completed=False)
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"], completed=False)
         assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
+        assert outcome == "challenger_failed"
+        assert result["abc123"]["unresolved_reason"] == "challenger_failed"
 
     def test_none_logs_defaults_all_to_fail_closed(self):
-        result = parse_adversarial_finding_verdicts(None, ["abc123"])
+        result, outcome = parse_adversarial_finding_verdicts(None, ["abc123"])
         assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
+        assert outcome == "empty_logs"
+        assert result["abc123"]["unresolved_reason"] == "empty_logs"
 
     def test_malformed_json_defaults_all_to_fail_closed(self):
-        result = parse_adversarial_finding_verdicts("not json at all", ["abc123"])
+        result, outcome = parse_adversarial_finding_verdicts("not json at all", ["abc123"])
         assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
+        assert outcome == "no_json_array"
+        assert result["abc123"]["unresolved_reason"] == "no_json_array"
 
     def test_multiple_findings_partial_fail(self):
         logs = (
             '[{"hash": "h1", "verdict": "fail", "reason": "bad"}, '
             '{"hash": "h2", "verdict": "pass", "reason": "ok"}]'
         )
-        result = parse_adversarial_finding_verdicts(logs, ["h1", "h2", "h3"])
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["h1", "h2", "h3"])
         assert result["h1"]["passed"] is False
         assert result["h1"]["reason"] == "bad"
         assert result["h1"]["explicit"] is True
@@ -6984,6 +6995,100 @@ class TestParseAdversarialFindingVerdicts:
         assert result["h2"]["explicit"] is True
         assert result["h3"]["passed"] is False  # absent → fail-closed (not an implicit pass)
         assert result["h3"]["explicit"] is False  # not an explicit challenger verdict
+        # h3 was not matched; h1/h2 were — outcome is ok because some hashes matched
+        assert outcome == "ok"
+        assert result["h3"]["unresolved_reason"] == "no_hash_matches"
+
+    def test_invalid_json_array_parse_outcome(self):
+        # A JSON array is found but cannot be parsed as valid JSON (simulated via
+        # a truncated array that _extract_json_array still locates).
+        logs = 'some preamble [{"hash": "abc", "verdict": "fail", "reason": "bad"'
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc"])
+        assert result["abc"]["passed"] is False
+        assert result["abc"]["explicit"] is False
+        # Either invalid_json or no_json_array depending on _extract_json_array behaviour.
+        assert outcome in ("invalid_json", "no_json_array")
+        assert result["abc"]["unresolved_reason"] in ("invalid_json", "no_json_array")
+
+    def test_empty_string_logs_gives_empty_logs_outcome(self):
+        result, outcome = parse_adversarial_finding_verdicts("", ["abc123"])
+        assert outcome == "empty_logs"
+        assert result["abc123"]["unresolved_reason"] == "empty_logs"
+
+    def test_whitespace_only_logs_gives_empty_logs_outcome(self):
+        result, outcome = parse_adversarial_finding_verdicts("   \n  ", ["abc123"])
+        assert outcome == "empty_logs"
+        assert result["abc123"]["unresolved_reason"] == "empty_logs"
+
+    def test_verdict_unrecognized_token(self):
+        logs = '[{"hash": "abc123", "verdict": "maybe", "reason": "not sure"}]'
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
+        assert result["abc123"]["passed"] is False
+        assert result["abc123"]["explicit"] is False
+        assert result["abc123"]["unresolved_reason"] == "verdict_unrecognized"
+        assert outcome == "ok"  # hash was found; verdict token was just unrecognized
+
+
+def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
+    """Each parse failure mode produces a distinct per-finding unresolved_reason.
+
+    Acceptance test: validates the new parse_outcome + per-finding unresolved_reason
+    classification in parse_adversarial_finding_verdicts. The production code that
+    writes parse_outcome into ADVERSARIAL_GATE_VERDICT_KEY (task_lifecycle.py) depends
+    on this function returning the tuple correctly.
+    """
+    hashes = ["h1", "h2"]
+
+    # 1. Challenger task failed (completed=False) → challenger_failed
+    result, outcome = parse_adversarial_finding_verdicts(
+        '[{"hash": "h1", "verdict": "fail"}]', hashes, completed=False
+    )
+    assert outcome == "challenger_failed"
+    assert all(r["unresolved_reason"] == "challenger_failed" for r in result.values())
+    assert all(r["passed"] is False for r in result.values())
+
+    # 2. Empty logs → empty_logs
+    result, outcome = parse_adversarial_finding_verdicts(None, hashes)
+    assert outcome == "empty_logs"
+    assert all(r["unresolved_reason"] == "empty_logs" for r in result.values())
+
+    # 3. No JSON array in logs → no_json_array
+    result, outcome = parse_adversarial_finding_verdicts(
+        "The challenger could not determine a verdict.", hashes
+    )
+    assert outcome == "no_json_array"
+    assert all(r["unresolved_reason"] == "no_json_array" for r in result.values())
+
+    # 4. JSON array with no known hashes → no_hash_matches
+    result, outcome = parse_adversarial_finding_verdicts(
+        '[{"hash": "unknown-hash", "verdict": "fail", "reason": "x"}]', hashes
+    )
+    assert outcome == "no_hash_matches"
+    assert all(r["unresolved_reason"] == "no_hash_matches" for r in result.values())
+
+    # 5. Happy path: both hashes receive explicit verdicts → ok, no unresolved_reason
+    logs = (
+        '[{"hash": "h1", "verdict": "pass", "reason": "solid"}, '
+        '{"hash": "h2", "verdict": "fail", "reason": "stale"}]'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, hashes)
+    assert outcome == "ok"
+    assert result["h1"]["passed"] is True
+    assert result["h1"]["explicit"] is True
+    assert "unresolved_reason" not in result["h1"]
+    assert result["h2"]["passed"] is False
+    assert result["h2"]["explicit"] is True
+    assert "unresolved_reason" not in result["h2"]
+
+    # 6. Unrecognized verdict token → verdict_unrecognized, outcome still ok (hash found)
+    result, outcome = parse_adversarial_finding_verdicts(
+        '[{"hash": "h1", "verdict": "uncertain", "reason": "dunno"}]', hashes
+    )
+    assert outcome == "ok"
+    assert result["h1"]["unresolved_reason"] == "verdict_unrecognized"
+    assert result["h1"]["passed"] is False
+    # h2 was not in the output at all → no_hash_matches
+    assert result["h2"]["unresolved_reason"] == "no_hash_matches"
 
 
 # ---------------------------------------------------------------------------
@@ -7848,6 +7953,76 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
     assert (
         deferred_by_title[high_unresolved["title"]].get("finding_hash")
         == unresolved_hash
+    )
+
+
+@_pytest.mark.asyncio
+async def test_spawn_gate_counters_bounded_to_manifest_set(db_session, mocker):
+    """Counters reflect only manifest-challenged findings; excluded high-stakes do not drift.
+
+    Scenario: 3 high-stakes findings exist. The manifest can only fit 2 (budget-bounded).
+    The excluded finding gets fail-closed but must NOT inflate the refuted counter.
+    survived = challenged - refuted must remain >= 0 and equal challenged manifest size
+    minus explicitly or implicitly refuted manifest findings.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-bounded01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    # Three high-stakes findings; only two were admitted to the manifest.
+    hs_in_manifest_1 = _high_stakes_finding(direction["id"], "Manifest finding one")
+    hs_in_manifest_2 = _high_stakes_finding(direction["id"], "Manifest finding two")
+    hs_excluded = _high_stakes_finding(direction["id"], "Budget-excluded high-stakes finding")
+
+    def _h(f):
+        return _finding_hash(f["title"], f.get("description", "") or f.get("prompt", ""))
+
+    hash1 = _h(hs_in_manifest_1)
+    hash2 = _h(hs_in_manifest_2)
+    # hs_excluded is NOT in the manifest
+
+    findings = [hs_in_manifest_1, hs_in_manifest_2, hs_excluded]
+    task.plan_output = findings
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                hash1: {"passed": True, "reason": "solid", "explicit": True},
+                hash2: {"passed": False, "reason": "stale", "explicit": True},
+            },
+            "grader_task_id": "test-grader-bounded-001",
+        },
+        # Only hash1 and hash2 were challenged — hs_excluded was budget-capped out.
+        "_adversarial_challenged_hashes": [hash1, hash2],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=findings,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    # challenged_count reflects only the manifest (2), not all 3 high-stakes findings.
+    assert ctx.get("research_spawn_gate_challenged_count") == 2
+    # hash2 was explicitly refuted; hs_excluded must NOT inflate this count.
+    assert ctx.get("research_spawn_gate_refuted_count") == 1
+    # survived = challenged - refuted must be >= 0 and consistent.
+    assert ctx.get("research_spawn_gate_survived_count") == 1
+    assert (
+        ctx["research_spawn_gate_survived_count"]
+        == ctx["research_spawn_gate_challenged_count"] - ctx["research_spawn_gate_refuted_count"]
     )
 
 

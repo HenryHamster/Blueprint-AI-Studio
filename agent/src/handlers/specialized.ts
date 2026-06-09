@@ -758,10 +758,41 @@ export async function handleInvestigate(
       `${userPrompt}\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
       ws, statusRef, model, effort, disallowedTools
     );
-    // Preserve the raw challenger output verbatim — the verdict array lives in
-    // the final text. Prefer lastResultText (the model's final message); fall
-    // back to the transcript tail when the runner did not surface a final text.
-    const challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+    // Locally validate the output is a parseable [{hash, verdict, reason}] array.
+    // On a format miss with exitCode===0, perform one bounded focused re-ask
+    // (matching the sibling handlers' self-repair path). The challenged hashes are
+    // included so the model can re-emit a complete array. On repair success, post
+    // the repaired array. On failure, pass the raw output through unchanged so the
+    // backend parser fail-closes findings (preserving current fail-closed behavior).
+    const challengedHashes = Array.isArray(investigateCtx._adversarial_challenged_hashes)
+      ? (investigateCtx._adversarial_challenged_hashes as string[])
+      : [];
+    const hashListStr = challengedHashes.length > 0
+      ? ` The following finding hashes must each appear in the array: ${challengedHashes.map(h => JSON.stringify(h)).join(', ')}.`
+      : '';
+    const repaired = await repairStructuredOutput<Array<Record<string, unknown>>>({
+      mode: 'array',
+      requiredKeys: ['hash', 'verdict'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior adversarial challenge response did not end with a parseable JSON verdict array.
+Return ONLY the JSON array. Each element must have "hash", "verdict", and "reason" fields.${hashListStr} No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing adversarial challenge verdict array...',
+      schemaLabel: 'audit_challenge',
+    });
+    let challengeLogs: string;
+    if (repaired.value !== null && repaired.retry !== null) {
+      // A focused re-ask succeeded — post the repaired (now-parseable) array.
+      challengeLogs = sanitize(JSON.stringify(repaired.value));
+    } else {
+      // First attempt was already parseable (retry===null), repair failed, or
+      // exitCode!==0 — pass raw output through unchanged.
+      challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+    }
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: exitCode === 0 ? 'COMPLETED' : 'FAILED',

@@ -438,13 +438,14 @@ async def _resolve_quality_grader_completion(
                     for f in stored_findings
                     if isinstance(f, dict)
                 ]
-        finding_verdicts = parse_adversarial_finding_verdicts(
+        finding_verdicts, parse_outcome = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )
         failed_count = sum(1 for v in finding_verdicts.values() if not v["passed"])
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
             "finding_verdicts": finding_verdicts,
             "grader_task_id": str(grader.id),
+            "parse_outcome": parse_outcome,
         }
         ctx.pop("awaiting_adversarial_grader", None)
         grader.latest_status_message = (
@@ -915,6 +916,49 @@ async def _resolve_finding_challenge_completion(
         )
     except Exception:
         logger.debug("[CHALLENGE] broadcast after challenge failed", exc_info=True)
+
+
+async def trigger_stranded_sidecar_resolution(
+    sidecar: Task, session: AsyncSession
+) -> None:
+    """Invoke the appropriate lane resolver for a terminal side-car that never posted status.
+
+    Called by the stranded-sidecar recovery sweep when it detects a FAILED or
+    CANCELLED side-car whose source task is still EVALUATING.  Constructs a
+    synthetic ``AgentStatusPayload`` carrying the sidecar's terminal status and
+    last message, then dispatches to the resolver for the sidecar's lane
+    (identified by which SOURCE_KEY the sidecar carries in its context).
+
+    All four resolver functions already handle a FAILED payload fail-closed, so
+    no additional logic is needed here — this is purely a routing shim.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_SOURCE_KEY,
+        SAFEGUARD_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+    )
+
+    synthetic = AgentStatusPayload(
+        task_id=sidecar.id,
+        status=sidecar.status,
+        logs=sidecar.latest_status_message or "",
+    )
+    ctx = sidecar.context or {}
+    if ctx.get(SAFEGUARD_CHALLENGE_SOURCE_KEY):
+        await _resolve_safeguard_challenge_completion(sidecar, synthetic, session)
+    elif ctx.get(QUALITY_GRADER_SOURCE_KEY):
+        await _resolve_quality_grader_completion(sidecar, synthetic, session)
+    elif ctx.get(FINDING_CHALLENGE_SOURCE_KEY):
+        await _resolve_finding_challenge_completion(sidecar, synthetic, session)
+    elif ctx.get(REVIEW_SECOND_OPINION_SOURCE_KEY):
+        await _resolve_review_second_opinion(sidecar, synthetic, session)
+    else:
+        logger.warning(
+            "[SIDECAR-RECOVERY] Sidecar %s has no recognised source key; cannot route",
+            sidecar.id,
+        )
+
 
 async def _process_post_commit(
     task_id: uuid.UUID,
