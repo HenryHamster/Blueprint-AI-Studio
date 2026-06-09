@@ -93,6 +93,40 @@ def registry_capability_vocabulary(problem_model: object) -> list[dict]:
     return vocab
 
 
+def working_capability_names(problem_model: object) -> set[str]:
+    """Return canonical names of registry capabilities declared ``working``.
+
+    A ``working`` capability already exists in the codebase per the
+    strategist-curated registry, so a prerequisite naming it is satisfied by
+    the repo itself — no task has to provide it. Only the exact ``working``
+    status qualifies: ``partial`` / ``planned`` capabilities still gate, since
+    the declared foundation genuinely does not (fully) exist yet.
+    """
+    working: set[str] = set()
+    for raw_name, status in _iter_capability_entries(problem_model):
+        if not (isinstance(status, str) and status.strip().lower() == "working"):
+            continue
+        normalized = normalize_capability_name(raw_name)
+        if normalized:
+            working.add(normalized)
+    return working
+
+
+def registry_satisfies_capability_need(
+    need: Mapping, working_names: Iterable[str]
+) -> bool:
+    """True iff ``need`` is a capability need whose ref the registry marks working.
+
+    Shared by the spawn-time prerequisite resolver and the blocked-resume sweep
+    so both layers agree that an already-``working`` capability never blocks a
+    dependent. Non-capability needs and unnormalizable refs never match.
+    """
+    if not isinstance(need, Mapping) or need.get("kind") != "capability":
+        return False
+    normalized = normalize_capability_name(need.get("ref"))
+    return normalized is not None and normalized in set(working_names)
+
+
 def off_registry_capability_refs(
     refs: Iterable[object], registry_names: Iterable[str]
 ) -> list[str]:

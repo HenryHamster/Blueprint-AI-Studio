@@ -10,8 +10,7 @@ import asyncio
 import logging
 import os
 import re
-from urllib.parse import quote
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,7 @@ _PRESENT_SYSTEM_STATUSES = {"mature", "functional", "partial"}
 _PRESENT_CAPABILITY_STATUSES = {"working", "partial"}
 
 
-def _parse_ref(ref: str) -> Tuple[str, Optional[int], Optional[int]]:
+def _parse_ref(ref: str) -> Tuple[str, int | None, int | None]:
     """Parse a file reference string into (path, start_line, end_line).
 
     Formats:
@@ -60,19 +59,18 @@ def _parse_ref(ref: str) -> Tuple[str, Optional[int], Optional[int]]:
 
 def _looks_like_file_path(path: str) -> bool:
     """Cheap rejector for obvious non-file refs before expensive checks."""
-    return bool(
-        path
-        and isinstance(path, str)
-        and (
-            "/" in path
-            or path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs"))
-        )
-    )
+    if not path or not isinstance(path, str):
+        return False
+    # Glob patterns ("routers/*.py") and whitespace-bearing tokens are never
+    # literal repo paths — checking them costs a guaranteed-miss API call each.
+    if any(ch in path for ch in "*?[]{}") or path != path.strip() or " " in path:
+        return False
+    return "/" in path or path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs"))
 
 
 async def _file_exists_at_head(
     path: str, *, cwd: str = "/tmp/workspace"
-) -> Optional[bool]:
+) -> bool | None:
     """Check whether a file exists in HEAD using 'git ls-files'. Tri-state.
 
     True  → present at HEAD.
@@ -90,7 +88,7 @@ async def _file_exists_at_head(
     return await _path_exists_at_head(path, repo_root=cwd)
 
 
-async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> Optional[bool]:
+async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> bool | None:
     """Return whether *path* exists in HEAD, or None when indeterminate.
 
     False means the path is definitely absent in HEAD. None means git/root
@@ -125,7 +123,7 @@ async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> Option
             return None
         # git ls-files returns 0 and outputs the path if it exists, empty otherwise
         return path in stdout.decode(errors="replace").splitlines()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — grounding must degrade to indeterminate, never raise
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
         )
@@ -140,58 +138,33 @@ async def _file_exists_in_repo_branch(
     repo: str,
     branch: str,
     project_id: str | None = None,
-) -> bool:
-    """Check whether *path* exists on ``owner/repo@branch`` via GitHub API."""
+) -> bool | None:
+    """Check whether *path* exists on ``owner/repo@branch``. Tri-state.
+
+    Backed by the cached branch-tree snapshot
+    (:func:`app.github_repo_snapshot.path_exists_on_branch`): set membership
+    against one cached ``git/trees`` fetch instead of one ``/contents`` call
+    per path, so a grounding pass costs O(1) API calls regardless of how many
+    files it cites.
+
+    True/False are definite answers from the snapshot. None is indeterminate
+    (snapshot unavailable — rate limit, quota reserve, truncated tree, or any
+    API error) and must NEVER be treated as absence: previously an API failure
+    here read as ``False``, which let a quota outage downgrade design-doc
+    entries to "missing".
+    """
     if not _looks_like_file_path(path):
         return False
+    from app.github_repo_snapshot import path_exists_on_branch
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    encoded_path = quote(path, safe="/")
-    encoded_branch = quote(branch, safe="")
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/contents/"
-        f"{encoded_path}?ref={encoded_branch}"
+    return await path_exists_on_branch(
+        path,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
     )
-    try:
-        from app.github import _github_request
-
-        response = await _github_request(
-            "GET",
-            url,
-            headers,
-            max_retries=2,
-            project_id=project_id,
-        )
-        if response.status_code == 404:
-            return False
-        if response.status_code != 200:
-            logger.warning(
-                "[SOURCE_REF_VALIDATION] GitHub contents lookup failed for %s on "
-                "%s/%s@%s: HTTP %s",
-                path,
-                owner,
-                repo,
-                branch,
-                response.status_code,
-            )
-            return False
-        payload = response.json()
-        return isinstance(payload, dict) and payload.get("type") == "file"
-    except Exception as e:
-        logger.warning(
-            "[SOURCE_REF_VALIDATION] Failed GitHub contents lookup for %s on "
-            "%s/%s@%s: %s",
-            path,
-            owner,
-            repo,
-            branch,
-            e,
-        )
-        return False
 
 
 async def _file_content_in_repo_branch(
@@ -203,7 +176,7 @@ async def _file_content_in_repo_branch(
     branch: str,
     project_id: str | None = None,
     return_content: bool = False,
-) -> Tuple[Optional[bool], Optional[Any]]:
+) -> Tuple[bool | None, Any | None]:
     """Fetch *path* on ``owner/repo@branch`` and return ``(exists, line_count)``.
 
     The GitHub-API content foundation that line-number validation needs (the
@@ -219,64 +192,31 @@ async def _file_content_in_repo_branch(
 
     ``line_count`` is None whenever it cannot be determined, so an indeterminate
     count never invalidates a line-number citation.
+
+    Backed by the cached snapshot layer
+    (:func:`app.github_repo_snapshot.file_text_on_branch`): existence comes
+    from the branch-tree snapshot and content from the blob cache (keyed by
+    immutable blob SHA), so repeated reads of the same file across findings,
+    design-doc entries, and retried passes cost one API call per content
+    change instead of one per read.
     """
     if not _looks_like_file_path(path):
         return None, None
+    from app.github_repo_snapshot import file_text_on_branch
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    encoded_path = quote(path, safe="/")
-    encoded_branch = quote(branch, safe="")
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/contents/"
-        f"{encoded_path}?ref={encoded_branch}"
+    exists, text = await file_text_on_branch(
+        path,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
     )
-    try:
-        from app.github import _github_request
-
-        response = await _github_request(
-            "GET", url, headers, max_retries=2, project_id=project_id
-        )
-        if response.status_code == 404:
-            return False, None
-        if response.status_code != 200:
-            logger.warning(
-                "[SOURCE_REF_VALIDATION] GitHub contents fetch failed for %s on "
-                "%s/%s@%s: HTTP %s",
-                path,
-                owner,
-                repo,
-                branch,
-                response.status_code,
-            )
-            return None, None
-        payload = response.json()
-        if not (isinstance(payload, dict) and payload.get("type") == "file"):
-            return None, None
-        content_b64 = payload.get("content")
-        if not isinstance(content_b64, str):
-            return True, None
-        import base64
-
-        try:
-            text = base64.b64decode(content_b64).decode(errors="replace")
-        except Exception:
-            return True, None
-        return (True, text) if return_content else (True, text.count("\n"))
-    except Exception as e:
-        logger.warning(
-            "[SOURCE_REF_VALIDATION] Failed GitHub contents fetch for %s on "
-            "%s/%s@%s: %s",
-            path,
-            owner,
-            repo,
-            branch,
-            e,
-        )
-        return None, None
+    if exists is not True:
+        return exists, None
+    if not isinstance(text, str):
+        return True, None
+    return (True, text) if return_content else (True, text.count("\n"))
 
 
 async def _file_has_line_count(path: str, min_line: int) -> bool:
@@ -315,7 +255,7 @@ async def _file_has_line_count(path: str, min_line: int) -> bool:
 
         line_count = stdout.count(b"\n")
         return line_count >= min_line
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Error validating line count for {path}: {e}"
         )
@@ -343,6 +283,91 @@ def partition_missing(
     return present, missing
 
 
+async def _classify_each_path(
+    paths: list,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> List[bool | None]:
+    """Per-item existence verdicts for *paths*, aligned by index.
+
+    True/False are definite answers from the integration-branch tree (or local
+    git HEAD); None is indeterminate. Non-string entries are unambiguously not
+    files → False. Shared core of the two public classifiers below.
+    """
+    use_repo_branch = all([token, owner, repo, branch])
+    verdicts: List[bool | None] = []
+    for p in paths:
+        exists: bool | None
+        if isinstance(p, str):
+            if use_repo_branch:
+                exists = await _file_exists_in_repo_branch(
+                    p,
+                    token=str(token),
+                    owner=str(owner),
+                    repo=str(repo),
+                    branch=str(branch),
+                    project_id=project_id,
+                )
+            else:
+                exists = (
+                    await _file_exists_at_head(p)
+                    if cwd == "/tmp/workspace"
+                    else await _file_exists_at_head(p, cwd=cwd)
+                )
+        else:
+            exists = False
+        verdicts.append(exists)
+    return verdicts
+
+
+async def classify_paths_tristate(
+    paths: list,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Tuple[List[str], List[str], List[str]]:
+    """Classify *paths* into (present, missing, indeterminate) buckets.
+
+    The honest three-bucket sibling of :func:`classify_existing_paths`:
+    ``missing`` contains ONLY unambiguous absences from the integration-branch
+    tree (or local git HEAD), while paths whose existence could not be
+    determined (rate limit, quota reserve, truncated tree, git error) land in
+    ``indeterminate``. Verdict-producing callers (claimed_absent / stale-ref /
+    effective-status computations) must use THIS form so an API outage is
+    never laundered into "the code does not exist". Order is preserved within
+    each bucket.
+    """
+    verdicts = await _classify_each_path(
+        paths,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
+        cwd=cwd,
+    )
+    present: List[str] = []
+    missing: List[str] = []
+    indeterminate: List[str] = []
+    for p, exists in zip(paths, verdicts, strict=True):
+        if exists is True:
+            present.append(p)
+        elif exists is False:
+            missing.append(p)
+        else:
+            indeterminate.append(p)
+    return present, missing, indeterminate
+
+
 async def classify_existing_paths(
     paths: list,
     *,
@@ -362,29 +387,25 @@ async def classify_existing_paths(
     relies on). Read-only and advisory: callers use the result to annotate,
     never to mutate stored state. Non-string entries are treated as missing.
     Order is preserved within each bucket.
+
+    Two-bucket compatibility form: indeterminate paths are folded into
+    ``missing`` (the documented legacy falsy-None behavior). Callers that
+    derive verdicts from absence must use :func:`classify_paths_tristate`
+    instead.
     """
+    verdicts = await _classify_each_path(
+        paths,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
+        cwd=cwd,
+    )
     present: List[str] = []
     missing: List[str] = []
-    use_repo_branch = all([token, owner, repo, branch])
-    for p in paths:
-        exists = False
-        if isinstance(p, str):
-            if use_repo_branch:
-                exists = await _file_exists_in_repo_branch(
-                    p,
-                    token=str(token),
-                    owner=str(owner),
-                    repo=str(repo),
-                    branch=str(branch),
-                    project_id=project_id,
-                )
-            else:
-                exists = (
-                    await _file_exists_at_head(p)
-                    if cwd == "/tmp/workspace"
-                    else await _file_exists_at_head(p, cwd=cwd)
-                )
-        if exists:
+    for p, exists in zip(paths, verdicts, strict=True):
+        if exists is True:
             present.append(p)
         else:
             missing.append(p)
@@ -393,7 +414,7 @@ async def classify_existing_paths(
 
 async def _git_output(
     args: List[str], repo_root: str = _REPO_ROOT, timeout: int = 5
-) -> Optional[str]:
+) -> str | None:
     """Run ``git <args>`` in *repo_root* and return stdout, or None on any failure.
 
     Conservative by construction: a missing checkout, non-zero exit, timeout, or
@@ -417,7 +438,7 @@ async def _git_output(
         if proc.returncode != 0:
             return None
         return stdout.decode(errors="replace")
-    except Exception:
+    except Exception:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
         logger.debug("[SOURCE_REF_VALIDATION] git %s failed", args, exc_info=True)
         return None
 
@@ -430,7 +451,7 @@ async def resolve_head_commit(
     branch: str | None = None,
     project_id: str | None = None,
     cwd: str = "/tmp/workspace",
-) -> Optional[str]:
+) -> str | None:
     """Resolve the current HEAD commit SHA of the integration/verification branch.
 
     Uses the GitHub API (the branch tip) when ``token/owner/repo/branch`` are all
@@ -447,7 +468,7 @@ async def resolve_head_commit(
             return await get_branch_sha(
                 str(token), str(owner), str(repo), str(branch)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
             logger.debug(
                 "[SOURCE_REF_VALIDATION] head-commit GitHub resolution failed",
                 exc_info=True,
@@ -480,7 +501,7 @@ def finding_cited_paths(finding: Dict[str, Any]) -> List[str]:
 
 
 async def cited_paths_changed_since(
-    sha: Optional[str],
+    sha: str | None,
     paths: list,
     *,
     token: str | None = None,
@@ -489,7 +510,7 @@ async def cited_paths_changed_since(
     branch: str | None = None,
     project_id: str | None = None,
     cwd: str = "/tmp/workspace",
-) -> Optional[bool]:
+) -> bool | None:
     """Return whether any of *paths* changed between *sha* and current HEAD.
 
     Tri-state, mirroring :func:`validate_source_refs`:
@@ -519,7 +540,7 @@ async def cited_paths_changed_since(
                 str(branch),
                 project_id=project_id,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
             logger.debug(
                 "[SOURCE_REF_VALIDATION] changed-files GitHub compare failed",
                 exc_info=True,
@@ -603,7 +624,7 @@ async def _symbol_defined_at_head(
     repo: str | None = None,
     branch: str | None = None,
     project_id: str | None = None,
-) -> Optional[bool]:
+) -> bool | None:
     """Return whether ``symbol`` is defined in ``path`` at HEAD.
 
     True  → file exists at HEAD and a plausible definition of ``symbol`` found.
@@ -646,7 +667,7 @@ async def _symbol_defined_at_head(
             proc.kill()
             logger.warning(f"[SOURCE_REF_VALIDATION] git show timeout for {path}")
             return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
         logger.warning(f"[SOURCE_REF_VALIDATION] git show failed for {path}: {e}")
         return None
     if proc.returncode == 0:
@@ -668,7 +689,7 @@ async def _symbol_defined_in_repo_branch(
     repo: str,
     branch: str,
     project_id: str | None = None,
-) -> Optional[bool]:
+) -> bool | None:
     """Return whether ``symbol`` is defined in ``path`` on ``owner/repo@branch``.
 
     Branch-aware sibling of :func:`_symbol_defined_at_head` (which only reads the
@@ -703,51 +724,22 @@ async def _symbol_defined_in_repo_branch(
     ):
         return None
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    encoded_path = quote(path, safe="/")
-    encoded_branch = quote(branch, safe="")
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/contents/"
-        f"{encoded_path}?ref={encoded_branch}"
+    # Shares the cached snapshot/blob reads with every other grounding path —
+    # symbol checks on hot files no longer re-download the file per reference.
+    # An absent file (exists False) stays indeterminate here per the docstring:
+    # file-level absence is the file-level grounding pass's concern.
+    exists, text = await _file_content_in_repo_branch(
+        path,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
+        return_content=True,
     )
-    try:
-        from app.github import _github_request
-
-        response = await _github_request(
-            "GET", url, headers, max_retries=2, project_id=project_id
-        )
-        # A non-200 (incl. 404) means we cannot read the file → indeterminate.
-        # File-level absence is handled by the file-level grounding pass.
-        if response.status_code != 200:
-            return None
-        payload = response.json()
-        if not (isinstance(payload, dict) and payload.get("type") == "file"):
-            return None
-        content_b64 = payload.get("content")
-        if not isinstance(content_b64, str):
-            return None
-        import base64
-
-        try:
-            text = base64.b64decode(content_b64).decode(errors="replace")
-        except Exception:
-            return None
-        return bool(_symbol_definition_regex(symbol).search(text))
-    except Exception as e:
-        logger.warning(
-            "[SOURCE_REF_VALIDATION] Failed symbol lookup for %s:%s on %s/%s@%s: %s",
-            path,
-            symbol,
-            owner,
-            repo,
-            branch,
-            e,
-        )
+    if exists is not True or not isinstance(text, str):
         return None
+    return bool(_symbol_definition_regex(symbol).search(text))
 
 
 def _extract_design_doc_paths(entry: Any) -> list[str]:
@@ -799,11 +791,12 @@ async def reconcile_design_doc_presence(
 
     When ``token``/``owner``/``repo``/``branch`` are all provided, backing-path
     presence is checked against the project's real GitHub integration-branch
-    tree (boolean, never indeterminate — same mechanism
-    :func:`classify_existing_paths` uses). Otherwise the local checkout's git
-    HEAD is consulted via :func:`_path_exists_at_head`, in which case a valid
-    ``repo_root`` is required (the ``os.path.isdir`` guard gates only this local
-    branch) and an indeterminate result leaves the entry untouched.
+    tree (tri-state — same mechanism :func:`classify_existing_paths` uses).
+    Otherwise the local checkout's git HEAD is consulted via
+    :func:`_path_exists_at_head`, in which case a valid ``repo_root`` is
+    required (the ``os.path.isdir`` guard gates only this local branch). On
+    EITHER path an indeterminate result leaves the entry untouched — a GitHub
+    rate limit or git outage is never evidence the backing files are gone.
     """
     if not isinstance(value, dict):
         return value
@@ -835,7 +828,7 @@ async def reconcile_design_doc_presence(
     seen_present = False
     for path in paths:
         if use_repo_branch:
-            exists: Optional[bool] = await _file_exists_in_repo_branch(
+            exists: bool | None = await _file_exists_in_repo_branch(
                 path,
                 token=str(token),
                 owner=str(owner),
@@ -843,6 +836,11 @@ async def reconcile_design_doc_presence(
                 branch=str(branch),
                 project_id=project_id,
             )
+            # Indeterminate (rate limit / quota reserve / API error) must leave
+            # the entry untouched, exactly like the local-git branch below —
+            # a GitHub outage is not evidence the backing files are gone.
+            if exists is None:
+                return value
         else:
             exists = await _path_exists_at_head(path, repo_root=repo_root)
             if exists is None:
@@ -1062,7 +1060,7 @@ async def resolve_branch_verification_context(session: Any, project: Any) -> Dic
         if resolved:
             token, owner, repo = resolved
             ctx.update({"token": token, "owner": owner, "repo": repo})
-    except Exception:
+    except Exception:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
         logger.debug(
             "[SOURCE_REF_VALIDATION] GitHub credential resolution skipped for "
             "design-doc grounding",
@@ -1072,8 +1070,8 @@ async def resolve_branch_verification_context(session: Any, project: Any) -> Dic
 
 
 async def detect_absent_symbols(
-    module_pointers: Optional[list] = None,
-    text_fields: Optional[list] = None,
+    module_pointers: list | None = None,
+    text_fields: list | None = None,
     *,
     token: str | None = None,
     owner: str | None = None,
@@ -1123,9 +1121,9 @@ async def detect_absent_symbols(
 
 
 async def summarize_ungrounded_claims(
-    claims: Optional[list],
-    sources: Optional[list] = None,
-) -> Optional[Dict[str, Any]]:
+    claims: list | None,
+    sources: list | None = None,
+) -> Dict[str, Any] | None:
     """Verify ``path:symbol`` references in a finding's claims resolve at HEAD.
 
     Parses ``path:symbol`` references out of each claim (and, when provided,
@@ -1179,7 +1177,7 @@ async def summarize_ungrounded_claims(
     }
 
 
-def extract_source_file_paths(sources: Optional[list]) -> list:
+def extract_source_file_paths(sources: list | None) -> list:
     """Extract normalized file paths from all file-type sources.
 
     Returns a deduplicated list of file paths (line numbers stripped) from
@@ -1207,8 +1205,8 @@ def extract_source_file_paths(sources: Optional[list]) -> list:
 
 
 def summarize_broken_refs(
-    validated_sources: Optional[list],
-) -> Optional[Dict[str, Any]]:
+    validated_sources: list | None,
+) -> Dict[str, Any] | None:
     """Summarize file-type sources marked invalid by validate_source_refs.
 
     Walks the output of validate_source_refs and returns a structured
@@ -1262,7 +1260,7 @@ def collect_stale_refs(validated_sources: list) -> list:
 
 
 async def validate_source_refs(
-    sources: Optional[list],
+    sources: list | None,
     *,
     token: str | None = None,
     owner: str | None = None,
@@ -1495,7 +1493,7 @@ def classify_reproduction(
 
 
 def _extract_bug_report_file_refs(
-    content: Any, structured_context: Optional[Dict[str, Any]] = None
+    content: Any, structured_context: Dict[str, Any] | None = None
 ) -> List[str]:
     """Extract repo-relative file paths cited in a bug report's free text.
 
@@ -1551,7 +1549,7 @@ def _has_validation_backend(
 async def summarize_bug_report_citations(
     content: Any,
     *,
-    structured_context: Optional[Dict[str, Any]] = None,
+    structured_context: Dict[str, Any] | None = None,
     token: str | None = None,
     owner: str | None = None,
     repo: str | None = None,
@@ -1697,8 +1695,8 @@ async def compute_message_citation_warning(
     project: Any,
     content: Any,
     *,
-    structured_context: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    structured_context: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
     """Best-effort citation warning for a BUG_REPORT/BLOCKER message, or None.
 
     Resolves the project's integration-branch verification context (via

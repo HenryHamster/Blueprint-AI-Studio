@@ -11593,10 +11593,10 @@ def _patch_classify(mocker, present_paths: set):
     async def _classify(paths, **_kwargs):
         present = [p for p in paths if isinstance(p, str) and p in present_paths]
         missing = [p for p in paths if not (isinstance(p, str) and p in present_paths)]
-        return present, missing
+        return present, missing, []
 
     mocker.patch(
-        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+        "app.autonomous_research.classify_paths_tristate", side_effect=_classify
     )
 
 
@@ -11803,10 +11803,10 @@ async def test_system_verification_uses_project_repo_and_integration_branch(
 
     async def _classify(paths, **kwargs):
         seen_kwargs.update(kwargs)
-        return paths, []
+        return paths, [], []
 
     mocker.patch(
-        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+        "app.autonomous_research.classify_paths_tristate", side_effect=_classify
     )
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
@@ -11863,14 +11863,14 @@ async def test_symbol_verification_passes_branch_context_to_symbol_checks(
     seen_kwargs = {}
 
     async def _classify(paths, **kwargs):
-        return paths, []
+        return paths, [], []
 
     async def _detect(*args, **kwargs):
         seen_kwargs.update(kwargs)
         return ["backend/app/ctx.py:missing_symbol"]
 
     mocker.patch(
-        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+        "app.autonomous_research.classify_paths_tristate", side_effect=_classify
     )
     mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
     mocker.patch(
@@ -11993,14 +11993,14 @@ async def test_capability_verification_passes_branch_context_to_symbol_checks(
     seen_kwargs = {}
 
     async def _classify(paths, **kwargs):
-        return paths, []
+        return paths, [], []
 
     async def _detect(*args, **kwargs):
         seen_kwargs.update(kwargs)
         return ["backend/app/ctx.py:missing_symbol"]
 
     mocker.patch(
-        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+        "app.autonomous_research.classify_paths_tristate", side_effect=_classify
     )
     mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
     mocker.patch(

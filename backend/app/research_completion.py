@@ -13,7 +13,7 @@ import os
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,8 +38,8 @@ from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
 )
 from app.compute_experiment_contract import (
-    _author_compute_launch_contract,  # noqa: F401 — re-exported for tests
-    _validate_compute_launch_contract,  # noqa: F401 — re-exported for tests
+    _author_compute_launch_contract,
+    _validate_compute_launch_contract,
     resolve_compute_spend_approval,
     resolve_compute_spend_threshold,
 )
@@ -62,7 +62,7 @@ from app.finding_deduplication import (
     deduplicate_findings,
     extract_retired_failed_approaches,
     extract_archived_diagnoses,
-    finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
+    finding_hash as _finding_hash,
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
     normalize_prerequisite,
     resolve_prerequisite_task,
@@ -251,8 +251,8 @@ _DOWNGRADED_VERIFICATION_BASIS = "pattern_inferred"
 
 def _reconcile_verification_basis(
     finding: Dict[str, Any],
-    broken_provenance: Optional[Dict[str, Any]],
-    ungrounded: Optional[Dict[str, Any]],
+    broken_provenance: Dict[str, Any] | None,
+    ungrounded: Dict[str, Any] | None,
 ) -> bool:
     """Cap a self-reported high-evidence verification_basis against HEAD truth.
 
@@ -297,7 +297,7 @@ def _reconcile_verification_basis(
 
 def _staleness_provenance_warning(
     finding: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
     """Return a provenance warning when deferred findings need HEAD revalidation."""
     if finding.get("needs_revalidation") is not True:
         return None
@@ -311,7 +311,7 @@ def _staleness_provenance_warning(
 
 def _merge_provenance_warnings(
     finding: Dict[str, Any],
-    *warnings: Optional[Dict[str, Any]],
+    *warnings: Dict[str, Any] | None,
 ) -> None:
     """Merge provenance warnings onto a finding, preserving existing signals."""
     merged: Dict[str, Any] = {}
@@ -443,7 +443,7 @@ def _synthesize_deferred_finding_memo(
     sf: Dict[str, Any],
     drop_reason: str,
     source_task_id: str,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
     """Synthesize a memo dict for a deferred finding without a model call.
 
     Returns None when the finding has no title or description (insufficient data).
@@ -504,7 +504,7 @@ def _consume_finding_challenge_record(
     *,
     boundary: str,
     first_verdict: str,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
     """Attach one returned challenge verdict to the finding it gates.
 
     ``task_evaluators`` writes a single active record on the source task. The
@@ -539,21 +539,21 @@ def _consume_finding_challenge_record(
     return attached
 
 
-def _challenge_agrees(record: Optional[Dict[str, Any]]) -> bool:
+def _challenge_agrees(record: Dict[str, Any] | None) -> bool:
     return isinstance(record, dict) and record.get("agreement") == CHALLENGE_AGREES
 
 
-def _challenge_disagrees(record: Optional[Dict[str, Any]]) -> bool:
+def _challenge_disagrees(record: Dict[str, Any] | None) -> bool:
     return isinstance(record, dict) and record.get("agreement") == CHALLENGE_DISAGREES
 
 
-def _challenge_second_verdict(record: Optional[Dict[str, Any]]) -> str:
+def _challenge_second_verdict(record: Dict[str, Any] | None) -> str:
     if not isinstance(record, dict):
         return ""
     return str(record.get("second_opinion_verdict") or "").lower()
 
 
-def _challenge_confirms_verdict(record: Optional[Dict[str, Any]], verdict: str) -> bool:
+def _challenge_confirms_verdict(record: Dict[str, Any] | None, verdict: str) -> bool:
     return _challenge_agrees(record) and _challenge_second_verdict(record) == str(
         verdict
     ).lower()
@@ -581,7 +581,7 @@ def _reconcile_reproduce_provenance_state(
     finding["_provenance_warnings"] = reconciled
 
 
-def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
+def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     """Extract structured research findings JSON array from agent output text."""
     json_str = _extract_json_array(text, "title", "prompt")
     if json_str:
@@ -713,7 +713,7 @@ async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
         try:
             if not os.path.exists(insights_path):
                 return []
-            with open(insights_path, "r") as f:
+            with open(insights_path) as f:
                 raw = f.read(200_000)
             data = json.loads(raw)
             if isinstance(data, list):
@@ -729,7 +729,7 @@ async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
 
 def _avg_medium_expansion_ratio(
     directions: List[Dict[str, Any]],
-) -> Optional[float]:
+) -> float | None:
     """Aggregate medium-scope expansion ratios across ``directions``'s last 3
     research_history entries. Prefers max(mean_merged, mean_failed) so the
     failed-task overflow signal biases conservatively. Returns None when no
@@ -765,7 +765,7 @@ def _compute_prompt_telemetry(
     direction_outcomes to surface patterns like "prompts mentioning tests merge
     at higher rates than those that don't".
     """
-    import re  # noqa: PLC0415
+    import re
 
     text = full_prompt or ""
     budget = SCOPE_FILE_BUDGETS.get(scope, {}).get("total_files_max") or 0
@@ -801,8 +801,8 @@ def _resolve_compute_spend_threshold(
 
 
 def _outcome_complexity_threshold(
-    direction: Optional[Dict[str, Any]],
-) -> Optional[float]:
+    direction: Dict[str, Any] | None,
+) -> float | None:
     """Derive the escalation threshold for medium-scope findings from the
     direction's recent avg_complexity_merged / avg_complexity_failed observations
     (last 3 research_history entries, 'medium' scope_breakdown).
@@ -832,7 +832,7 @@ def _outcome_complexity_threshold(
 
 
 def _cochange_decomposition_suppressed(
-    direction: Optional[Dict[str, Any]],
+    direction: Dict[str, Any] | None,
     min_sub_findings: int = 3,
     merge_rate_threshold: float = 0.4,
 ) -> bool:
@@ -860,10 +860,10 @@ def _cochange_decomposition_suppressed(
 def _calibrate_finding_scope(
     finding: Dict[str, Any],
     scope: str,
-    direction: Optional[Dict[str, Any]],
-    cochange_index: Optional[Dict[str, Any]],
-    all_directions: Optional[List[Dict[str, Any]]] = None,
-) -> tuple[str, Optional[str]]:
+    direction: Dict[str, Any] | None,
+    cochange_index: Dict[str, Any] | None,
+    all_directions: List[Dict[str, Any]] | None = None,
+) -> tuple[str, str | None]:
     """Apply pre-spawn scope-upgrade heuristics (file count, cross-module span,
     expansion-ratio prediction, composite complexity).
 
@@ -873,7 +873,7 @@ def _calibrate_finding_scope(
     when the composite-complexity check runs.
     """
     title = finding.get("title", "")
-    scope_calibrated_from: Optional[str] = None
+    scope_calibrated_from: str | None = None
 
     if scope == "small":
         _heuristic_files = finding.get("related_files") or []
@@ -1022,8 +1022,8 @@ def _calibrate_finding_scope(
 def _build_preventive_context(
     finding: Dict[str, Any],
     directions_by_id: Dict[str, Dict[str, Any]],
-    project_anomalies: Optional[Dict[str, Dict[str, Any]]],
-) -> Optional[Dict[str, Any]]:
+    project_anomalies: Dict[str, Dict[str, Any]] | None,
+) -> Dict[str, Any] | None:
     """Produce a concise preventive warning when a finding's related_files
     overlap with recently-diagnosed failure hotspots or active anomaly patterns.
 
@@ -1037,7 +1037,7 @@ def _build_preventive_context(
     related_set = set(related_files)
     cutoff = _utcnow() - timedelta(days=14)
 
-    hotspot: Optional[Dict[str, Any]] = None
+    hotspot: Dict[str, Any] | None = None
     for d in directions_by_id.values():
         affected = [
             a for a in (d.get("diagnosed_affected_files") or []) if isinstance(a, str)
@@ -1063,7 +1063,7 @@ def _build_preventive_context(
         }
         break
 
-    anomaly_match: Optional[Dict[str, Any]] = None
+    anomaly_match: Dict[str, Any] | None = None
     if project_anomalies:
         modules = {f.split("/", 1)[0].lower() for f in related_files if "/" in f}
         for key, info in project_anomalies.items():
@@ -1219,10 +1219,10 @@ def _summarize_dispatch_outcome(
 
 
 async def _summarize_ungrounded_claims_grounded(
-    claims: Optional[list],
-    sources: Optional[list],
+    claims: list | None,
+    sources: list | None,
     ctx: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
     """GitHub-context-aware variant of :func:`summarize_ungrounded_claims`.
 
     The shared ``summarize_ungrounded_claims`` helper checks each
@@ -1276,7 +1276,7 @@ async def _summarize_ungrounded_claims_grounded(
 
 
 def _count_total_symbol_refs(
-    claims: Optional[list], sources: Optional[list]
+    claims: list | None, sources: list | None
 ) -> int:
     """Count distinct ``path:symbol`` references across a finding's claims/excerpts.
 
@@ -1300,7 +1300,7 @@ def _count_total_symbol_refs(
     return len(seen)
 
 
-def _file_source_present_count(sources: Optional[list]) -> int:
+def _file_source_present_count(sources: list | None) -> int:
     """Count file-type sources that survive validation (not marked invalid).
 
     A source is counted present unless :func:`validate_source_refs` stamped it
@@ -1490,7 +1490,7 @@ def converge_spawn_batch_foundations(
     mutated in place with ``depends_on`` plus the ``_foundation_converged`` context
     marker); the caller persists them.
     """
-    from app.digest_metrics import (  # noqa: PLC0415
+    from app.digest_metrics import (
         apply_foundation_convergence_action,
         compute_foundation_convergence_actions,
     )
@@ -1767,7 +1767,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # context the citation checks use. Degrades to None (no stamp) when the SHA
     # is unknown (no creds + no checkout) — a missing SHA never marks a finding
     # stale downstream.
-    _generated_head_sha: Optional[str] = None
+    _generated_head_sha: str | None = None
     if project_obj is not None:
         try:
             _generated_head_sha = await resolve_head_commit(**_src_ref_ctx)
@@ -1789,7 +1789,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _f["generated_head_sha"] = _generated_head_sha
         if "claims" in _f and not isinstance(_f.get("claims"), list):
             _f["claims"] = []
-        _broken_provenance: Optional[Dict[str, Any]] = None
+        _broken_provenance: Dict[str, Any] | None = None
         if "sources" in _f:
             if not isinstance(_f["sources"], list):
                 _f["sources"] = []
@@ -1953,7 +1953,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _stamp_dt = None
             if isinstance(_stamp, str):
                 try:
-                    from datetime import datetime as _dt  # noqa: PLC0415
+                    from datetime import datetime as _dt
 
                     _stamp_dt = _dt.fromisoformat(_stamp.replace("Z", "+00:00"))
                     if _stamp_dt.tzinfo is not None:
@@ -1984,9 +1984,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if (
                 (_reason == "ultra_low_confidence" and _count >= 4)
                 or (_reason == "degradation_gate" and _count >= 3)
-            ):
-                _decayed.append(f)
-            elif _reason == "adversarial_gate" and _count >= 3:
+            ) or (_reason == "adversarial_gate" and _count >= 3):
                 _decayed.append(f)
             elif _reason == "low_actionability" and _count >= 3:
                 _record = _consume_finding_challenge_record(
@@ -2160,7 +2158,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Build a compact, budget-bounded manifest for the adversarial grader.
             # Each finding gets a stable hash identifier; the manifest stays valid
             # JSON under the per-prompt char budget regardless of finding count or size.
-            from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+            from app.finding_deduplication import finding_hash as _fh
 
             _hs_with_hash = []
             for _f in _high_stakes:
@@ -2215,7 +2213,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
-        from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
+        from app.finding_deduplication import finding_hash as _fh
 
         # Hashes that were actually in the challenge manifest. Used to distinguish
         # "challenged but no verdict returned" (fail-closed) from "never challenged
@@ -2314,8 +2312,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _spawn_gate_refuted_reasons.append(_reason)
 
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
-    from app import shared_state as _ss  # noqa: PLC0415
-    from app import max_plan_pool as _pool_mod  # noqa: PLC0415
+    from app import shared_state as _ss
+    from app import max_plan_pool as _pool_mod
 
     _max_vms = _runtime_config.get("max_concurrent_vms", 8)
     _available_slots = max(0, _max_vms - _ss.tasks_active_gauge)
@@ -2580,8 +2578,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             try:
                 from app.release_qualifier import (
                     _resolve_github_with_session as _rc_resolve_gh,
-                )  # noqa: PLC0415
-                from app import github as _rc_github  # noqa: PLC0415
+                )
+                from app import github as _rc_github
 
                 if project_obj is not None:
                     _gh_creds_rc = await _rc_resolve_gh(session, project_obj)
@@ -3317,7 +3315,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _directions_by_id.get(str(_mit_dir_id)) if _mit_dir_id else None
         )
         if _mit_direction and _scope_cal_project:
-            from app.strategic_spawning import _build_failure_feedback_mitigation  # noqa: PLC0415
+            from app.strategic_spawning import _build_failure_feedback_mitigation
 
             scope, _, _ = _build_failure_feedback_mitigation(
                 _mit_direction, scope, task_type, _scope_cal_project.design_doc
@@ -3659,9 +3657,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 from app.anomaly_detection import (
                     _error_fingerprint,
                     _is_recurring_failure_class,
-                )  # noqa: PLC0415
-                from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
-                from app import shared_state as _ss  # noqa: PLC0415
+                )
+                from app.task_lifecycle import _derive_failure_stage
+                from app import shared_state as _ss
 
                 error_msg = _prior.latest_status_message or ""
                 prior_retry_ctx["_previous_error_fingerprint"] = _error_fingerprint(
@@ -3732,7 +3730,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # task_lifecycle._requeue_parent_task so re-spawned findings get the
             # same tailored prompt_suffix as directly requeued retries.
             try:
-                from app.retry_prompt import _build_retry_prompt_suffix  # noqa: PLC0415
+                from app.retry_prompt import _build_retry_prompt_suffix
 
                 _retry_prompt_suffix, _scope_override = _build_retry_prompt_suffix(
                     failure_class_val,
@@ -3782,8 +3780,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # implementing agent early visibility into budget pressure before it
         # commits to a broad approach. Complements the review-pipeline's runtime
         # pressure system (which fires at 70%/90% after changes are made).
-        _predicted_utilization: Optional[float] = None
-        _file_budget_warning: Optional[str] = None
+        _predicted_utilization: float | None = None
+        _file_budget_warning: str | None = None
         if scope == "medium" and related_files:
             _util_ratio = (
                 _avg_medium_expansion_ratio([_pred_direction])
@@ -3809,7 +3807,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"the most critical files from related_files and avoid incidental edits that "
                     f"would push the change past the budget."
                 )
-        from app import shared_state as _ss_pc  # noqa: PLC0415
+        from app import shared_state as _ss_pc
 
         _project_anomalies = _ss_pc.persistent_anomalies.get(str(task.project_id))
         _preventive = _build_preventive_context(
@@ -4512,10 +4510,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # need-resolution path applies (blocked_need_resolution._would_create_cycle),
     # so a declared prerequisite that would close a depends_on cycle is refused at
     # the structural source rather than deferred to the dispatch-time cycle breaker.
-    from app.blocked_need_resolution import _would_create_cycle  # noqa: PLC0415
-    from app.task_blocked import build_need, enter_blocked_state  # noqa: PLC0415
+    from app.blocked_need_resolution import _would_create_cycle
+    from app.capability_registry import (
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+    from app.task_blocked import build_need, enter_blocked_state
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
+    # Capabilities the strategist registry already declares ``working`` exist in
+    # the codebase itself: a prerequisite naming one is satisfied by the repo, so
+    # it must neither wire an edge nor block the dependent. Without this, a
+    # finding that honestly declares "builds on existing capability X" parks
+    # BLOCKED on a need no task will ever advertise (providers are stamped only
+    # while X is being BUILT), rides the recheck sweep to the escalation deadline,
+    # and lands on the operator — for work that was runnable all along.
+    _working_registry_caps = working_capability_names(
+        getattr(project_obj, "problem_model", None)
+    )
     # Identities (kind, ref) that a finding deferred THIS cycle would satisfy. A
     # dependent blocked on one of these sits live-blocked behind dormant data: the
     # deferred foundation is not a real task, so nothing can satisfy the need until
@@ -4633,7 +4645,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     prereq.get("ref"),
                     label=prereq.get("label"),
                 )
-                if prereq_need:
+                if prereq_need and registry_satisfies_capability_need(
+                    prereq_need, _working_registry_caps
+                ):
+                    logger.info(
+                        "[RESEARCH] Finding '%s' prerequisite capability:%s is "
+                        "already 'working' per the problem_model registry — "
+                        "satisfied by the codebase, no gate",
+                        finding_title,
+                        prereq.get("ref"),
+                    )
+                elif prereq_need:
                     needs.append(prereq_need)
                     unresolved_entries.append(prereq)
             # foundation == ct itself (self-prerequisite): neither edge nor need.
@@ -4908,7 +4930,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     Appends a minimal history entry tagged research_task_failed=True to the direction
     referenced in task.context.direction_id (falling back to the payload field).
     """
-    from app.failure_classification import INFRA_CLASSES, classify_failure  # noqa: PLC0415
+    from app.failure_classification import INFRA_CLASSES, classify_failure
 
     direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
         "current_direction_id"
@@ -4942,7 +4964,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             return
         _found = True
         history = target.get("research_history", [])
-        new_history = history + [entry]
+        new_history = [*history, entry]
         # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
         if len(new_history) > 10:
             target["history_aggregate"] = _fold_evicted_into_aggregate(
@@ -4979,9 +5001,9 @@ _BOUNDED_CHALLENGE_SURFACE_KEYS: frozenset = frozenset(
 
 
 def resolve_research_findings_for_surface(
-    plan_output: Optional[List[Any]],
-    artifact_logs: Optional[str],
-) -> Optional[List[Dict[str, Any]]]:
+    plan_output: List[Any] | None,
+    artifact_logs: str | None,
+) -> List[Dict[str, Any]] | None:
     """Return the canonical challenge-enriched finding list for surface rendering.
 
     Prefers task.plan_output (which carries attached finding_challenge records)

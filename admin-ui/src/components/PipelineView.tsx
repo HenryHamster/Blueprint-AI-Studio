@@ -3,6 +3,8 @@ import { AlertTriangle, ChevronDown, ChevronRight, ExternalLink, Archive } from 
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 import { parseTimestamp } from '../utils/time';
+import { getSidecarBackref, deriveSidecarBadge, SIDECAR_TONE_CLASSES, type SidecarBadge } from '../utils/sidecarTasks';
+import { buildForest, type TreeNode } from './PipelineView.utils';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
@@ -17,13 +19,6 @@ const STATUS_COLORS: Record<string, string> = {
   QUEUED: 'bg-neutral-500',
   BLOCKED: 'bg-amber-500',
 };
-
-interface TreeNode {
-  task: Task;
-  children: TreeNode[];
-  isSyntheticParent?: boolean;
-  isOrphan?: boolean;
-}
 
 type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
 
@@ -57,74 +52,7 @@ interface PipelineViewProps {
   onUnarchiveTask?: (taskId: string) => void;
 }
 
-function buildForest(tasks: Task[]): TreeNode[] {
-  const taskMap = new Map<string, Task>();
-  for (const t of tasks) taskMap.set(t.id, t);
-
-  const nodeMap = new Map<string, TreeNode>();
-  for (const t of tasks) nodeMap.set(t.id, { task: t, children: [] });
-
-  const roots: TreeNode[] = [];
-  // Group orphans (tasks whose parent is not on this page) by parent_task_id
-  const orphanGroups = new Map<string, TreeNode[]>();
-
-  for (const t of tasks) {
-    const node = nodeMap.get(t.id);
-    if (!node) continue;
-    const parent = t.parent_task_id ? nodeMap.get(t.parent_task_id) : undefined;
-    if (parent) {
-      parent.children.push(node);
-    } else if (t.parent_task_id) {
-      // Orphan: parent exists but is not on this page
-      node.isOrphan = true;
-      const group = orphanGroups.get(t.parent_task_id) || [];
-      group.push(node);
-      orphanGroups.set(t.parent_task_id, group);
-    } else {
-      roots.push(node);
-    }
-  }
-
-  // Create synthetic parent nodes for orphan groups
-  const syntheticRoots: TreeNode[] = [];
-  for (const [parentId, orphans] of orphanGroups) {
-    const shortId = parentId.slice(0, 8);
-    const syntheticParent: TreeNode = {
-      task: {
-        id: `synthetic-${parentId}`,
-        title: `Task group (parent: ${shortId})`,
-        description: '',
-        status: 'QUEUED',
-        created_by: '',
-        requires_approval: false,
-        parent_task_id: parentId,
-        created_at: orphans[0].task.created_at,
-        history: [],
-      } as Task,
-      children: orphans,
-      isSyntheticParent: true,
-    };
-    syntheticRoots.push(syntheticParent);
-  }
-
-  // Sort children by pipeline order: research → plan → create → review → fix
-  const typeOrder: Record<string, number> = { research: 0, plan: 1, create: 2, review: 3, fix: 4 };
-  const sortChildren = (node: TreeNode) => {
-    node.children.sort((a, b) => (typeOrder[a.task.task_type || 'create'] ?? 2) - (typeOrder[b.task.task_type || 'create'] ?? 2));
-    node.children.forEach(sortChildren);
-  };
-  roots.forEach(sortChildren);
-  syntheticRoots.forEach(sortChildren);
-
-  // Sort roots by creation time (newest first)
-  roots.sort((a, b) => parseTimestamp(b.task.created_at).getTime() - parseTimestamp(a.task.created_at).getTime());
-  syntheticRoots.sort((a, b) => parseTimestamp(b.task.created_at).getTime() - parseTimestamp(a.task.created_at).getTime());
-
-  // Synthetic groups appear first so users see incomplete groups at the top
-  return [...syntheticRoots, ...roots];
-}
-
-function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount, sidecarBadges, isSidecar, isSidecarFallback }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number; sidecarBadges?: SidecarBadge[]; isSidecar?: boolean; isSidecarFallback?: boolean }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
@@ -195,6 +123,33 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         );
       })()}
 
+      {/* Side-car indicator — this row IS a side-car (grader/challenger). The
+          fallback variant means its primary task is not on this page/filter,
+          so the row renders top-level with a navigate-to-primary chip. */}
+      {(isSidecar || isSidecarFallback) && (() => {
+        const backref = getSidecarBackref(task);
+        if (!backref) return null;
+        return (
+          <>
+            <span
+              className="text-[9px] text-violet-400 bg-violet-500/10 border border-violet-500/30 px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider whitespace-nowrap shrink-0"
+              title={`Side-car (${backref.kind}) for task ${backref.primaryTaskId}`}
+            >
+              ↳ side-car
+            </span>
+            {isSidecarFallback && (
+              <button
+                onClick={e => { e.stopPropagation(); onNavigateToParent?.(backref.primaryTaskId); }}
+                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+                title={`Copy primary task ID: ${backref.primaryTaskId}`}
+              >
+                ↑ Primary on another page
+              </button>
+            )}
+          </>
+        );
+      })()}
+
       {/* Type badge */}
       {style && Icon && (
         <span className={`${style.bg} ${style.text} border text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-0.5 shrink-0`}>
@@ -242,6 +197,18 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
           Blocking {blockingCount}
         </span>
       )}
+
+      {/* Side-car presence/outcome badges — this row is the PRIMARY of one or
+          more nested side-cars (second-opinion challenger, grader, ...). */}
+      {sidecarBadges?.map((b, i) => (
+        <span
+          key={`${b.kind}-${i}`}
+          className={`text-[9px] border px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0 ${SIDECAR_TONE_CLASSES[b.tone]}`}
+          title={b.title}
+        >
+          {b.text}
+        </span>
+      ))}
 
       {/* Title + status message */}
       <div className="flex flex-col min-w-0 flex-1">
@@ -314,6 +281,18 @@ function TreeBranch({
   const [childrenExpanded, setChildrenExpanded] = useState(true);
   const hasChildren = node.children.length > 0;
 
+  // Side-cars nest under their primary, collapsed by default — they're
+  // verification machinery, not pipeline work, so they stay out of the way
+  // until the operator opens them.
+  const [sidecarsExpanded, setSidecarsExpanded] = useState(false);
+  const hasSidecars = node.sidecars.length > 0;
+  const sidecarBadges = useMemo(
+    () => node.sidecars
+      .map(s => deriveSidecarBadge(s.task, node.task))
+      .filter((b): b is SidecarBadge => b !== null),
+    [node.sidecars, node.task],
+  );
+
   return (
     <div className="relative">
       {/* Connector line from parent */}
@@ -378,9 +357,48 @@ function TreeBranch({
             </button>
           )}
           <div className="flex-1 min-w-0">
-            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} onUnarchiveParent={onUnarchiveParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} />
+            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} onUnarchiveParent={onUnarchiveParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} sidecarBadges={sidecarBadges.length > 0 ? sidecarBadges : undefined} isSidecar={node.isSidecar} isSidecarFallback={node.isSidecarFallback} />
           </div>
         </div>
+
+        {/* Side-cars: graders/challengers back-referencing this task, nested
+            and collapsed by default. */}
+        {hasSidecars && (
+          <>
+            <div style={{ paddingLeft: 20 }}>
+              <button
+                onClick={e => { e.stopPropagation(); setSidecarsExpanded(v => !v); }}
+                className="min-h-[44px] inline-flex items-center gap-1 text-[10px] text-violet-400/80 hover:text-violet-300 transition-colors"
+                title={sidecarsExpanded ? 'Collapse side-cars' : 'Expand side-cars'}
+              >
+                {sidecarsExpanded
+                  ? <ChevronDown className="w-3 h-3 shrink-0" />
+                  : <ChevronRight className="w-3 h-3 shrink-0" />}
+                {node.sidecars.length} side-car{node.sidecars.length === 1 ? '' : 's'}
+              </button>
+            </div>
+            {sidecarsExpanded && (
+              <div className="mt-1 space-y-1">
+                {node.sidecars.map((child, i) => (
+                  <TreeBranch
+                    key={child.task.id}
+                    node={child}
+                    taskMap={taskMap}
+                    allTaskIds={allTaskIds}
+                    prChainMap={prChainMap}
+                    onViewLogs={onViewLogs}
+                    onNavigateToParent={onNavigateToParent}
+                    onUnarchiveParent={onUnarchiveParent}
+                    isLast={i === node.sidecars.length - 1}
+                    depth={depth + 1}
+                    activeFilter={activeFilter}
+                    blockingMap={blockingMap}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
 
         {/* Children */}
         {hasChildren && childrenExpanded && (
@@ -427,7 +445,11 @@ function buildPrChainMap(tasks: Task[]): Map<number, Task> {
 }
 
 function collectAllIds(node: TreeNode): string[] {
-  return [node.task.id, ...node.children.flatMap(c => collectAllIds(c))];
+  return [
+    node.task.id,
+    ...node.children.flatMap(c => collectAllIds(c)),
+    ...node.sidecars.flatMap(c => collectAllIds(c)),
+  ];
 }
 
 function RootGroup({
@@ -774,15 +796,21 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
 }
 
 function countNodes(node: TreeNode): number {
-  return 1 + node.children.reduce((sum, c) => sum + countNodes(c), 0);
+  return 1
+    + node.children.reduce((sum, c) => sum + countNodes(c), 0)
+    + node.sidecars.reduce((sum, c) => sum + countNodes(c), 0);
 }
 
 function countByStatus(node: TreeNode, status: string): number {
   const self = node.task.status === status ? 1 : 0;
-  return self + node.children.reduce((sum, c) => sum + countByStatus(c, status), 0);
+  return self
+    + node.children.reduce((sum, c) => sum + countByStatus(c, status), 0)
+    + node.sidecars.reduce((sum, c) => sum + countByStatus(c, status), 0);
 }
 
 function countByStatuses(node: TreeNode, statuses: string[]): number {
   const self = statuses.includes(node.task.status) ? 1 : 0;
-  return self + node.children.reduce((sum, c) => sum + countByStatuses(c, statuses), 0);
+  return self
+    + node.children.reduce((sum, c) => sum + countByStatuses(c, statuses), 0)
+    + node.sidecars.reduce((sum, c) => sum + countByStatuses(c, statuses), 0);
 }

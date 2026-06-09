@@ -853,10 +853,9 @@ async def test_symbol_defined_in_repo_branch_present_true(mocker):
     """File present on the branch + a plausible definition → True."""
     from app.source_ref_validation import _symbol_defined_in_repo_branch
 
-    resp = _GhResp(200, _file_payload("def do_thing():\n    return 1\n"))
     mocker.patch(
-        "app.github._github_request",
-        new=AsyncMock(return_value=resp),
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(True, "def do_thing():\n    return 1\n")),
     )
     result = await _symbol_defined_in_repo_branch(
         "backend/app/x.py",
@@ -875,10 +874,9 @@ async def test_symbol_defined_in_repo_branch_file_present_symbol_gone_false(mock
     """File present but no plausible definition → unambiguous absence (False)."""
     from app.source_ref_validation import _symbol_defined_in_repo_branch
 
-    resp = _GhResp(200, _file_payload("def something_else():\n    pass\n"))
     mocker.patch(
-        "app.github._github_request",
-        new=AsyncMock(return_value=resp),
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(True, "def something_else():\n    pass\n")),
     )
     result = await _symbol_defined_in_repo_branch(
         "backend/app/x.py",

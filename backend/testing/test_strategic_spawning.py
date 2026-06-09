@@ -8290,7 +8290,7 @@ class TestVerifyCapabilityBackingPaths:
     """The strategic payload annotates each capability with advisory backing-
     path verification, never mutating the durable problem_model.
 
-    classify_existing_paths is patched per-test so the cases are deterministic
+    classify_paths_tristate is patched per-test so the cases are deterministic
     and don't depend on the integration-branch file tree.
     """
 
@@ -8309,7 +8309,7 @@ class TestVerifyCapabilityBackingPaths:
         # classify must never be called when there are no paths to check.
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
+            "classify_paths_tristate",
             new=AsyncMock(side_effect=AssertionError("should not be called")),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(pm)
@@ -8332,8 +8332,8 @@ class TestVerifyCapabilityBackingPaths:
         }
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
-            new=AsyncMock(return_value=(["a.py", "b.py"], [])),
+            "classify_paths_tristate",
+            new=AsyncMock(return_value=(["a.py", "b.py"], [], [])),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(pm)
         ver = out["capabilities"][0]["verification"]
@@ -8356,8 +8356,8 @@ class TestVerifyCapabilityBackingPaths:
         }
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
-            new=AsyncMock(return_value=(["a.py"], ["gone.py"])),
+            "classify_paths_tristate",
+            new=AsyncMock(return_value=(["a.py"], ["gone.py"], [])),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(pm)
         ver = out["capabilities"][0]["verification"]
@@ -8380,8 +8380,8 @@ class TestVerifyCapabilityBackingPaths:
         }
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
-            new=AsyncMock(return_value=([], ["gone1.py", "gone2.py"])),
+            "classify_paths_tristate",
+            new=AsyncMock(return_value=([], ["gone1.py", "gone2.py"], [])),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(pm)
         ver = out["capabilities"][0]["verification"]
@@ -8406,8 +8406,8 @@ class TestVerifyCapabilityBackingPaths:
         }
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
-            new=AsyncMock(return_value=(["a.py"], [])),
+            "classify_paths_tristate",
+            new=AsyncMock(return_value=(["a.py"], [], [])),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(pm)
         # Input capability is untouched (no verification key added in place).
@@ -8432,11 +8432,11 @@ class TestVerifyCapabilityBackingPaths:
 
         async def _classify(paths, **kwargs):
             seen_kwargs.update(kwargs)
-            return (paths, [])
+            return (paths, [], [])
 
         with patch.object(
             strategic_spawning,
-            "classify_existing_paths",
+            "classify_paths_tristate",
             new=AsyncMock(side_effect=_classify),
         ):
             out = await strategic_spawning._verify_capability_backing_paths(

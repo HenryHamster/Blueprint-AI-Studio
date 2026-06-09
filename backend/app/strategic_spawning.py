@@ -51,7 +51,7 @@ from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.problem_model import compute_model_size_signal, parse_problem_model
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
-    classify_existing_paths,
+    classify_paths_tristate,
     ground_design_doc,
     resolve_branch_verification_context,
 )
@@ -97,8 +97,8 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
 def _empty_finding_challenge_summary() -> dict[str, Any]:
     return {
         "challenged_findings": 0,
-        "agreement_distribution": {k: 0 for k in _CHALLENGE_AGREEMENT_BUCKETS},
-        "boundary_distribution": {k: 0 for k in _CHALLENGE_BOUNDARY_BUCKETS},
+        "agreement_distribution": dict.fromkeys(_CHALLENGE_AGREEMENT_BUCKETS, 0),
+        "boundary_distribution": dict.fromkeys(_CHALLENGE_BOUNDARY_BUCKETS, 0),
         "fail_closed_unparseable": 0,
     }
 
@@ -374,7 +374,7 @@ def _compute_model_health(pm: dict | None) -> dict | None:
         return compute_model_size_signal(parse_problem_model(None))
     try:
         return compute_model_size_signal(parse_problem_model(pm))
-    except Exception:
+    except Exception:  # noqa: BLE001 — advisory soft signal must degrade, never raise
         logger.warning(
             "[STRATEGIC] could not compute model_health (durable problem_model "
             "failed strict validation); omitting the soft signal this cycle",
@@ -745,10 +745,7 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
         if not isinstance(e, dict):
             continue
         field = e.get("field") or ""
-        if field == "running_update":
-            document = "running_update"
-        else:
-            document = "vision"
+        document = "running_update" if field == "running_update" else "vision"
         entries.append(
             {
                 "document": document,
@@ -799,7 +796,7 @@ async def _verify_capability_backing_paths(
     ``autonomous_research.py``: for every capability that declares
     ``backing_paths``, classify those paths against the integration-branch
     file tree (prefer the project's real GitHub repo/branch when available,
-    else local git HEAD via :func:`classify_existing_paths`) and attach a
+    else local git HEAD via :func:`classify_paths_tristate`) and attach a
     per-capability ``verification`` block::
 
         {"present": [...], "missing": [...], "effective_status": "..."}
@@ -808,8 +805,11 @@ async def _verify_capability_backing_paths(
     code actually shows rather than trusting the stored status verbatim:
       - ``backing_paths`` empty → ``"unverified"`` (no linkage to check)
       - all paths present → the capability's own stored status (verified)
-      - mixed presence → ``"partial"``
-      - all paths missing → ``"absent"`` (claimed but no backing code exists)
+      - no definite absence but unknowable paths → ``"unverified"`` (a rate
+        limit or API outage is never evidence of absent code)
+      - mixed (some definitely missing, rest present/unknowable) → ``"partial"``
+      - all paths definitely missing → ``"absent"`` (claimed but no backing
+        code exists)
 
     Operates on a copy: the input *pm* (and therefore the durable
     ``project.problem_model``) is never mutated. *pm* is expected to already
@@ -836,7 +836,7 @@ async def _verify_capability_backing_paths(
             }
             new_caps.append(cap2)
             continue
-        present, missing = await classify_existing_paths(
+        present, missing, indeterminate = await classify_paths_tristate(
             paths,
             token=token,
             owner=owner,
@@ -844,17 +844,23 @@ async def _verify_capability_backing_paths(
             branch=branch,
             project_id=project_id,
         )
-        if not missing:
+        if not missing and not indeterminate:
             effective_status = str(cap2.get("status", "")) or "unverified"
-        elif present:
+        elif not missing:
+            # Unknowable paths only (rate limit / quota reserve / API error):
+            # no verdict either way — never launder an outage into absence.
+            effective_status = "unverified"
+        elif present or indeterminate:
             effective_status = "partial"
         else:
-            # Every declared backing path is absent from the integration
-            # branch: the capability is claimed but its code does not exist.
+            # Every declared backing path is unambiguously absent from the
+            # integration branch: the capability is claimed but its code does
+            # not exist.
             effective_status = "absent"
         cap2["verification"] = {
             "present": present,
             "missing": missing,
+            **({"indeterminate": indeterminate} if indeterminate else {}),
             "effective_status": effective_status,
         }
         new_caps.append(cap2)
@@ -1786,10 +1792,13 @@ def _build_operator_steering_directive(
                 != ARMING_STEERING
             ):
                 continue
-        except Exception:
+        except Exception:  # noqa: BLE001 — fail open: treat as steering
             # Unknown/malformed type — treat as steering rather than silently
             # dropping a potential directive.
-            pass
+            logger.debug(
+                "[STRATEGIC] message arming classification failed; treating as steering",
+                exc_info=True,
+            )
         steering_msgs.append(m)
     # conversation_thread is chronological (oldest→newest); the steering
     # message(s) that woke this cycle are the most recent, so quote the tail.

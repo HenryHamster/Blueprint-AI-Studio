@@ -262,6 +262,44 @@ def test_registry_capability_names_canonicalize_problem_model_names():
     ]
 
 
+def test_working_capability_names_only_working_status():
+    from app.capability_registry import working_capability_names
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="Seeded evaluation harness", status="working"),
+            Capability(name=" PR Promotion ", status="partial"),
+            Capability(name="future-thing", status="planned"),
+        ]
+    )
+
+    assert working_capability_names(model) == {"seeded-evaluation-harness"}
+    assert working_capability_names(None) == set()
+
+
+def test_registry_satisfies_capability_need_matches_working_only():
+    from app.capability_registry import registry_satisfies_capability_need
+
+    working = {"seeded-evaluation-harness"}
+    # Refs normalize before matching, so the agent's raw phrasing still matches.
+    assert registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "Seeded Evaluation Harness"}, working
+    )
+    assert registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "seeded-evaluation-harness"}, working
+    )
+    # Non-working capability, task-kind need, and junk refs never match.
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "pr-promotion"}, working
+    )
+    assert not registry_satisfies_capability_need(
+        {"kind": "task", "ref": "seeded-evaluation-harness"}, working
+    )
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "   "}, working
+    )
+
+
 def test_capability_ambiguous_resolves_to_canonical():
     # Two candidates qualify for capability 'design' by different exact signals
     # (payload type vs. exact title). The canonical (earliest-created) one wins

@@ -180,7 +180,7 @@ class TestScopeBudgetGate:
     def test_medium_exactly_at_limit_passes_unchanged(self):
         # MEDIUM_ANALYSIS_PLAN_FILE_LIMIT files is exactly at the limit, not over
         files = [f"file{i}.py" for i in range(MEDIUM_ANALYSIS_PLAN_FILE_LIMIT)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+        scope, cal_from, warning, _requires_approval = check_scope_budget_mismatch(
             "medium", files
         )
         assert scope == "medium"
@@ -189,7 +189,7 @@ class TestScopeBudgetGate:
 
     def test_medium_one_over_limit_upgrades(self):
         files = [f"file{i}.py" for i in range(MEDIUM_ANALYSIS_PLAN_FILE_LIMIT + 1)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+        scope, cal_from, _warning, _requires_approval = check_scope_budget_mismatch(
             "medium", files
         )
         assert scope == "large"
@@ -297,11 +297,7 @@ class TestLowActionabilityDecay:
         for f in findings:
             _count = int(f.get("deferred_count", 0) or 0)
             _reason = f.get("deferred_reason")
-            if _reason == "ultra_low_confidence" and _count >= 4:
-                _decayed.append(f)
-            elif _reason == "degradation_gate" and _count >= 3:
-                _decayed.append(f)
-            elif _reason == "low_actionability" and _count >= 3:
+            if (_reason == "ultra_low_confidence" and _count >= 4) or (_reason == "degradation_gate" and _count >= 3) or (_reason == "low_actionability" and _count >= 3):
                 _decayed.append(f)
             else:
                 _kept.append(f)
@@ -533,13 +529,13 @@ class TestVerificationBasisHeadReconciliation:
     at HEAD; clean or absent citations preserve the reported basis."""
 
     def test_shared_tier_constant_matches_normalization_set(self):
-        assert VALID_VERIFICATION_BASES == {
+        assert {
             "code_verified",
             "path_verified",
             "pattern_inferred",
             "deduced",
-        }
-        assert _HIGH_EVIDENCE_BASES == {"code_verified", "path_verified"}
+        } == VALID_VERIFICATION_BASES
+        assert {"code_verified", "path_verified"} == _HIGH_EVIDENCE_BASES
         assert _DOWNGRADED_VERIFICATION_BASIS == "pattern_inferred"
 
     def test_code_verified_with_broken_citation_downgrades(self):
@@ -1848,7 +1844,7 @@ class TestReproduceOnHeadGate:
     ):
         from test_autonomous_research import _patch_research_externals
 
-        _project, direction, task = await _grader_project_and_task(
+        _project, _direction, task = await _grader_project_and_task(
             db_session, direction_id
         )
         if task_context:
@@ -2038,7 +2034,7 @@ class TestReproduceOnHeadGate:
         has_backend = kw.pop("has_backend", True)
         validate = kw.pop("validate", None)
 
-        _project, direction, task = await _grader_project_and_task(
+        _project, _direction, task = await _grader_project_and_task(
             db_session, direction_id
         )
         _patch_research_externals(mocker)
@@ -2943,7 +2939,7 @@ class TestKnowledgeFindingRouting:
     async def _spawn_from_finding(self, db_session, mocker, *, direction_id, finding):
         from test_autonomous_research import _patch_research_externals
 
-        _project, direction, task = await _grader_project_and_task(
+        _project, _direction, task = await _grader_project_and_task(
             db_session, direction_id
         )
 
@@ -4671,6 +4667,120 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
         u.get("kind") == "task" and u.get("ref") == missing_ref
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_working_registry_capability_prerequisite_does_not_block(
+    db_session, mocker
+):
+    """A finding declaring a capability prerequisite that the strategist registry
+    already marks ``working`` spawns UNBLOCKED with no edge and no recorded need:
+    the capability exists in the codebase itself, so no provider task will ever
+    advertise it — blocking would strand runnable work to the escalation
+    deadline."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq07")
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": [
+            {"name": "Budgeted compute job substrate", "status": "working"},
+            {"name": "future-capability", "status": "planned"},
+        ],
+    }
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    child = children[0]
+    assert child.status != TaskStatus.BLOCKED, (
+        "a prerequisite on an already-working registry capability must not block"
+    )
+    assert not (child.depends_on or []), (
+        "a registry-satisfied prerequisite must not wire a depends_on edge"
+    )
+    assert not get_blocker_needs(child), (
+        "a registry-satisfied prerequisite must not persist a blocker need"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_planned_registry_capability_prerequisite_still_blocks(
+    db_session, mocker
+):
+    """The registry bypass is exact: a capability whose declared status is NOT
+    ``working`` (planned/partial) still gates the dependent — the foundation
+    genuinely does not exist yet."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq08")
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": [
+            {"name": "budgeted-compute-job-substrate", "status": "planned"},
+        ],
+    }
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.BLOCKED, (
+        "a planned (not-yet-built) capability prerequisite must still gate"
+    )
+    assert get_blocker_needs(child), "the unresolved need must be persisted"
 
 
 @_pytest.mark.asyncio

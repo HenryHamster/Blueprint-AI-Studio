@@ -788,6 +788,22 @@ async def _fetch_knowledge_substance_index(session, project_id) -> list:
     return await fetch_knowledge_substance_index(session, project_id)
 
 
+async def _fetch_working_capability_names(session, project_id) -> set:
+    """Canonical names of registry capabilities the project declares ``working``.
+
+    Drawn from the strategist-curated ``project.problem_model.capabilities``
+    registry — the same vocabulary agents declare prerequisite refs from. A
+    ``working`` capability already exists in the codebase, so a capability need
+    naming one is satisfied by the repo itself (no provider task required).
+    Cached per project across the sweep batch like the candidate sets.
+    """
+    from app.capability_registry import working_capability_names
+    from app.models import Project
+
+    project = await session.get(Project, project_id)
+    return working_capability_names(getattr(project, "problem_model", None))
+
+
 async def _classify_blocker_needs(
     task,
     session,
@@ -796,6 +812,7 @@ async def _classify_blocker_needs(
     completed_cache: dict,
     dead_cache: dict,
     knowledge_cache: dict,
+    registry_cache: dict,
 ) -> dict:
     """Classify EVERY recorded need of a blocked task against the live foundations.
 
@@ -810,10 +827,16 @@ async def _classify_blocker_needs(
       ``residual``        — needs not yet accounted for (no foundation matches)
       ``dead``            — ≥1 need names a terminally FAILED/CANCELLED foundation
 
-    Resolution per need is active → completed → knowledge → dead → residual.
-    Knowledge-satisfied needs (a dangling kind='task' ref whose substance persists
-    as a durable KnowledgeDocument) are routed into ``completed_needs`` so the
-    existing resume path handles them without wiring a depends_on edge. This
+    Resolution per need is active → completed → knowledge → registry → dead →
+    residual. Knowledge-satisfied needs (a dangling kind='task' ref whose
+    substance persists as a durable KnowledgeDocument) are routed into
+    ``completed_needs`` so the existing resume path handles them without wiring
+    a depends_on edge. The registry step does the same for a capability need the
+    project's problem_model already declares ``working`` — the capability exists
+    in the codebase itself, so no provider task will ever advertise it; without
+    this step such a need sits residual to the escalation deadline (or worse, a
+    long-dead historical provider routes it to the dead-foundation cancel). It
+    deliberately runs BEFORE the dead check for exactly that reason. This
     prevents the dead-foundation path from cancelling a dependent whose need IS
     durably satisfied. Reuses the shared conservative predicates in
     :mod:`app.blocked_need_resolution` (no parallel matcher); candidate sets are
@@ -828,6 +851,7 @@ async def _classify_blocker_needs(
         need_matched_dead_foundation,
         knowledge_substance_satisfies_need,
     )
+    from app.capability_registry import registry_satisfies_capability_need
 
     needs = get_blocker_needs(task)
     disp = {
@@ -859,6 +883,14 @@ async def _classify_blocker_needs(
     if knowledge is None:
         knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
         knowledge_cache[task.project_id] = knowledge
+    # Registry working-capability set, fetched only when a capability need is
+    # actually present (the common task-kind path pays no extra query).
+    working_caps = registry_cache.get(task.project_id)
+    if working_caps is None and any(n.get("kind") == "capability" for n in needs):
+        working_caps = await _fetch_working_capability_names(session, task.project_id)
+        registry_cache[task.project_id] = working_caps
+    if working_caps is None:
+        working_caps = set()
 
     # Stranded-parent set so a ghost-merge / unshipped foundation does NOT satisfy
     # a completed need — mirrors the respawn-dedup layer's "shipped" notion
@@ -888,6 +920,14 @@ async def _classify_blocker_needs(
         # task is CANCELLED but whose substance persists as a KnowledgeDocument is
         # satisfied — do NOT route it to the dead-foundation path.
         if knowledge_substance_satisfies_need(need, knowledge):
+            disp["completed_needs"].append(need)
+            continue
+        # Registry-satisfied capability: the problem_model already declares this
+        # capability ``working``, so the codebase itself is the foundation —
+        # resume with no edge. Checked BEFORE the dead-foundation path so a
+        # stale terminal provider of a still-working capability can never
+        # cancel the dependent.
+        if registry_satisfies_capability_need(need, working_caps):
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
@@ -1480,6 +1520,10 @@ async def sweep_unblock_blocked_tasks(
     # originating task is CANCELLED but whose substance persists as a durable
     # KnowledgeDocument is satisfied rather than routed to the dead-foundation path.
     knowledge_cache: dict = {}
+    # Per-project registry working-capability sets (problem_model.capabilities):
+    # a capability need the registry already declares ``working`` is satisfied by
+    # the codebase itself and resumes with no edge.
+    registry_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1532,6 +1576,7 @@ async def sweep_unblock_blocked_tasks(
             completed_cache=completed_cache,
             dead_cache=dead_cache,
             knowledge_cache=knowledge_cache,
+            registry_cache=registry_cache,
         )
 
         # Already escalated terminally — leave parked for the operator. On
@@ -1874,6 +1919,7 @@ async def _event_driven_unblock_project(
     completed_cache: dict = {}
     dead_cache: dict = {}
     knowledge_cache: dict = {}
+    registry_cache: dict = {}
 
     for task in candidates:
         # Skip tasks with no machine-resolvable needs; the sweep handles those.
@@ -1889,6 +1935,7 @@ async def _event_driven_unblock_project(
                 completed_cache=completed_cache,
                 dead_cache=dead_cache,
                 knowledge_cache=knowledge_cache,
+                registry_cache=registry_cache,
             )
             if not disp["had_needs"]:
                 continue
