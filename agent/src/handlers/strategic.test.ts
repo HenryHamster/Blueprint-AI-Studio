@@ -134,6 +134,7 @@ import {
   handleStrategic,
 } from './strategic.js';
 import { runClaudeCode } from '../index.js';
+import { VmConfigMissingError } from '../providers/runners.js';
 import { runThinkerWithGate } from '../prompts/thinker.js';
 
 describe('buildStagedDirectionsSection', () => {
@@ -691,5 +692,36 @@ describe('handleStrategic prompt_suffix wiring', () => {
       'task-4', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
     );
     expect(capturedThinkerParams?.availableCapabilitiesSection).toBe('');
+  });
+});
+
+describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
+  it('propagates a vm_config_missing death from the required-calls retry instead of swallowing it', async () => {
+    // The swallowing retry-catch previously turned a vm_config_missing death into a
+    // [WARNING] + a misclassified COMPLETED/claude_code_failed status — the warm VM
+    // then stranded into vm_unresponsive. The fix rethrows VmConfigMissingError so it
+    // reaches runRoleOnce's classifier for a clean PROVISION_FAILURE requeue.
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    // Executor (call 0) returns exit 0 with no required-call evidence → triggers the
+    // required-calls retry (call 1), which dies vm_config_missing.
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockRejectedValueOnce(
+        new VmConfigMissingError(
+          'provider config file missing on VM (boot/retarget materialization lost)',
+        ),
+      );
+
+    const statusRef = { value: '' };
+    await expect(
+      handleStrategic('task-vmcm', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef),
+    ).rejects.toBeInstanceOf(VmConfigMissingError);
+
+    // Restore the shared default so later tests are unaffected.
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   });
 });

@@ -6,6 +6,7 @@ import {
   apiPost,
   resolveBaseBranch,
 } from '../index.js';
+import { VmConfigMissingError } from '../providers/runners.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import {
@@ -886,6 +887,11 @@ ${analysisText.slice(0, 50_000)}
         lastResultText = retryResult.lastResultText || lastResultText;
       }
     } catch (e) {
+      // Never swallow an infra failure: a vm_config_missing death in the retry
+      // runClaudeCode must propagate to runRoleOnce's classifier so the
+      // orchestrator gets a clean PROVISION_FAILURE requeue, not a misclassified
+      // COMPLETED/claude_code_failed that strands the warm VM into vm_unresponsive.
+      if (e instanceof VmConfigMissingError) throw e;
       sendLog(ws, `[WARNING] Could not verify strategic required calls: ${String(e)}\n`);
     }
 
@@ -921,6 +927,7 @@ ${analysisText.slice(0, 50_000)}
         lastResultText = retryResult.lastResultText || lastResultText;
       }
     } catch (e) {
+      if (e instanceof VmConfigMissingError) throw e;
       sendLog(ws, `[WARNING] Could not verify strategic direction ops: ${String(e)}\n`);
     }
 
