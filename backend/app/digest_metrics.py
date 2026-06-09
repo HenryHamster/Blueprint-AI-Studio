@@ -149,7 +149,21 @@ def _compute_first_attempt_breakdowns(
     without_arch = [
         t for t in measured if (t.context or {}).get("_had_arch_context") is False
     ]
+    with_rm = [
+        t for t in measured if (t.context or {}).get("_had_repo_map") is True
+    ]
+    without_rm = [
+        t for t in measured if (t.context or {}).get("_had_repo_map") is False
+    ]
     sample_size = len(measured)
+    def _lift(flag, tasks):
+        tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        a = [t for t in tasks if (t.context or {}).get(flag) is True]
+        b = [t for t in tasks if (t.context or {}).get(flag) is False]
+        return round(_fa_rate(a) - _fa_rate(b), 2) if len(a) >= 10 and len(b) >= 10 else None
+
+    playbook_lift = _lift("_had_playbook", measured)
+    arch_context_lift = _lift("_had_arch_context", measured)
 
     by_type_groups: Dict[str, list] = {}
     for t in terminal_tasks:
@@ -183,6 +197,15 @@ def _compute_first_attempt_breakdowns(
                 trend = "declining"
             else:
                 trend = "stable"
+    playbook_lift_trend: str | None = None
+    arch_context_lift_trend: str | None = None
+    if prev_terminal_tasks is not None:
+        prev_playbook_lift = _lift("_had_playbook", prev_terminal_tasks)
+        prev_arch_context_lift = _lift("_had_arch_context", prev_terminal_tasks)
+        playbook_lift_trend = _format_compliance_trend(playbook_lift, prev_playbook_lift)
+        arch_context_lift_trend = _format_compliance_trend(
+            arch_context_lift, prev_arch_context_lift
+        )
 
     first_attempt_by_review_category: Dict[str, float] | None = None
     failed_with_cats = [
@@ -220,13 +243,34 @@ def _compute_first_attempt_breakdowns(
         )
         return round(succ / len(measured), 2)
 
+    with_rm_rate = _fa_rate(with_rm)
+    without_rm_rate = _fa_rate(without_rm)
+    _min_lift_sample = 5
+    repo_map_lift: float | None = (
+        round(with_rm_rate - without_rm_rate, 2)
+        if (
+            with_rm_rate is not None
+            and without_rm_rate is not None
+            and len(with_rm) >= _min_lift_sample
+            and len(without_rm) >= _min_lift_sample
+        )
+        else None
+    )
+
     return {
         "overall": overall,
         "verified_overall": _fa_verified_rate(terminal_tasks),
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
+        "playbook_lift": playbook_lift,
+        "playbook_lift_trend": playbook_lift_trend,
         "with_arch_context": _fa_rate(with_arch),
         "without_arch_context": _fa_rate(without_arch),
+        "arch_context_lift": arch_context_lift,
+        "arch_context_lift_trend": arch_context_lift_trend,
+        "with_repo_map": with_rm_rate,
+        "without_repo_map": without_rm_rate,
+        "repo_map_lift": repo_map_lift,
         "sample_size": sample_size,
         "by_type": by_type,
         "by_scope": by_scope,

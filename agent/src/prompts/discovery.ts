@@ -42,6 +42,7 @@ export function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
+
 // ── Greenfield (empty / near-empty repo) detection ──────────────────────────
 // Config/scaffolding files that do NOT count as real source. A repo containing
 // only these (plus dotfiles) is a fresh project to bootstrap, not a codebase to

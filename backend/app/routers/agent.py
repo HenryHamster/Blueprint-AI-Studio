@@ -3993,6 +3993,14 @@ async def agent_heartbeat(
             ctx["prompt_fingerprint"] = req.prompt_fingerprint
             task.context = ctx
 
+    # Write-once repo-map capability flag. Set on the first heartbeat that
+    # carries had_repo_map so that later heartbeats (which don't re-send it)
+    # cannot clear the flag; mirrors the _had_arch_context write-once pattern.
+    if req.had_repo_map is not None and (task.context or {}).get("_had_repo_map") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_repo_map"] = req.had_repo_map
+        task.context = ctx
+
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
     # counters posted on every heartbeat — last write wins. Backwards-
     # compatible: older agents that don't ship these fields leave the column

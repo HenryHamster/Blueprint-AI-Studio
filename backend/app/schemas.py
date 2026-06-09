@@ -346,6 +346,11 @@ class HeartbeatRequest(BaseModel):
     format_error_total: int | None = Field(None, ge=0)
     format_repair_attempts: int | None = Field(None, ge=0)
     format_repair_successes: int | None = Field(None, ge=0)
+    # Whether the language-aware repo map was non-empty and injected into the
+    # agent prompt for this task. Set once on the first heartbeat after the
+    # standard handler registers it; used to compute with/without repo-map
+    # first-attempt success breakdowns in the digest.
+    had_repo_map: bool | None = None
 
 
 class ComputeJobResponse(BaseModel):

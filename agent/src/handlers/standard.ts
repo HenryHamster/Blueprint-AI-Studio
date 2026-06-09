@@ -598,7 +598,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before Claude starts so short code-change tasks persist the
   // fingerprint even if they finish before the next periodic heartbeat.
-  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, had_repo_map: repoMap !== '' });
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with

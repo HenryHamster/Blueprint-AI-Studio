@@ -4312,6 +4312,159 @@ def test_first_attempt_breakdowns_verified_overall_no_measured_is_none():
     assert result["verified_overall"] is None
 
 
+def test_first_attempt_breakdowns_playbook_lift():
+    """playbook and arch-context lifts are named, guarded deltas with trends."""
+    def mk(s, pb=None, arch=None):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_succeeded": s,
+                **({"_had_playbook": pb} if pb is not None else {}),
+                **({"_had_arch_context": arch} if arch is not None else {}),
+            },
+        )
+
+    def tasks(spec):
+        return [mk(s, **flags) for s, count, flags in spec for _ in range(count)]
+
+    result = _compute_first_attempt_breakdowns(
+        tasks(
+            [
+                (True, 8, {"pb": True}),
+                (False, 2, {"pb": True}),
+                (True, 5, {"pb": False}),
+                (False, 5, {"pb": False}),
+                (True, 7, {"arch": True}),
+                (False, 3, {"arch": True}),
+                (True, 4, {"arch": False}),
+                (False, 6, {"arch": False}),
+            ]
+        ),
+        prev_terminal_tasks=tasks(
+            [
+                (True, 6, {"pb": True}),
+                (False, 4, {"pb": True}),
+                (True, 5, {"pb": False}),
+                (False, 5, {"pb": False}),
+                (True, 5, {"arch": True}),
+                (False, 5, {"arch": True}),
+                (True, 4, {"arch": False}),
+                (False, 6, {"arch": False}),
+            ]
+        ),
+    )
+    assert result["playbook_lift"] == 0.3
+    assert result["playbook_lift_trend"] == "improving"
+    assert result["arch_context_lift"] == 0.3
+    assert result["arch_context_lift_trend"] == "improving"
+    assert (
+        _compute_first_attempt_breakdowns(
+            [mk(True, pb=True) for _ in range(9)]
+            + [mk(False, pb=False) for _ in range(9)]
+            + [mk(True, arch=True) for _ in range(10)]
+            + [mk(False, arch=False) for _ in range(9)]
+        )["playbook_lift"]
+        is None
+    )
+    assert (
+        _compute_first_attempt_breakdowns(
+            [mk(True, pb=True) for _ in range(9)]
+            + [mk(False, pb=False) for _ in range(9)]
+            + [mk(True, arch=True) for _ in range(10)]
+            + [mk(False, arch=False) for _ in range(9)]
+        )["arch_context_lift"]
+        is None
+    )
+
+# ── _compute_first_attempt_breakdowns: repo-map breakdowns ──────────────────
+
+
+def _fa_rm_task(*, succeeded: bool, had_repo_map: bool | None) -> object:
+    """Task fixture for repo-map breakdown tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if had_repo_map is not None:
+        ctx["_had_repo_map"] = had_repo_map
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_with_without_repo_map_rates():
+    """with_repo_map and without_repo_map rates are computed from _had_repo_map flag."""
+    tasks = [
+        _fa_rm_task(succeeded=True, had_repo_map=True),
+        _fa_rm_task(succeeded=True, had_repo_map=True),
+        _fa_rm_task(succeeded=False, had_repo_map=False),
+        _fa_rm_task(succeeded=False, had_repo_map=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] == 0.0
+    # Both arms have < 5 tasks, so lift should be None
+    assert result["repo_map_lift"] is None
+
+
+def test_first_attempt_breakdowns_repo_map_lift_computed_with_enough_samples():
+    """repo_map_lift is the difference when both arms have >= 5 samples."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] == 0.0
+    assert result["repo_map_lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_repo_map_lift_none_when_one_arm_empty():
+    """repo_map_lift is None when one arm has no tasks."""
+    tasks = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 6
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] is None
+    assert result["repo_map_lift"] is None
+
+
+def test_first_attempt_breakdowns_repo_map_no_flag_not_counted():
+    """Tasks without _had_repo_map do not appear in either arm."""
+    tasks = [
+        _fa_rm_task(succeeded=True, had_repo_map=None),
+        _fa_rm_task(succeeded=False, had_repo_map=None),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] is None
+    assert result["without_repo_map"] is None
+    assert result["repo_map_lift"] is None
+
+
+def test_first_attempt_breakdowns_existing_playbook_keys_unaffected():
+    """Adding repo-map keys does not remove or alter the existing playbook keys."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": True, "_had_playbook": True},
+        ),
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": False, "_had_playbook": False},
+        ),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "with_playbook" in result
+    assert "without_playbook" in result
+    assert result["with_playbook"] == 1.0
+    assert result["without_playbook"] == 0.0
+    # New keys present
+    assert "with_repo_map" in result
+    assert "without_repo_map" in result
+    assert "repo_map_lift" in result
+
+
 # ── Migration-serialization slot contention ─────────────────────────────────
 
 
