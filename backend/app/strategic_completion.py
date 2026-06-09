@@ -148,7 +148,7 @@ def _strategic_event_completion_summary(
         if running_update_changed is None
         else bool(running_update_changed)
     )
-    return {
+    summary: dict[str, Any] = {
         "status": status,
         "status_message": status_message or task.latest_status_message,
         "failure_reason": failure_reason or getattr(cycle, "failure_reason", None),
@@ -172,6 +172,19 @@ def _strategic_event_completion_summary(
             if d.get("status") == "active"
         ),
     }
+    # Compact strategic-judgment-challenge summary: rides the completion dict into
+    # the websocket payload and digest. The full bounded record stays in
+    # cycle_metadata for drill-down; only {mode, verdict, warned/blocked counts}
+    # travel here. Prefer the durable cycle_metadata copy, fall back to the
+    # in-flight task.context record; omit the key entirely for legacy cycles with
+    # no challenge so absence never reads as a failure.
+    _challenge_record = meta.get("strategic_judgment_challenge") or ctx.get(
+        STRATEGIC_CHALLENGE_CONTEXT_KEY
+    )
+    _challenge_summary = strategic_challenge_summary(_challenge_record)
+    if _challenge_summary is not None:
+        summary["strategic_judgment_challenge"] = _challenge_summary
+    return summary
 
 
 def spawn_title_is_redundant(
@@ -394,6 +407,270 @@ _VALID_EVIDENCE_PROGRESS = frozenset({"advancing", "stalled", "met"})
 _EVIDENCE_PROGRESS_SUPPRESSING = frozenset({"advancing", "met"})
 _EVIDENCE_PROGRESS_RATIONALE_MAX = 300
 EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
+
+
+# ── Strategic judgment challenge record ──────────────────────────────────────
+# An independent adversarial SECOND OPINION over the strategist's OWN
+# self-produced judgments — evidence_progress ratings, retirement critiques, and
+# portfolio-shape decisions — recorded BEFORE the executor commits strategic
+# state. The record is bounded + versioned, stored on task.context under
+# STRATEGIC_CHALLENGE_CONTEXT_KEY by the set_strategic_challenge endpoint (which
+# deliberately does NOT flip _strategic_api_called, so a challenge-only cycle
+# cannot masquerade as a successful executor mutation), copied verbatim into
+# StrategicCycle.cycle_metadata at completion, and consulted by the first hard
+# gate: an advancing/met evidence_progress verdict may only SUPPRESS the
+# deterministic outcome-scaffolding flag when the challenge APPROVED the same
+# direction_id + status judgment. A rejected / uncertain / missing / malformed
+# challenge approval leaves the deterministic backstop active.
+STRATEGIC_CHALLENGE_CONTEXT_KEY = "_strategic_judgment_challenge"
+STRATEGIC_CHALLENGE_RECORD_VERSION = 1
+_VALID_CHALLENGE_VERDICTS = frozenset({"approved", "rejected", "uncertain"})
+_CHALLENGE_RATIONALE_MAX = 300
+# Section-block verdict vocabulary emitted by the challenger prompt:
+#   retirement_critique_quality: solid (clean), shallow (warn), not_assessed (neutral)
+#   portfolio_shape_risk:        low (clean),   elevated (warn), high (block)
+# Standard evidence-progress vocab (rejected/uncertain) is also accepted for
+# backwards compatibility and for tests that seed sections directly.
+_SECTION_BLOCK_VERDICTS = frozenset({"rejected", "high"})
+_SECTION_WARN_VERDICTS = frozenset({"uncertain", "shallow", "elevated"})
+_CHALLENGE_SUBJECT_MAX = 120
+# Per-section cap on challenge items so the JSON blob stored on task.context and
+# copied into cycle_metadata stays bounded regardless of agent output size.
+_CHALLENGE_MAX_ITEMS = 50
+
+
+def _sanitize_challenge_verdict_block(
+    raw: object,
+    *,
+    default_verdict: str,
+    default_rationale: str = "",
+) -> dict:
+    if not isinstance(raw, dict):
+        return {
+            "verdict": default_verdict,
+            "rationale": default_rationale[:_CHALLENGE_RATIONALE_MAX],
+        }
+    verdict = str(raw.get("verdict", "")).strip().lower() or str(
+        raw.get("assessment", "")
+    ).strip().lower()
+    rationale = str(raw.get("rationale", "")).strip() or str(
+        raw.get("reason", "")
+    ).strip()
+    return {
+        "verdict": (verdict or default_verdict)[:64],
+        "rationale": rationale[:_CHALLENGE_RATIONALE_MAX],
+    }
+
+
+def sanitize_strategic_challenge_record(raw: object) -> dict | None:
+    """Validate + bound a raw strategic-judgment-challenge record.
+
+    Accepts the agent's challenge payload and returns a sanitized, versioned
+    dict::
+
+        {
+          "challenge_version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+          "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+          "status": "ok|blocked|invalid",
+          "evidence_progress": [
+              {"direction_id", "status", "verdict", "rationale"}, ...
+          ],
+          "retirement_critique_quality": {"verdict", "rationale"},
+          "portfolio_shape_risk": {"verdict", "rationale"},
+          "notes": "..."
+        }
+
+    Returns ``None`` only when ``raw`` is not a dict at all (the caller maps
+    that to a 400). A dict with no usable judgments in any section is preserved
+    as a valid EMPTY record — the strategist may legitimately have found nothing
+    to challenge, and recording the empty pass still proves a challenge ran.
+
+    Per-item sanitation is lenient: an item with an unknown verdict / status, a
+    missing identifier, or a non-dict shape is dropped (not raised) so a single
+    malformed entry never discards the rest of the record. Every section is
+    capped at ``_CHALLENGE_MAX_ITEMS`` and every string is length-bounded.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    version_raw = raw.get("challenge_version", raw.get("version"))
+    version = (
+        version_raw
+        if isinstance(version_raw, int) and version_raw > 0
+        else STRATEGIC_CHALLENGE_RECORD_VERSION
+    )
+    status_raw = str(raw.get("status", "")).strip().lower()
+    status = status_raw if status_raw in {"ok", "blocked", "invalid"} else "invalid"
+    record: dict[str, Any] = {
+        "challenge_version": version,
+        "version": version,
+        "status": status,
+    }
+
+    ep_in = raw.get("evidence_progress")
+    ep_items: list[dict] = []
+    if isinstance(ep_in, list):
+        for item in ep_in[:_CHALLENGE_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("direction_id", "")).strip()
+            status = str(item.get("status", "")).strip().lower()
+            verdict = str(item.get("verdict", "")).strip().lower()
+            if (
+                not did
+                or status not in _VALID_EVIDENCE_PROGRESS
+                or verdict not in _VALID_CHALLENGE_VERDICTS
+            ):
+                continue
+            ep_items.append(
+                {
+                    "direction_id": did[:64],
+                    "status": status,
+                    "verdict": verdict,
+                    "rationale": str(item.get("rationale", "")).strip()[
+                        :_CHALLENGE_RATIONALE_MAX
+                    ],
+                }
+            )
+    record["evidence_progress"] = ep_items
+    record["retirement_critique_quality"] = _sanitize_challenge_verdict_block(
+        raw.get("retirement_critique_quality"),
+        default_verdict="not_assessed",
+    )
+    record["portfolio_shape_risk"] = _sanitize_challenge_verdict_block(
+        raw.get("portfolio_shape_risk"),
+        default_verdict="not_assessed",
+    )
+    notes = raw.get("notes")
+    if isinstance(notes, str):
+        cleaned_notes = notes.strip()[:_CHALLENGE_RATIONALE_MAX]
+        if cleaned_notes:
+            record["notes"] = cleaned_notes
+
+    return record
+
+
+def challenge_approves_evidence_progress(
+    record: object, direction_id: str, status: str
+) -> bool:
+    """True iff the challenge record APPROVED this exact (direction_id, status).
+
+    The first hard gate: an advancing/met evidence_progress self-rating may only
+    suppress the deterministic scaffolding backstop when an independent challenge
+    explicitly endorsed it. Any other outcome — a ``rejected`` or ``uncertain``
+    verdict, a verdict for a different status, a missing direction entry, or a
+    missing / malformed record — returns False, so the deterministic detector
+    stays active.
+    """
+    if not isinstance(record, dict):
+        return False
+    # Only ok-status records can approve anything; blocked/invalid records
+    # must not suppress the deterministic scaffolding backstop.
+    if record.get("status") != "ok":
+        return False
+    target_status = (status or "").strip().lower()
+    target_id = (direction_id or "").strip()
+    if not target_id or not target_status:
+        return False
+    for item in record.get("evidence_progress") or []:
+        if not isinstance(item, dict):
+            continue
+        if (
+            str(item.get("direction_id", "")).strip() == target_id
+            and str(item.get("status", "")).strip().lower() == target_status
+            and str(item.get("verdict", "")).strip().lower() == "approved"
+        ):
+            return True
+    return False
+
+
+def strategic_challenge_summary(record: object) -> dict | None:
+    """Derive a compact, websocket-safe summary of a strategic-judgment challenge.
+
+    Consumes a sanitized challenge record — the bounded shape produced by
+    :func:`sanitize_strategic_challenge_record` and persisted verbatim into
+    ``StrategicCycle.cycle_metadata['strategic_judgment_challenge']`` — and
+    returns four scalar fields suitable for completion receipts, recent-cycle
+    summaries, and digest cards WITHOUT shipping the full bounded item list::
+
+        {
+          "mode": "ok" | "blocked" | "invalid",         # the record's own status
+          "verdict": "approved" | "warned" | "blocked",  # rolled-up overall verdict
+          "warned_count": int,    # challenged judgments the challenger could not confirm
+          "blocked_count": int,   # challenged judgments the challenger disputed
+        }
+
+    ``blocked_count`` / ``warned_count`` tally every challenged judgment across the
+    ``evidence_progress`` items AND the two section verdict blocks
+    (``retirement_critique_quality``, ``portfolio_shape_risk``).
+
+    For ``evidence_progress`` items the standard vocabulary applies: ``rejected``
+    → blocked, ``uncertain`` → warned, everything else → clean.
+
+    For the two section blocks the challenger prompt uses a different vocabulary:
+    ``retirement_critique_quality`` emits ``solid`` (clean) / ``shallow`` (warned) /
+    ``not_assessed`` (clean); ``portfolio_shape_risk`` emits ``low`` (clean) /
+    ``elevated`` (warned) / ``high`` (blocked). The standard ``rejected`` /
+    ``uncertain`` values are also accepted for backward compatibility.
+
+    The rolled-up ``verdict`` is ``blocked`` when anything was blocked, else
+    ``warned`` when anything was warned, else ``approved``.
+
+    Returns ``None`` when ``record`` is not a dict (legacy cycles carrying no
+    challenge record), so callers can omit the field entirely rather than emit a
+    misleading zeroed summary that would read as a failure.
+    """
+    if not isinstance(record, dict):
+        return None
+
+    warned = 0
+    blocked = 0
+
+    def _tally(verdict: object) -> None:
+        # Standard evidence-progress vocabulary: approved / rejected / uncertain.
+        nonlocal warned, blocked
+        v = str(verdict or "").strip().lower()
+        if v == "rejected":
+            blocked += 1
+        elif v == "uncertain":
+            warned += 1
+
+    def _tally_section(verdict: object) -> None:
+        # Section-block vocabulary from the challenger prompt, plus standard
+        # rejected/uncertain for backward compatibility.
+        nonlocal warned, blocked
+        v = str(verdict or "").strip().lower()
+        if v in _SECTION_BLOCK_VERDICTS:
+            blocked += 1
+        elif v in _SECTION_WARN_VERDICTS:
+            warned += 1
+
+    for item in record.get("evidence_progress") or []:
+        if isinstance(item, dict):
+            _tally(item.get("verdict"))
+    for section in ("retirement_critique_quality", "portfolio_shape_risk"):
+        block = record.get(section)
+        if isinstance(block, dict):
+            _tally_section(block.get("verdict"))
+
+    mode_raw = str(record.get("status", "")).strip().lower()
+    mode = mode_raw if mode_raw in {"ok", "blocked", "invalid"} else "invalid"
+
+    if mode != "ok":
+        verdict = "blocked"
+    elif blocked:
+        verdict = "blocked"
+    elif warned:
+        verdict = "warned"
+    else:
+        verdict = "approved"
+
+    return {
+        "mode": mode,
+        "verdict": verdict,
+        "warned_count": warned,
+        "blocked_count": blocked,
+    }
 
 
 async def _link_clustered_bug_messages(
@@ -1835,7 +2112,7 @@ def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
 def _evidence_progress_suppresses_scaffolding(
     direction: dict, total_cycles: int, stall_run: int
 ) -> bool:
-    """True if a current agent evidence_progress verdict confirms advancement.
+    """True if a CHALLENGE-APPROVED, current agent evidence_progress verdict confirms advancement.
 
     An ``advancing`` or ``met`` verdict recorded within the last ``stall_run``
     cycles suppresses the advisory scaffolding flag — the agent has confirmed
@@ -1845,11 +2122,20 @@ def _evidence_progress_suppresses_scaffolding(
     backstop whenever the agent omits the optional assessment. The verdict
     expires after a full stall window so a stale "advancing" cannot mask a
     direction that later genuinely stalls.
+
+    FIRST HARD GATE: a self-produced advancing/met verdict only earns suppression
+    when an INDEPENDENT challenge approved the same direction_id + status — i.e.
+    ``_apply_evidence_progress_verdicts`` stamped ``challenge_approved: True`` onto
+    the persisted verdict from the stored challenge record. An unchallenged,
+    rejected, uncertain, or malformed approval leaves ``challenge_approved`` falsy,
+    so the deterministic scaffolding backstop stays active.
     """
     ep = direction.get("evidence_progress")
     if not isinstance(ep, dict):
         return False
     if ep.get("status") not in _EVIDENCE_PROGRESS_SUPPRESSING:
+        return False
+    if not ep.get("challenge_approved"):
         return False
     recorded_cycle = ep.get("cycle_index")
     if not isinstance(recorded_cycle, int):
@@ -2270,6 +2556,11 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
     }
     if not by_id:
         return 0
+    # First hard gate substrate: the stored independent challenge record. An
+    # advancing/met verdict only earns ``challenge_approved`` when the challenge
+    # endorsed the same direction_id + status; a stalled verdict is never a
+    # suppressor so it never needs (or gets) an approval stamp.
+    challenge_record = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
     now_iso = _utcnow().isoformat()
     applied = 0
     for d in project.directions or []:
@@ -2284,6 +2575,11 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         cycle_index = len(history) + (agg.get("total_cycles") or 0)
+        challenge_approved = status in _EVIDENCE_PROGRESS_SUPPRESSING and (
+            challenge_approves_evidence_progress(
+                challenge_record, d.get("id"), status
+            )
+        )
         d["evidence_progress"] = {
             "status": status,
             "rationale": str(verdict.get("rationale", ""))[
@@ -2292,6 +2588,7 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
             "recorded_at": now_iso,
             "cycle_index": cycle_index,
             "cycle_task_id": str(task.id),
+            "challenge_approved": challenge_approved,
         }
         applied += 1
     if applied:
@@ -2394,6 +2691,16 @@ async def _handle_strategic_completion(
             }
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
+            # Copy the bounded, versioned strategic judgment challenge record
+            # (evidence_progress / retirement / portfolio-shape second opinion)
+            # verbatim into cycle_metadata so the challenge pass is durably
+            # attached to the cycle. Stored under STRATEGIC_CHALLENGE_CONTEXT_KEY
+            # by the set_strategic_challenge endpoint; a no-op when absent.
+            _challenge_record = (task.context or {}).get(
+                STRATEGIC_CHALLENGE_CONTEXT_KEY
+            )
+            if _challenge_record is not None:
+                _extra["strategic_judgment_challenge"] = _challenge_record
             try:
                 from app.research_completion import query_findings_index
 
@@ -3413,6 +3720,12 @@ async def _handle_strategic_completion(
             _fb_critiques = parsed.get("retired_direction_critiques")
             if _fb_critiques is not None:
                 _fb_extra["retirement_critiques"] = _fb_critiques
+            # A challenge record is always stored on task.context by the
+            # set_strategic_challenge endpoint (never in the parsed log), so the
+            # fallback path reads it from context too. No-op when absent.
+            _fb_challenge = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
+            if _fb_challenge is not None:
+                _fb_extra["strategic_judgment_challenge"] = _fb_challenge
             fallback_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,

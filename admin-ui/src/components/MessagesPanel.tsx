@@ -20,6 +20,7 @@ import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messa
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
+import { StrategicChallengeChip } from './StrategicChallengeChip';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -1258,6 +1259,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             )}
             {lastCycleCompletion.status_message && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'} italic`}>{lastCycleCompletion.status_message.slice(0, 80)}</span>
+            )}
+            {lastCycleCompletion.strategic_judgment_challenge && (
+              <span className="ml-1.5 align-middle">
+                <StrategicChallengeChip summary={lastCycleCompletion.strategic_judgment_challenge} />
+              </span>
             )}
           </span>
         </div>

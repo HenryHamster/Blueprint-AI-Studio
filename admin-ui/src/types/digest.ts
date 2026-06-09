@@ -68,6 +68,24 @@ export interface RecentCompletion {
   unverified_merge_reason?: string | null;
 }
 
+// Compact, websocket-safe rollup of a strategic-judgment challenge. Mirrors the
+// backend `strategic_challenge_summary` (strategic_completion.py): only the four
+// scalar fields travel into completion receipts, recent-cycle summaries, and
+// digest cards — the full bounded item list stays in durable cycle_metadata.
+// All fields optional so a partial/legacy payload degrades gracefully; the field
+// is OMITTED entirely for cycles that carried no challenge, so absence never
+// reads as a failure.
+export interface StrategicChallengeSummary {
+  // The record's own status.
+  mode?: 'ok' | 'blocked' | 'invalid';
+  // Rolled-up overall verdict across challenged judgments.
+  verdict?: 'approved' | 'warned' | 'blocked';
+  // Challenged judgments the challenger could not confirm (uncertain).
+  warned_count?: number;
+  // Challenged judgments the challenger disputed (rejected).
+  blocked_count?: number;
+}
+
 interface LatestCycle {
   cycle_id?: string | null;
   // Required (non-null) so `completed_at ?? started_at` stays `string` for
@@ -82,6 +100,9 @@ interface LatestCycle {
   summary_text?: string | null;
   memos_available?: number | null;
   memos_cited?: number | null;
+  // Present only when this cycle carried a strategic-judgment challenge record;
+  // omitted for legacy cycles so absence is not rendered as a warning state.
+  strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
 export interface RecentFailure {

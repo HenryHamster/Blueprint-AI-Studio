@@ -203,6 +203,14 @@ def _completion_payload(summary: Mapping[str, Any]) -> dict[str, Any]:
     failure_reason = _compact_str(summary.get("failure_reason"))
     if failure_reason:
         payload["failure_reason"] = failure_reason
+    # Compact strategic-judgment-challenge summary (mode/verdict/warned/blocked).
+    # Built upstream by strategic_completion._strategic_event_completion_summary;
+    # forwarded verbatim here as four scalar fields so the full bounded item list
+    # never rides the websocket payload. Absent for legacy cycles with no
+    # challenge record, keeping this an additive, backward-compatible key.
+    challenge = summary.get("strategic_judgment_challenge")
+    if isinstance(challenge, dict):
+        payload["strategic_judgment_challenge"] = challenge
     return payload
 
 

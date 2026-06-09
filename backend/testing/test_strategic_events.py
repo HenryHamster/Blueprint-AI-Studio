@@ -143,6 +143,55 @@ async def test_emit_cycle_completed_payload_includes_progress_and_outcome():
 
 
 @pytest.mark.asyncio
+async def test_emit_cycle_completed_payload_includes_compact_challenge_summary():
+    """A compact challenge summary on the completion dict rides into the payload."""
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_cycle_completed(
+            project_id,
+            task_id,
+            2,
+            cycle_id="sc-challenged",
+            completion={
+                "status": "completed",
+                "strategic_judgment_challenge": {
+                    "mode": "ok",
+                    "verdict": "blocked",
+                    "warned_count": 1,
+                    "blocked_count": 2,
+                },
+            },
+        )
+
+    completion = mock_bcast.await_args.args[2]["completion"]
+    assert completion["strategic_judgment_challenge"] == {
+        "mode": "ok",
+        "verdict": "blocked",
+        "warned_count": 1,
+        "blocked_count": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_emit_cycle_completed_payload_omits_challenge_when_absent():
+    """Legacy cycles with no challenge record omit the key entirely."""
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_cycle_completed(
+            project_id,
+            task_id,
+            2,
+            cycle_id="sc-legacy",
+            completion={"status": "completed"},
+        )
+
+    completion = mock_bcast.await_args.args[2]["completion"]
+    assert "strategic_judgment_challenge" not in completion
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "kind",
     [
@@ -218,6 +267,21 @@ async def test_emit_payloads_stay_tiny_for_notify_ceiling():
                 "staged_direction_ids": [f"d-next-{i}" for i in range(100)],
                 "updated_direction_ids": [f"d-live-{i}" for i in range(100)],
                 "failure_reason": "x" * 10_000,
+                # Compact challenge summary stays four scalar fields regardless of
+                # how large the underlying bounded record was.
+                "strategic_judgment_challenge": {
+                    "mode": "ok",
+                    "verdict": "blocked",
+                    "warned_count": 7,
+                    "blocked_count": 11,
+                },
             },
         )
         assert len(json.dumps(captured["data"]).encode("utf-8")) < 6_000
+        # The compact challenge summary survived the soft-limit trim.
+        assert captured["data"]["completion"]["strategic_judgment_challenge"] == {
+            "mode": "ok",
+            "verdict": "blocked",
+            "warned_count": 7,
+            "blocked_count": 11,
+        }

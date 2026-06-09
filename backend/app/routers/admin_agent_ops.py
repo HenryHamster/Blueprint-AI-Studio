@@ -601,7 +601,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "set_strategic_challenge"
     data: Any = {}
 
 
@@ -2333,6 +2333,66 @@ async def strategic_operation(
             f"[STRATEGIC API] Stored {len(cited_ids)} cited memo id(s) for task {task.id}"
         )
         return _resp({"status": "ok", "op": "cite_memos", "count": len(cited_ids)})
+
+    elif payload.op == "set_strategic_challenge":
+        # Store the independent adversarial SECOND OPINION over the strategist's
+        # own self-produced judgments (evidence_progress ratings, retirement
+        # critiques, portfolio-shape decisions). The record is sanitized to a
+        # bounded, versioned shape and stashed on task.context for the completion
+        # handler to copy into StrategicCycle.cycle_metadata and for the first
+        # hard gate (_evidence_progress_suppresses_scaffolding) to consult.
+        #
+        # NOTE: deliberately do NOT set _strategic_api_called here. A challenge is
+        # a review of the agent's own judgments, NOT an executor mutation of
+        # strategic state — flagging api-usage would let a challenge-only cycle
+        # masquerade as a successful strategic mutation and suppress the no-op /
+        # failure circuit-breaker. Mirrors the cite_memos rationale above.
+        from app.strategic_completion import (
+            STRATEGIC_CHALLENGE_CONTEXT_KEY,
+            sanitize_strategic_challenge_record,
+        )
+
+        record = sanitize_strategic_challenge_record(data)
+        if record is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "set_strategic_challenge: data must be an object with optional "
+                    "evidence_progress / retirement_critiques / portfolio_shape lists"
+                ),
+            )
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            STRATEGIC_CHALLENGE_CONTEXT_KEY: record,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        ep_n = len(record.get("evidence_progress", []))
+        rc_n = 1 if "retirement_critique_quality" in record else 0
+        ps_n = 1 if "portfolio_shape_risk" in record else 0
+        logger.info(
+            "[STRATEGIC API] Stored strategic judgment challenge for task %s "
+            "(evidence_progress=%d, retirement_critique_quality=%d, portfolio_shape_risk=%d)",
+            task.id,
+            ep_n,
+            rc_n,
+            ps_n,
+        )
+        version = record.get("challenge_version", record.get("version"))
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_strategic_challenge",
+                "version": version,
+                "challenge_version": version,
+                "challenge_status": record.get("status"),
+                "evidence_progress_count": ep_n,
+                "retirement_critique_quality_count": rc_n,
+                "portfolio_shape_risk_count": ps_n,
+            }
+        )
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

@@ -46,6 +46,11 @@ from app.strategic_completion import (
     _check_outcome_scaffolding,
     _apply_evidence_progress_verdicts,
     _reset_scaffolding_state_on_outcome_change,
+    sanitize_strategic_challenge_record,
+    strategic_challenge_summary,
+    challenge_approves_evidence_progress,
+    STRATEGIC_CHALLENGE_CONTEXT_KEY,
+    STRATEGIC_CHALLENGE_RECORD_VERSION,
     EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
@@ -168,6 +173,108 @@ def test_strategic_completion_event_summary_uses_proposal_counters():
     assert summary["updated_count"] == 1
     assert summary["retired_count"] == 2
     assert summary["directions_changed"] is True
+
+
+def test_strategic_completion_event_summary_includes_compact_challenge_summary_without_items():
+    """A cycle carrying a challenge record surfaces ONLY the compact
+    {mode, verdict, warned_count, blocked_count} summary in the event payload —
+    never the full bounded evidence_progress / section item list.
+
+    Exercises the production seam: ``_strategic_event_completion_summary`` reads
+    the durable ``cycle_metadata['strategic_judgment_challenge']`` record and runs
+    it through ``strategic_challenge_summary``.
+    """
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review"}],
+        context={},
+    )
+    project = Project(name="P", user_id="u1", directions=[])
+    record = sanitize_strategic_challenge_record(
+        {
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "approved"},
+                {"direction_id": "d-2", "status": "met", "verdict": "rejected"},
+                {"direction_id": "d-3", "status": "advancing", "verdict": "uncertain"},
+            ],
+            "retirement_critique_quality": {
+                "verdict": "rejected",
+                "rationale": "critique was shallow",
+            },
+            "portfolio_shape_risk": {"verdict": "solid", "rationale": "balanced"},
+        }
+    )
+    cycle = StrategicCycle(
+        id="sc-challenged",
+        project_id=task.project_id,
+        outcome="completed",
+        cycle_metadata={"strategic_judgment_challenge": record},
+    )
+
+    summary = _strategic_event_completion_summary(task, project, cycle=cycle)
+
+    challenge = summary["strategic_judgment_challenge"]
+    assert challenge == {
+        "mode": "ok",
+        "verdict": "blocked",
+        "warned_count": 1,  # one uncertain evidence_progress item
+        "blocked_count": 2,  # one rejected item + one rejected section verdict
+    }
+    # The compact summary must NOT carry the bounded item list — that stays in
+    # cycle_metadata for drill-down, never on the websocket-bound summary.
+    assert "evidence_progress" not in challenge
+    assert "retirement_critique_quality" not in challenge
+    assert "portfolio_shape_risk" not in challenge
+
+
+def test_strategic_completion_event_summary_omits_challenge_for_legacy_cycle():
+    """Cycles with no challenge record omit the key entirely so absence does not
+    read as a failure."""
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review"}],
+        context={},
+    )
+    project = Project(name="P", user_id="u1", directions=[])
+    cycle = StrategicCycle(
+        id="sc-legacy",
+        project_id=task.project_id,
+        outcome="completed",
+        cycle_metadata={},
+    )
+
+    summary = _strategic_event_completion_summary(task, project, cycle=cycle)
+
+    assert "strategic_judgment_challenge" not in summary
+
+
+def test_strategic_completion_event_summary_challenge_falls_back_to_context():
+    """When the cycle metadata has no record yet (in-flight), the summary falls
+    back to the task.context challenge record."""
+    record = sanitize_strategic_challenge_record(
+        {
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "met", "verdict": "approved"}
+            ],
+        }
+    )
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review"}],
+        context={STRATEGIC_CHALLENGE_CONTEXT_KEY: record},
+    )
+    project = Project(name="P", user_id="u1", directions=[])
+
+    summary = _strategic_event_completion_summary(task, project)
+
+    assert summary["strategic_judgment_challenge"] == {
+        "mode": "ok",
+        "verdict": "approved",
+        "warned_count": 0,
+        "blocked_count": 0,
+    }
 
 
 # ── _check_direction_health ──────────────────────────────────────────────────
@@ -4580,6 +4687,157 @@ async def test_cite_memos_does_not_set_api_called(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_set_strategic_challenge_stores_record_without_api_called(
+    client, db_session
+):
+    """set_strategic_challenge sanitizes + stores the record on task.context but
+    must NOT flip _strategic_api_called — a challenge-only cycle is not a
+    successful executor mutation."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="SC-HTTP", vm="vm-sc")
+    token = create_agent_token(str(task.id), "vm-sc", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_strategic_challenge",
+            "data": {
+                "challenge_version": 1,
+                "status": "ok",
+                "evidence_progress": [
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                        "rationale": "ships real evidence",
+                    }
+                ],
+                "retirement_critique_quality": {
+                    "verdict": "solid",
+                    "rationale": "names the pattern",
+                },
+                "portfolio_shape_risk": {
+                    "verdict": "uncertain",
+                    "rationale": "lane sprawl",
+                },
+                "notes": "challenge notes",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_strategic_challenge"
+    assert body["version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+    assert body["challenge_version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+    assert body["challenge_status"] == "ok"
+    assert body["evidence_progress_count"] == 1
+    assert body["retirement_critique_quality_count"] == 1
+    assert body["portfolio_shape_risk_count"] == 1
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
+    assert stored is not None
+    assert stored["version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+    assert stored["challenge_version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+    assert stored["status"] == "ok"
+    assert stored["evidence_progress"][0]["verdict"] == "approved"
+    assert stored["retirement_critique_quality"]["verdict"] == "solid"
+    assert stored["portfolio_shape_risk"]["verdict"] == "uncertain"
+    assert stored["notes"] == "challenge notes"
+    # The crucial invariant: a challenge does not look like an executor mutation.
+    assert (task.context or {}).get("_strategic_api_called") is not True
+
+
+@pytest.mark.asyncio
+async def test_set_strategic_challenge_non_object_returns_400(client, db_session):
+    """A non-dict data payload is rejected with 400 and stores nothing."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="SC-BAD", vm="vm-sc-bad")
+    token = create_agent_token(str(task.id), "vm-sc-bad", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_strategic_challenge",
+            "data": ["not", "an", "object"],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    await db_session.refresh(task)
+    assert STRATEGIC_CHALLENGE_CONTEXT_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_set_strategic_challenge_copied_into_cycle_metadata(
+    client, db_session, mocker
+):
+    """End-to-end: a stored challenge record is copied into StrategicCycle.cycle_metadata
+    at strategic completion."""
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app import strategic_cycle
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    task = await _make_strategic_task(
+        db_session,
+        name="SC-META",
+        vm="vm-sc-meta",
+        directions=[{"id": "d-1", "status": "active", "text": "runner"}],
+    )
+    token = create_agent_token(
+        str(task.id), "vm-sc-meta", task_type="strategic_review"
+    )
+    chresp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_strategic_challenge",
+            "data": {
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "met", "verdict": "approved"}
+                ]
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert chresp.status_code == 200, chresp.text
+    # A real executor mutation in the same cycle drives the API completion path
+    # (set_evidence_progress flips _strategic_api_called). The challenge rides
+    # along into cycle_metadata.
+    epresp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [{"direction_id": "d-1", "status": "met", "rationale": "done"}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert epresp.status_code == 200, epresp.text
+
+    await db_session.refresh(task)
+    project = await db_session.get(Project, task.project_id)
+    await _handle_strategic_completion(task, "", db_session, project=project)
+
+    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    cycle = await strategic_cycle.get(db_session, cycle_id)
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "strategic_judgment_challenge" in meta
+    assert meta["strategic_judgment_challenge"]["status"] == "ok"
+    assert meta["strategic_judgment_challenge"]["evidence_progress"][0]["verdict"] == (
+        "approved"
+    )
+
+
+@pytest.mark.asyncio
 async def test_staged_only_completion_uses_api_path(db_session, mocker):
     from unittest.mock import AsyncMock
     from app import strategic_cycle
@@ -7680,21 +7938,42 @@ class TestCheckOutcomeScaffolding:
     # ── Agent evidence_progress verdict refinement ──────────────────────────
     # _scaffolding_direction has total_cycles=14, stall_run=6, so a verdict at
     # cycle_index >= 9 is "current" (14 - cycle_index < 6) and one at <= 8 is stale.
+    # FIRST HARD GATE: an advancing/met verdict only suppresses when it carries
+    # challenge_approved=True (stamped by _apply_evidence_progress_verdicts from an
+    # APPROVED challenge record). An unchallenged verdict no longer suppresses.
 
     def test_advancing_verdict_suppresses_flag(self):
         d = _scaffolding_direction(
             [5, 5, 5, 5, 5, 5],
-            evidence_progress={"status": "advancing", "cycle_index": 14},
+            evidence_progress={
+                "status": "advancing",
+                "cycle_index": 14,
+                "challenge_approved": True,
+            },
         )
-        # Deterministic detector would fire, but the agent confirms advancement.
+        # Deterministic detector would fire, but a challenge-approved verdict
+        # confirms advancement.
         assert _check_outcome_scaffolding(d) is None
 
     def test_met_verdict_suppresses_flag(self):
         d = _scaffolding_direction(
             [5, 5, 5, 5, 5, 5],
-            evidence_progress={"status": "met", "cycle_index": 14},
+            evidence_progress={
+                "status": "met",
+                "cycle_index": 14,
+                "challenge_approved": True,
+            },
         )
         assert _check_outcome_scaffolding(d) is None
+
+    def test_unchallenged_advancing_verdict_does_not_suppress(self):
+        # First hard gate: an advancing verdict with no challenge approval (the
+        # legacy/unchallenged shape) no longer suppresses the deterministic flag.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing", "cycle_index": 14},
+        )
+        assert _check_outcome_scaffolding(d) is not None
 
     def test_stalled_verdict_does_not_suppress_flag(self):
         d = _scaffolding_direction(
@@ -7711,18 +7990,24 @@ class TestCheckOutcomeScaffolding:
         assert _check_outcome_scaffolding(d) is not None
 
     def test_stale_advancing_verdict_does_not_suppress(self):
-        # A verdict recorded a full stall window ago has expired -> detector fires.
+        # A challenge-approved verdict recorded a full stall window ago has
+        # expired -> detector fires (the recency gate still applies on top of
+        # the challenge gate).
         d = _scaffolding_direction(
             [5, 5, 5, 5, 5, 5],
-            evidence_progress={"status": "advancing", "cycle_index": 5},
+            evidence_progress={
+                "status": "advancing",
+                "cycle_index": 5,
+                "challenge_approved": True,
+            },
         )
         assert _check_outcome_scaffolding(d) is not None
 
     def test_undated_advancing_verdict_suppresses(self):
-        # No cycle_index -> trust the agent's confirmation as current.
+        # No cycle_index -> trust a challenge-approved confirmation as current.
         d = _scaffolding_direction(
             [5, 5, 5, 5, 5, 5],
-            evidence_progress={"status": "advancing"},
+            evidence_progress={"status": "advancing", "challenge_approved": True},
         )
         assert _check_outcome_scaffolding(d) is None
 
@@ -7896,6 +8181,537 @@ class TestApplyEvidenceProgressVerdicts:
         _apply_evidence_progress_verdicts(task, project)
         assert project.directions[0]["evidence_progress"]["status"] == "advancing"
         assert project.directions[0]["evidence_progress"]["rationale"] == "second"
+
+
+class TestSanitizeStrategicChallengeRecord:
+    def test_non_dict_returns_none(self):
+        assert sanitize_strategic_challenge_record(None) is None
+        assert sanitize_strategic_challenge_record([]) is None
+        assert sanitize_strategic_challenge_record("nope") is None
+
+    def test_empty_dict_yields_versioned_empty_record(self):
+        rec = sanitize_strategic_challenge_record({})
+        assert rec == {
+            "challenge_version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "invalid",
+            "evidence_progress": [],
+            "retirement_critique_quality": {
+                "verdict": "not_assessed",
+                "rationale": "",
+            },
+            "portfolio_shape_risk": {
+                "verdict": "not_assessed",
+                "rationale": "",
+            },
+        }
+
+    def test_sanitizes_agent_shape_and_preserves_second_opinion_blocks(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "challenge_version": 1,
+                "status": "blocked",
+                "evidence_progress": [
+                    {
+                        "direction_id": "d-1",
+                        "status": "Advancing",
+                        "verdict": "Approved",
+                        "rationale": "ships real evidence",
+                    }
+                ],
+                "retirement_critique_quality": {
+                    "verdict": "solid",
+                    "rationale": "names the pattern",
+                },
+                "portfolio_shape_risk": {
+                    "verdict": "elevated",
+                    "rationale": "lanes are concentrated",
+                },
+                "notes": "needs follow-up",
+            }
+        )
+        assert rec["challenge_version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+        assert rec["version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
+        assert rec["status"] == "blocked"
+        # status/verdict are lower-cased.
+        assert rec["evidence_progress"] == [
+            {
+                "direction_id": "d-1",
+                "status": "advancing",
+                "verdict": "approved",
+                "rationale": "ships real evidence",
+            }
+        ]
+        assert rec["retirement_critique_quality"] == {
+            "verdict": "solid",
+            "rationale": "names the pattern",
+        }
+        assert rec["portfolio_shape_risk"] == {
+            "verdict": "elevated",
+            "rationale": "lanes are concentrated",
+        }
+        assert rec["notes"] == "needs follow-up"
+
+    def test_drops_malformed_items_keeps_valid_ones(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "evidence_progress": [
+                    "not a dict",
+                    {"direction_id": "", "status": "met", "verdict": "approved"},
+                    {"direction_id": "d-3", "status": "bogus", "verdict": "approved"},
+                    {"direction_id": "d-4", "status": "met", "verdict": "maybe"},
+                    {"direction_id": "d-5", "status": "met", "verdict": "approved"},
+                ]
+            }
+        )
+        # Only the last fully-valid item survives.
+        assert rec["evidence_progress"] == [
+            {
+                "direction_id": "d-5",
+                "status": "met",
+                "verdict": "approved",
+                "rationale": "",
+            }
+        ]
+
+    def test_bounds_item_count_and_string_lengths(self):
+        big = [
+            {
+                "direction_id": f"d-{i}",
+                "status": "advancing",
+                "verdict": "approved",
+                "rationale": "x" * 1000,
+            }
+            for i in range(120)
+        ]
+        rec = sanitize_strategic_challenge_record({"evidence_progress": big})
+        assert len(rec["evidence_progress"]) == 50  # _CHALLENGE_MAX_ITEMS
+        assert len(rec["evidence_progress"][0]["rationale"]) == 300
+
+
+class TestStrategicChallengeSummary:
+    def test_non_dict_returns_none(self):
+        assert strategic_challenge_summary(None) is None
+        assert strategic_challenge_summary([]) is None
+        assert strategic_challenge_summary("nope") is None
+
+    def test_clean_pass_is_approved_with_zero_counts(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                    }
+                ],
+            }
+        )
+        assert strategic_challenge_summary(rec) == {
+            "mode": "ok",
+            "verdict": "approved",
+            "warned_count": 0,
+            "blocked_count": 0,
+        }
+
+    def test_mixed_evidence_and_section_verdicts_roll_up_to_blocked(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                    },
+                    {"direction_id": "d-2", "status": "met", "verdict": "rejected"},
+                    {
+                        "direction_id": "d-3",
+                        "status": "advancing",
+                        "verdict": "uncertain",
+                    },
+                ],
+                # section verdict blocks contribute too
+                "retirement_critique_quality": {"verdict": "uncertain"},
+                "portfolio_shape_risk": {"verdict": "rejected"},
+            }
+        )
+        assert strategic_challenge_summary(rec) == {
+            "mode": "ok",
+            # rejected anywhere -> overall blocked
+            "verdict": "blocked",
+            "warned_count": 2,  # one uncertain item + one uncertain section
+            "blocked_count": 2,  # one rejected item + one rejected section
+        }
+
+    def test_only_uncertain_rolls_up_to_warned(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "met", "verdict": "uncertain"}
+                ],
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary["verdict"] == "warned"
+        assert summary["warned_count"] == 1
+        assert summary["blocked_count"] == 0
+
+    @pytest.mark.parametrize("status", ["blocked", "invalid"])
+    def test_non_ok_status_fails_closed_even_without_disputed_counts(self, status):
+        rec = sanitize_strategic_challenge_record({"status": status})
+        assert strategic_challenge_summary(rec) == {
+            "mode": status,
+            "verdict": "blocked",
+            "warned_count": 0,
+            "blocked_count": 0,
+        }
+
+    def test_mode_mirrors_record_status(self):
+        for status in ("ok", "blocked", "invalid"):
+            rec = sanitize_strategic_challenge_record({"status": status})
+            assert strategic_challenge_summary(rec)["mode"] == status
+
+    def test_unknown_status_normalizes_to_invalid(self):
+        # A raw record bypassing sanitation with an out-of-vocab status.
+        assert strategic_challenge_summary({"status": "weird"})["mode"] == "invalid"
+
+    def test_compact_summary_excludes_bounded_item_list(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "met", "verdict": "rejected"}
+                ],
+                "retirement_critique_quality": {"verdict": "solid"},
+                "portfolio_shape_risk": {"verdict": "elevated"},
+                "notes": "follow up",
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        # Only the four compact scalar fields — none of the bounded item lists.
+        assert set(summary) == {"mode", "verdict", "warned_count", "blocked_count"}
+        # elevated portfolio_shape_risk counts as warned; rejected evidence item as blocked
+        assert summary["blocked_count"] == 1
+        assert summary["warned_count"] == 1
+        assert summary["verdict"] == "blocked"
+
+    def test_section_shallow_maps_to_warned(self):
+        # retirement_critique_quality: "shallow" is the prompt's negative verdict
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [],
+                "retirement_critique_quality": {"verdict": "shallow"},
+                "portfolio_shape_risk": {"verdict": "low"},
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary == {
+            "mode": "ok",
+            "verdict": "warned",
+            "warned_count": 1,
+            "blocked_count": 0,
+        }
+
+    def test_section_elevated_maps_to_warned(self):
+        # portfolio_shape_risk: "elevated" is the prompt's mid-level risk verdict
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [],
+                "retirement_critique_quality": {"verdict": "solid"},
+                "portfolio_shape_risk": {"verdict": "elevated"},
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary == {
+            "mode": "ok",
+            "verdict": "warned",
+            "warned_count": 1,
+            "blocked_count": 0,
+        }
+
+    def test_section_high_maps_to_blocked(self):
+        # portfolio_shape_risk: "high" is the prompt's severe risk verdict → blocked
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [],
+                "retirement_critique_quality": {"verdict": "solid"},
+                "portfolio_shape_risk": {"verdict": "high"},
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary == {
+            "mode": "ok",
+            "verdict": "blocked",
+            "warned_count": 0,
+            "blocked_count": 1,
+        }
+
+    def test_section_clean_verdicts_are_approved(self):
+        # solid, low, not_assessed are all clean — no warn/block contribution
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                ],
+                "retirement_critique_quality": {"verdict": "solid"},
+                "portfolio_shape_risk": {"verdict": "low"},
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary == {
+            "mode": "ok",
+            "verdict": "approved",
+            "warned_count": 0,
+            "blocked_count": 0,
+        }
+
+    def test_section_both_negative_accumulates_counts(self):
+        # shallow retirement + elevated portfolio both contribute to warned count
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [],
+                "retirement_critique_quality": {"verdict": "shallow"},
+                "portfolio_shape_risk": {"verdict": "elevated"},
+            }
+        )
+        summary = strategic_challenge_summary(rec)
+        assert summary == {
+            "mode": "ok",
+            "verdict": "warned",
+            "warned_count": 2,
+            "blocked_count": 0,
+        }
+
+
+class TestChallengeApprovesEvidenceProgress:
+    def _rec(self, items, status="ok"):
+        return {"version": 1, "status": status, "evidence_progress": items}
+
+    def test_approved_exact_match_returns_true(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "approved"}]
+        )
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is True
+
+    def test_rejected_returns_false(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "rejected"}]
+        )
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+    def test_uncertain_returns_false(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "met", "verdict": "uncertain"}]
+        )
+        assert challenge_approves_evidence_progress(rec, "d-1", "met") is False
+
+    def test_status_mismatch_returns_false(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "met", "verdict": "approved"}]
+        )
+        # Approval was for "met", not "advancing".
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+    def test_direction_mismatch_returns_false(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "approved"}]
+        )
+        assert challenge_approves_evidence_progress(rec, "d-2", "advancing") is False
+
+    def test_missing_or_malformed_record_returns_false(self):
+        assert challenge_approves_evidence_progress(None, "d-1", "advancing") is False
+        assert challenge_approves_evidence_progress({}, "d-1", "advancing") is False
+        assert challenge_approves_evidence_progress("x", "d-1", "advancing") is False
+        assert (
+            challenge_approves_evidence_progress(self._rec([]), "d-1", "advancing")
+            is False
+        )
+
+    def test_blank_args_return_false(self):
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "approved"}]
+        )
+        assert challenge_approves_evidence_progress(rec, "", "advancing") is False
+        assert challenge_approves_evidence_progress(rec, "d-1", "") is False
+
+    def test_blocked_status_with_approved_entry_returns_false(self):
+        # A blocked record must never approve even if it has an approved entry.
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "approved"}],
+            status="blocked",
+        )
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+    def test_invalid_status_with_approved_entry_returns_false(self):
+        # An invalid record must never approve.
+        rec = self._rec(
+            [{"direction_id": "d-1", "status": "advancing", "verdict": "approved"}],
+            status="invalid",
+        )
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+    def test_missing_status_field_returns_false(self):
+        # A record with no status field must not be treated as ok.
+        rec = {"version": 1, "evidence_progress": [
+            {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+        ]}
+        assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+
+class TestStrategicChallengeGate:
+    """First hard gate: an advancing/met evidence_progress verdict may only
+    suppress the deterministic scaffolding flag when the stored challenge record
+    APPROVED the same direction_id + status."""
+
+    def _task(self, verdicts, challenge):
+        ctx = {EVIDENCE_PROGRESS_CONTEXT_KEY: verdicts}
+        if challenge is not None:
+            ctx[STRATEGIC_CHALLENGE_CONTEXT_KEY] = challenge
+        return Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context=ctx,
+        )
+
+    def _project_with_scaffold(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        d["id"] = "d-1"
+        return Project(
+            name="CG", user_id="u1", vision={"purpose": "p", "revision": 1}, directions=[d]
+        )
+
+    def test_apply_stamps_challenge_approved_when_challenge_approves(self):
+        project = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            {
+                "version": 1,
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                ],
+            },
+        )
+        assert _apply_evidence_progress_verdicts(task, project) == 1
+        assert project.directions[0]["evidence_progress"]["challenge_approved"] is True
+
+    def test_apply_marks_unapproved_when_challenge_rejects(self):
+        project = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            {
+                "version": 1,
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "advancing", "verdict": "rejected"}
+                ],
+            },
+        )
+        _apply_evidence_progress_verdicts(task, project)
+        assert project.directions[0]["evidence_progress"]["challenge_approved"] is False
+
+    def test_apply_marks_unapproved_when_challenge_missing(self):
+        project = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            None,
+        )
+        _apply_evidence_progress_verdicts(task, project)
+        assert project.directions[0]["evidence_progress"]["challenge_approved"] is False
+
+    def test_strategic_challenge_record_gates_advancing_evidence_progress(self):
+        # End-to-end of the first hard gate through real production helpers:
+        # the SAME advancing self-rating either suppresses the deterministic
+        # outcome-scaffolding flag or not, decided solely by whether the stored
+        # challenge record approved the matching direction_id + status.
+        approving = {
+            "version": 1,
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+            ],
+        }
+        rejecting = {
+            "version": 1,
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "rejected"}
+            ],
+        }
+        wrong_status = {
+            "version": 1,
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "met", "verdict": "approved"}
+            ],
+        }
+
+        # Precondition: with no verdict at all the deterministic detector fires.
+        bare = self._project_with_scaffold()
+        assert _check_outcome_scaffolding(bare.directions[0]) is not None
+
+        # APPROVED → the verdict is stamped challenge_approved and suppresses.
+        approved_proj = self._project_with_scaffold()
+        approved_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "real"}],
+            approving,
+        )
+        _apply_evidence_progress_verdicts(approved_task, approved_proj)
+        assert _check_outcome_scaffolding(approved_proj.directions[0]) is None
+
+        # REJECTED → not approved → deterministic scaffolding stays active.
+        rejected_proj = self._project_with_scaffold()
+        rejected_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "real"}],
+            rejecting,
+        )
+        _apply_evidence_progress_verdicts(rejected_task, rejected_proj)
+        assert _check_outcome_scaffolding(rejected_proj.directions[0]) is not None
+
+        # APPROVED but for a DIFFERENT status (met, not advancing) → no match,
+        # so the advancing self-rating does not suppress.
+        mismatch_proj = self._project_with_scaffold()
+        mismatch_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "real"}],
+            wrong_status,
+        )
+        _apply_evidence_progress_verdicts(mismatch_task, mismatch_proj)
+        assert _check_outcome_scaffolding(mismatch_proj.directions[0]) is not None
+
+        # MISSING challenge → not approved → deterministic scaffolding stays active.
+        missing_proj = self._project_with_scaffold()
+        missing_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "real"}],
+            None,
+        )
+        _apply_evidence_progress_verdicts(missing_task, missing_proj)
+        assert _check_outcome_scaffolding(missing_proj.directions[0]) is not None
+
+    def test_stalled_verdict_stays_advisory_regardless_of_challenge(self):
+        # A stalled verdict never suppresses, and never claims challenge approval,
+        # even if a (nonsensical) challenge "approved" a stalled status.
+        project = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "stalled", "rationale": "no progress"}],
+            {
+                "version": 1,
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "stalled", "verdict": "approved"}
+                ],
+            },
+        )
+        _apply_evidence_progress_verdicts(task, project)
+        assert project.directions[0]["evidence_progress"]["challenge_approved"] is False
+        assert _check_outcome_scaffolding(project.directions[0]) is not None
 
 
 @pytest.mark.asyncio

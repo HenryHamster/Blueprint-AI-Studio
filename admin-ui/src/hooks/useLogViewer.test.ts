@@ -209,6 +209,14 @@ describe('useLogViewer strategist events', () => {
             directions_changed: true,
             problem_model_changed: false,
             running_update_changed: true,
+            // Compact strategic-judgment-challenge summary rides the completion
+            // sub-object verbatim and must be captured for the receipt chip.
+            strategic_judgment_challenge: {
+              mode: 'ok',
+              verdict: 'warned',
+              warned_count: 1,
+              blocked_count: 0,
+            },
           },
         },
       });
@@ -224,6 +232,12 @@ describe('useLogViewer strategist events', () => {
       tasks_spawned: 3,
       directions_changed: true,
       running_update_changed: true,
+      strategic_judgment_challenge: {
+        mode: 'ok',
+        verdict: 'warned',
+        warned_count: 1,
+        blocked_count: 0,
+      },
     });
 
     // Directions refetch must have been debounced and fired.

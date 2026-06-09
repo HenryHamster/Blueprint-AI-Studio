@@ -13,7 +13,11 @@ import {
   buildContextPrefix, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
-import { writeStrategicHelpers } from './strategic-helpers.js';
+import {
+  writeStrategicHelpers,
+  runStrategicChallenge,
+  buildStrategicChallengeExecutorSection,
+} from './strategic-helpers.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
 } from '../telemetry.js';
@@ -645,6 +649,40 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       }
     }
 
+    // ── Independent strategic challenge (adversarial second opinion) ──
+    // Re-judge the thinker's self-produced judgments — evidence_progress claims,
+    // retirement-critique quality, portfolio-shape risk — with a FRESH adversarial
+    // pass BEFORE the executor commits them. Produces a bounded versioned record;
+    // a blocked (non-zero exit / runner error) or invalid (unparseable) outcome
+    // yields a record approving NOTHING (gate fails closed). The record is
+    // persisted via the strategic challenge API op BEFORE the executor runs and
+    // surfaced in the executor prompt so an advancing/met evidence_progress verdict
+    // can only be submitted for a challenge-approved (direction_id, status) pair.
+    // Deliberately NOT added to the executor required-call retry checks, and the
+    // store op does NOT set _strategic_api_called — a challenge-only cycle must not
+    // look like a successful strategic mutation.
+    const challengeRecord = await runStrategicChallenge({
+      analysisText,
+      dirSummaryText,
+      pastRetirementCritiquesSection,
+      portfolioCompositionText,
+      ws, statusRef, model, effort, disallowedTools,
+      runClaudeCode, sendLog,
+    });
+    try {
+      await apiPost('/api/agent/strategic', {
+        task_id: taskId,
+        op: 'set_strategic_challenge',
+        data: challengeRecord,
+      });
+      sendLog(ws, `[INFO] Strategic challenge recorded (status=${challengeRecord.status})\n`);
+    } catch (e) {
+      const error = new Error(`Failed to persist strategic challenge record: ${String(e)}`);
+      sendLog(ws, `[ERROR] ${error.message}\n`);
+      throw error;
+    }
+    const strategicChallengeSection = buildStrategicChallengeExecutorSection(challengeRecord);
+
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.
     // Note: do NOT overwrite CLAUDE.md here. The executor needs to inherit the
@@ -782,6 +820,8 @@ ${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones,
 
 ${analysisText.slice(0, 50_000)}
 
+${strategicChallengeSection}
+
 # Instructions
 
 1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
@@ -810,7 +850,7 @@ ${analysisText.slice(0, 50_000)}
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
-   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call.
+   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
 
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`

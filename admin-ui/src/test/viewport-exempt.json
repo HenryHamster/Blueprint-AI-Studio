@@ -36,6 +36,7 @@
     "DirectionsAddForm": "Add-direction form sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx which exercises it inline.",
     "DirectionsQuickLinks": "Quick-links nav sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx which exercises it inline.",
     "DirectionsList": "Directions list sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx (including the dense stress fixture) which exercises it inline.",
-    "FleetCapacityCard": "Fleet capacity stat card rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline."
+    "FleetCapacityCard": "Fleet capacity stat card rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline.",
+    "StrategicChallengeChip": "Compact verdict chip rendered exclusively inside SystemStatusCard and MessagesPanel; viewport coverage is provided by SystemStatusCard.viewport.test.tsx and MessagesPanel.viewport.test.tsx which exercise it inline."
   }
 }

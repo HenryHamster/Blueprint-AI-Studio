@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
+import type { StrategicChallengeSummary } from '../types/digest';
 import { API_BASE_URL, authHeaders, fetchTask } from '../api';
 
 interface UseLogViewerDeps {
@@ -36,6 +37,10 @@ export interface StrategicCycleCompletion {
   retired_direction_ids?: string[];
   status_message?: string;
   failure_reason?: string;
+  // Compact strategic-judgment-challenge summary; present only when the cycle
+  // carried a challenge record (the backend omits it otherwise). The handler
+  // passes msg.data.completion verbatim, so no handler change is needed.
+  strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
 let _trackLogIdCounter = 0;

@@ -4407,4 +4407,38 @@ describe('MessagesPanel strategic cycle progress indicators', () => {
     expect(el.textContent).not.toContain('Cycle complete');
     expect(el.textContent).not.toContain('Cycle failed');
   });
+
+  test('completion receipt shows compact strategic challenge summary when present', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: {
+        status: 'completed',
+        created_count: 1,
+        strategic_judgment_challenge: {
+          mode: 'ok',
+          verdict: 'warned',
+          warned_count: 2,
+          blocked_count: 1,
+        },
+      },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    // Compact chip surfaces verdict and counts without the full item list.
+    const chip = el.querySelector('[aria-label*="Strategic judgment challenge"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toContain('challenge: ok · warned');
+    expect(chip?.textContent).toContain('1 blocked');
+    expect(chip?.textContent).toContain('2 warned');
+  });
+
+  test('completion receipt shows no challenge chip (and no warning styling) when summary absent', async () => {
+    const el = await renderPanel({
+      strategistActive: false,
+      lastCycleCompletion: { status: 'completed', created_count: 1 },
+    });
+    expect(el.textContent).toContain('Cycle complete');
+    // Pre-challenge cycles carry no summary → no chip rendered at all.
+    expect(el.querySelector('[aria-label*="Strategic judgment challenge"]')).toBeNull();
+    expect(el.textContent).not.toContain('challenge:');
+  });
 });

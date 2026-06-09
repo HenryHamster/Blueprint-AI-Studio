@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { timeAgo } from '../utils/time';
+import { StrategicChallengeChip } from './StrategicChallengeChip';
 import type { DigestData } from '../types/digest';
 import type { DirectionProgress } from './DirectionProgressSection';
 
@@ -38,6 +39,9 @@ export function CatchUpLatestCycleSection({ latestCycle }: CatchUpLatestCycleSec
           <span className="text-[10px] text-violet-400" title="memos available / cited in this cycle">
             {latestCycle.memos_available ?? 0}m avail, {latestCycle.memos_cited ?? 0} cited
           </span>
+        )}
+        {latestCycle.strategic_judgment_challenge && (
+          <StrategicChallengeChip summary={latestCycle.strategic_judgment_challenge} />
         )}
       </div>
       {latestCycle.summary_text && (
