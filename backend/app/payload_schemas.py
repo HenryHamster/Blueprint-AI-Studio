@@ -498,12 +498,12 @@ class ReleaseAuditPayload(_SystemPopulated):
 
 
 class ReleaseAuditChallengePayload(_SystemPopulated):
-    """Payload for the advisory release-audit challenger pass.
+    """Payload for the binding release-audit challenger pass.
 
     Like :class:`ReleaseAuditPayload` the task scores ONE pinned candidate
-    commit (``candidate_sha``) against ``base_branch``. It additionally receives
-    the primary audit report it must challenge via ``primary_audit_report``.
-    Both are optional here because BasePayload is extra-field tolerant
+    commit (``candidate_sha``) against ``base_branch``. It may additionally
+    receive primary findings to re-judge when the caller already has them.
+    Fields remain optional here because BasePayload is extra-field tolerant
     (``extra='allow'``) and the agent handler fails loud at runtime when the
     candidate SHA is missing/invalid — the schema does not need to re-enforce it.
     """

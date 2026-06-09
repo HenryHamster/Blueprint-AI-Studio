@@ -502,22 +502,17 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Release Audit Challenge",
         "read_only",
         description=(
-            "Advisory, independent challenger pass over a release-audit "
-            "candidate: re-examines the same pinned candidate/diff plus the "
-            "primary audit report and emits a structured challenge record "
-            "(agreement, missing/overstated findings, challenge severity). "
-            "Advisory only — the primary release_audit remains the "
-            "promotion-influencing verdict."
+            "Binding, independent challenger pass over a release-audit "
+            "candidate: re-examines the same pinned candidate/diff and emits "
+            "structured verdicts over higher-severity primary findings."
         ),
         run_shape="single_agent",
         output_kind="verdict",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
-        # No forward gate: this is an advisory pilot whose challenge artifact is
-        # consumed by the deterministic qualifier synthesis (a separate change),
-        # not graded by a terminal-artifact forward-quality check here. Mirrors
-        # ``plan``'s gate-less ``none`` so a missing/partial challenge artifact
-        # never fails the pilot task at the forward gate.
+        # No forward gate: the deterministic release qualifier consumes the
+        # challenge artifact directly instead of grading it through a generic
+        # terminal-artifact forward-quality check here.
         evaluation="none",
     ),
     TaskCapability(

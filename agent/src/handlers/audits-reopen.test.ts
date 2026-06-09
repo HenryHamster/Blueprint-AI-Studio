@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// ── Hoisted shared mocks ───────────────────────────────────────────────────────
+// runClaudeCode is shared across both the ../index.js and ../providers/runners.js
+// mock factories so that calls from audits.ts AND from structured-output-repair.ts
+// (which may resolve its import through the re-export chain) are tracked by the
+// same vi.fn() instance and controlled by the same mockResolvedValueOnce calls.
+const { sharedRunClaudeCode } = vi.hoisted(() => ({
+  sharedRunClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+}));
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
@@ -18,7 +27,7 @@ vi.mock('../index.js', async (importOriginal) => {
     gitAsync: vi.fn().mockResolvedValue(''),
     gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn(),
-    runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+    runClaudeCode: sharedRunClaudeCode,
     cloneWithRetry: vi.fn().mockResolvedValue(undefined),
     sendHeartbeatSync: vi.fn(),
     listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
@@ -84,6 +93,22 @@ vi.mock('child_process', () => ({
     kill: vi.fn(),
   }),
 }));
+
+// Backstop: prevent the real runProviderAgent/spawn path from being reached
+// regardless of module-resolution order. structured-output-repair.ts imports
+// runClaudeCode from '../index.js' (mocked above as sharedRunClaudeCode), but a
+// stale-cache edge case can leave the runners.ts re-export binding unintercepted.
+// Using sharedRunClaudeCode here ensures that if the resolution falls through to
+// runners.ts, it still calls the same tracked vi.fn() as all other callers.
+vi.mock('../providers/runners.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../providers/runners.js')>();
+  return {
+    ...actual,
+    runClaudeCode: sharedRunClaudeCode,
+    runProviderAgent: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+    provisionAmbientHelpers: vi.fn(),
+  };
+});
 
 vi.mock('ws', () => ({
   default: class MockWebSocket {
@@ -204,7 +229,11 @@ describe('handleSelfAudit — bounded self-repair on format miss', () => {
   });
 
   it('records repair success and posts COMPLETED when re-ask returns parseable findings object', async () => {
-    const repairedObj = '{"findings":[{"system_id":"sys-auth","score":72,"components":{"test_coverage":80,"friction_density":65,"claim_consistency":75,"failure_mix":70},"top_issues":["Missing tests"],"recommended_mode":"fundamentals","evidence":[{"file":"auth.py","summary":"..."}]}]}';
+    // The self-audit extractor uses requiredKeys ['findings','system_id'], so the
+    // repaired object must have BOTH as top-level own properties for the extractor
+    // to accept it. A bare {"findings":[...]} would fail the own-property check on
+    // "system_id" even though the nested findings contain it.
+    const repairedObj = '{"system_id":"sys-auth","findings":[{"system_id":"sys-auth","score":72,"components":{"test_coverage":80,"friction_density":65,"claim_consistency":75,"failure_mix":70},"top_issues":["Missing tests"],"recommended_mode":"fundamentals","evidence":[{"file":"auth.py","summary":"..."}]}]}';
     vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Analysis...', lastResultText: '' });
     vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: repairedObj });
 

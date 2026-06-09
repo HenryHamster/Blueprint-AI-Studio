@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   computePromptFingerprint, type PlaybookEntry,
@@ -336,14 +336,12 @@ Rules:
 
   const buildConfig = resolveBuildConfig(task);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
-  const typeHints = getTaskTypeHints(buildConfig);
-  const typeHint = typeHints['release_audit_challenge'] ? '\n\n' + typeHints['release_audit_challenge'] : '';
   statusRef.value = 'Running release audit challenge...';
   const challengeFingerprint = computePromptFingerprint('release_audit_challenge', buildConfig);
   setCurrentPromptFingerprint(challengeFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: challengeFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    challengePrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${challengeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+    challengePrompt + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${challengeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
 

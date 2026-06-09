@@ -141,8 +141,8 @@ async def _spawn_release_audit_challenge_task(
 
     The spawned task remains pinned to the same candidate/diff range.  When
     ``primary_audit_task_id`` is available, it is recorded for consumers that
-    still expect the older advisory audit-challenge linkage; the new binding
-    challenge gate treats it as best-effort metadata.
+    still expect audit/challenge task linkage; the binding challenge gate treats
+    it as best-effort metadata.
     """
     payload: dict[str, Any] = {
         "type": "release_audit_challenge",
@@ -176,7 +176,7 @@ async def _spawn_release_audit_challenge_task(
         title=f"Release audit challenge: {base_branch}...{candidate_sha[:8]} diff",
         description=(
             f"Independent adversarial re-judgement of the release_audit findings "
-            f"for {diff_range} (advisory second opinion for the release qualifier)"
+            f"for {diff_range} (binding second opinion for the release qualifier)"
         ),
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

@@ -202,9 +202,39 @@ class TestAuditsTsSchemaContract:
             "field name — must use 'severity' to avoid drift"
         )
 
+def _resolve_audit_challenge_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/audit-challenge.ts`` across local + Docker.
+
+    Mirrors :func:`_resolve_audits_ts_path`.  The binding release-audit
+    challenge handler emits a RELEASE_AUDIT_CHALLENGE artifact whose shape a
+    backend consumer reads verbatim; these tests pin that the producer's prompt
+    still documents the contract keys + verdict enum.
+    """
+    env_override = os.getenv("AGENT_AUDIT_CHALLENGE_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/audit-challenge.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "audit-challenge.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 class TestAuditChallengeTsContract:
-    """Introspect agent/src/handlers/audit-challenge.ts to pin the advisory
+    """Introspect agent/src/handlers/audit-challenge.ts to pin the binding
     RELEASE_AUDIT_CHALLENGE artifact contract the backend consumer relies on.
     """
 
@@ -277,7 +307,7 @@ async def test_spawn_release_audit_challenge_pins_candidate(db_session):
 
 @pytest.mark.asyncio
 async def test_get_latest_release_audit_challenge_scoped_by_sha(db_session):
-    """``get_latest_release_audit_challenge`` returns the parsed advisory verdict
+    """``get_latest_release_audit_challenge`` returns the parsed binding verdict
     for the matching candidate, and ``None`` for a non-matching candidate."""
     from app import release_qualifier as rq
     from app.models import Artifact, ArtifactType, Project
