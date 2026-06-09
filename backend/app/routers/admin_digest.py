@@ -51,6 +51,7 @@ from app.digest_metrics import (
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
@@ -1314,6 +1315,14 @@ async def _compute_digest(
         session, project_id
     )
 
+    # --- Compute-wake post-commit stuck-marker count (read-only) — surfaces
+    # DELIVERED compute_job_terminal registrations still carrying the durable
+    # post-commit marker, i.e., rows whose knowledge-persistence side effects
+    # have not yet completed. A non-zero count is actionable for operators. ---
+    compute_wake_post_commit_health = await compute_wake_post_commit_health_signals(
+        session, project_id
+    )
+
     # --- Park/wake operational health (read-only) — PARKED population + wake
     # delivery backlog for the park-and-wake primitive. Distinct from the
     # parked_blockers block above (escalated BLOCKED tasks); this grounds
@@ -1470,6 +1479,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
+        "compute_wake_post_commit_health": compute_wake_post_commit_health,
         "park_wake_health": park_wake_health,
         "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,

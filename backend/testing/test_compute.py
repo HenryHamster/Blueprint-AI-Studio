@@ -4299,6 +4299,10 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
     from app import knowledge_completion as knowledge_completion_module
     from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_completion import (
+        _COMPUTE_WAKE_NEXT_RETRY_KEY,
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+    )
     from app.task_lifecycle import fire_task_wakes, park_task
     from app.time_utils import _utcnow
 
@@ -4367,7 +4371,7 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
     monkeypatch.setattr(
         "app.knowledge_completion.persist_compute_experiment_knowledge",
@@ -4394,7 +4398,9 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     assert task.status == TaskStatus.COMPLETED
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
     assert reg.result_state == "finalized"
-    assert reg.source_metadata.get("_compute_wake_post_commit_meta") is not None
+    assert reg.source_metadata.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) is not None
+    first_next_retry = reg.source_metadata.get(_COMPUTE_WAKE_NEXT_RETRY_KEY)
+    assert first_next_retry is not None
     assert docs == []
     assert persist_calls == 1
 
@@ -4417,7 +4423,36 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     )
     assert task.status == TaskStatus.COMPLETED
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
-    assert reg.source_metadata.get("_compute_wake_post_commit_meta") is None
+    assert reg.source_metadata.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) is not None
+    assert reg.source_metadata.get(_COMPUTE_WAKE_NEXT_RETRY_KEY) == first_next_retry
+    assert len(docs) == 0
+    assert persist_calls == 1
+
+    retry_at = datetime.fromisoformat(first_next_retry) + timedelta(seconds=1)
+    monkeypatch.setattr("app.task_completion._utcnow", lambda: retry_at)
+    monkeypatch.setattr("app.reaper_sweeps._utcnow", lambda: retry_at)
+
+    final = await sweep_deliver_task_wakes(db_session, retry_at)
+    assert final == 0
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert task.status == TaskStatus.COMPLETED
+    assert reg.delivery_state == WakeDeliveryState.DELIVERED
+    assert reg.source_metadata.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) is None
+    assert _COMPUTE_WAKE_NEXT_RETRY_KEY not in (reg.source_metadata or {})
     assert len(docs) == 1
     assert docs[0].source_task_id == task.id
     assert persist_calls == 2
@@ -4796,6 +4831,260 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     # Exactly one knowledge document persisted for the marked task.
     assert len(docs) == 1
     assert docs[0].source_task_id == marked_task.id
+
+
+@pytest.mark.asyncio
+async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
+    db_session, monkeypatch
+):
+    """A backlog of failing marked rows with future next_retry_after cannot starve newer ready rows.
+
+    Creates batch_size DELIVERED rows WITH the marker AND with
+    ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` set to a far-future timestamp (simulating
+    rows in their backoff window). Then creates ONE DELIVERED row WITH the marker
+    but WITHOUT ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` (ready to be retried now).
+
+    A single sweep_deliver_task_wakes call must skip the backlogged rows (backoff
+    window not expired) and process the ready row, clearing its marker and
+    persisting exactly one KnowledgeDocument. The backlog rows must remain
+    untouched (marker still present).
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_completion import (
+        _COMPUTE_WAKE_NEXT_RETRY_KEY,
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+    )
+    from app.task_lifecycle import deliver_wake, fire_task_wakes, park_task
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Compute Wake Retry Starvation Backoff", user_id="test-user"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    batch_size = 10
+    # --- Build batch_size DELIVERED rows WITH the marker AND a far-future backoff ---
+    far_future = (_utcnow() + timedelta(hours=24)).isoformat()
+    backlog_regs = []
+    for _ in range(batch_size):
+        backlog_task = Task(
+            project_id=project.id,
+            title="compute_experiment: backoff row",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+        )
+        db_session.add(backlog_task)
+        await db_session.commit()
+        await db_session.refresh(backlog_task)
+
+        backlog_job = await compute_jobs.create_compute_job(
+            db_session,
+            backlog_task,
+            command="echo backlog",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        await park_task(
+            db_session,
+            backlog_task,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(backlog_job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=_utcnow() + timedelta(hours=1),
+            reason=f"parked on backlog job {backlog_job.id}",
+        )
+        await db_session.commit()
+
+        backlog_job.status = ComputeJobStatus.SUCCEEDED
+        backlog_job.outcome = ComputeJobOutcome.SUCCESS
+        backlog_job.final_cost_usd = 0.01
+        backlog_job.accrued_cost_usd = 0.01
+        db_session.add(backlog_job)
+        await fire_task_wakes(
+            db_session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(backlog_job.id),
+        )
+        await db_session.commit()
+
+        # Deliver to DELIVERED state (marker seeded at delivery time).
+        b_reg = (
+            (
+                await db_session.execute(
+                    select(TaskWakeRegistration).where(
+                        TaskWakeRegistration.wake_source_ref == str(backlog_job.id)
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        await deliver_wake(db_session, b_reg, now=_utcnow())
+        await db_session.commit()
+
+        # Inject a far-future backoff timestamp so this row is skipped by the sweep.
+        db_session.expire_all()
+        b_reg = (
+            (
+                await db_session.execute(
+                    select(TaskWakeRegistration).where(
+                        TaskWakeRegistration.wake_source_ref == str(backlog_job.id)
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        meta = dict(b_reg.source_metadata or {})
+        meta[_COMPUTE_WAKE_NEXT_RETRY_KEY] = far_future
+        b_reg.source_metadata = meta
+        db_session.add(b_reg)
+        await db_session.commit()
+        backlog_regs.append(b_reg.id)
+
+    # --- Build ONE DELIVERED row WITH the marker and WITHOUT next_retry_after ---
+    ready_task = Task(
+        project_id=project.id,
+        title="compute_experiment: ready row",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+    )
+    db_session.add(ready_task)
+    await db_session.commit()
+    await db_session.refresh(ready_task)
+
+    ready_job = await compute_jobs.create_compute_job(
+        db_session,
+        ready_task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    await park_task(
+        db_session,
+        ready_task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(ready_job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on ready job {ready_job.id}",
+    )
+    await db_session.commit()
+
+    ready_job.status = ComputeJobStatus.SUCCEEDED
+    ready_job.outcome = ComputeJobOutcome.SUCCESS
+    ready_job.final_cost_usd = 0.22
+    ready_job.accrued_cost_usd = 0.22
+    db_session.add(ready_job)
+    await fire_task_wakes(
+        db_session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(ready_job.id),
+    )
+    await db_session.commit()
+
+    ready_reg = (
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await deliver_wake(db_session, ready_reg, now=_utcnow())
+    await db_session.commit()
+
+    # Verify the ready row has the marker but no next_retry_after.
+    db_session.expire_all()
+    ready_reg = (
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert _COMPUTE_WAKE_POST_COMMIT_META_KEY in (ready_reg.source_metadata or {})
+    assert _COMPUTE_WAKE_NEXT_RETRY_KEY not in (ready_reg.source_metadata or {})
+
+    # Patch side effects so the sweep can complete.
+    monkeypatch.setattr(
+        "app.task_completion.broadcast_to_project",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=None),
+    )
+
+    # Run sweep with batch_size. The batch_size backlog rows have a far-future
+    # next_retry_after and must NOT fill the window — the SQL and Python guards
+    # should skip them and the one ready row must be found and retried.
+    await sweep_deliver_task_wakes(db_session, _utcnow(), batch_size=batch_size)
+
+    db_session.expire_all()
+
+    # The ready row must have its marker cleared (side effects ran successfully).
+    ready_reg = (
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration).where(
+                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (ready_reg.source_metadata or {})
+
+    # Exactly one knowledge document persisted for the ready task.
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == ready_task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    assert docs[0].source_task_id == ready_task.id
+
+    # All backlog rows must still have their marker (and far-future backoff) intact.
+    for reg_id in backlog_regs:
+        b_reg = (
+            (
+                await db_session.execute(
+                    select(TaskWakeRegistration).where(
+                        TaskWakeRegistration.id == reg_id
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert _COMPUTE_WAKE_POST_COMMIT_META_KEY in (b_reg.source_metadata or {}), (
+            f"Backlog row {reg_id} had its marker cleared (starvation occurred)"
+        )
+        assert (b_reg.source_metadata or {}).get(_COMPUTE_WAKE_NEXT_RETRY_KEY) == far_future, (
+            f"Backlog row {reg_id} had its backoff timestamp modified"
+        )
 
 
 def test_build_compute_result_logs_shape_metrics_and_disposition():

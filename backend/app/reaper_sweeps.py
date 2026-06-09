@@ -3165,6 +3165,8 @@ class WakeSweepResult(int):
                                 sweep (the residual delivery backlog)
       * ``stall_cycles``      — consecutive no-progress cycles with a FIRED backlog
       * ``delivery_stalled``  — True once ``stall_cycles`` crosses the threshold
+      * ``post_commit_stuck`` — DELIVERED rows that still returned False from
+                                ``run_compute_wake_post_commit`` this cycle
     """
 
     delivered: int
@@ -3174,6 +3176,7 @@ class WakeSweepResult(int):
     fired_undelivered: int
     stall_cycles: int
     delivery_stalled: bool
+    post_commit_stuck: int
 
     def __new__(
         cls,
@@ -3185,6 +3188,7 @@ class WakeSweepResult(int):
         fired_undelivered: int = 0,
         stall_cycles: int = 0,
         delivery_stalled: bool = False,
+        post_commit_stuck: int = 0,
     ) -> "WakeSweepResult":
         self = super().__new__(cls, delivered)
         self.delivered = int(delivered)
@@ -3194,6 +3198,7 @@ class WakeSweepResult(int):
         self.fired_undelivered = int(fired_undelivered)
         self.stall_cycles = int(stall_cycles)
         self.delivery_stalled = bool(delivery_stalled)
+        self.post_commit_stuck = int(post_commit_stuck)
         return self
 
     def as_log_fields(self) -> dict:
@@ -3206,6 +3211,7 @@ class WakeSweepResult(int):
             "fired_undelivered": self.fired_undelivered,
             "stall_cycles": self.stall_cycles,
             "delivery_stalled": self.delivery_stalled,
+            "post_commit_stuck": self.post_commit_stuck,
         }
 
     def is_noteworthy(self) -> bool:
@@ -3216,6 +3222,7 @@ class WakeSweepResult(int):
             or self.stranded
             or self.delivery_failed
             or self.delivery_stalled
+            or self.post_commit_stuck
         )
 
 
@@ -3252,12 +3259,13 @@ async def sweep_deliver_task_wakes(
     commit internal KnowledgeDocument rows; their post-commit broadcast + knowledge
     persistence run via ``run_compute_wake_post_commit`` AFTER the delivery commit.
     """
-    from sqlalchemy import func
+    from sqlalchemy import func, or_
 
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
     from app.database import resolve_dialect_name
     from app.failure_classification import PARK_WAKE_STRANDED
     from app.task_completion import (
+        _COMPUTE_WAKE_NEXT_RETRY_KEY,
         _COMPUTE_WAKE_POST_COMMIT_META_KEY,
         run_compute_wake_post_commit,
     )
@@ -3271,7 +3279,9 @@ async def sweep_deliver_task_wakes(
     expired = 0
     stranded_count = 0
     delivery_failed = 0
+    post_commit_stuck = 0
     touched = False
+    now_iso = now.isoformat()
 
     # Retry delivered compute-wake registrations that are carrying the durable
     # post-commit marker before processing any new FIRED rows. This keeps the
@@ -3279,8 +3289,13 @@ async def sweep_deliver_task_wakes(
     # committed as DELIVERED.
     #
     # ``has_key`` uses the JSONB ``?`` operator (PostgreSQL only). On SQLite
-    # (standalone tests) the predicate is omitted; the Python loop guards below
-    # still filter correctly in that case.
+    # (standalone tests) these predicates are omitted; the Python loop guards
+    # below still filter correctly in that case.
+    #
+    # The ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` filter excludes rows whose backoff
+    # window has not yet elapsed, preventing a failing batch from starving
+    # newer ready rows: a row is eligible only if the key is absent (never
+    # failed) OR its stored timestamp is <= now.
     _retry_where = [
         TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
         TaskWakeRegistration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND,
@@ -3289,6 +3304,17 @@ async def sweep_deliver_task_wakes(
         _retry_where.append(
             TaskWakeRegistration.source_metadata.has_key(
                 _COMPUTE_WAKE_POST_COMMIT_META_KEY
+            )
+        )
+        _retry_where.append(
+            or_(
+                ~TaskWakeRegistration.source_metadata.has_key(
+                    _COMPUTE_WAKE_NEXT_RETRY_KEY
+                ),
+                TaskWakeRegistration.source_metadata[
+                    _COMPUTE_WAKE_NEXT_RETRY_KEY
+                ].astext
+                <= now_iso,
             )
         )
     retry_rows = (
@@ -3307,9 +3333,15 @@ async def sweep_deliver_task_wakes(
     for reg in retry_rows:
         if _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {}):
             continue
+        # SQLite guard: skip rows whose backoff window has not expired yet.
+        if (reg.source_metadata or {}).get(_COMPUTE_WAKE_NEXT_RETRY_KEY, "") > now_iso:
+            continue
         try:
-            await run_compute_wake_post_commit(session, reg)
+            ok = await run_compute_wake_post_commit(session, reg)
+            if not ok:
+                post_commit_stuck += 1
         except Exception:
+            post_commit_stuck += 1
             logger.exception(
                 "[REAPER] Wake post-commit retry failed for registration %s",
                 reg.id,
@@ -3492,6 +3524,7 @@ async def sweep_deliver_task_wakes(
         fired_undelivered=int(fired_undelivered),
         stall_cycles=_wake_delivery_stall_cycles,
         delivery_stalled=delivery_stalled,
+        post_commit_stuck=post_commit_stuck,
     )
 
 

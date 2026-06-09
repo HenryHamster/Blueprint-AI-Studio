@@ -15,6 +15,7 @@ import logging
 import random
 import re
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -85,6 +86,8 @@ logger = logging.getLogger(__name__)
 
 
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
+_COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
+_COMPUTE_WAKE_MAX_ATTEMPTS = 12
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -2078,6 +2081,31 @@ async def _finalize_compute_experiment(
     )
 
 
+async def _clear_post_commit_marker(session: AsyncSession, registration) -> None:
+    """Remove post-commit retry keys from source_metadata and commit."""
+    marker = dict(registration.source_metadata or {})
+    marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+    marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
+    registration.source_metadata = marker
+    flag_modified(registration, "source_metadata")
+    session.add(registration)
+    await session.commit()
+
+
+async def _schedule_post_commit_backoff(
+    session: AsyncSession, registration, attempts: int
+) -> None:
+    """Write a next_retry_after backoff timestamp into source_metadata and commit."""
+    backoff_delta = timedelta(seconds=min(60 * 2 ** (attempts - 1), 3600))
+    next_retry_after = (_utcnow() + backoff_delta).isoformat()
+    marker = dict(registration.source_metadata or {})
+    marker[_COMPUTE_WAKE_NEXT_RETRY_KEY] = next_retry_after
+    registration.source_metadata = marker
+    flag_modified(registration, "source_metadata")
+    session.add(registration)
+    await session.commit()
+
+
 async def run_compute_wake_post_commit(session: AsyncSession, registration) -> bool:
     """Post-commit broadcast + durable knowledge for a wake-finalized compute task.
 
@@ -2090,7 +2118,11 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
 
     Strictly best-effort and fully self-contained: a no-op for any non-compute
     wake kind, and any failure is reported back as ``False`` so the sweep can
-    retry a delivered registration carrying the durable marker.
+    retry a delivered registration carrying the durable marker. Transient
+    failures write a ``_COMPUTE_WAKE_NEXT_RETRY_KEY`` backoff timestamp so the
+    retry sub-pass skips this row until the window expires, preventing a failing
+    batch from starving newer marked rows. After ``_COMPUTE_WAKE_MAX_ATTEMPTS``
+    the marker is cleared and a WARNING is emitted.
     """
     from app.compute_jobs import (
         COMPUTE_JOB_TERMINAL_WAKE_KIND,
@@ -2103,14 +2135,30 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
     try:
         task = await session.get(Task, registration.task_id)
         if task is None:
+            # Permanent failure: task is gone; clear the marker so the row is
+            # not retried indefinitely.
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
             return False
         marker = dict(registration.source_metadata or {})
         marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
-        marker_meta["attempts"] = int(marker_meta.get("attempts", 0) or 0) + 1
+        attempts = int(marker_meta.get("attempts", 0) or 0) + 1
+        if attempts >= _COMPUTE_WAKE_MAX_ATTEMPTS:
+            logger.warning(
+                "[COMPUTE] Post-commit wake max attempts (%d) reached for task %s; clearing marker",
+                _COMPUTE_WAKE_MAX_ATTEMPTS,
+                registration.task_id,
+            )
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
+            return False
+        marker_meta["attempts"] = attempts
         marker_meta["updated_at"] = _utcnow().isoformat()
         if "started_at" not in marker_meta:
             marker_meta["started_at"] = marker_meta["updated_at"]
         marker[_COMPUTE_WAKE_POST_COMMIT_META_KEY] = marker_meta
+        # Clear any stale next_retry_after now that we are actively attempting.
+        marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
         registration.source_metadata = marker
         flag_modified(registration, "source_metadata")
         session.add(registration)
@@ -2127,6 +2175,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
                     ComputeJob, uuid.UUID(str(registration.wake_source_ref))
                 )
         if job is None:
+            # Permanent failure: job is gone; clear the marker.
+            with contextlib.suppress(Exception):
+                await _clear_post_commit_marker(session, registration)
             return False
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
@@ -2134,9 +2185,13 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             task, logs, criterion, session
         )
         if not persisted:
+            # Transient failure: schedule a backoff retry.
+            with contextlib.suppress(Exception):
+                await _schedule_post_commit_backoff(session, registration, attempts)
             return False
         marker = dict(registration.source_metadata or {})
         marker.pop(_COMPUTE_WAKE_POST_COMMIT_META_KEY, None)
+        marker.pop(_COMPUTE_WAKE_NEXT_RETRY_KEY, None)
         registration.source_metadata = marker
         flag_modified(registration, "source_metadata")
         session.add(registration)
@@ -2148,6 +2203,14 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             getattr(registration, "task_id", None),
             exc_info=True,
         )
+        # Best-effort: rollback and schedule a backoff retry so the row is not
+        # retried every cycle, which would starve newer marked rows.
+        with contextlib.suppress(Exception):
+            await session.rollback()
+            marker = dict(registration.source_metadata or {})
+            marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
+            attempts = int(marker_meta.get("attempts", 0) or 0)
+            await _schedule_post_commit_backoff(session, registration, attempts)
         return False
 
 

@@ -2305,6 +2305,52 @@ async def compute_dependency_health_signals(
     }
 
 
+async def compute_wake_post_commit_health_signals(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Count DELIVERED compute_job_terminal registrations still carrying the
+    post-commit stuck marker.
+
+    A non-zero ``stuck_count`` means these rows are waiting for their
+    ``run_compute_wake_post_commit`` side effects to complete. Rows with an
+    active backoff window are included because they are still stuck — they
+    simply have a scheduled retry time. Scoped to ``project_id`` when
+    provided, else fleet-wide.
+    """
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.models import TaskWakeRegistration, WakeDeliveryState
+    from app.task_completion import _COMPUTE_WAKE_POST_COMMIT_META_KEY
+
+    if resolve_dialect_name(session) == "sqlite":
+        marker_predicate = func.json_extract(
+            TaskWakeRegistration.source_metadata,
+            f"$.{_COMPUTE_WAKE_POST_COMMIT_META_KEY}",
+        ).is_not(None)
+    else:
+        marker_predicate = TaskWakeRegistration.source_metadata.has_key(
+            _COMPUTE_WAKE_POST_COMMIT_META_KEY
+        )
+
+    filters = [
+        TaskWakeRegistration.delivery_state == WakeDeliveryState.DELIVERED,
+        TaskWakeRegistration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        marker_predicate,
+    ]
+    if project_id is not None:
+        filters.append(TaskWakeRegistration.project_id == project_id)
+
+    stuck_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(TaskWakeRegistration)
+            .where(*filters)
+        )
+    ).scalar() or 0
+
+    return {"stuck_count": int(stuck_count)}
+
+
 def _coerce_count(value: Any) -> "int | None":
     """Best-effort int coercion for a JSONB tally value; ``None`` when the value
     is missing or non-numeric. Lives outside the aggregation loop so the
