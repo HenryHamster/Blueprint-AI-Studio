@@ -67,6 +67,19 @@ runtime_config: Dict = {
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.
     "review_second_opinion_gate_enabled": True,
+    # Rollout mode for binding agent-authored direction retirement to the
+    # strategic judgment challenge's per-direction second opinion.
+    #   observe  — compute/record verdict, never block
+    #   advisory — compute/record a prominent warning, never block
+    #   enforce  — unsupported/missing/invalid challenge defers fail-closed
+    # Ships observe by default so operators can inspect challenge quality before
+    # selecting enforce via runtime config.
+    "strategic_retirement_challenge_gate_mode": os.getenv(
+        "STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe"
+    ).lower()
+    if os.getenv("STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe").lower()
+    in ("observe", "advisory", "enforce")
+    else "observe",
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
@@ -392,6 +405,17 @@ runtime_config: Dict = {
     # spawn rate so narrowing direction count does not throttle the agent's own
     # decision cadence. 0 disables the fallback. Cooldown still gates duplicates.
     "strategic_max_interval_minutes": 180,
+    # Gate mode for the strategic evidence-progress challenge. Three values:
+    #   "enforce"  — fail-closed (default, current behavior): a suppressing
+    #                evidence-progress verdict is ignored when the challenge did
+    #                not approve it, keeping the deterministic scaffolding detector
+    #                active.
+    #   "advisory" — record-and-warn: the gate would have blocked but does not;
+    #                a warning is logged and gate_would_block is stamped on the
+    #                persisted verdict so operators can calibrate before enforcing.
+    #   "observe"  — record-only: the gate would-block decision is stamped but
+    #                suppression is always allowed; no warning is emitted.
+    "strategic_challenge_gate_mode": "enforce",
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     # Budget on the strategist's autonomous spawn_task path (research / plan /
     # web_research / design tasks created directly from a strategic review). Each
@@ -1058,6 +1082,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "strategic_max_interval_minutes",
                         int(config_json["strategic_max_interval_minutes"]),
                     )
+                if "strategic_challenge_gate_mode" in config_json:
+                    raw_mode = str(
+                        config_json["strategic_challenge_gate_mode"]
+                    ).strip().lower()
+                    if raw_mode in {"observe", "advisory", "enforce"}:
+                        _set("strategic_challenge_gate_mode", raw_mode)
                 if "require_approval_gates" in config_json:
                     _set(
                         "require_approval_gates",
@@ -1103,6 +1133,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_second_opinion_gate_enabled",
                         bool(config_json["review_second_opinion_gate_enabled"]),
                     )
+                if "strategic_retirement_challenge_gate_mode" in config_json:
+                    raw_mode = str(
+                        config_json["strategic_retirement_challenge_gate_mode"] or ""
+                    ).strip().lower()
+                    if raw_mode in ("observe", "advisory", "enforce"):
+                        _set("strategic_retirement_challenge_gate_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",

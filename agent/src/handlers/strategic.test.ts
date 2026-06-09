@@ -47,6 +47,7 @@ const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
     challenge_version: 1,
     status: 'ok' as const,
     evidence_progress: [] as Array<{ direction_id: string; status: string; verdict: string; rationale: string }>,
+    retirement_approvals: [] as Array<{ direction_id: string; verdict: string; rationale: string }>,
     retirement_critique_quality: { verdict: 'solid', rationale: '' },
     portfolio_shape_risk: { verdict: 'low', rationale: '' },
   },
@@ -64,12 +65,17 @@ vi.mock('./strategic-helpers.js', () => ({
   buildStrategicChallengeExecutorSection: (record: {
     status: string;
     evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
+    retirement_approvals?: Array<{ direction_id: string; verdict: string }>;
   }) => {
     const approved = record.evidence_progress
       .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
       .map(e => `${e.direction_id}:${e.status}`)
       .join(',');
-    return `CHALLENGE_SECTION(status=${record.status};approved=${approved})`;
+    const retirementApproved = (record.retirement_approvals || [])
+      .filter(r => r.verdict === 'approved')
+      .map(r => r.direction_id)
+      .join(',');
+    return `CHALLENGE_SECTION(status=${record.status};approved=${approved};retirements=${retirementApproved})`;
   },
 }));
 
@@ -464,7 +470,7 @@ describe('handleStrategic strategic challenge gate', () => {
     // The executor prompt carries the challenge section (only the APPROVED
     // advancing/met pair, d-7) plus the evidence-progress gate instruction.
     const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
-    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=d-7:advancing)');
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=d-7:advancing;retirements=)');
     expect(executorPrompt).toContain('Challenge gate');
     expect(executorPrompt).toContain('the independent challenge APPROVED');
   });
@@ -502,7 +508,37 @@ describe('handleStrategic strategic challenge gate', () => {
     // A blocked challenge approves nothing — the executor prompt must say so and
     // list no approved pairs.
     const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
-    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=blocked;approved=)');
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=blocked;approved=;retirements=)');
+  });
+
+  it('executor prompt carries retirement gate section wired from challenge record', async () => {
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+
+    const challengeWithRetirement = {
+      ...DEFAULT_CHALLENGE_RECORD,
+      retirement_approvals: [
+        { direction_id: 'd-30', verdict: 'approved', rationale: 'real pattern' },
+        { direction_id: 'd-31', verdict: 'rejected', rationale: 'shallow' },
+      ],
+    };
+    vi.mocked(runStrategicChallenge).mockResolvedValueOnce(
+      challengeWithRetirement as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
+    );
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    await handleStrategic(
+      'task-ret-gate', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    // Mock echoes only approved retirements (d-30, not d-31).
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=;retirements=d-30)');
+    // Static executor instruction mentions deferred response handling.
+    expect(executorPrompt).toContain('"status": "deferred"');
+    expect(executorPrompt).toContain('SOFT NON-ERROR OUTCOME');
   });
 
   it('fails closed when challenge persistence fails before executor', async () => {

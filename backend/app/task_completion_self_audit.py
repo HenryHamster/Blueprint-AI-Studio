@@ -38,6 +38,33 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Context key written by _handle_self_audit_completion; stores a bounded
+# per-direction record of what the propagation pass decided and why.
+SELF_AUDIT_PROPAGATION_RECORD_KEY = "self_audit_propagation_record"
+_PROPAGATION_RECORD_MAX_ENTRIES = 200
+
+
+def _record_skipped_propagation_note(
+    direction: dict, proposed_mode: str, reason: str
+) -> None:
+    """Append a bounded note when self-audit propagation is skipped for a direction.
+
+    Records what mode was proposed and why propagation was skipped so the decision
+    is visible in the task record and to operators rather than silently dropped.
+    """
+    notes = list(direction.get("notes") or [])
+    notes.append(
+        {
+            "text": (
+                f"Self-audit propagation skipped: proposed mode '{proposed_mode}' — {reason}"
+            ),
+            "source": "self_audit_skip",
+            "proposed_mode": proposed_mode,
+            "created_at": _utcnow().isoformat(),
+        }
+    )
+    direction["notes"] = notes
+
 
 def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> None:
     """Append an explanatory note to a direction dict when its mode is auto-cleared.
@@ -395,6 +422,7 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
             propagation_inputs.append((mode, system_id, consecutive_ship_count))
 
     if project and propagation_inputs:
+        effect_entries: List[Dict[str, Any]] = []
 
         def _propagate_modes(directions: List[Dict[str, Any]]):
             for mode_, system_id_, csc_ in propagation_inputs:
@@ -406,8 +434,50 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                             or d.get("system_id") != system_id_
                         ):
                             continue
+                        direction_id = d.get("id")
                         if _is_recent_strategic_mode_lock(d, mode_, now_):
+                            effect_entries.append(
+                                {
+                                    "system_id": system_id_,
+                                    "direction_id": direction_id,
+                                    "proposed_mode": mode_,
+                                    "outcome": "skipped",
+                                    "reason": "recent stricter strategic mode lock",
+                                }
+                            )
                             continue
+                        # Operator-pin guard: if the direction already has a mode
+                        # whose source is not one of the auto sources (self_audit,
+                        # strategic), treat it as a manual operator pin and never
+                        # overwrite it — mirroring the auto-clear protection.
+                        existing_meta = d.get(RECOMMENDED_MODE_META_KEY) or {}
+                        existing_mode = d.get("recommended_mode")
+                        if existing_mode is not None:
+                            existing_source = (
+                                existing_meta.get("source")
+                                if isinstance(existing_meta, dict)
+                                else None
+                            )
+                            _auto_sources = {
+                                RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                                RECOMMENDED_MODE_SOURCE_STRATEGIC,
+                            }
+                            if existing_source not in _auto_sources:
+                                _record_skipped_propagation_note(
+                                    d,
+                                    mode_,
+                                    "direction mode is operator-pinned and protected from auto propagation",
+                                )
+                                effect_entries.append(
+                                    {
+                                        "system_id": system_id_,
+                                        "direction_id": direction_id,
+                                        "proposed_mode": mode_,
+                                        "outcome": "skipped",
+                                        "reason": "operator-pinned mode",
+                                    }
+                                )
+                                continue
                         d["recommended_mode"] = mode_
                         d[RECOMMENDED_MODE_META_KEY] = {
                             "mode": mode_,
@@ -415,16 +485,58 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                             "source_task_id": str(task.id),
                             "set_at": now_.isoformat(),
                         }
+                        effect_entries.append(
+                            {
+                                "system_id": system_id_,
+                                "direction_id": direction_id,
+                                "proposed_mode": mode_,
+                                "outcome": "applied",
+                                "reason": None,
+                            }
+                        )
                 elif mode_ == "ship":
-                    _maybe_auto_clear_direction_mode(
+                    cleared = _maybe_auto_clear_direction_mode(
                         directions, system_id_, csc_, str(task.id), now_
                     )
+                    for d in directions:
+                        if (
+                            d.get("status") != "active"
+                            or d.get("system_id") != system_id_
+                        ):
+                            continue
+                        direction_id = d.get("id")
+                        if cleared:
+                            effect_entries.append(
+                                {
+                                    "system_id": system_id_,
+                                    "direction_id": direction_id,
+                                    "proposed_mode": mode_,
+                                    "outcome": "cleared",
+                                    "reason": f"auto-cleared after {csc_} consecutive ship assessments",
+                                }
+                            )
+                        else:
+                            effect_entries.append(
+                                {
+                                    "system_id": system_id_,
+                                    "direction_id": direction_id,
+                                    "proposed_mode": mode_,
+                                    "outcome": "skipped",
+                                    "reason": f"ship assessment below threshold ({csc_} < {_SHIP_RECOVERY_THRESHOLD}) or mode not auto-clearable",
+                                }
+                            )
             return None
 
         # Drop the cached directions snapshot (expire_on_commit=False) so the
         # helper reads the row fresh under the lock.
         session.expire(project, ["directions"])
         await with_directions_locked(session, task.project_id, _propagate_modes)
+
+        # Store a bounded propagation record in task.context for operator/debug visibility.
+        ctx = dict(task.context or {})
+        ctx[SELF_AUDIT_PROPAGATION_RECORD_KEY] = effect_entries[:_PROPAGATION_RECORD_MAX_ENTRIES]
+        task.context = ctx
+        flag_modified(task, "context")
 
     summary = f"Self audit ingested {upserted} system(s)"
     if dropped:

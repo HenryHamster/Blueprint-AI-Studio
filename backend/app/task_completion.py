@@ -3268,10 +3268,12 @@ async def _try_recover_memo_from_parse_failure(
 from app.task_completion_self_audit import (  # noqa: E402,F401
     _AUDIT_CLEARABLE_MODES,
     _MODE_STRICTNESS,
+    _PROPAGATION_RECORD_MAX_ENTRIES,
     _SELF_AUDIT_COMPONENT_KEYS,
     _SELF_AUDIT_PROPAGATED_MODES,
     _SHIP_RECOVERY_THRESHOLD,
     _VALID_SELF_AUDIT_MODES,
+    SELF_AUDIT_PROPAGATION_RECORD_KEY,
     _handle_self_audit_completion,
     _is_recent_strategic_mode_lock,
     _maybe_auto_clear_direction_mode,

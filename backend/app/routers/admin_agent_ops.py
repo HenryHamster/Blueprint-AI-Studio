@@ -55,8 +55,11 @@ from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
+    STRATEGIC_CHALLENGE_CONTEXT_KEY,
+    challenge_approves_retirement,
     spawn_budget_status,
     spawn_title_is_redundant,
+    strategic_retirement_challenge_gate_mode,
 )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
@@ -677,6 +680,62 @@ async def strategic_operation(
             running_update_changed=running_update_changed,
         )
 
+    async def _challenge_gate(
+        op: str,
+        *,
+        direction_id: str | None = None,
+        text: str | None = None,
+    ) -> dict | None:
+        """Consult the stored strategic-judgment challenge for this portfolio op.
+
+        Hard-blocked portfolio mutations only proceed when the stored challenge
+        is explicitly ok and contains a matching verdict; absent challenge
+        context still behaves like the pre-gate legacy path.
+        """
+        from app.strategic_completion import (
+            STRATEGIC_CHALLENGE_CONTEXT_KEY,
+            challenge_rejects_portfolio_op,
+            portfolio_op_challenge_verdict,
+        )
+
+        record = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
+        blocked, why = challenge_rejects_portfolio_op(
+            record, op, direction_id=direction_id, text=text
+        )
+        if blocked:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            reason = f"Strategic challenge rejected this {op}"
+            if why:
+                reason = f"{reason}: {why}"
+            logger.info(
+                "[STRATEGIC API] Challenge HARD-BLOCKED %s (direction=%s) for "
+                "project %s",
+                op,
+                direction_id,
+                project.id,
+            )
+            body: dict = {"status": "blocked", "op": op, "reason": reason}
+            if direction_id:
+                body["direction_id"] = direction_id
+            return _resp(body)
+        item = portfolio_op_challenge_verdict(
+            record, op, direction_id=direction_id, text=text
+        )
+        if item and str(item.get("verdict", "")).strip().lower() in (
+            "warned",
+            "uncertain",
+        ):
+            note = str(item.get("rationale", "")).strip()
+            advisory = f"Strategic challenge flagged this {op} as advisory"
+            if note:
+                advisory = f"{advisory}: {note}"
+            warnings.append(advisory)
+        return None
+
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
             raise HTTPException(
@@ -794,6 +853,9 @@ async def strategic_operation(
                 status_code=400,
                 detail="success_evidence and retirement_condition are required for direction creation",
             )
+        _blk = await _challenge_gate("create_direction", text=text)
+        if _blk is not None:
+            return _blk
         # Atomic create-staged: when ``staged`` is set, the direction is born in
         # the "staged" state stamped to the CURRENT open version — identical
         # resolution semantics to ``stage_direction`` — so a next-version idea
@@ -1000,6 +1062,12 @@ async def strategic_operation(
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
+        # Second hard gate: any direction update is a portfolio-shape mutation.
+        # The challenger verdict is keyed by direction_id, so a rejection blocks
+        # all direction-field changes, not just status flips.
+        _blk = await _challenge_gate("update_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
         directions = list(project.directions or [])
         updated = False
         for d in directions:
@@ -1189,34 +1257,157 @@ async def strategic_operation(
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
+        now_iso = _utcnow().isoformat()
+        ctx = task.context or {}
+        challenge_record = ctx.get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
+        gate_mode = strategic_retirement_challenge_gate_mode()
+        challenge_approved = challenge_approves_retirement(challenge_record, dir_id)
+
+        challenge_status = "missing"
+        challenge_verdict = "missing"
+        challenge_rationale = ""
+        if isinstance(challenge_record, dict):
+            challenge_status = str(
+                challenge_record.get("status", "invalid") or "invalid"
+            ).strip().lower()
+            challenge_verdict = "missing_approval"
+            for item in challenge_record.get("retirement_approvals") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("direction_id", "")).strip() != str(dir_id).strip():
+                    continue
+                challenge_verdict = str(
+                    item.get("verdict", "missing") or "missing"
+                ).strip().lower()
+                challenge_rationale = str(item.get("rationale", "")).strip()[
+                    :STRATEGIC_RATIONALE_MAX
+                ]
+                break
+
+        if challenge_approved:
+            gate_reason = "retirement second opinion approved"
+        elif challenge_status != "ok":
+            gate_reason = (
+                f"retirement second opinion unavailable or non-ok "
+                f"(challenge_status={challenge_status})"
+            )
+        else:
+            gate_reason = (
+                f"retirement second opinion did not approve "
+                f"(verdict={challenge_verdict})"
+            )
+        gate_audit = {
+            "direction_id": str(dir_id),
+            "mode": gate_mode,
+            "approved": challenge_approved,
+            "challenge_status": challenge_status,
+            "verdict": challenge_verdict,
+            "rationale": challenge_rationale,
+            "reason": gate_reason[:STRATEGIC_RATIONALE_MAX],
+            "recorded_at": now_iso,
+        }
         directions = list(project.directions or [])
-        retired = False
+        matched_direction = None
         for d in directions:
             if d.get("id") == dir_id:
-                d["status"] = "expired"
-                notes = d.get("notes", [])
-                notes.append(
-                    {
-                        "text": f"Retired by strategic review: {rationale}",
-                        "added_at": _utcnow().isoformat(),
-                    }
-                )
-                d["notes"] = _cap_list(
-                    notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
-                )
-                retired = True
+                matched_direction = d
                 break
-        if not retired:
+        if matched_direction is None:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        _blk = await _challenge_gate("retire_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
+
+        if not challenge_approved and gate_mode == "enforce":
+            notes = matched_direction.get("notes", [])
+            notes.append(
+                {
+                    "text": f"Strategic retirement deferred: {gate_reason}",
+                    "added_at": now_iso,
+                }
+            )
+            matched_direction["notes"] = _cap_list(
+                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+            )
+            _d = directions
+            await _with_directions_locked(session, project.id, lambda _: _d)
+            verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
+            verdicts.append(gate_audit)
+            deferrals = list(ctx.get("_strategic_retirement_deferrals", []))
+            deferrals.append(gate_audit)
+            task.context = {
+                **ctx,
+                "_strategic_api_called": True,
+                "_strategic_retirement_gate_verdicts": _cap_list(
+                    verdicts,
+                    STRATEGIC_NOTES_HISTORY_MAX,
+                    "_strategic_retirement_gate_verdicts",
+                    warnings,
+                ),
+                "_strategic_retirement_deferrals": _cap_list(
+                    deferrals,
+                    STRATEGIC_NOTES_HISTORY_MAX,
+                    "_strategic_retirement_deferrals",
+                    warnings,
+                ),
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            await _emit_updated(
+                STRATEGIC_KIND_DIRECTIONS,
+                changed_direction_ids=[dir_id],
+                changed_count=1,
+            )
+            logger.info(
+                "[STRATEGIC API] Deferred retirement for direction %s: %s",
+                dir_id,
+                gate_reason,
+            )
+            return _resp(
+                {
+                    "status": "deferred",
+                    "op": "retire_direction",
+                    "direction_id": dir_id,
+                    "reason": gate_reason,
+                    "gate_mode": gate_mode,
+                    "challenge_status": challenge_status,
+                    "challenge_verdict": challenge_verdict,
+                }
+            )
+
+        if not challenge_approved and gate_mode == "advisory":
+            warnings.append(
+                f"Retirement challenge did not support direction {dir_id}; "
+                "advisory mode committed the retirement anyway"
+            )
+        matched_direction["status"] = "expired"
+        notes = matched_direction.get("notes", [])
+        notes.append(
+            {
+                "text": f"Retired by strategic review: {rationale}",
+                "added_at": now_iso,
+            }
+        )
+        matched_direction["notes"] = _cap_list(
+            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+        )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
-        ctx = task.context or {}
+        verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
+        verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
         retired_ids.append(dir_id)
         task.context = {
             **ctx,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
             "_strategic_retired_ids": retired_ids,
+            "_strategic_retirement_gate_verdicts": _cap_list(
+                verdicts,
+                STRATEGIC_NOTES_HISTORY_MAX,
+                "_strategic_retirement_gate_verdicts",
+                warnings,
+            ),
         }
         flag_modified(task, "context")
         session.add(task)
@@ -1268,6 +1459,13 @@ async def strategic_operation(
         from app.release_version import current_open_version
 
         open_version = await current_open_version(session, project.id)
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        _blk = await _challenge_gate("stage_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
         if open_version is None:
             # No open version to gate against — staging would have no target to
             # auto-activate at, so surface a 409 rather than stranding the work.
@@ -1286,10 +1484,6 @@ async def strategic_operation(
                 status_code=409,
             )
         staged_for_version = open_version.version_number
-        directions = list(project.directions or [])
-        target = next((d for d in directions if d.get("id") == dir_id), None)
-        if not target:
-            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
         target["status"] = "staged"
         target["staged_for_version"] = staged_for_version
         target["staged_at"] = _utcnow().isoformat()
@@ -1362,6 +1556,9 @@ async def strategic_operation(
                 ),
                 status_code=409,
             )
+        _blk = await _challenge_gate("approve_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
         active_count = sum(1 for d in directions if d.get("status") == "active")
         max_active = _runtime_config.get("max_active_directions", 5)
         if active_count >= max_active:
@@ -1443,6 +1640,9 @@ async def strategic_operation(
                 ),
                 status_code=409,
             )
+        _blk = await _challenge_gate("reject_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
         rejected_text = (target.get("text") or "")[:200].strip()
         remaining = [d for d in directions if d.get("id") != dir_id]
         if rejected_text:
@@ -2348,7 +2548,6 @@ async def strategic_operation(
         # masquerade as a successful strategic mutation and suppress the no-op /
         # failure circuit-breaker. Mirrors the cite_memos rationale above.
         from app.strategic_completion import (
-            STRATEGIC_CHALLENGE_CONTEXT_KEY,
             sanitize_strategic_challenge_record,
         )
 
@@ -2358,7 +2557,8 @@ async def strategic_operation(
                 status_code=400,
                 detail=(
                     "set_strategic_challenge: data must be an object with optional "
-                    "evidence_progress / retirement_critiques / portfolio_shape lists"
+                    "evidence_progress / retirement_approvals / "
+                    "retirement_critiques / portfolio_shape / portfolio_operations lists"
                 ),
             )
         ctx = task.context or {}
@@ -2370,15 +2570,21 @@ async def strategic_operation(
         session.add(task)
         await session.commit()
         ep_n = len(record.get("evidence_progress", []))
+        ra_n = len(record.get("retirement_approvals", []))
         rc_n = 1 if "retirement_critique_quality" in record else 0
         ps_n = 1 if "portfolio_shape_risk" in record else 0
+        po_n = len(record.get("portfolio_operations", []))
         logger.info(
             "[STRATEGIC API] Stored strategic judgment challenge for task %s "
-            "(evidence_progress=%d, retirement_critique_quality=%d, portfolio_shape_risk=%d)",
+            "(evidence_progress=%d, retirement_approvals=%d, "
+            "retirement_critique_quality=%d, portfolio_shape_risk=%d, "
+            "portfolio_operations=%d)",
             task.id,
             ep_n,
+            ra_n,
             rc_n,
             ps_n,
+            po_n,
         )
         version = record.get("challenge_version", record.get("version"))
         return _resp(
@@ -2389,6 +2595,7 @@ async def strategic_operation(
                 "challenge_version": version,
                 "challenge_status": record.get("status"),
                 "evidence_progress_count": ep_n,
+                "retirement_approvals_count": ra_n,
                 "retirement_critique_quality_count": rc_n,
                 "portfolio_shape_risk_count": ps_n,
             }
