@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Module mocks (mirror audits.test.ts) ─────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
@@ -102,6 +103,7 @@ import {
 } from '../index.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-chal-1';
@@ -337,5 +339,33 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('release_audit_challenge_unparseable');
+  });
+
+  it('self-repair records audit_challenge schema telemetry and pins output basename', async () => {
+    // Force the repair path: readHandlerOutput returns null, first run has no JSON,
+    // repair run returns valid JSON → exercises all three schema-dimensioned telemetry calls.
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'no json here', lastResultText: 'no json either' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }),
+      });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // readHandlerOutput must use the live artifact basename (not a _REPORT variant)
+    expectCalledWith(readHandlerOutput, TASK_ID, 'release_audit_challenge', WS);
+
+    // All three schema-dimensioned telemetry calls must carry 'audit_challenge'
+    expectCalledWith(recordFormatMiss, expect.any(String), 'audit_challenge');
+    expectCalledWith(recordFormatRepairAttempt, 'audit_challenge');
+    expectCalledWith(recordFormatRepairSuccess, 'audit_challenge');
+
+    // Successful repair must emit the correct artifact type
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.artifact_type).toBe('RELEASE_AUDIT_CHALLENGE');
+    expect(call.status).toBe('COMPLETED');
   });
 });

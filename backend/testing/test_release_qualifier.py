@@ -2232,6 +2232,8 @@ class TestChallengedVsUnchallengedTelemetry:
         self,
         *,
         challenged: bool = False,
+        candidate_sha: str = "feed" * 10,
+        challenged_candidate_sha: str | None = None,
         reported_agreement: str | None = "agree",
         excluded_findings_count: int = 0,
         would_promote: bool = False,
@@ -2249,6 +2251,7 @@ class TestChallengedVsUnchallengedTelemetry:
                 "status": "available",
                 "reported_agreement": reported_agreement,
                 "challenge_severity": "low",
+                "challenged_candidate_sha": challenged_candidate_sha or candidate_sha,
             }
         else:
             recon["audit_challenge"] = {
@@ -2257,6 +2260,7 @@ class TestChallengedVsUnchallengedTelemetry:
                 "reported_agreement": None,
             }
         return {
+            "candidate_sha": candidate_sha,
             "audit_reconciliation": recon,
             "would_promote": would_promote,
             "terminal_status": terminal_status,
@@ -2428,6 +2432,186 @@ class TestChallengedVsUnchallengedTelemetry:
         assert ch["wrong_decision_rate"] is None
         assert ch["wrong_decision_resolved_sample"] == 0
 
+    def test_challenge_refuted_rate_distinct_from_exclusion(self):
+        """challenge_refuted_count/rate aggregates challenger refuted_count from
+        audit_challenge; it is distinct from exclusion_rate and does NOT perturb it.
+
+        This is the required acceptance test: real merge-test verdict shape with
+        refuted_count > 0, asserting challenge_refuted_rate is set correctly and
+        exclusion_rate is unchanged.
+        """
+        # 3 challenged verdicts with binding synthesis shape (as produced by
+        # _compute_challenge_synthesis_from_binding_verdicts after a real merge-test).
+        # Verdict A: 1 refuted, 0 excluded
+        # Verdict B: 2 refuted, 1 excluded
+        # Verdict C: 0 refuted, 0 excluded
+        # Total refuted = 3, n = 3 → challenge_refuted_rate = 1.0
+        # exclusion_count = 1 (only B has excluded_findings_count > 0) → exclusion_rate = 1/3
+        def _make_binding_verdict(refuted_count, excluded_findings_count, sha="abc1234"):
+            return {
+                "candidate_sha": sha,
+                "audit_reconciliation": {
+                    "model_reported_score": 1.0,
+                    "findings_derived_score": 1.0,
+                    "score_delta": 0.0,
+                    "excluded_findings_count": excluded_findings_count,
+                    "audit_challenge": {
+                        "status": "available",
+                        "binding": True,
+                        "confirmed_count": 1,
+                        "refuted_count": refuted_count,
+                        "uncertain_count": 0,
+                        "reported_agreement": "agree" if refuted_count == 0 else "partial",
+                        "challenged_candidate_sha": sha,
+                    },
+                },
+                "would_promote": True,
+                "terminal_status": "not_promoted",
+                "post_promotion_outcome": None,
+                "excluded_audit_findings": None,
+            }
+
+        verdicts = [
+            _make_binding_verdict(refuted_count=1, excluded_findings_count=0),
+            _make_binding_verdict(refuted_count=2, excluded_findings_count=1),
+            _make_binding_verdict(refuted_count=0, excluded_findings_count=0),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+
+        assert ch["insufficient_sample"] is False
+        assert ch["sample_size"] == 3
+
+        # challenge_refuted_count/rate: sum of refuted_count across challenged verdicts
+        assert ch["challenge_refuted_count"] == 3
+        assert ch["challenge_refuted_rate"] == pytest.approx(3 / 3, abs=1e-4)
+
+        # exclusion_rate is driven by excluded_findings_count, not refuted_count
+        assert ch["exclusion_count"] == 1
+        assert ch["exclusion_rate"] == pytest.approx(1 / 3, abs=1e-4)
+
+        # Rates are distinct — exclusion_rate != challenge_refuted_rate
+        assert ch["exclusion_rate"] != ch["challenge_refuted_rate"]
+
+        # Unchallenged cohort has no challenge_refuted fields
+        assert "challenge_refuted_count" not in result["unchallenged"]
+        assert "challenge_refuted_rate" not in result["unchallenged"]
+
+    def test_challenge_refuted_rate_zero_when_no_refuted(self):
+        """challenge_refuted_rate is 0.0 when all challenged verdicts have refuted_count=0."""
+        verdicts = [
+            {
+                "candidate_sha": f"sha{i:04d}",
+                "audit_reconciliation": {
+                    "excluded_findings_count": 0,
+                    "audit_challenge": {
+                        "status": "available",
+                        "confirmed_count": 1,
+                        "refuted_count": 0,
+                        "reported_agreement": "agree",
+                        "challenged_candidate_sha": f"sha{i:04d}",
+                    },
+                },
+                "would_promote": False,
+                "terminal_status": "not_promoted",
+                "post_promotion_outcome": None,
+                "excluded_audit_findings": None,
+            }
+            for i in range(3)
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+        assert ch["challenge_refuted_count"] == 0
+        assert ch["challenge_refuted_rate"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_challenge_refuted_rate_absent_on_insufficient_sample(self):
+        """challenge_refuted_count/rate are absent when cohort is insufficient_sample."""
+        verdicts = [self._make_verdict(challenged=True)]  # only 1, below min sample
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["insufficient_sample"] is True
+        assert "challenge_refuted_count" not in result["challenged"]
+        assert "challenge_refuted_rate" not in result["challenged"]
+
+    def test_available_challenge_with_mismatched_sha_goes_unchallenged(self):
+        verdicts = [
+            self._make_verdict(
+                challenged=True,
+                candidate_sha="feed" * 10,
+                challenged_candidate_sha="beef" * 10,
+            ),
+            self._make_verdict(challenged=False),
+            self._make_verdict(challenged=False),
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["sample_size"] == 0
+        assert result["unchallenged"]["sample_size"] == 3
+
+    def test_available_challenge_without_explicit_sha_stays_challenged(self):
+        """Legacy binding challenge blobs without challenged_candidate_sha still count.
+
+        The qualifier now treats an omitted challenged SHA as the current candidate
+        rather than forcing a false mismatch, so older binding artifacts remain
+        visible in the challenged cohort.
+        """
+        verdicts = [
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_reconciliation": {
+                    "audit_challenge": {
+                        "status": "available",
+                        "reported_agreement": "agree",
+                        "confirmed_count": 1,
+                        "refuted_count": 0,
+                        "uncertain_count": 0,
+                    }
+                },
+                "would_promote": False,
+                "terminal_status": "not_promoted",
+                "post_promotion_outcome": None,
+                "excluded_audit_findings": None,
+            }
+            for _ in range(3)
+        ]
+        result = rq.compute_challenged_vs_unchallenged_telemetry(verdicts)
+        assert result["challenged"]["sample_size"] == 3
+        assert result["unchallenged"]["sample_size"] == 0
+
+
+def test_challenge_synthesis_rejects_mismatched_sha_and_counts_uncertain_as_non_agreement():
+    candidate_sha = "feed" * 10
+    mismatched = rq._compute_challenge_synthesis_from_binding_verdicts(
+        {"findings": []},
+        {
+            "challenged_candidate_sha": "beef" * 10,
+            "verdicts": [
+                {
+                    "finding_title": "Merge-test candidate mismatch",
+                    "verdict": "confirmed",
+                }
+            ],
+        },
+        candidate_sha=candidate_sha,
+    )
+    assert mismatched["status"] == "unavailable"
+    assert mismatched["reason"] == "audit_challenge_sha_mismatch"
+
+    uncertain_only = rq._compute_challenge_synthesis_from_binding_verdicts(
+        {"findings": []},
+        {
+            "challenged_candidate_sha": candidate_sha,
+            "verdicts": [
+                {
+                    "finding_title": "Merge-test unresolved second opinion",
+                    "verdict": "uncertain",
+                }
+            ],
+        },
+        candidate_sha=candidate_sha,
+    )
+    assert uncertain_only["status"] == "available"
+    assert uncertain_only["uncertain_count"] == 1
+    assert uncertain_only["reported_agreement"] != "agree"
+
 
 def test_challenge_telemetry_counts_binding_challenge_as_challenged():
     """Binding challenge synthesis (status=available, binding=True) lands in challenged cohort.
@@ -2447,9 +2631,11 @@ def test_challenge_telemetry_counts_binding_challenge_as_challenged():
         "refuted_count": 1,
         "uncertain_count": 0,
         "reported_agreement": "partial",
+        "challenged_candidate_sha": "feed" * 10,
     }
     verdicts = [
         {
+            "candidate_sha": "feed" * 10,
             "audit_reconciliation": {
                 "model_reported_score": 1.0,
                 "findings_derived_score": 1.0,
@@ -4496,9 +4682,7 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         smoke_logs={"passed": True},
         challenge_verdicts=[
             {
-                "finding_title": "No issue",
                 "verdict": "confirmed",
-                "rationale": "challenger agrees",
             }
         ],
     )
@@ -4514,6 +4698,7 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         f"expected 'available', got {synthesis!r}"
     )
     assert synthesis["binding"] is True
+    assert synthesis["challenged_candidate_sha"] == _candidate_sha
     assert synthesis["confirmed_count"] >= 1
 
     # The verdict row should also land in the 'challenged' telemetry cohort.
@@ -4531,6 +4716,7 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
     assert verdict.audit_reconciliation["audit_challenge"]["status"] == "available"
 
     verdict_dict = {
+        "candidate_sha": verdict.candidate_sha,
         "audit_reconciliation": verdict.audit_reconciliation,
         "would_promote": verdict.would_promote,
         "terminal_status": verdict.terminal_status,
@@ -4542,6 +4728,103 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
     # be classified into the 'challenged' bucket (not 'unchallenged').
     assert telemetry["challenged"]["sample_size"] == 1
     assert telemetry["unchallenged"]["sample_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_clean_audit_mismatched_challenge_is_unavailable_and_unchallenged(
+    db_session,
+):
+    from app import shared_state
+    from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    _candidate_sha = "feed" * 10
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={"passed": True},
+        challenge_verdicts=[
+            {
+                "finding_title": "No issue",
+                "verdict": "confirmed",
+                "rationale": "challenger agrees",
+            }
+        ],
+    )
+
+    challenge_task_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    challenge_artifact = (
+        (
+            await db_session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == challenge_task_id,
+                    Artifact.artifact_type == ArtifactType.RELEASE_AUDIT_CHALLENGE,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    challenge_artifact.logs = json.dumps(
+        {
+            "challenged_candidate_sha": "beef" * 10,
+            "verdicts": [
+                {
+                    "finding_title": "No issue",
+                    "verdict": "confirmed",
+                }
+            ],
+        }
+    )
+    db_session.add(challenge_artifact)
+    await db_session.commit()
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    synthesis = version.last_qualification["audit_reconciliation"]["audit_challenge"]
+    assert synthesis["status"] == "unavailable"
+    assert synthesis["reason"] == "audit_challenge_sha_mismatch"
+    assert synthesis["challenged_candidate_sha"] == "beef" * 10
+
+    verdict = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    telemetry = compute_challenged_vs_unchallenged_telemetry(
+        [
+            {
+                "candidate_sha": verdict.candidate_sha,
+                "audit_reconciliation": verdict.audit_reconciliation,
+                "would_promote": verdict.would_promote,
+                "terminal_status": verdict.terminal_status,
+                "post_promotion_outcome": verdict.post_promotion_outcome,
+                "excluded_audit_findings": verdict.excluded_audit_findings,
+            }
+        ]
+    )
+    assert telemetry["challenged"]["sample_size"] == 0
+    assert telemetry["unchallenged"]["sample_size"] == 1
 
 
 @pytest.mark.asyncio

@@ -859,6 +859,9 @@ function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: ChallengedV
                   {s.wrong_decision_rate != null && (
                     <span className={`text-[10px] px-1 py-0 rounded border ${s.wrong_decision_rate > 0 ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`} title={`post-promotion wrong decision rate over ${s.wrong_decision_resolved_sample ?? 0} resolved promotions`}>wrong {pct(s.wrong_decision_rate)}</span>
                   )}
+                  {s.challenge_refuted_rate != null && (
+                    <span className={`text-[10px] px-1 py-0 rounded border ${(s.challenge_refuted_rate ?? 0) > 0 ? 'bg-violet-500/10 border-violet-500/30 text-violet-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title={`challenger-refuted false positive rate — fraction of verdicts where the adversarial challenger explicitly refuted findings as false positives (${s.challenge_refuted_count ?? 0} total refuted findings)`}>refuted {pct(s.challenge_refuted_rate)}</span>
+                  )}
                 </div>
               )}
             </div>

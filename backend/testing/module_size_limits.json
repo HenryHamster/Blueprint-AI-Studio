@@ -88,7 +88,8 @@
     "knowledge_completion.py": 2100,
     "alert_dispatch.py": 1750,
     "compute_jobs.py": 1800,
-    "task_evaluators.py": 1950
+    "task_evaluators.py": 1950,
+    "release_scoring.py": 1800
   },
   "agent": {
     "index.ts": 4600,

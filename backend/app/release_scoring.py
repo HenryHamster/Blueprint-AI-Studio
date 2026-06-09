@@ -803,6 +803,7 @@ def _compute_challenge_synthesis_from_binding_verdicts(
     primary_report: dict[str, Any] | None,
     challenge_verdicts: dict[str, Any] | None,
     *,
+    candidate_sha: str | None = None,
     challenge_reason: str | None = None,
 ) -> dict[str, Any]:
     """Compute audit-challenge synthesis from the binding RELEASE_AUDIT_CHALLENGE artifact.
@@ -820,7 +821,24 @@ def _compute_challenge_synthesis_from_binding_verdicts(
             "refuted_count": 0,
             "uncertain_count": 0,
             "reported_agreement": None,
+            "challenged_candidate_sha": None,
         }
+    challenged_sha = str(
+        challenge_verdicts.get("challenged_candidate_sha") or ""
+    ).strip()
+    if candidate_sha and challenged_sha and challenged_sha != candidate_sha:
+        return {
+            "status": "unavailable",
+            "reason": "audit_challenge_sha_mismatch",
+            "binding": True,
+            "confirmed_count": 0,
+            "refuted_count": 0,
+            "uncertain_count": 0,
+            "reported_agreement": None,
+            "challenged_candidate_sha": challenged_sha or None,
+        }
+    if candidate_sha and not challenged_sha:
+        challenged_sha = candidate_sha
     verdicts_list = challenge_verdicts.get("verdicts")
     if not isinstance(verdicts_list, list):
         return {
@@ -831,6 +849,7 @@ def _compute_challenge_synthesis_from_binding_verdicts(
             "refuted_count": 0,
             "uncertain_count": 0,
             "reported_agreement": None,
+            "challenged_candidate_sha": challenged_sha or None,
         }
     confirmed = sum(
         1
@@ -849,9 +868,14 @@ def _compute_challenge_synthesis_from_binding_verdicts(
         if isinstance(v, dict) and str(v.get("verdict") or "").lower() == "uncertain"
     )
     total = confirmed + refuted + uncertain
-    if total == 0 or refuted == 0:
+    conclusive = confirmed + refuted
+    if total == 0:
+        reported_agreement = None
+    elif uncertain > 0:
+        reported_agreement = "partial"
+    elif refuted == 0 and confirmed > 0:
         reported_agreement = "agree"
-    elif refuted > total / 2:
+    elif conclusive > 0 and refuted > conclusive / 2:
         reported_agreement = "disagree"
     else:
         reported_agreement = "partial"
@@ -863,6 +887,7 @@ def _compute_challenge_synthesis_from_binding_verdicts(
         "refuted_count": refuted,
         "uncertain_count": uncertain,
         "reported_agreement": reported_agreement,
+        "challenged_candidate_sha": challenged_sha or None,
     }
 
 
@@ -1408,7 +1433,17 @@ def compute_challenged_vs_unchallenged_telemetry(
             continue
         recon = v.get("audit_reconciliation")
         challenge = recon.get("audit_challenge") if isinstance(recon, dict) else None
-        if isinstance(challenge, dict) and challenge.get("status") == "available":
+        candidate_sha = str(v.get("candidate_sha") or "").strip()
+        challenge_sha = (
+            str(challenge.get("challenged_candidate_sha") or "").strip()
+            if isinstance(challenge, dict)
+            else ""
+        )
+        if (
+            isinstance(challenge, dict)
+            and challenge.get("status") == "available"
+            and (not candidate_sha or not challenge_sha or challenge_sha == candidate_sha)
+        ):
             challenged.append(v)
         else:
             unchallenged.append(v)
@@ -1468,6 +1503,26 @@ def compute_challenged_vs_unchallenged_telemetry(
             )
             stats["disagreement_rate"] = round(disagree_count / n, 4)
             stats["disagreement_count"] = disagree_count
+
+            # challenge_refuted_count: total findings the adversarial challenger
+            # explicitly marked refuted_false_positive across all challenged verdicts.
+            # Distinct from exclusion_rate (unverified primary findings) — this is
+            # findings the challenger actively refuted, not verification-excluded ones.
+            challenge_refuted_count = sum(
+                int(
+                    v["audit_reconciliation"]["audit_challenge"].get("refuted_count")
+                    or 0
+                )
+                for v in cohort
+                if isinstance(v.get("audit_reconciliation"), dict)
+                and isinstance(
+                    v["audit_reconciliation"].get("audit_challenge"), dict
+                )
+                and v["audit_reconciliation"]["audit_challenge"].get("status")
+                == "available"
+            )
+            stats["challenge_refuted_count"] = challenge_refuted_count
+            stats["challenge_refuted_rate"] = round(challenge_refuted_count / n, 4)
 
         return stats
 

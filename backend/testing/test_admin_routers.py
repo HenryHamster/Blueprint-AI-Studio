@@ -9502,6 +9502,81 @@ class TestVersionLifecycleChallengedVsUnchallenged:
         assert tel["unchallenged"]["sample_size"] == 4
         assert "exclusion_rate" in tel["unchallenged"]
 
+    @pytest.mark.asyncio
+    async def test_challenge_refuted_count_exposed_on_challenged_cohort(
+        self, client: AsyncClient, db_session
+    ):
+        """Endpoint exposes challenge_refuted_count/rate when challenged verdicts
+        carry refuted_count in their audit_challenge synthesis."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+
+        # Seed 3 challenged verdicts with refuted_count > 0 (total refuted = 6)
+        for i in range(3):
+            v = QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=f"ref{i:04d}",
+                confidence=0.92,
+                would_promote=True,
+                promotion_enabled=False,
+                terminal_status="dry_run",
+                threshold=0.90,
+                audit_reconciliation={
+                    "audit_challenge": {
+                        "status": "available",
+                        "binding": True,
+                        "confirmed_count": 1,
+                        "refuted_count": 2,
+                        "uncertain_count": 0,
+                        "reported_agreement": "partial",
+                        "challenged_candidate_sha": f"ref{i:04d}",
+                    },
+                    "excluded_findings_count": 0,
+                },
+            )
+            db_session.add(v)
+
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        tel = resp.json()["challenged_vs_unchallenged"]
+        ch = tel["challenged"]
+        assert ch["insufficient_sample"] is False
+        assert ch["sample_size"] == 3
+        # 3 verdicts × 2 refuted_count each = 6 total refuted
+        assert ch["challenge_refuted_count"] == 6
+        assert abs(ch["challenge_refuted_rate"] - round(6 / 3, 4)) < 1e-4
+        # Unchallenged cohort absent — insufficient_sample, no challenge_refuted keys
+        assert tel["unchallenged"]["insufficient_sample"] is True
+        assert "challenge_refuted_count" not in tel["unchallenged"]
+
 
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""

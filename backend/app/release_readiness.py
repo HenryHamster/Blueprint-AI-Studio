@@ -456,6 +456,7 @@ async def get_challenged_vs_unchallenged_telemetry(
     verdicts = list((await session.execute(stmt)).scalars().all())
     verdict_dicts = [
         {
+            "candidate_sha": v.candidate_sha,
             "audit_reconciliation": v.audit_reconciliation,
             "would_promote": v.would_promote,
             "terminal_status": v.terminal_status,

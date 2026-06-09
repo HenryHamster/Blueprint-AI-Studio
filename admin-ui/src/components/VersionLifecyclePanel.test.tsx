@@ -2490,5 +2490,66 @@ describe('VersionLifecyclePanel', () => {
       const panel = screen.getByTestId('challenged-vs-unchallenged');
       expect(panel).toHaveTextContent('wrong 0%');
     });
+
+    it('renders challenge_refuted_rate chip on challenged cohort when present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 4,
+                insufficient_sample: false,
+                exclusion_rate: 0.25,
+                exclusion_count: 1,
+                disagreement_rate: 0.5,
+                disagreement_count: 2,
+                challenge_refuted_count: 6,
+                challenge_refuted_rate: 0.5,
+              },
+              unchallenged: {
+                sample_size: 4,
+                insufficient_sample: false,
+                exclusion_rate: 0.0,
+                exclusion_count: 0,
+              },
+              total_verdicts: 8,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      // challenged cohort shows refuted chip
+      expect(panel).toHaveTextContent('refuted 50%');
+      // unchallenged cohort has no challenge_refuted fields — chip absent
+      const chips = panel.querySelectorAll('span[title*="challenger-refuted"]');
+      expect(chips.length).toBe(1);
+    });
+
+    it('does not render challenge_refuted_rate chip when field is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 3,
+                insufficient_sample: false,
+                exclusion_rate: 0.0,
+                disagreement_rate: 0.0,
+              },
+              unchallenged: { sample_size: 1, insufficient_sample: true },
+              total_verdicts: 4,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      expect(panel).not.toHaveTextContent('refuted');
+    });
   });
 });
