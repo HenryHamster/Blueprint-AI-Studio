@@ -16853,6 +16853,13 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    # Keep this test focused on the back-merge commit contract; the new
+    # default-on second-opinion gate would otherwise park the review before the
+    # merge path under test runs.
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
 
     # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
     # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
@@ -19572,3 +19579,228 @@ async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
     )
     assert len(regs_after_stale) == 1, "stale callback must not create or remove registrations"
     assert regs_after_stale[0].delivery_state == reg_state_after_park
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /api/agent/tasks/{original_task_id}/reviewer-merge — self-merge path
+#
+# Automatic fresh-reviewer passes (enabled / lone-checker / incomplete-SR
+# recovery) run AFTER the primary code-change session posted its terminal
+# status. They self-merge their reviewer output back into the SAME task's
+# durable _self_review_outcome (token sub == original_task_id). See
+# agent/src/handlers/{standard,fresh-reviewer}.ts and
+# merge_operator_reviewer_findings in app/routers/agent.py.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _make_reviewer_merge_project(db_session) -> Project:
+    project = Project(name="Reviewer Merge Test", user_id="test-user-rm")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_session):
+    """A task self-merging its automatic fresh-reviewer output is authorized and
+    persists the supplied recovery origin onto _self_review_outcome and the
+    per-category check_results origin tags."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-self-merge",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Token subject == the task itself → self-merge authorization.
+    token = create_agent_token(str(task.id), "agent-vm-self-merge")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "description": "missed null check",
+                    "severity": "HIGH",
+                }
+            ],
+            "reviewer_edges_considered": [
+                {"case": "empty list", "handled": False}
+            ],
+            "reviewer_recovery_origin": "lone_checker_recovery",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["finding_count"] == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    sr = task.context["_self_review_outcome"]
+    assert len(sr["reviewer_findings"]) == 1
+    # Supplied recovery origin is stamped (not the operator default).
+    assert sr["reviewer_recovery_origin"] == "lone_checker_recovery"
+    assert sr["reviewer_edges_considered"] == [
+        {"case": "empty list", "handled": False}
+    ]
+    # The previously-passing self-attestation is overridden and tagged with the
+    # same recovery origin.
+    assert sr["check_results"]["correctness"]["passed"] is False
+    assert sr["check_results"]["correctness"]["origin"] == "lone_checker_recovery"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_self_merge_no_origin_uses_plain_reviewer(
+    client, db_session
+):
+    """A self-merge that supplies NO recovery origin (enabled path) tags findings
+    with a plain reviewer origin and leaves reviewer_recovery_origin unset — the
+    operator default must NOT leak into the self-merge path."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-self-enabled",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"security": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-self-enabled")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "security",
+                    "description": "unvalidated input",
+                    "severity": "MEDIUM",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    sr = task.context["_self_review_outcome"]
+    # No recovery origin recorded for the plain enabled path.
+    assert "reviewer_recovery_origin" not in sr
+    # A category that previously PASSED self-review → reviewer_disagreement.
+    assert sr["check_results"]["security"]["passed"] is False
+    assert sr["check_results"]["security"]["origin"] == "reviewer_disagreement"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_operator_path_no_origin_defaults_to_operator(
+    client, db_session
+):
+    """The legacy operator-requested request shape (no reviewer_recovery_origin
+    field) is byte-for-byte unchanged: it still defaults to
+    operator_requested_recovery."""
+    project = await _make_reviewer_merge_project(db_session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-orig",
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}}
+            }
+        },
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    reviewer = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "review"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-op-rev",
+        context={"operator_requested_review_for": str(original.id)},
+    )
+    db_session.add(reviewer)
+    await db_session.commit()
+    await db_session.refresh(reviewer)
+
+    token = create_agent_token(str(reviewer.id), "agent-vm-op-rev")
+    resp = await client.post(
+        f"/api/agent/tasks/{original.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "description": "missed edge case",
+                    "severity": "HIGH",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    db_session.expire_all()
+    await db_session.refresh(original)
+    sr = original.context["_self_review_outcome"]
+    assert sr["reviewer_recovery_origin"] == "operator_requested_recovery"
+    assert (
+        sr["check_results"]["correctness"]["origin"]
+        == "operator_requested_recovery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
+    """A requesting task that is neither the target itself nor an operator-scoped
+    reviewer for it is rejected with 403."""
+    project = await _make_reviewer_merge_project(db_session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-target",
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    other = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "unrelated"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-unrelated",
+        context={"operator_requested_review_for": str(uuid.uuid4())},
+    )
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    token = create_agent_token(str(other.id), "agent-vm-unrelated")
+    resp = await client.post(
+        f"/api/agent/tasks/{original.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [],
+            "reviewer_recovery_origin": "lone_checker_recovery",
+        },
+    )
+    assert resp.status_code == 403

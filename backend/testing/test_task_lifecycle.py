@@ -3484,6 +3484,12 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     the spawn must pass suppress_warm_handoff=True so no warm-target pin
     lands on the new task. We verify by patching _spawn_pipeline_task and
     asserting on the call kwargs."""
+    # This test asserts the synchronous APPROVE-CI-failure fix spawn; disable
+    # the default-on second-opinion gate so that path runs directly.
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
     # Skip rollup; we don't actually need it for this test.
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
@@ -3627,6 +3633,14 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         captured_spawn_kwargs.append(kwargs)
         return (None, False)
 
+    # This helper drives the SYNCHRONOUS verification-only-downgrade /
+    # REQUEST_CHANGES-fix mechanics. The default-on second-opinion gate would
+    # park + challenge first; disable it so the synchronous path under test runs
+    # directly (the gate-off / operator-rollback path).
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     # APPROVE-path merge cluster (only exercised when the verdict flips to
     # APPROVE on a verification-only + green-CI PR). Harmless for the
@@ -4090,6 +4104,13 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from datetime import datetime, timezone
 
+    # Asserts the synchronous APPROVE→merge path; disable the default-on
+    # second-opinion gate so the merge runs directly.
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
+
     session, factory = tl_db
     project = await _make_project(session)
 
@@ -4277,6 +4298,14 @@ def payload_for(review_task):
 
 def _patch_approve_merge_env(mocker):
     """Mocks shared by the APPROVE inline-merge tests (CI green, PR open)."""
+    # These tests assert the SYNCHRONOUS review-finalization mechanics (inline
+    # merge, dual-head guard). The default-on second-opinion gate would instead
+    # park + spawn a challenger first; disable it so the synchronous path under
+    # test runs directly (it is exactly the operator-rollback / gate-off path).
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -7817,3 +7846,444 @@ async def test_resolve_challenge_source_gone_early_return(tl_db):
 
     # Must not raise even when the source safeguard is missing from the DB.
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
+# Default-on second-opinion gate for ordinary review verdicts
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _panel_logs(overall, *, issues=None, lens_verdict=None):
+    """A full panel_review verdict JSON string (all four required lenses)."""
+    lv = lens_verdict or overall
+    return json.dumps(
+        {
+            "overall_verdict": overall,
+            "summary": "panel summary",
+            "issues": list(issues or []),
+            "lenses": {
+                "correctness": {"verdict": lv, "summary": "c", "issues": []},
+                "security": {"verdict": lv, "summary": "s", "issues": []},
+                "code_quality": {"verdict": lv, "summary": "q", "issues": []},
+                "test_coverage": {"verdict": lv, "summary": "t", "issues": []},
+            },
+        }
+    )
+
+
+async def _setup_review_gate(tl_db, mocker, *, pr_number=7777):
+    """Set up GitHub/merge mocks and an APPROVE-able review task. Returns handles."""
+    captured_spawn = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_spawn.append(kwargs)
+        return (None, False)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "deadbeef", "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+    return session, factory, project, original, review_task, merge_mock, captured_spawn
+
+
+async def _find_challenger(session, project_id, review_id):
+    """Locate the panel_review challenger spawned for review_id."""
+    from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
+
+    rows = (
+        (await session.execute(select(Task).where(Task.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+    for t in rows:
+        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_id):
+            return t
+    return None
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_gate_blocks_approve_merge_until_reconciled(tl_db, mocker):
+    """Gate-on high-stakes APPROVE parks + spawns a panel challenger, does NOT
+    merge, and merges only after a confirming reconciliation."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        _spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7777)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7777",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    # First pass: parked EVALUATING, challenger spawned, NO merge yet.
+    await session.refresh(review_task)
+    assert review_task.status == TaskStatus.EVALUATING
+    assert (review_task.context or {}).get("awaiting_review_second_opinion")
+    assert not merge_mock.called, "merge must NOT fire before reconciliation"
+
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None, "a panel_review challenger must be spawned"
+    assert challenger.first_payload.get("type") == "panel_review"
+
+    # Drive the challenger to completion with a confirming APPROVE panel verdict.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("APPROVE"),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["challenger_task_id"] == str(challenger.id)
+    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_challenge_rejected_approve_does_not_merge(tl_db, mocker):
+    """A challenge that overturns an APPROVE must NOT auto-merge."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7778)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # Challenge overturns to REQUEST_CHANGES with a concrete defect.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs(
+            "REQUEST_CHANGES",
+            issues=[{"description": "real defect", "severity": "critical"}],
+        ),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert not merge_mock.called, "overturned APPROVE must not merge"
+    # Reconciled REQUEST_CHANGES spawns a fix with the surviving issues.
+    assert captured_spawn, "overturned APPROVE must spawn a fix with surviving issues"
+    assert captured_spawn[0].get("current_issues"), "fix must carry surviving issues"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_gate_request_changes_spawns_fix_after_reconcile(
+    tl_db, mocker
+):
+    """Gate-on REQUEST_CHANGES parks, then spawns fix only after a confirming
+    reconciliation."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7779)
+
+    issues = [{"description": "off-by-one bug", "file": "app/x.py", "line": 3}]
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json=json.dumps({"verdict": "REQUEST_CHANGES", "issues": issues}),
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    assert review_task.status == TaskStatus.EVALUATING
+    assert not captured_spawn, "fix must NOT spawn before reconciliation"
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("REQUEST_CHANGES", issues=issues),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec["state"] == "challenged_confirmed"
+    assert captured_spawn, "confirmed REQUEST_CHANGES must spawn a fix"
+    assert captured_spawn[0].get("current_issues") == issues
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_challenge_rejected_request_changes_no_fix(tl_db, mocker):
+    """A challenge that overturns a REQUEST_CHANGES must NOT spawn fix work."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7780)
+
+    issues = [{"description": "questionable concern", "severity": "major"}]
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json=json.dumps({"verdict": "REQUEST_CHANGES", "issues": issues}),
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # Challenge overturns to APPROVE.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("APPROVE"),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec["state"] == "challenged_rejected"
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert not captured_spawn, "overturned REQUEST_CHANGES must not spawn fix"
+    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_unparseable_challenge_escalates(tl_db, mocker):
+    """A failed/unparseable challenge fails closed: no merge, no fix, original
+    flagged requires_approval."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7781)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # Challenge output is not a parseable panel verdict.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs="the panel crashed and produced no structured verdict",
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    await session.refresh(original)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec.get("escalated") is True
+    assert review_task.status == TaskStatus.COMPLETED
+    assert not merge_mock.called, "unparseable challenge must not merge"
+    assert not captured_spawn, "unparseable challenge must not spawn fix"
+    assert original.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker):
+    """Gate disabled → today's synchronous behavior, recorded as unchallenged."""
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7782)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is None, "gate-off must not spawn a challenger"
+    assert merge_mock.called, "gate-off must merge synchronously"
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec["state"] == "unchallenged"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
+    """Single-shot guard: a second finalize while a challenge is in flight does
+    not spawn a second challenger, and the challenger never recurses."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7783)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
+
+    # Re-finalize the still-parked review task: must NOT spawn a second challenger.
+    payload2 = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload2, _session_factory=factory)
+    challengers = [
+        t
+        for t in (
+            await session.execute(select(Task).where(Task.project_id == project.id))
+        )
+        .scalars()
+        .all()
+        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_task.id)
+    ]
+    assert len(challengers) == 1, "single-shot guard must prevent a second challenger"
+
+    # The challenger itself routes to the resolver, never re-entering the gate:
+    # completing it produces a reconciliation, not another challenger.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("APPROVE"),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+    challengers_after = [
+        t
+        for t in (
+            await session.execute(select(Task).where(Task.project_id == project.id))
+        )
+        .scalars()
+        .all()
+        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_task.id)
+    ]
+    assert len(challengers_after) == 1, "challenger must not recursively spawn the gate"

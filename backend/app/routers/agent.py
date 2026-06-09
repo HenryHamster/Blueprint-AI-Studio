@@ -289,6 +289,15 @@ async def verify_agent_token(
         "/api/agent/credentials/rotate",
         "/api/agent/next-role",
         "/api/agent/vm-heartbeat",
+    ) or (
+        # Self-merge: an automatic fresh-reviewer pass runs AFTER ./done has
+        # already posted the task's terminal status, then persists its findings
+        # back into the now-COMPLETED task's own _self_review_outcome. Treat the
+        # reviewer-merge path as terminal-task-allowed so the same VM can land
+        # that merge; the vm_instance_mismatch guard below still rejects a
+        # DIFFERENT VM replaying a leaked terminal-task token.
+        request.url.path.startswith("/api/agent/tasks/")
+        and request.url.path.endswith("/reviewer-merge")
     )
     # Issue M3 freshness check (warm-VM rev): only the warm-VM idempotent
     # paths /next-role and /vm-heartbeat carry the replay risk for terminal
@@ -4212,10 +4221,26 @@ async def spawn_subtask(
 # which stays here.
 
 
+# Recognized recovery-origin flavors an agent may stamp on a merged SR outcome.
+# When an agent omits ``reviewer_recovery_origin`` the operator-requested path
+# defaults to ``operator_requested_recovery`` (byte-for-byte legacy behavior);
+# a self-merge from the enabled (non-recovery) path leaves no recovery origin.
+_VALID_REVIEWER_RECOVERY_ORIGINS = frozenset(
+    {
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    }
+)
+
+
 class ReviewerMergeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     reviewer_findings: list[dict]
     reviewer_edges_considered: list[dict] = []
+    # Optional recovery-origin flavor the agent computed in-VM. Absent for the
+    # legacy operator-requested request shape (defaults preserve that path).
+    reviewer_recovery_origin: str | None = None
 
 
 @router.post("/tasks/{original_task_id}/reviewer-merge")
@@ -4227,7 +4252,19 @@ async def merge_operator_reviewer_findings(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """Merge operator-requested fresh-reviewer findings into an existing task's SR outcome."""
+    """Merge fresh-reviewer findings into an existing task's SR outcome.
+
+    Two authorization paths are accepted:
+
+    * **operator-requested** — the requesting task's
+      ``context.operator_requested_review_for`` equals the target task id (an
+      operator spawned a dedicated review task for another task's PR); and
+    * **self-merge** — the requesting task id (token ``sub``) equals the target
+      task id (a task persisting its own automatic fresh-reviewer output into
+      its ``_self_review_outcome`` after the terminal status was already posted).
+
+    Anything else is rejected with 403.
+    """
     requesting_task_id = token.get("sub")
     if not requesting_task_id:
         raise HTTPException(status_code=403, detail="No task in token")
@@ -4237,7 +4274,9 @@ async def merge_operator_reviewer_findings(
         raise HTTPException(status_code=404, detail="Requesting task not found")
 
     ctx = requesting_task.context or {}
-    if str(ctx.get("operator_requested_review_for")) != str(original_task_id):
+    is_self = str(requesting_task_id) == str(original_task_id)
+    is_operator = str(ctx.get("operator_requested_review_for")) == str(original_task_id)
+    if not (is_self or is_operator):
         raise HTTPException(
             status_code=403, detail="Not authorized for this target task"
         )
@@ -4246,10 +4285,19 @@ async def merge_operator_reviewer_findings(
     if not original_task:
         raise HTTPException(status_code=404, detail="Original task not found")
 
+    # Resolve the effective recovery origin. A request that supplies a recognized
+    # flavor wins; otherwise the operator path defaults to
+    # ``operator_requested_recovery`` (legacy behavior) and a non-operator
+    # self-merge carries no recovery origin (plain reviewer / enabled path).
+    recovery_origin = req.reviewer_recovery_origin
+    if recovery_origin not in _VALID_REVIEWER_RECOVERY_ORIGINS:
+        recovery_origin = "operator_requested_recovery" if is_operator else None
+
     orig_ctx = dict(original_task.context or {})
     sr = dict(orig_ctx.get("_self_review_outcome") or {})
     sr["reviewer_findings"] = req.reviewer_findings
-    sr["reviewer_recovery_origin"] = "operator_requested_recovery"
+    if recovery_origin:
+        sr["reviewer_recovery_origin"] = recovery_origin
 
     check_results = dict(sr.get("check_results") or {})
     for finding in req.reviewer_findings:
@@ -4257,10 +4305,16 @@ async def merge_operator_reviewer_findings(
         if cat:
             existing = check_results.get(cat)
             if not existing or existing.get("passed") is True:
+                if recovery_origin:
+                    finding_origin = recovery_origin
+                elif existing and existing.get("passed") is True:
+                    finding_origin = "reviewer_disagreement"
+                else:
+                    finding_origin = "reviewer"
                 check_results[cat] = {
                     "passed": False,
                     "issue": f"[reviewer] {finding.get('description', '')}",
-                    "origin": "operator_requested_recovery",
+                    "origin": finding_origin,
                 }
     sr["check_results"] = check_results
 

@@ -728,6 +728,17 @@ export async function handleFix(
   const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
   const fixReason = reviewLoop?.fix_reason as string | undefined;
   const taskContext = (task.context as Record<string, unknown> | undefined) || {};
+  // Challenge-reconciliation: when the backend has resolved a second-opinion
+  // challenge, it passes only the challenge-surviving issues (issues the
+  // challenger confirmed or didn't reject) so the fix agent doesn't address
+  // issues the challenge invalidated. Falls back to the raw review-history
+  // issues when absent (no challenge, or pre-challenge tasks).
+  type FixIssue = { severity: string; description: string; file?: string; line?: number };
+  const survivingIssues: FixIssue[] | undefined = Array.isArray(payload.surviving_issues)
+    ? payload.surviving_issues as FixIssue[]
+    : Array.isArray(taskContext.surviving_issues)
+      ? taskContext.surviving_issues as FixIssue[]
+      : undefined;
   const ciFailureLogs = [
     strVal(taskContext.ci_failure_logs),
     strVal(taskContext._ci_failure_logs),
@@ -750,7 +761,7 @@ export async function handleFix(
     iterationHeader += includeOriginalScope
       ? 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. You may modify files from the original task scope when fixing a flagged issue requires updating a related definition or consumer, but do NOT introduce new files outside the original scope, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n'
       : 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
-    const latestIssues = reviewHistory[reviewHistory.length - 1]?.issues || [];
+    const latestIssues = survivingIssues ?? reviewHistory[reviewHistory.length - 1]?.issues ?? [];
     const issueFiles = latestIssues.map(i => i.file).filter((f): f is string => typeof f === 'string' && f.length > 0);
     const originalScopeFiles = includeOriginalScope
       ? [
@@ -843,7 +854,7 @@ export async function handleFix(
   if (fixProjectId) writeFetchHelper(taskId, fixProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const fixFetchGuidance = fixProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const parallelFixFlag = fixProjectMetaEarly?.enable_parallel_fix === true;
-  const latestIssuesForFanOut = reviewHistory[reviewHistory.length - 1]?.issues ?? [];
+  const latestIssuesForFanOut = survivingIssues ?? reviewHistory[reviewHistory.length - 1]?.issues ?? [];
   const reviewIssueFilesForFanOut = latestIssuesForFanOut
     .map(i => i.file)
     .filter((f): f is string => typeof f === 'string' && f.length > 0);

@@ -129,6 +129,177 @@ CHALLENGE_AGREES = "agrees"
 CHALLENGE_DISAGREES = "disagrees"
 CHALLENGE_INDETERMINATE = "indeterminate"
 
+# ── Review second-opinion gate (default-on adversarial challenge) ──────────
+# Context key written on the spawned panel_review CHALLENGER task, pointing at
+# the ordinary ``review`` task whose verdict it challenges. ``_process_post_commit``
+# watches for this key to route the challenger's completion back to the parked
+# review task (re-entrant resolution, exactly like the forward-quality grader).
+REVIEW_SECOND_OPINION_SOURCE_KEY = "review_second_opinion_for_task_id"
+
+# Context key set on the parked REVIEW task while a challenge is in flight.
+# Presence (single-shot guard) means a challenger has already been spawned and
+# the primary verdict must not act until the challenge resolves.
+REVIEW_SECOND_OPINION_AWAITING_KEY = "awaiting_review_second_opinion"
+
+# Context key on the parked REVIEW task holding the primary verdict + issue set
+# captured at park time, so the re-entrant resolution can reconcile against it
+# without re-parsing the original agent output.
+REVIEW_SECOND_OPINION_PARKED_KEY = "review_second_opinion_parked"
+
+
+def review_is_high_stakes(
+    verdict: str,
+    issues: list | None,
+    investigated_files: list | None,
+    review_task: Task,
+) -> bool:
+    """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
+
+    Default-broad and fail-safe (the gate is meant to catch single-pass
+    mistakes, so it errs toward challenging):
+
+    * an APPROVE always qualifies — it hands the PR straight to the auto-merge
+      decision tree, the highest-stakes review outcome;
+    * a REQUEST_CHANGES qualifies when it carries at least one concrete defect
+      (an issue with a description) — verification-only rejections have already
+      been downgraded to APPROVE upstream, so a REQUEST_CHANGES reaching here is
+      a genuine change request — or when the reviewed change touched
+      security-critical files.
+
+    Kept as a single function so operators can narrow it (e.g. gate only
+    cross-module or critical-file PRs) without touching the lifecycle wiring.
+    """
+    if verdict == "APPROVE":
+        return True
+    if verdict == "REQUEST_CHANGES":
+        if any(
+            isinstance(i, dict) and str(i.get("description") or "").strip()
+            for i in (issues or [])
+        ):
+            return True
+        if (review_task.context or {}).get("touched_critical"):
+            return True
+    return False
+
+
+async def spawn_review_second_opinion(
+    review_task: Task,
+    session: AsyncSession,
+    *,
+    verdict: str,
+    issues: list | None,
+    feedback: str,
+    pr_number,
+    branch: str,
+    base_branch: str,
+    original_task_id: str,
+    original_prompt: str,
+    investigated_files: list | None,
+) -> Task | None:
+    """Spawn an independent ``panel_review`` challenger and park the review task.
+
+    Mirrors :func:`spawn_forward_quality_grader`: parks ``review_task`` in
+    EVALUATING with a single-shot guard, captures the primary verdict + issue
+    set under ``REVIEW_SECOND_OPINION_PARKED_KEY``, and spawns a side-car
+    ``panel_review`` task (NOT a rollup child) carrying a back-reference under
+    ``REVIEW_SECOND_OPINION_SOURCE_KEY``. The challenger's completion returns
+    through the re-entrant path (``_resolve_review_second_opinion``).
+
+    Returns the challenger ``Task``, or ``None`` when a challenge is already in
+    flight or has already resolved (single-shot — never double-spawn, and the
+    challenger itself never re-triggers the gate because its completion routes
+    to the resolver, not the review-finalization branch).
+    """
+    # Lazy import to avoid a module-level cycle with task_completion.
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    ctx = dict(review_task.context or {})
+    if (
+        ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY)
+        or ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY) is not None
+    ):
+        # Challenge already in flight or already reconciled — never double-spawn.
+        return None
+
+    challenger = Task(
+        project_id=review_task.project_id,
+        title=f"[CHALLENGE] second-opinion panel review for PR #{pr_number}",
+        description=(
+            "Independent multi-lens panel review challenging a primary "
+            "code-review verdict before it commits to merge or fix."
+        ),
+        # Side-car, not a rollup child (mirrors the grader): the back-reference
+        # lives in context, so the challenger never entangles the review task's
+        # parent-rollup accounting.
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+                "original_prompt": original_prompt,
+                "is_challenge": True,
+                "primary_verdict": verdict,
+                "primary_issues": list(issues or []),
+            }
+        ],
+        context={
+            REVIEW_SECOND_OPINION_SOURCE_KEY: str(review_task.id),
+            "pr_number": pr_number,
+            "branch": branch,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=review_task.priority,
+    )
+    session.add(challenger)
+
+    # Park the review task awaiting the challenge verdict. Overrides the
+    # COMPLETED status the orchestrator set pre-handler — the verdict is NOT
+    # final until reconciled.
+    review_task.status = TaskStatus.EVALUATING
+    review_task.latest_status_message = (
+        f"Awaiting independent second-opinion panel review before committing "
+        f"{verdict} verdict on PR #{pr_number}"
+    )[:500]
+    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = True
+    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
+        "verdict": verdict,
+        "issues": list(issues or []),
+        "feedback": (feedback or "")[:5000],
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": original_task_id,
+        "original_prompt": original_prompt,
+        "investigated_files": list(investigated_files or []),
+    }
+    review_task.context = ctx
+    flag_modified(review_task, "context")
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(challenger)
+
+    # Record the concrete challenger id for observability.
+    ctx2 = dict(review_task.context or {})
+    ctx2[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(challenger.id)
+    review_task.context = ctx2
+    flag_modified(review_task, "context")
+    session.add(review_task)
+    await session.commit()
+
+    logger.info(
+        "[REVIEW SECOND-OPINION] Spawned challenger %s for review task %s "
+        "(PR #%s, primary verdict %s); review parked EVALUATING",
+        challenger.id,
+        review_task.id,
+        pr_number,
+        verdict,
+    )
+    return challenger
+
 
 @dataclass(frozen=True)
 class EvaluationVerdict:

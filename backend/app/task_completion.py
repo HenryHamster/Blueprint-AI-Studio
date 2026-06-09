@@ -2604,6 +2604,94 @@ def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ── Review second-opinion reconciliation ──────────────────────────────────
+# Context key on the REVIEW task holding the durable reconciliation record of a
+# primary verdict against its independent panel-review challenge. Exactly one of
+# four states (see ``reconcile_review_second_opinion``):
+#   unchallenged          gate off / not high-stakes (recorded inline, never here)
+#   challenged_confirmed  challenge upholds the verdict AND the surviving issues
+#   challenged_revised    same verdict direction, surviving issue set changed
+#   challenged_rejected   challenge overturns the verdict direction
+REVIEW_SECOND_OPINION_RECONCILIATION_KEY = "review_second_opinion"
+
+
+def _review_issue_signature(issue: Any) -> str:
+    """Stable identity for a review issue, for set comparison across reviewers."""
+    if not isinstance(issue, dict):
+        return str(issue).strip().lower()
+    desc = str(issue.get("description") or "").strip().lower()
+    file = str(issue.get("file") or "").strip().lower()
+    line = str(issue.get("line") or "").strip()
+    return f"{file}:{line}:{desc}"
+
+
+def reconcile_review_second_opinion(
+    primary_verdict: str,
+    primary_issues: List[Dict[str, Any]] | None,
+    panel: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reconcile a primary review verdict against a normalized panel challenge.
+
+    ``panel`` is the output of :func:`_parse_panel_review_output` (already
+    validated to carry ``overall_verdict`` ∈ {APPROVE, REQUEST_CHANGES}).
+
+    Returns a record with exactly one of three challenge states
+    (``challenged_confirmed`` / ``challenged_revised`` / ``challenged_rejected``
+    — the fourth, ``unchallenged``, is recorded inline by the gate and never
+    reaches this function) plus the reconciled verdict and the surviving /
+    agreed issue set downstream consumers act on.
+    """
+    primary_verdict = (
+        primary_verdict if primary_verdict in ("APPROVE", "REQUEST_CHANGES") else "REQUEST_CHANGES"
+    )
+    challenge_verdict = panel.get("overall_verdict")
+    if challenge_verdict not in ("APPROVE", "REQUEST_CHANGES"):
+        # Defensive: parser guarantees one of the two, but fail toward
+        # confirming the primary rather than inventing an overturn.
+        challenge_verdict = primary_verdict
+    challenge_issues = panel.get("issues")
+    challenge_issues = challenge_issues if isinstance(challenge_issues, list) else []
+
+    if challenge_verdict != primary_verdict:
+        # Challenge overturns the verdict direction.
+        state = "challenged_rejected"
+        reconciled_verdict = challenge_verdict
+        surviving = challenge_issues if challenge_verdict == "REQUEST_CHANGES" else []
+    elif primary_verdict == "APPROVE":
+        # Both APPROVE — no blocking issue set to compare.
+        state = "challenged_confirmed"
+        reconciled_verdict = "APPROVE"
+        surviving = []
+    else:
+        # Both REQUEST_CHANGES — compare the surviving issue set.
+        primary_sigs = {_review_issue_signature(i) for i in (primary_issues or [])}
+        challenge_sigs = {_review_issue_signature(i) for i in challenge_issues}
+        reconciled_verdict = "REQUEST_CHANGES"
+        if primary_sigs and primary_sigs == challenge_sigs:
+            state = "challenged_confirmed"
+            surviving = list(primary_issues or [])
+        else:
+            # Surviving set changed: keep the primary issues the challenge still
+            # upholds (intersection); fall back to the challenge's own set, then
+            # the primary's, so the fix is never spawned with an empty issue set.
+            agreed = [
+                i
+                for i in (primary_issues or [])
+                if _review_issue_signature(i) in challenge_sigs
+            ]
+            surviving = agreed or challenge_issues or list(primary_issues or [])
+            state = "challenged_revised"
+
+    return {
+        "state": state,
+        "primary_verdict": primary_verdict,
+        "challenge_verdict": challenge_verdict,
+        "reconciled_verdict": reconciled_verdict,
+        "surviving_issues": surviving,
+        "challenge_summary": str(panel.get("summary") or "")[:2000],
+    }
+
+
 async def _handle_panel_review_completion(
     task: Task, logs: str, session: AsyncSession
 ):

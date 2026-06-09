@@ -4900,6 +4900,37 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_review_second_opinion_gate_enabled(self, client: AsyncClient):
+        """review_second_opinion_gate_enabled accepts booleans, rejects
+        non-booleans, and round-trips on GET (operator rollback for the
+        default-on second-opinion gate). Guards all four wiring points."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_second_opinion_gate_enabled"] is False
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": True},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_second_opinion_gate_enabled"] is True
+
+        bad = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_gate_enabled": "false"},
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"review_second_opinion_gate_enabled": 0}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_pool_project_allowlist_round_trip(
         self, client: AsyncClient
     ):

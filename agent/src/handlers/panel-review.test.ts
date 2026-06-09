@@ -321,4 +321,122 @@ describe('handlePanelReview', () => {
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('panel_review_lens_failed');
   });
+
+  describe('challenge mode', () => {
+    const PRIMARY_VERDICT = 'REQUEST_CHANGES';
+    const PRIMARY_ISSUES = [
+      { severity: 'critical', description: 'Missing null check on user input', file: 'src/auth.ts', line: 42 },
+      { severity: 'major', description: 'Unhandled promise rejection in handler', file: 'src/handler.ts', line: 88 },
+    ];
+
+    // Restore the full readHandlerOutput implementation before each challenge test,
+    // because a prior test (serial fallback: stops at first unusable lens) overrides
+    // it to return null for all lenses except correctness, and clearAllMocks() does
+    // not reset mock implementations — only call tracking.
+    beforeEach(() => {
+      vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
+        if (outputType === 'panel_review_lens_correctness') {
+          return { verdict: 'REQUEST_CHANGES', summary: 'A caller compatibility issue remains.', issues: [{ severity: 'major', description: 'Caller still expects the old payload shape.', file: 'agent/src/handlers/panel-review.ts', line: 120 }] };
+        }
+        if (outputType === 'panel_review_lens_security') {
+          return { verdict: 'APPROVE', summary: 'No security regressions were found.', issues: [] };
+        }
+        if (outputType === 'panel_review_lens_code_quality') {
+          return { verdict: 'APPROVE', summary: 'The workflow stays inside the existing review infrastructure.', issues: [] };
+        }
+        if (outputType === 'panel_review_lens_test_coverage') {
+          return { verdict: 'APPROVE', summary: 'Targeted tests cover the new workflow and UI rendering.', issues: [] };
+        }
+        return null;
+      });
+    });
+
+    async function runChallengeHandler() {
+      await handlePanelReview(
+        'task-challenge-1',
+        {
+          ...PAYLOAD,
+          is_challenge: true,
+          primary_verdict: PRIMARY_VERDICT,
+          primary_issues: PRIMARY_ISSUES,
+        },
+        { project_metadata: {}, playbook: {}, context: {} },
+        'gh-token',
+        'owner',
+        'repo',
+        null,
+        { value: '' },
+        'gpt-5',
+        'medium',
+      );
+    }
+
+    it('challenge run references the primary verdict and issues', async () => {
+      await runChallengeHandler();
+
+      // One orchestrating pass launched for the parallel path.
+      expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0] ?? '';
+
+      // The primary verdict must appear in the per-lens body blocks.
+      expect(prompt).toContain(PRIMARY_VERDICT);
+
+      // Each primary issue description must appear so the lens can confirm or dispute.
+      for (const issue of PRIMARY_ISSUES) {
+        expect(prompt).toContain(issue.description);
+      }
+
+      // The challenge-mode section header must be present.
+      expect(prompt).toContain('Challenge Mode: Second-Opinion Pass');
+
+      // The confirm/dispute instruction must be present.
+      expect(prompt).toContain('CONFIRM');
+      expect(prompt).toContain('DISPUTE');
+    });
+
+    it('challenge mode: serial fallback includes primary verdict and issues in each per-lens prompt', async () => {
+      vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+
+      await runChallengeHandler();
+
+      // Each of the four individual lens prompts should contain the primary verdict.
+      expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(PANEL_REVIEW_LENSES.length);
+      for (let i = 0; i < PANEL_REVIEW_LENSES.length; i++) {
+        const prompt = vi.mocked(runClaudeCode).mock.calls[i]?.[0] ?? '';
+        expect(prompt).toContain(PRIMARY_VERDICT);
+        expect(prompt).toContain('Missing null check on user input');
+        expect(prompt).toContain('Challenge Mode: Second-Opinion Pass');
+      }
+    });
+
+    it('challenge mode absent: lens prompt has no challenge section (backward compatible)', async () => {
+      await runHandler();
+
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0] ?? '';
+      expect(prompt).not.toContain('Challenge Mode');
+      expect(prompt).not.toContain('INDEPENDENT CHALLENGER');
+      // Standard lens content still present.
+      for (const lens of PANEL_REVIEW_LENSES) {
+        expect(prompt).toContain(lens.focus);
+      }
+    });
+
+    it('challenge mode: synthesized verdict still emits the required backend shape', async () => {
+      await runChallengeHandler();
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.status).toBe('COMPLETED');
+
+      const parsed = JSON.parse(call.logs as string) as Record<string, unknown>;
+      // Shape required by the backend reconciler must be unchanged.
+      expect(parsed).toHaveProperty('overall_verdict');
+      expect(parsed).toHaveProperty('summary');
+      expect(parsed).toHaveProperty('issues');
+      expect(parsed).toHaveProperty('lenses');
+      expect(Object.keys(parsed.lenses as Record<string, unknown>).sort()).toEqual(
+        ['code_quality', 'correctness', 'security', 'test_coverage'],
+      );
+    });
+  });
 });
