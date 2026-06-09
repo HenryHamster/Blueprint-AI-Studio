@@ -1893,7 +1893,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_refuted_count = 0
     _spawn_gate_survived_count = 0
     if _adversarial_verdict_raw is not None:
-        _adv_verdicts: dict[str, bool] = (
+        _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
         from app.finding_deduplication import finding_hash as _fh  # noqa: PLC0415
@@ -1903,8 +1903,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 str(_f.get("title", "")),
                 str(_f.get("description", "") or _f.get("prompt", "")),
             )
-            if not _adv_verdicts.get(_fhash, True):
+            _verdict_obj = _adv_verdicts.get(_fhash)
+            if _verdict_obj is None:
+                # Hash absent from grader output: fail-open pass, not an explicit verdict.
+                _passed = True
+                _reason = "fail-open: no verdict returned for this finding"
+                _explicit = False
+            elif isinstance(_verdict_obj, bool):
+                # Normalise legacy bool verdicts so old stored context still works.
+                _passed = _verdict_obj
+                _reason = ""
+                _explicit = True
+            else:
+                _passed = bool(_verdict_obj.get("passed", True))
+                _reason = str(_verdict_obj.get("reason") or "")
+                _explicit = bool(_verdict_obj.get("explicit", True))
+            if not _passed:
                 _f["_adversarial_verdict"] = "fail"
+            _f["_adversarial_verdict_reason"] = _reason
+            _f["_adversarial_verdict_explicit"] = _explicit
         _spawn_gate_challenged_count = sum(
             1 for _f in findings if _is_high_stakes_finding(_f)
         )
@@ -1974,9 +1991,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         prior_actionable = _fresh_actionable
         # Decay: discard findings that have been deferred repeatedly for outcome-blind
         # reasons (ultra_low_confidence / degradation_gate / low_actionability /
-        # prereq_deferred_same_cycle). Retrying them unchanged wastes a findings slot
-        # each cycle. batch_cap deferrals are pure capacity constraints and are not
-        # decayed.
+        # prereq_deferred_same_cycle / adversarial_gate). Retrying them unchanged
+        # wastes a findings slot each cycle. batch_cap deferrals are pure capacity
+        # constraints and are not decayed.
         _decayed: list[dict] = []
         _kept: list[dict] = []
         for f in prior_actionable:
@@ -1986,6 +2003,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 (_reason == "ultra_low_confidence" and _count >= 4)
                 or (_reason == "degradation_gate" and _count >= 3)
             ):
+                _decayed.append(f)
+            elif _reason == "adversarial_gate" and _count >= 3:
                 _decayed.append(f)
             elif _reason == "low_actionability" and _count >= 3:
                 _record = _consume_finding_challenge_record(
@@ -3943,19 +3962,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             depends_on=[],
             priority=finding_priority,
         )
+        _spawn_gate_challenged = bool(
+            _adversarial_verdict_raw is not None and _is_high_stakes_finding(finding)
+        )
+        _spawn_gate_verdict = (
+            "pass"
+            if _spawn_gate_challenged and finding.get("_adversarial_verdict") != "fail"
+            else None
+        )
         new_task.context = {
             **(new_task.context or {}),
-            "research_spawn_gate_challenged": bool(
-                _adversarial_verdict_raw is not None
-                and _is_high_stakes_finding(finding)
-            ),
-            "research_spawn_gate_verdict": (
-                "pass"
-                if _adversarial_verdict_raw is not None
-                and _is_high_stakes_finding(finding)
-                and finding.get("_adversarial_verdict") != "fail"
-                else None
-            ),
+            "research_spawn_gate_challenged": _spawn_gate_challenged,
+            "research_spawn_gate_verdict": _spawn_gate_verdict,
+            "research_spawn_gate_reason": (
+                finding.get("_adversarial_verdict_reason") or None
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_explicit": (
+                finding.get("_adversarial_verdict_explicit")
+            )
+            if _spawn_gate_challenged
+            else None,
         }
         # Record the defect's reproduce-on-HEAD verdict on the spawned fix so its
         # outcome scoring can refuse bare-merge success when the target defect
@@ -4000,12 +4028,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         return stamped
 
-    # Adversarially-deferred findings: stamp deferral + clear the fail verdict so
-    # the finding re-enters the next cycle clean (no stale _adversarial_verdict).
+    # Adversarially-deferred findings: stamp deferral + carry the challenger's
+    # reason + clear the internal verdict keys so the finding re-enters the next
+    # cycle clean.
     _adv_deferred_stamped = []
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
         _adf_stamped.pop("_adversarial_verdict", None)
+        _gate_reason = _adf_stamped.pop("_adversarial_verdict_reason", None)
+        _adf_stamped.pop("_adversarial_verdict_explicit", None)
+        if _gate_reason:
+            _adf_stamped["adversarial_gate_reason"] = _gate_reason
         _adv_deferred_stamped.append(_adf_stamped)
 
     _all_deferred = (

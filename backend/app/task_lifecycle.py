@@ -424,7 +424,7 @@ async def _resolve_quality_grader_completion(
         finding_verdicts = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )
-        failed_count = sum(1 for v in finding_verdicts.values() if not v)
+        failed_count = sum(1 for v in finding_verdicts.values() if not v["passed"])
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
             "finding_verdicts": finding_verdicts,
             "grader_task_id": str(grader.id),

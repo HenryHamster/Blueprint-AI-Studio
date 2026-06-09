@@ -6307,30 +6307,39 @@ class TestParseAdversarialFindingVerdicts:
     def test_extracts_fail_verdict(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "premise wrong"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        assert result["abc123"] is False
+        assert result["abc123"]["passed"] is False
+        assert result["abc123"]["reason"] == "premise wrong"
+        assert result["abc123"]["explicit"] is True
 
     def test_extracts_pass_verdict(self):
         logs = '[{"hash": "abc123", "verdict": "pass", "reason": "well-grounded"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        assert result["abc123"] is True
+        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["reason"] == "well-grounded"
+        assert result["abc123"]["explicit"] is True
 
     def test_missing_hash_defaults_to_pass(self):
         logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        assert result["abc123"] is True
+        assert result["abc123"]["passed"] is True
+        # fail-open bypass must be distinguishable from explicit challenger pass
+        assert result["abc123"]["explicit"] is False
 
     def test_not_completed_defaults_all_to_pass(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"], completed=False)
-        assert result["abc123"] is True
+        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["explicit"] is False
 
     def test_none_logs_defaults_all_to_pass(self):
         result = parse_adversarial_finding_verdicts(None, ["abc123"])
-        assert result["abc123"] is True
+        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["explicit"] is False
 
     def test_malformed_json_defaults_all_to_pass(self):
         result = parse_adversarial_finding_verdicts("not json at all", ["abc123"])
-        assert result["abc123"] is True
+        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["explicit"] is False
 
     def test_multiple_findings_partial_fail(self):
         logs = (
@@ -6338,9 +6347,14 @@ class TestParseAdversarialFindingVerdicts:
             '{"hash": "h2", "verdict": "pass", "reason": "ok"}]'
         )
         result = parse_adversarial_finding_verdicts(logs, ["h1", "h2", "h3"])
-        assert result["h1"] is False
-        assert result["h2"] is True
-        assert result["h3"] is True  # absent → pass
+        assert result["h1"]["passed"] is False
+        assert result["h1"]["reason"] == "bad"
+        assert result["h1"]["explicit"] is True
+        assert result["h2"]["passed"] is True
+        assert result["h2"]["reason"] == "ok"
+        assert result["h2"]["explicit"] is True
+        assert result["h3"]["passed"] is True  # absent → fail-open pass
+        assert result["h3"]["explicit"] is False  # not an explicit challenger verdict
 
 
 # ---------------------------------------------------------------------------
@@ -6512,7 +6526,9 @@ async def test_adversarial_reentry_failed_finding_is_deferred(db_session, mocker
     task.context = {
         **(task.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {fhash: False},
+            "finding_verdicts": {
+                fhash: {"passed": False, "reason": "premise wrong", "explicit": True}
+            },
             "grader_task_id": "test-grader-001",
         },
     }
@@ -6594,6 +6610,167 @@ async def test_adversarial_gate_fails_open_on_absent_verdicts(db_session, mocker
         .all()
     )
     assert len(children) == 1, "absent hash in verdict → fail-open → finding must spawn"
+    # The fail-open child must record explicit=False so callers can distinguish it.
+    assert (children[0].context or {}).get("research_spawn_gate_explicit") is False
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_refuted_finding_records_challenge_reason(
+    db_session, mocker
+):
+    """A refuted finding's deferred record carries the challenger's reason (acceptance test)."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-reason01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Refuted stale finding")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
+
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                fhash: {
+                    "passed": False,
+                    "reason": "premise wrong — code moved to new module",
+                    "explicit": True,
+                }
+            },
+            "grader_task_id": "test-grader-reason-001",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert any(
+        d.get("title") == hs["title"] for d in deferred
+    ), "refuted finding must be in deferred_findings"
+    matching = [d for d in deferred if d.get("title") == hs["title"]]
+    assert len(matching) == 1
+    d = matching[0]
+    assert d.get("adversarial_gate_reason") == "premise wrong — code moved to new module", (
+        "deferred record must carry the challenger's reason"
+    )
+    assert "_adversarial_verdict" not in d, "_adversarial_verdict must be cleared"
+    assert "_adversarial_verdict_reason" not in d, "internal key must be cleared"
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_deferral_decays_or_escalates_after_threshold(
+    db_session, mocker
+):
+    """Repeated adversarial refutations are counted and terminally escalated."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-decay01")
+    _patch_research_externals(mocker)
+    decayed = _make_finding("Refuted stale finding", direction_id=direction["id"])
+    decayed["risk"] = "high"
+    decayed["deferred_reason"] = "adversarial_gate"
+    decayed["deferred_count"] = 3
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up is not None
+    assert give_up["by_reason"] == {"adversarial_gate": 1}
+    assert give_up["by_direction"] == {direction["id"]: 1}
+    assert not any(
+        f.get("title") == decayed["title"]
+        for f in (task.context or {}).get("deferred_findings", [])
+    )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_fail_open_explicit_false_on_child(db_session, mocker):
+    """A fail-open pass (hash absent from grader output) produces a child with explicit=False."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-explicit01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Fail-open explicit check")
+
+    # Grader returned an empty verdict dict — no hash matched → fail-open pass.
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},
+            "grader_task_id": "test-grader-explicit-001",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "fail-open finding must spawn"
+    child = children[0]
+    assert (child.context or {}).get("research_spawn_gate_challenged") is True
+    assert (child.context or {}).get("research_spawn_gate_verdict") == "pass"
+    # explicit=False distinguishes fail-open from a clean challenger confirmation
+    assert (child.context or {}).get("research_spawn_gate_explicit") is False, (
+        "fail-open bypass must record explicit=False so it is distinguishable from "
+        "a clean challenger confirmation"
+    )
 
 
 @_pytest.mark.asyncio
@@ -6628,7 +6805,18 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     task.context = {
         **(task.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {pass_hash: True, fail_hash: False},
+            "finding_verdicts": {
+                pass_hash: {
+                    "passed": True,
+                    "reason": "well-grounded",
+                    "explicit": True,
+                },
+                fail_hash: {
+                    "passed": False,
+                    "reason": "stale premise",
+                    "explicit": True,
+                },
+            },
             "grader_task_id": "test-grader-telemetry-001",
         },
     }
@@ -6659,8 +6847,12 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     unchallenged = by_title[low["title"]]
     assert (challenged.context or {}).get("research_spawn_gate_challenged") is True
     assert (challenged.context or {}).get("research_spawn_gate_verdict") == "pass"
+    assert (challenged.context or {}).get("research_spawn_gate_reason") == "well-grounded"
+    assert (challenged.context or {}).get("research_spawn_gate_explicit") is True
     assert (unchallenged.context or {}).get("research_spawn_gate_challenged") is False
     assert (unchallenged.context or {}).get("research_spawn_gate_verdict") is None
+    assert (unchallenged.context or {}).get("research_spawn_gate_reason") is None
+    assert (unchallenged.context or {}).get("research_spawn_gate_explicit") is None
 
     assert (task.context or {}).get("research_spawn_gate_challenged_count") == 2
     assert (task.context or {}).get("research_spawn_gate_refuted_count") == 1
@@ -6735,7 +6927,9 @@ async def test_high_stakes_finding_default_on_adversarial_rejudgment(
     task.context = {
         **(task.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {fhash: True},
+            "finding_verdicts": {
+                fhash: {"passed": True, "reason": "all criteria met", "explicit": True}
+            },
             "grader_task_id": str(others[0].id),
         },
     }
@@ -6779,7 +6973,13 @@ async def test_high_stakes_finding_default_on_adversarial_rejudgment(
     task2.context = {
         **(task2.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {fhash2: False},
+            "finding_verdicts": {
+                fhash2: {
+                    "passed": False,
+                    "reason": "stale — code no longer exists",
+                    "explicit": True,
+                }
+            },
             "grader_task_id": "mock-grader-fail-001",
         },
     }

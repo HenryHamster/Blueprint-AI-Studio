@@ -736,14 +736,21 @@ def parse_adversarial_finding_verdicts(
     logs: str | None,
     finding_hashes: list[str],
     completed: bool = True,
-) -> dict[str, bool]:
+) -> dict[str, dict]:
     """Parse per-finding pass/fail verdicts from adversarial grader output.
 
-    Returns a dict mapping finding_hash → passed (bool). FAIL-OPEN: any finding
-    whose hash is absent from the output defaults to True (pass) so a crashed or
-    truncated adversarial grader never blocks spawning.
+    Returns a dict mapping finding_hash → {passed: bool, reason: str, explicit: bool}.
+    FAIL-OPEN: any finding whose hash is absent from the output defaults to
+    passed=True with explicit=False so a crashed or truncated adversarial grader
+    never blocks spawning. ``explicit=False`` distinguishes a fail-open bypass
+    from a clean challenger pass (``explicit=True``).
     """
-    result: dict[str, bool] = {h: True for h in finding_hashes}
+    _fail_open: dict = {
+        "passed": True,
+        "reason": "fail-open: no verdict returned for this finding",
+        "explicit": False,
+    }
+    result: dict[str, dict] = {h: dict(_fail_open) for h in finding_hashes}
     if not completed or not logs:
         return result
     from app.task_completion import _extract_json_array  # noqa: PLC0415
@@ -761,10 +768,11 @@ def parse_adversarial_finding_verdicts(
                     if h not in result:
                         continue
                     v = str(item.get("verdict") or "").strip().lower()
+                    reason = str(item.get("reason") or "")[:480]
                     if v in ("pass", "passed", "approve", "approved"):
-                        result[h] = True
+                        result[h] = {"passed": True, "reason": reason, "explicit": True}
                     elif v in ("fail", "failed", "reject", "rejected"):
-                        result[h] = False
+                        result[h] = {"passed": False, "reason": reason, "explicit": True}
         except (json.JSONDecodeError, ValueError):
             pass
     return result
