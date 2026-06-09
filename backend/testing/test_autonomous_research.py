@@ -3622,6 +3622,83 @@ async def test_child_task_has_research_task_as_parent(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_compute_experiment_finding_propagates_live_proof_contract(
+    db_session, mocker
+):
+    """Research-authored live-proof compute_experiment findings keep their markers.
+
+    The child payload must preserve the proof fields so the agent launcher can
+    enforce the live-release precondition instead of treating the job as
+    ordinary compute.
+    """
+    from app.shared_state import runtime_config
+
+    direction = _active_direction("d-liveproof1", "Live-proof direction")
+    project = Project(
+        name="Live Proof Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    prev_threshold = runtime_config.get("compute_experiment_spend_threshold_usd")
+    runtime_config["compute_experiment_spend_threshold_usd"] = 10.0
+    try:
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[
+                {
+                    **_make_finding(
+                        title="Prove the release is serving",
+                        direction_id=direction["id"],
+                        finding_type="benchmark",
+                    ),
+                    "command": "python live_proof.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "live_proof": True,
+                    "live_proof_marker": "research-live-proof",
+                    "live_release_proof": {
+                        "enabled": True,
+                        "marker": "research-live-proof",
+                    },
+                    "live_release_proof_marker": "research-live-proof",
+                    "requires_live_release": True,
+                }
+            ],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if prev_threshold is None:
+            runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+        else:
+            runtime_config["compute_experiment_spend_threshold_usd"] = prev_threshold
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    payload = child_tasks[0].first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload["live_proof"] is True
+    assert payload["live_proof_marker"] == "research-live-proof"
+    assert payload["live_release_proof"] == {
+        "enabled": True,
+        "marker": "research-live-proof",
+    }
+    assert payload["live_release_proof_marker"] == "research-live-proof"
+    assert payload["requires_live_release"] is True
+
+
+@pytest.mark.asyncio
 async def test_research_task_status_becomes_evaluating(db_session, mocker):
     """After _handle_research_completion, the research task's status is EVALUATING."""
     direction = _active_direction("d-evalsts1", "Evaluating status direction")

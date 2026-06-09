@@ -849,6 +849,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "env",
                             "accelerator",
                             "provisioning_model",
+                            "live_proof",
+                            "live_proof_marker",
+                            "live_release_proof",
+                            "live_release_proof_marker",
+                            "requires_live_release",
                         )
                         if compute_contract.get(key) is not None
                     },

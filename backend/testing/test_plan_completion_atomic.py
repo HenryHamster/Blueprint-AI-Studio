@@ -617,6 +617,54 @@ async def test_compute_experiment_prereq_spawns_launch_payload_and_dependency(
 
 
 @pytest.mark.asyncio
+async def test_compute_experiment_prereq_propagates_live_proof_contract(
+    db_session, mocker, _quiet_mocks
+):
+    """A live-proof compute_experiment subtask keeps its proof markers on the child.
+
+    The plan-completion child payload must carry the proof marker fields through
+    to first_payload so the agent-side launcher can enforce the live-release
+    precondition instead of launching the job as ordinary compute.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Prove the release is serving",
+                    "prompt": "launch a live-proof compute job",
+                    "type": "compute_experiment",
+                    "command": "python live_proof.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "live_proof": True,
+                    "live_proof_marker": "plan-live-proof",
+                    "live_release_proof": {"enabled": True, "marker": "plan-live-proof"},
+                    "live_release_proof_marker": "plan-live-proof",
+                    "requires_live_release": True,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    payload = children[0].first_payload or {}
+    assert payload["type"] == "compute_experiment"
+    assert payload["live_proof"] is True
+    assert payload["live_proof_marker"] == "plan-live-proof"
+    assert payload["live_release_proof"] == {"enabled": True, "marker": "plan-live-proof"}
+    assert payload["live_release_proof_marker"] == "plan-live-proof"
+    assert payload["requires_live_release"] is True
+
+
+@pytest.mark.asyncio
 async def test_implementation_child_can_depend_on_knowledge_prereq(
     db_session, mocker, _quiet_mocks
 ):

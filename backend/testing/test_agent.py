@@ -26,6 +26,8 @@ from app.models import (
     MaxPlanAccount,
     Project,
     ProjectStatus,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -667,6 +669,88 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     assert first.json()["data"]["id"] == second.json()["data"]["id"]
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact_status", "reason_code", "expected_aggregate", "expected_message"),
+    [
+        ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
+        ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
+    ],
+)
+async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
+    client: AsyncClient,
+    db_session,
+    artifact_status,
+    reason_code,
+    expected_aggregate,
+    expected_message,
+):
+    project = Project(name="Agent Compute Live Proof Gate", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="backend_revision",
+                serving_status="serving_confirmed",
+                served_identifier="abc123",
+                served_at=datetime.utcnow(),
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="agent_image",
+                serving_status=artifact_status,
+                reason_code=reason_code,
+            ),
+        ]
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-live-proof",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-live-proof")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 412
+    detail = resp.json()["error"]["message"]
+    assert detail["error"] == "live_release_precondition_failed"
+    assert detail["reason"] == "release_not_serving_confirmed"
+    assert expected_message in detail["message"]
+    assert "agent_image" in detail["message"]
+    evidence = detail["live_release_evidence"]
+    assert evidence["release_version_number"] == 3
+    assert evidence["aggregate_serving_status"] == expected_aggregate
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
 
 
 @pytest.mark.asyncio

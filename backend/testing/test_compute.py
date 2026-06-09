@@ -44,6 +44,8 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -2182,6 +2184,168 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert first.id == second.id
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_proof_compute_job_requires_promoted_release(db_session):
+    project = Project(name="Live Proof No Promotion", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo live",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            live_proof_marker="v8-live-proof",
+        )
+
+    assert exc.value.detail["reason"] == "no_promoted_release"
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_compute_job_ignores_unconfirmed_release(db_session):
+    project = Project(name="Ordinary Before Serving", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="unconfirmed",
+        )
+    )
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ordinary",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+    assert "live_release_evidence" not in job.polling_metadata
+
+
+@pytest.mark.asyncio
+async def test_live_proof_compute_job_records_serving_evidence_and_idempotency(
+    db_session,
+):
+    project = Project(name="Live Proof Serving", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    served_at = datetime.utcnow()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=7,
+        status="promoted",
+        promoted_sha="def456",
+        promoted_at=served_at,
+        serving_status="serving_confirmed",
+        served_sha="def456",
+        served_at=served_at,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="backend_revision",
+                serving_status="serving_confirmed",
+                served_identifier="def456",
+                served_at=served_at,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="agent_image",
+                serving_status="serving_confirmed",
+                served_identifier="def456",
+                served_at=served_at,
+            ),
+        ]
+    )
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ordinary = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    with pytest.raises(ValueError, match="already has an active compute job"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo proof",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            live_proof_marker="v8-live-proof",
+        )
+    ordinary.status = ComputeJobStatus.SUCCEEDED
+    db_session.add(ordinary)
+    await db_session.commit()
+
+    live = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        live_proof_marker="v8-live-proof",
+    )
+    reused = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo proof",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        live_proof_marker="v8-live-proof",
+    )
+
+    evidence = reused.polling_metadata["live_release_evidence"]
+    assert live.id == reused.id
+    assert evidence["release_version_number"] == 7
+    assert evidence["promoted_sha"] == "def456"
+    assert evidence["aggregate_serving_status"] == "serving_confirmed"
+    assert {
+        artifact["artifact_kind"] for artifact in evidence["required_artifacts"]
+    } == {"backend_revision", "agent_image"}
 
 
 async def _make_compute_task(db_session):

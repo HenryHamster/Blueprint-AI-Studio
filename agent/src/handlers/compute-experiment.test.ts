@@ -111,6 +111,25 @@ describe('handleComputeExperiment', () => {
     expect((req.source_metadata as Record<string, unknown>).experiment).toBe('perf-sweep-v1');
   });
 
+  it('forwards the live-proof launch marker', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'QUEUED' }));
+
+    await handleComputeExperiment(
+      'task-1',
+      { ...VALID_PAYLOAD, live_proof_marker: 'v8-live-proof' },
+      TASK,
+      '',
+      'o',
+      'r',
+      null,
+      { value: '' },
+    );
+
+    expectCalledWith(apiPost, '/api/agent/compute-jobs', expect.objectContaining({
+      live_proof_marker: 'v8-live-proof',
+    }));
+  });
+
   it('fails fast WITHOUT launching when the spend cap is missing', async () => {
     const payload = { type: 'compute_experiment', command: 'python bench.py', deadline_seconds: 600 };
     await handleComputeExperiment('task-1', payload, TASK, '', 'o', 'r', null, { value: '' });
@@ -139,6 +158,21 @@ describe('handleComputeExperiment', () => {
     expect(completion.status).toBe('FAILED');
     expect(completion.failure_category).toBe('compute_launch_failed');
     expect(completion.status).not.toBe('PARKED');
+  });
+
+  it('blocks the task when the backend rejects a live-proof precondition', async () => {
+    vi.mocked(apiPost).mockRejectedValue(new Error(
+      'POST /api/agent/compute-jobs failed (412): {"error":{"code":412,"message":{"error":"live_release_precondition_failed","reason":"release_not_serving_confirmed","message":"waiting on required artifacts: agent_image","live_release_evidence":{"release_version_number":3,"aggregate_serving_status":"unconfirmed"}}}}',
+    ));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD, live_proof_marker: 'v8-live-proof' }, TASK, '', 'o', 'r', null, { value: '' });
+
+    expect(vi.mocked(apiGet)).not.toHaveBeenCalled();
+    const completion = lastCompletionPayload();
+    expect(completion.status).toBe('FAILED');
+    expect(completion.failure_category).toBe('BLOCKED_PRECONDITION');
+    expect(completion.logs as string).toContain('BLOCKER: waiting on required artifacts: agent_image');
+    expect(completion.logs as string).not.toContain('compute_launch_failed');
   });
 
   it('fails the task (NOT parked) when the launch returns no job id', async () => {
