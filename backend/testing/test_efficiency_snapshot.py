@@ -17,12 +17,17 @@ from app.efficiency_snapshot import (
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     DESIGN_DOC_KEY,
+    FORMAT_COMPLIANCE_KEY,
+    FORMAT_COMPLIANCE_RATE_KEY,
     LLM_TOKEN_PRICING,
+    NESTED_METRIC_CONSUMERS,
+    SELF_REPAIR_SUCCESS_RATE_KEY,
     _compute_cold_start_breakdown_p50,
     _compute_llm_cost_pricing_coverage,
     _last_run_due,
     compute_current_axes,
     compute_llm_cost_breakdown,
+    compute_llm_cost_by_task_type,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
@@ -3105,6 +3110,24 @@ def _make_timeout_task(project_id, subtype: str):
     )
 
 
+def _make_format_compliance_task(
+    project_id,
+    *,
+    errors: int,
+    repair_attempts: int = 0,
+    repair_successes: int = 0,
+):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        format_compliance_summary={
+            "format_error_total": errors,
+            "format_repair_attempts": repair_attempts,
+            "format_repair_successes": repair_successes,
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_timeout_rate_persisted_and_drifted(db_session):
     """The AGENT_TIMEOUT-rate measure is folded into the snapshot and drifts vs baseline."""
@@ -3197,6 +3220,110 @@ async def test_agent_timeout_rate_backfilled_into_preexisting_baseline(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_snapshot_persists_format_compliance_block(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(
+        _make_format_compliance_task(
+            project.id,
+            errors=2,
+            repair_attempts=2,
+            repair_successes=1,
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    block = snap[FORMAT_COMPLIANCE_KEY]
+    assert block["tasks_measured"] == 2
+    assert block[FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+    assert block["format_error_total"] == 2
+    assert block["repair_attempts"] == 2
+    assert block["repair_successes"] == 1
+    assert block[SELF_REPAIR_SUCCESS_RATE_KEY] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+    assert fc["tasks_measured"] == 2
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["current"] == 0.5
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["baseline"] == 0.5
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["drift_pct"] == 0.0
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["history"] == [
+        {"captured_at": snap["captured_at"], "value": 0.5}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_backfilled_into_preexisting_baseline(db_session):
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2020-01-01T00:00:00+00:00"},
+                "snapshots": [],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(_make_format_compliance_task(project.id, errors=1))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    assert snap[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+
+    await db_session.commit()
+    await db_session.refresh(project)
+    baseline = project.design_doc[DESIGN_DOC_KEY]["baseline"]
+    assert baseline[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    assert drift[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY]["baseline"] == 0.5
+    assert drift[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY]["drift_pct"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_efficiency_axes_endpoint_exposes_format_compliance(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(
+        _make_format_compliance_task(
+            project.id,
+            errors=1,
+            repair_attempts=1,
+            repair_successes=1,
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/efficiency-axes")
+    assert resp.status_code == 200
+    body = resp.json()
+    fc = body[FORMAT_COMPLIANCE_KEY]
+    assert fc["tasks_measured"] == 2
+    assert fc["format_error_total"] == 1
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["current"] == 0.5
+    assert fc[SELF_REPAIR_SUCCESS_RATE_KEY]["current"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_exposes_timeout_rate(
     client: AsyncClient, db_session
 ):
@@ -3272,6 +3399,239 @@ def test_all_axes_have_named_consumer_or_retired_record():
     )
 
 
+def test_nested_snapshot_metrics_have_ground_truth_and_named_consumer():
+    required = {"agent_timeout_rate", FORMAT_COMPLIANCE_KEY}
+    missing = required - set(NESTED_METRIC_CONSUMERS)
+    assert not missing, (
+        f"Nested snapshot metrics missing governance entries: {sorted(missing)}"
+    )
+    for metric_key in required:
+        entry = NESTED_METRIC_CONSUMERS[metric_key]
+        assert entry.get("ground_truth"), (
+            f"NESTED_METRIC_CONSUMERS['{metric_key}'] must name ground_truth"
+        )
+        assert entry.get("consumer"), (
+            f"NESTED_METRIC_CONSUMERS['{metric_key}'] must name consumer"
+        )
+
+
 def test_axis_llm_cost_constant_value():
     """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
+
+
+# ---------------------------------------------------------------------------
+# compute_llm_cost_by_task_type tests
+# ---------------------------------------------------------------------------
+
+
+def test_llm_cost_breakdown_by_task_type_basic():
+    """Tasks with distinct payload types bucket into separate rows; totals
+    reconcile with compute_llm_cost_breakdown's overall total_cost_usd."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # 'create' task: 2000 in, 1000 out — cost = 2000*3e-6 + 1000*15e-6 = 0.021
+    create_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # 'review' task: 1000 in, 500 out — cost = 1000*3e-6 + 500*15e-6 = 0.0105
+    review_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([create_task, review_task])
+    by_type = {r["task_type"]: r for r in rows}
+
+    assert set(by_type) == {"create", "review"}
+
+    create_row = by_type["create"]
+    expected_create_cost = round(2000 * input_rate + 1000 * output_rate, 6)
+    assert create_row["total_cost_usd"] == expected_create_cost
+    assert create_row["total_input_tokens"] == 2000
+    assert create_row["total_output_tokens"] == 1000
+    assert create_row["llm_call_count"] == 8
+    assert create_row["task_count"] == 1
+    assert create_row["merged_count"] == 1
+    assert create_row["merge_rate"] == 1.0
+    assert create_row["verified_merged_count"] == 1
+    assert create_row["verified_merge_rate"] == 1.0
+
+    review_row = by_type["review"]
+    expected_review_cost = round(1000 * input_rate + 500 * output_rate, 6)
+    assert review_row["total_cost_usd"] == expected_review_cost
+    assert review_row["merged_count"] == 0
+    assert review_row["merge_rate"] == 0.0
+
+    # share_of_total_cost must sum to 1.0
+    share_sum = sum(r["share_of_total_cost"] or 0.0 for r in rows)
+    assert abs(share_sum - 1.0) < 1e-6
+
+    # Total cost must reconcile with compute_llm_cost_breakdown
+    breakdown_total = compute_llm_cost_breakdown([create_task, review_task])["totals"]["total_cost_usd"]
+    type_total = round(sum(r["total_cost_usd"] for r in rows), 6)
+    assert type_total == breakdown_total
+
+    # Sorted cost descending: create (0.021) before review (0.0105)
+    assert rows[0]["task_type"] == "create"
+    assert rows[1]["task_type"] == "review"
+
+
+def test_llm_cost_breakdown_by_task_type_no_type_field():
+    """Tasks with no 'type' key in first_payload fall into 'unspecified' bucket."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Payload has no 'type' key
+    no_type = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"effort": "high"}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Empty payloads list
+    empty_payload = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[],
+        api_call_summary={
+            "total_input_tokens": 300,
+            "total_output_tokens": 100,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([no_type, empty_payload])
+    assert len(rows) == 1
+    assert rows[0]["task_type"] == "unspecified"
+    assert rows[0]["task_count"] == 2
+    assert rows[0]["total_input_tokens"] == 800
+    assert rows[0]["total_output_tokens"] == 300
+
+
+def test_llm_cost_breakdown_by_task_type_merge_credited_once():
+    """A multi-attempt merged task credits merged_count once to its type bucket,
+    not once per attempt-row (regression guard for the per-model merge-once pattern)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    now = _utcnow()
+    from app.models import bank_task_current_attempt
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": True},
+        payloads=[{"type": "fix"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "llm_call_count": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+    # Second attempt on the same model
+    task.status = TaskStatus.COMPLETED
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+        "llm_call_count": 2,
+    }
+
+    rows = compute_llm_cost_by_task_type([task])
+    assert len(rows) == 1
+    fix_row = rows[0]
+    assert fix_row["task_type"] == "fix"
+    assert fix_row["task_count"] == 1
+    # Merged once, not once per attempt
+    assert fix_row["merged_count"] == 1
+    assert fix_row["merge_rate"] == 1.0
+    assert fix_row["verified_merged_count"] == 1
+    # Cost includes both attempts
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_cost = round((1000 + 250) * input_rate + (400 + 150) * output_rate, 6)
+    assert fix_row["total_cost_usd"] == expected_cost
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
+    client: AsyncClient, db_session
+):
+    """The /llm-cost-breakdown endpoint must include a 'by_task_type' list."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create"}],
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/llm-cost-breakdown")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "by_task_type" in data
+    by_type = {r["task_type"]: r for r in data["by_task_type"]}
+    assert "create" in by_type
+    row = by_type["create"]
+    assert row["task_count"] == 1
+    assert row["merged_count"] == 1
+    assert row["total_input_tokens"] == 1000
+    assert row["total_output_tokens"] == 500
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_cost = round(1000 * input_rate + 500 * output_rate, 6)
+    assert row["total_cost_usd"] == expected_cost

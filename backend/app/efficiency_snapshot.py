@@ -89,6 +89,9 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+FORMAT_COMPLIANCE_KEY = "format_compliance"
+FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
+SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
 
 ALL_AXES: tuple[str, ...] = (
     AXIS_COST_PER_MERGED_PR,
@@ -131,6 +134,17 @@ AXIS_CONSUMERS: dict[str, dict] = {
     },
     AXIS_LLM_COST_PER_MERGED_PR: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+}
+
+NESTED_METRIC_CONSUMERS: dict[str, dict] = {
+    "agent_timeout_rate": {
+        "ground_truth": "Task.context.failure_category + Task.context.timeout_subtype",
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
+    },
+    FORMAT_COMPLIANCE_KEY: {
+        "ground_truth": "Task.format_compliance_summary",
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
 }
 
@@ -264,6 +278,11 @@ async def _load_recent_tasks(
                 Task.vm_dispatched_at,
                 Task.provider,
                 Task.model,
+                Task.format_compliance_summary,
+                # payloads: required so task.first_payload can be read without
+                # triggering an async lazy-load (used by compute_llm_cost_by_task_type
+                # and compute_effort_model_efficiency when called from this path).
+                Task.payloads,
             )
         )
         .limit(5000)
@@ -1235,6 +1254,114 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     }
 
 
+def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-task-type LLM cost/token rollup over the given tasks.
+
+    Buckets each task by ``task.first_payload.get("type", "unspecified")`` and
+    accumulates the full attempt-history token cost (same pricing table and
+    same :func:`_task_llm_attempts` helper as :func:`compute_llm_cost_breakdown`
+    so totals reconcile). A task that has no payload or no type key is bucketed
+    as ``"unspecified"``.
+
+    Merge attribution is TASK-level: a merged task is credited once to its
+    type bucket (not once per attempt-row), so merge rates and cost-per-merge
+    are consistent with the per-model breakdown.
+
+    ``cost_per_merge`` is ``None`` for any bucket whose total cost is zero (no
+    priced tasks) or that has no verified merges — avoids divide-by-zero and
+    misleading zero-cost figures.
+
+    Returns a list sorted by ``total_cost_usd`` descending so the heaviest
+    spender is first.
+    """
+    from collections import defaultdict
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_call_count": 0,
+            "task_count": 0,
+            "merged_count": 0,
+            "verified_merged_count": 0,
+            "cost_usd": 0.0,
+        }
+    )
+    total_cost = 0.0
+
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type") or "unspecified"
+        merged = is_merged_completion(t)
+        verified = is_verified_merge(t)
+
+        bucket = buckets[task_type]
+        bucket["task_count"] += 1
+        if merged:
+            bucket["merged_count"] += 1
+        if verified:
+            bucket["verified_merged_count"] += 1
+
+        task_cost = 0.0
+        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider, model = "unattributed", "unknown"
+            else:
+                provider, model = provider.lower(), model.lower()
+
+            pricing = LLM_TOKEN_PRICING.get((provider, model))
+            if pricing:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+            else:
+                cost = 0.0
+
+            bucket["input_tokens"] += int(input_tokens)
+            bucket["output_tokens"] += int(output_tokens)
+            bucket["llm_call_count"] += call_count
+            bucket["cost_usd"] += cost
+            task_cost += cost
+
+        total_cost += task_cost
+
+    def _share(cost: float) -> float | None:
+        if total_cost <= 0:
+            return None
+        return round(cost / total_cost, 4)
+
+    def _merge_rate(merged: float, count: float) -> float | None:
+        if count <= 0:
+            return None
+        return round(merged / count, 4)
+
+    def _cost_per_merge(cost: float, verified_merged: float) -> float | None:
+        if cost <= 0 or verified_merged <= 0:
+            return None
+        return round(cost / verified_merged, 6)
+
+    rows = [
+        {
+            "task_type": task_type,
+            "total_input_tokens": int(b["input_tokens"]),
+            "total_output_tokens": int(b["output_tokens"]),
+            "total_cost_usd": round(b["cost_usd"], 6),
+            "llm_call_count": int(b["llm_call_count"]),
+            "task_count": int(b["task_count"]),
+            "merged_count": int(b["merged_count"]),
+            "merge_rate": _merge_rate(b["merged_count"], b["task_count"]),
+            "verified_merged_count": int(b["verified_merged_count"]),
+            "verified_merge_rate": _merge_rate(b["verified_merged_count"], b["task_count"]),
+            "cost_per_merge": _cost_per_merge(b["cost_usd"], b["verified_merged_count"]),
+            "share_of_total_cost": _share(b["cost_usd"]),
+        }
+        for task_type, b in sorted(
+            buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+    return rows
+
+
 def _compute_llm_cost_pricing_coverage(
     tasks: list[Task],
 ) -> Dict[str, Any]:
@@ -1797,7 +1924,7 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
-    from app.digest_metrics import compute_timeout_rate
+    from app.digest_metrics import compute_format_compliance_metrics, compute_timeout_rate
     from app.warm_backlog_reuse import (
         compute_dominant_pool_miss,
         compute_dominant_reuse_dropout,
@@ -1862,6 +1989,11 @@ async def compute_current_axes(
         # reached tasks (started_at present) so the rate is not gameable by raw
         # volume. See app.digest_metrics.compute_timeout_rate.
         "agent_timeout_rate": compute_timeout_rate(tasks),
+        # Durable structured-output format-compliance measure (v7 shared
+        # self-repair adoption): overall block only, read from persisted
+        # Task.format_compliance_summary. Per-task-type detail remains a live
+        # digest concern; the snapshot needs the durable baseline/trend.
+        FORMAT_COMPLIANCE_KEY: compute_format_compliance_metrics(tasks)["overall"],
     }
 
 
@@ -1944,6 +2076,11 @@ async def write_snapshot(
                 and snapshot.get("agent_timeout_rate") is not None
             ):
                 baseline["agent_timeout_rate"] = snapshot["agent_timeout_rate"]
+            if (
+                baseline.get(FORMAT_COMPLIANCE_KEY) is None
+                and snapshot.get(FORMAT_COMPLIANCE_KEY) is not None
+            ):
+                baseline[FORMAT_COMPLIANCE_KEY] = snapshot[FORMAT_COMPLIANCE_KEY]
             container["baseline"] = baseline
 
         snapshots = list(container.get("snapshots") or [])
@@ -2176,9 +2313,40 @@ async def read_baseline_with_drift(
         "window_days": latest_timeout.get("window_days"),
     }
 
+    latest_format = latest.get(FORMAT_COMPLIANCE_KEY) or {}
+    baseline_format = baseline.get(FORMAT_COMPLIANCE_KEY) or {}
+
+    def _format_rate_axis(rate_key: str) -> Dict[str, Any]:
+        return {
+            "current": latest_format.get(rate_key),
+            "baseline": baseline_format.get(rate_key),
+            "drift_pct": _rate_drift_pct(
+                latest_format.get(rate_key), baseline_format.get(rate_key)
+            ),
+            "history": [
+                {
+                    "captured_at": snap.get("captured_at"),
+                    "value": (snap.get(FORMAT_COMPLIANCE_KEY) or {}).get(rate_key),
+                }
+                for snap in snapshots
+                if snap.get(FORMAT_COMPLIANCE_KEY)
+            ],
+        }
+
+    format_compliance = {
+        FORMAT_COMPLIANCE_RATE_KEY: _format_rate_axis(FORMAT_COMPLIANCE_RATE_KEY),
+        SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(SELF_REPAIR_SUCCESS_RATE_KEY),
+        "tasks_measured": latest_format.get("tasks_measured"),
+        "well_formed_tasks": latest_format.get("well_formed_tasks"),
+        "format_error_total": latest_format.get("format_error_total"),
+        "repair_attempts": latest_format.get("repair_attempts"),
+        "repair_successes": latest_format.get("repair_successes"),
+    }
+
     return {
         "axes": axes,
         "agent_timeout_rate": agent_timeout_rate,
+        FORMAT_COMPLIANCE_KEY: format_compliance,
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
@@ -2613,6 +2781,7 @@ async def get_llm_cost_breakdown(
         "window_days": window_days,
         "generated_at": _utcnow().isoformat(),
         **breakdown,
+        "by_task_type": compute_llm_cost_by_task_type(tasks),
     }
 
 

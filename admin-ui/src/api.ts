@@ -1112,11 +1112,30 @@ export interface LlmCostModelRow {
   cost_per_merge: number | null;
 }
 
+export interface LlmCostTaskTypeRow {
+  /** Task type from first_payload["type"], or "unspecified" when absent. */
+  task_type: string;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_usd: number;
+  llm_call_count: number;
+  task_count: number;
+  merged_count: number;
+  merge_rate: number | null;
+  verified_merged_count: number;
+  verified_merge_rate: number | null;
+  /** cost_usd / verified_merged_count, null when cost is zero or no verified merges. */
+  cost_per_merge: number | null;
+  share_of_total_cost: number | null;
+}
+
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
   by_provider: Array<Omit<LlmCostModelRow, 'model'>>;
   by_model: LlmCostModelRow[];
+  /** Per-task-type cost attribution — same pricing table as by_model, bucketed by first_payload["type"]. */
+  by_task_type: LlmCostTaskTypeRow[];
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;

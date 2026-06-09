@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { fetchLlmCostBreakdown, type LlmCostBreakdownResponse } from '../api';
+import { fetchLlmCostBreakdown, type LlmCostBreakdownResponse, type LlmCostTaskTypeRow } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 function fmtTokens(n: number): string {
@@ -49,7 +49,7 @@ export function LlmCostBreakdownPanel({
   if (!selectedProjectId || state?.projectId !== selectedProjectId) return null;
   const data = state.data;
 
-  const { by_model, totals, unpriced_combos, approximate_priced_combos } = data;
+  const { by_model, by_task_type, totals, unpriced_combos, approximate_priced_combos } = data;
   const coverage = totals.unpriced_coverage_fraction;
   const fullCoverage = coverage == null || coverage >= 1;
 
@@ -106,6 +106,77 @@ export function LlmCostBreakdownPanel({
         <span className="font-mono">{approximate_priced_combos.join(', ')}</span>
       </div>
     </div>
+  );
+
+  const TaskTypeSection = by_task_type.length > 0 && (
+    <section className="mt-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        LLM Cost by Task Type <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        {/* Mobile: stacked card layout */}
+        <div className="sm:hidden divide-y divide-neutral-800/30">
+          {by_task_type.map((row: LlmCostTaskTypeRow, i: number) => (
+            <div key={i} className="px-3 py-2 text-[10px]">
+              <div className="flex items-start justify-between gap-2 mb-1">
+                <span className="font-medium text-neutral-200 break-words font-mono">{row.task_type}</span>
+                <span className="text-neutral-500 shrink-0 tabular-nums">{fmtShare(row.share_of_total_cost)}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
+                <span>Tokens: <span className="text-neutral-300 tabular-nums">{fmtTokens(row.total_input_tokens + row.total_output_tokens)}</span></span>
+                <span>Cost: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
+                <span>Tasks: <span className="text-neutral-300 tabular-nums">{row.task_count}</span></span>
+                <span>Merged: <span className="text-neutral-300 tabular-nums">{row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})</span></span>
+                <span>$/Verified Merge: <span className="text-neutral-300 font-mono tabular-nums">{fmtCostPerMerge(row.cost_per_merge)}</span></span>
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* Desktop: table layout */}
+        <table className="hidden sm:table w-full text-xs">
+          <thead>
+            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+              <th className="text-left px-3 py-2 font-medium">Task Type</th>
+              <th className="text-right px-3 py-2 font-medium">In / Out Tokens</th>
+              <th className="text-right px-3 py-2 font-medium">Cost</th>
+              <th className="text-right px-3 py-2 font-medium">Tasks</th>
+              <th className="text-right px-3 py-2 font-medium">Merged</th>
+              <th className="text-right px-3 py-2 font-medium">Verified</th>
+              <th className="text-right px-3 py-2 font-medium">$/Verified Merge</th>
+              <th className="text-right px-3 py-2 font-medium">Share</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {by_task_type.map((row: LlmCostTaskTypeRow, i: number) => (
+              <tr key={i}>
+                <td className="px-3 py-2 font-mono text-neutral-200">{row.task_type}</td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {fmtTokens(row.total_input_tokens)} / {fmtTokens(row.total_output_tokens)}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
+                  ${row.total_cost_usd.toFixed(2)}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.task_count}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.verified_merged_count}/{row.task_count} ({fmtMergeRate(row.verified_merge_rate)})
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
+                  {fmtCostPerMerge(row.cost_per_merge)}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {fmtShare(row.share_of_total_cost)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 
   return (
@@ -188,6 +259,7 @@ export function LlmCostBreakdownPanel({
           </tbody>
         </table>
       </div>
+      {TaskTypeSection}
     </section>
   );
 }
