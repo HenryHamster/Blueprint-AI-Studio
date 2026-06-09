@@ -51,7 +51,7 @@ from app.playbook_learning import (
     summarize_recent_successes,
 )
 from app.source_ref_validation import (
-    classify_existing_paths,
+    classify_paths_tristate,
     detect_absent_symbols,
     resolve_branch_verification_context,
 )
@@ -1735,16 +1735,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             modules = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
             if not modules:
                 continue
-            present, missing = await classify_existing_paths(
+            present, missing, indeterminate = await classify_paths_tristate(
                 modules, **verification_kwargs
             )
-            if not missing:
+            if not missing and not indeterminate:
                 status = "verified"
-            elif present:
+            elif not missing:
+                # Nothing is definitely absent but some paths were unknowable
+                # (rate limit / quota reserve / API error) — no verdict either
+                # way. Never "verified" (can't confirm) and never an absence.
+                status = "unverified"
+            elif present or indeterminate:
                 status = "partial"
             else:
-                # Every declared module is absent from the integration branch:
-                # the system is claimed but its backing code does not exist.
+                # Every declared module is unambiguously absent from the
+                # integration branch: the system is claimed but its backing
+                # code does not exist.
                 status = "claimed_absent"
             # Symbol-level depth: a present file can still have lost the cited
             # symbol. An unambiguously-absent symbol gets the same treat-as-missing
@@ -1761,6 +1767,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
                 "missing": missing,
+                **({"indeterminate": indeterminate} if indeterminate else {}),
                 **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
@@ -1798,12 +1805,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             cap_paths = list(dict.fromkeys(cap_paths))
             if not cap_paths:
                 continue  # no path pointer → absence is not evidence of absent code
-            present, missing = await classify_existing_paths(
+            present, missing, indeterminate = await classify_paths_tristate(
                 cap_paths, **verification_kwargs
             )
-            if not missing:
+            if not missing and not indeterminate:
                 status = "verified"
-            elif present:
+            elif not missing:
+                # Unknowable paths only (see systems loop): no verdict.
+                status = "unverified"
+            elif present or indeterminate:
                 status = "partial"
             else:
                 status = "claimed_absent"
@@ -1821,6 +1831,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
                 "missing": missing,
+                **({"indeterminate": indeterminate} if indeterminate else {}),
                 **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
@@ -2489,7 +2500,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (  # noqa: E402
+from app.autonomous_research_residual import (
     _spawn_residual_fingerprint_remediation,
 )
 

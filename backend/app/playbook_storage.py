@@ -217,7 +217,7 @@ def _absent_symbol_in_present_file(entry: dict, repo_root: str) -> str | None:
                 # symbol verdict. Leave it to the file-level check.
                 continue
             try:
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                with open(full, encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
             except OSError:
                 # Unreadable → indeterminate; degrade gracefully, never flag.
@@ -460,7 +460,7 @@ async def check_and_flag_stale_refs_branch_aware(
     if not use_repo_branch:
         return check_and_flag_stale_refs(doc, repo_root or "")
 
-    from app.source_ref_validation import classify_existing_paths
+    from app.source_ref_validation import classify_paths_tristate
 
     updated = False
     for key, value in doc.items():
@@ -469,7 +469,7 @@ async def check_and_flag_stale_refs_branch_aware(
         paths = _extract_file_paths(value.get("content", ""))
         if not paths:
             continue
-        _present, missing = await classify_existing_paths(
+        _present, missing, indeterminate = await classify_paths_tristate(
             paths,
             token=token,
             owner=owner,
@@ -477,6 +477,11 @@ async def check_and_flag_stale_refs_branch_aware(
             branch=branch,
             project_id=project_id,
         )
+        # Indeterminate paths (rate limit / quota reserve / API error) are not
+        # evidence either way: never flag on them, and never clear an existing
+        # flag while any path is unknowable — leave the entry untouched.
+        if indeterminate and not missing:
+            continue
         any_missing = bool(missing)
         if any_missing and not value.get("stale_file_refs"):
             entry = dict(value)
@@ -562,23 +567,29 @@ async def ground_design_doc_systems_branch_aware(
 
         paths = _extract_entry_paths(value)
 
-        # File-level absence: downgrade only when EVERY referenced path is gone on
-        # the branch. No pointer / a partial hit leaves the entry untouched.
+        # File-level absence: downgrade only when EVERY referenced path is
+        # UNAMBIGUOUSLY gone on the branch. No pointer, a partial hit, or any
+        # indeterminate lookup (rate limit / quota reserve / API error) leaves
+        # the entry untouched — an outage is never evidence of absent code.
         file_absent = False
         if paths:
             any_present = False
+            any_indeterminate = False
             for path in paths:
-                if await _file_exists_in_repo_branch(
+                exists = await _file_exists_in_repo_branch(
                     path,
                     token=str(token),
                     owner=str(owner),
                     repo=str(repo),
                     branch=str(branch),
                     project_id=project_id,
-                ):
+                )
+                if exists:
                     any_present = True
                     break
-            file_absent = not any_present
+                if exists is None:
+                    any_indeterminate = True
+            file_absent = not any_present and not any_indeterminate
 
         # Symbol-level absence: only consulted when the file-level check did not
         # already fire (complementary, not a replacement).
