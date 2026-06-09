@@ -6378,8 +6378,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text  # noqa: E402 — deliberate mid-file import for the post-commit poison-recovery test section below
-from sqlalchemy.exc import (  # noqa: E402 — see above
+from sqlalchemy import text as _sa_text
+from sqlalchemy.exc import (
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )
@@ -7868,7 +7868,7 @@ def _panel_logs(overall, *, issues=None, lens_verdict=None):
     )
 
 
-async def _setup_review_gate(tl_db, mocker, *, pr_number=7777):
+async def _setup_review_gate(tl_db, mocker, *, pr_number=7777, base_branch="main"):
     """Set up GitHub/merge mocks and an APPROVE-able review task. Returns handles."""
     captured_spawn = []
 
@@ -7924,7 +7924,7 @@ async def _setup_review_gate(tl_db, mocker, *, pr_number=7777):
     project = await _make_project(session)
     original = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        payloads=[{"type": "create", "prompt": "X", "base_branch": base_branch}],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         context={},
@@ -7940,7 +7940,7 @@ async def _setup_review_gate(tl_db, mocker, *, pr_number=7777):
                 "type": "review",
                 "pr_number": pr_number,
                 "branch": "feat/x",
-                "base_branch": "main",
+                "base_branch": base_branch,
                 "original_task_id": str(original.id),
             }
         ],
@@ -7950,7 +7950,7 @@ async def _setup_review_gate(tl_db, mocker, *, pr_number=7777):
             "review_loop": {
                 "pr_number": pr_number,
                 "branch": "feat/x",
-                "base_branch": "main",
+                "base_branch": base_branch,
                 "original_task_id": str(original.id),
                 "iteration": 1,
             },
@@ -7985,7 +7985,7 @@ async def test_second_opinion_gate_blocks_approve_merge_until_reconciled(tl_db, 
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
         merge_mock,
         _spawn,
@@ -8034,7 +8034,7 @@ async def test_second_opinion_challenge_rejected_approve_does_not_merge(tl_db, m
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
         merge_mock,
         captured_spawn,
@@ -8071,18 +8071,17 @@ async def test_second_opinion_challenge_rejected_approve_does_not_merge(tl_db, m
 
 
 @pytest.mark.asyncio
-async def test_second_opinion_gate_request_changes_spawns_fix_after_reconcile(
-    tl_db, mocker
-):
-    """Gate-on REQUEST_CHANGES parks, then spawns fix only after a confirming
-    reconciliation."""
+async def test_second_opinion_gate_request_changes_not_challenged(tl_db, mocker):
+    """REQUEST_CHANGES is not high-stakes: no park, no challenger — the fix
+    spawns synchronously and the outcome is recorded ``unchallenged`` (a wrong
+    rejection self-corrects through the fix loop's re-review)."""
     (
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
-        merge_mock,
+        _merge_mock,
         captured_spawn,
     ) = await _setup_review_gate(tl_db, mocker, pr_number=7779)
 
@@ -8095,62 +8094,47 @@ async def test_second_opinion_gate_request_changes_spawns_fix_after_reconcile(
     await _process_post_commit(review_task.id, payload, _session_factory=factory)
 
     await session.refresh(review_task)
-    assert review_task.status == TaskStatus.EVALUATING
-    assert not captured_spawn, "fix must NOT spawn before reconciliation"
+    assert review_task.status != TaskStatus.EVALUATING, "must not park"
     challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("REQUEST_CHANGES", issues=issues),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec["state"] == "challenged_confirmed"
-    assert captured_spawn, "confirmed REQUEST_CHANGES must spawn a fix"
+    assert challenger is None, "REQUEST_CHANGES must not spawn a challenger"
+    assert captured_spawn, "REQUEST_CHANGES must spawn the fix synchronously"
     assert captured_spawn[0].get("current_issues") == issues
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec["state"] == "unchallenged"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
 
 
 @pytest.mark.asyncio
-async def test_second_opinion_challenge_rejected_request_changes_no_fix(tl_db, mocker):
-    """A challenge that overturns a REQUEST_CHANGES must NOT spawn fix work."""
+async def test_second_opinion_gate_non_trunk_approve_not_challenged(tl_db, mocker):
+    """An APPROVE on a PR targeting a non-trunk base (e.g. a research branch)
+    is not high-stakes: it merges synchronously without a challenger — the
+    rollup review re-covers it at the trunk boundary."""
     (
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
         merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7780)
+        _captured_spawn,
+    ) = await _setup_review_gate(
+        tl_db, mocker, pr_number=7780, base_branch="research/abc123"
+    )
 
-    issues = [{"description": "questionable concern", "severity": "major"}]
     payload = AgentStatusPayload(
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
-        verdict_json=json.dumps({"verdict": "REQUEST_CHANGES", "issues": issues}),
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
     )
     await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # Challenge overturns to APPROVE.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("APPROVE"),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
 
     await session.refresh(review_task)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is None, "non-trunk APPROVE must not spawn a challenger"
+    assert merge_mock.called, "non-trunk APPROVE must merge synchronously"
     rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec["state"] == "challenged_rejected"
+    assert rec is not None and rec["state"] == "unchallenged"
     assert rec["reconciled_verdict"] == "APPROVE"
-    assert not captured_spawn, "overturned REQUEST_CHANGES must not spawn fix"
-    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
 
 
 @pytest.mark.asyncio
@@ -8205,10 +8189,10 @@ async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker)
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
         merge_mock,
-        captured_spawn,
+        _captured_spawn,
     ) = await _setup_review_gate(tl_db, mocker, pr_number=7782)
 
     payload = AgentStatusPayload(
@@ -8234,10 +8218,10 @@ async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
         session,
         factory,
         project,
-        original,
+        _original,
         review_task,
-        merge_mock,
-        captured_spawn,
+        _merge_mock,
+        _captured_spawn,
     ) = await _setup_review_gate(tl_db, mocker, pr_number=7783)
 
     payload = AgentStatusPayload(
