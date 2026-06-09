@@ -103,10 +103,34 @@ class KnowledgeSubstance(NamedTuple):
     forward_quality_verdict: dict[str, Any] | None = None
 
 
+def _is_durable_compute_citation(value: str) -> bool:
+    """True when value is a durable storage URI or path-like reference.
+
+    Rejects bare http(s):// URLs — ephemeral signed download URLs and bare result
+    URLs are transient and cannot serve as durable grounding evidence. Accepts
+    gs://, s3://, az://, file: URIs, path-like references (containing '/'), and
+    metric fragment references of the form gs://...#metric:name=value anchored to
+    a durable storage URI.
+    """
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if lowered.startswith(("gs://", "s3://", "az://", "file:")):
+        return True
+    return "/" in value
+
+
 def knowledge_substance_has_durable_compute_grounding(
     substance: KnowledgeSubstance,
 ) -> bool:
     """True when a compute_experiment substance carries durable grounded evidence.
+
+    Fails closed: the write-time grounding probe is the ONLY positive proof. When
+    the probe is absent — no forward_quality_verdict, no probes dict, no grounding
+    sub-probe, or grounded count absent or zero — returns False. Additionally, at
+    least one citation must be a durable reference (gs://, s3://, az://, file:, or
+    path-like); bare http(s):// ephemeral/signed URLs are rejected even when the
+    probe is present and grounded > 0.
 
     This is a consumer-side predicate over stored knowledge-document signals. It
     does not re-derive artifact durability; it only inspects the persisted
@@ -121,21 +145,28 @@ def knowledge_substance_has_durable_compute_grounding(
     if not citations:
         return False
 
+    # At least one citation must be a durable reference, not merely non-empty.
+    if not any(_is_durable_compute_citation(c) for c in citations):
+        return False
+
     verdict = substance.forward_quality_verdict
-    if isinstance(verdict, dict):
-        if verdict.get("citation_grounding_miss"):
-            return False
-        probes = verdict.get("probes")
-        if isinstance(probes, dict):
-            grounding = probes.get("grounding")
-            if isinstance(grounding, dict):
-                grounded = grounding.get("grounded")
-                if grounded is not None:
-                    try:
-                        return int(grounded) > 0
-                    except (TypeError, ValueError):
-                        return False
-    return True
+    if not isinstance(verdict, dict):
+        return False  # no write-time probe verdict — fail closed
+    if verdict.get("citation_grounding_miss"):
+        return False
+    probes = verdict.get("probes")
+    if not isinstance(probes, dict):
+        return False  # probe dict absent — fail closed
+    grounding = probes.get("grounding")
+    if not isinstance(grounding, dict):
+        return False  # grounding sub-probe absent — fail closed
+    grounded = grounding.get("grounded")
+    if grounded is None:
+        return False  # grounded count absent — fail closed
+    try:
+        return int(grounded) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def fetch_knowledge_substance_index(

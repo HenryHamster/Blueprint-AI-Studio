@@ -786,3 +786,90 @@ def test_knowledge_empty_index_returns_false():
 
     need = {"kind": "task", "ref": "anything"}
     assert knowledge_substance_satisfies_need(need, []) is False
+
+
+# ── fail-closed probe-absent compute-grounding gate ───────────────────────────
+
+def test_unprobed_compute_doc_does_not_satisfy_prereq():
+    """A compute substance with a durable citation but NO grounding probe must NOT
+    satisfy a prereq — the probe is the only positive proof of durable grounding,
+    so absence of the verdict fails closed (not open)."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-unprobed-1",
+            topic="compute-unprobed-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict=None,  # probe never ran — no verdict
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-unprobed-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_no_probes_key_compute_doc_does_not_satisfy_prereq():
+    """Verdict present but probes dict absent → fail closed."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-noprobes-1",
+            topic="compute-noprobes-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={"analysis_mode": "llm"},  # no probes key
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-noprobes-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_no_grounding_subprobe_compute_doc_does_not_satisfy_prereq():
+    """Probes dict present but grounding sub-probe absent → fail closed."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-noground-1",
+            topic="compute-noground-1",
+            source_kind="compute_experiment",
+            source_citations=("gs://bucket/jobs/result.json",),
+            forward_quality_verdict={"analysis_mode": "llm", "probes": {}},  # no grounding
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-noground-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_ephemeral_url_citation_compute_doc_does_not_satisfy_prereq():
+    """A compute substance whose only citation is an ephemeral signed URL must not
+    satisfy a prereq — bare http(s):// URLs are transient, not durable references."""
+    from app.blocked_need_resolution import knowledge_substance_satisfies_need
+    from app.knowledge_query import KnowledgeSubstance
+
+    substance = [
+        KnowledgeSubstance(
+            finding_hash="compute-ephemeral-1",
+            topic="compute-ephemeral-1",
+            source_kind="compute_experiment",
+            source_citations=("https://signed.storage.example.com/result.json?token=abc",),
+            forward_quality_verdict={
+                "analysis_mode": "llm",
+                "probes": {
+                    "grounding": {
+                        "checked": True,
+                        "file_citations": 1,
+                        "grounded": 1,
+                        "unresolved": [],
+                    }
+                },
+            },
+        )
+    ]
+    need = {"kind": "task", "ref": "compute-ephemeral-1"}
+    assert knowledge_substance_satisfies_need(need, substance) is False
