@@ -59,7 +59,10 @@ from app.task_capabilities import (
 )
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
-from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.artifact_prerequisites import (
+    ARTIFACT_PREREQUISITES_KEY,
+    backfill_artifact_prerequisites,
+)
 from app.github import (
     create_check_run,
     get_pull_request,
@@ -778,6 +781,14 @@ async def claim_task(
             if task.vm_cold_start_ms is None:
                 task.vm_cold_start_ms = max(0, int(claim_latency * 1000))
         session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+    # Backfill artifact prerequisites from already-completed direct dependencies.
+    # A dependent queued after its producer completed never received the push-path
+    # delivery, so we hydrate the pointers here before snapshotting the context.
+    await backfill_artifact_prerequisites(task, session)
+    if session.new or session.dirty:
         await session.commit()
         await session.refresh(task)
 

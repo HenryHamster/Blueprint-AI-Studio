@@ -53,6 +53,73 @@ def _artifact_pointer(artifact: Artifact, source_task_id: str) -> dict[str, Any]
     return pointer
 
 
+async def backfill_artifact_prerequisites(task: Task, session) -> None:
+    """Hydrate artifact_prerequisites from already-completed direct dependencies.
+
+    Called at claim time so a dependent that was queued after its producer
+    completed still receives artifact pointers before launch.  Idempotent:
+    skips any pointer whose artifact_id is already present in the list.
+    """
+    if not task.depends_on:
+        return
+    try:
+        dep_ids = list(task.depends_on)
+        query = select(Task).where(
+            Task.id.in_(dep_ids),
+            Task.status == TaskStatus.COMPLETED,
+        )
+        producers = (await session.execute(query)).scalars().all()
+        if not producers:
+            return
+
+        artifact_query = (
+            select(Artifact)
+            .where(
+                Artifact.task_id.in_([p.id for p in producers]),
+                Artifact.logical_key.isnot(None),
+            )
+        )
+        artifacts = (await session.execute(artifact_query)).scalars().all()
+        if not artifacts:
+            return
+
+        ctx = dict(task.context or {})
+        existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
+        prereqs = list(existing) if isinstance(existing, list) else []
+        existing_ids = {
+            p.get("artifact_id")
+            for p in prereqs
+            if isinstance(p, dict)
+        }
+
+        added = 0
+        for artifact in artifacts:
+            aid = str(artifact.id)
+            if aid in existing_ids:
+                continue
+            pointer = _artifact_pointer(artifact, str(artifact.task_id))
+            prereqs.append(pointer)
+            existing_ids.add(aid)
+            added += 1
+
+        if added:
+            ctx[ARTIFACT_PREREQUISITES_KEY] = prereqs
+            task.context = ctx
+            flag_modified(task, "context")
+            session.add(task)
+            logger.info(
+                "[ARTIFACT] Backfilled %d artifact prerequisite(s) onto task %s",
+                added,
+                task.id,
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[ARTIFACT] backfill_artifact_prerequisites failed for task %s",
+            task.id,
+            exc_info=True,
+        )
+
+
 async def deliver_artifact_to_dependents(
     task: Task,
     artifact: Artifact,
