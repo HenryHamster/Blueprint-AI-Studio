@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { previewOnboardProject, createComputeExperiment } from './api';
+import { previewOnboardProject, createComputeExperiment, fetchComputeJobs } from './api';
 
 vi.mock('./firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
@@ -79,5 +79,33 @@ describe('createComputeExperiment', () => {
         deadline_seconds: 1800,
       }),
     ).rejects.toThrow('spend cap exceeds approval threshold');
+  });
+});
+
+describe('fetchComputeJobs', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('omits include_finished_minutes unless explicitly provided', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ compute_jobs: [] }), { status: 200 }),
+    );
+
+    await fetchComputeJobs('proj-1');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs');
+  });
+
+  it('serializes include_finished_minutes when provided', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ compute_jobs: [] }), { status: 200 }),
+    );
+
+    await fetchComputeJobs('proj-1', undefined, 1440);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
   });
 });

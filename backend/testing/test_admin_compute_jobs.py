@@ -13,6 +13,8 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -38,7 +40,14 @@ async def _add_member(session, project_id, role):
     await session.commit()
 
 
-async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title="compute_experiment task"):
+async def _make_job(
+    session,
+    project,
+    *,
+    status=ComputeJobStatus.RUNNING,
+    title="compute_experiment task",
+    with_artifact=False,
+):
     task = Task(
         project_id=project.id,
         title=title,
@@ -48,6 +57,17 @@ async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title=
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    artifact = None
+    if with_artifact:
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri="gs://bucket/jobs/job-1/result.parquet",
+            logical_key="compute-result-job-1",
+        )
+        session.add(artifact)
+        await session.commit()
+        await session.refresh(artifact)
     job = ComputeJob(
         task_id=task.id,
         project_id=project.id,
@@ -57,18 +77,19 @@ async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title=
         spend_cap_usd=2.0,
         accrued_cost_usd=0.5,
         result_reference="https://storage.example.com/jobs/job-1/result.json",
+        artifact_id=artifact.id if artifact else None,
     )
     session.add(job)
     await session.commit()
     await session.refresh(job)
-    return task, job
+    return task, job, artifact
 
 
 @pytest.mark.asyncio
 async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session)
     await _add_member(db_session, project.id, "viewer")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
     assert resp.status_code == 200
@@ -78,6 +99,54 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     assert jobs[0]["task_title"] == "compute_experiment task"
     assert jobs[0]["task_type"] == "compute_experiment"
     assert jobs[0]["result_reference"] == "https://storage.example.com/jobs/job-1/result.json"
+    # A job with only a raw result_reference and no linked Artifact must expose
+    # the descriptor explicitly as null so operators can tell the two apart.
+    assert jobs[0]["artifact"] is None
+
+
+@pytest.mark.asyncio
+async def test_linked_compute_result_artifact_descriptor_serialized(
+    client: AsyncClient, db_session
+):
+    """A job whose artifact_id resolves to a COMPUTE_RESULT Artifact exposes a
+    structured `artifact` descriptor carrying the artifact's identity and
+    download affordance (id/type/storage_uri/logical_key/created_at)."""
+    project = await _make_project(db_session, name="Linked Artifact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, artifact = await _make_job(db_session, project, with_artifact=True)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == str(job.id)
+    assert jobs[0]["artifact_id"] == str(artifact.id)
+
+    descriptor = jobs[0]["artifact"]
+    assert descriptor is not None
+    assert descriptor["id"] == str(artifact.id)
+    assert descriptor["artifact_type"] == ArtifactType.COMPUTE_RESULT.value
+    assert descriptor["storage_uri"] == "gs://bucket/jobs/job-1/result.parquet"
+    assert descriptor["logical_key"] == "compute-result-job-1"
+    assert descriptor["created_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_no_artifact_omits_descriptor(
+    client: AsyncClient, db_session
+):
+    """A job carrying only a result_reference (no artifact_id) must serialize a
+    null `artifact` descriptor — the distinction has to be explicit."""
+    project = await _make_project(db_session, name="No Artifact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project)
+    assert job.artifact_id is None
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert jobs[0]["artifact"] is None
+    assert jobs[0]["result_reference"] is not None
 
 
 @pytest.mark.asyncio
@@ -93,7 +162,7 @@ async def test_list_compute_jobs_non_member_404(client: AsyncClient, db_session)
 async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Killable")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 200
@@ -109,7 +178,7 @@ async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
 ):
     project = await _make_project(db_session, name="Kill RPC Failure")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
     job.external_compute_id = "admin-kill-rpc-failure"
     db_session.add(job)
     await db_session.commit()
@@ -137,7 +206,7 @@ async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
 async def test_kill_compute_job_viewer_forbidden(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Viewer Only")
     await _add_member(db_session, project.id, "viewer")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 403
@@ -156,7 +225,7 @@ async def test_kill_compute_job_missing_404(client: AsyncClient, db_session):
 async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Already Done")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project, status=ComputeJobStatus.SUCCEEDED)
+    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.SUCCEEDED)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 409
@@ -169,7 +238,7 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     terminal job rather than blowing up with a 500."""
     project = await _make_project(db_session, name="Peer Terminal")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     # Simulate the peer-terminal race: kill_compute_job returns None (peer won),
     # but the job in DB is already CANCELLED.

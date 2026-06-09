@@ -7267,14 +7267,14 @@ class TestMarkLandedParentDependents:
 
 # ── Step 12: BLOCKED-task auto-unblock / escalation sweep ─────────────────────
 
-from app.reaper_sweeps import (
+from app.reaper_sweeps import (  # noqa: E402
     sweep_unblock_blocked_tasks,
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow  # noqa: E402
 
 
 async def _blocked_task(db, project, **kwargs):
@@ -10335,10 +10335,10 @@ async def test_full_reaper_cycle_does_not_reap_blocked_task(
 
 # ── Step 15: linked bug-class message convergence / resurfacing sweep ─────────
 
-from app.reaper_sweeps import sweep_converge_linked_bug_messages
-from app.models import MessageType, ProjectMessage
-from app.models import Direction
-from app.message_convergence import link_message_to_outcome
+from app.reaper_sweeps import sweep_converge_linked_bug_messages  # noqa: E402
+from app.models import MessageType, ProjectMessage  # noqa: E402
+from app.models import Direction  # noqa: E402
+from app.message_convergence import link_message_to_outcome  # noqa: E402
 
 
 async def _make_bug_message(
@@ -11011,7 +11011,7 @@ async def test_spawn_converge_refuses_cycle_for_coordinated_siblings(reaper_db):
 
 # ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ───────
 
-from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages
+from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages  # noqa: E402
 
 
 async def _make_landed_task(db, project, *, status=TaskStatus.COMPLETED, landed=True):
@@ -11305,7 +11305,7 @@ async def test_open_owned_one_bad_row_does_not_abort_batch(reaper_db):
 
 # ── Step 18: negatively resolve OPEN bug-class messages confirmed stale on HEAD ─
 
-from app.reaper_sweeps import sweep_resolve_stale_open_bug_messages
+from app.reaper_sweeps import sweep_resolve_stale_open_bug_messages  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -11713,7 +11713,7 @@ async def test_migration_slot_contention_sweep_silent_with_no_waiters(reaper_db,
 
 # ── event_driven_unblock_dependents ──────────────────────────────────────────
 
-from app.reaper_sweeps import event_driven_unblock_dependents
+from app.reaper_sweeps import event_driven_unblock_dependents  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -12444,7 +12444,7 @@ async def test_knowledge_completion_trigger_is_fail_open(reaper_db, mocker, monk
 #           need-less parked transient blockers re-evaluate and requeue when cleared
 #   Fix 3: recovery sweep resets already-parked transient blockers to bounded re-eval
 
-from app.reaper_sweeps import (
+from app.reaper_sweeps import (  # noqa: E402
     sweep_recover_stranded_transient_blockers,
     _BLOCKED_PARKED_REEVAL_INTERVAL,
     _TRANSIENT_BLOCKER_PARK_SENTINEL,

@@ -18,7 +18,7 @@ from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import kill_compute_job, list_compute_jobs
 from app.database import get_session
-from app.models import ComputeJob, Task
+from app.models import Artifact, ComputeJob, Task
 from app.schemas import serialize_compute_job_response
 
 router = APIRouter(
@@ -28,8 +28,29 @@ router = APIRouter(
 )
 
 
+def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
+    """Build the additive operator-facing descriptor for a linked artifact.
+
+    Exposes the artifact's identity and download affordance (downloads are
+    resolved elsewhere via /api/admin/artifacts/download-url by storage_uri),
+    so the descriptor only needs to carry the identifying fields.
+    """
+    # artifact_type is persisted as a plain String column, so it reads back as a
+    # str; tolerate either the Enum member or the raw value.
+    return {
+        "id": str(artifact.id),
+        "artifact_type": getattr(
+            artifact.artifact_type, "value", artifact.artifact_type
+        ),
+        "storage_uri": artifact.storage_uri,
+        "logical_key": artifact.logical_key,
+        "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+    }
+
+
 async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[str, Any]]:
-    """Serialize jobs and augment each with the launching task's title/type."""
+    """Serialize jobs and augment each with the launching task's title/type and
+    an optional descriptor for the job's linked durable Artifact."""
     task_ids = {job.task_id for job in jobs if job.task_id is not None}
     titles: Dict[uuid.UUID, tuple[str | None, str | None]] = {}
     if task_ids:
@@ -40,12 +61,27 @@ async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[s
             task_type = str(task.first_payload.get("type") or "") or None
             titles[task.id] = (task.title, task_type)
 
+    # Batch-load linked artifacts to avoid an N+1 query across the listed jobs.
+    artifact_ids = {job.artifact_id for job in jobs if job.artifact_id is not None}
+    artifacts: Dict[uuid.UUID, Artifact] = {}
+    if artifact_ids:
+        artifact_rows = (
+            await session.execute(
+                select(Artifact).where(Artifact.id.in_(artifact_ids))
+            )
+        ).scalars().all()
+        artifacts = {artifact.id: artifact for artifact in artifact_rows}
+
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response(job)
         title, task_type = titles.get(job.task_id, (None, None))
         data["task_title"] = title
         data["task_type"] = task_type
+        linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
+        data["artifact"] = (
+            _artifact_descriptor(linked_artifact) if linked_artifact else None
+        )
         payload.append(data)
     return payload
 

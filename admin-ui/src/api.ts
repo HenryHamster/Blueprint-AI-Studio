@@ -2181,6 +2181,13 @@ export interface ComputeJob {
   // completion-defining outcome of a finished compute_experiment. Optional/null
   // on legacy or in-flight rows that predate artifact creation.
   artifact_id?: string | null;
+  artifact?: {
+    id: string;
+    artifact_type: string;
+    storage_uri: string | null;
+    logical_key?: string | null;
+    created_at?: string | null;
+  } | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
   polling_metadata?: Record<string, unknown>;
@@ -2195,9 +2202,15 @@ export interface ComputeJob {
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,
+  includeFinishedMinutes?: number,
 ): Promise<ComputeJob[]> {
+  const query = new URLSearchParams();
+  if (typeof includeFinishedMinutes === 'number') {
+    query.set('include_finished_minutes', String(includeFinishedMinutes));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs`,
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
     undefined,
     2,
     30000,

@@ -22,6 +22,8 @@ import {
   type MergeTestResult,
 } from '../utils/mergeTestVerdict';
 
+const WIDE_FINISHED_WINDOW_MINUTES = 10_080;
+
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
 
@@ -184,7 +186,7 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
-    fetchComputeJobs(projectId)
+    fetchComputeJobs(projectId, undefined, WIDE_FINISHED_WINDOW_MINUTES)
       .then(all => {
         if (!cancelled) setJobs(all.filter(j => j.task_id === taskId));
       })
@@ -192,6 +194,7 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
     return () => { cancelled = true; };
   }, [projectId, taskId]);
 
+  if (!projectId) return null;
   if (jobs.length === 0) return null;
 
   const isComputeExperiment = (task.task_type as string) === 'compute_experiment' ||
@@ -284,7 +287,17 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
                 <span className="text-xs text-neutral-400 break-words">{job.terminal_reason}</span>
               </DetailRow>
             )}
-            {job.artifact_id && (
+            {job.artifact?.storage_uri ? (
+              <DetailRow label="Compute Result Artifact">
+                <ResolvedReferenceLink
+                  projectId={projectId}
+                  reference={job.artifact.storage_uri}
+                  className="inline-flex items-center gap-1.5 font-semibold text-emerald-400 hover:text-emerald-300 hover:underline break-words text-left disabled:opacity-70"
+                >
+                  <span className="break-words">{job.artifact.storage_uri}</span>
+                </ResolvedReferenceLink>
+              </DetailRow>
+            ) : job.artifact_id ? (
               <DetailRow label="Artifact">
                 {job.result_reference ? (
                   <ResolvedReferenceLink
@@ -299,9 +312,9 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
                   <span className="font-semibold text-emerald-400">COMPUTE_RESULT artifact</span>
                 )}
               </DetailRow>
-            )}
-            {job.result_reference && (
-              <DetailRow label="Result reference">
+            ) : null}
+            {!job.artifact?.storage_uri && job.result_reference && (
+              <DetailRow label={job.artifact_id ? "Result reference" : "Raw result reference"}>
                 <ResolvedReferenceLink
                   projectId={projectId}
                   reference={job.result_reference}

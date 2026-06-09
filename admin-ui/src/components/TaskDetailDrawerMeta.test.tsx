@@ -556,6 +556,7 @@ describe('DetailsTab — Merge Test Gate', () => {
     ]);
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 10_080);
     expect(await screen.findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i })).toHaveAttribute(
       'href',
       'https://storage.example.com/jobs/job-1/result.json',
@@ -624,6 +625,8 @@ describe('DetailsTab — Merge Test Gate', () => {
         last_polled_at: '2026-01-01T00:10:00Z',
         accrued_cost_usd: 1.5,
         final_cost_usd: 1.5,
+        artifact_id: null,
+        artifact: null,
         result_reference: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
         task_title: 'compute_experiment: run a budgeted job',
         task_type: 'compute_experiment',
@@ -639,6 +642,73 @@ describe('DetailsTab — Merge Test Gate', () => {
       'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
     );
     expect(openSpy).toHaveBeenCalled();
+  });
+
+  it('renders linked compute-result artifacts distinctly from raw result references', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      {
+        id: 'job-1',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-1',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        artifact_id: 'artifact-1',
+        artifact: {
+          id: 'artifact-1',
+          artifact_type: 'COMPUTE_RESULT',
+          storage_uri: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/artifacts/result.json',
+          logical_key: 'tasks/task-verify-1/artifacts/result.json',
+          created_at: '2026-01-01T00:10:00Z',
+        },
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+      {
+        id: 'job-2',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-2',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        artifact_id: null,
+        artifact: null,
+        result_reference: 'https://storage.example.com/jobs/job-2/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('Compute Result Artifact')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/artifacts\/result\.json/i })).toBeInTheDocument();
+    expect(screen.getByText('Raw result reference')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-2\/result\.json/i })).toBeInTheDocument();
   });
 
   it('renders storage-backed task artifacts through the signed download resolver', () => {
@@ -1145,6 +1215,8 @@ function makeComputeJob(overrides: Partial<import('../api').ComputeJob> = {}): i
     last_polled_at: '2026-06-08T00:30:00Z',
     accrued_cost_usd: 3.5,
     final_cost_usd: 3.5,
+    artifact_id: null,
+    artifact: null,
     result_reference: null,
     artifact_id: null,
     accelerator_type: null,
