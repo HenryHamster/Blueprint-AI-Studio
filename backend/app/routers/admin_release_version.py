@@ -374,6 +374,14 @@ async def get_version_lifecycle(
 
     promotion_readiness = await compute_promotion_readiness(session, project_id)
 
+    from app.release_readiness import (  # noqa: PLC0415
+        get_challenged_vs_unchallenged_telemetry,
+    )
+
+    challenged_vs_unchallenged = await get_challenged_vs_unchallenged_telemetry(
+        session, project_id
+    )
+
     return {
         "current_version": current_version_out,
         "recent_versions": [
@@ -402,6 +410,7 @@ async def get_version_lifecycle(
         "staged_directions": (
             _build_staged_directions_summary(project_row) if project_row else []
         ),
+        "challenged_vs_unchallenged": challenged_vs_unchallenged,
     }
 
 

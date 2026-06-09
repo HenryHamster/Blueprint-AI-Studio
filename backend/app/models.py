@@ -227,7 +227,6 @@ class ArtifactType(str, Enum):
     # Like MERGE_TEST_RESULT, the column is a plain String so no migration is
     # needed.
     RELEASE_AUDIT_CHALLENGE = "RELEASE_AUDIT_CHALLENGE"
-    RELEASE_AUDIT_CHALLENGE_REPORT = "RELEASE_AUDIT_CHALLENGE_REPORT"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is

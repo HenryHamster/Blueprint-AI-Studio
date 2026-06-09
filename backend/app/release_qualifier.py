@@ -62,7 +62,6 @@ Public API: ``run_qualification``, ``maybe_finalize_qualification``,
 from __future__ import annotations
 
 import logging
-import json
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -81,7 +80,6 @@ from app.acceptance_gate import (
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import (
-    Artifact,
     ArtifactType,
     Project,
     Task,
@@ -1630,57 +1628,6 @@ async def _compute_acceptance_window_aggregate(
     }
 
 
-async def _load_release_audit_challenge_report(
-    session: AsyncSession,
-    challenge_task_id: str | None,
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Load optional advisory challenge evidence without affecting qualification."""
-    if not challenge_task_id:
-        return None, "challenge_absent"
-    try:
-        task_id = uuid.UUID(str(challenge_task_id))
-    except (ValueError, TypeError):
-        return None, "challenge_task_id_invalid"
-
-    challenge_task = await session.get(Task, task_id)
-    if challenge_task is None:
-        return None, "challenge_task_missing"
-    if challenge_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-        return None, f"challenge_task_{challenge_task.status.lower()}"
-    if challenge_task.status != TaskStatus.COMPLETED:
-        return None, f"challenge_task_{challenge_task.status.lower()}"
-
-    artifact = (
-        (
-            await session.execute(
-                select(Artifact)
-                .where(
-                    Artifact.task_id == task_id,
-                    Artifact.artifact_type
-                    == ArtifactType.RELEASE_AUDIT_CHALLENGE_REPORT,
-                )
-                .order_by(Artifact.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if artifact is None or not artifact.logs:
-        return None, "challenge_absent"
-    try:
-        parsed = json.loads(artifact.logs)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] challenge artifact for task %s is unparseable",
-            task_id,
-        )
-        return None, "challenge_unparseable"
-    if not isinstance(parsed, dict):
-        return None, "challenge_unparseable"
-    return parsed, None
-
-
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1885,15 +1832,6 @@ async def _finalize_qualification(
             session, version, qual, "audit_report_missing"
         )
 
-    audit_challenge_report, audit_challenge_reason = (
-        await _load_release_audit_challenge_report(session, audit_challenge_task_id)
-    )
-    if (
-        audit_challenge_reason == "challenge_absent"
-        and qual.get("audit_challenge_spawn_error")
-    ):
-        audit_challenge_reason = "challenge_spawn_failed"
-
     audit_score, test_erosion_score = _score_audit(audit_report)
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually
@@ -2029,20 +1967,15 @@ async def _finalize_qualification(
     audit_findings = _extract_audit_findings(_audit_report_scored)
     # Build the reconciliation record on the RECONCILED report so
     # findings_derived_score agrees with the applied audit_score.  The challenge
-    # synthesis is derived from the binding verdict artifact (new gate) or the
-    # advisory reason (legacy path) — kept separate from excluded_findings_count
-    # (verification-gate drops) so they are never double-counted.
-    _synthesis_reason: str | None = (
-        None  # binding gate ran — derive from challenge_verdicts
-        if (challenge_task_id or not audit_challenge_task_id)
-        else audit_challenge_reason  # legacy advisory path only
-    )
+    # synthesis is derived from the binding verdict artifact (new gate) — kept
+    # separate from excluded_findings_count (verification-gate drops) so they
+    # are never double-counted.
     audit_reconciliation = {
         **_compute_audit_reconciliation(_audit_report_scored),
         "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
             audit_report,
             challenge_verdicts,
-            challenge_reason=_synthesis_reason,
+            challenge_reason=None,
         ),
         "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
     }

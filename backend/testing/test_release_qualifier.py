@@ -4236,7 +4236,7 @@ async def _attach_audit_challenge(
         db_session.add(
             Artifact(
                 task_id=task.id,
-                artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE_REPORT,
+                artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
                 logs=json.dumps(logs) if logs is not None else raw_logs,
             )
         )
@@ -4459,7 +4459,89 @@ async def test_finalize_unparseable_challenge_is_advisory_and_verdict_identical(
         "audit_challenge"
     ]
     assert challenge["status"] == "unavailable"
-    assert challenge["reason"] == "challenge_unparseable"
+    # The dead _REPORT reader is gone; the advisory path no longer reads any
+    # artifact, so unparseable evidence yields "challenge_absent" (same as the
+    # baseline), confirming the finalize path never consults _REPORT.
+    assert challenge["reason"] == "challenge_absent"
+
+
+@pytest.mark.asyncio
+async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
+    db_session, mocker
+):
+    """Synthesis resolves the RELEASE_AUDIT_CHALLENGE artifact the live handler
+    emits.  A real emitted-artifact challenge drives status='available' and lands
+    the verdict in the challenged telemetry cohort.  No live finalize path
+    consults RELEASE_AUDIT_CHALLENGE_REPORT."""
+    from app import shared_state
+    from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    _candidate_sha = "feed" * 10
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={"passed": True},
+        challenge_verdicts=[
+            {
+                "finding_title": "No issue",
+                "verdict": "confirmed",
+                "rationale": "challenger agrees",
+            }
+        ],
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The binding RELEASE_AUDIT_CHALLENGE artifact drove the synthesis to
+    # 'available' — the dead _REPORT reader was never consulted.
+    synthesis = version.last_qualification["audit_reconciliation"]["audit_challenge"]
+    assert synthesis["status"] == "available", (
+        f"expected 'available', got {synthesis!r}"
+    )
+    assert synthesis["binding"] is True
+    assert synthesis["confirmed_count"] >= 1
+
+    # The verdict row should also land in the 'challenged' telemetry cohort.
+    verdict = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.audit_reconciliation["audit_challenge"]["status"] == "available"
+
+    verdict_dict = {
+        "audit_reconciliation": verdict.audit_reconciliation,
+        "would_promote": verdict.would_promote,
+        "terminal_status": verdict.terminal_status,
+        "post_promotion_outcome": verdict.post_promotion_outcome,
+        "excluded_audit_findings": verdict.excluded_audit_findings,
+    }
+    telemetry = compute_challenged_vs_unchallenged_telemetry([verdict_dict])
+    # With only one verdict the cohort is too small for rate stats, but it must
+    # be classified into the 'challenged' bucket (not 'unchallenged').
+    assert telemetry["challenged"]["sample_size"] == 1
+    assert telemetry["unchallenged"]["sample_size"] == 0
 
 
 @pytest.mark.asyncio

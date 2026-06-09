@@ -22,6 +22,7 @@ import {
   type VersionQualification,
   type PromotionReadiness,
   type QualificationState,
+  type ChallengedVsUnchallengedTelemetry,
 } from '../api';
 import { timeAgo, formatDurationSec, deployWindowStatus } from '../utils/time';
 
@@ -833,6 +834,41 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
   );
 }
 
+function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: ChallengedVsUnchallengedTelemetry }) {
+  const { challenged, unchallenged, total_verdicts } = telemetry;
+  const pct = (r: number) => `${Math.round(r * 100)}%`;
+  const bothInsufficient = challenged.insufficient_sample && unchallenged.insufficient_sample;
+  return (
+    <div data-testid="challenged-vs-unchallenged" className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Challenge Impact ({total_verdicts} verdicts)</p>
+      {bothInsufficient ? (
+        <span className="text-[10px] text-neutral-600 italic">not enough data yet (need ≥3 per cohort)</span>
+      ) : (
+        <div className="flex flex-wrap gap-x-4 gap-y-1">
+          {([{ label: 'challenged', s: challenged }, { label: 'unchallenged', s: unchallenged }] as const).map(({ label, s }) => (
+            <div key={label} className="space-y-0.5">
+              <span className="text-[10px] text-neutral-500">{label} ({s.sample_size})</span>
+              {s.insufficient_sample ? (
+                <span className="text-[10px] text-neutral-600 italic"> — insufficient</span>
+              ) : (
+                <div className="flex flex-wrap gap-1">
+                  <span className="text-[10px] px-1 py-0 rounded bg-neutral-800 border border-neutral-700 text-neutral-400" title="exclusion rate — fraction of verdicts with audit findings excluded for lacking verification">excl {pct(s.exclusion_rate ?? 0)}</span>
+                  {s.disagreement_rate != null && (
+                    <span className={`text-[10px] px-1 py-0 rounded border ${(s.disagreement_rate ?? 0) > 0.2 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title="challenger disagreement rate — fraction where the challenger did not fully agree">disagree {pct(s.disagreement_rate)}</span>
+                  )}
+                  {s.wrong_decision_rate != null && (
+                    <span className={`text-[10px] px-1 py-0 rounded border ${s.wrong_decision_rate > 0 ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`} title={`post-promotion wrong decision rate over ${s.wrong_decision_resolved_sample ?? 0} resolved promotions`}>wrong {pct(s.wrong_decision_rate)}</span>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
@@ -1457,6 +1493,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           </div>
         )}
         {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {data.challenged_vs_unchallenged && (
+          <ChallengedVsUnchallengedSummary telemetry={data.challenged_vs_unchallenged} />
+        )}
         {data.staged_directions && data.staged_directions.length > 0 && (
           <StagedDirectionsSummary staged={data.staged_directions} />
         )}

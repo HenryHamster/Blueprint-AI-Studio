@@ -1411,6 +1411,23 @@ export interface StagedDirection {
   staged_age_days: number | null;
 }
 
+export interface ChallengedVsUnchallengedCohort {
+  sample_size: number;
+  insufficient_sample: boolean;
+  exclusion_rate?: number;
+  exclusion_count?: number;
+  disagreement_rate?: number;
+  disagreement_count?: number;
+  wrong_decision_rate?: number | null;
+  wrong_decision_resolved_sample?: number;
+}
+
+export interface ChallengedVsUnchallengedTelemetry {
+  challenged: ChallengedVsUnchallengedCohort;
+  unchallenged: ChallengedVsUnchallengedCohort;
+  total_verdicts: number;
+}
+
 export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
@@ -1423,6 +1440,8 @@ export interface VersionLifecycleResponse {
   promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
   staged_directions?: StagedDirection[];
+  /** Challenged-vs-unchallenged decision-quality cohort comparison. Advisory/display only. */
+  challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;
 }
 
 export interface SetPromotionEnabledResponse {

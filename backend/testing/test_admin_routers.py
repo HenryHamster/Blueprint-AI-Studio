@@ -9366,6 +9366,143 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert verdicts[0]["candidate_sha"] == "aggsha789"
 
 
+class TestVersionLifecycleChallengedVsUnchallenged:
+    """GET /version-lifecycle exposes the challenged-vs-unchallenged telemetry
+    field derived from real QualificationVerdict history."""
+
+    @pytest.mark.asyncio
+    async def test_challenged_vs_unchallenged_present_and_has_expected_shape(
+        self, client: AsyncClient, db_session
+    ):
+        """The endpoint always returns challenged_vs_unchallenged with the three
+        required keys; an empty history produces an insufficient_sample state."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "challenged_vs_unchallenged" in body
+        tel = body["challenged_vs_unchallenged"]
+        assert "challenged" in tel
+        assert "unchallenged" in tel
+        assert "total_verdicts" in tel
+        # No verdicts seeded — both cohorts are insufficient_sample.
+        assert tel["total_verdicts"] == 0
+        assert tel["challenged"]["insufficient_sample"] is True
+        assert tel["unchallenged"]["insufficient_sample"] is True
+
+    @pytest.mark.asyncio
+    async def test_challenged_vs_unchallenged_populated_from_verdict_history(
+        self, client: AsyncClient, db_session
+    ):
+        """Seeding verdicts with and without audit_reconciliation.audit_challenge
+        produces cohort stats (not insufficient_sample) for the large-enough cohort."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+
+        # Seed 4 challenged verdicts (audit_reconciliation.audit_challenge available)
+        for i in range(4):
+            v = QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=f"chal{i:04d}",
+                confidence=0.91,
+                would_promote=True,
+                promotion_enabled=False,
+                terminal_status="dry_run",
+                threshold=0.90,
+                audit_reconciliation={
+                    "audit_challenge": {
+                        "status": "available",
+                        "reported_agreement": "agree",
+                        "confirmed_count": 1,
+                        "refuted_count": 0,
+                        "uncertain_count": 0,
+                    },
+                    "excluded_findings_count": 0,
+                },
+            )
+            db_session.add(v)
+
+        # Seed 4 unchallenged verdicts (no audit_challenge)
+        for i in range(4):
+            v = QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=f"unch{i:04d}",
+                confidence=0.85,
+                would_promote=False,
+                promotion_enabled=False,
+                terminal_status="not_promoted",
+                threshold=0.90,
+            )
+            db_session.add(v)
+
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        tel = resp.json()["challenged_vs_unchallenged"]
+        assert tel["total_verdicts"] == 8
+        # Both cohorts have 4 verdicts >= _MIN_TELEMETRY_SAMPLE (3).
+        assert tel["challenged"]["insufficient_sample"] is False
+        assert tel["challenged"]["sample_size"] == 4
+        assert "exclusion_rate" in tel["challenged"]
+        assert "disagreement_rate" in tel["challenged"]
+        assert tel["unchallenged"]["insufficient_sample"] is False
+        assert tel["unchallenged"]["sample_size"] == 4
+        assert "exclusion_rate" in tel["unchallenged"]
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 

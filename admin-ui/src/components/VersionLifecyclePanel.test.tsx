@@ -2387,4 +2387,108 @@ describe('VersionLifecyclePanel', () => {
       promptSpy.mockRestore();
     });
   });
+
+  describe('ChallengedVsUnchallengedSummary', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders nothing when challenged_vs_unchallenged is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('challenged-vs-unchallenged')).not.toBeInTheDocument();
+    });
+
+    it('renders insufficient-sample state when both cohorts lack data', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: { sample_size: 1, insufficient_sample: true },
+              unchallenged: { sample_size: 2, insufficient_sample: true },
+              total_verdicts: 3,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('challenged-vs-unchallenged')).toBeInTheDocument();
+      expect(screen.getByText(/not enough data yet/)).toBeInTheDocument();
+    });
+
+    it('renders cohort stats with exclusion and disagreement rates', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 10,
+                insufficient_sample: false,
+                exclusion_rate: 0.3,
+                exclusion_count: 3,
+                disagreement_rate: 0.25,
+                disagreement_count: 2,
+                wrong_decision_rate: 0.1,
+                wrong_decision_resolved_sample: 10,
+              },
+              unchallenged: {
+                sample_size: 15,
+                insufficient_sample: false,
+                exclusion_rate: 0.2,
+                exclusion_count: 3,
+                wrong_decision_rate: 0.4,
+                wrong_decision_resolved_sample: 5,
+              },
+              total_verdicts: 25,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      expect(panel).toBeInTheDocument();
+      expect(panel).toHaveTextContent('25 verdicts');
+      expect(panel).toHaveTextContent('challenged (10)');
+      expect(panel).toHaveTextContent('excl 30%');
+      expect(panel).toHaveTextContent('disagree 25%');
+      expect(panel).toHaveTextContent('unchallenged (15)');
+      expect(panel).toHaveTextContent('excl 20%');
+    });
+
+    it('renders wrong_decision_rate as zero-rate emerald when no wrong decisions', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            challenged_vs_unchallenged: {
+              challenged: {
+                sample_size: 5,
+                insufficient_sample: false,
+                exclusion_rate: 0.0,
+                disagreement_rate: 0.0,
+                wrong_decision_rate: 0.0,
+                wrong_decision_resolved_sample: 5,
+              },
+              unchallenged: { sample_size: 1, insufficient_sample: true },
+              total_verdicts: 6,
+            },
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const panel = screen.getByTestId('challenged-vs-unchallenged');
+      expect(panel).toHaveTextContent('wrong 0%');
+    });
+  });
 });
