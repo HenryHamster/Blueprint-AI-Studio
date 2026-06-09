@@ -1214,10 +1214,13 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     * **2.0** — exact summary text match.  This tier beats any fuzzy score so
       that best-match assignment always prefers an exact match over a fuzzy one
       when a verdict could plausibly match multiple findings.
-    * **(0.0, 1.0]** — token-overlap fuzzy match using the significant-token
-      min-denominator (original behaviour, unchanged threshold).  Covers the
-      common case where the challenge runs in parallel without
-      ``primary_findings`` and independently re-describes the same issue.
+    * **(0.0, 1.0]** — token-overlap fuzzy match.  Confirmed/uncertain verdicts
+      use the significant-token min-denominator (original behaviour, unchanged
+      threshold).  Refuted false positives use a stricter Jaccard-style
+      denominator so a short subset summary cannot over-bind to a broader
+      finding.  This still covers the common case where the challenge runs in
+      parallel without ``primary_findings`` and independently re-describes the
+      same issue.
     * ``None`` — no match (file-path conflict or similarity below threshold).
 
     Confirmed/uncertain verdict severity is deliberately NOT used for scoring:

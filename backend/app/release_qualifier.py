@@ -410,9 +410,13 @@ async def _qualification_in_flight(
     # only when the qualifying run had the smoketest subsystem enabled —
     # records that predate the smoketest_enabled flag default to "required"
     # so legacy pending records keep their original conservative behaviour.
+    # The challenge child is required when the qualifying run recorded a
+    # challenge_task_id — it must reach a terminal state before finalize can fire.
     required_keys = ["audit_task_id"]
     if qual.get("smoketest_enabled", True):
         required_keys.append("smoketest_task_id")
+    if qual.get("challenge_task_id"):
+        required_keys.append("challenge_task_id")
 
     child_ids: list[uuid.UUID] = []
     parse_failed = False
@@ -2306,6 +2310,8 @@ async def _required_children_terminal(
     smoketest_required = bool(qual.get("smoketest_enabled", True))
     audit_task_id_raw = qual.get("audit_task_id")
     smoketest_task_id_raw = qual.get("smoketest_task_id")
+    challenge_task_id_raw = qual.get("challenge_task_id")
+    challenge_required = bool(challenge_task_id_raw)
 
     if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
         logger.warning(
@@ -2326,13 +2332,19 @@ async def _required_children_terminal(
             if smoketest_required and smoketest_task_id_raw
             else None
         )
+        challenge_task_id = (
+            uuid.UUID(str(challenge_task_id_raw))
+            if challenge_required
+            else None
+        )
     except (ValueError, AttributeError):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
-            "child task ids (%r, %r) — not ready",
+            "child task ids (%r, %r, challenge=%r) — not ready",
             version.version_number,
             audit_task_id_raw,
             smoketest_task_id_raw,
+            challenge_task_id_raw,
         )
         return False
 
@@ -2342,8 +2354,17 @@ async def _required_children_terminal(
         if smoketest_task_id is not None
         else None
     )
+    challenge_task: Task | None = (
+        await session.get(Task, challenge_task_id)
+        if challenge_task_id is not None
+        else None
+    )
 
-    if audit_task is None or (smoketest_required and smoketest_task is None):
+    if (
+        audit_task is None
+        or (smoketest_required and smoketest_task is None)
+        or (challenge_required and challenge_task is None)
+    ):
         logger.debug(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
             "tasks not yet persisted — not ready",
@@ -2351,23 +2372,34 @@ async def _required_children_terminal(
         )
         return False
 
-    if audit_task.status not in _TERMINAL_STATUSES or (
-        smoketest_required
-        and smoketest_task is not None
-        and smoketest_task.status not in _TERMINAL_STATUSES
+    if (
+        audit_task.status not in _TERMINAL_STATUSES
+        or (
+            smoketest_required
+            and smoketest_task is not None
+            and smoketest_task.status not in _TERMINAL_STATUSES
+        )
+        or (
+            challenge_required
+            and challenge_task is not None
+            and challenge_task.status not in _TERMINAL_STATUSES
+        )
     ):
         # A required child is still running — not time to finalize yet.
         return False
 
     logger.info(
         "[RELEASE_QUALIFIER] finalize-gate: required children terminal for "
-        "version v%d (audit=%s/%s smoke=%s)",
+        "version v%d (audit=%s/%s smoke=%s challenge=%s)",
         version.version_number,
         audit_task.id,
         audit_task.status,
         f"{smoketest_task.id}/{smoketest_task.status}"
         if smoketest_task is not None
         else "disabled",
+        f"{challenge_task.id}/{challenge_task.status}"
+        if challenge_task is not None
+        else "not_spawned",
     )
     return True
 
