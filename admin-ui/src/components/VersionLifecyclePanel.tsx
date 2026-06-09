@@ -11,6 +11,7 @@ import {
   triggerQualify,
   type AuditFinding,
   type AuditReconciliation,
+  type ChallengerRefutedFinding,
   type CiResolution,
   type CurrentVersion,
   type LatestAudit,
@@ -533,6 +534,7 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
 type DurableQualificationEvidence = {
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
   migration_safety_detail?: string | null;
   migration_apply_safety?: string | null;
@@ -600,7 +602,20 @@ function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidenc
         className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
         title={excludedFindings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
       >
-        {excludedFindings.length} excluded finding{excludedFindings.length !== 1 ? 's' : ''}
+        {excludedFindings.length} excluded audit finding{excludedFindings.length !== 1 ? 's' : ''}
+      </span>,
+    );
+  }
+  const challengerRefuted = q.challenger_refuted_audit_findings ?? [];
+  if (challengerRefuted.length > 0) {
+    chips.push(
+      <span
+        key="challenger-refuted-findings"
+        data-testid="challenger-refuted-findings"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-300 border-violet-500/20"
+        title={challengerRefuted.map((f) => `${f.severity}: ${f.summary} — ${f.challenger_reason}`).join(' | ')}
+      >
+        {challengerRefuted.length} challenger false positive{challengerRefuted.length !== 1 ? 's' : ''}
       </span>,
     );
   }

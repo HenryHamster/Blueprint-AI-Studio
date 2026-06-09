@@ -132,6 +132,7 @@ from app.release_qualifier_audit import (
     _spawn_release_audit_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
+    get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
 )
@@ -165,6 +166,8 @@ from app.release_scoring import (
     _extract_test_erosion_detail,
     _finding_subject_is_authorized_divergence,  # noqa: F401 — re-exported for tests
     _fmt_sub_scores,
+    _match_finding_to_challenge,  # noqa: F401 — re-exported for callers/tests
+    _reconcile_audit_with_challenge,  # noqa: F401 — re-exported for callers/tests
     _score_audit,
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
@@ -1277,6 +1280,7 @@ async def run_qualification(
     # the design doc specifies (audit + test-erosion + smoketest).
     smoketest_enabled = bool(_runtime_config.get("smoketest_enabled"))
     audit_task_id: str | None = None
+    challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
     audit_challenge_spawn_error: str | None = None
     smoketest_task_id: str | None = None
@@ -1290,27 +1294,22 @@ async def run_qualification(
             candidate_sha=candidate_sha,
         )
         audit_task_id = str(audit_task.id)
-        try:
-            audit_challenge_task = await _spawn_release_audit_challenge_task(
-                session,
-                project_id,
-                version_id=version.id,
-                base_branch=promotion_target,
-                diff_range=diff_range,
-                candidate_sha=candidate_sha,
-                primary_audit_task_id=audit_task_id,
-            )
-            audit_challenge_task_id = str(audit_challenge_task.id)
-        except Exception as exc:  # noqa: BLE001 — advisory task must not block qualification
-            audit_challenge_spawn_error = str(exc)[:300]
-            logger.warning(
-                "[RELEASE_QUALIFIER] advisory audit challenge spawn failed for "
-                "version v%d candidate %s (qualification continues): %s",
-                version.version_number,
-                candidate_sha[:8],
-                exc,
-                exc_info=True,
-            )
+        # Binding adversarial second opinion on the primary audit's findings,
+        # pinned to the SAME candidate as the audit.  Spawned alongside (not
+        # gated on) the audit; its verdicts are BINDING — verified higher-severity
+        # findings must be challenger-confirmed to deduct, and a missing/uncertain
+        # verdict HOLDS the finalization attempt (fail-closed gate).
+        challenge_task = await _spawn_release_audit_challenge_task(
+            session,
+            project_id,
+            version_id=version.id,
+            base_branch=promotion_target,
+            diff_range=diff_range,
+            candidate_sha=candidate_sha,
+            primary_audit_task_id=audit_task_id,
+        )
+        challenge_task_id = str(challenge_task.id)
+        audit_challenge_task_id = challenge_task_id
         if smoketest_enabled:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
@@ -1360,6 +1359,7 @@ async def run_qualification(
         "smoketest_enabled": smoketest_enabled,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
+        "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "smoketest_task_id": smoketest_task_id,
@@ -1377,14 +1377,14 @@ async def run_qualification(
     logger.info(
         "[RELEASE_QUALIFIER] qualification started for v%d project=%s "
         "candidate=%s ci_green=%s smoketest_enabled=%s audit_task=%s "
-        "audit_challenge_task=%s smoketest_task=%s",
+        "challenge_task=%s smoketest_task=%s",
         version.version_number,
         project_id,
         candidate_sha[:8],
         ci_green,
         smoketest_enabled,
         audit_task_id,
-        audit_challenge_task_id,
+        challenge_task_id,
         smoketest_task_id,
     )
     return {
@@ -1394,6 +1394,7 @@ async def run_qualification(
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "audit_task_id": audit_task_id,
+        "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "smoketest_task_id": smoketest_task_id,
@@ -1426,6 +1427,7 @@ _BLOCKER_LABELS: dict[str, str] = {
         "production's recorded schema state (deploy-fatal drift)"
     ),
 }
+
 
 async def _resolve_migration_identity_at_finalize(
     session: AsyncSession,
@@ -1600,14 +1602,11 @@ async def _compute_acceptance_window_aggregate(
     """
 
     since = version.opened_at
-    stmt = (
-        select(Task)
-        .where(
-            Task.project_id == version.project_id,
-            Task.status == TaskStatus.COMPLETED,
-            landed_signal_predicate(session),
-            Task.updated_at >= since,
-        )
+    stmt = select(Task).where(
+        Task.project_id == version.project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
     )
     rows = [
         task
@@ -1619,7 +1618,8 @@ async def _compute_acceptance_window_aggregate(
     verified = sum(
         1
         for task in rows
-        if classify_merged_acceptance_context(task.context or {}) in {"proven", "satisfied_unproven"}
+        if classify_merged_acceptance_context(task.context or {})
+        in {"proven", "satisfied_unproven"}
     )
     fraction = (verified / total) if total > 0 else None
     return {
@@ -1714,7 +1714,8 @@ async def _finalize_qualification(
     qual = dict(version.last_qualification or {})
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
-    audit_challenge_task_id = qual.get("audit_challenge_task_id")
+    challenge_task_id = qual.get("challenge_task_id")
+    audit_challenge_task_id = qual.get("audit_challenge_task_id") or challenge_task_id
     smoketest_task_id = qual.get("smoketest_task_id")
     # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
     # Read from the recorded qualification (NOT live runtime_config) — the
@@ -1894,7 +1895,8 @@ async def _finalize_qualification(
 
     audit_score, test_erosion_score = _score_audit(audit_report)
     # Observability: record model-reported vs findings-derived score delta and
-    # count of findings excluded for missing/short verification_note.
+    # count of findings excluded for missing/short verification_note.  Use the
+    # original (un-reconciled) report for the model-vs-derived cross-check.
     audit_reconciliation = _compute_audit_reconciliation(audit_report)
     audit_reconciliation = {
         **audit_reconciliation,
@@ -1911,7 +1913,8 @@ async def _finalize_qualification(
     # Carry the higher-severity findings the verification gate EXCLUDED from
     # scoring — for display only, marked unverified — so an audit whose
     # sub-score was inflated by dropped findings is rendered honestly instead of
-    # reading as clean. Never confirmed blockers.
+    # reading as clean. Never confirmed blockers.  Use original report (the
+    # unverified-primary gap is independent of the challenge reconciliation).
     excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
     # Carry the specific test-erosion detail (deleted files / negative deltas)
     # so the agent can target it when test-erosion is the binding constraint,
@@ -1975,6 +1978,66 @@ async def _finalize_qualification(
     # Carry the specific smoketest-failure detail (failed suite / named tests)
     # so the agent can target it when smoketest is the binding constraint.
     smoketest_detail = _extract_smoketest_detail(smoketest_result)
+
+    _audit_report_scored = audit_report
+    challenge_verdicts: dict[str, Any] | None = None
+    challenger_refuted_audit_findings: list[dict[str, Any]] = []
+    # --- Read the audit-challenge verdict -------------------------------------
+    # The new binding challenge gate applies when this qualification actually
+    # ran the binding challenge flow.  Legacy advisory-only challenge records
+    # (``audit_challenge_task_id`` without ``challenge_task_id``) remain
+    # observable via audit_reconciliation but do not hard-gate qualification.
+    #
+    # If neither task id is present, this is the new binding flow with a missing
+    # challenge artifact, which MUST hold the version.
+    if challenge_task_id or not audit_challenge_task_id:
+        # The challenge child runs in parallel with the audit.  Its per-finding
+        # verdicts (confirmed / refuted_false_positive / uncertain) are now BINDING:
+        # a verified higher-severity finding may only deduct after the challenger
+        # confirms it.  A missing or uncertain verdict for any such finding HOLDS
+        # this attempt (fail-closed) so the version returns to stabilize for
+        # re-evaluation rather than falsely promoting or silently dropping the
+        # deduction.  The artifact is still read best-effort; a missing challenge
+        # with NO deductible findings proceeds normally (no hold needed).
+        try:
+            challenge_verdicts = await _latest_artifact_logs(
+                session,
+                uuid.UUID(str(challenge_task_id)),
+                ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid challenge_task_id %s on version v%d",
+                challenge_task_id,
+                version.version_number,
+            )
+
+        # --- Challenge reconciliation: fail-closed audit challenge gate -----------
+        # Each verified higher-severity finding must have a challenger-confirmed
+        # verdict to deduct.  Challenger-refuted findings are excluded from scoring
+        # and recorded separately (distinct from excluded_audit_findings which tracks
+        # the unverified-primary substantiation gap — do not fold the two concepts).
+        # A missing/uncertain/SHA-mismatched challenge for any deductible finding
+        # HOLDS the attempt via _handle_infra_failure (same pattern as the migration
+        # defer path: no verdict recorded, version returns to stabilize).
+        _challenge_hold, _audit_report_scored, challenger_refuted_audit_findings = (
+            _reconcile_audit_with_challenge(audit_report, challenge_verdicts, candidate_sha)
+        )
+        if _challenge_hold:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d challenge reconciliation HOLD: %s — "
+                "returning to stabilize for re-evaluation",
+                version.version_number,
+                _challenge_hold,
+            )
+            return await _handle_infra_failure(session, version, qual, _challenge_hold)
+
+    # Score using the reconciled report (refuted findings removed when challenge ran).
+    audit_score, test_erosion_score = _score_audit(_audit_report_scored)
+    # Carry the confirmed (actionable) findings into last_qualification so the
+    # strategic agent can target them.  Use reconciled report when available so
+    # refuted findings are not surfaced as actionable blockers.
+    audit_findings = _extract_audit_findings(_audit_report_scored)
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed
@@ -2047,17 +2110,21 @@ async def _finalize_qualification(
     acceptance_aggregate = None
     if version.opened_at is not None:
         merged_rows = (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == version.project_id,
-                    Task.status == TaskStatus.COMPLETED,
-                    landed_signal_predicate(session),
-                    Task.updated_at >= version.opened_at,
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == version.project_id,
+                        Task.status == TaskStatus.COMPLETED,
+                        landed_signal_predicate(session),
+                        Task.updated_at >= version.opened_at,
+                    )
+                    .order_by(Task.created_at.asc())
                 )
-                .order_by(Task.created_at.asc())
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         merged_rows = [
             task
             for task in merged_rows
@@ -2076,10 +2143,18 @@ async def _finalize_qualification(
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": audit_task_id,
+        "challenge_task_id": challenge_task_id,
+        # Parsed challenge artifact — observable on last_qualification.
+        "challenge_verdicts": challenge_verdicts,
         "audit_challenge_task_id": audit_challenge_task_id,
+        "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
         "excluded_audit_findings": excluded_audit_findings,
+        # Challenger-confirmed false positives: findings the challenge marked
+        # refuted_false_positive with an auditable reason — DISTINCT from
+        # excluded_audit_findings (which tracks the unverified-primary gap).
+        "challenger_refuted_audit_findings": challenger_refuted_audit_findings,
         "test_erosion_detail": test_erosion_detail,
         "smoketest_detail": smoketest_detail,
         "audit_missing_reason": audit_missing_reason,
@@ -2153,10 +2228,7 @@ async def _finalize_qualification(
             # The migration-apply blocker carries the specific missing object so
             # the operator sees WHICH required table/column the candidate's chain
             # would fail to create, not just the generic blocker label.
-            if (
-                composite["blocker"] == "migration_apply_drift"
-                and apply_detail
-            ):
+            if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
             notify_event = "release_blocked"
             notify_summary = (

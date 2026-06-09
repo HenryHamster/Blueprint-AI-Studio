@@ -1187,6 +1187,12 @@ export interface AuditFinding {
   summary: string;
 }
 
+export interface ChallengerRefutedFinding {
+  severity: string;
+  summary: string;
+  challenger_reason: string;
+}
+
 export interface LatestAudit {
   audit_task_id: string;
   task_status: string;
@@ -1221,6 +1227,8 @@ export interface VersionQualification {
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
+  challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
   migration_safety_detail?: string | null;
   migration_apply_safety?: string | null;
@@ -1594,6 +1602,8 @@ export interface QualificationVerdictRecord {
   audit_missing_reason: string | null;
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
+  challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
   migration_safety_detail?: string | null;
   migration_apply_safety?: string | null;

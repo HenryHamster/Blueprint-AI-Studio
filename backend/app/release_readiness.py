@@ -139,7 +139,10 @@ async def _compute_acceptance_aggregate(
             session, project_id, since=version.opened_at
         )
         return {
-            **{bucket: int(agg.get(bucket, 0)) for bucket in ACCEPTANCE_AGGREGATE_BUCKETS},
+            **{
+                bucket: int(agg.get(bucket, 0))
+                for bucket in ACCEPTANCE_AGGREGATE_BUCKETS
+            },
             "total": int(agg.get("total", 0)),
         }
     except Exception:  # noqa: BLE001 — defensive: any failure must not block readiness
@@ -235,6 +238,7 @@ async def _compute_validated_precision(
         "ground_truth_validated": sample >= _READINESS_MIN_RESOLVED_OUTCOMES,
     }
 
+
 # The readiness window is hardcoded to DRY-RUN-regime verdicts (promotion_enabled
 # is False) — sensible pre-go-live calibration, but stale once promotion goes
 # live, because live promote/promotion-failed verdicts are recorded with
@@ -287,6 +291,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "migration_apply_safety_detail": qual.get("migration_apply_safety_detail"),
         "audit_findings": qual.get("audit_findings"),
         "excluded_audit_findings": qual.get("excluded_audit_findings"),
+        "challenger_refuted_audit_findings": qual.get("challenger_refuted_audit_findings"),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
         "audit_reconciliation": qual.get("audit_reconciliation"),
@@ -354,6 +359,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "migration_apply_safety_detail": verdict.migration_apply_safety_detail,
         "audit_findings": verdict.audit_findings,
         "excluded_audit_findings": verdict.excluded_audit_findings,
+        "challenger_refuted_audit_findings": verdict.challenger_refuted_audit_findings,
         "test_erosion_detail": verdict.test_erosion_detail,
         "smoketest_detail": verdict.smoketest_detail,
         "audit_reconciliation": verdict.audit_reconciliation,

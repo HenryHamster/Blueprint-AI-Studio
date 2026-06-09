@@ -26,7 +26,7 @@ import { repairStructuredOutput } from './structured-output-repair.js';
 // Returns the ./fetch guidance block (or '' when project_id is missing); the
 // design-doc advertisement is appended to each prompt unconditionally because
 // writeDesignDocHelper is provisioned alongside it whenever project_id is present.
-function provisionAuditFetchHelpers(
+export function provisionAuditFetchHelpers(
   taskId: string, task: Record<string, unknown>,
 ): string {
   const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
@@ -38,7 +38,7 @@ function provisionAuditFetchHelpers(
 
 // Advertise the read-only ./design-doc CLI in an audit prompt. Gated on the same
 // project_id as the helper write so we never advertise an unwritten helper.
-function designDocAdvertisement(task: Record<string, unknown>): string {
+export function designDocAdvertisement(task: Record<string, unknown>): string {
   const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
   return projectId
     ? '\n\nRead full design-doc section prose on demand with `./design-doc get <key>` (list keys with `./design-doc list`).'

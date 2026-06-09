@@ -1216,7 +1216,9 @@ class TestScoreAuditAuthorizedDivergence:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0), "authorized revision-identity divergence must not deduct"
+        assert audit == pytest.approx(1.0), (
+            "authorized revision-identity divergence must not deduct"
+        )
 
     def test_authorized_divergence_excluded_but_unrelated_finding_still_deducts(self):
         """The authorized renumber is delegated to the gate; an unrelated medium
@@ -1255,7 +1257,9 @@ class TestScoreAuditAuthorizedDivergence:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0 - 0.15), "migration-body defect must still deduct"
+        assert audit == pytest.approx(1.0 - 0.15), (
+            "migration-body defect must still deduct"
+        )
 
     def test_helper_matches_authorized_and_rejects_unrelated(self):
         """_finding_subject_is_authorized_divergence: matches a listed-revision
@@ -1265,7 +1269,10 @@ class TestScoreAuditAuthorizedDivergence:
             "summary": "0143 revision-identity collision (renumber).",
             "verification_note": self._AUTH_VNOTE,
         }
-        unrelated = {"severity": "medium", "summary": "Missing null check in app/api.py."}
+        unrelated = {
+            "severity": "medium",
+            "summary": "Missing null check in app/api.py.",
+        }
         body_defect = {
             "severity": "high",
             "summary": "0143 add_compute_job_persistence has no downgrade().",
@@ -2813,6 +2820,7 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert challenge_task.context["release_version_id"] == str(version.id)
     assert challenge_task.context["candidate_sha"] == candidate
     assert challenge_task.context["primary_audit_task_id"] == str(audit_task.id)
+    assert version.last_qualification["challenge_task_id"] == str(challenge_task.id)
     assert version.last_qualification["audit_challenge_task_id"] == str(
         challenge_task.id
     )
@@ -2986,7 +2994,9 @@ async def test_run_qualification_proceeds_when_synced(db_session, mocker):
     the gate is a no-op and qualification proceeds normally (pending verdict)."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
-    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
@@ -3006,7 +3016,9 @@ async def test_run_qualification_defers_when_candidate_behind_main(db_session, m
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     # main NOT absorbed into the candidate.
-    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False)
+    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
@@ -3037,7 +3049,9 @@ async def test_run_qualification_fall_through_when_unsynced_too_long(
     db_session.add(version)
     await db_session.commit()
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
-    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False)
+    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
@@ -3369,7 +3383,6 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
         .scalars()
         .all()
     )
-    # smoketest_enabled defaults False → release_audit + advisory challenge only.
     assert sorted(t.first_payload.get("type") for t in tasks) == [
         "release_audit",
         "release_audit_challenge",
@@ -3526,7 +3539,9 @@ async def test_run_qualification_dry_run_but_automain_moved_runs_fresh(
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_cached_not_promoted_same_sha_is_noop(db_session, mocker):
+async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
+    db_session, mocker
+):
     """Idempotent qualification: when a conclusive not_promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification
     early-returns cached_verdict and spawns nothing — a candidate that scored
@@ -3642,7 +3657,9 @@ async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_non_conclusive_error_always_retries(db_session, mocker):
+async def test_run_qualification_non_conclusive_error_always_retries(
+    db_session, mocker
+):
     """Non-idempotent infra/error verdicts: when a prior qualification
     finalized with an error status (not a conclusive verdict) and the
     candidate_sha is unchanged, run_qualification proceeds with a fresh run
@@ -3710,16 +3727,28 @@ async def _seed_qualification_children(
     *,
     audit_logs: dict | None,
     smoke_logs: dict | None,
+    challenge_verdicts: list[dict] | None = None,
     ci_green: bool = True,
 ):
-    """Create the two child tasks + their report artifacts, and stamp
-    version.last_qualification with their ids (pending state)."""
+    """Create the qualifier child tasks + their report artifacts, and stamp
+    version.last_qualification with their ids (pending state).
+
+    ``challenge_verdicts`` — when supplied, a RELEASE_AUDIT_CHALLENGE artifact
+    is created for a new challenge task with those verdicts so the fail-closed
+    audit-challenge gate can resolve them.  When None, no challenge artifact is
+    created; tests with NO verified higher-severity findings proceed without one
+    (the gate is inert), while tests with verified findings that want to reach
+    scoring/promotion must pass ``challenge_verdicts`` or the gate will hold.
+    """
+    _candidate_sha = "feed" * 10
+
     audit_task = Task(
         project_id=project.id,
         title="audit",
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         vm_instance_id="vm-audit",
         status=TaskStatus.COMPLETED,
+        context={"candidate_sha": _candidate_sha},
     )
     smoke_task = Task(
         project_id=project.id,
@@ -3751,14 +3780,43 @@ async def _seed_qualification_children(
             )
         )
 
+    challenge_task_id: str | None = None
+    if challenge_verdicts is not None:
+        challenge_task = Task(
+            project_id=project.id,
+            title="audit-challenge",
+            payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+            vm_instance_id="vm-challenge",
+            status=TaskStatus.COMPLETED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        db_session.add(challenge_task)
+        await db_session.flush()
+        db_session.add(
+            Artifact(
+                task_id=challenge_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+                logs=json.dumps(
+                    {
+                        "challenged_candidate_sha": _candidate_sha,
+                        "verdicts": challenge_verdicts,
+                    }
+                ),
+            )
+        )
+        await db_session.flush()
+        await db_session.refresh(challenge_task)
+        challenge_task_id = str(challenge_task.id)
+
     version.last_qualification = {
         "status": "pending",
-        "candidate_sha": "feed" * 10,
+        "candidate_sha": _candidate_sha,
         "ci_green": ci_green,
         "smoketest_enabled": True,
         "started_at": "2026-05-19T00:00:00",
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
+        "challenge_task_id": challenge_task_id,
     }
     db_session.add(version)
     await db_session.commit()
@@ -4387,6 +4445,356 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.last_qualification["status"] == "infra_failure"
 
 
+# ===========================================================================
+# Audit challenge reconciliation — fail-closed gate
+# ===========================================================================
+
+_CANDIDATE_SHA = "abcd1234" * 5  # 40-char hex
+
+
+async def _seed_challenge_artifact(
+    db_session,
+    project,
+    version,
+    *,
+    audit_task,
+    verdicts: list[dict],
+    candidate_sha: str = _CANDIDATE_SHA,
+) -> None:
+    """Create a challenge task + RELEASE_AUDIT_CHALLENGE artifact and stamp
+    version.last_qualification with the challenge_task_id."""
+    challenge_task = Task(
+        project_id=project.id,
+        title="audit-challenge",
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        vm_instance_id="vm-challenge",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(challenge_task)
+    await db_session.flush()
+
+    artifact_payload = {
+        "challenged_candidate_sha": candidate_sha,
+        "verdicts": verdicts,
+    }
+    db_session.add(
+        Artifact(
+            task_id=challenge_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps(artifact_payload),
+        )
+    )
+
+    # Stamp the challenge task id onto last_qualification.
+    version.last_qualification = {
+        **(version.last_qualification or {}),
+        "challenge_task_id": str(challenge_task.id),
+        "candidate_sha": candidate_sha,
+    }
+    # Also update the audit task's candidate_sha to match.
+    audit_task.context = {**(audit_task.context or {}), "candidate_sha": candidate_sha}
+
+    db_session.add(version)
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_deductible_finding_lacks_challenge_confirmation(
+    db_session, mocker
+):
+    """Fail-closed audit challenge gate: when a verified higher-severity finding
+    has no challenge confirmation the qualification attempt is HELD as an infra
+    failure so the version returns to stabilize for re-evaluation.  Neither a
+    false promote nor a false block is recorded.
+
+    This is the named acceptance criterion for the bind-audit-scoring task.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    # Audit reports a verified HIGH finding (verification_note ≥ 20 chars so it
+    # passes _finding_is_verified and would normally deduct 0.15).
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL injection risk in user input path.",
+                    "file": "app/routes.py",
+                    "verification_note": "Confirmed via full route inspection — no sanitisation.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Patch candidate_sha to the known value so challenge SHA-matching works.
+    version.last_qualification = {
+        **(version.last_qualification or {}),
+        "candidate_sha": _CANDIDATE_SHA,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # No challenge task / artifact in last_qualification → _reconcile returns hold.
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Must be held as infra_failure — not promoted, not recorded as a quality verdict.
+    assert result["status"] == "infra_failure"
+    assert result["error"] in {
+        "audit_challenge_missing",
+        "audit_challenge_sha_mismatch",
+    }
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    lq = version.last_qualification
+    assert lq["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_confirmed_finding_still_deducts_with_challenge(
+    db_session, mocker
+):
+    """A challenger-confirmed finding deducts from the audit sub-score as before.
+    A challenge verdict of 'confirmed' is not a false positive — it must still
+    count against the audit score."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL injection risk in user input path.",
+                    "file": "app/routes.py",
+                    "verification_note": "Confirmed via full route inspection — no sanitisation.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "high",
+                "summary": "SQL injection risk in user input path.",
+                "file": "app/routes.py",
+                "verdict": "confirmed",
+                "reason": "Independent review confirms the injection vector is real.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Should score and proceed (not hold) — dry_run because promotion is disabled.
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # Confirmed finding deducted 0.15 → audit_score ≈ 0.85 (1.0 - 0.15).
+    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01)
+    # challenger_refuted_audit_findings must be empty — this finding was confirmed.
+    assert lq.get("challenger_refuted_audit_findings") == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_refuted_finding_excluded_and_recorded(db_session, mocker):
+    """A challenger-confirmed false positive (refuted_false_positive) is excluded
+    from the audit sub-score and recorded in challenger_refuted_audit_findings with
+    the auditable reason — distinct from excluded_audit_findings."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "False alarm: path is already sanitised.",
+                    "file": "app/routes.py",
+                    "verification_note": "Reviewer noted sanitization is missing in diff.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "high",
+                "summary": "False alarm: path is already sanitised.",
+                "file": "app/routes.py",
+                "verdict": "refuted_false_positive",
+                "reason": "The sanitizer middleware covers this path — the auditor missed it.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Refuted finding must not reduce the audit score → clean 1.0 → dry_run passes.
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # No deduction applied (finding refuted) → audit score is 1.0.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01)
+    # Refuted finding recorded in challenger_refuted_audit_findings.
+    refuted = lq.get("challenger_refuted_audit_findings", [])
+    assert len(refuted) == 1
+    assert refuted[0]["severity"] == "high"
+    assert (
+        "sanitiser" in refuted[0]["challenger_reason"].lower()
+        or "sanitizer" in refuted[0]["challenger_reason"].lower()
+    )
+    # excluded_audit_findings must NOT contain this finding (different concept).
+    excluded = lq.get("excluded_audit_findings", [])
+    assert not any("False alarm" in f.get("summary", "") for f in excluded)
+
+
+@pytest.mark.asyncio
+async def test_finalize_challenge_matches_nonverbatim_challenger_summary(
+    db_session, mocker
+):
+    """Fuzzy token-overlap matching lets a challenger verdict with a differently-worded
+    summary (but describing the same finding) bind to the primary audit finding.
+    The challenge runs in parallel without primary_findings, so its free-text
+    summary will differ from the primary's — exact matching would permanently HOLD."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    # Primary audit's exact wording
+                    "summary": "SQL injection vulnerability in authentication endpoint",
+                    "file": "app/auth.py",
+                    "verification_note": "User input reaches the query without escaping.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _seed_challenge_artifact(
+        db_session,
+        project,
+        version,
+        audit_task=audit_task,
+        verdicts=[
+            {
+                "severity": "high",
+                # Challenger independently describes the same finding with different wording
+                "summary": "SQL injection flaw in auth endpoint login handler",
+                "file": "app/auth.py",
+                "verdict": "confirmed",
+                "reason": "Independent review confirms unsanitised SQL query in auth path.",
+            }
+        ],
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Must score normally (not HOLD as audit_challenge_missing) — the fuzzy match
+    # binds the challenger's non-verbatim summary to the primary finding.
+    assert result["status"] == "dry_run", (
+        f"Expected dry_run but got {result['status']} "
+        f"(error={result.get('error')!r}) — fuzzy summary matching may have failed"
+    )
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # Confirmed finding deducts 0.15 → audit_score ≈ 0.85.
+    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01)
+    assert lq.get("challenger_refuted_audit_findings") == []
+
+
 @pytest.mark.asyncio
 async def test_finalize_apply_gate_ok_does_not_block_promotion(db_session, mocker):
     """When the apply gate returns 'ok' (the autouse default) qualification
@@ -4546,6 +4954,22 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
             ],
             "suites": {"startup": {"passed": True}},
         },
+        challenge_verdicts=[
+            {
+                "severity": "high",
+                "summary": "Token baked into VM image.",
+                "file": "",
+                "verdict": "confirmed",
+                "reason": "Independently confirmed: API token is hardcoded in the provisioner command.",
+            },
+            {
+                "severity": "high",
+                "summary": "Unsafe dependency pinning.",
+                "file": "",
+                "verdict": "confirmed",
+                "reason": "Independently confirmed: semver range operator allows drift.",
+            },
+        ],
     )
 
     result = await rq._finalize_qualification(db_session, version)
@@ -7118,6 +7542,16 @@ async def test_finalize_quality_blocker_four_critical_findings(db_session, mocke
             "tests": [{"name": "smoke-b", "status": "pass"}],
             "suites": {"startup": {"passed": True}},
         },
+        challenge_verdicts=[
+            {
+                "severity": "critical",
+                "summary": f"SQL injection {i}.",
+                "file": "app/db.py",
+                "verdict": "confirmed",
+                "reason": f"Independently confirmed: parameterisation missing at injection vector {i}.",
+            }
+            for i in range(4)
+        ],
     )
 
     mocker.patch("app.release_qualifier.promote", new=AsyncMock())
@@ -10836,6 +11270,22 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
             ],
             "suites": {"startup": {"passed": True}},
         },
+        challenge_verdicts=[
+            {
+                "severity": "high",
+                "summary": "Unverified retry path.",
+                "file": "",
+                "verdict": "confirmed",
+                "reason": "Independently confirmed: retry loop swallows transient errors with no telemetry.",
+            },
+            {
+                "severity": "high",
+                "summary": "Missing null check.",
+                "file": "",
+                "verdict": "confirmed",
+                "reason": "Independently confirmed: None dereference on unguarded payload.audit access.",
+            },
+        ],
     )
 
     result = await rq._finalize_qualification(db_session, version)
@@ -12252,7 +12702,12 @@ async def test_readiness_is_framed_as_self_approval_not_trustworthy(db_session):
     await _ensure_verdict_table(db_session)
     for i in range(6):
         await _seed_verdict(
-            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+            db_session,
+            project.id,
+            version.id,
+            seq=i,
+            would_promote=True,
+            confidence=0.95,
         )
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
@@ -12329,7 +12784,12 @@ async def _seed_clean_streak(db_session, project, version, *, n: int = 6):
     """Seed ``n`` clean, high-confidence would-promote verdicts (ready streak)."""
     for i in range(n):
         await _seed_verdict(
-            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+            db_session,
+            project.id,
+            version.id,
+            seq=i,
+            would_promote=True,
+            confidence=0.95,
         )
 
 
@@ -12542,13 +13002,14 @@ async def test_validated_precision_from_resolved_outcomes(db_session):
         )
     # Resolved promoted outcomes: 4 serving_confirmed, 1 deploy_failed → 0.80.
     outcomes = (
-        ["serving_confirmed"] * 4
-        + ["deploy_failed"]
-        + ["unconfirmed", None]  # ignored
+        ["serving_confirmed"] * 4 + ["deploy_failed"] + ["unconfirmed", None]  # ignored
     )
     for j, outcome in enumerate(outcomes):
         await _seed_promoted_verdict(
-            db_session, project.id, version.id, seq=100 + j,
+            db_session,
+            project.id,
+            version.id,
+            seq=100 + j,
             post_promotion_outcome=outcome,
         )
 
@@ -12572,11 +13033,17 @@ async def test_validated_precision_below_min_keeps_unvalidated(db_session):
     await _ensure_verdict_table(db_session)
     # Only 2 resolved outcomes — below _READINESS_MIN_RESOLVED_OUTCOMES (5).
     await _seed_promoted_verdict(
-        db_session, project.id, version.id, seq=100,
+        db_session,
+        project.id,
+        version.id,
+        seq=100,
         post_promotion_outcome="serving_confirmed",
     )
     await _seed_promoted_verdict(
-        db_session, project.id, version.id, seq=101,
+        db_session,
+        project.id,
+        version.id,
+        seq=101,
         post_promotion_outcome="deploy_failed",
     )
 
@@ -12601,13 +13068,19 @@ async def test_validated_precision_self_corrects_on_deploy_failed_recovery(db_se
     # 4 serving_confirmed + 1 deploy_failed → precision 0.80 over 5 resolved.
     confirmed_rows = [
         await _seed_promoted_verdict(
-            db_session, project.id, version.id, seq=100 + i,
+            db_session,
+            project.id,
+            version.id,
+            seq=100 + i,
             post_promotion_outcome="serving_confirmed",
         )
         for i in range(4)
     ]
     failed_row = await _seed_promoted_verdict(
-        db_session, project.id, version.id, seq=200,
+        db_session,
+        project.id,
+        version.id,
+        seq=200,
         post_promotion_outcome="deploy_failed",
     )
 
@@ -12721,7 +13194,12 @@ async def test_readiness_post_go_live_is_historical_not_current(db_session):
     # A healthy dry-run streak that WOULD read as ready pre-go-live...
     for i in range(6):
         await _seed_verdict(
-            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+            db_session,
+            project.id,
+            version.id,
+            seq=i,
+            would_promote=True,
+            confidence=0.95,
         )
 
     # ...but promotion is now live for this project.
@@ -12767,7 +13245,12 @@ async def test_readiness_resolves_promotion_enabled_from_runtime_config(db_sessi
     await _ensure_verdict_table(db_session)
     for i in range(6):
         await _seed_verdict(
-            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+            db_session,
+            project.id,
+            version.id,
+            seq=i,
+            would_promote=True,
+            confidence=0.95,
         )
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -13082,9 +13565,7 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
                 status=TaskStatus.COMPLETED,
                 context={
                     "pr_merged": True,
-                    "review_loop": {
-                        "unverified_merge_reason": "verify_setup_failed"
-                    },
+                    "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
                 },
             ),
             Task(
@@ -14333,8 +14814,7 @@ async def test_promotion_pending_timeout_force_fails_stranded_version(
     )
     # enabled_at is older than the cap — the promotion has stranded.
     stranded_enabled = (
-        _utcnow()
-        - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+        _utcnow() - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
     ).isoformat()
     version.last_qualification = {
         **version.last_qualification,
@@ -14433,8 +14913,7 @@ async def test_promotion_pending_timeout_wired_into_sweep(db_session):
         smoke_status=TaskStatus.COMPLETED,
     )
     stranded_enabled = (
-        _utcnow()
-        - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+        _utcnow() - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
     ).isoformat()
     version.last_qualification = {
         **version.last_qualification,
@@ -14848,7 +15327,11 @@ async def test_resolve_lifecycle_audit_evidence_matching_candidate(db_session):
 
     report = {"audit_score": 0.8, "findings": []}
     task = await _add_release_audit_task(
-        db_session, project, version_id=version.id, candidate_sha=candidate, report=report
+        db_session,
+        project,
+        version_id=version.id,
+        candidate_sha=candidate,
+        report=report,
     )
 
     result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
@@ -16295,7 +16778,9 @@ def test_get_latest_qualification_audit_findings_prefers_verdict_row():
         version_number=1,
         phase="stabilize",
         status="open",
-        last_qualification={"audit_findings": [{"severity": "low", "summary": "stale"}]},
+        last_qualification={
+            "audit_findings": [{"severity": "low", "summary": "stale"}]
+        },
     )
     verdict = QualificationVerdict(
         project_id=version.project_id,
@@ -16517,7 +17002,9 @@ async def test_acceptance_window_aggregate_ignores_post_terminal_updates(
     await db_session.commit()
 
     with patch("app.models._utcnow", return_value=post_terminal_message_at):
-        old_task.latest_status_message = "Deduped after merge; leaving the task terminal"
+        old_task.latest_status_message = (
+            "Deduped after merge; leaving the task terminal"
+        )
         await db_session.commit()
 
     fresh_task = Task(

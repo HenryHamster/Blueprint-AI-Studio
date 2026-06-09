@@ -10,6 +10,8 @@ the key to 'issues'/'level' breaks a test immediately.
 import json
 import os
 import pathlib
+import uuid
+
 import pytest
 
 # Pure functions — no DB, no I/O.
@@ -251,3 +253,180 @@ class TestAuditsTsSchemaContract:
             assert f'"{key}"' in schema_block
         assert '"issues"' not in schema_block
         assert '"level"' not in schema_block
+
+def _resolve_audit_challenge_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/audit-challenge.ts`` across local + Docker.
+
+    Mirrors :func:`_resolve_audits_ts_path`.  The advisory release-audit
+    challenge handler emits a RELEASE_AUDIT_CHALLENGE artifact whose shape a
+    backend consumer reads verbatim; these tests pin that the producer's prompt
+    still documents the contract keys + verdict enum.
+    """
+    env_override = os.getenv("AGENT_AUDIT_CHALLENGE_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/audit-challenge.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "audit-challenge.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+class TestAuditChallengeTsContract:
+    """Introspect agent/src/handlers/audit-challenge.ts to pin the advisory
+    RELEASE_AUDIT_CHALLENGE artifact contract the backend consumer relies on.
+    """
+
+    @pytest.fixture(scope="class")
+    def ts_source(self) -> str:
+        path = _resolve_audit_challenge_ts_path()
+        if path is None:
+            pytest.skip(
+                "agent/src/handlers/audit-challenge.ts not available in this "
+                "test environment (CI docker context builds from ./backend; run "
+                "via scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        return pathlib.Path(path).read_text()
+
+    def test_documents_top_level_contract_keys(self, ts_source):
+        assert '"challenged_candidate_sha"' in ts_source, (
+            "audit-challenge.ts must document the 'challenged_candidate_sha' key"
+        )
+        assert '"verdicts"' in ts_source, (
+            "audit-challenge.ts must document the 'verdicts' key"
+        )
+
+    def test_documents_full_verdict_enum(self, ts_source):
+        for verdict in ("confirmed", "refuted_false_positive", "uncertain"):
+            assert verdict in ts_source, (
+                f"audit-challenge.ts must document the '{verdict}' verdict value"
+            )
+
+
+@pytest.mark.asyncio
+async def test_spawn_release_audit_challenge_pins_candidate(db_session):
+    """``_spawn_release_audit_challenge_task`` pins the challenge child to the
+    exact candidate SHA + diff range, mirroring the release_audit spawn."""
+    from app import release_qualifier as rq
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Challenge",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "abcdef12" * 5  # 40-char placeholder SHA
+    version_id = uuid.uuid4()
+    task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=version_id,
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.first_payload["type"] == "release_audit_challenge"
+    assert task.first_payload["candidate_sha"] == candidate
+    assert task.first_payload["base_branch"] == "main"
+    assert task.first_payload["diff_range"] == f"main...{candidate}"
+    # Context is scoped so the lookup helper can find it by candidate + version.
+    assert task.context["candidate_sha"] == candidate
+    assert task.context["release_version_id"] == str(version_id)
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_challenge_scoped_by_sha(db_session):
+    """``get_latest_release_audit_challenge`` returns the parsed advisory verdict
+    for the matching candidate, and ``None`` for a non-matching candidate."""
+    from app import release_qualifier as rq
+    from app.models import Artifact, ArtifactType, Project
+
+    project = Project(
+        name="RQ-Challenge-Lookup",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "feedbeef" * 5  # 40-char placeholder SHA
+    challenge_task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+
+    verdict_blob = {
+        "challenged_candidate_sha": candidate,
+        "verdicts": [
+            {
+                "severity": "high",
+                "summary": "sql injection in auth",
+                "file": "app/auth.py",
+                "verdict": "refuted_false_positive",
+                "reason": "Read app/auth.py:60 — the value is a hardcoded "
+                "constant, not user input, so the injection finding is a "
+                "false positive.",
+            }
+        ],
+    }
+    db_session.add(
+        Artifact(
+            task_id=challenge_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps(verdict_blob),
+        )
+    )
+    await db_session.commit()
+
+    found = await rq.get_latest_release_audit_challenge(
+        db_session, project.id, candidate_sha=candidate
+    )
+    assert found is not None
+    assert found["candidate_sha"] == candidate
+    assert found["challenge_task_id"] == str(challenge_task.id)
+    assert found["verdict"] == verdict_blob
+    assert found["verdict"]["verdicts"][0]["verdict"] == "refuted_false_positive"
+
+    other = await rq.get_latest_release_audit_challenge(
+        db_session, project.id, candidate_sha="0" * 40
+    )
+    assert other is None
+    assert (
+        await rq.get_latest_release_audit_challenge(
+            db_session, project.id, candidate_sha=None
+        )
+        is None
+    )

@@ -22,9 +22,8 @@ import { handleReview, handleFix } from './review-fix.js';
 import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
-import {
-  handleSecurityAudit, handleSelfAudit, handleReleaseAudit, handleReleaseAuditChallenge,
-} from './audits.js';
+import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
+import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';

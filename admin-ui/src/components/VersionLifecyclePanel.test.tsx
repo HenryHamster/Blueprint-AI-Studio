@@ -1107,7 +1107,7 @@ describe('VersionLifecyclePanel', () => {
 
       const evidence = screen.getByTestId('durable-qualification-evidence');
       expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
-      expect(within(evidence).getByText(/1 excluded finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
       expect(within(evidence).getByText(/migration block/)).toBeInTheDocument();
       expect(within(evidence).getByText(/apply warn/)).toBeInTheDocument();
       expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
@@ -1163,11 +1163,113 @@ describe('VersionLifecyclePanel', () => {
       const history = await screen.findByTestId('verdict-history');
       const evidence = within(history).getByTestId('durable-qualification-evidence');
       expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
       expect(within(evidence).getByText(/migration pass/)).toBeInTheDocument();
       expect(within(evidence).getByText(/apply pass/)).toBeInTheDocument();
       expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
+    });
+
+    it('renders challenger-refuted false positives with reason in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v2',
+            release_version_id: 'rv2',
+            candidate_sha: 'aabbcc112233',
+            confidence: 0.92,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            audit_findings: [{ severity: 'high', summary: 'confirmed finding' }],
+            excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+            challenger_refuted_audit_findings: [
+              { severity: 'high', summary: 'false alarm finding', challenger_reason: 'already fixed in HEAD' },
+              { severity: 'medium', summary: 'another false positive', challenger_reason: 'out of scope' },
+            ],
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-03T00:00:00Z',
+            created_at: '2026-01-03T00:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      const evidence = within(history).getByTestId('durable-qualification-evidence');
+      // Challenger-refuted chip shows count and is distinct from excluded-audit-findings chip
+      expect(within(evidence).getByTestId('challenger-refuted-findings')).toBeInTheDocument();
+      expect(within(evidence).getByText(/2 challenger false positives/)).toBeInTheDocument();
+      // Tooltip includes severity, summary, and reason for each refuted finding
+      expect(within(evidence).getByTitle('high: false alarm finding — already fixed in HEAD | medium: another false positive — out of scope')).toBeInTheDocument();
+      // The existing excluded-audit-findings chip still renders distinctly
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
+      expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBe(
+        within(evidence).queryByText(/1 excluded audit finding/),
+      );
+    });
+
+    it('renders challenger-refuted false positives with reason on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'high', summary: 'confirmed finding' }],
+                excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+                challenger_refuted_audit_findings: [
+                  { severity: 'high', summary: 'false alarm', challenger_reason: 'fixed upstream' },
+                ],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByTestId('challenger-refuted-findings')).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 challenger false positive/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('high: false alarm — fixed upstream')).toBeInTheDocument();
+
+      // Excluded audit finding chip still renders separately
+      expect(within(evidence).getByText(/1 excluded audit finding/)).toBeInTheDocument();
+    });
+
+    it('does not render challenger chips when challenger_refuted_audit_findings is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'high', summary: 'some finding' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBeInTheDocument();
     });
   });
 

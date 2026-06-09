@@ -181,6 +181,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'compute_experiment', // Uses compute-experiment.ts; launches+polls a compute job, no Claude prompt
   'web_research',     // Uses web-research.ts bespoke prompt assembly (web-first knowledge doc)
   'design',           // Uses design.ts bespoke prompt assembly (codebase-grounded design doc)
+  'release_audit_challenge', // Uses audit-challenge.ts bespoke prompt assembly (advisory second opinion)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────

@@ -219,6 +219,14 @@ class ArtifactType(str, Enum):
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
+    # Binding second-opinion verdict from the release_audit_challenge handler:
+    # an independent adversarial re-judgement of the primary release_audit's
+    # higher-severity findings (confirmed / refuted_false_positive / uncertain).
+    # Used as a fail-closed gate in _finalize_qualification — verified findings
+    # must be challenger-confirmed to deduct; missing/uncertain verdicts HOLD.
+    # Like MERGE_TEST_RESULT, the column is a plain String so no migration is
+    # needed.
+    RELEASE_AUDIT_CHALLENGE = "RELEASE_AUDIT_CHALLENGE"
     RELEASE_AUDIT_CHALLENGE_REPORT = "RELEASE_AUDIT_CHALLENGE_REPORT"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
@@ -3860,6 +3868,14 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
     excluded_audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    # Challenger-confirmed false positives: findings the independent challenger
+    # marked refuted_false_positive with auditable reasons.  DISTINCT from
+    # excluded_audit_findings (which captures the unverified-primary gap).
+    # Each entry: {severity, summary, file, challenger_reason}.
+    challenger_refuted_audit_findings: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )
