@@ -384,6 +384,10 @@ async def test_hollow_compute_knowledge_does_not_deliver_to_dependents(
     from app.knowledge_completion import persist_compute_experiment_knowledge
 
     project = Project(name="HollowComputeDelivery", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
     task = Task(
         project_id=project.id,
         title="compute_experiment: hollow doc",
