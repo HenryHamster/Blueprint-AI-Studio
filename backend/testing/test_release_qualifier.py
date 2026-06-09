@@ -45,6 +45,7 @@ from sqlalchemy import func as sa_func
 from sqlalchemy import select
 
 from app import release_qualifier as rq
+from app import release_scoring as rs
 from app import release_version as rv
 from app.models import (
     Alert,
@@ -2323,6 +2324,195 @@ class TestReconcileAuditChallengeRefutedSeverityCeiling:
         assert hold is None
         assert modified is report
         assert refuted == []
+
+
+# ---------------------------------------------------------------------------
+# Parametrized severity matrix for the refuted_false_positive ceiling gate
+# ---------------------------------------------------------------------------
+
+
+class TestRefutedSeverityMatrixScoreFinding:
+    """Parametrized matrix for _score_finding_to_challenge severity ceiling.
+
+    A refuted_false_positive verdict must have a severity rank <= the finding's
+    rank (i.e. verdict severity must be at least as severe as the finding).
+    Confirmed/uncertain verdicts are NOT gated by severity.
+    """
+
+    SUMMARY = "SQL injection in query builder"
+
+    def _finding(self, severity: str) -> dict:
+        return {"severity": severity, "summary": self.SUMMARY}
+
+    def _verdict(self, verdict_type: str, severity: str) -> dict:
+        return {"verdict": verdict_type, "severity": severity, "summary": self.SUMMARY}
+
+    # --- refuted_false_positive: cases that must return None (no match) ---
+
+    @pytest.mark.parametrize(
+        "verdict_sev,finding_sev",
+        [
+            ("medium", "critical"),
+            ("medium", "high"),
+            ("low", "critical"),
+            ("low", "high"),
+            ("low", "medium"),
+        ],
+    )
+    def test_refuted_lower_rank_cannot_bind(self, verdict_sev, finding_sev):
+        """refuted_false_positive with lower-rank severity returns None — no binding."""
+        score = rs._score_finding_to_challenge(
+            self._finding(finding_sev),
+            self._verdict("refuted_false_positive", verdict_sev),
+        )
+        assert score is None, (
+            f"Expected no match: verdict_sev={verdict_sev!r} vs finding_sev={finding_sev!r}"
+        )
+
+    # --- refuted_false_positive: cases that must succeed (return a score) ---
+
+    @pytest.mark.parametrize(
+        "verdict_sev,finding_sev",
+        [
+            ("medium", "medium"),   # equal rank — passes ceiling
+            ("high", "medium"),     # higher rank — passes ceiling
+            ("critical", "medium"), # higher rank — passes ceiling
+            ("high", "high"),       # equal rank — passes ceiling
+            ("critical", "high"),   # higher rank — passes ceiling
+            ("critical", "critical"), # equal rank — passes ceiling
+        ],
+    )
+    def test_refuted_equal_or_higher_rank_can_bind(self, verdict_sev, finding_sev):
+        """refuted_false_positive with equal or higher-rank severity returns a score."""
+        score = rs._score_finding_to_challenge(
+            self._finding(finding_sev),
+            self._verdict("refuted_false_positive", verdict_sev),
+        )
+        assert score is not None, (
+            f"Expected a match: verdict_sev={verdict_sev!r} vs finding_sev={finding_sev!r}"
+        )
+        assert score > 0
+
+    # --- unknown/missing severity edge cases ---
+
+    def test_refuted_missing_verdict_severity_treated_as_unknown(self):
+        """A refuted verdict with no severity key falls back to rank 99 (unknown).
+
+        Unknown verdict rank (99) > any real finding rank, so the ceiling fires
+        and the verdict cannot bind to a finding with a known severity.
+        """
+        finding = self._finding("critical")
+        verdict = {"verdict": "refuted_false_positive", "summary": self.SUMMARY}
+        score = rs._score_finding_to_challenge(finding, verdict)
+        assert score is None, "Missing verdict severity should not bind to a critical finding"
+
+    def test_refuted_missing_finding_severity_treated_as_unknown(self):
+        """A finding with no severity has rank 99; any verdict rank <= 99 can bind."""
+        finding = {"summary": self.SUMMARY}  # no severity key
+        verdict = self._verdict("refuted_false_positive", "low")
+        score = rs._score_finding_to_challenge(finding, verdict)
+        # low rank (3) <= unknown finding rank (99): ceiling passes, content matches
+        assert score is not None, "Low verdict should bind to a finding with unknown severity"
+
+    def test_confirmed_verdict_not_gated_by_severity(self):
+        """confirmed verdicts are never filtered by severity — any severity combination passes."""
+        finding = self._finding("critical")
+        verdict = self._verdict("confirmed", "info")
+        score = rs._score_finding_to_challenge(finding, verdict)
+        assert score is not None, "confirmed verdict should match regardless of severity"
+
+    def test_uncertain_verdict_not_gated_by_severity(self):
+        """uncertain verdicts are never filtered by severity."""
+        finding = self._finding("critical")
+        verdict = self._verdict("uncertain", "low")
+        score = rs._score_finding_to_challenge(finding, verdict)
+        assert score is not None, "uncertain verdict should match regardless of severity"
+
+
+class TestRefutedSeverityMatrixReconcile:
+    """End-to-end parametrized matrix for _reconcile_audit_with_challenge.
+
+    Verifies the severity ceiling gate causes the right hold code or binding
+    outcome at the reconciliation level, not just the scoring level.
+    """
+
+    SHA = "deadbeef"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def _verified(self, severity: str, summary: str) -> dict:
+        return {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+
+    @pytest.mark.parametrize(
+        "verdict_sev,finding_sev",
+        [
+            ("medium", "critical"),
+            ("medium", "high"),
+            ("low", "medium"),
+        ],
+    )
+    def test_lower_rank_refutation_triggers_hold(self, verdict_sev, finding_sev):
+        """A refuted verdict whose rank is lower than the finding's triggers hold."""
+        finding = self._verified(finding_sev, "Unescaped user input reaches SQL query")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": verdict_sev,
+                    "summary": "Unescaped user input reaches SQL query",
+                    "reason": "assessed only the surface-level form validation",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_missing", (
+            f"verdict_sev={verdict_sev!r} vs finding_sev={finding_sev!r}: "
+            f"expected hold='audit_challenge_missing', got {hold!r}"
+        )
+        assert modified is None
+        assert refuted == []
+
+    @pytest.mark.parametrize(
+        "verdict_sev,finding_sev",
+        [
+            ("medium", "medium"),
+            ("high", "medium"),
+            ("critical", "medium"),
+        ],
+    )
+    def test_equal_or_higher_rank_refutation_removes_finding(self, verdict_sev, finding_sev):
+        """A refuted verdict with >= rank removes the finding from the report."""
+        finding = self._verified(finding_sev, "Unescaped user input reaches SQL query")
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": verdict_sev,
+                    "summary": "Unescaped user input reaches SQL query",
+                    "reason": "query uses parameterized statements throughout",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+        assert hold is None, (
+            f"verdict_sev={verdict_sev!r} vs finding_sev={finding_sev!r}: "
+            f"expected no hold, got {hold!r}"
+        )
+        assert modified is not None
+        assert modified["findings"] == []
+        assert len(refuted) == 1
+        assert refuted[0]["severity"] == finding_sev
 
 
 class TestChallengedVsUnchallengedTelemetry:
