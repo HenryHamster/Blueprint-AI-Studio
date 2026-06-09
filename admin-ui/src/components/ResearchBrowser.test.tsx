@@ -481,6 +481,56 @@ describe('ResearchBrowser spawn-gate provenance', () => {
     // Only adversarial_gate deferrals show the refuted badge
     expect(screen.queryByText('refuted')).not.toBeInTheDocument();
   });
+
+  it('prefers hash-based deferred matching when finding_hash is present on both sides', () => {
+    // The finding's title was edited after the deferral was recorded, so a
+    // title-only match would MISS. The stable finding_hash still links them.
+    const researchTask = {
+      ...makeResearchTask([makeFinding({ title: 'Renamed Finding Title', finding_hash: 'abc123' })]),
+      context: {
+        deferred_findings: [{
+          title: 'Original Stale Title',
+          finding_hash: 'abc123',
+          deferred_reason: 'adversarial_gate',
+          adversarial_gate_reason: 'Refuted by hash-matched challenger',
+        }],
+      },
+    };
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByText('refuted');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute('title', expect.stringContaining('hash-matched'));
+  });
+
+  it('falls back to title matching when the finding has no finding_hash', () => {
+    const researchTask = {
+      ...makeResearchTask([makeFinding({ title: 'No Hash Finding' })]),
+      context: {
+        deferred_findings: [{
+          title: 'No Hash Finding',
+          finding_hash: 'xyz789',
+          deferred_reason: 'adversarial_gate',
+          adversarial_gate_reason: 'Refuted via title fallback',
+        }],
+      },
+    };
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByText('refuted');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute('title', expect.stringContaining('title fallback'));
+  });
 });
 
 describe('ResearchBrowser researchFeed prop', () => {

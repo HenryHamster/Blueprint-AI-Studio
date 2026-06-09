@@ -2194,6 +2194,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
     "retired_directions_summary": {"priority": "low"},
+    # Bounded fail-closed retirement deferrals from the prior cycle. High
+    # priority so a supported/unsupported retirement second opinion stays
+    # visible to the next strategist pass instead of getting dropped behind
+    # lower-value long-tail context.
+    "retirement_deferrals": {"priority": "high"},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
@@ -3145,6 +3150,41 @@ def _build_past_retirement_critiques(
             results.extend(critiques)
         if len(results) >= n:
             break
+    return results[:n]
+
+
+def _build_past_retirement_deferrals(
+    cycle_history: list, n: int = 5
+) -> list[dict[str, Any]]:
+    """Collect the most recent N fail-closed retirement deferrals.
+
+    Surface the deferrals from completed strategic cycles so the next review
+    pass can see which direction retirements were deferred and why.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in cycle_history:
+        if entry.get("outcome") != "completed":
+            continue
+        deferrals = entry.get("retirement_deferrals")
+        if not isinstance(deferrals, list):
+            continue
+        for deferral in deferrals:
+            if not isinstance(deferral, dict):
+                continue
+            results.append(
+                {
+                    "direction_id": str(deferral.get("direction_id", "")).strip()[:64],
+                    "approved": bool(deferral.get("approved")),
+                    "challenge_status": str(
+                        deferral.get("challenge_status", "")
+                    ).strip()[:32],
+                    "verdict": str(deferral.get("verdict", "")).strip()[:32],
+                    "reason": str(deferral.get("reason", "")).strip()[:300],
+                    "recorded_at": str(deferral.get("recorded_at", "")).strip()[:64],
+                }
+            )
+            if len(results) >= n:
+                return results[:n]
     return results[:n]
 
 
@@ -5328,6 +5368,15 @@ async def _spawn_strategic_review(
             **(
                 {"past_retirement_critiques": _past_critiques}
                 if (_past_critiques := _build_past_retirement_critiques(cycle_history))
+                else {}
+            ),
+            **(
+                {"retirement_deferrals": _retirement_deferrals}
+                if (
+                    _retirement_deferrals := _build_past_retirement_deferrals(
+                        cycle_history
+                    )
+                )
                 else {}
             ),
             **(

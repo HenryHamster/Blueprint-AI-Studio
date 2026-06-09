@@ -1420,6 +1420,10 @@ export interface ChallengedVsUnchallengedCohort {
   disagreement_count?: number;
   wrong_decision_rate?: number | null;
   wrong_decision_resolved_sample?: number;
+  /** Count of findings the adversarial challenger explicitly refuted as false positives (challenged cohort only). */
+  challenge_refuted_count?: number;
+  /** Rate of challenger-refuted false positives per verdict in the challenged cohort. Distinct from exclusion_rate. */
+  challenge_refuted_rate?: number;
 }
 
 export interface ChallengedVsUnchallengedTelemetry {

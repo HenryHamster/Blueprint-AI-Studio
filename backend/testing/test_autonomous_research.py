@@ -36,6 +36,7 @@ from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 from app.capability_demand import collect_missing_capability_demand
 from app.payload_schemas import validate_internal_payload
+from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -4514,6 +4515,63 @@ async def test_non_decomposed_siblings_do_not_chain(db_session, mocker, monkeypa
     assert len(child_tasks) == 2
     assert list(child_tasks[0].depends_on or []) == []
     assert list(child_tasks[1].depends_on or []) == []
+
+
+@pytest.mark.asyncio
+async def test_partial_adversarial_manifest_fail_closes_omitted_high_stakes_findings(
+    db_session, mocker, monkeypatch
+):
+    """High-stakes findings omitted from the bounded adversarial manifest do not spawn."""
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
+    direction = _active_direction("d-advpartial01", "Adversarial manifest direction")
+    project = Project(
+        name="Adversarial Partial Manifest Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    kept = _make_finding("Keep challenge", direction["id"], scope="small")
+    omitted = _make_finding("Drop challenge", direction["id"], scope="small")
+    kept_hash = hashlib.sha256((kept["title"] + kept["description"]).encode()).hexdigest()[:16]
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=True)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[kept, omitted],
+    )
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                kept_hash: {
+                    "passed": True,
+                    "reason": "explicit pass",
+                    "explicit": True,
+                }
+            }
+        },
+        "_adversarial_challenged_hashes": [kept_hash],
+    }
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].title == kept["title"]
 
 
 @pytest.mark.asyncio

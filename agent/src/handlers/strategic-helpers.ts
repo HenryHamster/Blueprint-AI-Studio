@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
 import { extractJsonObject } from '../json-extract.js';
@@ -15,7 +16,7 @@ function generateStrategicScript(taskIdRaw: string): string {
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -70,6 +71,8 @@ case "$OP" in
   update-direction)     _call "update_direction" ;;
   retire-direction)     _call "retire_direction" ;;
   stage-direction)      _call "stage_direction" ;;
+  approve-direction)    _call "approve_direction" ;;
+  reject-direction)     _call "reject_direction" ;;
   create-message)            _call "create_message" ;;
   resolve-message)           _call "resolve_message" ;;
   spawn-task)                _call "spawn_task" ;;
@@ -313,12 +316,52 @@ export interface ChallengeEvidenceProgressVerdict {
   rationale: string;
 }
 
+export interface ChallengeRetirementApprovalVerdict {
+  direction_id: string;
+  verdict: ChallengeEvidenceVerdict;
+  rationale: string;
+}
+
+export type ChallengePortfolioVerdict = 'approved' | 'rejected' | 'warned' | 'uncertain';
+
+const _PORTFOLIO_OP_ALIASES: Record<string, string> = {
+  create: 'create_direction',
+  update: 'update_direction',
+  retire: 'retire_direction',
+  stage: 'stage_direction',
+  approve: 'approve_direction',
+  reject: 'reject_direction',
+};
+const _VALID_PORTFOLIO_OPS = new Set<string>(Object.values(_PORTFOLIO_OP_ALIASES));
+const _VALID_PORTFOLIO_VERDICTS = new Set<string>(['approved', 'rejected', 'warned', 'uncertain']);
+const _PORTFOLIO_BLOCK_VERDICTS = new Set<string>(['rejected']);
+const _PORTFOLIO_WARN_VERDICTS = new Set<string>(['warned', 'uncertain']);
+const _HARD_BLOCK_PORTFOLIO_OPS = new Set<string>([
+  'create_direction',
+  'update_direction',
+  'retire_direction',
+  'stage_direction',
+  'approve_direction',
+  'reject_direction',
+]);
+
+export interface ChallengePortfolioOperationVerdict {
+  op: string;
+  direction_id: string;
+  text: string;
+  fingerprint: string;
+  verdict: ChallengePortfolioVerdict;
+  rationale: string;
+}
+
 export interface StrategicChallengeRecord {
   challenge_version: number;
   status: 'ok' | 'blocked' | 'invalid';
   evidence_progress: ChallengeEvidenceProgressVerdict[];
+  retirement_approvals: ChallengeRetirementApprovalVerdict[];
   retirement_critique_quality: { verdict: string; rationale: string };
   portfolio_shape_risk: { verdict: string; rationale: string };
+  portfolio_operations: ChallengePortfolioOperationVerdict[];
   notes?: string;
 }
 
@@ -343,8 +386,10 @@ function emptyChallengeRecord(
     challenge_version: STRATEGIC_CHALLENGE_VERSION,
     status,
     evidence_progress: [],
+    retirement_approvals: [],
     retirement_critique_quality: { verdict: 'not_assessed', rationale: note.slice(0, _RATIONALE_MAX) },
     portfolio_shape_risk: { verdict: 'not_assessed', rationale: note.slice(0, _RATIONALE_MAX) },
+    portfolio_operations: [],
     notes: note.slice(0, _NOTES_MAX),
   };
 }
@@ -390,6 +435,83 @@ function normalizeEvidenceProgress(raw: unknown): ChallengeEvidenceProgressVerdi
   return out;
 }
 
+// Mirrors normalizeEvidenceProgress for the retirement_approvals list. No status
+// field — retirement approvals are a simple (direction_id, verdict, rationale) triple.
+// Fail-closed: any verdict that is not an explicit "approved" is treated as rejected.
+function normalizeRetirementApprovals(raw: unknown): ChallengeRetirementApprovalVerdict[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChallengeRetirementApprovalVerdict[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const direction_id = _safeStr(o.direction_id).trim().slice(0, 64);
+    let verdict = _safeStr(o.verdict).trim().toLowerCase();
+    if (!direction_id) continue;
+    // Fail closed: any verdict that is not an explicit "approved" is rejected.
+    if (!_VALID_EV_VERDICT.has(verdict)) verdict = 'rejected';
+    out.push({
+      direction_id,
+      verdict: verdict as ChallengeEvidenceVerdict,
+      rationale: _safeStr(o.rationale).trim().slice(0, _RATIONALE_MAX),
+    });
+    if (out.length >= _MAX_EV_VERDICTS) break;
+  }
+  return out;
+}
+
+function canonicalPortfolioOp(op: unknown): string | null {
+  const name = _safeStr(op).trim().toLowerCase();
+  if (_VALID_PORTFOLIO_OPS.has(name)) return name;
+  return _PORTFOLIO_OP_ALIASES[name] ?? null;
+}
+
+export function portfolioOperationFingerprint(
+  op: unknown,
+  opts: { directionId?: string; text?: string } = {},
+): string {
+  const canon = canonicalPortfolioOp(op) ?? _safeStr(op).trim().toLowerCase();
+  const did = (opts.directionId ?? '').trim();
+  if (did) return `${canon}:${did}`;
+  const norm = (opts.text ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+  if (norm) {
+    const digest = createHash('sha256').update(norm).digest('hex').slice(0, 16);
+    return `${canon}:text:${digest}`;
+  }
+  return `${canon}:`;
+}
+
+function normalizePortfolioOperations(raw: unknown): ChallengePortfolioOperationVerdict[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChallengePortfolioOperationVerdict[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const canon = canonicalPortfolioOp(o.op);
+    if (!canon) continue;
+    const verdict = _safeStr(o.verdict).trim().toLowerCase();
+    if (!_VALID_PORTFOLIO_VERDICTS.has(verdict)) continue;
+    const direction_id = _safeStr(o.direction_id).trim().slice(0, 64);
+    const text = _safeStr(o.text).trim();
+    const fingerprint = portfolioOperationFingerprint(canon, {
+      directionId: direction_id || undefined,
+      text: text || undefined,
+    });
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    out.push({
+      op: canon,
+      direction_id,
+      text,
+      fingerprint,
+      verdict: verdict as ChallengePortfolioVerdict,
+      rationale: _safeStr(o.rationale).trim().slice(0, _RATIONALE_MAX),
+    });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
 // Parse the challenger's raw output into a bounded record. Returns an `invalid`
 // record (approving nothing) when no well-formed JSON object can be extracted.
 export function parseStrategicChallengeRecord(rawText: string): StrategicChallengeRecord {
@@ -428,10 +550,12 @@ export function parseStrategicChallengeRecord(rawText: string): StrategicChallen
   const record: StrategicChallengeRecord = {
     challenge_version: STRATEGIC_CHALLENGE_VERSION,
     status: isOk ? 'ok' : 'blocked',
-    // Only an explicitly-ok challenge may carry evidence_progress through.
+    // Only an explicitly-ok challenge may carry evidence_progress or retirement_approvals through.
     evidence_progress: isOk ? normalizeEvidenceProgress(obj.evidence_progress) : [],
+    retirement_approvals: isOk ? normalizeRetirementApprovals(obj.retirement_approvals) : [],
     retirement_critique_quality: coerceVerdictBlock(obj.retirement_critique_quality),
     portfolio_shape_risk: coerceVerdictBlock(obj.portfolio_shape_risk),
+    portfolio_operations: isOk ? normalizePortfolioOperations(obj.portfolio_operations) : [],
   };
   const notes = _safeStr(obj.notes).trim().slice(0, _NOTES_MAX);
   if (notes) record.notes = notes;
@@ -446,20 +570,26 @@ export function buildStrategicChallengePrompt(opts: {
   dirSummaryText: string;
   pastRetirementCritiquesSection: string;
   portfolioCompositionText: string;
+  stagedDirectionsText?: string;
+  activeCapacityText?: string;
 }): string {
   const analysis = (opts.analysisText || '').slice(0, 40_000);
   const ctxBlocks = [
     opts.dirSummaryText ? `## Existing directions (what the thinker saw)\n${opts.dirSummaryText}` : '',
     opts.portfolioCompositionText ? `## Portfolio composition\n${opts.portfolioCompositionText}` : '',
+    opts.activeCapacityText ? `## Active-direction capacity\n${opts.activeCapacityText}` : '',
+    opts.stagedDirectionsText ? `## Already-staged (next-version) directions\n${opts.stagedDirectionsText}` : '',
     opts.pastRetirementCritiquesSection || '',
   ].filter(Boolean).join('\n\n');
   return `# Role: independent strategic challenge (adversarial second opinion)
 
-You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produced a strategic analysis containing self-assessed judgments. Your job is to CHALLENGE — not rubber-stamp — three classes of those self-produced judgments BEFORE they are committed:
+You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produced a strategic analysis containing self-assessed judgments. Your job is to CHALLENGE — not rubber-stamp — five classes of those self-produced judgments BEFORE they are committed:
 
 1. **evidence_progress** — the thinker's claims that a long-running direction is "advancing" or "met". These are self-serving by construction. APPROVE an advancing/met claim ONLY when the analysis presents concrete, observable evidence that the direction's own success_evidence is actually being met. If the evidence is thin, assumed, or absent, REJECT (a stalled reality must not be dressed up as progress). When in doubt, REJECT — approving a false "advancing" is the costly error.
-2. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
-3. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
+2. **retirement_approvals** — for EVERY direction the thinker proposes to retire, judge whether the retirement reasoning names a real, evidenced pattern (approve) or is shallow/boilerplate/unsupported (reject). When in doubt, REJECT — approving an unsupported retirement is the costly error. If the thinker proposes no retirements, emit an empty array.
+3. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
+4. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
+5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
 
 You do NOT commit anything. You ONLY emit a verdict record. Be terse and skeptical.
 
@@ -475,12 +605,20 @@ Output ONLY a single JSON object — no markdown, no code fences, no preamble �
   "evidence_progress": [
     {"direction_id": "d-xxx", "status": "advancing|stalled|met", "verdict": "approved|rejected", "rationale": "one line"}
   ],
+  "retirement_approvals": [
+    {"direction_id": "d-xxx", "verdict": "approved|rejected", "rationale": "one line"}
+  ],
   "retirement_critique_quality": {"verdict": "solid|shallow|not_assessed", "rationale": "one line"},
-  "portfolio_shape_risk": {"verdict": "low|elevated|high", "rationale": "one line"}
+  "portfolio_shape_risk": {"verdict": "low|elevated|high", "rationale": "one line"},
+  "portfolio_operations": [
+    {"op": "create_direction|update_direction|retire_direction|stage_direction|approve_direction|reject_direction", "direction_id": "d-xxx", "text": "<proposed text — creates only>", "verdict": "approved|warned|uncertain|rejected", "rationale": "one line"}
+  ]
 }
 Rules:
 - Add an evidence_progress entry for EVERY direction the thinker rated advancing or met (verdict "approved" only with concrete evidence, otherwise "rejected"). Directions the thinker called stalled need no entry — stalled is advisory and never gated. If the thinker rated none, emit an empty array.
+- Add a retirement_approvals entry for EVERY direction the thinker proposes to retire (verdict "approved" only when the reasoning names a real evidenced pattern, otherwise "rejected"). When in doubt, REJECT. If the thinker proposes no retirements, emit an empty array.
 - "retirement_critique_quality" and "portfolio_shape_risk" are REQUIRED keys even when there is little to say.
+- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
 - Output the JSON object and nothing else.`;
 }
 
@@ -494,6 +632,8 @@ export async function runStrategicChallenge(opts: {
   dirSummaryText: string;
   pastRetirementCritiquesSection: string;
   portfolioCompositionText: string;
+  stagedDirectionsText?: string;
+  activeCapacityText?: string;
   ws: WebSocket | null;
   statusRef: { value: string };
   model?: string;
@@ -521,7 +661,7 @@ export async function runStrategicChallenge(opts: {
   if (record.status === 'invalid') {
     sendLog(ws, `[WARNING] Strategic challenge produced unparseable output (recording invalid record; no evidence approvals).\n`);
   } else {
-    sendLog(ws, `[INFO] Strategic challenge complete (status=${record.status}, evidence_verdicts=${record.evidence_progress.length}).\n`);
+    sendLog(ws, `[INFO] Strategic challenge complete (status=${record.status}, evidence_verdicts=${record.evidence_progress.length}, retirement_approvals=${record.retirement_approvals.length}, portfolio_op_verdicts=${record.portfolio_operations.length}).\n`);
   }
   return record;
 }
@@ -530,20 +670,41 @@ export async function runStrategicChallenge(opts: {
 // prompt. The executor may submit an advancing/met verdict only for a
 // challenge-approved (direction_id, status) pair listed here.
 export function buildStrategicChallengeExecutorSection(record: StrategicChallengeRecord): string {
-  // Only ok-status records can approve advancing/met pairs; blocked/invalid
-  // records must present an empty approval list to the executor.
-  const approved = record.status === 'ok'
+  // Only ok-status records can approve advancing/met pairs or retirements;
+  // blocked/invalid records must present empty approval lists to the executor.
+  const approvedEvidence = record.status === 'ok'
     ? record.evidence_progress.filter(
         e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'),
       )
     : [];
-  const approvedList = approved.length > 0
-    ? approved.map(e => `  - ${e.direction_id} → ${e.status}`).join('\n')
+  const approvedEvidenceList = approvedEvidence.length > 0
+    ? approvedEvidence.map(e => `  - ${e.direction_id} → ${e.status}`).join('\n')
     : '  - (none — no advancing/met evidence_progress verdict was approved this cycle)';
+  const approvedRetirements = record.status === 'ok'
+    ? record.retirement_approvals.filter(r => r.verdict === 'approved')
+    : [];
+  const approvedRetirementList = approvedRetirements.length > 0
+    ? approvedRetirements.map(r => `  - ${r.direction_id}`).join('\n')
+    : '  - (none — no retirement was approved this cycle)';
+  const portfolioOps = record.status === 'ok' ? record.portfolio_operations : [];
+  const renderOp = (o: ChallengePortfolioOperationVerdict): string =>
+    `  - ${o.op} ${o.direction_id ? o.direction_id : (o.text ? `text:"${o.text.slice(0, 80)}"` : o.fingerprint)}${o.rationale ? ` — ${o.rationale}` : ''}`;
+  const rejectedBlocking = portfolioOps.filter(o => _PORTFOLIO_BLOCK_VERDICTS.has(o.verdict) && _HARD_BLOCK_PORTFOLIO_OPS.has(o.op));
+  const warned = portfolioOps.filter(
+    o => _PORTFOLIO_WARN_VERDICTS.has(o.verdict)
+      || (o.verdict === 'rejected' && !_HARD_BLOCK_PORTFOLIO_OPS.has(o.op)),
+  );
+  const approvedOps = portfolioOps.filter(o => o.verdict === 'approved');
+  const rejectedList = rejectedBlocking.length > 0 ? rejectedBlocking.map(renderOp).join('\n') : '  - (none)';
+  const warnedList = warned.length > 0 ? warned.map(renderOp).join('\n') : '  - (none)';
+  const approvedOpsList = approvedOps.length > 0 ? approvedOps.map(renderOp).join('\n') : '  - (none)';
   const json = JSON.stringify(record);
   const boundedJson = json.length > 8000 ? `${json.slice(0, 8000)}…` : json;
   const statusCaveat = record.status !== 'ok'
-    ? `\n_The challenge was **${record.status}** — treat it as approving NOTHING. Do NOT submit any advancing/met evidence_progress this cycle._`
+    ? `\n_The challenge was **${record.status}** — treat it as approving NOTHING. Do NOT submit any advancing/met evidence_progress this cycle, do NOT call retire-direction, and do NOT rely on any portfolio-operation approval this cycle._`
+    : '';
+  const portfolioCaveat = record.status !== 'ok'
+    ? '\n_The challenge was not OK — it carries NO portfolio-operation verdicts. Hard-blocked ops will be rejected by the backend._'
     : '';
   return [
     '# Independent strategic challenge (adversarial second opinion — advisory gate)',
@@ -555,7 +716,22 @@ export function buildStrategicChallengeExecutorSection(record: StrategicChalleng
     '## Evidence-progress gate (REQUIRED before `set-evidence-progress`)',
     'You may pass an `advancing` or `met` status to `./strategic set-evidence-progress` ONLY for a (direction_id, status) pair the challenge APPROVED below. For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid (no approvals) — do NOT submit advancing/met for it: submit `stalled` (always allowed, advisory) or omit it. This gate refines evidence_progress only; it does NOT change retirement critiques, direction caps, staging, version_phase/qualify handling, or operator-wins semantics.',
     'Challenge-approved advancing/met pairs:',
-    approvedList,
+    approvedEvidenceList,
+    '',
+    '## Retirement gate (REQUIRED before `retire-direction`)',
+    'You may call `./strategic retire-direction` ONLY for a direction the challenge APPROVED below. For any direction the challenge did NOT approve — or if the challenge was blocked/invalid — the backend will return HTTP 200 with `"status": "deferred"` instead of committing the retirement.',
+    '**A `"status": "deferred"` response is a SOFT NON-ERROR OUTCOME** — it is intentional and final. Log it and move on. Do NOT re-attempt the retire-direction call, do NOT classify it as a failure, and do NOT count it as a missing required call.',
+    'Challenge-approved retirement direction IDs:',
+    approvedRetirementList,
+    '',
+    '## Portfolio-operation gate (applies to create/update/retire/stage/approve/reject)',
+    'The challenge judged each concrete direction mutation. When you call `./strategic create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction`, the backend matches your call to the verdict below by `direction_id` (existing-direction ops) or by the proposed `text` (creates) — so pass the SAME `direction_id`/`text` the analysis used.' + portfolioCaveat,
+    '- **REJECTED (do NOT attempt — hard-blocked):** these destructive / fan-out-sensitive moves were judged unsafe; the backend will reject the call (HTTP 409). Do not retry them this cycle.',
+    rejectedList,
+    '- **WARNED (advisory — you MAY proceed):** subjective concerns; weigh them but they do not block.',
+    warnedList,
+    '- **APPROVED (clean):**',
+    approvedOpsList,
   ].join('\n');
 }
 

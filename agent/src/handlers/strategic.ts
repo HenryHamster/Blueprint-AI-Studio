@@ -177,7 +177,7 @@ export function renderDesignDocIndexOverview(index: Record<string, unknown> | un
 // Schema restated to the agent on a bounded self-repair re-ask when a clean exit
 // emitted the legacy inline strategic markers but the JSON failed to extract.
 const STRATEGIC_COMPLETION_SCHEMA_HINT =
-  `{\n  "problem_model": { ... } | "vision": "...",\n  "direction_operations": [ { "op": "create_direction" | "update_direction" | "retire_direction", ... } ]\n}\nThe object MUST contain "direction_operations" and at least one of "problem_model" or "vision".`;
+  `{\n  "problem_model": { ... } | "vision": "...",\n  "direction_operations": [ { "op": "create_direction" | "update_direction" | "retire_direction" | "stage_direction" | "approve_direction" | "reject_direction", ... } ]\n}\nThe object MUST contain "direction_operations" and at least one of "problem_model" or "vision".`;
 
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -661,11 +661,20 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     // Deliberately NOT added to the executor required-call retry checks, and the
     // store op does NOT set _strategic_api_called — a challenge-only cycle must not
     // look like a successful strategic mutation.
+    // Capacity + staged context so the challenge can judge the NET portfolio
+    // effect of proposed creates/stages (fan-out / over-capacity) — the same
+    // already-shipped payload fields the thinker saw, not new backend state.
+    const activeCapacityText = authoritativeActive !== undefined
+      ? `active directions: ${authoritativeActive} of ${maxActiveDirections} max`
+      + (authoritativePaused !== undefined ? ` (${authoritativePaused} paused)` : '')
+      : `active-direction cap: ${maxActiveDirections} max`;
     const challengeRecord = await runStrategicChallenge({
       analysisText,
       dirSummaryText,
       pastRetirementCritiquesSection,
       portfolioCompositionText,
+      stagedDirectionsText: stagedDirectionsSection,
+      activeCapacityText,
       ws, statusRef, model, effort, disallowedTools,
       runClaudeCode, sendLog,
     });
@@ -838,10 +847,13 @@ ${strategicChallengeSection}
 
 3. **Direction ops.** From Section 3, retire first, then create/update. For each create, set \`gap_id\` pointing to the gap_id defined in the problem_model. Parallel moves are fine — file the gap_id and let the orchestrator handle concurrency.
 
+   **Portfolio-operation gate (see the "Independent strategic challenge" section above).** Each create/update/retire/stage/approve/reject was judged by the independent challenge. Pass the SAME \`direction_id\` (existing-direction ops) or proposed \`text\` (creates) the analysis used, so the backend matches your call to its verdict. Do NOT attempt any move listed as **REJECTED** — it is a destructive or fan-out-sensitive mutation the challenge blocked, and the backend will reject the call (HTTP 409); skip it this cycle. Moves listed as **WARNED** are advisory — you may proceed but weigh the caution. If the challenge was blocked/invalid it carries no portfolio verdicts and nothing is gate-blocked.
+
    - Does an existing direction already cover this? → UPDATE it; don't duplicate.
    - Does this depend on another direction being done first? → Keep it paused or don't create yet.
    - Did the Thinker's Section 3 "Staging" decide this work belongs to the NEXT version? → For an existing direction, \`./strategic stage-direction\`. For a NEW idea, \`./strategic create-direction\` with \`"staged": true\` — born staged in ONE atomic op (never create-then-stage, which would briefly expose it as research-eligible). Stage ONLY what the analysis explicitly staged — never to defer a call the analysis left open.
    - Direction text describes OUTCOME ("users can X", "the system handles Y"), not implementation. Implementation details go in rationale.
+   - **Retirement gate:** If \`./strategic retire-direction\` returns HTTP 200 with \`"status": "deferred"\`, the backend recorded the deferral but did NOT retire the direction — the independent challenge did not support it (see the "Retirement gate" section above). This is a **SOFT NON-ERROR OUTCOME**: do NOT re-attempt the call, do NOT classify it as a failure, and do NOT count it as a missing required call.
 
    Priority is scarce:
    - high: 1-2 directions max — top work RIGHT NOW
@@ -939,12 +951,12 @@ ${strategicChallengeSection}
     try {
       const directionCreatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"create_direction"/.test(allOutput)
         || /"op"\s*:\s*"create_direction"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
-      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction)"/.test(allOutput)
-        || /"op"\s*:\s*"(update_direction|retire_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
+      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"/.test(allOutput)
+        || /"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
       const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
 
       // Detect constraint rejections (cap/dedup) so we don't retry wastefully
-      const directionRejectedInOutput = /\[CONSTRAINT\].*create_direction/.test(allOutput) || /"status"\s*:\s*"skipped"/.test(allOutput);
+      const directionRejectedInOutput = /\[CONSTRAINT\].*(create_direction|approve_direction|reject_direction)/.test(allOutput) || /"status"\s*:\s*"skipped"/.test(allOutput);
 
       // Check if thinker's structured output contained direction recommendations
       const structuredSection = analysisText.match(/## Structured Output[\s\S]*$/i)?.[0] ?? '';

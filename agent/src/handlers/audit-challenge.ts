@@ -364,6 +364,7 @@ Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with
       effort,
       disallowedTools,
       retryStatus: 'Repairing release audit challenge JSON...',
+      schemaLabel: 'audit_challenge',
     });
     if (repaired.value !== null) {
       logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha)));

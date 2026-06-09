@@ -64,7 +64,8 @@ QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 # Context key written on the SOURCE task when the adversarial per-finding grader
 # returns. Value is {"finding_verdicts": {hash: bool}, "grader_task_id": "..."}.
 # True = finding passed adversarial challenge; False = failed (finding deferred).
-# Absent hash → pass (fail-open: a crashed grader never blocks spawning).
+# Absent hash → fail-closed (passed=False, explicit=False): only an explicit pass
+# from the challenger allows spawning; missing/malformed/non-completed → unspawned.
 ADVERSARIAL_GATE_VERDICT_KEY = "adversarial_gate"
 
 # Context key written on a spawned safeguard-challenge task, pointing at the
@@ -876,12 +877,60 @@ def _extract_verdict_object_any(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+_ADVERSARIAL_MANIFEST_CHAR_BUDGET = 14_000
+_ADVERSARIAL_MANIFEST_DESC_CAP = 400
+
+
+def build_adversarial_challenge_manifest(
+    high_stakes: list[dict],
+) -> tuple[list[dict], str]:
+    """Build a compact, budget-bounded JSON manifest for the adversarial challenger.
+
+    Each item keeps only the fields the challenger needs to judge a finding:
+    ``hash``, ``title``, ``description`` (≤400 chars), ``risk``, ``scope``,
+    plus provenance sentinels ``verification_basis_downgraded_from`` and
+    ``needs_revalidation`` when present.
+
+    Items are admitted greedily until the serialised JSON would exceed
+    ``_ADVERSARIAL_MANIFEST_CHAR_BUDGET``.  The returned list is always a
+    valid JSON array; the second element of the tuple is the serialised string.
+    """
+    compact: list[dict] = []
+    running_json = "[]"
+    for item in high_stakes:
+        entry: dict = {}
+        h = str(item.get("hash") or "")
+        if not h:
+            continue
+        entry["hash"] = h
+        entry["title"] = str(item.get("title") or "")[:200]
+        desc = str(item.get("description") or item.get("prompt") or "")
+        entry["description"] = desc[:_ADVERSARIAL_MANIFEST_DESC_CAP]
+        if item.get("risk"):
+            entry["risk"] = str(item["risk"])
+        if item.get("scope"):
+            entry["scope"] = str(item["scope"])
+        if item.get("verification_basis_downgraded_from"):
+            entry["verification_basis_downgraded_from"] = str(
+                item["verification_basis_downgraded_from"]
+            )
+        if item.get("needs_revalidation"):
+            entry["needs_revalidation"] = True
+        candidate = compact + [entry]
+        candidate_json = json.dumps(candidate)
+        if len(candidate_json) > _ADVERSARIAL_MANIFEST_CHAR_BUDGET:
+            break
+        compact = candidate
+        running_json = candidate_json
+    return compact, running_json
+
+
 def build_adversarial_finding_prompt(high_stakes_findings_json: str) -> str:
     """Build a refute-first per-finding adversarial challenge prompt.
 
     Instructs a fresh agent to actively try to REFUTE each finding before it
-    spawns implementation work. Fail-open semantics: absent findings in the
-    output default to pass so a truncated or crashed grader never blocks work.
+    spawns implementation work. Fail-closed semantics: only an explicit pass
+    verdict allows spawning; absent or malformed output leaves findings unspawned.
     """
     return (
         "You are an ADVERSARIAL CHALLENGER. Each of the following research "
@@ -900,7 +949,7 @@ def build_adversarial_finding_prompt(high_stakes_findings_json: str) -> str:
         "clearly hold at HEAD.\n\n"
         "Findings to challenge (JSON array, each has a 'hash' identifier):\n"
         "-----8<----- FINDINGS START -----8<-----\n"
-        f"{high_stakes_findings_json[:20000]}\n"
+        f"{high_stakes_findings_json}\n"
         "-----8<----- FINDINGS END -----8<-----\n\n"
         "End your response with EXACTLY ONE JSON array, one object per finding "
         "in the SAME ORDER as the input, and nothing after it:\n"
@@ -917,17 +966,18 @@ def parse_adversarial_finding_verdicts(
     """Parse per-finding pass/fail verdicts from adversarial grader output.
 
     Returns a dict mapping finding_hash → {passed: bool, reason: str, explicit: bool}.
-    FAIL-OPEN: any finding whose hash is absent from the output defaults to
-    passed=True with explicit=False so a crashed or truncated adversarial grader
-    never blocks spawning. ``explicit=False`` distinguishes a fail-open bypass
-    from a clean challenger pass (``explicit=True``).
+    FAIL-CLOSED: any finding whose hash is absent from the output defaults to
+    passed=False with explicit=False so a crashed or truncated adversarial grader
+    leaves findings unspawned and auditable as unresolved. ``explicit=False``
+    distinguishes an unresolved finding from a clean challenger pass (``explicit=True``).
+    Only an explicit ``verdict: pass`` from the challenger produces passed=True.
     """
-    _fail_open: dict = {
-        "passed": True,
-        "reason": "fail-open: no verdict returned for this finding",
+    _unresolved: dict = {
+        "passed": False,
+        "reason": "fail-closed: no verdict returned for this finding",
         "explicit": False,
     }
-    result: dict[str, dict] = {h: dict(_fail_open) for h in finding_hashes}
+    result: dict[str, dict] = {h: dict(_unresolved) for h in finding_hashes}
     if not completed or not logs:
         return result
     from app.task_completion import _extract_json_array  # noqa: PLC0415
@@ -1018,6 +1068,7 @@ async def spawn_forward_quality_grader(
     rubric: str | None = None,
     question: str | None = None,
     adversarial_mode: bool = False,
+    finding_hashes: list[str] | None = None,
 ) -> Task | None:
     """Spawn an independent grader task for ``source_task`` and park the source.
 
@@ -1100,6 +1151,11 @@ async def spawn_forward_quality_grader(
             "scope": "small",
             "graded_task_type": task_type,
             **({"adversarial_grader": True} if adversarial_mode else {}),
+            **(
+                {"_adversarial_challenged_hashes": finding_hashes}
+                if adversarial_mode and finding_hashes
+                else {}
+            ),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,

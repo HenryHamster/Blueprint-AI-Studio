@@ -49,6 +49,9 @@ from app.strategic_completion import (
     sanitize_strategic_challenge_record,
     strategic_challenge_summary,
     challenge_approves_evidence_progress,
+    challenge_approves_retirement,
+    portfolio_operation_fingerprint,
+    challenge_rejects_portfolio_op,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     STRATEGIC_CHALLENGE_RECORD_VERSION,
     EVIDENCE_PROGRESS_CONTEXT_KEY,
@@ -62,10 +65,11 @@ from app.strategic_completion import (
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
     _build_past_retirement_critiques,
+    _spawn_strategic_review,
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Project, StrategicCycle, Task
+from app.models import Project, ProjectMember, StrategicCycle, Task
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -220,6 +224,7 @@ def test_strategic_completion_event_summary_includes_compact_challenge_summary_w
         "verdict": "blocked",
         "warned_count": 1,  # one uncertain evidence_progress item
         "blocked_count": 2,  # one rejected item + one rejected section verdict
+        "gate_mode": "enforce",
     }
     # The compact summary must NOT carry the bounded item list — that stays in
     # cycle_metadata for drill-down, never on the websocket-bound summary.
@@ -274,6 +279,7 @@ def test_strategic_completion_event_summary_challenge_falls_back_to_context():
         "verdict": "approved",
         "warned_count": 0,
         "blocked_count": 0,
+        "gate_mode": "enforce",
     }
 
 
@@ -4713,6 +4719,13 @@ async def test_set_strategic_challenge_stores_record_without_api_called(
                         "rationale": "ships real evidence",
                     }
                 ],
+                "retirement_approvals": [
+                    {
+                        "direction_id": "d-ret",
+                        "verdict": "approved",
+                        "rationale": "retirement is evidenced",
+                    }
+                ],
                 "retirement_critique_quality": {
                     "verdict": "solid",
                     "rationale": "names the pattern",
@@ -4733,6 +4746,7 @@ async def test_set_strategic_challenge_stores_record_without_api_called(
     assert body["challenge_version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
     assert body["challenge_status"] == "ok"
     assert body["evidence_progress_count"] == 1
+    assert body["retirement_approvals_count"] == 1
     assert body["retirement_critique_quality_count"] == 1
     assert body["portfolio_shape_risk_count"] == 1
 
@@ -4743,6 +4757,7 @@ async def test_set_strategic_challenge_stores_record_without_api_called(
     assert stored["challenge_version"] == STRATEGIC_CHALLENGE_RECORD_VERSION
     assert stored["status"] == "ok"
     assert stored["evidence_progress"][0]["verdict"] == "approved"
+    assert stored["retirement_approvals"][0]["verdict"] == "approved"
     assert stored["retirement_critique_quality"]["verdict"] == "solid"
     assert stored["portfolio_shape_risk"]["verdict"] == "uncertain"
     assert stored["notes"] == "challenge notes"
@@ -4769,6 +4784,531 @@ async def test_set_strategic_challenge_non_object_returns_400(client, db_session
     assert resp.status_code == 400, resp.text
     await db_session.refresh(task)
     assert STRATEGIC_CHALLENGE_CONTEXT_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_retirement_gated_on_challenge_second_opinion(
+    client, db_session, mocker
+):
+    """Agent retirements fail closed on unsupported second opinions in enforce mode."""
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.shared_state import runtime_config
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    old_mode = runtime_config.get("strategic_retirement_challenge_gate_mode")
+
+    async def make_task(name, vm, direction_id, challenge_marker=None):
+        context = None
+        if challenge_marker is not None:
+            context = {
+                STRATEGIC_CHALLENGE_CONTEXT_KEY: challenge_marker,
+            }
+        task = await _make_strategic_task(
+            db_session,
+            name=name,
+            vm=vm,
+            directions=[
+                {
+                    "id": direction_id,
+                    "status": "active",
+                    "text": f"Direction {direction_id}",
+                    "research_history": [],
+                    "notes": [],
+                }
+            ],
+        )
+        if context:
+            task.context = {**(task.context or {}), **context}
+            db_session.add(task)
+            await db_session.commit()
+            await db_session.refresh(task)
+        return task
+
+    async def retire(task, vm, direction_id, rationale="pattern is complete"):
+        token = create_agent_token(str(task.id), vm, task_type="strategic_review")
+        return await client.post(
+            "/api/agent/strategic",
+            json={
+                "task_id": str(task.id),
+                "op": "retire_direction",
+                "data": {"direction_id": direction_id, "rationale": rationale},
+            },
+            headers={"x-agent-token": token},
+        )
+
+    async def project_direction(task, direction_id):
+        project = await db_session.get(Project, task.project_id)
+        await db_session.refresh(project)
+        return next(d for d in project.directions if d.get("id") == direction_id)
+
+    try:
+        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
+
+        supported_challenge = {
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "ok",
+            "portfolio_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-supported",
+                    "verdict": "approved",
+                }
+            ],
+            "retirement_approvals": [
+                {
+                    "direction_id": "d-supported",
+                    "verdict": "approved",
+                    "rationale": "retirement rationale names real evidence",
+                }
+            ],
+        }
+        supported_challenge = sanitize_strategic_challenge_record(supported_challenge)
+        supported = await make_task(
+            "RET-SUPPORTED", "vm-ret-supported", "d-supported", supported_challenge
+        )
+        supported_resp = await retire(
+            supported, "vm-ret-supported", "d-supported", "evidence-rich memo"
+        )
+        assert supported_resp.status_code == 200, supported_resp.text
+        assert supported_resp.json()["status"] == "ok"
+        supported_dir = await project_direction(supported, "d-supported")
+        assert supported_dir["status"] == "expired"
+        assert any(
+            "Retired by strategic review: evidence-rich memo" in note.get("text", "")
+            for note in supported_dir.get("notes", [])
+        )
+
+        rejected_challenge = {
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "ok",
+            "portfolio_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-rejected",
+                    "verdict": "approved",
+                }
+            ],
+            "retirement_approvals": [
+                {
+                    "direction_id": "d-rejected",
+                    "verdict": "rejected",
+                    "rationale": "shallow and unsupported",
+                }
+            ],
+            "retirement_critique_quality": {"verdict": "shallow"},
+        }
+        rejected_challenge = sanitize_strategic_challenge_record(rejected_challenge)
+        rejected = await make_task(
+            "RET-REJECTED", "vm-ret-rejected", "d-rejected", rejected_challenge
+        )
+        rejected_resp = await retire(rejected, "vm-ret-rejected", "d-rejected")
+        assert rejected_resp.status_code == 200, rejected_resp.text
+        rejected_body = rejected_resp.json()
+        assert rejected_body["status"] == "deferred"
+        assert rejected_body["op"] == "retire_direction"
+        rejected_dir = await project_direction(rejected, "d-rejected")
+        assert rejected_dir["status"] == "active"
+        assert any(
+            "Strategic retirement deferred" in note.get("text", "")
+            for note in rejected_dir.get("notes", [])
+        )
+        await db_session.refresh(rejected)
+        rejected_ctx = rejected.context or {}
+        assert rejected_ctx["_strategic_retirement_deferrals"][0]["direction_id"] == (
+            "d-rejected"
+        )
+        assert rejected_ctx["_strategic_retirement_deferrals"][0]["approved"] is False
+        assert rejected_ctx["_strategic_api_called"] is True
+        assert "_strategic_retired_ids" not in rejected_ctx
+
+        await _handle_strategic_completion(rejected, "", db_session)
+        cycle = await db_session.get(StrategicCycle, rejected.strategic_cycle_id)
+        meta = cycle.cycle_metadata or {}
+        assert meta["retirement_deferrals"][0]["direction_id"] == "d-rejected"
+        assert meta["retirement_gate_verdicts"][0]["verdict"] == "rejected"
+
+        from app.models import TaskStatus
+
+        rejected.status = TaskStatus.COMPLETED
+        db_session.add(rejected)
+        await db_session.commit()
+        await db_session.refresh(rejected)
+
+        project = await db_session.get(Project, rejected.project_id)
+        assert project is not None
+        spawned = await _spawn_strategic_review(project, db_session)
+        assert spawned is True
+        from sqlmodel import select
+
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        spawned_tasks = [t for t in result.scalars().all() if t.id != rejected.id]
+        assert spawned_tasks, "Expected a new strategic_review task after deferral"
+        spawned_payload = spawned_tasks[0].payloads[0]
+        assert spawned_payload["type"] == "strategic_review"
+        assert spawned_payload["retirement_deferrals"][0]["direction_id"] == "d-rejected"
+        assert spawned_payload["retirement_deferrals"][0]["verdict"] == "rejected"
+        assert spawned_payload["retirement_deferrals"][0]["challenge_status"] == "ok"
+
+        blocked_challenge = {
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "blocked",
+            "retirement_approvals": [
+                {"direction_id": "d-blocked", "verdict": "approved"}
+            ],
+        }
+        invalid_challenge = {
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "invalid",
+            "retirement_approvals": [
+                {"direction_id": "d-invalid", "verdict": "approved"}
+            ],
+        }
+        blocked_challenge = sanitize_strategic_challenge_record(blocked_challenge)
+        invalid_challenge = sanitize_strategic_challenge_record(invalid_challenge)
+        for suffix, challenge in (
+            ("missing", None),
+            ("blocked", blocked_challenge),
+            ("invalid", invalid_challenge),
+        ):
+            direction_id = f"d-{suffix}"
+            task = await make_task(
+                f"RET-{suffix}", f"vm-ret-{suffix}", direction_id, challenge
+            )
+            resp = await retire(task, f"vm-ret-{suffix}", direction_id)
+            assert resp.status_code == 200, resp.text
+            expected_status = "deferred" if suffix == "missing" else "blocked"
+            assert resp.json()["status"] == expected_status
+            direction = await project_direction(task, direction_id)
+            assert direction["status"] == "active"
+
+        for mode in ("observe", "advisory"):
+            runtime_config["strategic_retirement_challenge_gate_mode"] = mode
+            direction_id = f"d-{mode}"
+            task = await make_task(
+                f"RET-{mode}",
+                f"vm-ret-{mode}",
+                direction_id,
+                sanitize_strategic_challenge_record(
+                    {
+                        "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+                        "status": "ok",
+                        "portfolio_operations": [
+                            {
+                                "op": "retire_direction",
+                                "direction_id": direction_id,
+                                "verdict": "warned",
+                            }
+                        ],
+                        "retirement_approvals": [
+                            {"direction_id": direction_id, "verdict": "uncertain"}
+                        ],
+                    }
+                ),
+            )
+            resp = await retire(task, f"vm-ret-{mode}", direction_id)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["status"] == "ok"
+            if mode == "advisory":
+                assert "warnings" in resp.json()
+            direction = await project_direction(task, direction_id)
+            assert direction["status"] == "expired"
+
+        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
+        operator_project = Project(
+            name="RET-OPERATOR",
+            user_id="test-user-123",
+            vision={"purpose": "test", "revision": 1},
+            directions=[
+                {
+                    "id": "d-operator",
+                    "status": "active",
+                    "text": "Operator-owned retirement",
+                    "research_history": [],
+                    "notes": [],
+                }
+            ],
+        )
+        db_session.add(operator_project)
+        await db_session.commit()
+        await db_session.refresh(operator_project)
+        db_session.add(
+            ProjectMember(
+                project_id=operator_project.id,
+                user_id="test-user-123",
+                role="owner",
+            )
+        )
+        await db_session.commit()
+
+        operator_resp = await client.patch(
+            f"/api/admin/projects/{operator_project.id}/directions/d-operator",
+            json={"status": "expired"},
+        )
+        assert operator_resp.status_code == 200, operator_resp.text
+        await db_session.refresh(operator_project)
+        operator_dir = next(
+            d for d in operator_project.directions if d.get("id") == "d-operator"
+        )
+        assert operator_dir["status"] == "expired"
+    finally:
+        if old_mode is None:
+            runtime_config.pop("strategic_retirement_challenge_gate_mode", None)
+        else:
+            runtime_config["strategic_retirement_challenge_gate_mode"] = old_mode
+
+
+async def _set_portfolio_operation_challenge(
+    db_session,
+    task,
+    *,
+    op: str,
+    direction_id: str | None = None,
+    text: str | None = None,
+    verdict: str = "rejected",
+):
+    challenge = {
+        "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+        "status": "ok",
+        "portfolio_operations": [
+            {
+                "op": op,
+                "direction_id": direction_id or "",
+                **({"text": text} if text is not None else {}),
+                "verdict": verdict,
+            }
+        ],
+    }
+    challenge = sanitize_strategic_challenge_record(challenge)
+    task.context = {
+        **(task.context or {}),
+        STRATEGIC_CHALLENGE_CONTEXT_KEY: challenge,
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+
+async def _post_strategic_op(client, task, vm: str, op: str, data: dict):
+    from app.auth import create_agent_token
+
+    token = create_agent_token(str(task.id), vm, task_type="strategic_review")
+    return await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": op, "data": data},
+        headers={"x-agent-token": token},
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_direction_rejected_portfolio_operation_blocks(
+    client, db_session
+):
+    task = await _make_strategic_task(db_session, name="PO-CREATE", vm="vm-po-create")
+    await _set_portfolio_operation_challenge(
+        db_session,
+        task,
+        op="create_direction",
+        text="Build the widget pipeline",
+    )
+
+    resp = await _post_strategic_op(
+        client,
+        task,
+        "vm-po-create",
+        "create_direction",
+        {
+            "text": "Build the widget pipeline",
+            "priority": "medium",
+            "rationale": "new direction",
+            "success_evidence": "Widget pipeline ships",
+            "retirement_condition": "No open widget backlog",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["op"] == "create_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    assert project.directions == []
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_rejected_portfolio_operation_blocks(
+    client, db_session
+):
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-RETIRE",
+        vm="vm-po-retire",
+        directions=[
+            {
+                "id": "d-retire",
+                "status": "active",
+                "text": "Retire me",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    await _set_portfolio_operation_challenge(
+        db_session, task, op="retire_direction", direction_id="d-retire"
+    )
+
+    resp = await _post_strategic_op(
+        client,
+        task,
+        "vm-po-retire",
+        "retire_direction",
+        {"direction_id": "d-retire", "rationale": "redundant"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["op"] == "retire_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    retired = next(d for d in project.directions if d.get("id") == "d-retire")
+    assert retired["status"] == "active"
+    assert not any(
+        "Retired by strategic review" in (note.get("text") or "")
+        for note in retired.get("notes", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage_direction_rejected_portfolio_operation_blocks(
+    client, db_session
+):
+    from app import release_version as rv
+
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-STAGE",
+        vm="vm-po-stage",
+        directions=[
+            {
+                "id": "d-stage",
+                "status": "active",
+                "text": "Stage me",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    project = await db_session.get(Project, task.project_id)
+    await rv.open_version(db_session, project.id, version_number=7)
+    await db_session.commit()
+    await _set_portfolio_operation_challenge(
+        db_session, task, op="stage_direction", direction_id="d-stage"
+    )
+
+    resp = await _post_strategic_op(
+        client,
+        task,
+        "vm-po-stage",
+        "stage_direction",
+        {"direction_id": "d-stage", "rationale": "next version work"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["op"] == "stage_direction"
+
+    await db_session.refresh(project)
+    staged = next(d for d in project.directions if d.get("id") == "d-stage")
+    assert staged["status"] == "active"
+    assert "staged_for_version" not in staged
+
+
+@pytest.mark.asyncio
+async def test_approve_direction_rejected_portfolio_operation_blocks(
+    client, db_session
+):
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-APPROVE",
+        vm="vm-po-approve",
+        directions=[
+            {
+                "id": "d-approve",
+                "status": "proposed",
+                "text": "Approve me",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    await _set_portfolio_operation_challenge(
+        db_session, task, op="approve_direction", direction_id="d-approve"
+    )
+
+    resp = await _post_strategic_op(
+        client,
+        task,
+        "vm-po-approve",
+        "approve_direction",
+        {"direction_id": "d-approve", "rationale": "good idea"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["op"] == "approve_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    approved = next(d for d in project.directions if d.get("id") == "d-approve")
+    assert approved["status"] == "proposed"
+    assert "activated_at" not in approved
+
+
+@pytest.mark.asyncio
+async def test_reject_direction_rejected_portfolio_operation_blocks(
+    client, db_session
+):
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-REJECT",
+        vm="vm-po-reject",
+        directions=[
+            {
+                "id": "d-reject",
+                "status": "proposed",
+                "text": "Reject me",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    await _set_portfolio_operation_challenge(
+        db_session, task, op="reject_direction", direction_id="d-reject"
+    )
+
+    resp = await _post_strategic_op(
+        client,
+        task,
+        "vm-po-reject",
+        "reject_direction",
+        {"direction_id": "d-reject", "rationale": "not worthwhile"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["op"] == "reject_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    rejected = next(d for d in project.directions if d.get("id") == "d-reject")
+    assert rejected["status"] == "proposed"
+    assert all(d.get("status") != "rejected" for d in project.directions)
 
 
 @pytest.mark.asyncio
@@ -8196,6 +8736,7 @@ class TestSanitizeStrategicChallengeRecord:
             "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
             "status": "invalid",
             "evidence_progress": [],
+            "retirement_approvals": [],
             "retirement_critique_quality": {
                 "verdict": "not_assessed",
                 "rationale": "",
@@ -8204,6 +8745,7 @@ class TestSanitizeStrategicChallengeRecord:
                 "verdict": "not_assessed",
                 "rationale": "",
             },
+            "portfolio_operations": [],
         }
 
     def test_sanitizes_agent_shape_and_preserves_second_opinion_blocks(self):
@@ -8217,6 +8759,13 @@ class TestSanitizeStrategicChallengeRecord:
                         "status": "Advancing",
                         "verdict": "Approved",
                         "rationale": "ships real evidence",
+                    }
+                ],
+                "retirement_approvals": [
+                    {
+                        "direction_id": "d-ret",
+                        "verdict": "Approved",
+                        "rationale": "pattern is evidenced",
                     }
                 ],
                 "retirement_critique_quality": {
@@ -8240,6 +8789,13 @@ class TestSanitizeStrategicChallengeRecord:
                 "status": "advancing",
                 "verdict": "approved",
                 "rationale": "ships real evidence",
+                }
+        ]
+        assert rec["retirement_approvals"] == [
+            {
+                "direction_id": "d-ret",
+                "verdict": "approved",
+                "rationale": "pattern is evidenced",
             }
         ]
         assert rec["retirement_critique_quality"] == {
@@ -8288,6 +8844,236 @@ class TestSanitizeStrategicChallengeRecord:
         assert len(rec["evidence_progress"]) == 50  # _CHALLENGE_MAX_ITEMS
         assert len(rec["evidence_progress"][0]["rationale"]) == 300
 
+    def test_sanitizes_retirement_approval_items_independently(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "retirement_approvals": [
+                    "not a dict",
+                    {"direction_id": "", "verdict": "approved"},
+                    {"direction_id": "d-1", "verdict": "maybe"},
+                    {
+                        "direction_id": "d-2",
+                        "verdict": "uncertain",
+                        "rationale": "x" * 1000,
+                    },
+                ]
+            }
+        )
+        assert rec["retirement_approvals"] == [
+            {
+                "direction_id": "d-2",
+                "verdict": "uncertain",
+                "rationale": "x" * 300,
+            }
+        ]
+
+
+class TestPortfolioOperations:
+    def test_legacy_record_without_portfolio_operations_defaults_empty(self):
+        rec = sanitize_strategic_challenge_record(
+            {"status": "ok", "evidence_progress": []}
+        )
+        assert rec["portfolio_operations"] == []
+
+    def test_portfolio_operations_sanitized_and_fingerprinted(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-1",
+                        "verdict": "Rejected",
+                        "rationale": "no evidence the lane is dead",
+                    },
+                    {
+                        "op": "create",
+                        "text": "Build a Widget Pipeline",
+                        "verdict": "warned",
+                    },
+                ],
+            }
+        )
+        ops = rec["portfolio_operations"]
+        assert ops[0] == {
+            "op": "retire_direction",
+            "direction_id": "d-1",
+            "fingerprint": portfolio_operation_fingerprint(
+                "retire_direction", direction_id="d-1"
+            ),
+            "verdict": "rejected",
+            "rationale": "no evidence the lane is dead",
+        }
+        assert ops[1]["op"] == "create_direction"
+        assert ops[1]["verdict"] == "warned"
+        assert ops[1]["fingerprint"] == portfolio_operation_fingerprint(
+            "create_direction", text="build a widget pipeline"
+        )
+
+    def test_evidence_progress_and_portfolio_operations_both_survive(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "evidence_progress": [
+                    {
+                        "direction_id": "d-1",
+                        "status": "met",
+                        "verdict": "approved",
+                    }
+                ],
+                "portfolio_operations": [
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-2",
+                        "verdict": "rejected",
+                    }
+                ],
+            }
+        )
+        assert rec["evidence_progress"] == [
+            {
+                "direction_id": "d-1",
+                "status": "met",
+                "verdict": "approved",
+                "rationale": "",
+            }
+        ]
+        assert rec["portfolio_operations"] == [
+            {
+                "op": "retire_direction",
+                "direction_id": "d-2",
+                "fingerprint": portfolio_operation_fingerprint(
+                    "retire_direction", direction_id="d-2"
+                ),
+                "verdict": "rejected",
+                "rationale": "",
+            }
+        ]
+
+    def test_portfolio_operations_drops_unknown_op_and_verdict(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    "not a dict",
+                    {"op": "set_vision", "direction_id": "d-1", "verdict": "rejected"},
+                    {"op": "retire_direction", "direction_id": "d-2", "verdict": "nope"},
+                    {"op": "retire_direction", "direction_id": "d-3", "verdict": "rejected"},
+                ],
+            }
+        )
+        assert [i["direction_id"] for i in rec["portfolio_operations"]] == ["d-3"]
+
+    def test_portfolio_operations_collapse_duplicate_fingerprints(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"},
+                    {"op": "retire", "direction_id": "d-1", "verdict": "approved"},
+                ]
+            }
+        )
+        assert len(rec["portfolio_operations"]) == 1
+        assert rec["portfolio_operations"][0]["verdict"] == "rejected"
+
+    def test_blocked_record_drops_portfolio_operations(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "blocked",
+                "portfolio_operations": [
+                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"},
+                    {"op": "create_direction", "text": "build x", "verdict": "rejected"},
+                ],
+            }
+        )
+        assert rec["portfolio_operations"] == []
+
+
+class TestPortfolioOperationFingerprint:
+    def test_id_keyed_ops_are_stable_and_canonical(self):
+        assert portfolio_operation_fingerprint(
+            "retire", direction_id="d-1"
+        ) == portfolio_operation_fingerprint("retire_direction", direction_id="d-1")
+
+    def test_create_keys_on_normalized_text(self):
+        a = portfolio_operation_fingerprint("create_direction", text="Build  X")
+        b = portfolio_operation_fingerprint("create_direction", text="build x")
+        assert a == b
+        assert a != portfolio_operation_fingerprint(
+            "create_direction", text="build y"
+        )
+
+    def test_different_ops_do_not_collide(self):
+        assert portfolio_operation_fingerprint(
+            "retire_direction", direction_id="d-1"
+        ) != portfolio_operation_fingerprint(
+            "stage_direction", direction_id="d-1"
+        )
+
+
+class TestChallengeRejectsPortfolioOp:
+    def _rec(self, ops):
+        return sanitize_strategic_challenge_record(
+            {"status": "ok", "portfolio_operations": ops}
+        )
+
+    def test_rejection_blocks_destructive_op(self):
+        rec = self._rec(
+            [{"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"}]
+        )
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "retire_direction", direction_id="d-1"
+        )
+        assert blocked is True
+        assert isinstance(why, str)
+
+    def test_warned_does_not_block(self):
+        rec = self._rec(
+            [{"op": "stage_direction", "direction_id": "d-1", "verdict": "warned"}]
+        )
+        assert challenge_rejects_portfolio_op(
+            rec, "stage_direction", direction_id="d-1"
+        ) == (False, "")
+
+    def test_rejection_on_create_blocks(self):
+        rec = self._rec(
+            [{"op": "create_direction", "text": "build x", "verdict": "rejected"}]
+        )
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "create_direction", text="build x"
+        )
+        assert blocked is True
+        assert isinstance(why, str)
+
+    def test_blocked_record_blocks_hard_op(self):
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "blocked",
+                "portfolio_operations": [
+                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"}
+                ],
+            }
+        )
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "retire_direction", direction_id="d-1"
+        )
+        assert blocked is True
+        assert "blocked" in why or "challenge status" in why
+
+    def test_fingerprint_mismatch_blocks(self):
+        rec = self._rec(
+            [{"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"}]
+        )
+        assert challenge_rejects_portfolio_op(
+            rec, "retire_direction", direction_id="d-2"
+        )[0] is True
+
+    def test_missing_record_does_not_block(self):
+        assert challenge_rejects_portfolio_op(
+            None, "retire_direction", direction_id="d-1"
+        ) == (False, "")
+
 
 class TestStrategicChallengeSummary:
     def test_non_dict_returns_none(self):
@@ -8313,6 +9099,7 @@ class TestStrategicChallengeSummary:
             "verdict": "approved",
             "warned_count": 0,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
     def test_mixed_evidence_and_section_verdicts_roll_up_to_blocked(self):
@@ -8335,14 +9122,19 @@ class TestStrategicChallengeSummary:
                 # section verdict blocks contribute too
                 "retirement_critique_quality": {"verdict": "uncertain"},
                 "portfolio_shape_risk": {"verdict": "rejected"},
+                "portfolio_operations": [
+                    {"op": "stage_direction", "direction_id": "d-4", "verdict": "warned"},
+                    {"op": "retire_direction", "direction_id": "d-5", "verdict": "rejected"},
+                ],
             }
         )
         assert strategic_challenge_summary(rec) == {
             "mode": "ok",
             # rejected anywhere -> overall blocked
             "verdict": "blocked",
-            "warned_count": 2,  # one uncertain item + one uncertain section
-            "blocked_count": 2,  # one rejected item + one rejected section
+            "warned_count": 3,  # one uncertain item + one uncertain section + one warned op
+            "blocked_count": 3,  # one rejected item + one rejected section + one rejected op
+            "gate_mode": "enforce",
         }
 
     def test_only_uncertain_rolls_up_to_warned(self):
@@ -8367,6 +9159,7 @@ class TestStrategicChallengeSummary:
             "verdict": "blocked",
             "warned_count": 0,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
     def test_mode_mirrors_record_status(self):
@@ -8392,7 +9185,7 @@ class TestStrategicChallengeSummary:
         )
         summary = strategic_challenge_summary(rec)
         # Only the four compact scalar fields — none of the bounded item lists.
-        assert set(summary) == {"mode", "verdict", "warned_count", "blocked_count"}
+        assert set(summary) == {"mode", "verdict", "warned_count", "blocked_count", "gate_mode"}
         # elevated portfolio_shape_risk counts as warned; rejected evidence item as blocked
         assert summary["blocked_count"] == 1
         assert summary["warned_count"] == 1
@@ -8414,6 +9207,7 @@ class TestStrategicChallengeSummary:
             "verdict": "warned",
             "warned_count": 1,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
     def test_section_elevated_maps_to_warned(self):
@@ -8432,6 +9226,7 @@ class TestStrategicChallengeSummary:
             "verdict": "warned",
             "warned_count": 1,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
     def test_section_high_maps_to_blocked(self):
@@ -8450,6 +9245,7 @@ class TestStrategicChallengeSummary:
             "verdict": "blocked",
             "warned_count": 0,
             "blocked_count": 1,
+            "gate_mode": "enforce",
         }
 
     def test_section_clean_verdicts_are_approved(self):
@@ -8470,6 +9266,7 @@ class TestStrategicChallengeSummary:
             "verdict": "approved",
             "warned_count": 0,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
     def test_section_both_negative_accumulates_counts(self):
@@ -8488,6 +9285,7 @@ class TestStrategicChallengeSummary:
             "verdict": "warned",
             "warned_count": 2,
             "blocked_count": 0,
+            "gate_mode": "enforce",
         }
 
 
@@ -8564,6 +9362,51 @@ class TestChallengeApprovesEvidenceProgress:
             {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
         ]}
         assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
+
+
+class TestChallengeApprovesRetirement:
+    def _rec(self, items, status="ok"):
+        return {"version": 1, "status": status, "retirement_approvals": items}
+
+    def test_approved_exact_match_returns_true(self):
+        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
+        assert challenge_approves_retirement(rec, "d-1") is True
+
+    @pytest.mark.parametrize("verdict", ["rejected", "uncertain"])
+    def test_non_approved_verdict_returns_false(self, verdict):
+        rec = self._rec([{"direction_id": "d-1", "verdict": verdict}])
+        assert challenge_approves_retirement(rec, "d-1") is False
+
+    def test_direction_mismatch_returns_false(self):
+        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
+        assert challenge_approves_retirement(rec, "d-2") is False
+
+    def test_missing_or_malformed_record_returns_false(self):
+        assert challenge_approves_retirement(None, "d-1") is False
+        assert challenge_approves_retirement({}, "d-1") is False
+        assert challenge_approves_retirement("x", "d-1") is False
+        assert challenge_approves_retirement(self._rec([]), "d-1") is False
+
+    def test_blank_direction_returns_false(self):
+        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
+        assert challenge_approves_retirement(rec, "") is False
+
+    @pytest.mark.parametrize("status", ["blocked", "invalid"])
+    def test_non_ok_status_with_approved_entry_returns_false(self, status):
+        rec = self._rec(
+            [{"direction_id": "d-1", "verdict": "approved"}],
+            status=status,
+        )
+        assert challenge_approves_retirement(rec, "d-1") is False
+
+    def test_missing_status_field_returns_false(self):
+        rec = {
+            "version": 1,
+            "retirement_approvals": [
+                {"direction_id": "d-1", "verdict": "approved"}
+            ],
+        }
+        assert challenge_approves_retirement(rec, "d-1") is False
 
 
 class TestStrategicChallengeGate:
@@ -8712,6 +9555,193 @@ class TestStrategicChallengeGate:
         _apply_evidence_progress_verdicts(task, project)
         assert project.directions[0]["evidence_progress"]["challenge_approved"] is False
         assert _check_outcome_scaffolding(project.directions[0]) is not None
+
+
+class TestStrategicChallengeGateMode:
+    """Gate mode runtime config: observe/advisory/enforce control suppression behavior."""
+
+    def _task(self, verdicts, challenge):
+        ctx = {EVIDENCE_PROGRESS_CONTEXT_KEY: verdicts}
+        if challenge is not None:
+            ctx[STRATEGIC_CHALLENGE_CONTEXT_KEY] = challenge
+        return Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context=ctx,
+        )
+
+    def _project_with_scaffold(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        d["id"] = "d-1"
+        return Project(
+            name="GateModeTest",
+            user_id="u1",
+            vision={"purpose": "p", "revision": 1},
+            directions=[d],
+        )
+
+    def _rejecting_challenge(self):
+        return {
+            "version": 1,
+            "status": "ok",
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "rejected"}
+            ],
+        }
+
+    def test_challenge_gate_mode_observe_advisory_enforce(self, mocker):
+        """Acceptance test: observe/advisory/enforce modes all honor their contract."""
+        # --- enforce (default): gate blocks when challenge did not approve ---
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "enforce"},
+            clear=False,
+        )
+        enforce_proj = self._project_with_scaffold()
+        enforce_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(enforce_task, enforce_proj)
+        ep = enforce_proj.directions[0]["evidence_progress"]
+        assert ep["gate_mode"] == "enforce"
+        assert ep["gate_would_block"] is True
+        assert ep["challenge_approved"] is False
+        # enforce: scaffolding NOT suppressed
+        assert _check_outcome_scaffolding(enforce_proj.directions[0]) is not None
+
+        # --- observe: gate stamps would-block but does NOT suppress ---
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "observe"},
+            clear=False,
+        )
+        observe_proj = self._project_with_scaffold()
+        observe_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(observe_task, observe_proj)
+        ep = observe_proj.directions[0]["evidence_progress"]
+        assert ep["gate_mode"] == "observe"
+        assert ep["gate_would_block"] is True
+        assert ep["challenge_approved"] is False
+        # observe: suppression allowed (scaffolding IS suppressed)
+        assert _check_outcome_scaffolding(observe_proj.directions[0]) is None
+
+        # --- advisory: gate stamps would-block, emits warning, does NOT block ---
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "advisory"},
+            clear=False,
+        )
+        advisory_proj = self._project_with_scaffold()
+        advisory_task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(advisory_task, advisory_proj)
+        ep = advisory_proj.directions[0]["evidence_progress"]
+        assert ep["gate_mode"] == "advisory"
+        assert ep["gate_would_block"] is True
+        assert ep["challenge_approved"] is False
+        # advisory: suppression allowed (scaffolding IS suppressed)
+        assert _check_outcome_scaffolding(advisory_proj.directions[0]) is None
+
+    def test_default_mode_is_enforce(self, mocker):
+        """Absent config key defaults to enforce (current behavior preserved)."""
+        # Remove key to simulate absent config
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {},
+            clear=True,
+        )
+        proj = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(task, proj)
+        ep = proj.directions[0]["evidence_progress"]
+        assert ep["gate_mode"] == "enforce"
+        # enforce (default): gate blocks
+        assert _check_outcome_scaffolding(proj.directions[0]) is not None
+
+    def test_advisory_logs_warning_when_gate_would_block(self, mocker, caplog):
+        """Advisory mode emits a warning log when gate_would_block is True."""
+        import logging
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "advisory"},
+            clear=False,
+        )
+        proj = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(task, proj)
+        with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
+            _check_outcome_scaffolding(proj.directions[0])
+        assert any("advisory" in r.message for r in caplog.records)
+
+    def test_observe_no_warning_when_gate_would_block(self, mocker, caplog):
+        """Observe mode does NOT emit a warning log."""
+        import logging
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "observe"},
+            clear=False,
+        )
+        proj = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            self._rejecting_challenge(),
+        )
+        _apply_evidence_progress_verdicts(task, proj)
+        with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
+            _check_outcome_scaffolding(proj.directions[0])
+        assert not any("advisory" in r.message for r in caplog.records)
+
+    def test_gate_mode_surfaced_in_challenge_summary(self, mocker):
+        """gate_mode from runtime config is included in strategic_challenge_summary."""
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "advisory"},
+            clear=False,
+        )
+        record = {
+            "status": "ok",
+            "evidence_progress": [],
+        }
+        summary = strategic_challenge_summary(record)
+        assert summary is not None
+        assert summary["gate_mode"] == "advisory"
+
+    def test_gate_mode_enforce_approved_still_suppresses(self, mocker):
+        """In enforce mode, an approved challenge still suppresses scaffolding."""
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"strategic_challenge_gate_mode": "enforce"},
+            clear=False,
+        )
+        proj = self._project_with_scaffold()
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "ok"}],
+            {
+                "version": 1,
+                "status": "ok",
+                "evidence_progress": [
+                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                ],
+            },
+        )
+        _apply_evidence_progress_verdicts(task, proj)
+        ep = proj.directions[0]["evidence_progress"]
+        assert ep["gate_mode"] == "enforce"
+        assert ep["gate_would_block"] is False
+        assert ep["challenge_approved"] is True
+        assert _check_outcome_scaffolding(proj.directions[0]) is None
 
 
 @pytest.mark.asyncio
@@ -9108,6 +10138,469 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
         .all()
     )
     assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_ops_respect_rejected_challenge(db_session, mocker):
+    """Legacy fallback mutations must not bypass a stored non-ok challenge."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackChallengeGate",
+        user_id="u-fallback-gate",
+        vision={"purpose": "test", "revision": 0},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    challenge = sanitize_strategic_challenge_record(
+        {
+            "status": "blocked",
+            "portfolio_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Blocked by challenge",
+                    "verdict": "rejected",
+                },
+                {
+                    "op": "stage_direction",
+                    "direction_id": "d-stage",
+                    "verdict": "rejected",
+                },
+                {
+                    "op": "approve_direction",
+                    "direction_id": "d-approve",
+                    "verdict": "rejected",
+                },
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "verdict": "rejected",
+                }
+            ],
+        }
+    )
+    directions = [
+        {
+            "id": "d-stage",
+            "text": "Stage me",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "research_history": [],
+            "notes": [],
+        },
+        {
+            "id": "d-approve",
+            "text": "Approve me",
+            "status": "proposed",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "research_history": [],
+            "notes": [],
+        },
+        {
+            "id": "d-reject",
+            "text": "Reject me",
+            "status": "proposed",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "research_history": [],
+            "notes": [],
+        },
+    ]
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={STRATEGIC_CHALLENGE_CONTEXT_KEY: challenge},
+    )
+    project.directions = directions
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Blocked by challenge",
+                    "priority": "medium",
+                    "rationale": "should never commit",
+                    "success_evidence": "Evidence exists",
+                    "retirement_condition": "Condition remains unmet",
+                },
+                {
+                    "op": "stage_direction",
+                    "direction_id": "d-stage",
+                    "rationale": "should never stage",
+                },
+                {
+                    "op": "approve_direction",
+                    "direction_id": "d-approve",
+                    "rationale": "should never approve",
+                },
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "rationale": "should never reject",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    assert [d.get("id") for d in project.directions] == [
+        "d-stage",
+        "d-approve",
+        "d-reject",
+    ]
+    assert next(d for d in project.directions if d.get("id") == "d-stage")[
+        "status"
+    ] == "active"
+    assert next(d for d in project.directions if d.get("id") == "d-approve")[
+        "status"
+    ] == "proposed"
+    assert next(d for d in project.directions if d.get("id") == "d-reject")[
+        "status"
+    ] == "proposed"
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_ops_accept_http_style_stage_approve_reject(
+    db_session, mocker
+):
+    """Fallback parsing must apply stage/approve/reject direction ops too."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app import release_version as rv
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackHttpStyleStageApproveReject",
+        user_id="u-fallback-stage-approve-reject",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-stage",
+                "text": "Stage me",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            },
+            {
+                "id": "d-approve",
+                "text": "Approve me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            },
+            {
+                "id": "d-reject",
+                "text": "Reject me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await rv.open_version(db_session, project.id, version_number=7)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "stage_direction",
+                    "direction_id": "d-stage",
+                    "rationale": "next version work",
+                },
+                {
+                    "op": "approve_direction",
+                    "direction_id": "d-approve",
+                    "rationale": "good idea",
+                },
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "rationale": "not worthwhile",
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    staged = next(d for d in project.directions if d.get("id") == "d-stage")
+    assert staged["status"] == "staged"
+    assert staged["staged_for_version"] == 7
+    approved = next(d for d in project.directions if d.get("id") == "d-approve")
+    assert approved["status"] == "active"
+    assert approved.get("activated_at")
+    rejected = next(d for d in project.directions if d.get("id") == "d-reject")
+    assert rejected["status"] == "rejected"
+    assert rejected.get("rejected_at")
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_dirs_staged") == 1
+    assert (task.context or {}).get("_strategic_dirs_updated") == 1
+    assert (task.context or {}).get("_strategic_dirs_retired") == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_ops_preserve_prior_creates_before_approve(
+    db_session, mocker
+):
+    """A fallback create must survive when a later approve_direction is applied."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackCreateApprove",
+        user_id="u-fallback-create-approve",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-approve",
+                "text": "Approve me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Created before approve",
+                    "priority": "medium",
+                    "rationale": "keep earlier create",
+                    "success_evidence": "Evidence exists",
+                    "retirement_condition": "Condition remains unmet",
+                },
+                {
+                    "op": "approve_direction",
+                    "direction_id": "d-approve",
+                    "rationale": "good idea",
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if d.get("text") == "Created before approve"
+    ]
+    assert len(created) == 1
+    assert created[0].get("status") == "active"
+    approved = next(d for d in project.directions if d.get("id") == "d-approve")
+    assert approved["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_ops_preserve_prior_creates_before_reject(
+    db_session, mocker
+):
+    """A fallback create must survive when a later reject_direction is applied."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackCreateReject",
+        user_id="u-fallback-create-reject",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-reject",
+                "text": "Reject me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Created before reject",
+                    "priority": "medium",
+                    "rationale": "keep earlier create",
+                    "success_evidence": "Evidence exists",
+                    "retirement_condition": "Condition remains unmet",
+                },
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "rationale": "not worthwhile",
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if d.get("text") == "Created before reject"
+    ]
+    assert len(created) == 1
+    assert created[0].get("status") == "active"
+    rejected = next(d for d in project.directions if d.get("id") == "d-reject")
+    assert rejected["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_ops_accept_http_style_create_direction(
+    db_session, mocker
+):
+    """Legacy fallback parsing now accepts the HTTP-style create_direction name."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackHttpStyle",
+        user_id="u-fallback-http",
+        vision={"purpose": "test", "revision": 0},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "HTTP style fallback create",
+                    "priority": "medium",
+                    "rationale": "new direction",
+                    "success_evidence": "HTTP-style op is accepted",
+                    "retirement_condition": "Condition is no longer needed",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if d.get("text") == "HTTP style fallback create"
+    ]
+    assert len(created) == 1
+    assert created[0].get("status") == "active"
 
 
 @pytest.mark.asyncio

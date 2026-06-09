@@ -153,7 +153,7 @@ describe('DirectionProgressSection spawn gate', () => {
     fireEvent.click(btn);
   }
 
-  it('renders_research_spawn_gate_comparison — shows challenged/refuted/survived counts and merge rate comparison', () => {
+  it('renders_research_spawn_gate_comparison — breakdown, merge-rate denominators, and reasons sample', () => {
     render(
       <DirectionProgressSection
         directions={[makeDirection({
@@ -161,12 +161,16 @@ describe('DirectionProgressSection spawn gate', () => {
             challenged_count: 5,
             refuted_count: 2,
             survived_count: 3,
+            explicit_pass_count: 2,
+            fail_open_count: 1,
+            unresolved_count: 1,
             challenged_spawned: 3,
             challenged_merged: 2,
             challenged_merge_rate: 0.67,
             unchallenged_spawned: 10,
             unchallenged_merged: 4,
             unchallenged_merge_rate: 0.40,
+            refuted_reasons: ['stale: defect absent on HEAD', 'over-claimed impact'],
           },
         })]}
       />,
@@ -178,8 +182,40 @@ describe('DirectionProgressSection spawn gate', () => {
     expect(row.textContent).toContain('5 challenged');
     expect(row.textContent).toContain('2 refuted');
     expect(row.textContent).toContain('3 survived');
-    expect(row.textContent).toContain('67% challenged');
-    expect(row.textContent).toContain('40% unchallenged');
+    // Decision-quality breakdown.
+    expect(row.textContent).toContain('2 explicit-pass');
+    expect(row.textContent).toContain('1 fail-open');
+    expect(row.textContent).toContain('1 unresolved');
+    // Merge-rate denominators (sample sizes) surfaced beside each percentage.
+    expect(row.textContent).toContain('67% challenged (2/3)');
+    expect(row.textContent).toContain('40% unchallenged (4/10)');
+    // Compact reasons sample.
+    const reasons = screen.getByText(/refuted\/unresolved reasons:/);
+    expect(reasons.textContent).toContain('stale: defect absent on HEAD');
+    expect(reasons.textContent).toContain('over-claimed impact');
+  });
+
+  it('renders the strategist (bare-key) aggregate spelling as well', () => {
+    render(
+      <DirectionProgressSection
+        directions={[makeDirection({
+          research_spawn_gate: {
+            challenged: 4,
+            refuted: 1,
+            survived: 3,
+            explicit_pass_count: 3,
+            fail_open_count: 0,
+            unresolved_count: 0,
+          },
+        })]}
+      />,
+    );
+    expand();
+
+    const row = screen.getByText(/Spawn gate:/);
+    expect(row.textContent).toContain('4 challenged');
+    expect(row.textContent).toContain('3 survived');
+    expect(row.textContent).toContain('1 refuted');
   });
 
   it('omits spawn gate block when research_spawn_gate is null', () => {

@@ -1975,6 +1975,7 @@ async def _finalize_qualification(
         "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
             audit_report,
             challenge_verdicts,
+            candidate_sha=candidate_sha,
             challenge_reason=None,
         ),
         "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),

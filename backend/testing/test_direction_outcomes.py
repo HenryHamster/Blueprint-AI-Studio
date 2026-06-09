@@ -212,26 +212,42 @@ async def test_guard_invalid_uuid_in_history(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_guard_no_child_tasks(db_session: AsyncSession):
-    """Breaks without updating when research task has no child tasks."""
+    """Zero-child cycles still persist parent spawn-gate telemetry."""
     direction_id = "d-nochildren"
-    project = await _create_project(
-        db_session, directions=[_make_direction(direction_id, str(uuid.uuid4()))]
-    )
-    # Use a valid UUID that has no child tasks
-    fresh_task_id = str(uuid.uuid4())
-    project.directions[0]["research_history"][0]["task_id"] = fresh_task_id
-    session_project = await db_session.get(Project, project.id)
-    session_project.directions = project.directions
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 1,
+        "research_spawn_gate_explicit_pass_count": 1,
+        "research_spawn_gate_fail_open_count": 0,
+        "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_refuted_reasons": ["fail-closed: no verdict"],
+    }
+    project.directions = [_make_direction(direction_id, research_task_id)]
     await db_session.flush()
 
     await _update_direction_research_outcomes(
         project_id=project.id,
         direction_id=direction_id,
-        research_task_id=fresh_task_id,
+        research_task_id=research_task_id,
         session=db_session,
     )
     await db_session.refresh(project)
-    assert "tasks_completed" not in project.directions[0]["research_history"][0]
+    entry = project.directions[0]["research_history"][0]
+    assert "tasks_completed" not in entry
+    assert entry["research_spawn_gate_challenged_count"] == 3
+    assert entry["research_spawn_gate_refuted_count"] == 2
+    assert entry["research_spawn_gate_survived_count"] == 1
+    assert entry["research_spawn_gate_explicit_pass_count"] == 1
+    assert entry["research_spawn_gate_fail_open_count"] == 0
+    assert entry["research_spawn_gate_unresolved_count"] == 1
+    assert entry["research_spawn_gate_refuted_reasons"] == [
+        "fail-closed: no verdict"
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5458,3 +5474,96 @@ async def test_spawn_gate_counts_and_rates_are_recorded(db_session: AsyncSession
     assert entry["research_spawn_gate_unchallenged_spawned"] == 1
     assert entry["research_spawn_gate_unchallenged_merged"] == 0
     assert entry["research_spawn_gate_unchallenged_merge_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession):
+    """Decision-quality breakdown counters and reasons sample roll into history.
+
+    The new explicit_pass/fail_open/unresolved counters and the compact
+    refuted/unresolved reasons sample produced on the research task context are
+    copied into the per-direction research_history entry, alongside (not
+    replacing) the existing challenged/refuted/survived counters and the
+    challenged/unchallenged spawned+merged denominators.
+    """
+    direction_id = "d-spawn-gate-breakdown"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 4,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 2,
+        "research_spawn_gate_explicit_pass_count": 1,
+        "research_spawn_gate_fail_open_count": 1,
+        "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_refuted_reasons": [
+            "stale premise",
+            "fail-closed: no verdict returned for this finding",
+            # Duplicate is deduped by the producer; assert resilience anyway.
+            "stale premise",
+        ],
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+            "research_spawn_gate_verdict": "pass",
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-open",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+            "research_spawn_gate_verdict": None,
+        },
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Legacy inclusive counters preserved.
+    assert entry["research_spawn_gate_challenged_count"] == 4
+    assert entry["research_spawn_gate_refuted_count"] == 2
+    assert entry["research_spawn_gate_survived_count"] == 2
+    # New decision-quality breakdown rolled up.
+    assert entry["research_spawn_gate_explicit_pass_count"] == 1
+    assert entry["research_spawn_gate_fail_open_count"] == 1
+    assert entry["research_spawn_gate_unresolved_count"] == 1
+    # Denominators / sample sizes preserved (merge rates travel with them).
+    assert entry["research_spawn_gate_challenged_spawned"] == 1
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 1.0
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1
+    assert entry["research_spawn_gate_unchallenged_merged"] == 0
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 0.0
+    # Compact reasons sample rolled up, deduped, and capped.
+    reasons = entry["research_spawn_gate_refuted_reasons"]
+    assert "stale premise" in reasons
+    assert any("fail-closed" in r for r in reasons)
+    assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
+    assert len(reasons) <= 5

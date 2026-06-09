@@ -138,6 +138,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "review_second_opinion_gate_enabled",
         "smoketest_enabled",
         "spend_approval_timeout_hours",
+        "strategic_retirement_challenge_gate_mode",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
         "task_type_categories",
@@ -398,6 +399,10 @@ async def get_settings(
         ),
         "review_second_opinion_gate_enabled": bool(
             _runtime_config.get("review_second_opinion_gate_enabled", True)
+        ),
+        "strategic_retirement_challenge_gate_mode": str(
+            _runtime_config.get("strategic_retirement_challenge_gate_mode", "observe")
+            or "observe"
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
@@ -971,6 +976,17 @@ async def _apply_settings(
                 detail="review_second_opinion_gate_enabled must be a boolean",
             )
         _runtime_config["review_second_opinion_gate_enabled"] = val
+    if "strategic_retirement_challenge_gate_mode" in payload:
+        val = str(payload["strategic_retirement_challenge_gate_mode"] or "").strip().lower()
+        if val not in ("observe", "advisory", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "strategic_retirement_challenge_gate_mode must be one of: "
+                    "observe, advisory, enforce"
+                ),
+            )
+        _runtime_config["strategic_retirement_challenge_gate_mode"] = val
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -2244,6 +2260,12 @@ async def _apply_settings(
                         _runtime_config.get(
                             "review_second_opinion_gate_enabled", True
                         )
+                    ),
+                    "strategic_retirement_challenge_gate_mode": str(
+                        _runtime_config.get(
+                            "strategic_retirement_challenge_gate_mode", "observe"
+                        )
+                        or "observe"
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)

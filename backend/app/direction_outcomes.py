@@ -291,6 +291,12 @@ def acceptance_metrics_consistent(entry: dict) -> bool:
 
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
 
+# Bounds for the compact refuted/unresolved spawn-gate reasons sample rolled into
+# each research_history entry — kept in lockstep with the producer caps in
+# research_completion.py so the sample stays compact across many cycles.
+_SPAWN_GATE_REASONS_SAMPLE_CAP = 5
+_SPAWN_GATE_REASON_MAX_LEN = 200
+
 
 def compute_direction_autonomy_state(direction: dict) -> dict:
     """Return lifetime autonomy metrics and retirement eligibility for a direction.
@@ -623,6 +629,18 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_survived_count": {
         "consumer": "digest_direction_progress.py, routers/agent.py (research spawn-gate cycle telemetry)"
     },
+    "research_spawn_gate_explicit_pass_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (decision-quality breakdown: explicit challenger pass slice of survived)"
+    },
+    "research_spawn_gate_fail_open_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (decision-quality breakdown: fail-open/no-explicit-verdict pass slice of survived)"
+    },
+    "research_spawn_gate_unresolved_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (decision-quality breakdown: unresolved/no-verdict slice of refuted)"
+    },
+    "research_spawn_gate_refuted_reasons": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (compact deduped sample of refuted/unresolved challenger reasons for a degraded-gate signal)"
+    },
     "research_spawn_gate_challenged_spawned": {
         "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
     },
@@ -734,9 +752,81 @@ async def _update_direction_research_outcomes(
         if research_task is not None
         else {}
     )
+    spawn_gate_challenged_count = int(
+        research_task_ctx.get("research_spawn_gate_challenged_count")
+        or 0
+    )
+    spawn_gate_refuted_count = int(
+        research_task_ctx.get("research_spawn_gate_refuted_count") or 0
+    )
+    spawn_gate_survived_count = int(
+        research_task_ctx.get("research_spawn_gate_survived_count") or 0
+    )
+    # Decision-quality breakdown of the inclusive survived/refuted buckets
+    # (additive — the legacy counters above are preserved unchanged).
+    spawn_gate_explicit_pass_count = int(
+        research_task_ctx.get("research_spawn_gate_explicit_pass_count") or 0
+    )
+    spawn_gate_fail_open_count = int(
+        research_task_ctx.get("research_spawn_gate_fail_open_count") or 0
+    )
+    spawn_gate_unresolved_count = int(
+        research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
+    )
+    # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
+    spawn_gate_refuted_reasons: list[str] = []
+    _seen_spawn_gate_reasons: set[str] = set()
+    for _sg_reason in research_task_ctx.get("research_spawn_gate_refuted_reasons") or []:
+        _sg_reason = str(_sg_reason).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
+        if (
+            _sg_reason
+            and _sg_reason not in _seen_spawn_gate_reasons
+            and len(spawn_gate_refuted_reasons) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        ):
+            _seen_spawn_gate_reasons.add(_sg_reason)
+            spawn_gate_refuted_reasons.append(_sg_reason)
+
+    def _apply_spawn_gate_parent_metrics() -> None:
+        # Keep these as direct entry[...] writes so the manifest guard can
+        # discover them via AST, matching the other direction outcome fields.
+        entry["research_spawn_gate_challenged_count"] = (
+            spawn_gate_challenged_count
+        )
+        entry["research_spawn_gate_refuted_count"] = spawn_gate_refuted_count
+        entry["research_spawn_gate_survived_count"] = spawn_gate_survived_count
+        # Decision-quality breakdown - additive; the inclusive survived/refuted
+        # counters above stay intact for back-compat.
+        entry["research_spawn_gate_explicit_pass_count"] = (
+            spawn_gate_explicit_pass_count
+        )
+        entry["research_spawn_gate_fail_open_count"] = spawn_gate_fail_open_count
+        entry["research_spawn_gate_unresolved_count"] = (
+            spawn_gate_unresolved_count
+        )
+        if spawn_gate_refuted_reasons:
+            entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
+
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
     if not child_tasks_rows:
+        _apply_spawn_gate_parent_metrics()
+        if project is not None:
+            session.expire(project, ["directions"])
+
+            def _apply_zero_child_spawn_gate(dirs: list) -> None:
+                for fresh_d in dirs:
+                    if fresh_d.get("id") != direction_id:
+                        continue
+                    history = list(fresh_d.get("research_history", []))
+                    for idx, history_entry in enumerate(history):
+                        if history_entry.get("task_id") == research_task_id:
+                            history[idx] = entry
+                            break
+                    fresh_d["research_history"] = history
+                    break
+
+            await with_directions_locked(session, project_id, _apply_zero_child_spawn_gate)
+            await session.commit()
         return
     # Set of child task IDs that ever opened a PR. The PULL_REQUEST Artifact is
     # the canonical "this task opened a PR" record (partial-unique per task, see
@@ -797,17 +887,6 @@ async def _update_direction_research_outcomes(
             k: round(v, 4) for k, v in cost_by_provider_model.items()
         }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
-
-    spawn_gate_challenged_count = int(
-        research_task_ctx.get("research_spawn_gate_challenged_count")
-        or 0
-    )
-    spawn_gate_refuted_count = int(
-        research_task_ctx.get("research_spawn_gate_refuted_count") or 0
-    )
-    spawn_gate_survived_count = int(
-        research_task_ctx.get("research_spawn_gate_survived_count") or 0
-    )
 
     entry["tasks_completed"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
@@ -985,9 +1064,7 @@ async def _update_direction_research_outcomes(
     unchallenged_merged = sum(
         1 for ct in unchallenged_children if is_merged_completion(ct)
     )
-    entry["research_spawn_gate_challenged_count"] = spawn_gate_challenged_count
-    entry["research_spawn_gate_refuted_count"] = spawn_gate_refuted_count
-    entry["research_spawn_gate_survived_count"] = spawn_gate_survived_count
+    _apply_spawn_gate_parent_metrics()
     entry["research_spawn_gate_challenged_spawned"] = challenged_spawned
     entry["research_spawn_gate_challenged_merged"] = challenged_merged
     entry["research_spawn_gate_challenged_merge_rate"] = (

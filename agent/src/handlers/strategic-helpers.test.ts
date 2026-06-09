@@ -15,6 +15,7 @@ import {
   buildStrategicChallengeExecutorSection,
   runStrategicChallenge,
   STRATEGIC_CHALLENGE_VERSION,
+  portfolioOperationFingerprint,
 } from './strategic-helpers.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 
@@ -73,6 +74,8 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('set-problem-model');
     expect(content).toContain('create-direction');
     expect(content).toContain('set-running-update');
+    expect(content).toContain('approve-direction');
+    expect(content).toContain('reject-direction');
   });
 
   it('embeds projectId in fetch script safely', () => {
@@ -200,6 +203,8 @@ describe('writeStrategicHelpers', () => {
       'create_direction',
       'update_direction',
       'retire_direction',
+      'approve_direction',
+      'reject_direction',
       'set_retirement_critiques',
     ];
     requiredPatterns.forEach(pattern => {
@@ -534,13 +539,155 @@ describe('parseStrategicChallengeRecord', () => {
     expect(rec.evidence_progress).toEqual([]);
     expect(rec.notes).toContain('portfolio_shape_risk');
   });
+
+  it('normalizes retirement_approvals: approved and rejected verdicts', () => {
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_approvals": [
+        {"direction_id": "d-10", "verdict": "approved", "rationale": "real evidenced pattern"},
+        {"direction_id": "d-11", "verdict": "rejected", "rationale": "shallow boilerplate"}
+      ],
+      "retirement_critique_quality": {"verdict": "solid"},
+      "portfolio_shape_risk": {"verdict": "low"}
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('ok');
+    expect(rec.retirement_approvals).toHaveLength(2);
+    expect(rec.retirement_approvals[0]).toEqual({
+      direction_id: 'd-10', verdict: 'approved', rationale: 'real evidenced pattern',
+    });
+    expect(rec.retirement_approvals[1]).toEqual({
+      direction_id: 'd-11', verdict: 'rejected', rationale: 'shallow boilerplate',
+    });
+  });
+
+  it('retirement_approvals fails closed: unknown/absent verdict becomes "rejected"', () => {
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_approvals": [
+        {"direction_id": "d-12", "rationale": "no verdict field"},
+        {"direction_id": "d-13", "verdict": "maybe", "rationale": "unknown verdict"}
+      ],
+      "retirement_critique_quality": {"verdict": "solid"},
+      "portfolio_shape_risk": {"verdict": "low"}
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.retirement_approvals).toHaveLength(2);
+    expect(rec.retirement_approvals.map(r => r.verdict)).toEqual(['rejected', 'rejected']);
+  });
+
+  it('retirement_approvals drops entries with no direction_id', () => {
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_approvals": [
+        {"verdict": "approved", "rationale": "no direction_id"},
+        {"direction_id": "d-14", "verdict": "approved", "rationale": "valid"}
+      ],
+      "retirement_critique_quality": {"verdict": "solid"},
+      "portfolio_shape_risk": {"verdict": "low"}
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.retirement_approvals).toHaveLength(1);
+    expect(rec.retirement_approvals[0].direction_id).toBe('d-14');
+  });
+
+  it('empty/absent retirement_approvals parses to empty array on ok record', () => {
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_critique_quality": {"verdict": "solid"},
+      "portfolio_shape_risk": {"verdict": "low"}
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.retirement_approvals).toEqual([]);
+  });
+
+  it('blocked record produces retirement_approvals=[] even if challenger emitted them', () => {
+    const raw = `{
+      "status": "blocked",
+      "evidence_progress": [],
+      "retirement_approvals": [{"direction_id": "d-15", "verdict": "approved"}],
+      "retirement_critique_quality": {"verdict": "solid"},
+      "portfolio_shape_risk": {"verdict": "low"}
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('blocked');
+    expect(rec.retirement_approvals).toEqual([]);
+  });
+
+  it('emptyChallengeRecord (blocked/invalid) has retirement_approvals=[]', () => {
+    const rec = parseStrategicChallengeRecord('not json');
+    expect(rec.status).toBe('invalid');
+    expect(rec.retirement_approvals).toEqual([]);
+  });
+
+  it('normalizes portfolio operation verdicts', () => {
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_critique_quality": {"verdict": "solid", "rationale": "names the pattern"},
+      "portfolio_shape_risk": {"verdict": "low", "rationale": "balanced"},
+      "portfolio_operations": [
+        {"op": "retire_direction", "direction_id": "d-keep", "verdict": "Rejected", "rationale": "no proof the lane is exhausted"},
+        {"op": "create", "text": "Build a Widget Pipeline", "verdict": "warned", "rationale": "over-concentrates release"},
+        {"op": "stage_direction", "direction_id": "d-next", "verdict": "approved"},
+        {"op": "bogus_op", "direction_id": "d-x", "verdict": "rejected"},
+        {"op": "update_direction", "direction_id": "d-y", "verdict": "maybe-ish"},
+        {"op": "retire_direction", "direction_id": "d-keep", "verdict": "warned", "rationale": "duplicate fingerprint — dropped"}
+      ]
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('ok');
+    expect(rec.portfolio_operations).toHaveLength(3);
+
+    const retire = rec.portfolio_operations[0];
+    expect(retire.op).toBe('retire_direction');
+    expect(retire.verdict).toBe('rejected');
+    expect(retire.direction_id).toBe('d-keep');
+    expect(retire.fingerprint).toBe(
+      portfolioOperationFingerprint('retire_direction', { directionId: 'd-keep' }),
+    );
+
+    const create = rec.portfolio_operations[1];
+    expect(create.op).toBe('create_direction');
+    expect(create.verdict).toBe('warned');
+    expect(create.direction_id).toBe('');
+    expect(create.text).toBe('Build a Widget Pipeline');
+    expect(create.fingerprint).toBe(
+      portfolioOperationFingerprint('create_direction', { text: 'build a widget pipeline' }),
+    );
+    expect(create.fingerprint).toMatch(/^create_direction:text:[0-9a-f]{16}$/);
+
+    expect(rec.portfolio_operations[2]).toMatchObject({
+      op: 'stage_direction', direction_id: 'd-next', verdict: 'approved',
+    });
+    expect(rec.retirement_critique_quality.verdict).toBe('solid');
+    expect(rec.portfolio_shape_risk.verdict).toBe('low');
+  });
+
+  it('blocked record drops portfolio_operations entirely', () => {
+    const raw = `{"status":"blocked","evidence_progress":[],
+      "retirement_critique_quality":{"verdict":"not_assessed"},
+      "portfolio_shape_risk":{"verdict":"not_assessed"},
+      "portfolio_operations":[
+        {"op":"retire_direction","direction_id":"d-1","verdict":"rejected"}
+      ]}`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('blocked');
+    expect(rec.portfolio_operations).toEqual([]);
+  });
 });
 
 describe('buildStrategicChallengeExecutorSection', () => {
   const base = {
     challenge_version: 1,
+    retirement_approvals: [] as Array<{ direction_id: string; verdict: 'approved' | 'rejected'; rationale: string }>,
     retirement_critique_quality: { verdict: 'solid', rationale: '' },
     portfolio_shape_risk: { verdict: 'low', rationale: '' },
+    portfolio_operations: [] as Array<{ op: string; direction_id: string; text: string; fingerprint: string; verdict: 'approved' | 'rejected' | 'warned' | 'uncertain'; rationale: string }>,
   };
 
   it('lists only challenge-approved advancing/met pairs as the gate', () => {
@@ -566,9 +713,28 @@ describe('buildStrategicChallengeExecutorSection', () => {
       ...base,
       status: 'blocked',
       evidence_progress: [],
+      retirement_approvals: [],
     });
     expect(section).toContain('approving NOTHING');
     expect(section).toContain('(none —');
+  });
+
+  it('includes portfolio-operation gate output', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'ok',
+      evidence_progress: [],
+      retirement_approvals: [],
+      portfolio_operations: [
+        { op: 'retire_direction', direction_id: 'd-1', text: '', fingerprint: 'retire_direction:d-1', verdict: 'rejected', rationale: 'unsafe' },
+        { op: 'stage_direction', direction_id: 'd-2', text: '', fingerprint: 'stage_direction:d-2', verdict: 'warned', rationale: 'advisory' },
+        { op: 'create_direction', direction_id: '', text: 'build x', fingerprint: 'create_direction:text:1234abcd1234abcd', verdict: 'approved', rationale: 'clean' },
+      ],
+    });
+    expect(section).toContain('Portfolio-operation gate');
+    expect(section).toContain('REJECTED');
+    expect(section).toContain('WARNED');
+    expect(section).toContain('APPROVED');
   });
 });
 
@@ -636,6 +802,84 @@ describe('buildStrategicChallengePrompt', () => {
     expect(prompt).toContain('THINKER_SAID_THIS');
     expect(prompt).toContain('D-LIST');
     expect(prompt).toContain('portfolio_shape_risk');
+    expect(prompt).toContain('portfolio_operations');
     expect(prompt).toContain('Output ONLY a single JSON object');
+  });
+
+  it('includes retirement_approvals field name and instruction', () => {
+    const prompt = buildStrategicChallengePrompt({
+      analysisText: 'analysis',
+      dirSummaryText: 'dirs',
+      pastRetirementCritiquesSection: '',
+      portfolioCompositionText: 'portfolio',
+    });
+    expect(prompt).toContain('retirement_approvals');
+    expect(prompt).toContain('"verdict": "approved|rejected"');
+    // Instructs challenger to emit an entry per proposed retirement.
+    expect(prompt).toContain('EVERY direction the thinker proposes to retire');
+    // Fail-closed instruction present.
+    expect(prompt).toContain('When in doubt, REJECT');
+  });
+});
+
+describe('buildStrategicChallengeExecutorSection (retirement gate)', () => {
+  const base = {
+    challenge_version: 1,
+    retirement_critique_quality: { verdict: 'solid', rationale: '' },
+    portfolio_shape_risk: { verdict: 'low', rationale: '' },
+    portfolio_operations: [] as Array<{ op: string; direction_id: string; text: string; fingerprint: string; verdict: 'approved' | 'rejected' | 'warned' | 'uncertain'; rationale: string }>,
+  };
+
+  it('lists challenge-approved retirement direction IDs in the retirement gate block', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'ok',
+      evidence_progress: [],
+      retirement_approvals: [
+        { direction_id: 'd-20', verdict: 'approved', rationale: 'evidenced' },
+        { direction_id: 'd-21', verdict: 'rejected', rationale: 'shallow' },
+      ],
+    });
+    expect(section).toContain('Retirement gate');
+    expect(section).toContain('  - d-20');
+    // Rejected retirement must not appear in the approved-retirements list section.
+    // (d-21 appears in the embedded JSON record, but not as an approved "  - d-21" bullet.)
+    expect(section).not.toContain('  - d-21');
+  });
+
+  it('retirement gate shows none when no retirements were approved', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'ok',
+      evidence_progress: [],
+      retirement_approvals: [
+        { direction_id: 'd-22', verdict: 'rejected', rationale: 'unsupported' },
+      ],
+    });
+    expect(section).toContain('Retirement gate');
+    expect(section).toContain('(none — no retirement was approved this cycle)');
+  });
+
+  it('explains that a deferred retire response is a soft non-error outcome', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'ok',
+      evidence_progress: [],
+      retirement_approvals: [],
+    });
+    expect(section).toContain('"status": "deferred"');
+    expect(section).toContain('SOFT NON-ERROR OUTCOME');
+    expect(section).toContain('Do NOT re-attempt the retire-direction call');
+  });
+
+  it('blocked record retirement gate shows none and mentions approving NOTHING', () => {
+    const section = buildStrategicChallengeExecutorSection({
+      ...base,
+      status: 'blocked',
+      evidence_progress: [],
+      retirement_approvals: [],
+    });
+    expect(section).toContain('approving NOTHING');
+    expect(section).toContain('(none — no retirement was approved this cycle)');
   });
 });

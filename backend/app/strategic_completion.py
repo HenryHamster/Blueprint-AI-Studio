@@ -184,6 +184,9 @@ def _strategic_event_completion_summary(
     _challenge_summary = strategic_challenge_summary(_challenge_record)
     if _challenge_summary is not None:
         summary["strategic_judgment_challenge"] = _challenge_summary
+    _retirement_deferrals = meta.get("retirement_deferrals")
+    if isinstance(_retirement_deferrals, list) and _retirement_deferrals:
+        summary["retirement_deferrals"] = _retirement_deferrals
     return summary
 
 
@@ -420,8 +423,10 @@ EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
 # StrategicCycle.cycle_metadata at completion, and consulted by the first hard
 # gate: an advancing/met evidence_progress verdict may only SUPPRESS the
 # deterministic outcome-scaffolding flag when the challenge APPROVED the same
-# direction_id + status judgment. A rejected / uncertain / missing / malformed
-# challenge approval leaves the deterministic backstop active.
+# direction_id + status judgment. The same fail-closed shape gates agent-authored
+# retirements when the runtime rollout mode reaches enforce. A rejected /
+# uncertain / missing / malformed challenge approval leaves the deterministic
+# backstop active and never approves a retirement.
 STRATEGIC_CHALLENGE_CONTEXT_KEY = "_strategic_judgment_challenge"
 STRATEGIC_CHALLENGE_RECORD_VERSION = 1
 _VALID_CHALLENGE_VERDICTS = frozenset({"approved", "rejected", "uncertain"})
@@ -437,6 +442,44 @@ _CHALLENGE_SUBJECT_MAX = 120
 # Per-section cap on challenge items so the JSON blob stored on task.context and
 # copied into cycle_metadata stays bounded regardless of agent output size.
 _CHALLENGE_MAX_ITEMS = 50
+_RETIREMENT_APPROVALS_KEY = "retirement_approvals"
+_PORTFOLIO_OP_ALIASES = {
+    "create": "create_direction",
+    "update": "update_direction",
+    "retire": "retire_direction",
+    "stage": "stage_direction",
+    "approve": "approve_direction",
+    "reject": "reject_direction",
+}
+_VALID_PORTFOLIO_OPS = frozenset(
+    {
+        "create_direction",
+        "update_direction",
+        "retire_direction",
+        "stage_direction",
+        "approve_direction",
+        "reject_direction",
+    }
+)
+_VALID_PORTFOLIO_VERDICTS = frozenset({"approved", "rejected", "warned", "uncertain"})
+_PORTFOLIO_BLOCK_VERDICTS = frozenset({"rejected"})
+_PORTFOLIO_WARN_VERDICTS = frozenset({"warned", "uncertain"})
+_HARD_BLOCK_PORTFOLIO_OPS = frozenset(
+    {
+        "create_direction",
+        "update_direction",
+        "retire_direction",
+        "stage_direction",
+        "approve_direction",
+        "reject_direction",
+    }
+)
+STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY = (
+    "strategic_retirement_challenge_gate_mode"
+)
+STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES = frozenset(
+    {"observe", "advisory", "enforce"}
+)
 
 
 def _sanitize_challenge_verdict_block(
@@ -474,6 +517,9 @@ def sanitize_strategic_challenge_record(raw: object) -> dict | None:
           "status": "ok|blocked|invalid",
           "evidence_progress": [
               {"direction_id", "status", "verdict", "rationale"}, ...
+          ],
+          "retirement_approvals": [
+              {"direction_id", "verdict", "rationale"}, ...
           ],
           "retirement_critique_quality": {"verdict", "rationale"},
           "portfolio_shape_risk": {"verdict", "rationale"},
@@ -514,18 +560,18 @@ def sanitize_strategic_challenge_record(raw: object) -> dict | None:
             if not isinstance(item, dict):
                 continue
             did = str(item.get("direction_id", "")).strip()
-            status = str(item.get("status", "")).strip().lower()
+            item_status = str(item.get("status", "")).strip().lower()
             verdict = str(item.get("verdict", "")).strip().lower()
             if (
                 not did
-                or status not in _VALID_EVIDENCE_PROGRESS
+                or item_status not in _VALID_EVIDENCE_PROGRESS
                 or verdict not in _VALID_CHALLENGE_VERDICTS
             ):
                 continue
             ep_items.append(
                 {
                     "direction_id": did[:64],
-                    "status": status,
+                    "status": item_status,
                     "verdict": verdict,
                     "rationale": str(item.get("rationale", "")).strip()[
                         :_CHALLENGE_RATIONALE_MAX
@@ -533,6 +579,26 @@ def sanitize_strategic_challenge_record(raw: object) -> dict | None:
                 }
             )
     record["evidence_progress"] = ep_items
+    retirement_in = raw.get(_RETIREMENT_APPROVALS_KEY)
+    retirement_items: list[dict] = []
+    if isinstance(retirement_in, list):
+        for item in retirement_in[:_CHALLENGE_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("direction_id", "")).strip()
+            verdict = str(item.get("verdict", "")).strip().lower()
+            if not did or verdict not in _VALID_CHALLENGE_VERDICTS:
+                continue
+            retirement_items.append(
+                {
+                    "direction_id": did[:64],
+                    "verdict": verdict,
+                    "rationale": str(item.get("rationale", "")).strip()[
+                        :_CHALLENGE_RATIONALE_MAX
+                    ],
+                }
+            )
+    record[_RETIREMENT_APPROVALS_KEY] = retirement_items
     record["retirement_critique_quality"] = _sanitize_challenge_verdict_block(
         raw.get("retirement_critique_quality"),
         default_verdict="not_assessed",
@@ -541,6 +607,11 @@ def sanitize_strategic_challenge_record(raw: object) -> dict | None:
         raw.get("portfolio_shape_risk"),
         default_verdict="not_assessed",
     )
+    record["portfolio_operations"] = (
+        _sanitize_portfolio_operations(raw.get("portfolio_operations"))
+        if status == "ok"
+        else []
+    )
     notes = raw.get("notes")
     if isinstance(notes, str):
         cleaned_notes = notes.strip()[:_CHALLENGE_RATIONALE_MAX]
@@ -548,6 +619,121 @@ def sanitize_strategic_challenge_record(raw: object) -> dict | None:
             record["notes"] = cleaned_notes
 
     return record
+
+
+def _canonical_portfolio_op(op: object) -> str | None:
+    """Return a canonical portfolio op name or None for unknown ops."""
+    name = str(op or "").strip().lower()
+    if name in _VALID_PORTFOLIO_OPS:
+        return name
+    return _PORTFOLIO_OP_ALIASES.get(name)
+
+
+def portfolio_operation_fingerprint(
+    op: object,
+    *,
+    direction_id: object = None,
+    text: object = None,
+) -> str:
+    """Deterministic fingerprint for a portfolio mutation."""
+    canon = _canonical_portfolio_op(op) or str(op or "").strip().lower()
+    did = str(direction_id or "").strip()
+    if did:
+        return f"{canon}:{did}"
+    norm = " ".join(str(text or "").strip().lower().split())
+    if norm:
+        digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+        return f"{canon}:text:{digest}"
+    return f"{canon}:"
+
+
+def _sanitize_portfolio_operations(raw: object) -> list[dict]:
+    """Validate + bound the per-operation portfolio challenge verdict list."""
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw[:_CHALLENGE_MAX_ITEMS]:
+        if not isinstance(entry, dict):
+            continue
+        canon = _canonical_portfolio_op(entry.get("op"))
+        if canon is None:
+            continue
+        verdict = str(entry.get("verdict", "")).strip().lower()
+        if verdict not in _VALID_PORTFOLIO_VERDICTS:
+            continue
+        did = str(entry.get("direction_id", "")).strip()
+        txt = str(entry.get("text", "")).strip()
+        fp = portfolio_operation_fingerprint(canon, direction_id=did or None, text=txt or None)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        items.append(
+            {
+                "op": canon,
+                "direction_id": did[:64],
+                "fingerprint": fp,
+                "verdict": verdict,
+                "rationale": str(entry.get("rationale", "")).strip()[
+                    :_CHALLENGE_RATIONALE_MAX
+                ],
+            }
+        )
+    return items
+
+
+def portfolio_op_challenge_verdict(
+    record: object,
+    op: object,
+    *,
+    direction_id: object = None,
+    text: object = None,
+) -> dict | None:
+    """Return the stored per-operation challenge item matching this mutation."""
+    if not isinstance(record, dict):
+        return None
+    target_fp = portfolio_operation_fingerprint(
+        op, direction_id=direction_id, text=text
+    )
+    for item in record.get("portfolio_operations") or []:
+        if isinstance(item, dict) and item.get("fingerprint") == target_fp:
+            return item
+    return None
+
+
+def challenge_rejects_portfolio_op(
+    record: object,
+    op: object,
+    *,
+    direction_id: object = None,
+    text: object = None,
+) -> tuple[bool, str]:
+    """Whether a stored challenge HARD-BLOCKS this portfolio mutation.
+
+    Returns False only when the op is benign, the challenge is absent, or an
+    explicitly ok challenge approved/warned the matching mutation.
+    """
+    canon = _canonical_portfolio_op(op)
+    if canon is None or canon not in _HARD_BLOCK_PORTFOLIO_OPS:
+        return (False, "")
+    if record is None:
+        return (False, "")
+    if not isinstance(record, dict):
+        return (True, "challenge record was malformed")
+    if str(record.get("status", "")).strip().lower() != "ok":
+        return (
+            True,
+            f"challenge status was {str(record.get('status', 'missing')).strip().lower()}",
+        )
+    item = portfolio_op_challenge_verdict(
+        record, canon, direction_id=direction_id, text=text
+    )
+    if item is None:
+        return (True, "no matching portfolio_operations verdict")
+    verdict = str(item.get("verdict", "")).strip().lower()
+    if verdict in _PORTFOLIO_BLOCK_VERDICTS:
+        return (True, str(item.get("rationale", "")).strip())
+    return (False, "")
 
 
 def challenge_approves_evidence_progress(
@@ -584,6 +770,43 @@ def challenge_approves_evidence_progress(
     return False
 
 
+def challenge_approves_retirement(record: object, direction_id: str) -> bool:
+    """True iff the challenge record APPROVED retiring this direction_id.
+
+    Mirrors :func:`challenge_approves_evidence_progress` in fail-closed shape:
+    non-dict records, non-ok statuses, blank direction ids, rejected/uncertain
+    entries, and missing entries all return False. No caller should treat an
+    unavailable retirement second opinion as approval.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("status") != "ok":
+        return False
+    target_id = (direction_id or "").strip()
+    if not target_id:
+        return False
+    for item in record.get(_RETIREMENT_APPROVALS_KEY) or []:
+        if not isinstance(item, dict):
+            continue
+        if (
+            str(item.get("direction_id", "")).strip() == target_id
+            and str(item.get("verdict", "")).strip().lower() == "approved"
+        ):
+            return True
+    return False
+
+
+def strategic_retirement_challenge_gate_mode() -> str:
+    """Return the current retirement challenge rollout mode."""
+    raw = str(
+        _runtime_config.get(STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY, "observe")
+        or "observe"
+    ).strip().lower()
+    if raw not in STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES:
+        return "observe"
+    return raw
+
+
 def strategic_challenge_summary(record: object) -> dict | None:
     """Derive a compact, websocket-safe summary of a strategic-judgment challenge.
 
@@ -601,7 +824,8 @@ def strategic_challenge_summary(record: object) -> dict | None:
         }
 
     ``blocked_count`` / ``warned_count`` tally every challenged judgment across the
-    ``evidence_progress`` items AND the two section verdict blocks
+    ``evidence_progress`` items, ``retirement_approvals`` items, the per-operation
+    ``portfolio_operations`` verdicts, AND the two section verdict blocks
     (``retirement_critique_quality``, ``portfolio_shape_risk``).
 
     For ``evidence_progress`` items the standard vocabulary applies: ``rejected``
@@ -645,13 +869,29 @@ def strategic_challenge_summary(record: object) -> dict | None:
         elif v in _SECTION_WARN_VERDICTS:
             warned += 1
 
+    def _tally_portfolio(verdict: object) -> None:
+        # Per-operation portfolio vocabulary: rejected -> blocked, warned/
+        # uncertain -> warned, approved -> clean.
+        nonlocal warned, blocked
+        v = str(verdict or "").strip().lower()
+        if v in _PORTFOLIO_BLOCK_VERDICTS:
+            blocked += 1
+        elif v in _PORTFOLIO_WARN_VERDICTS:
+            warned += 1
+
     for item in record.get("evidence_progress") or []:
+        if isinstance(item, dict):
+            _tally(item.get("verdict"))
+    for item in record.get(_RETIREMENT_APPROVALS_KEY) or []:
         if isinstance(item, dict):
             _tally(item.get("verdict"))
     for section in ("retirement_critique_quality", "portfolio_shape_risk"):
         block = record.get(section)
         if isinstance(block, dict):
             _tally_section(block.get("verdict"))
+    for item in record.get("portfolio_operations") or []:
+        if isinstance(item, dict):
+            _tally_portfolio(item.get("verdict"))
 
     mode_raw = str(record.get("status", "")).strip().lower()
     mode = mode_raw if mode_raw in {"ok", "blocked", "invalid"} else "invalid"
@@ -665,11 +905,17 @@ def strategic_challenge_summary(record: object) -> dict | None:
     else:
         verdict = "approved"
 
+    gate_mode_raw = str(
+        _runtime_config.get("strategic_challenge_gate_mode", "enforce")
+    ).strip().lower()
+    gate_mode_val = gate_mode_raw if gate_mode_raw in {"observe", "advisory", "enforce"} else "enforce"
+
     return {
         "mode": mode,
         "verdict": verdict,
         "warned_count": warned,
         "blocked_count": blocked,
+        "gate_mode": gate_mode_val,
     }
 
 
@@ -2142,7 +2388,18 @@ def _evidence_progress_suppresses_scaffolding(
     if ep.get("status") not in _EVIDENCE_PROGRESS_SUPPRESSING:
         return False
     if not ep.get("challenge_approved"):
-        return False
+        gate_mode = str(ep.get("gate_mode", "enforce")).strip().lower()
+        if gate_mode not in {"observe", "advisory", "enforce"}:
+            gate_mode = "enforce"
+        if gate_mode == "enforce":
+            return False
+        if gate_mode == "advisory" and ep.get("gate_would_block"):
+            logger.warning(
+                "strategic challenge gate [advisory]: evidence_progress suppression "
+                "allowed but gate would have blocked (direction cycle_task_id=%s)",
+                ep.get("cycle_task_id", "?"),
+            )
+        # observe or advisory: allow suppression; fall through to staleness check
     recorded_cycle = ep.get("cycle_index")
     if not isinstance(recorded_cycle, int):
         # Undated verdict — trust the agent's confirmation (treat as current).
@@ -2567,6 +2824,10 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
     # endorsed the same direction_id + status; a stalled verdict is never a
     # suppressor so it never needs (or gets) an approval stamp.
     challenge_record = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
+    gate_mode_raw = str(
+        _runtime_config.get("strategic_challenge_gate_mode", "enforce")
+    ).strip().lower()
+    gate_mode = gate_mode_raw if gate_mode_raw in {"observe", "advisory", "enforce"} else "enforce"
     now_iso = _utcnow().isoformat()
     applied = 0
     for d in project.directions or []:
@@ -2586,6 +2847,9 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
                 challenge_record, d.get("id"), status
             )
         )
+        gate_would_block = (
+            status in _EVIDENCE_PROGRESS_SUPPRESSING and not challenge_approved
+        )
         d["evidence_progress"] = {
             "status": status,
             "rationale": str(verdict.get("rationale", ""))[
@@ -2595,6 +2859,8 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
             "cycle_index": cycle_index,
             "cycle_task_id": str(task.id),
             "challenge_approved": challenge_approved,
+            "gate_mode": gate_mode,
+            "gate_would_block": gate_would_block,
         }
         applied += 1
     if applied:
@@ -2687,6 +2953,12 @@ async def _handle_strategic_completion(
             _retirement_critiques = (task.context or {}).get(
                 "_strategic_retirement_critiques"
             )
+            _retirement_gate_verdicts = (task.context or {}).get(
+                "_strategic_retirement_gate_verdicts"
+            )
+            _retirement_deferrals = (task.context or {}).get(
+                "_strategic_retirement_deferrals"
+            )
             _extra: dict = {
                 "created_direction_ids": created_ids,
                 "retired_direction_ids": retired_ids,
@@ -2697,6 +2969,10 @@ async def _handle_strategic_completion(
             }
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
+            if _retirement_gate_verdicts is not None:
+                _extra["retirement_gate_verdicts"] = _retirement_gate_verdicts
+            if _retirement_deferrals is not None:
+                _extra["retirement_deferrals"] = _retirement_deferrals
             # Copy the bounded, versioned strategic judgment challenge record
             # (evidence_progress / retirement / portfolio-shape second opinion)
             # verbatim into cycle_metadata so the challenge pass is durably
@@ -3255,6 +3531,9 @@ async def _handle_strategic_completion(
             )
             direction_ops = direction_ops[:MAX_DIRECTION_OPS]
         directions = list(project.directions or [])
+        fallback_challenge_record = (task.context or {}).get(
+            STRATEGIC_CHALLENGE_CONTEXT_KEY
+        )
         creates_count = 0
 
         # Deferred import to avoid circular dependency with app.main.
@@ -3268,7 +3547,9 @@ async def _handle_strategic_completion(
         for op_entry in direction_ops:
             if not isinstance(op_entry, dict):
                 continue
-            op = op_entry.get("op")
+            op = _canonical_portfolio_op(op_entry.get("op"))
+            if op is None:
+                continue
             rationale = str(op_entry.get("rationale", ""))
             if len(rationale) > STRATEGIC_RATIONALE_MAX:
                 logger.warning(
@@ -3276,11 +3557,23 @@ async def _handle_strategic_completion(
                 )
                 rationale = rationale[:STRATEGIC_RATIONALE_MAX]
 
-            if op == "create":
+            if op == "create_direction":
                 if creates_count >= MAX_DIRECTION_CREATES:
                     continue
                 text = op_entry.get("text", "").strip()
                 if not text:
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    text=text,
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked create_direction: %s",
+                        task.id,
+                        why or "challenge rejected this create_direction",
+                    )
                     continue
                 if len(text) > STRATEGIC_DIRECTION_TEXT_MAX:
                     logger.warning(
@@ -3445,10 +3738,23 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}"
                 )
 
-            elif op == "update":
+            elif op == "update_direction":
                 dir_id = op_entry.get("direction_id")
                 changes = op_entry.get("changes", {})
                 if not dir_id or not changes:
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked update_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this update_direction",
+                    )
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
@@ -3642,9 +3948,22 @@ async def _handle_strategic_completion(
                         )
                         break
 
-            elif op == "retire":
+            elif op == "retire_direction":
                 dir_id = op_entry.get("direction_id")
                 if not dir_id:
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked retire_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this retire_direction",
+                    )
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
@@ -3674,6 +3993,243 @@ async def _handle_strategic_completion(
                             f"[STRATEGIC] Retired direction {dir_id} for project {project.id}"
                         )
                         break
+
+            elif op == "stage_direction":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked stage_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this stage_direction",
+                    )
+                    continue
+                from app.release_version import current_open_version
+
+                open_version = await current_open_version(session, project.id)
+                if open_version is None:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback stage_direction skipped for %s because no open version exists",
+                        task.id,
+                        dir_id,
+                    )
+                    continue
+                for d in directions:
+                    if d.get("id") == dir_id:
+                        staged_for_version = open_version.version_number
+                        d["status"] = "staged"
+                        d["staged_for_version"] = staged_for_version
+                        d["staged_at"] = _utcnow().isoformat()
+                        notes = d.get("notes", [])
+                        notes.append(
+                            {
+                                "text": (
+                                    f"Staged to begin after v{staged_for_version} promotes"
+                                    + (f": {rationale}" if rationale else "")
+                                ),
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        )
+                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        ctx = task.context or {}
+                        task.context = {
+                            **ctx,
+                            "_strategic_dirs_staged": ctx.get(
+                                "_strategic_dirs_staged", 0
+                            )
+                            + 1,
+                            "_strategic_staged_ids": list(
+                                ctx.get("_strategic_staged_ids", [])
+                            )
+                            + [dir_id],
+                        }
+                        flag_modified(task, "context")
+                        session.add(task)
+                        ops_applied += 1
+                        logger.info(
+                            f"[STRATEGIC] Staged direction {dir_id} for project {project.id}"
+                        )
+                        break
+
+            elif op == "approve_direction":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if not target:
+                    continue
+                if target.get("status") != "proposed":
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback approve_direction skipped for %s because status=%s",
+                        task.id,
+                        dir_id,
+                        target.get("status"),
+                    )
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked approve_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this approve_direction",
+                    )
+                    continue
+                active_count = sum(
+                    1 for d in directions if d.get("status") == "active"
+                )
+                max_active = _runtime_config.get("max_active_directions", 5)
+                if active_count >= max_active:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback approve_direction skipped for %s because active count %s/%s reached cap",
+                        task.id,
+                        dir_id,
+                        active_count,
+                        max_active,
+                    )
+                    continue
+                target["status"] = "active"
+                target["activated_at"] = _utcnow().isoformat()
+                notes = target.get("notes", [])
+                notes.append(
+                    {
+                        "text": (
+                            f"Approved by strategic review: {rationale}"
+                            if rationale
+                            else "Approved by strategic review"
+                        ),
+                        "added_at": _utcnow().isoformat(),
+                    }
+                )
+                target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                ctx = task.context or {}
+                task.context = {
+                    **ctx,
+                    "_strategic_proposals_approved": ctx.get(
+                        "_strategic_proposals_approved", 0
+                    )
+                    + 1,
+                    "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0)
+                    + 1,
+                    "_strategic_updated_ids": list(
+                        ctx.get("_strategic_updated_ids", [])
+                    )
+                    + [dir_id],
+                }
+                flag_modified(task, "context")
+                session.add(task)
+                ops_applied += 1
+                logger.info(
+                    f"[STRATEGIC] Approved direction {dir_id} for project {project.id}"
+                )
+
+            elif op == "reject_direction":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if not target:
+                    continue
+                if target.get("status") != "proposed":
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback reject_direction skipped for %s because status=%s",
+                        task.id,
+                        dir_id,
+                        target.get("status"),
+                    )
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked reject_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this reject_direction",
+                    )
+                    continue
+                rejected_text = (target.get("text") or "")[:200].strip()
+                remaining = [d for d in directions if d.get("id") != dir_id]
+                if rejected_text:
+                    tombstone = {
+                        "id": target["id"],
+                        "text": rejected_text,
+                        "status": "rejected",
+                        "rejected_at": _utcnow().isoformat(),
+                        "rejected_by": "strategic",
+                        **(
+                            {"rejection_rationale": rationale} if rationale else {}
+                        ),
+                    }
+                    rejected = [d for d in remaining if d.get("status") == "rejected"]
+                    non_rejected = [
+                        d for d in remaining if d.get("status") != "rejected"
+                    ]
+                    rejected.append(tombstone)
+                    rejected = rejected[-20:]
+                    remaining = non_rejected + rejected
+                cancelled_result = await session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.QUEUED,
+                        Task.context["direction_id"].as_string() == dir_id,
+                    )
+                )
+                cancelled_tasks = cancelled_result.scalars().all()
+                vm_ids_to_delete: list[str] = []
+                for t in cancelled_tasks:
+                    t.status = TaskStatus.CANCELLED
+                    t.latest_status_message = (
+                        f"Cancelled: proposal {dir_id} was rejected by strategic review"
+                    )
+                    session.add(t)
+                    if t.vm_instance_id:
+                        vm_ids_to_delete.append(t.vm_instance_id)
+                directions = remaining
+                _d = directions
+                from app.task_locking import with_directions_locked as _with_directions_locked
+
+                await _with_directions_locked(session, task.project_id, lambda _: _d)
+                ctx = task.context or {}
+                task.context = {
+                    **ctx,
+                    "_strategic_proposals_rejected": ctx.get(
+                        "_strategic_proposals_rejected", 0
+                    )
+                    + 1,
+                    "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0)
+                    + 1,
+                    "_strategic_retired_ids": list(
+                        ctx.get("_strategic_retired_ids", [])
+                    )
+                    + [dir_id],
+                }
+                flag_modified(task, "context")
+                session.add(task)
+                for vm_id in vm_ids_to_delete:
+                    from app.vm_lifecycle import (
+                        _ensure_vm_deleted as _main_ensure_vm_deleted,
+                    )
+
+                    await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
+                ops_applied += 1
+                logger.info(
+                    f"[STRATEGIC] Rejected direction {dir_id} for project {project.id}"
+                )
 
         if ops_applied > 0:
             from app.task_locking import with_directions_locked

@@ -30,7 +30,9 @@ from app.task_completion import (
     _handle_self_audit_completion,
     _normalize_self_audit_finding,
     _parse_self_audit_findings,
+    SELF_AUDIT_PROPAGATION_RECORD_KEY,
 )
+from app.task_completion_self_audit import _PROPAGATION_RECORD_MAX_ENTRIES
 from testing.factories import make_project, make_task
 
 
@@ -503,6 +505,174 @@ class TestSelfAuditCompletion:
         assert project.directions[0]["recommended_mode"] == "ship"
 
     @pytest.mark.asyncio
+    async def test_operator_pinned_mode_not_overwritten_by_propagation(
+        self, db_session, mock_broadcast
+    ):
+        """Operator-pinned direction mode (no meta / unknown source) survives self-audit propagation."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                # No recommended_mode_meta → operator-pinned
+            }
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 40,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["recommended_mode"] == "ship", (
+            f"Operator-pinned mode was overwritten; got {d['recommended_mode']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_operator_pinned_mode_not_overwritten_by_propagation_pause(
+        self, db_session, mock_broadcast
+    ):
+        """Operator-pinned mode survives even when audit proposes the strictest mode (pause)."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                # No recommended_mode_meta → operator-pinned
+            }
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 10,
+                            "recommended_mode": "pause",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["recommended_mode"] == "ship", (
+            f"Operator-pinned mode was overwritten by pause; got {d['recommended_mode']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skipped_propagation_note_is_recorded(
+        self, db_session, mock_broadcast
+    ):
+        """When propagation is skipped for an operator-pinned direction, a note is appended."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                "notes": [],
+                # No recommended_mode_meta → operator-pinned
+            }
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 40,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+        await db_session.refresh(project)
+        d = project.directions[0]
+        notes = d.get("notes") or []
+        skip_notes = [n for n in notes if n.get("source") == "self_audit_skip"]
+        assert len(skip_notes) == 1, (
+            f"Expected 1 self_audit_skip note, got {len(skip_notes)}: {notes}"
+        )
+        assert skip_notes[0].get("proposed_mode") == "fundamentals"
+
+    @pytest.mark.asyncio
+    async def test_self_audit_sourced_mode_can_still_be_overwritten(
+        self, db_session, mock_broadcast
+    ):
+        """Direction with source=self_audit meta is NOT protected — self-audit can update it."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "audit",
+                "recommended_mode_meta": {
+                    "source": "self_audit",
+                    "mode": "audit",
+                    "set_at": "2026-01-01T00:00:00+00:00",
+                },
+            }
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 55,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["recommended_mode"] == "fundamentals", (
+            f"self_audit-sourced mode should be overwritten; got {d['recommended_mode']!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_naive_strategic_set_at_does_not_crash_ingest(
         self, db_session, mock_broadcast
     ):
@@ -540,6 +710,160 @@ class TestSelfAuditCompletion:
         )
         await db_session.refresh(project)
         assert project.directions[0]["recommended_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_self_audit_records_mode_propagation_challenge_and_preserves_operator_pin(
+        self, db_session, mock_broadcast
+    ):
+        """Propagation record captures applied and operator-pin-skipped entries."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d-applied",
+                "status": "active",
+                "system_id": "sys-auth",
+                # No mode set — propagation should apply
+            },
+            {
+                "id": "d-pinned",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                # No recommended_mode_meta → operator-pinned
+            },
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 45,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+        await db_session.refresh(task)
+        record = (task.context or {}).get(SELF_AUDIT_PROPAGATION_RECORD_KEY)
+        assert record is not None, "Propagation record should be stored in task.context"
+        assert isinstance(record, list)
+        applied = [e for e in record if e.get("outcome") == "applied"]
+        skipped = [e for e in record if e.get("outcome") == "skipped"]
+        assert len(applied) == 1, f"Expected 1 applied entry, got {applied}"
+        assert applied[0]["direction_id"] == "d-applied"
+        assert applied[0]["proposed_mode"] == "fundamentals"
+        assert applied[0]["system_id"] == "sys-auth"
+        assert len(skipped) == 1, f"Expected 1 skipped entry, got {skipped}"
+        assert skipped[0]["direction_id"] == "d-pinned"
+        assert "operator" in skipped[0].get("reason", "").lower()
+
+        # Confirm operator-pinned direction was NOT changed
+        await db_session.refresh(project)
+        pinned = next(d for d in project.directions if d["id"] == "d-pinned")
+        assert pinned["recommended_mode"] == "ship"
+
+    @pytest.mark.asyncio
+    async def test_propagation_record_applied_stored_in_context(
+        self, db_session, mock_broadcast
+    ):
+        """An applied mode propagation produces an outcome='applied' record in task.context."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {"id": "d1", "status": "active", "system_id": "sys-compute"}
+        ]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {"findings": [{"system_id": "sys-compute", "score": 40, "recommended_mode": "audit"}]}
+            ),
+            db_session,
+        )
+        await db_session.refresh(task)
+        record = (task.context or {}).get(SELF_AUDIT_PROPAGATION_RECORD_KEY)
+        assert record is not None
+        assert len(record) == 1
+        assert record[0]["outcome"] == "applied"
+        assert record[0]["system_id"] == "sys-compute"
+        assert record[0]["proposed_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_propagation_record_auto_clear_captured(
+        self, db_session, mock_broadcast
+    ):
+        """Auto-clear (2 consecutive ship assessments) produces outcome='cleared' entries."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "audit",
+                "recommended_mode_meta": {
+                    "source": "self_audit",
+                    "mode": "audit",
+                    "set_at": "2026-01-01T00:00:00+00:00",
+                },
+                "notes": [],
+            }
+        ]
+        db_session.add(project)
+        ship_logs = json.dumps(
+            {"findings": [{"system_id": "sys-auth", "score": 90, "recommended_mode": "ship"}]}
+        )
+        task1 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task1)
+        await db_session.commit()
+        await _handle_self_audit_completion(task1, ship_logs, db_session)
+
+        task2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task2)
+        await db_session.commit()
+        await _handle_self_audit_completion(task2, ship_logs, db_session)
+
+        await db_session.refresh(task2)
+        record = (task2.context or {}).get(SELF_AUDIT_PROPAGATION_RECORD_KEY)
+        assert record is not None
+        cleared = [e for e in record if e.get("outcome") == "cleared"]
+        assert len(cleared) >= 1, f"Expected cleared entry after 2 ship assessments, got {record}"
+        assert cleared[0]["system_id"] == "sys-auth"
+
+    @pytest.mark.asyncio
+    async def test_propagation_record_bounded(self, db_session, mock_broadcast):
+        """Propagation record is capped at _PROPAGATION_RECORD_MAX_ENTRIES."""
+        project = await _seed_project_with_member(db_session)
+        # Create more directions than the cap to verify truncation
+        many_directions = [
+            {"id": f"d{i}", "status": "active", "system_id": "sys-load"}
+            for i in range(_PROPAGATION_RECORD_MAX_ENTRIES + 10)
+        ]
+        project.directions = many_directions
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {"findings": [{"system_id": "sys-load", "score": 40, "recommended_mode": "audit"}]}
+            ),
+            db_session,
+        )
+        await db_session.refresh(task)
+        record = (task.context or {}).get(SELF_AUDIT_PROPAGATION_RECORD_KEY)
+        assert record is not None
+        assert len(record) <= _PROPAGATION_RECORD_MAX_ENTRIES
 
 
 # ── Admin endpoint ──────────────────────────────────────────────────────────

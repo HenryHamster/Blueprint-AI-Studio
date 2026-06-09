@@ -13,6 +13,8 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    _SPAWN_GATE_REASON_MAX_LEN,
+    _SPAWN_GATE_REASONS_SAMPLE_CAP,
     declared_merged_count,
     proven_merged_count,
     verified_merged_count,
@@ -94,25 +96,45 @@ def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
 def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
     """Aggregate research spawn-gate counters from a direction's research_history.
 
-    Returns a compact 5-field dict (challenged, refuted, survived,
-    challenged_merge_rate, unchallenged_merge_rate) or None when all counters
-    are zero (no spawn-gate activity recorded).
+    Returns a compact dict or None when all counters are zero (no spawn-gate
+    activity recorded). Beyond the legacy challenged/refuted/survived counts and
+    merge rates, the dict carries the decision-quality breakdown
+    (explicit_pass/fail_open/unresolved), the preserved spawned/merged sample
+    sizes (so each merge rate always travels with its denominator), and a
+    compact, deduped, capped sample of refuted/unresolved challenger reasons.
     """
     challenged = 0
     refuted = 0
     survived = 0
+    explicit_pass = 0
+    fail_open = 0
+    unresolved = 0
     challenged_spawned = 0
     challenged_merged = 0
     unchallenged_spawned = 0
     unchallenged_merged = 0
+    refuted_reasons: List[str] = []
+    _seen_reasons: set[str] = set()
     for entry in history or []:
         challenged += entry.get("research_spawn_gate_challenged_count") or 0
         refuted += entry.get("research_spawn_gate_refuted_count") or 0
         survived += entry.get("research_spawn_gate_survived_count") or 0
+        explicit_pass += entry.get("research_spawn_gate_explicit_pass_count") or 0
+        fail_open += entry.get("research_spawn_gate_fail_open_count") or 0
+        unresolved += entry.get("research_spawn_gate_unresolved_count") or 0
         challenged_spawned += entry.get("research_spawn_gate_challenged_spawned") or 0
         challenged_merged += entry.get("research_spawn_gate_challenged_merged") or 0
         unchallenged_spawned += entry.get("research_spawn_gate_unchallenged_spawned") or 0
         unchallenged_merged += entry.get("research_spawn_gate_unchallenged_merged") or 0
+        for _r in entry.get("research_spawn_gate_refuted_reasons") or []:
+            _r = str(_r).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
+            if (
+                _r
+                and _r not in _seen_reasons
+                and len(refuted_reasons) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            ):
+                _seen_reasons.add(_r)
+                refuted_reasons.append(_r)
     if not any([challenged, refuted, survived, challenged_spawned, unchallenged_spawned]):
         return None
     challenged_merge_rate = (
@@ -127,8 +149,17 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         "challenged": challenged,
         "refuted": refuted,
         "survived": survived,
+        "explicit_pass_count": explicit_pass,
+        "fail_open_count": fail_open,
+        "unresolved_count": unresolved,
+        # Sample sizes preserved so each merge rate travels with its denominator.
+        "challenged_spawned": challenged_spawned,
+        "challenged_merged": challenged_merged,
+        "unchallenged_spawned": unchallenged_spawned,
+        "unchallenged_merged": unchallenged_merged,
         "challenged_merge_rate": challenged_merge_rate,
         "unchallenged_merge_rate": unchallenged_merge_rate,
+        "refuted_reasons": refuted_reasons,
     }
 
 
@@ -278,10 +309,15 @@ async def compute_direction_progress(
         spawn_gate_challenged_count = 0
         spawn_gate_refuted_count = 0
         spawn_gate_survived_count = 0
+        spawn_gate_explicit_pass_count = 0
+        spawn_gate_fail_open_count = 0
+        spawn_gate_unresolved_count = 0
         spawn_gate_challenged_spawned = 0
         spawn_gate_challenged_merged = 0
         spawn_gate_unchallenged_spawned = 0
         spawn_gate_unchallenged_merged = 0
+        spawn_gate_refuted_reasons: List[str] = []
+        _spawn_gate_seen_reasons: set[str] = set()
         for entry in d.get("research_history") or []:
             try:
                 entry_ts = _coerce_naive_utc(
@@ -437,6 +473,27 @@ async def compute_direction_progress(
                 spawn_gate_survived_count += (
                     entry.get("research_spawn_gate_survived_count") or 0
                 )
+                spawn_gate_explicit_pass_count += (
+                    entry.get("research_spawn_gate_explicit_pass_count") or 0
+                )
+                spawn_gate_fail_open_count += (
+                    entry.get("research_spawn_gate_fail_open_count") or 0
+                )
+                spawn_gate_unresolved_count += (
+                    entry.get("research_spawn_gate_unresolved_count") or 0
+                )
+                for _sg_reason in (
+                    entry.get("research_spawn_gate_refuted_reasons") or []
+                ):
+                    _sg_reason = str(_sg_reason).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
+                    if (
+                        _sg_reason
+                        and _sg_reason not in _spawn_gate_seen_reasons
+                        and len(spawn_gate_refuted_reasons)
+                        < _SPAWN_GATE_REASONS_SAMPLE_CAP
+                    ):
+                        _spawn_gate_seen_reasons.add(_sg_reason)
+                        spawn_gate_refuted_reasons.append(_sg_reason)
                 spawn_gate_challenged_spawned += (
                     entry.get("research_spawn_gate_challenged_spawned") or 0
                 )
@@ -793,14 +850,26 @@ async def compute_direction_progress(
             "challenged_count": spawn_gate_challenged_count,
             "refuted_count": spawn_gate_refuted_count,
             "survived_count": spawn_gate_survived_count,
+            # Decision-quality breakdown — additive over the legacy 9 fields.
+            "explicit_pass_count": spawn_gate_explicit_pass_count,
+            "fail_open_count": spawn_gate_fail_open_count,
+            "unresolved_count": spawn_gate_unresolved_count,
             "challenged_spawned": spawn_gate_challenged_spawned,
             "challenged_merged": spawn_gate_challenged_merged,
             "challenged_merge_rate": spawn_gate_challenged_merge_rate,
             "unchallenged_spawned": spawn_gate_unchallenged_spawned,
             "unchallenged_merged": spawn_gate_unchallenged_merged,
             "unchallenged_merge_rate": spawn_gate_unchallenged_merge_rate,
+            "refuted_reasons": spawn_gate_refuted_reasons,
         }
-        if not any(research_spawn_gate.values()):
+        # Drop the reasons sample from the all-zero test so a cycle with only an
+        # (empty) sample still collapses to None — gate emptiness is decided by
+        # the numeric counters, not the always-present sample list.
+        if not any(
+            v
+            for k, v in research_spawn_gate.items()
+            if k != "refuted_reasons"
+        ):
             research_spawn_gate = None
 
         cost_budget_usd = d.get("cost_budget_usd")

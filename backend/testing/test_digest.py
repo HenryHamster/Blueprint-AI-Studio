@@ -8127,6 +8127,7 @@ async def test_digest_latest_cycle_includes_compact_challenge_summary(
         "verdict": "blocked",  # one rejected evidence item
         "warned_count": 1,  # one uncertain section verdict
         "blocked_count": 1,
+        "gate_mode": "enforce",
     }
     # The bounded item list never travels on the digest summary.
     assert "evidence_progress" not in challenge

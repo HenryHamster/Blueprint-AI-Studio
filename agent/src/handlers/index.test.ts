@@ -37,6 +37,12 @@ vi.mock('./audits.js', () => ({
   handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
   handleSelfAudit: vi.fn().mockResolvedValue(undefined),
   handleReleaseAudit: vi.fn().mockResolvedValue(undefined),
+}));
+
+// handleReleaseAuditChallenge lives in audit-challenge.ts (not audits.ts).
+// Mock it separately so the registry test can compare function references
+// and confirm there is exactly one registration under release_audit_challenge.
+vi.mock('./audit-challenge.js', () => ({
   handleReleaseAuditChallenge: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -90,6 +96,7 @@ import {
 import { DISPATCHER_MEMO_SYNTHESIZER_KINDS } from './memo.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { handleReleaseAuditChallenge } from './audit-challenge.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
@@ -131,6 +138,15 @@ describe('handlers registry', () => {
 
   it('strategic_review and research are distinct handlers — research dispatches to strategic only when payload.research_mode is "strategic"', () => {
     expect(handlers.strategic_review).not.toBe(handlers.research);
+  });
+
+  it('release_audit_challenge maps to handleReleaseAuditChallenge — single registration, no dead divergent copy', () => {
+    // Confirm the registry uses the audit-challenge.ts export, not any stale copy
+    // that might exist in audits.ts. The mocked reference must match exactly.
+    expect(handlers.release_audit_challenge).toBe(handleReleaseAuditChallenge);
+    const resolution = resolveHandler('release_audit_challenge', {}, { type: 'release_audit_challenge' });
+    expect(resolution.dispatch).toBe('bespoke');
+    expect(resolution.handler).toBe(handleReleaseAuditChallenge);
   });
 
   it('all handlers are distinct function references from each other', () => {
