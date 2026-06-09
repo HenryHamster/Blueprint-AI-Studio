@@ -2561,6 +2561,214 @@ class TestRefutedSeverityMatrixReconcile:
         assert refuted[0]["severity"] == finding_sev
 
 
+class TestChallengerIndependentBlocker:
+    """Challenger-only confirmed >=HIGH verdicts must gate qualification.
+
+    When the challenger identifies a >=HIGH severity issue with no matching
+    primary finding (vi not in vi_assigned), the reconciliation must return
+    the 'audit_challenge_independent_blocker' hold code.
+    """
+
+    SHA = "cafebabe"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def test_challenger_only_high_confirmed_verdict_holds(self):
+        """Unmatched confirmed HIGH verdict with no primary findings returns hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "SQL injection in user search endpoint",
+                    "reason": "no parameterized query",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_independent_blocker"
+        assert modified is None
+        assert refuted == []
+
+    def test_challenger_only_critical_confirmed_verdict_holds(self):
+        """Unmatched confirmed CRITICAL verdict returns hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "critical",
+                    "summary": "Remote code execution via deserialization",
+                    "reason": "untrusted data deserialized without validation",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_independent_blocker"
+        assert modified is None
+        assert refuted == []
+
+    def test_challenger_only_blocker_confirmed_verdict_holds(self):
+        """Unmatched confirmed BLOCKER severity returns hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "blocker",
+                    "summary": "Auth bypass in admin panel",
+                    "reason": "session token not validated server-side",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold == "audit_challenge_independent_blocker"
+        assert modified is None
+        assert refuted == []
+
+    def test_challenger_only_medium_confirmed_no_hold(self):
+        """Unmatched confirmed MEDIUM verdict does not trigger independent blocker hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "medium",
+                    "summary": "Information disclosure in error messages",
+                    "reason": "stack traces exposed in non-production configs",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold is None
+        assert modified == self._report([])
+
+    def test_challenger_only_unknown_severity_no_hold(self):
+        """Unmatched confirmed verdict with missing/unknown severity does not hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "unknown_level",
+                    "summary": "Something weird",
+                    "reason": "indeterminate severity",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold is None
+        assert modified == self._report([])
+
+    def test_challenger_only_missing_severity_no_hold(self):
+        """Unmatched confirmed verdict with no severity field does not hold."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "summary": "Something without severity",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        assert hold is None
+        assert modified == self._report([])
+
+    def test_challenger_only_refuted_high_no_hold(self):
+        """Unmatched refuted/high verdict does not trigger independent blocker."""
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "XSS in comment field",
+                    "reason": "input is properly sanitized before rendering",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            self._report([]), envelope, self.SHA
+        )
+        # No primary findings -> no deductible -> no assignment needed -> no hold
+        assert hold is None
+        assert modified == self._report([])
+
+    def test_matched_finding_plus_unmatched_high_still_holds(self):
+        """One primary finding matched + one unmatched confirmed HIGH still holds."""
+        verified_finding = {
+            "severity": "medium",
+            "summary": "Info leak in error response",
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        report = self._report([verified_finding])
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "refuted_false_positive",
+                    "severity": "medium",
+                    "summary": "Info leak in error response",
+                    "reason": "the error response is behind an admin-only endpoint",
+                },
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "Challenger-discovered SQL injection missed by primary",
+                    "reason": "user-supplied data flows into raw query",
+                },
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert hold == "audit_challenge_independent_blocker"
+        assert modified is None
+        assert refuted == []
+
+    def test_all_matched_confirmed_high_no_independent_hold(self):
+        """When vi_assigned covers the confirmed HIGH verdict, no independent hold fires."""
+        verified_finding = {
+            "severity": "high",
+            "summary": "SQL injection in user search endpoint",
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        report = self._report([verified_finding])
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "SQL injection in user search endpoint",
+                    "reason": "confirmed the injection path",
+                }
+            ],
+        )
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        # confirmed matched verdict keeps the finding, no independent blocker
+        assert hold is None
+        assert modified == report
+        assert refuted == []
+
+
 class TestReconcileRefutedJustificationGate:
     """Backend reason-substantiveness gate for refuted_false_positive verdicts.
 

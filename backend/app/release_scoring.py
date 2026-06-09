@@ -1312,6 +1312,24 @@ def _reconcile_audit_with_challenge(
         deductible.append((idx, f))
 
     if not deductible:
+        # Even with no primary deductible findings, scan challenger verdicts for
+        # independently-confirmed >=HIGH severity issues the primary audit missed.
+        if isinstance(challenge_envelope, dict):
+            _challenged_sha = str(
+                challenge_envelope.get("challenged_candidate_sha") or ""
+            ).strip()
+            if candidate_sha and _challenged_sha == candidate_sha:
+                _raw = challenge_envelope.get("verdicts")
+                if isinstance(_raw, list):
+                    for _cv in _raw:
+                        if not isinstance(_cv, dict):
+                            continue
+                        if str(_cv.get("verdict") or "").lower().strip() != "confirmed":
+                            continue
+                        _sev = str(_cv.get("severity") or "").lower().strip()
+                        _rank = _SEVERITY_RANK.get(_sev, 99)
+                        if _rank != 99 and _rank <= 1:
+                            return "audit_challenge_independent_blocker", None, []
         return None, report, []
 
     challenge_verdicts_list: list = []
@@ -1398,6 +1416,19 @@ def _reconcile_audit_with_challenge(
             )
         else:
             return "audit_challenge_uncertain", None, []
+
+    # Scan unmatched challenger verdicts for independent confirmed blockers.
+    # The challenger may identify >=HIGH issues the primary audit missed; these
+    # must gate qualification even though no primary finding was matched to them.
+    for vi, cv in enumerate(available_verdicts):
+        if vi in vi_assigned:
+            continue
+        if str(cv.get("verdict") or "").lower().strip() != "confirmed":
+            continue
+        sev = str(cv.get("severity") or "").lower().strip()
+        rank = _SEVERITY_RANK.get(sev, 99)
+        if rank != 99 and rank <= 1:
+            return "audit_challenge_independent_blocker", None, []
 
     if not remove_idxs:
         return None, report, []
