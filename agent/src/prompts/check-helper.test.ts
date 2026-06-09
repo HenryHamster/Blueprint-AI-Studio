@@ -130,6 +130,71 @@ describe('writeCheckHelper — direct invocation', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
+  it('emits the merge-resolution verify block when mergeVerify is set (self-repo)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-merge-verify-1',
+      workBranch: 'blueprint/check-merge-verify-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+      mergeVerify: true,
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    // Derives affected backend test files from $CHANGED and runs them under the
+    // sanctioned Postgres harness, routed through `run` so a failure lands in
+    // FAILED and ./pr open (which gates on ./check) cannot push.
+    expect(script).toContain('merge-resolution closed-loop verify');
+    expect(script).toContain('MERGE_VERIFY_CAP=8');
+    expect(script).toContain('run "merge-resolution verify" bash -c ');
+    expect(script).toContain('scripts/test-backend.sh --postgres');
+    // Maps changed backend/app/*.py to its test file, and picks up directly
+    // changed test files.
+    expect(script).toContain('backend/app/');
+    expect(script).toContain('backend/testing/test_');
+    // Overflow past the cap is logged (deferred to CI), never silently dropped.
+    expect(script).toContain('deferred-to-CI:');
+    // Graceful no-Docker skip writes the GATE-ENVIRONMENT marker (taskId-scoped).
+    expect(script).toContain('/tmp/check_gate_env_check-merge-verify-1.txt');
+  });
+
+  it('omits the merge-resolution verify block when mergeVerify is not set', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-merge-verify-off',
+      workBranch: 'blueprint/check-merge-verify-off',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+      // mergeVerify omitted — review-feedback / non-conflict fixes are unchanged.
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    expect(script).not.toContain('merge-resolution closed-loop verify');
+    expect(script).not.toContain('merge-resolution verify');
+  });
+
+  it('generated ./check script with mergeVerify passes `bash -n` syntax check', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-merge-verify-2',
+      workBranch: 'blueprint/check-merge-verify-2',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+      mergeVerify: true,
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
+    // Pipe through stdin so we don't need a writable fs (vi.mock('fs') is in effect).
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
   it('generic fallback ./check script passes `bash -n` syntax check', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({

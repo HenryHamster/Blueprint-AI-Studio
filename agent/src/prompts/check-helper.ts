@@ -66,6 +66,64 @@ fi
 `;
 }
 
+/** Emit the merge-resolution closed-loop verify block for the generated ./check.
+ *
+ *  A conflict-resolution fix (the agent rebased/merged the base branch and
+ *  resolved conflicts) can silently break tests OUTSIDE the standalone gate's 3
+ *  files: a dropped fixture line (FK violation) or a code/test vintage skew
+ *  between the branch and a fast-moving base. The standalone `--no-postgres`
+ *  gate never runs those DB-backed files, so a bad resolution shipped clean and
+ *  CI re-failed, burning the whole review-fix budget (incident: rollup PR #8920,
+ *  research task 72e4b062 — 16 iterations exhausted on two tests the resolution
+ *  broke, not the diff under review).
+ *
+ *  This block derives the affected backend test files from $CHANGED (already
+ *  computed above): every `backend/testing/test_*.py` the merge touched, plus
+ *  `test_<module>.py` for each changed `backend/app/<module>.py` that has one.
+ *  It runs them under the sanctioned Postgres harness — bounded (capped; never
+ *  the full suite, which OOMs the 8 GB VM — the harness memory guard exempts
+ *  targeted *.py args). A still-broken affected test fails this gate, and since
+ *  ./pr open gates on ./check, the push is blocked until it passes. Overflow
+ *  past the cap is logged (deferred to CI), never silently dropped. Graceful
+ *  when Docker is absent: warn + GATE-ENVIRONMENT marker, don't block (CI runs
+ *  the authoritative suite on the PR). Derivation uses only $CHANGED + on-disk
+ *  test-file existence, so it reflects the RESOLVED tree at ./check time. */
+function buildMergeVerifyBlock(taskId: string): string {
+  return `
+# ── merge-resolution closed-loop verify ─────────────────────────────────────
+# This fix resolved a base-branch merge conflict. Verify the affected backend
+# test files pass under Postgres BEFORE ./pr open can push — a silent drop or a
+# code/test vintage skew from the resolution would otherwise surface only in CI.
+MERGE_VERIFY_CAP=8
+_mv_all=$(
+  {
+    printf '%s\\n' "$CHANGED" | grep -E '^backend/testing/test_[A-Za-z0-9_]+\\.py$'
+    printf '%s\\n' "$CHANGED" | grep -E '^backend/app/[A-Za-z0-9_]+\\.py$' \\
+      | sed -E 's|^backend/app/([A-Za-z0-9_]+)\\.py$|backend/testing/test_\\1.py|'
+  } | sort -u | grep -v '^$' | while read -r _mv_f; do [ -f "$_mv_f" ] && printf '%s\\n' "$_mv_f"; done
+)
+if [ -n "$_mv_all" ]; then
+  _mv_count=$(printf '%s\\n' "$_mv_all" | grep -c '^' || true)
+  if [ "$_mv_count" -gt "$MERGE_VERIFY_CAP" ]; then
+    echo "[check] merge-resolution verify: $_mv_count affected test file(s); running first $MERGE_VERIFY_CAP under Postgres, CI verifies the rest:"
+    printf '%s\\n' "$_mv_all" | tail -n +$((MERGE_VERIFY_CAP + 1)) | sed 's|^|[check]   deferred-to-CI: |'
+  fi
+  # Strip the backend/ prefix: scripts/test-backend.sh runs from backend/ and
+  # expects testing/test_x.py selectors.
+  _mv_run=$(printf '%s\\n' "$_mv_all" | head -n "$MERGE_VERIFY_CAP" | sed 's|^backend/||')
+  if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
+    echo "[check] merge-resolution verify: running affected backend test file(s) via the sanctioned Postgres harness..."
+    # shellcheck disable=SC2086
+    run "merge-resolution verify" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ $_mv_run
+  else
+    echo "[check] merge-resolution verify: SKIPPED — Docker unavailable, can't run the sanctioned Postgres harness on this VM."
+    echo "[check]   The affected backend tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
+    printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "merge-resolution verify skipped — no Docker for the sanctioned harness; CI verifies affected tests on the PR" >> /tmp/check_gate_env_${taskId}.txt
+  fi
+fi
+`;
+}
+
 export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
@@ -442,6 +500,7 @@ if touches backend/; then
   fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
+${cfg.mergeVerify ? buildMergeVerifyBlock(cfg.taskId) : ''}
 
 # Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
 # the line-count caps that backend/testing/test_invariants.py enforces, so a

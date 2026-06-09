@@ -82,6 +82,11 @@ export interface CodeChangeTaskOpts {
    *  fix→verify→push loop that previously shipped blind and re-failed in CI.
    *  Empty/undefined for non-ci_failure tasks. */
   ciFailureSelectors?: string[];
+  /** True when this fix resolved a base-branch merge conflict. Forwarded to the
+   *  generated ./check so it verifies the affected backend test files under
+   *  Postgres before ./pr open can push (closes the conflict-resolution verify
+   *  loop). Unset for non-conflict fixes. See buildMergeVerifyBlock. */
+  mergeVerify?: boolean;
   /** When true, this task was auto-decomposed from a larger finding into a
    *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
    *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
@@ -379,6 +384,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     regressingCategories: opts.regressingCategories,
     buildConfig: opts.buildConfig,
     ciFailureSelectors: opts.ciFailureSelectors,
+    mergeVerify: opts.mergeVerify,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

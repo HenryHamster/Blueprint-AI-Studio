@@ -56,6 +56,7 @@ from app.review_pipeline import (
     _is_verification_only_rejection,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
+    build_merge_conflict_fix_prompt,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
     should_auto_approve_diff,
@@ -1795,14 +1796,9 @@ async def _process_post_commit(
                                 if recovery_type == "fix":
                                     spawn_kwargs["fix_reason"] = "merge_conflict"
                                     spawn_kwargs["fix_prompt"] = (
-                                        f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
-                                        f"(GitHub mergeable_state='dirty'). The code review is already approved — "
-                                        f"focus only on resolving the conflict.\n\n"
-                                        f"After cloning:\n"
-                                        f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}`.\n"
-                                        f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
-                                        f"  3. Re-run lint/type/test suites for the affected files.\n"
-                                        f"  4. Commit the resolution and force-push with `--force-with-lease`."
+                                        build_merge_conflict_fix_prompt(
+                                            pr_number, base_branch
+                                        )
                                     )
                                 recovery_task, was_created = await _spawn_pipeline_task(
                                     task,
