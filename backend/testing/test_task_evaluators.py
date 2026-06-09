@@ -787,6 +787,7 @@ def test_finding_challenge_prompt_includes_question_when_supplied():
 def test_parse_finding_challenge_disagrees():
     """A structured 'disagrees' second opinion is recorded with all six fields."""
     from app.task_evaluators import (
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
         CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
         FindingChallengeRecord,
         parse_finding_challenge_verdict,
@@ -807,6 +808,42 @@ def test_parse_finding_challenge_disagrees():
     assert rec.agreement == "disagrees"
     assert "renamed" in rec.reason
     assert rec.sidecar_task_id == "sidecar-1"
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id is None
+    assert rec.produced_by == "challenge_sidecar"
+    assert rec.to_context() == {
+        "challenged_boundary": CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        "first_verdict": "absent",
+        "second_opinion_verdict": "present",
+        "agreement": "disagrees",
+        "reason": rec.reason,
+        "sidecar_task_id": "sidecar-1",
+        "schema_version": FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        "source_task_id": None,
+        "produced_by": "challenge_sidecar",
+    }
+
+
+def test_parse_finding_challenge_propagates_source_task_id():
+    from app.task_evaluators import (
+        FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    rec = parse_finding_challenge_verdict(
+        '{"verdict": "present", "agreement": "disagrees", "reasoning": "renamed"}',
+        "absent",
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        "sidecar-2",
+        source_task_id="task-123",
+    )
+    ctx = rec.to_context()
+    assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert rec.source_task_id == "task-123"
+    assert ctx["schema_version"] == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
+    assert ctx["source_task_id"] == "task-123"
+    assert ctx["produced_by"] == "challenge_sidecar"
 
 
 def test_parse_finding_challenge_agrees():
@@ -968,3 +1005,104 @@ def test_parse_finding_challenge_backward_compat_no_source_task_id():
     assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
     assert rec.source_task_id is None
     assert rec.produced_by == "challenge_sidecar"
+
+
+# ── build_adversarial_challenge_manifest ──────────────────────────────────────
+
+
+class TestBuildAdversarialChallengeManifest:
+    """build_adversarial_challenge_manifest: compact, bounded, valid JSON manifest."""
+
+    def _finding(self, title="Risk finding", risk="high", scope="medium", **kwargs):
+        return {
+            "title": title,
+            "description": f"Description of {title}",
+            "risk": risk,
+            "scope": scope,
+            "hash": f"hash-{title[:20].replace(' ', '-')}",
+            **kwargs,
+        }
+
+    def test_single_finding_produces_valid_json(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        items, json_str = build_adversarial_challenge_manifest([self._finding()])
+        assert len(items) == 1
+        parsed = json.loads(json_str)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 1
+
+    def test_hash_preserved_in_manifest(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        f = self._finding(title="Specific finding")
+        f["hash"] = "stable-hash-abc"
+        items, json_str = build_adversarial_challenge_manifest([f])
+        assert items[0]["hash"] == "stable-hash-abc"
+        assert "stable-hash-abc" in json_str
+
+    def test_compact_fields_only_no_complexity_signals(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        f = self._finding()
+        f["_complexity_signals"] = {"loc": 5000, "files": 30}
+        f["already_spawned"] = False
+        f["actionability_grade"] = "HIGH"
+        items, _ = build_adversarial_challenge_manifest([f])
+        assert "_complexity_signals" not in items[0]
+        assert "already_spawned" not in items[0]
+        assert "actionability_grade" not in items[0]
+        assert "hash" in items[0]
+        assert "title" in items[0]
+
+    def test_long_description_is_truncated(self):
+        from app.task_evaluators import (
+            _ADVERSARIAL_MANIFEST_DESC_CAP,
+            build_adversarial_challenge_manifest,
+        )
+
+        f = self._finding()
+        f["description"] = "x" * 2000
+        items, _ = build_adversarial_challenge_manifest([f])
+        assert len(items[0]["description"]) == _ADVERSARIAL_MANIFEST_DESC_CAP
+
+    def test_many_findings_stay_within_budget(self):
+        from app.task_evaluators import (
+            _ADVERSARIAL_MANIFEST_CHAR_BUDGET,
+            build_adversarial_challenge_manifest,
+        )
+
+        findings = [
+            self._finding(title=f"Finding {i}", risk="high")
+            for i in range(50)
+        ]
+        for f in findings:
+            f["description"] = "A" * 400
+        items, json_str = build_adversarial_challenge_manifest(findings)
+        assert len(json_str) <= _ADVERSARIAL_MANIFEST_CHAR_BUDGET
+        assert json.loads(json_str)  # valid JSON
+
+    def test_provenance_fields_preserved(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        f = self._finding()
+        f["verification_basis_downgraded_from"] = "high"
+        f["needs_revalidation"] = True
+        items, _ = build_adversarial_challenge_manifest([f])
+        assert items[0].get("verification_basis_downgraded_from") == "high"
+        assert items[0].get("needs_revalidation") is True
+
+    def test_findings_without_hash_are_skipped(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        f = self._finding()
+        f["hash"] = ""
+        items, json_str = build_adversarial_challenge_manifest([f])
+        assert items == []
+        assert json_str == "[]"
+
+    def test_result_json_array_is_always_parseable(self):
+        from app.task_evaluators import build_adversarial_challenge_manifest
+
+        _, json_str = build_adversarial_challenge_manifest([])
+        assert json.loads(json_str) == []

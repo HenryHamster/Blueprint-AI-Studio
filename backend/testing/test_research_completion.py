@@ -6000,6 +6000,84 @@ class TestComputeExperimentSpawn:
         )
 
 
+@_pytest.mark.asyncio
+async def test_compute_experiment_with_gpu_or_material_spend_is_adversarially_challenged(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: a compute_experiment finding with GPU accelerator or material spend
+    is treated as high-stakes and must be adversarially challenged before any child is spawned.
+
+    The adversarial spawn gate calls _is_high_stakes_finding on each finding; a compute
+    finding with an accelerator or spend approaching the threshold must return True, causing
+    the task to park EVALUATING while the adversarial grader runs. No compute_experiment
+    child must spawn before the challenger verdict arrives.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-cx-adv01"
+    )
+    # A GPU-backed compute finding — must be high-stakes regardless of spend
+    finding = _compute_finding(
+        direction["id"],
+        spend_cap_usd=2.0,
+        deadline_seconds=600,
+        accelerator="T4",
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding", return_value=True
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "compute_experiment_spend_threshold_usd": 5.0,
+            "adversarial_spawn_gate_enabled": True,
+        },
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Task must be parked EVALUATING awaiting adversarial verdict, not COMPLETED.
+    assert task.status == TaskStatus.EVALUATING, (
+        "GPU-backed compute finding must park the task EVALUATING awaiting adversarial challenge"
+    )
+    assert task.context.get("awaiting_adversarial_grader"), (
+        "awaiting_adversarial_grader flag must be set after gating a high-stakes compute finding"
+    )
+
+    # No compute_experiment child must have been spawned yet.
+    children = await _children_of(db_session, task)
+    compute_children = [
+        c for c in children
+        if (c.first_payload or {}).get("type") == "compute_experiment"
+    ]
+    assert compute_children == [], (
+        "compute_experiment task must not spawn before adversarial verdict arrives"
+    )
+
+    # An adversarial grader must have been spawned.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders = [t for t in others if (t.context or {}).get("adversarial_grader") is True]
+    assert len(graders) == 1, (
+        f"Exactly one adversarial grader must be spawned; got {len(graders)}"
+    )
+
+
 class TestAcceptanceEvidencePropagation:
     """Plan-time acceptance_evidence rides each surviving finding to its child.
 
@@ -6450,13 +6528,144 @@ class TestIsHighStakesFinding:
         assert not _is_high_stakes_finding(None)
 
 
+class TestIsHighStakesComputeFinding:
+    """_is_high_stakes_finding: compute_experiment findings with GPU/spend/deadline."""
+
+    def _cf(self, **kw):
+        base = {
+            "title": "Measure GPU throughput",
+            "description": "Benchmark the training loop.",
+            "prompt": "Run the benchmark job",
+            "type": "compute_experiment",
+            "command": "python3 bench.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 600,
+        }
+        base.update(kw)
+        return base
+
+    def test_gpu_accelerator_is_high_stakes(self):
+        assert _is_high_stakes_finding(self._cf(accelerator="T4"))
+
+    def test_gpu_accelerator_nested_is_high_stakes(self):
+        finding = {
+            "title": "Benchmark",
+            "prompt": "Run benchmark",
+            "type": "compute_experiment",
+            "compute_experiment": {
+                "command": "bench.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 600,
+                "accelerator": "A100",
+            },
+        }
+        assert _is_high_stakes_finding(finding)
+
+    def test_spend_exceeds_threshold_is_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+        assert _is_high_stakes_finding(self._cf(spend_cap_usd=10.0, accelerator=None))
+
+    def test_spend_approaches_threshold_is_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 10.0},
+        )
+        # 75% of threshold exceeds the 50% approach boundary
+        assert _is_high_stakes_finding(self._cf(spend_cap_usd=7.5, accelerator=None))
+
+    def test_spend_at_half_threshold_is_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 10.0},
+        )
+        assert _is_high_stakes_finding(self._cf(spend_cap_usd=5.0, accelerator=None))
+
+    def test_spend_below_approach_is_not_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 100.0},
+        )
+        # 1% of threshold — well below the 50% approach boundary
+        assert not _is_high_stakes_finding(self._cf(spend_cap_usd=1.0, accelerator=None))
+
+    def test_zero_threshold_any_spend_is_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 0.0},
+        )
+        assert _is_high_stakes_finding(self._cf(spend_cap_usd=0.01, accelerator=None))
+
+    def test_long_deadline_is_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 1000.0},
+        )
+        assert _is_high_stakes_finding(self._cf(deadline_seconds=7200, accelerator=None, spend_cap_usd=0.01))
+
+    def test_deadline_at_boundary_is_not_high_stakes(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 1000.0},
+        )
+        # Exactly 3600 seconds (== 1 hour) is NOT over the threshold
+        assert not _is_high_stakes_finding(self._cf(deadline_seconds=3600, accelerator=None, spend_cap_usd=0.01))
+
+    def test_malformed_contract_not_high_stakes_via_this_gate(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+        # Missing spend_cap_usd — defer path is _validate_compute_launch_contract
+        finding = {
+            "title": "Benchmark",
+            "prompt": "Run benchmark",
+            "type": "compute_experiment",
+            "command": "bench.py",
+            "deadline_seconds": 600,
+        }
+        assert not _is_high_stakes_finding(finding)
+
+    def test_nested_compute_contract_fields_read(self, mocker):
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+        finding = {
+            "title": "Nested contract benchmark",
+            "prompt": "Run nested benchmark",
+            "type": "compute_experiment",
+            "compute_experiment": {
+                "command": "bench.py",
+                "spend_cap_usd": 50.0,
+                "deadline_seconds": 600,
+            },
+        }
+        assert _is_high_stakes_finding(finding)
+
+    def test_low_actionability_compute_not_high_stakes(self):
+        assert not _is_high_stakes_finding(
+            self._cf(actionability_grade="LOW", accelerator="T4")
+        )
+
+    def test_measurement_type_gpu_is_high_stakes(self):
+        finding = dict(self._cf(type="measurement", accelerator="V100"))
+        assert _is_high_stakes_finding(finding)
+
+    def test_benchmark_type_gpu_is_high_stakes(self):
+        finding = dict(self._cf(type="benchmark", accelerator="H100"))
+        assert _is_high_stakes_finding(finding)
+
+
 # ---------------------------------------------------------------------------
-# parse_adversarial_finding_verdicts: fail-open parse (pure unit tests)
+# parse_adversarial_finding_verdicts: fail-closed parse (pure unit tests)
 # ---------------------------------------------------------------------------
 
 
 class TestParseAdversarialFindingVerdicts:
-    """parse_adversarial_finding_verdicts: fail-open pass/fail extraction."""
+    """parse_adversarial_finding_verdicts: fail-closed pass/fail extraction."""
 
     def test_extracts_fail_verdict(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "premise wrong"}]'
@@ -6472,27 +6681,27 @@ class TestParseAdversarialFindingVerdicts:
         assert result["abc123"]["reason"] == "well-grounded"
         assert result["abc123"]["explicit"] is True
 
-    def test_missing_hash_defaults_to_pass(self):
+    def test_missing_hash_defaults_to_fail_closed(self):
         logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        assert result["abc123"]["passed"] is True
-        # fail-open bypass must be distinguishable from explicit challenger pass
+        # fail-closed: absent hash → passed=False, not an implicit pass
+        assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
 
-    def test_not_completed_defaults_all_to_pass(self):
+    def test_not_completed_defaults_all_to_fail_closed(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
         result = parse_adversarial_finding_verdicts(logs, ["abc123"], completed=False)
-        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
 
-    def test_none_logs_defaults_all_to_pass(self):
+    def test_none_logs_defaults_all_to_fail_closed(self):
         result = parse_adversarial_finding_verdicts(None, ["abc123"])
-        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
 
-    def test_malformed_json_defaults_all_to_pass(self):
+    def test_malformed_json_defaults_all_to_fail_closed(self):
         result = parse_adversarial_finding_verdicts("not json at all", ["abc123"])
-        assert result["abc123"]["passed"] is True
+        assert result["abc123"]["passed"] is False
         assert result["abc123"]["explicit"] is False
 
     def test_multiple_findings_partial_fail(self):
@@ -6507,7 +6716,7 @@ class TestParseAdversarialFindingVerdicts:
         assert result["h2"]["passed"] is True
         assert result["h2"]["reason"] == "ok"
         assert result["h2"]["explicit"] is True
-        assert result["h3"]["passed"] is True  # absent → fail-open pass
+        assert result["h3"]["passed"] is False  # absent → fail-closed (not an implicit pass)
         assert result["h3"]["explicit"] is False  # not an explicit challenger verdict
 
 
@@ -6803,7 +7012,15 @@ async def test_adversarial_grader_completion_parses_real_output_and_defers_faile
     _, _, findings_block = prompt.partition("-----8<----- FINDINGS START -----8<-----")
     findings_json, _, _ = findings_block.partition("-----8<----- FINDINGS END -----8<-----")
     parsed_findings = json.loads(findings_json.strip())
-    assert parsed_findings == [{**hs, "hash": fhash}]
+    assert len(parsed_findings) == 1
+    manifest_item = parsed_findings[0]
+    # Compact manifest: only essential fields are kept (hash, title, description, risk, scope).
+    assert manifest_item["hash"] == fhash
+    assert manifest_item["title"] == hs["title"]
+    assert "description" in manifest_item
+    # Full raw finding fields like prompt/type/actionability_grade are not in compact manifest.
+    assert "prompt" not in manifest_item
+    assert "actionability_grade" not in manifest_item
 
     grader.status = TaskStatus.COMPLETED
     db_session.add(grader)
@@ -6957,8 +7174,10 @@ async def test_adversarial_gate_defers_recovered_deferred_finding_on_fail_verdic
 
 
 @_pytest.mark.asyncio
-async def test_adversarial_gate_fails_open_on_absent_verdicts(db_session, mocker):
-    """Fail-open: if grader output missing a finding's hash, that finding still spawns."""
+async def test_adversarial_gate_defers_missing_hash_without_child(db_session, mocker):
+    """Fail-closed (acceptance test): if grader output is missing a finding's hash,
+    that finding must NOT spawn and must be recorded as deferred with adversarial_gate reason."""
+    from app.research_completion import _finding_hash
     from test_autonomous_research import _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-adv05")
@@ -6968,17 +7187,19 @@ async def test_adversarial_gate_fails_open_on_absent_verdicts(db_session, mocker
         side_effect=lambda f: f.get("risk") == "high",
     )
 
-    hs = _high_stakes_finding(direction["id"], "Fail-open finding")
+    hs = _high_stakes_finding(direction["id"], "Fail-closed missing-hash finding")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
 
-    # Adversarial grader returned verdicts but NOT for this finding (empty dict).
+    # Adversarial grader returned an empty verdict dict — hash absent → fail-closed.
     task.plan_output = [hs]
     task.status = TaskStatus.COMPLETED
     task.context = {
         **(task.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {},  # empty — absent hash defaults to pass
+            "finding_verdicts": {},  # empty — absent hash must default to fail-closed
             "grader_task_id": "test-grader-002",
         },
+        "_adversarial_challenged_hashes": [fhash],
     }
     db_session.add(task)
     await db_session.commit()
@@ -7000,9 +7221,11 @@ async def test_adversarial_gate_fails_open_on_absent_verdicts(db_session, mocker
         .scalars()
         .all()
     )
-    assert len(children) == 1, "absent hash in verdict → fail-open → finding must spawn"
-    # The fail-open child must record explicit=False so callers can distinguish it.
-    assert (children[0].context or {}).get("research_spawn_gate_explicit") is False
+    assert len(children) == 0, "absent hash in verdict → fail-closed → finding must NOT spawn"
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert any(d.get("title") == hs["title"] for d in deferred), (
+        "absent-hash finding must appear in deferred_findings under adversarial_gate"
+    )
 
 
 @_pytest.mark.asyncio
@@ -7110,8 +7333,9 @@ async def test_adversarial_gate_deferral_decays_or_escalates_after_threshold(
 
 
 @_pytest.mark.asyncio
-async def test_adversarial_fail_open_explicit_false_on_child(db_session, mocker):
-    """A fail-open pass (hash absent from grader output) produces a child with explicit=False."""
+async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocker):
+    """Fail-closed: a hash absent from grader output must NOT produce a child task."""
+    from app.research_completion import _finding_hash
     from test_autonomous_research import _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-adv-explicit01")
@@ -7121,9 +7345,10 @@ async def test_adversarial_fail_open_explicit_false_on_child(db_session, mocker)
         side_effect=lambda f: f.get("risk") == "high",
     )
 
-    hs = _high_stakes_finding(direction["id"], "Fail-open explicit check")
+    hs = _high_stakes_finding(direction["id"], "Fail-closed explicit check")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
 
-    # Grader returned an empty verdict dict — no hash matched → fail-open pass.
+    # Grader returned an empty verdict dict — no hash matched → fail-closed.
     task.plan_output = [hs]
     task.status = TaskStatus.COMPLETED
     task.context = {
@@ -7132,6 +7357,7 @@ async def test_adversarial_fail_open_explicit_false_on_child(db_session, mocker)
             "finding_verdicts": {},
             "grader_task_id": "test-grader-explicit-001",
         },
+        "_adversarial_challenged_hashes": [fhash],
     }
     db_session.add(task)
     await db_session.commit()
@@ -7153,14 +7379,11 @@ async def test_adversarial_fail_open_explicit_false_on_child(db_session, mocker)
         .scalars()
         .all()
     )
-    assert len(children) == 1, "fail-open finding must spawn"
-    child = children[0]
-    assert (child.context or {}).get("research_spawn_gate_challenged") is True
-    assert (child.context or {}).get("research_spawn_gate_verdict") == "pass"
-    # explicit=False distinguishes fail-open from a clean challenger confirmation
-    assert (child.context or {}).get("research_spawn_gate_explicit") is False, (
-        "fail-open bypass must record explicit=False so it is distinguishable from "
-        "a clean challenger confirmation"
+    assert len(children) == 0, "fail-closed: absent hash must NOT produce a child task"
+    # The unresolved finding must be deferred, not silently dropped.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert any(d.get("title") == hs["title"] for d in deferred), (
+        "absent-hash finding must be deferred, not silently dropped"
     )
 
 
@@ -7248,6 +7471,118 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     assert (task.context or {}).get("research_spawn_gate_challenged_count") == 2
     assert (task.context or {}).get("research_spawn_gate_refuted_count") == 1
     assert (task.context or {}).get("research_spawn_gate_survived_count") == 1
+
+
+@_pytest.mark.asyncio
+async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker):
+    """Explicit-pass, fail-open, unresolved, and refuted outcomes get distinct counts.
+
+    The legacy challenged/refuted/survived counters stay inclusive while the new
+    breakdown splits the survived bucket into explicit_pass vs fail_open and the
+    refuted bucket into explicit-refutation vs unresolved. A compact deduped
+    sample of refuted/unresolved reasons is persisted, and deferred findings that
+    came from the adversarial gate carry their finding_hash (keyed the same way
+    verdicts are) alongside the title.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-breakdown01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    high_explicit_pass = _high_stakes_finding(direction["id"], "Explicit-pass refactor")
+    high_fail_open = _high_stakes_finding(direction["id"], "Fail-open defaulted pass")
+    high_refuted = _high_stakes_finding(direction["id"], "Refuted stale finding")
+    high_unresolved = _high_stakes_finding(direction["id"], "Unresolved no-verdict finding")
+    low = _make_finding(direction_id=direction["id"])
+    low["title"] = "Routine low-stakes follow-up"
+    low["risk"] = "low"
+
+    def _h(f):
+        return _finding_hash(f["title"], f.get("description", "") or f.get("prompt", ""))
+
+    pass_hash = _h(high_explicit_pass)
+    failopen_hash = _h(high_fail_open)
+    refuted_hash = _h(high_refuted)
+    unresolved_hash = _h(high_unresolved)
+
+    findings = [high_explicit_pass, high_fail_open, high_refuted, high_unresolved, low]
+    task.plan_output = findings
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                pass_hash: {"passed": True, "reason": "well-grounded", "explicit": True},
+                # Fail-open: passed but the challenger gave no explicit verdict.
+                failopen_hash: {"passed": True, "reason": "", "explicit": False},
+                refuted_hash: {
+                    "passed": False,
+                    "reason": "stale premise",
+                    "explicit": True,
+                },
+                # high_unresolved is intentionally absent → fail-closed unresolved.
+            },
+            "grader_task_id": "test-grader-breakdown-001",
+        },
+        # All four high-stakes findings were in the challenge manifest; the
+        # absent one (unresolved) must be treated as challenged-but-no-verdict.
+        "_adversarial_challenged_hashes": [
+            pass_hash,
+            failopen_hash,
+            refuted_hash,
+            unresolved_hash,
+        ],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=findings,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    # Legacy inclusive counters preserved.
+    assert ctx.get("research_spawn_gate_challenged_count") == 4
+    assert ctx.get("research_spawn_gate_refuted_count") == 2  # refuted + unresolved
+    assert ctx.get("research_spawn_gate_survived_count") == 2  # explicit + fail-open
+    # New decision-quality breakdown.
+    assert ctx.get("research_spawn_gate_explicit_pass_count") == 1
+    assert ctx.get("research_spawn_gate_fail_open_count") == 1
+    assert ctx.get("research_spawn_gate_unresolved_count") == 1
+    # explicit_pass + fail_open == survived; unresolved <= refuted.
+    assert (
+        ctx["research_spawn_gate_explicit_pass_count"]
+        + ctx["research_spawn_gate_fail_open_count"]
+        == ctx["research_spawn_gate_survived_count"]
+    )
+    # Compact reasons sample captures both the explicit refutation and the
+    # fail-closed (unresolved) reason, deduped.
+    reasons = ctx.get("research_spawn_gate_refuted_reasons") or []
+    assert "stale premise" in reasons
+    assert any("fail-closed" in r for r in reasons)
+    assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
+    assert len(reasons) <= 5
+
+    # Deferred findings (refuted + unresolved) carry their verdict-keyed
+    # finding_hash alongside the title so downstream consumers can match by hash.
+    deferred = ctx.get("deferred_findings") or []
+    deferred_by_title = {d.get("title"): d for d in deferred}
+    assert high_refuted["title"] in deferred_by_title
+    assert high_unresolved["title"] in deferred_by_title
+    assert deferred_by_title[high_refuted["title"]].get("finding_hash") == refuted_hash
+    assert (
+        deferred_by_title[high_unresolved["title"]].get("finding_hash")
+        == unresolved_hash
+    )
 
 
 @_pytest.mark.asyncio
@@ -7660,3 +7995,121 @@ async def test_adversarial_gate_rechecks_prior_deferred_high_stakes_findings(
     assert payload[0]["hash"]
     assert task.status == TaskStatus.EVALUATING
     assert task.context.get("awaiting_adversarial_grader") is True
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: a large findings list produces a parseable manifest within budget.
+
+    With many high-stakes findings that have long descriptions, the adversarial
+    grader payload must:
+    1. Be valid JSON (parseable by json.loads).
+    2. Stay within _ADVERSARIAL_MANIFEST_CHAR_BUDGET chars.
+    3. Each admitted finding carries a stable 'hash' field matching finding_hash().
+    4. The grader task context carries _adversarial_challenged_hashes that match.
+    5. The source task context also carries _adversarial_challenged_hashes.
+    """
+    from app.task_evaluators import _ADVERSARIAL_MANIFEST_CHAR_BUDGET
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-manifest-adv01"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    # Build 30 high-stakes findings each with a ~500-char description — this
+    # would overflow a naive json.dumps approach without manifest budgeting.
+    long_findings = []
+    for i in range(30):
+        long_findings.append({
+            "title": f"High-stakes finding number {i}",
+            "description": "Very long description " * 25 + f"(finding {i})",
+            "prompt": f"Implement fix for finding {i}",
+            "type": "improvement",
+            "priority": "high",
+            "scope": "medium",
+            "risk": "high",
+            "direction_id": direction["id"],
+            "actionability_grade": "HIGH",
+        })
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=long_findings,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Task must be parked awaiting the adversarial grader.
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be parked EVALUATING awaiting adversarial verdict"
+    )
+
+    # Find the spawned adversarial grader.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1, "Exactly one adversarial grader must be spawned"
+    grader = others[0]
+    assert (grader.context or {}).get("adversarial_grader") is True
+
+    # The grader prompt must contain valid JSON within budget.
+    prompt = (grader.first_payload or {}).get("prompt") or ""
+    import re as _re
+    fence_match = _re.search(
+        r"FINDINGS START.*?8<-----\n(.*?)\n-----8<----- FINDINGS END",
+        prompt,
+        _re.DOTALL,
+    )
+    assert fence_match, "Grader prompt must contain FINDINGS fences"
+    findings_json = fence_match.group(1).strip()
+    assert len(findings_json) <= _ADVERSARIAL_MANIFEST_CHAR_BUDGET, (
+        f"Manifest must stay within budget: {len(findings_json)} > {_ADVERSARIAL_MANIFEST_CHAR_BUDGET}"
+    )
+    parsed = json.loads(findings_json)
+    assert isinstance(parsed, list) and len(parsed) > 0, (
+        "Manifest JSON must be a non-empty list"
+    )
+
+    # Each admitted finding must have a stable hash. The hash is computed from
+    # the original description (before truncation) by the manifest builder.
+    # Verify all hashes are non-empty strings and are consistent within the manifest.
+    manifest_hashes = set()
+    for item in parsed:
+        assert isinstance(item["hash"], str) and len(item["hash"]) > 0, (
+            f"Finding {item['title']} must have a non-empty hash"
+        )
+        manifest_hashes.add(item["hash"])
+
+    # Grader context must carry _adversarial_challenged_hashes.
+    grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
+    assert isinstance(grader_hashes, list) and len(grader_hashes) > 0, (
+        "Grader context must carry _adversarial_challenged_hashes"
+    )
+    assert grader_hashes == [item["hash"] for item in parsed], (
+        "Grader context hashes must match manifest hashes"
+    )
+
+    # Source task context must also carry _adversarial_challenged_hashes.
+    source_hashes = (task.context or {}).get("_adversarial_challenged_hashes")
+    assert isinstance(source_hashes, list) and len(source_hashes) > 0, (
+        "Source task context must carry _adversarial_challenged_hashes"
+    )
+    assert source_hashes == grader_hashes, (
+        "Source and grader _adversarial_challenged_hashes must be identical"
+    )

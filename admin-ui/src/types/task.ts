@@ -187,6 +187,18 @@ export interface Task {
     research_spawn_gate_challenged_count?: number;
     research_spawn_gate_refuted_count?: number;
     research_spawn_gate_survived_count?: number;
+    // Decision-quality breakdown of the inclusive survived/refuted buckets
+    // (backend research_completion.py / direction_outcomes.py). All optional —
+    // older parent-task payloads omit them, so every consumer must tolerate
+    // their absence.
+    research_spawn_gate_explicit_pass_count?: number;
+    research_spawn_gate_fail_open_count?: number;
+    research_spawn_gate_unresolved_count?: number;
+    research_spawn_gate_refuted_reasons?: string[];
+    research_spawn_gate_challenged_spawned?: number;
+    research_spawn_gate_challenged_merged?: number;
+    research_spawn_gate_unchallenged_spawned?: number;
+    research_spawn_gate_unchallenged_merged?: number;
     [key: string]: unknown;
   };
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
@@ -227,6 +239,44 @@ export interface FixLoopAttempt {
   source?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
+}
+
+/**
+ * Aggregate research spawn-gate telemetry rolled up across a direction's
+ * research cycles. Two backend producers emit nearly-identical shapes:
+ *  - the digest direction-progress entry's `research_spawn_gate` payload
+ *    (backend digest_direction_progress.py) uses the `*_count` count keys; and
+ *  - the strategist's `spawn_gate_metrics` (compute_spawn_gate_aggregate) uses
+ *    the bare `challenged`/`refuted`/`survived` keys.
+ * This interface accepts BOTH spellings so a single UI type can read either; all
+ * fields are optional so older payloads (which carry only the legacy
+ * challenged/refuted/survived counts and merge rates) still render.
+ */
+export interface ResearchSpawnGateAggregate {
+  // Legacy inclusive counters — digest (`*_count`) and strategist (bare) spellings.
+  challenged_count?: number;
+  refuted_count?: number;
+  survived_count?: number;
+  challenged?: number;
+  refuted?: number;
+  survived?: number;
+  // Decision-quality breakdown: explicit challenger pass vs fail-open/no-verdict
+  // pass (both subsets of survived) and unresolved/no-verdict (subset of refuted).
+  explicit_pass_count?: number;
+  fail_open_count?: number;
+  unresolved_count?: number;
+  // Preserved merge-rate sample sizes so a shown rate always travels with its
+  // spawned/merged denominators.
+  challenged_spawned?: number;
+  challenged_merged?: number;
+  challenged_merge_rate?: number | null;
+  unchallenged_spawned?: number;
+  unchallenged_merged?: number;
+  unchallenged_merge_rate?: number | null;
+  // Compact, deduped, capped sample of refuted/unresolved challenger reasons —
+  // a degraded-gate signal the strategist/operator can act on without opening
+  // individual tasks.
+  refuted_reasons?: string[];
 }
 
 /** Discriminated union of spawn-gate outcomes for a research-derived child task. */

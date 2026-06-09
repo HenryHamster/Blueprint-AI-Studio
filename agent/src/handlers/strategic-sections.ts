@@ -682,12 +682,27 @@ export function buildDirSummaryText(
     let spawnGateSection = '';
     const sgm = d.spawn_gate_metrics as Record<string, unknown> | undefined;
     if (sgm && typeof sgm === 'object') {
-      const challenged = Number(sgm.challenged ?? 0);
-      const refuted = Number(sgm.refuted ?? 0);
-      const survived = Number(sgm.survived ?? 0);
+      const challenged = Number(sgm.challenged ?? sgm.challenged_count ?? 0);
+      const refuted = Number(sgm.refuted ?? sgm.refuted_count ?? 0);
+      const survived = Number(sgm.survived ?? sgm.survived_count ?? 0);
+      // Decision-quality breakdown: explicit challenger pass vs fail-open/no-verdict
+      // pass (subsets of survived) and unresolved/no-verdict (subset of refuted).
+      const explicitPass = Number(sgm.explicit_pass_count ?? 0);
+      const failOpen = Number(sgm.fail_open_count ?? 0);
+      const unresolved = Number(sgm.unresolved_count ?? 0);
       const cmr = sgm.challenged_merge_rate != null ? `${Math.round(Number(sgm.challenged_merge_rate) * 100)}%` : 'n/a';
       const umr = sgm.unchallenged_merge_rate != null ? `${Math.round(Number(sgm.unchallenged_merge_rate) * 100)}%` : 'n/a';
-      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged (${refuted} refuted, ${survived} survived) — merge rate: ${cmr} challenged vs ${umr} unchallenged`;
+      // Preserve the merge-rate sample sizes so each percentage travels with its
+      // merged/spawned denominator (a rate like 85% is meaningless without its n).
+      const cDenom = `${Number(sgm.challenged_merged ?? 0)}/${Number(sgm.challenged_spawned ?? 0)}`;
+      const uDenom = `${Number(sgm.unchallenged_merged ?? 0)}/${Number(sgm.unchallenged_spawned ?? 0)}`;
+      const reasons = Array.isArray(sgm.refuted_reasons)
+        ? (sgm.refuted_reasons as unknown[]).map(r => String(r)).filter(Boolean)
+        : [];
+      const reasonsPart = reasons.length > 0
+        ? `; refuted/unresolved reasons: ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}`
+        : '';
+      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved) — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
     }
 
     return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;

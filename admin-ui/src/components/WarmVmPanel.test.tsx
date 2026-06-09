@@ -631,6 +631,7 @@ describe('WarmVmPanel — warm-pool retarget toggles + per-account misses', () =
     // baseState omits the flag → defaults false → button reads NO-RETARGET.
     render(<WarmVmPanel onViewTask={() => {}} />);
 
+    await screen.findByText('backlog reuse');
     const btn = await screen.findByTestId('warm-pool-account-retarget-toggle');
     expect(btn.textContent).toBe('NO-RETARGET');
     fireEvent.click(btn);

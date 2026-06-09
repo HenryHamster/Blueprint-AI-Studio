@@ -346,7 +346,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     return map;
   }, [tasks, researchFeed]);
 
-  // Build a lookup of adversarially-deferred findings by (researchTaskId:titleLower).
+  // Build a lookup of adversarially-deferred findings, keyed BOTH by
+  // (researchTaskId:hash:<finding_hash>) when a stable hash is present and by
+  // (researchTaskId:title:<titleLower>) for compatibility. Lookups prefer the
+  // hash key (stable across title edits) and fall back to title when either
+  // side lacks a hash.
   const adversarialDeferredByKey = useMemo(() => {
     const feedTasks = researchFeed ?? tasks;
     const map = new Map<string, { adversarial_gate_reason: string | null }>();
@@ -355,15 +359,15 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
       const deferred = task.context?.deferred_findings;
       if (!Array.isArray(deferred)) continue;
       for (const df of deferred) {
-        if ((df as Record<string, unknown>).deferred_reason === 'adversarial_gate') {
-          const title = (df as Record<string, unknown>).title as string | undefined;
-          if (title) {
-            const key = `${task.id}:${title.toLowerCase()}`;
-            map.set(key, {
-              adversarial_gate_reason: ((df as Record<string, unknown>).adversarial_gate_reason as string | null | undefined) ?? null,
-            });
-          }
-        }
+        const dfr = df as Record<string, unknown>;
+        if (dfr.deferred_reason !== 'adversarial_gate') continue;
+        const entry = {
+          adversarial_gate_reason: (dfr.adversarial_gate_reason as string | null | undefined) ?? null,
+        };
+        const hash = dfr.finding_hash as string | undefined;
+        if (hash) map.set(`${task.id}:hash:${hash}`, entry);
+        const title = dfr.title as string | undefined;
+        if (title) map.set(`${task.id}:title:${title.toLowerCase()}`, entry);
       }
     }
     return map;
@@ -734,8 +738,12 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               </span>
                             )}
                             {!ef.outcome && (() => {
-                              const deferredKey = `${ef.taskId}:${ef.finding.title.toLowerCase()}`;
-                              const deferred = adversarialDeferredByKey.get(deferredKey);
+                              // Prefer hash-based matching when a finding_hash is
+                              // available on the finding; fall back to title.
+                              const fh = ef.finding.finding_hash;
+                              const deferred =
+                                (fh ? adversarialDeferredByKey.get(`${ef.taskId}:hash:${fh}`) : undefined)
+                                ?? adversarialDeferredByKey.get(`${ef.taskId}:title:${ef.finding.title.toLowerCase()}`);
                               if (!deferred) return null;
                               return (
                                 <span

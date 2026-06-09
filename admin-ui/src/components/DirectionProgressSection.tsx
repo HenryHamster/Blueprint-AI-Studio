@@ -9,6 +9,7 @@ import {
   summarizeOutcomeKinds,
   type OutcomeKindBreakdown,
 } from '../utils/outcomeKinds';
+import type { ResearchSpawnGateAggregate } from '../types/task';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -89,17 +90,7 @@ export interface DirectionProgress {
     tasks_created?: number;
   } | null;
   finding_challenge_summary?: DirectionFindingChallengeSummary | null;
-  research_spawn_gate?: {
-    challenged_count?: number;
-    refuted_count?: number;
-    survived_count?: number;
-    challenged_spawned?: number;
-    challenged_merged?: number;
-    challenged_merge_rate?: number | null;
-    unchallenged_spawned?: number;
-    unchallenged_merged?: number;
-    unchallenged_merge_rate?: number | null;
-  } | null;
+  research_spawn_gate?: ResearchSpawnGateAggregate | null;
   prompt_quality_hint?: string | null;
   decomposition_summary?: {
     plans_assessed?: number;
@@ -578,20 +569,35 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 {(() => {
                   const sg = dp.research_spawn_gate;
                   if (!sg) return null;
-                  const challenged = sg.challenged_count ?? 0;
-                  const refuted = sg.refuted_count ?? 0;
-                  const survived = sg.survived_count ?? 0;
+                  // Tolerate both the digest (`*_count`) and strategist (bare)
+                  // spellings so the row renders for either producer.
+                  const challenged = sg.challenged_count ?? sg.challenged ?? 0;
+                  const refuted = sg.refuted_count ?? sg.refuted ?? 0;
+                  const survived = sg.survived_count ?? sg.survived ?? 0;
                   if (!challenged && !refuted && !survived) return null;
+                  const explicitPass = sg.explicit_pass_count ?? 0;
+                  const failOpen = sg.fail_open_count ?? 0;
+                  const unresolved = sg.unresolved_count ?? 0;
                   const fmtRate = (r: number | null | undefined) =>
                     typeof r === 'number' ? `${Math.round(r * 100)}%` : '—';
                   const challengedRate = fmtRate(sg.challenged_merge_rate);
                   const unchallengedRate = fmtRate(sg.unchallenged_merge_rate);
+                  const challengedDenom = `${sg.challenged_merged ?? 0}/${sg.challenged_spawned ?? 0}`;
+                  const unchallengedDenom = `${sg.unchallenged_merged ?? 0}/${sg.unchallenged_spawned ?? 0}`;
+                  const reasons = (sg.refuted_reasons ?? []).filter(Boolean);
                   return (
-                    <span className="text-[9px] text-neutral-500">
-                      Spawn gate: {challenged} challenged · {refuted} refuted · {survived} survived
-                      {(sg.challenged_spawned ?? 0) > 0 || (sg.unchallenged_spawned ?? 0) > 0
-                        ? ` · merge rate: ${challengedRate} challenged vs ${unchallengedRate} unchallenged`
-                        : ''}
+                    <span className="text-[9px] text-neutral-500 flex flex-col gap-0.5">
+                      <span>
+                        Spawn gate: {challenged} challenged · {survived} survived ({explicitPass} explicit-pass · {failOpen} fail-open) · {refuted} refuted ({unresolved} unresolved)
+                        {(sg.challenged_spawned ?? 0) > 0 || (sg.unchallenged_spawned ?? 0) > 0
+                          ? ` · merge rate: ${challengedRate} challenged (${challengedDenom}) vs ${unchallengedRate} unchallenged (${unchallengedDenom})`
+                          : ''}
+                      </span>
+                      {reasons.length > 0 && (
+                        <span className="text-neutral-600 italic" title={reasons.join('\n')}>
+                          refuted/unresolved reasons: {reasons.slice(0, 3).join('; ')}{reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}
+                        </span>
+                      )}
                     </span>
                   );
                 })()}

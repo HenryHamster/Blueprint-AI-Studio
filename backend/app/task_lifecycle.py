@@ -362,8 +362,9 @@ async def _resolve_quality_grader_completion(
     context, the grader produced per-finding verdicts (not an artifact-level
     pass/fail). The per-finding dict is written under ``ADVERSARIAL_GATE_VERDICT_KEY``
     and the source is re-dispatched normally (the spawn loop will defer findings
-    whose hash maps to False in the verdict dict). Fail-open: absent hashes default
-    to pass so a crashed adversarial grader never blocks spawning.
+    whose hash maps to False in the verdict dict). Fail-closed: absent hashes default
+    to passed=False so a crashed adversarial grader leaves findings unspawned and
+    auditable as unresolved rather than silently converting to an implicit pass.
     """
     from app.task_evaluators import (
         ADVERSARIAL_GATE_VERDICT_KEY,
@@ -420,15 +421,23 @@ async def _resolve_quality_grader_completion(
         if isinstance(_stored_hashes, list) and _stored_hashes:
             all_hashes = [h for h in _stored_hashes if isinstance(h, str)]
         else:
-            # Fallback for tasks parked before this fix.
-            stored_findings = source.plan_output or []
-            if isinstance(stored_findings, dict):
-                stored_findings = stored_findings.get("findings") or []
-            all_hashes = [
-                _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
-                for f in stored_findings
-                if isinstance(f, dict)
-            ]
+            # Second fallback: check the grader's own context — the manifest builder
+            # stamps finding_hashes there so completion routing can recover even when
+            # the source-side post-spawn context write was lost (e.g. a crash between
+            # spawn and the subsequent source.context commit).
+            _grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
+            if isinstance(_grader_hashes, list) and _grader_hashes:
+                all_hashes = [h for h in _grader_hashes if isinstance(h, str)]
+            else:
+                # Final fallback for tasks parked before this fix.
+                stored_findings = source.plan_output or []
+                if isinstance(stored_findings, dict):
+                    stored_findings = stored_findings.get("findings") or []
+                all_hashes = [
+                    _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
+                    for f in stored_findings
+                    if isinstance(f, dict)
+                ]
         finding_verdicts = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )

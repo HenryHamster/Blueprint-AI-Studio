@@ -778,7 +778,7 @@ describe('buildDirSummaryText', () => {
     expect(idx1).toBeLessThan(idx2);
   });
 
-  it('renders research spawn-gate line when spawn_gate_metrics is present', () => {
+  it('renders research spawn-gate breakdown, sample sizes, and reasons when spawn_gate_metrics is present', () => {
     const result = buildDirSummaryText([{
       id: 'd-sg',
       text: 'direction with gate',
@@ -789,16 +789,33 @@ describe('buildDirSummaryText', () => {
         challenged: 5,
         refuted: 2,
         survived: 3,
+        explicit_pass_count: 2,
+        fail_open_count: 1,
+        unresolved_count: 1,
+        challenged_spawned: 3,
+        challenged_merged: 2,
+        unchallenged_spawned: 4,
+        unchallenged_merged: 3,
         challenged_merge_rate: 0.667,
         unchallenged_merge_rate: 0.75,
+        refuted_reasons: ['stale: defect absent on HEAD', 'over-claimed impact'],
       },
     }]);
     expect(result).toContain('Research spawn-gate');
     expect(result).toContain('5 challenged');
-    expect(result).toContain('2 refuted');
     expect(result).toContain('3 survived');
-    expect(result).toContain('67% challenged');
-    expect(result).toContain('75% unchallenged');
+    expect(result).toContain('2 refuted');
+    // Decision-quality breakdown distinguishes explicit pass from fail-open / unresolved.
+    expect(result).toContain('2 explicit-pass');
+    expect(result).toContain('1 fail-open');
+    expect(result).toContain('1 unresolved');
+    // Merge-rate percentages travel with their merged/spawned denominators.
+    expect(result).toContain('67% challenged (2/3)');
+    expect(result).toContain('75% unchallenged (3/4)');
+    // Compact inline sample of refuted/unresolved reasons.
+    expect(result).toContain('refuted/unresolved reasons:');
+    expect(result).toContain('stale: defect absent on HEAD');
+    expect(result).toContain('over-claimed impact');
   });
 
   it('omits research spawn-gate line when spawn_gate_metrics is absent', () => {
@@ -813,7 +830,7 @@ describe('buildDirSummaryText', () => {
     expect(result).not.toContain('challenged');
   });
 
-  it('renders n/a merge rates when challenged_merge_rate is null', () => {
+  it('renders n/a merge rates (with zero denominators) when merge rates are null', () => {
     const result = buildDirSummaryText([{
       id: 'd-sg-null',
       text: 'direction with partial gate data',
@@ -829,7 +846,30 @@ describe('buildDirSummaryText', () => {
       },
     }]);
     expect(result).toContain('Research spawn-gate');
-    expect(result).toContain('n/a challenged vs n/a unchallenged');
+    expect(result).toContain('n/a challenged (0/0)');
+    expect(result).toContain('n/a unchallenged (0/0)');
+  });
+
+  it('omits the reasons sample when no refuted_reasons are present', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-sg-noreasons',
+      text: 'direction with gate, no reasons',
+      status: 'active',
+      priority: 'low',
+      total_cycles: 1,
+      spawn_gate_metrics: {
+        challenged: 2,
+        refuted: 0,
+        survived: 2,
+        explicit_pass_count: 2,
+        fail_open_count: 0,
+        unresolved_count: 0,
+        challenged_merge_rate: 0.5,
+        unchallenged_merge_rate: null,
+      },
+    }]);
+    expect(result).toContain('Research spawn-gate');
+    expect(result).not.toContain('refuted/unresolved reasons:');
   });
 });
 
