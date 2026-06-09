@@ -21,7 +21,7 @@ import logging
 import statistics
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
@@ -148,6 +148,10 @@ AXIS_CONSUMERS: dict[str, dict] = {
 # timeout and kill cases are covered. Gemini pricing entries below price those estimates.
 LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     # Anthropic
+    # TEMPORARY model (limited availability ~2 weeks from 2026-06-09). Keep
+    # this pricing row after retirement so historical fable runs stay priced
+    # in cost dashboards. ($10/$50 per MTok list, platform.claude.com 2026-06.)
+    ("anthropic", "claude-fable-5"): (10e-6, 50e-6),
     ("anthropic", "claude-opus-4-8"): (15e-6, 75e-6),
     ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
     ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
@@ -278,7 +282,7 @@ def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
     return total_cost, merged
 
 
-def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
+def _compute_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     """Total VM cost / merged PR count over the window. None when no merges."""
     total_cost, merged = _cost_and_merges(tasks)
     if not merged:
@@ -305,7 +309,7 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
 
 
 def settle_pool_vm_idle_cost(
-    member: PoolVm, *, now: Optional[datetime] = None
+    member: PoolVm, *, now: datetime | None = None
 ) -> float:
     """Bank elapsed idle cost onto ``member.idle_cost_banked``; return the amount.
 
@@ -329,7 +333,7 @@ def settle_pool_vm_idle_cost(
 
 
 async def compute_pool_idle_cost(
-    session: AsyncSession, project_id: Optional[uuid.UUID] = None
+    session: AsyncSession, project_id: uuid.UUID | None = None
 ) -> Dict[str, Any]:
     """Aggregate warm-pool size + idle cost (banked + live accrual).
 
@@ -356,7 +360,7 @@ async def compute_pool_idle_cost(
     ``account_id``), so it stays in the fleet-wide ``retired_idle_cost_usd`` and
     is intentionally absent from the per-account totals.
     """
-    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+    from app.warm_backlog_reuse import _account_label
 
     stmt = select(PoolVm)
     if project_id is not None:
@@ -540,9 +544,9 @@ POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
 
 
 def compute_pool_payoff_verdict(
-    origin_breakdown: Optional[Dict[str, Any]],
-    cost_incl_axis: Optional[Dict[str, Any]],
-    pool_funnel: Optional[Dict[str, Any]],
+    origin_breakdown: Dict[str, Any] | None,
+    cost_incl_axis: Dict[str, Any] | None,
+    pool_funnel: Dict[str, Any] | None,
     *,
     hit_rate_floor: float = POOL_PAYOFF_HIT_RATE_FLOOR,
     origin_share_floor: float = POOL_PAYOFF_ORIGIN_SHARE_FLOOR,
@@ -681,7 +685,7 @@ def compute_pool_payoff_verdict(
 
 
 def _estimate_pool_hit_rate(
-    dispatches: list[tuple[Optional[str], Optional[datetime]]],
+    dispatches: list[tuple[str | None, datetime | None]],
     *,
     target_size: int,
     replenish_seconds: float,
@@ -720,7 +724,7 @@ def _estimate_pool_hit_rate(
     t0 = items[0][1]
     seq = [(label, (ts - t0).total_seconds()) for label, ts in items]
 
-    from collections import Counter  # noqa: PLC0415
+    from collections import Counter
 
     demand = Counter(label for label, _ in seq)
     # Demand-active accounts, busiest first — so a pool smaller than the account
@@ -731,7 +735,7 @@ def _estimate_pool_hit_rate(
 
     # Allocate slots. Each slot is its next-available time (relative seconds);
     # all members start ready at t0 (pool pre-warmed at window start).
-    alloc: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    alloc: Dict[str | None, int] = dict.fromkeys(accounts, 0)
     if account_retarget:
         shared_slots = [0.0] * target_size
     else:
@@ -740,7 +744,7 @@ def _estimate_pool_hit_rate(
             rem = target_size % n
             for i, a in enumerate(accounts):
                 alloc[a] = base + (1 if i < rem else 0)
-        slots: Dict[Optional[str], list[float]] = {
+        slots: Dict[str | None, list[float]] = {
             a: [0.0] * alloc[a] for a in accounts
         }
 
@@ -761,7 +765,7 @@ def _estimate_pool_hit_rate(
                 return True
         return False
 
-    hits_by_acct: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    hits_by_acct: Dict[str | None, int] = dict.fromkeys(accounts, 0)
     for label, t in seq:
         if account_retarget:
             if _serve(shared_slots, t):
@@ -810,7 +814,7 @@ async def estimate_pool_hit_rate(
     *,
     target_size: int,
     window_days: int = _AXIS_WINDOW_DAYS,
-    runtime_config: Optional[Mapping[str, Any]] = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Offline pool hit-rate estimate for a project at a candidate target size.
 
@@ -825,11 +829,11 @@ async def estimate_pool_hit_rate(
     (the maintainer interval and the pool idle TTL) but threaded through as
     explicit params to the pure helper for deterministic testing.
     """
-    from app.max_plan_pool import get_task_llm_account_id  # noqa: PLC0415
-    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+    from app.max_plan_pool import get_task_llm_account_id
+    from app.warm_backlog_reuse import _account_label
 
     if runtime_config is None:
-        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+        from app.shared_state import runtime_config as _rc
 
         runtime_config = _rc
 
@@ -845,7 +849,7 @@ async def estimate_pool_hit_rate(
         idle_ttl = 1800
 
     tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
-    dispatches: list[tuple[Optional[str], Optional[datetime]]] = []
+    dispatches: list[tuple[str | None, datetime | None]] = []
     for t in tasks:
         if t.vm_dispatched_at is None:
             continue
@@ -883,7 +887,7 @@ async def estimate_pool_hit_rate(
     }
 
 
-def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
+def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     """Total LLM token cost / merged PR count over the window. None when no merges."""
     total_cost = 0.0
     merged = 0
@@ -1118,19 +1122,19 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         if is_fallback and task_contributed:
             fallback_task_count += 1
 
-    def _share(cost: float) -> Optional[float]:
+    def _share(cost: float) -> float | None:
         if total_cost <= 0:
             return None
         return round(cost / total_cost, 4)
 
-    def _merge_rate(merged: float, count: float) -> Optional[float]:
+    def _merge_rate(merged: float, count: float) -> float | None:
         if count <= 0:
             return None
         return round(merged / count, 4)
 
     def _cost_per_merge(
         cost: float, verified_merged: float, priced: bool
-    ) -> Optional[float]:
+    ) -> float | None:
         # Only present a confident cost-per-merge when cost is fully known.
         # Unpriced buckets understate cost, so the figure would mislead; a
         # zero-verified-merge bucket would divide by zero.
@@ -1199,7 +1203,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         )
     ]
     priceable = priced_task_count + unpriced_task_count
-    unpriced_coverage_fraction: Optional[float] = (
+    unpriced_coverage_fraction: float | None = (
         round(priced_task_count / priceable, 4) if priceable else None
     )
     return {
@@ -1265,7 +1269,7 @@ def _compute_llm_cost_pricing_coverage(
             ):
                 unpriced_combos.append(combo)
     priceable = priced + unpriced + unattributed
-    coverage_fraction: Optional[float] = (
+    coverage_fraction: float | None = (
         round(priced / priceable, 4) if priceable else None
     )
     return {
@@ -1368,7 +1372,7 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
 
 def compute_effort_model_efficiency(
     tasks: list[Task],
-    runtime_config: Optional[Mapping[str, Any]] = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Per-effort-tier and per-actual-model efficiency rollup over finished tasks.
 
@@ -1416,12 +1420,12 @@ def compute_effort_model_efficiency(
       - ``fallbacks``: aggregate of ``context.model_fallback`` downgrade records
         (requested != effective resolved model), with a capped per-combo list.
     """
-    from collections import defaultdict  # noqa: PLC0415
+    from collections import defaultdict
 
-    from app import max_plan_pool  # noqa: PLC0415
+    from app import max_plan_pool
 
     if runtime_config is None:
-        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+        from app.shared_state import runtime_config as _rc
 
         runtime_config = _rc
 
@@ -1624,14 +1628,14 @@ def compute_effort_model_efficiency(
     }
 
 
-def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
+def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> float | None:
     samples = [int(t.vm_cold_start_ms) for t in tasks if t.vm_cold_start_ms is not None]
     if not samples:
         return None
     return round(float(statistics.median(samples)), 2)
 
 
-def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
+def _compute_vm_reuse_rate(tasks: list[Task]) -> float | None:
     """warm / participating. None when no VMs participated.
 
     Reads ``context['_timing']['warm_start']`` — the same source the
@@ -1659,7 +1663,7 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
 
 def _compute_warm_start_origin_breakdown(
     tasks: list[Task],
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
     """Break the warm-start population down by claim origin over the window.
 
     Reads ``context['_timing']['warm_claim_origin']`` for every task whose
@@ -1678,7 +1682,7 @@ def _compute_warm_start_origin_breakdown(
     bucket as a fraction of all warm starts (``None`` only when ``warm_total``
     is 0, which already returns None above).
     """
-    from app.warm_pool import WARM_POOL_ORIGIN  # noqa: PLC0415
+    from app.warm_pool import WARM_POOL_ORIGIN
 
     warm_pool = 0
     backlog_reuse = 0
@@ -1708,7 +1712,7 @@ def _compute_warm_start_origin_breakdown(
     }
 
 
-def _compute_median_api_calls_per_task(tasks: list[Task]) -> Optional[float]:
+def _compute_median_api_calls_per_task(tasks: list[Task]) -> float | None:
     counts: list[int] = []
     for t in tasks:
         if t.api_call_summary is None and t.llm_call_count_banked is None:
@@ -1720,7 +1724,7 @@ def _compute_median_api_calls_per_task(tasks: list[Task]) -> Optional[float]:
     return round(float(statistics.median(counts)), 2)
 
 
-def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
+def _compute_median_review_iterations(tasks: list[Task]) -> float | None:
     iters: list[int] = []
     for t in tasks:
         ctx = t.context or {}
@@ -1739,7 +1743,7 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
     return round(float(statistics.median(iters)), 2)
 
 
-def _parse_stage_ts(val: Any) -> Optional[datetime]:
+def _parse_stage_ts(val: Any) -> datetime | None:
     """Parse a stage timestamp (datetime or ISO string) to a naive datetime."""
     if isinstance(val, datetime):
         return val.replace(tzinfo=None) if val.tzinfo is not None else val
@@ -1754,7 +1758,7 @@ def _parse_stage_ts(val: Any) -> Optional[datetime]:
 
 def _compute_cold_start_breakdown_p50(
     tasks: list[Task],
-) -> Optional[Dict[str, Optional[float]]]:
+) -> Dict[str, float | None] | None:
     """Per-stage p50 ms breakdown of the VM cold-start interval.
 
     Returns None when no tasks have any stage data.  Individual stage values
@@ -1793,8 +1797,8 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
-    from app.digest_metrics import compute_timeout_rate  # noqa: PLC0415
-    from app.warm_backlog_reuse import (  # noqa: PLC0415
+    from app.digest_metrics import compute_timeout_rate
+    from app.warm_backlog_reuse import (
         compute_dominant_pool_miss,
         compute_dominant_reuse_dropout,
     )
@@ -1807,7 +1811,7 @@ async def compute_current_axes(
     # axis look better while real spend rises. Kept SEPARATE from the immutable
     # AXIS_COST_PER_MERGED_PR baseline (drift comparisons stay apples-to-apples).
     total_vm_cost, merged = _cost_and_merges(tasks)
-    cost_incl_pool_idle: Optional[float] = (
+    cost_incl_pool_idle: float | None = (
         round((total_vm_cost + pool_metrics["total_idle_cost_usd"]) / merged, 4)
         if merged
         else None
@@ -1986,7 +1990,7 @@ async def read_baseline_with_drift(
     series of ``{captured_at, dominant_reason, dominant_share, dropout_total}``
     so an operator can confirm a widening change reduced the dominant leak.
     """
-    from app.warm_backlog_reuse import (  # noqa: PLC0415
+    from app.warm_backlog_reuse import (
         get_pool_funnel_snapshot,
         get_reuse_funnel_snapshot,
     )
@@ -2053,7 +2057,7 @@ async def read_baseline_with_drift(
     for axis in ALL_AXES:
         cur = latest.get(axis)
         base = baseline.get(axis)
-        drift_pct: Optional[float]
+        drift_pct: float | None
         if (
             cur is None
             or base is None
@@ -2124,7 +2128,7 @@ async def read_baseline_with_drift(
     latest_timeout = latest.get("agent_timeout_rate") or {}
     baseline_timeout = baseline.get("agent_timeout_rate") or {}
 
-    def _rate_drift_pct(cur: Any, base: Any) -> Optional[float]:
+    def _rate_drift_pct(cur: Any, base: Any) -> float | None:
         if (
             not isinstance(cur, (int, float))
             or not isinstance(base, (int, float))
@@ -2254,7 +2258,7 @@ SNAPSHOT_INTERVAL_SECONDS = 3600
 _DAY_SECONDS = 24 * 3600
 
 
-def _last_run_due(last_run_at_iso: Optional[str], now: datetime) -> bool:
+def _last_run_due(last_run_at_iso: str | None, now: datetime) -> bool:
     """Return True when a new snapshot is due.
 
     Cadence is one snapshot per UTC day. The first call is always due.
@@ -2273,8 +2277,8 @@ def _last_run_due(last_run_at_iso: Optional[str], now: datetime) -> bool:
 
 
 async def maybe_write_daily_snapshot(
-    session: AsyncSession, project_id: uuid.UUID, *, now: Optional[datetime] = None
-) -> Optional[Dict[str, Any]]:
+    session: AsyncSession, project_id: uuid.UUID, *, now: datetime | None = None
+) -> Dict[str, Any] | None:
     """Write a snapshot iff the daily cadence has elapsed for the project.
 
     Reads ``design_doc["efficiency_baseline"]["last_run_at"]`` for the
@@ -2301,7 +2305,7 @@ async def maybe_write_daily_snapshot(
 
 async def maybe_alert_pool_payoff_transition(
     session: AsyncSession, project_id: uuid.UUID
-) -> Optional[str]:
+) -> str | None:
     """Raise an operator Alert when a scoped project's warm-pool payoff verdict
     crosses a decision boundary, deduplicated per project + verdict.
 
@@ -2328,10 +2332,10 @@ async def maybe_alert_pool_payoff_transition(
     bounded-enable projects are evaluated. Returns the verdict state when an alert
     fired, else ``None``.
     """
-    from app.alert_dispatch import _maybe_create_pool_payoff_alert  # noqa: PLC0415
-    from app.models import AlertSeverity  # noqa: PLC0415
-    from app.task_locking import with_design_doc_locked  # noqa: PLC0415
-    from app.warm_pool import is_project_warm_pool_scoped  # noqa: PLC0415
+    from app.alert_dispatch import _maybe_create_pool_payoff_alert
+    from app.models import AlertSeverity
+    from app.task_locking import with_design_doc_locked
+    from app.warm_pool import is_project_warm_pool_scoped
 
     if not is_project_warm_pool_scoped(project_id):
         return None
@@ -2395,7 +2399,7 @@ async def maybe_alert_pool_payoff_transition(
 
 async def maybe_alert_unpriced_models_coverage(
     session: AsyncSession, project_id: uuid.UUID
-) -> Optional[bool]:
+) -> bool | None:
     """Raise an operator Alert when a project's recent LLM spend runs on
     unpriced (provider, model) combinations, edge-triggered and deduplicated.
 
@@ -2421,9 +2425,9 @@ async def maybe_alert_unpriced_models_coverage(
     coverage recovers. Runs every hourly snapshot tick for every project.
     Returns ``True`` when an alert fired, else ``None``.
     """
-    from app.alert_dispatch import _maybe_create_unpriced_models_alert  # noqa: PLC0415
-    from app.models import AlertSeverity  # noqa: PLC0415
-    from app.task_locking import with_design_doc_locked  # noqa: PLC0415
+    from app.alert_dispatch import _maybe_create_unpriced_models_alert
+    from app.models import AlertSeverity
+    from app.task_locking import with_design_doc_locked
 
     tasks = await _load_recent_tasks(session, project_id)
     coverage = _compute_llm_cost_pricing_coverage(tasks)

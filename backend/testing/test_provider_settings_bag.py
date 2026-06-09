@@ -76,6 +76,56 @@ def test_anthropic_cli_emits_fallback_model_when_different():
     assert cli.args[idx + 1] == "claude-sonnet-4-6"
 
 
+def test_anthropic_fable_max_bag_validates_and_translates():
+    # The default max-effort cell ships fable-5 with an opus fallback (fable
+    # is a TEMPORARY limited-availability model — the fallback is what keeps
+    # tasks alive through rate limits now and retirement later). Exercise the
+    # exact bag end-to-end: schema validation then CLI translation.
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    bag = provider.validate_settings(
+        {
+            "model": "claude-fable-5",
+            "effort": "max",
+            "fallback_model": "claude-opus-4-8",
+        }
+    )
+    cli = provider.settings_to_cli(bag)
+    args = list(cli.args)
+    assert args[args.index("--model") + 1] == "claude-fable-5"
+    assert args[args.index("--effort") + 1] == "max"
+    assert args[args.index("--fallback-model") + 1] == "claude-opus-4-8"
+    assert not cli.unsupported
+
+
+def test_anthropic_fable_1m_opt_in_appends_suffix():
+    # 1M is *possible* on fable (suffix supported) but not enabled by default
+    # in the effort matrix — this covers the opt-in path only.
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    cli = provider.settings_to_cli(
+        {
+            "model": "claude-fable-5",
+            "use_1m_context": True,
+        }
+    )
+    args = list(cli.args)
+    assert args[args.index("--model") + 1] == "claude-fable-5[1m]"
+    assert not any("use_1m_context" in u for u in cli.unsupported)
+
+
+def test_anthropic_cli_translation_advisor_fable_executor_ignored():
+    # Fable is advisor-class (above opus) — pairing an opus advisor with it
+    # is a no-op, same as opus-on-opus.
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli(
+        {
+            "model": "claude-fable-5",
+            "advisor": {"enabled": True, "model": "claude-opus-4-8"},
+        }
+    )
+    assert any("advisor.enabled" in u for u in translation.unsupported)
+    assert not translation.prompt_fragments
+
+
 def test_openai_schema_accepts_known_knobs():
     provider = get_provider(LLMProviderName.OPENAI)
     validated = provider.validate_settings(
