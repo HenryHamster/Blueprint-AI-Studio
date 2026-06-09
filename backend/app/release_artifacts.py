@@ -158,9 +158,13 @@ def summarize_release_artifacts(
     * otherwise ``unconfirmed`` while any required artifact is pending.
 
     For backward compatibility, a missing backend artifact row falls back to the
-    legacy ``ReleaseVersion`` scalar projection. When no artifact evidence exists
-    at all (for example, an open version that has never promoted), the helper
-    preserves the scalar truth instead of inventing a serving state.
+    legacy ``ReleaseVersion`` scalar projection. The scalar is projected AS-IS:
+    a promotion that was never armed for serving confirmation (no row, scalar
+    NULL) reads as plain ``promoted`` (NA), never a synthesized ``unconfirmed``.
+    Inventing ``unconfirmed`` for an un-armed promotion creates a pending state
+    the sweep can never resolve, wedging the next version. When no artifact
+    evidence exists at all (for example, an open version that has never
+    promoted), the helper preserves the scalar truth instead of inventing one.
     """
 
     artifact_by_kind = {
@@ -183,14 +187,25 @@ def summarize_release_artifacts(
                 reason_code=artifact.reason_code,
             )
         elif is_backend_revision_artifact(provider.artifact_kind):
+            # No backend artifact row — project the legacy ReleaseVersion scalar
+            # DIRECTLY. Do NOT manufacture "unconfirmed" from status=="promoted":
+            # serving-confirmation arming (serving_status="unconfirmed" + the
+            # backend artifact row) only happens for promotions whose deploy is
+            # observable; a promotion that was never armed has serving_status
+            # NULL and NO rows. Synthesizing "unconfirmed" for it invents a
+            # pending serving state that NOTHING can ever resolve — the sweep
+            # only selects versions with serving_status=="unconfirmed" OR a real
+            # pending artifact row, so an un-armed promotion would sit falsely
+            # "unconfirmed" forever and wedge the next version (the real v3..v7
+            # case). This mirrors the non-backend branch below, which already
+            # treats a missing row as vacuous rather than a false negative. An
+            # armed promotion always persists its scalar AND its row in the same
+            # transaction, so the legitimate pending state is reported either by
+            # the real artifact row (above) or the scalar here.
             evidence = ReleaseArtifactEvidence(
                 artifact_kind=provider.artifact_kind,
                 required=provider.required,
-                serving_status=(
-                    version.serving_status
-                    if version.serving_status is not None
-                    else ("unconfirmed" if version.status == "promoted" else None)
-                ),
+                serving_status=version.serving_status,
                 served_identifier=version.served_sha,
                 served_at=version.served_at,
                 reason_code=version.deploy_failure_reason,
