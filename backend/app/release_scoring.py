@@ -1181,11 +1181,61 @@ def _finding_summary_tokens(text: str) -> frozenset[str]:
     return frozenset(tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 3)
 
 
+def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | None:
+    """Score a candidate verdict against an audit finding, or None if no match.
+
+    The scale is intentionally two-tiered:
+
+    * **2.0** — exact summary text match.  This tier beats any fuzzy score so
+      that best-match assignment always prefers an exact match over a fuzzy one
+      when a verdict could plausibly match multiple findings.
+    * **(0.0, 1.0]** — token-overlap fuzzy match using the significant-token
+      min-denominator (original behaviour, unchanged threshold).  Covers the
+      common case where the challenge runs in parallel without
+      ``primary_findings`` and independently re-describes the same issue.
+    * ``None`` — no match (file-path conflict or similarity below threshold).
+
+    Severity is deliberately NOT used for scoring: the primary audit and the
+    challenger may independently re-bucket the same issue at different severities,
+    so content must win even when the labels drift.
+    """
+    if not isinstance(verdict_entry, dict):
+        return None
+    f_summary = str(
+        finding.get("summary")
+        or finding.get("description")
+        or finding.get("title")
+        or finding.get("text")
+        or ""
+    ).strip()
+    f_file = str(finding.get("file") or "").strip()
+    cv_summary = str(verdict_entry.get("summary") or "").strip()
+    cv_file = str(verdict_entry.get("file") or "").strip()
+
+    if f_file and cv_file and f_file != cv_file:
+        return None
+
+    # Tier-1: exact summary match always beats any fuzzy score.
+    if cv_summary == f_summary:
+        return 2.0
+
+    # Tier-2: significant-token fuzzy match (min-denominator, threshold 0.6).
+    f_tokens = _finding_summary_tokens(f_summary)
+    cv_tokens = _finding_summary_tokens(cv_summary)
+    if f_tokens and cv_tokens:
+        overlap = len(f_tokens & cv_tokens)
+        min_size = min(len(f_tokens), len(cv_tokens))
+        if min_size > 0 and overlap / min_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
+            return overlap / min_size
+
+    return None
+
+
 def _match_finding_to_challenge(
     finding: dict,
     challenge_verdicts_list: list,
 ) -> dict | None:
-    """Return the first challenge verdict that matches this finding, or None.
+    """Return the best-scoring challenge verdict that matches this finding, or None.
 
     Matching is by summary + file; severity is advisory metadata and is not
     used for binding.  The primary audit and the challenger may independently
@@ -1196,42 +1246,25 @@ def _match_finding_to_challenge(
 
     Summary matching uses two passes:
     1. Exact text match (fast path — covers the case where the challenger was
-       given ``primary_findings`` and echoed back the exact text).
+       given ``primary_findings`` and echoed back the exact text).  Scores 2.0
+       to ensure it always beats any fuzzy match in best-match assignment.
     2. Token-overlap fuzzy match — covers the common case where the challenge
        runs in parallel without ``primary_findings`` and independently derives
        the same findings with different free-text wording.  Both sides must
-       share at least ``_FINDING_MATCH_TOKEN_THRESHOLD`` fraction of their
-       significant-token union (tokens of length >= 3) for a match to fire.
-    """
-    f_summary = str(
-        finding.get("summary")
-        or finding.get("description")
-        or finding.get("title")
-        or finding.get("text")
-        or ""
-    ).strip()
-    f_file = str(finding.get("file") or "").strip()
-    f_tokens = _finding_summary_tokens(f_summary)
+       share at least ``_FINDING_MATCH_TOKEN_THRESHOLD`` fraction of the
+       shorter token set (min-denominator) for a match to fire.  Scores ≤ 1.0.
 
+    Returns the highest-scoring match rather than the first, so that when
+    multiple verdicts could match a finding the most-similar one wins.
+    """
+    best_score: float = -1.0
+    best_verdict: dict | None = None
     for cv in challenge_verdicts_list:
-        if not isinstance(cv, dict):
-            continue
-        cv_summary = str(cv.get("summary") or "").strip()
-        cv_file = str(cv.get("file") or "").strip()
-        summary_matches = cv_summary == f_summary
-        if not summary_matches:
-            cv_tokens = _finding_summary_tokens(cv_summary)
-            if f_tokens and cv_tokens:
-                overlap = len(f_tokens & cv_tokens)
-                min_size = min(len(f_tokens), len(cv_tokens))
-                if min_size > 0 and overlap / min_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
-                    summary_matches = True
-        if not summary_matches:
-            continue
-        if f_file and cv_file and f_file != cv_file:
-            continue
-        return cv
-    return None
+        score = _score_finding_to_challenge(finding, cv)
+        if score is not None and score > best_score:
+            best_score = score
+            best_verdict = cv
+    return best_verdict
 
 
 def _reconcile_audit_with_challenge(
@@ -1292,16 +1325,39 @@ def _reconcile_audit_with_challenge(
     remove_idxs: set[int] = set()
     available_verdicts = list(challenge_verdicts_list)
 
-    for idx, f in deductible:
-        matched = _match_finding_to_challenge(f, available_verdicts)
-        if matched is None:
-            return "audit_challenge_missing", None, []
+    # Precompute (score, fi, vi) pairs for all deductible findings x available verdicts.
+    # fi indexes into deductible; vi indexes into available_verdicts.
+    scored_pairs: list[tuple[float, int, int]] = []
+    for fi, (idx, f) in enumerate(deductible):
+        for vi, cv in enumerate(available_verdicts):
+            score = _score_finding_to_challenge(f, cv)
+            if score is not None:
+                scored_pairs.append((score, fi, vi))
 
+    # Sort descending so the best matches are assigned first.
+    scored_pairs.sort(key=lambda x: -x[0])
+
+    # Greedy 1-to-1 assignment: each finding and each verdict used at most once.
+    fi_assigned: set[int] = set()
+    vi_assigned: set[int] = set()
+    assignment: dict[int, int] = {}  # fi -> vi
+
+    for score, fi, vi in scored_pairs:
+        if fi not in fi_assigned and vi not in vi_assigned:
+            assignment[fi] = vi
+            fi_assigned.add(fi)
+            vi_assigned.add(vi)
+
+    # All deductible findings must have exactly one verdict (fail-closed).
+    if len(assignment) < len(deductible):
+        return "audit_challenge_missing", None, []
+
+    for fi, (idx, f) in enumerate(deductible):
+        matched = available_verdicts[assignment[fi]]
         verdict_val = str(matched.get("verdict") or "").lower().strip()
         if verdict_val == "confirmed":
-            available_verdicts.remove(matched)
+            pass
         elif verdict_val == "refuted_false_positive":
-            available_verdicts.remove(matched)
             remove_idxs.add(idx)
             sev = str(f.get("severity") or f.get("level") or "").lower()
             summary = str(

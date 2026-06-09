@@ -2045,6 +2045,186 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert refuted == []
 
 
+class TestReconcileAuditBestMatchAssignment:
+    """Best-match pre-assignment: Jaccard denominator + global greedy assignment.
+
+    These tests verify the hardened matching introduced to close two failure modes:
+    (1) score inflation — a refutation mis-bound to a higher-severity finding cancels
+        a larger deduction than warranted; and
+    (2) spurious holds — a mis-bound verdict leaves the intended finding with no verdict.
+    """
+
+    SHA = "deadbeef"
+
+    def _report(self, findings: list) -> dict:
+        return {"findings": findings}
+
+    def _verified(self, severity: str, summary: str, file: str = "") -> dict:
+        return {
+            "severity": severity,
+            "summary": summary,
+            "file": file,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+
+    def test_refuted_verdict_cannot_cancel_higher_severity_finding(self):
+        """Refutation of a low-overlap finding must not be bound to a CRITICAL finding.
+
+        Finding A (CRITICAL) has a detailed summary with many tokens.
+        Finding B (HIGH) has a short summary whose tokens are a strict subset of A's.
+        The refutation verdict exactly matches B's summary.
+
+        Under the old min-denominator, "File read path traversal in upload module"
+        tokens are a subset of A's tokens → score = 1.0 against A, so the refutation
+        was mis-bound to A (CRITICAL, larger deduction = score inflation).
+
+        Under Jaccard (union denominator), the score against A is ~0.5 (below the 0.6
+        threshold), so the refutation is correctly bound to B.
+        """
+        finding_a = self._verified(
+            "critical",
+            "Unbounded file read allows arbitrary file disclosure via path traversal in upload module",
+        )
+        finding_b = self._verified(
+            "high",
+            "File read path traversal in upload module",
+        )
+        report = self._report([finding_a, finding_b])
+
+        # Verdicts emitted in reverse-finding order: refutation (for B) first so the
+        # old greedy code would have bound it to A (the first finding it matched).
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "File read path traversal in upload module",
+                "reason": "no actual arbitrary file access possible",
+            },
+            {
+                "verdict": "confirmed",
+                "summary": "Unbounded file read allows arbitrary file disclosure via path traversal in upload module",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # A (CRITICAL) must be confirmed — it must NOT be the refuted one.
+        assert hold is None
+        assert modified is not None
+        assert len(modified["findings"]) == 1
+        assert "Unbounded file read" in modified["findings"][0]["summary"]
+        assert len(refuted) == 1
+        assert refuted[0]["severity"] == "high"
+
+    def test_similar_findings_refutation_matches_correct_target(self):
+        """Two near-identical higher-severity findings; refutation matches only one.
+
+        Finding A: "SQL injection via query param in user endpoint"
+        Finding B: "SQL injection via header param in user endpoint"
+
+        The refutation summary exactly matches B. With best-match assignment,
+        the refutation is bound to B (exact match score 1.0) and A is confirmed.
+        """
+        finding_a = self._verified("high", "SQL injection via query param in user endpoint")
+        finding_b = self._verified("high", "SQL injection via header param in user endpoint")
+        report = self._report([finding_a, finding_b])
+
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "summary": "SQL injection via query param in user endpoint",
+            },
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "SQL injection via header param in user endpoint",
+                "reason": "header param is sanitized before use",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is not None
+        assert len(modified["findings"]) == 1
+        assert "query param" in modified["findings"][0]["summary"]
+        assert len(refuted) == 1
+        assert "header param" in refuted[0]["summary"]
+
+    def test_asymmetric_token_overlap_does_not_match_across_topics(self):
+        """A verdict summary with low token overlap against a finding does not match.
+
+        Verdict summary: "SQL injection endpoint"  (3 significant tokens)
+        Finding A: "Cross-site request forgery bypass in admin dashboard endpoint"
+
+        Only 1 token ("endpoint") is shared.  min-denominator: 1/3 = 0.33 < 0.6.
+        No match → reconciliation returns audit_challenge_missing (HOLD, fail-closed).
+        """
+        finding_a = self._verified(
+            "high",
+            "Cross-site request forgery bypass in admin dashboard endpoint",
+        )
+        report = self._report([finding_a])
+
+        verdicts = [
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "SQL injection endpoint",
+                "reason": "irrelevant finding",
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Verdict does not reach the 0.6 token-overlap threshold → HOLD (fail-closed).
+        assert hold == "audit_challenge_missing"
+        assert modified is None
+
+    def test_best_match_assignment_ignores_emission_order(self):
+        """Verdict order must not determine which finding each verdict is bound to.
+
+        Findings are emitted in order A, B; verdicts are emitted in order B, A (reversed).
+        Each verdict exactly matches only its intended finding.  Best-match assignment
+        must pair each verdict with its highest-scoring finding regardless of list order.
+        """
+        finding_a = self._verified("high", "Race condition in cache invalidation logic")
+        finding_b = self._verified("high", "Missing rate limit on password reset endpoint")
+        report = self._report([finding_a, finding_b])
+
+        # Verdicts in REVERSE order: B's verdict first, then A's.
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "summary": "Missing rate limit on password reset endpoint",
+            },
+            {
+                "verdict": "refuted_false_positive",
+                "summary": "Race condition in cache invalidation logic",
+                "reason": "lock acquired before shared state access",
+            },
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+
+        hold, modified, refuted = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # A is refuted (removed), B is confirmed (kept) — regardless of verdict order.
+        assert hold is None
+        assert modified is not None
+        assert len(modified["findings"]) == 1
+        assert "rate limit" in modified["findings"][0]["summary"]
+        assert len(refuted) == 1
+        assert "Race condition" in refuted[0]["summary"]
+
+
 class TestChallengedVsUnchallengedTelemetry:
     """Tests for compute_challenged_vs_unchallenged_telemetry (pure function)."""
 
