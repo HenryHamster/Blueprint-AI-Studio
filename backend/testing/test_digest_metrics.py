@@ -33,6 +33,7 @@ from app.digest_metrics import (
     compute_safeguard_shadow_metrics,
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
+    compute_trial_arm_accumulation,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
 from app.sr_review_quality_metrics import (
@@ -5737,3 +5738,93 @@ def test_compute_research_output_quality_skips_non_dict_findings_and_unknown_bas
     assert "unknown_tier" not in dist
     # Only the one dict finding counts toward total
     assert result["qualifying_task_count"] == 1
+
+
+# ── compute_trial_arm_accumulation: arm_composition basis tracking ────────────
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_reports_basis_composition(db_session):
+    """arm_composition breaks down each arm into assignment-keyed vs receipt-fallback.
+
+    When assignment_key != context_key, the result carries arm_composition with four
+    counters: with_assigned, with_receipt, without_assigned, without_receipt. These
+    let the verdict layer distinguish confounded legacy evidence from clean
+    intent-to-treat evidence, ensuring a decided verdict cannot silently rest on
+    fallback-receipt tasks that pre-date the deterministic holdback rollout.
+    """
+    from app.models import TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # Assignment-keyed WITH arm (2 tasks)
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        # Assignment-keyed WITHOUT arm (1 task)
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Receipt-fallback WITH arm — legacy, no assignment key (1 task)
+        _task({"_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Receipt-fallback WITHOUT arm — legacy, no assignment key (1 task)
+        _task({"_had_repo_map": False, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+
+    # Totals are unchanged — COALESCE-based arm partitioning covers all tasks.
+    assert accum["with_n"] == 3   # 2 assigned + 1 legacy receipt
+    assert accum["without_n"] == 2  # 1 assigned + 1 legacy receipt
+
+    # Per-basis breakdown must be present and accurate.
+    comp = accum["arm_composition"]
+    assert comp["with_assigned"] == 2
+    assert comp["with_receipt"] == 1
+    assert comp["without_assigned"] == 1
+    assert comp["without_receipt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_no_composition_without_assignment_key(db_session):
+    """When no assignment_key is provided, arm_composition is absent (receipt-only trial)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=_utcnow() - timedelta(days=1),
+        context={"_had_repo_map": True, "_first_attempt_succeeded": True},
+    ))
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        # no assignment_key
+    )
+    assert "arm_composition" not in accum

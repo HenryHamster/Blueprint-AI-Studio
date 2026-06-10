@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MIN_N_PER_ARM = 30          # minimum tasks per arm before deciding
 _DEFAULT_ADOPT_LIFT = 0.05           # lift >= this → adopt
 _DEFAULT_REJECT_LIFT = -0.03         # lift <= this → reject
+_DEFAULT_FUTILITY_N_MULTIPLIER = 3   # futility_n = min_n_per_arm * this
 
 
 def _default_config() -> dict[str, Any]:
@@ -34,6 +35,7 @@ def _default_config() -> dict[str, Any]:
         "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
         "adopt_lift": _DEFAULT_ADOPT_LIFT,
         "reject_lift": _DEFAULT_REJECT_LIFT,
+        "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
     }
 
 
@@ -59,6 +61,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         },
     },
     {
@@ -68,6 +71,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         },
     },
     {
@@ -77,6 +81,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         },
     },
     {
@@ -86,6 +91,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         },
     },
 ]
@@ -105,6 +111,7 @@ def evaluate_trial_verdict(
     window_hours: int | None = None,
     evaluated_at: str | None = None,
     accumulation_basis: str | None = None,
+    arm_composition: dict | None = None,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -125,11 +132,18 @@ def evaluate_trial_verdict(
                     reader can tell the decision came from cumulative-since-activation
                     counts rather than a single ``window_hours`` digest window.
                     When None the entry omits the key.
+    arm_composition: Per-basis breakdown dict from ``compute_trial_arm_accumulation``
+                    (keys: ``with_assigned``, ``with_receipt``, ``without_assigned``,
+                    ``without_receipt``). When provided, the entry is annotated with it
+                    for auditability, and a DECIDED verdict (adopt/reject) additionally
+                    requires the assignment-based subpopulation alone to satisfy
+                    ``min_n_per_arm`` — fallback-receipt tasks cannot tip a decision.
+                    When None the entry omits the key and the purity gate is skipped.
 
     Returns
     -------
     A dict with: verdict, verdict_reason, lift, n_with, n_without, window_hours,
-    thresholds, and optionally evaluated_at and accumulation_basis.
+    thresholds, and optionally evaluated_at, accumulation_basis, arm_composition.
     """
     cfg = _default_config()
     if config:
@@ -138,6 +152,7 @@ def evaluate_trial_verdict(
     min_n = int(cfg["min_n_per_arm"])
     adopt_threshold = float(cfg["adopt_lift"])
     reject_threshold = float(cfg["reject_lift"])
+    futility_n = int(cfg["futility_n"])
 
     entry: dict[str, Any] = {
         "lift": lift,
@@ -148,12 +163,15 @@ def evaluate_trial_verdict(
             "min_n_per_arm": min_n,
             "adopt_lift": adopt_threshold,
             "reject_lift": reject_threshold,
+            "futility_n": futility_n,
         },
     }
     if accumulation_basis is not None:
         entry["accumulation_basis"] = accumulation_basis
     if evaluated_at is not None:
         entry["evaluated_at"] = evaluated_at
+    if arm_composition is not None:
+        entry["arm_composition"] = arm_composition
 
     if lift is None or n_with < min_n or n_without < min_n:
         entry["verdict"] = "continue-trial"
@@ -161,15 +179,33 @@ def evaluate_trial_verdict(
         return entry
 
     if lift >= adopt_threshold:
-        entry["verdict"] = "adopt"
-        entry["verdict_reason"] = "sufficient_data"
+        verdict = "adopt"
+        verdict_reason = "sufficient_data"
     elif lift <= reject_threshold:
-        entry["verdict"] = "reject"
-        entry["verdict_reason"] = "sufficient_data"
+        verdict = "reject"
+        verdict_reason = "sufficient_data"
     else:
-        entry["verdict"] = "continue-trial"
-        entry["verdict_reason"] = "ambiguous_lift"
+        # Lift is ambiguous — check futility bound before continuing the trial.
+        if n_with >= futility_n and n_without >= futility_n:
+            verdict = "reject"
+            verdict_reason = "futility_bound_reached"
+        else:
+            verdict = "continue-trial"
+            verdict_reason = "ambiguous_lift"
 
+    # Purity gate: a decided verdict requires the assignment-based subpopulation
+    # alone to satisfy min_n per arm. Receipt-fallback tasks (legacy tasks that
+    # pre-date intent-to-treat assignment) are confounded and must not tip the
+    # decision. Only applies when arm_composition is provided.
+    if verdict in ("adopt", "reject") and arm_composition is not None:
+        with_assigned = int(arm_composition.get("with_assigned") or 0)
+        without_assigned = int(arm_composition.get("without_assigned") or 0)
+        if with_assigned < min_n or without_assigned < min_n:
+            verdict = "continue-trial"
+            verdict_reason = "insufficient_assigned_arm_data"
+
+    entry["verdict"] = verdict
+    entry["verdict_reason"] = verdict_reason
     return entry
 
 

@@ -8893,6 +8893,8 @@ def _arm_task(project_id, *, had_repo_map, first_attempt_succeeded, days_ago, id
         created_at=created,
         context={
             "_had_repo_map": had_repo_map,
+            # assignment key mirrors receipt — post-rollout tasks carry both.
+            "_repo_map_arm": had_repo_map,
             "_first_attempt_succeeded": first_attempt_succeeded,
         },
     )

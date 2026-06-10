@@ -1406,6 +1406,7 @@ async def _compute_digest(
                 evaluated_at=_verdict_evaluated_at,
                 config=_td["thresholds"],
                 accumulation_basis="cumulative_terminal_arm_tasks",
+                arm_composition=_accum.get("arm_composition"),
             )
             record_trial_verdict(_digest_project, _cap, _verdict_entry)
         try:

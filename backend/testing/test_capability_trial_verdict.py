@@ -208,6 +208,91 @@ class TestEvaluateTrialVerdict:
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_data"
 
+    # ── futility bound tests ──────────────────────────────────────────────────
+
+    def test_futility_bound_terminates_ambiguous_trial(self):
+        # Acceptance test: both arms at futility_n with ambiguous lift → reject/futility_bound_reached
+        # Default futility_n = 30 * 3 = 90
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=90, n_without=90,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    def test_futility_bound_reached_emits_reject(self):
+        entry = evaluate_trial_verdict(
+            lift=0.01, n_with=100, n_without=100,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    def test_below_futility_bound_stays_ambiguous(self):
+        # Both arms at min_n (30) but below futility_n (90)
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "ambiguous_lift"
+
+    def test_one_arm_below_futility_bound_stays_ambiguous(self):
+        # n_with >= futility_n but n_without < futility_n
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=90, n_without=50,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "ambiguous_lift"
+
+    def test_futility_bound_not_triggered_when_adopt_lift_met(self):
+        # lift >= adopt_lift must still produce adopt even at futility_n
+        entry = evaluate_trial_verdict(
+            lift=0.06, n_with=90, n_without=90,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_futility_bound_not_triggered_when_reject_lift_met(self):
+        # lift <= reject_lift must still produce reject/sufficient_data even at futility_n
+        entry = evaluate_trial_verdict(
+            lift=-0.05, n_with=90, n_without=90,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_futility_n_included_in_thresholds_entry(self):
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=90, n_without=90,
+            config=self._cfg(),
+        )
+        assert "futility_n" in entry["thresholds"]
+        assert entry["thresholds"]["futility_n"] == 90
+
+    def test_configurable_futility_n_respected(self):
+        # Custom futility_n lower than default — smaller arms can trigger futility
+        cfg = self._cfg()
+        cfg["futility_n"] = 50
+        entry = evaluate_trial_verdict(
+            lift=0.01, n_with=50, n_without=50,
+            config=cfg,
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    def test_futility_bound_holdback_is_one(self):
+        # futility_bound_reached reuses reject verdict — holdback must be 1.0
+        entry = evaluate_trial_verdict(
+            lift=0.01, n_with=90, n_without=90,
+            config=self._cfg(),
+        )
+        verdicts = {"repo_map": entry}
+        holdback = get_effective_holdback_fraction(verdicts, "repo_map", 0.1)
+        assert holdback == 1.0
+
 
 # ── record_trial_verdict ─────────────────────────────────────────────────────
 
@@ -572,6 +657,56 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == -0.07
 
+    def test_futility_bound_verdict_protected_from_insufficient_data_revert(self):
+        # A reject/futility_bound_reached must not be overwritten by continue-trial/insufficient_data
+        project = _make_project()
+        prior = {
+            "verdict": "reject",
+            "verdict_reason": "futility_bound_reached",
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+        }
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 3,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", incoming)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        assert project.capability_adoption_verdicts["repo_map"]["verdict_reason"] == "futility_bound_reached"
+        mock_flag.assert_not_called()
+
+    def test_strategic_review_can_override_futility_bound(self):
+        # Explicit strategist re-declaration must still override futility verdict
+        project = _make_project()
+        prior = {
+            "verdict": "reject",
+            "verdict_reason": "futility_bound_reached",
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+        }
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        strategic_reopen = {
+            "verdict": "continue-trial",
+            "evidence_source": "strategic_review",
+            "rationale": "re-opening trial after protocol change",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", strategic_reopen)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+        mock_flag.assert_called_once()
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 
@@ -659,6 +794,7 @@ class TestGetTrialDefinitions:
         assert "min_n_per_arm" in rm["thresholds"]
         assert "adopt_lift" in rm["thresholds"]
         assert "reject_lift" in rm["thresholds"]
+        assert "futility_n" in rm["thresholds"]
 
     def test_trial_definition_thresholds_fallback_to_defaults(self):
         """Thresholds in the definition can be overridden per-capability via config."""
@@ -679,3 +815,91 @@ class TestGetTrialDefinitions:
         assert entry["verdict"] == "adopt"
         assert entry["thresholds"]["adopt_lift"] == _DEFAULT_ADOPT_LIFT
         assert entry["thresholds"]["reject_lift"] == _DEFAULT_REJECT_LIFT
+
+
+# ── arm_composition and purity gate ──────────────────────────────────────────
+
+
+class TestArmComposition:
+    def _cfg(self, **overrides):
+        base = {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03}
+        base.update(overrides)
+        return base
+
+    def test_arm_composition_recorded_in_entry(self):
+        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=33,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["arm_composition"] == comp
+
+    def test_arm_composition_omitted_when_not_supplied(self):
+        entry = evaluate_trial_verdict(lift=0.08, n_with=30, n_without=30)
+        assert "arm_composition" not in entry
+
+    def test_purity_gate_blocks_adopt_when_assigned_with_arm_insufficient(self):
+        # Total n_with=35 would satisfy min_n=30 — but only 15 are assignment-based.
+        comp = {"with_assigned": 15, "with_receipt": 20, "without_assigned": 30, "without_receipt": 2}
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=32,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+        assert entry["arm_composition"] == comp
+
+    def test_purity_gate_blocks_adopt_when_assigned_without_arm_insufficient(self):
+        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 10, "without_receipt": 20}
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=30,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+    def test_purity_gate_allows_adopt_when_both_assigned_arms_sufficient(self):
+        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=33,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_purity_gate_blocks_reject_when_assigned_arm_insufficient(self):
+        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 12, "without_receipt": 18}
+        entry = evaluate_trial_verdict(
+            lift=-0.05, n_with=35, n_without=30,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+    def test_purity_gate_blocks_futility_bound_when_assigned_arm_insufficient(self):
+        # Total arms both >= futility_n=90, but assigned arms below min_n=30.
+        comp = {"with_assigned": 20, "with_receipt": 70, "without_assigned": 20, "without_receipt": 70}
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=90, n_without=90,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+    def test_purity_gate_skipped_when_arm_composition_absent(self):
+        # Without arm_composition, normal verdict logic applies.
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_purity_gate_does_not_affect_continue_trial(self):
+        # continue-trial from insufficient total n is not changed by the purity gate.
+        comp = {"with_assigned": 5, "with_receipt": 0, "without_assigned": 2, "without_receipt": 0}
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=5, n_without=2,
+            config=self._cfg(), arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_data"

@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -377,24 +377,35 @@ async def compute_trial_arm_accumulation(
     (with-arm rate − without-arm rate), where rates are ``None`` for an empty arm.
     """
     _assign_key = assignment_key if assignment_key else context_key
+    _has_assignment = _assign_key != context_key
     if resolve_dialect_name(session) == "sqlite":
         _primary_expr = func.json_extract(Task.context, f"$.{_assign_key}")
         _fallback_expr = func.json_extract(Task.context, f"$.{context_key}")
         arm_expr = (
             func.coalesce(_primary_expr, _fallback_expr)
-            if _assign_key != context_key
+            if _has_assignment
             else _primary_expr
         )
         succ_expr = func.json_extract(Task.context, "$._first_attempt_succeeded")
+        _assign_flag_expr = (
+            case((_primary_expr.is_not(None), 1), else_=0)
+            if _has_assignment
+            else None
+        )
     else:
         _primary_expr = Task.context[_assign_key].astext
         _fallback_expr = Task.context[context_key].astext
         arm_expr = (
             func.coalesce(_primary_expr, _fallback_expr)
-            if _assign_key != context_key
+            if _has_assignment
             else _primary_expr
         )
         succ_expr = Task.context["_first_attempt_succeeded"].astext
+        _assign_flag_expr = (
+            case((_primary_expr.is_not(None), 1), else_=0)
+            if _has_assignment
+            else None
+        )
 
     filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -404,24 +415,51 @@ async def compute_trial_arm_accumulation(
     if project_id is not None:
         filters.append(Task.project_id == project_id)
 
-    stmt = (
-        select(arm_expr, succ_expr, func.count())
-        .where(*filters)
-        .group_by(arm_expr, succ_expr)
-    )
-    rows = (await session.execute(stmt)).all()
-
     with_n = with_succ = without_n = without_succ = 0
-    for arm_val, succ_val, cnt in rows:
-        cnt = int(cnt)
-        if _json_truthy(arm_val):
-            with_n += cnt
-            if _json_truthy(succ_val):
-                with_succ += cnt
-        else:
-            without_n += cnt
-            if _json_truthy(succ_val):
-                without_succ += cnt
+    if _has_assignment:
+        stmt = (
+            select(arm_expr, succ_expr, _assign_flag_expr, func.count())
+            .where(*filters)
+            .group_by(arm_expr, succ_expr, _assign_flag_expr)
+        )
+        rows = (await session.execute(stmt)).all()
+        with_assigned = with_receipt = without_assigned = without_receipt = 0
+        for arm_val, succ_val, is_assigned_val, cnt in rows:
+            cnt = int(cnt)
+            is_assigned = bool(is_assigned_val)
+            if _json_truthy(arm_val):
+                with_n += cnt
+                if _json_truthy(succ_val):
+                    with_succ += cnt
+                if is_assigned:
+                    with_assigned += cnt
+                else:
+                    with_receipt += cnt
+            else:
+                without_n += cnt
+                if _json_truthy(succ_val):
+                    without_succ += cnt
+                if is_assigned:
+                    without_assigned += cnt
+                else:
+                    without_receipt += cnt
+    else:
+        stmt = (
+            select(arm_expr, succ_expr, func.count())
+            .where(*filters)
+            .group_by(arm_expr, succ_expr)
+        )
+        rows = (await session.execute(stmt)).all()
+        for arm_val, succ_val, cnt in rows:
+            cnt = int(cnt)
+            if _json_truthy(arm_val):
+                with_n += cnt
+                if _json_truthy(succ_val):
+                    with_succ += cnt
+            else:
+                without_n += cnt
+                if _json_truthy(succ_val):
+                    without_succ += cnt
 
     with_rate = round(with_succ / with_n, 2) if with_n else None
     without_rate = round(without_succ / without_n, 2) if without_n else None
@@ -430,7 +468,7 @@ async def compute_trial_arm_accumulation(
         if with_rate is not None and without_rate is not None
         else None
     )
-    return {
+    result: Dict[str, Any] = {
         "with_n": with_n,
         "without_n": without_n,
         "with_succ": with_succ,
@@ -439,6 +477,14 @@ async def compute_trial_arm_accumulation(
         "without_rate": without_rate,
         "lift": lift,
     }
+    if _has_assignment:
+        result["arm_composition"] = {
+            "with_assigned": with_assigned,
+            "with_receipt": with_receipt,
+            "without_assigned": without_assigned,
+            "without_receipt": without_receipt,
+        }
+    return result
 
 
 def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
