@@ -39,6 +39,7 @@ from app.ci_resolution import (
     merge_gate_runtime_block,
 )
 from app.problem_model import compute_model_size_signal, ProblemModel
+from app.capability_trial_verdict import get_trial_verdicts
 
 router = APIRouter(
     prefix="/api/admin",
@@ -58,6 +59,28 @@ def _redact_build_config(build_config: dict, role: str) -> dict:
     result = dict(build_config)
     result.pop("env_vars", None)
     return result
+
+
+def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert capability_proof_records into a summary per capability.
+
+    For each capability, returns: proof_count, latest proof_kind, latest proved_at,
+    latest commit_sha (from the most recent proof entry in the list).
+    """
+    summary = {}
+    if not proof_records:
+        return summary
+    for cap_name, entries in proof_records.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        latest = entries[-1]  # Most recent entry is last
+        summary[cap_name] = {
+            "proof_count": len(entries),
+            "latest_proof_kind": latest.get("proof_kind"),
+            "latest_proved_at": latest.get("proved_at"),
+            "latest_commit_sha": latest.get("commit_sha"),
+        }
+    return summary
 
 
 @router.get("/projects")
@@ -217,6 +240,10 @@ async def get_project(
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
+        "capability_proof_summary": _build_capability_proof_summary(
+            project.capability_proof_records or {}
+        ),
+        "capability_adoption_verdicts": get_trial_verdicts(project),
         "my_role": role,
     }
 

@@ -806,10 +806,10 @@ runtime_config: Dict = {
     # Tasks whose stable per-task hash falls below this threshold run WITHOUT
     # the repo map, allowing digest_metrics' without_repo_map arm to be
     # populated by real holdback runs rather than map-build failures only.
-    # Default 0.0 = unconditional injection (trial off); set to e.g. 0.1 for
-    # a 10% holdback arm. Setting back to 0.0 restores always-on injection
-    # once a verdict is reached. Operator-adjustable via runtime_config_json.
-    "repo_map_holdback_fraction": 0.0,
+    # Default-on trial: keep a small holdback arm alive until the capability
+    # gets a durable verdict. Operators can still dial it to 0.0 to disable the
+    # trial or override it per deployment via runtime_config_json.
+    "repo_map_holdback_fraction": 0.1,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.

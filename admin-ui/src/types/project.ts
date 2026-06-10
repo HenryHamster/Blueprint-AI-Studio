@@ -125,6 +125,27 @@ export interface MergeGateRuntime {
   summary?: MergeGateSummary;
 }
 
+export interface CapabilityProofSummary {
+  proof_count: number;
+  latest_proof_kind?: string;
+  latest_proved_at?: string;
+  latest_commit_sha?: string;
+}
+
+export interface CapabilityAdoptionVerdict {
+  verdict?: 'adopt' | 'reject' | 'continue-trial';
+  lift?: number | null;
+  n_with?: number;
+  n_without?: number;
+  window_hours?: number | null;
+  evaluated_at?: string;
+  thresholds?: {
+    min_n_per_arm?: number;
+    adopt_lift?: number;
+    reject_lift?: number;
+  };
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -154,6 +175,12 @@ export interface Project {
   merge_gate_runtime?: MergeGateRuntime;
   is_self_repo?: boolean;
   sr_catch_rate_targets?: Record<string, number>;
+  /** Per-capability proof summary (proof count and latest entry details).
+   *  Present on detail endpoint; absent on list endpoint. */
+  capability_proof_summary?: Record<string, CapabilityProofSummary>;
+  /** Durable adopt-or-reject verdicts for capability trials.
+   *  Present on detail endpoint; absent on list endpoint. */
+  capability_adoption_verdicts?: Record<string, CapabilityAdoptionVerdict>;
 }
 
 export interface AutoRemediationConfig {

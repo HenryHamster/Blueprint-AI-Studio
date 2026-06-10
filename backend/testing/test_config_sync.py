@@ -38,6 +38,10 @@ async def test_sync_returns_empty_for_none_state():
     assert changed == []
 
 
+def test_repo_map_holdback_default_is_nonzero():
+    assert _shared_state.runtime_config["repo_map_holdback_fraction"] == 0.1
+
+
 @pytest.mark.asyncio
 async def test_sync_scalar_cols_when_stable():
     state = DeploymentState(

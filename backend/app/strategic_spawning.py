@@ -43,6 +43,7 @@ from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
+from app.capability_trial_verdict import get_trial_verdicts
 from app.capability_registry import (
     registry_capability_names,
     registry_capability_vocabulary,
@@ -2206,6 +2207,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drops it whole under budget rather than trimming — mirroring
     # staged_directions / operator_overrides. Full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    "capability_trial_verdicts": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
@@ -5262,6 +5264,7 @@ async def _spawn_strategic_review(
         registry_capability_vocabulary(project.problem_model),
         getattr(project, "capability_proof_records", None),
     )
+    _sr_capability_trial_verdicts = get_trial_verdicts(project)
     if _missing_demand_present:
         _missing_demand_hint = missing_demand_prompt_hint(
             _missing_demand, registry_names=_sr_registry_names
@@ -5448,6 +5451,11 @@ async def _spawn_strategic_review(
             **(
                 {"available_capabilities": _sr_available_capabilities}
                 if _sr_available_capabilities
+                else {}
+            ),
+            **(
+                {"capability_trial_verdicts": _sr_capability_trial_verdicts}
+                if _sr_capability_trial_verdicts
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

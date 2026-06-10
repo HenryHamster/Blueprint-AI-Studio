@@ -474,6 +474,40 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
 
 @pytest.mark.asyncio
+async def test_spawn_review_includes_capability_trial_verdicts(db_session):
+    """The strategic_review payload carries durable capability trial verdicts."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        capability_adoption_verdicts={
+            "language-aware-repo-navigation": {
+                "verdict": "adopt",
+                "lift": 0.12,
+                "n_with": 42,
+                "n_without": 41,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert payload["capability_trial_verdicts"] == {
+        "language-aware-repo-navigation": {
+            "verdict": "adopt",
+            "lift": 0.12,
+            "n_with": 42,
+            "n_without": 41,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_review_includes_model_health_signal(db_session):
     """The strategic_review payload carries the soft model size/health signal
     computed from the DURABLE problem_model (honest pre-trim counts)."""

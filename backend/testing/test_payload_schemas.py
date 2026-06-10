@@ -630,6 +630,7 @@ def test_strategic_review_optional_fields_accepted():
         "project_name": "MyProject",
         "research_mode": "strategic",
         "max_active_directions": 10,
+        "capability_trial_verdicts": {"cap-a": {"verdict": "adopt"}},
     }
     result = _valid(raw)
     assert result["design_doc"] == {"summary": "doc"}
@@ -640,6 +641,7 @@ def test_strategic_review_optional_fields_accepted():
     assert result["project_name"] == "MyProject"
     assert result["research_mode"] == "strategic"
     assert result["max_active_directions"] == 10
+    assert result["capability_trial_verdicts"] == {"cap-a": {"verdict": "adopt"}}
 
 
 def test_strategic_review_omit_optional_fields_passes():
