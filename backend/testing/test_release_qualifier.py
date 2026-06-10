@@ -9410,6 +9410,241 @@ class TestFinalizeInfraFailure:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_challenge_provision_failure_respawns_new_task(self, db_session):
+        """PROVISION_FAILURE challenge child is re-spawned with the same candidate_sha."""
+        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        _candidate_sha = "feed" * 10
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-chal-prov",
+            status=TaskStatus.COMPLETED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-chal-prov",
+            status=TaskStatus.COMPLETED,
+        )
+        challenge_task = Task(
+            project_id=project.id,
+            title="audit-challenge",
+            payloads=[
+                {
+                    "type": "release_audit_challenge",
+                    "base_branch": "main",
+                    "diff_range": f"main...{_candidate_sha}",
+                }
+            ],
+            vm_instance_id="vm-challenge-prov",
+            status=TaskStatus.FAILED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        db_session.add(audit_task)
+        db_session.add(smoke_task)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(smoke_task)
+        await db_session.refresh(challenge_task)
+
+        persist_failure_category(challenge_task, PROVISION_FAILURE)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(challenge_task)
+
+        # Seed a verified high finding so the challenge gate is active and
+        # _primary_findings_for_challenge_retry returns a non-empty list.
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "severity": "high",
+                                "summary": "SQL injection in user input handler",
+                                "verification_note": "confirmed via full repo scan",
+                            }
+                        ],
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=smoke_task.id,
+                artifact_type=ArtifactType.SMOKETEST_RESULT,
+                logs=json.dumps(
+                    {
+                        "passed": True,
+                        "tests": [{"name": "startup", "status": "pass"}],
+                        "suites": {"startup": {"passed": True}},
+                    }
+                ),
+            )
+        )
+        await db_session.commit()
+
+        original_challenge_id = str(challenge_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": _candidate_sha,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": str(smoke_task.id),
+            "challenge_task_id": original_challenge_id,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "challenge_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["challenge_infra_respawn_count"] == 1
+        assert new_qual["challenge_task_id"] != original_challenge_id
+
+        # No QualificationVerdict — verdict not rendered on respawn.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_challenge_infra_respawn_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When challenge_infra_respawn_count hits cap, route to infra_failure
+        with label 'challenge_infra_respawn_cap_exceeded'."""
+        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        _candidate_sha = "bead" * 10
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-chal-cap",
+            status=TaskStatus.COMPLETED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-chal-cap",
+            status=TaskStatus.COMPLETED,
+        )
+        challenge_task = Task(
+            project_id=project.id,
+            title="audit-challenge",
+            payloads=[
+                {
+                    "type": "release_audit_challenge",
+                    "base_branch": "main",
+                    "diff_range": f"main...{_candidate_sha}",
+                }
+            ],
+            vm_instance_id="vm-challenge-cap",
+            status=TaskStatus.FAILED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        db_session.add(audit_task)
+        db_session.add(smoke_task)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(smoke_task)
+        await db_session.refresh(challenge_task)
+
+        persist_failure_category(challenge_task, PROVISION_FAILURE)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(challenge_task)
+
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "severity": "high",
+                                "summary": "Auth bypass in session check",
+                                "verification_note": "confirmed via full repo scan",
+                            }
+                        ],
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=smoke_task.id,
+                artifact_type=ArtifactType.SMOKETEST_RESULT,
+                logs=json.dumps(
+                    {
+                        "passed": True,
+                        "tests": [{"name": "startup", "status": "pass"}],
+                        "suites": {"startup": {"passed": True}},
+                    }
+                ),
+            )
+        )
+        await db_session.commit()
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": _candidate_sha,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": str(smoke_task.id),
+            "challenge_task_id": str(challenge_task.id),
+            # At the cap — next failure must route to infra_failure.
+            "challenge_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "challenge_infra_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"] == "challenge_infra_respawn_cap_exceeded"
+        )
+
+    @pytest.mark.asyncio
     async def test_infra_failure_dispatches_external_webhook(self, db_session, mocker):
         """_handle_infra_failure fires an external webhook with RELEASE_INFRA_FAILURE."""
         import asyncio
@@ -9625,23 +9860,21 @@ class TestFinalizeInfraFailure:
         )
 
     @pytest.mark.asyncio
-    async def test_audit_provision_failure_respawns_new_task(
-        self, db_session
-    ):
-        """FAILED audit classified as transient infra respawns instead of
-        falling through to infra_failure."""
+    async def test_audit_provision_failure_respawns_new_task(self, db_session):
+        """PROVISION_FAILURE audit child is re-spawned with the same candidate_sha."""
         from app.failure_classification import PROVISION_FAILURE, persist_failure_category
 
         project, version = await _make_project_and_version(db_session)
+        candidate = "babe1234" * 5
         audit_task = Task(
             project_id=project.id,
             title="audit",
             payloads=[
                 {
                     "type": "release_audit",
-                    "base_branch": "main",
-                    "diff_range": "main...deadbeef",
-                    "candidate_sha": "deadbeef" * 5,
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "candidate_sha": candidate,
                 }
             ],
             vm_instance_id="vm-audit-provision",
@@ -9657,16 +9890,16 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
         await db_session.refresh(audit_task)
 
+        original_audit_id = str(audit_task.id)
         version.last_qualification = {
             "status": "pending",
-            "candidate_sha": "deadbeef" * 5,
+            "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
             "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": str(audit_task.id),
+            "audit_task_id": original_audit_id,
             "smoketest_task_id": None,
             "prior_infra_streak": 0,
-            "audit_provision_respawn_count": 0,
         }
         db_session.add(version)
         await db_session.commit()
@@ -9675,14 +9908,15 @@ class TestFinalizeInfraFailure:
         result = await rq._finalize_qualification(db_session, version)
         await db_session.commit()
 
-        assert result["status"] == "audit_provision_respawned"
+        assert result["status"] == "audit_infra_respawned"
         assert result["respawn_count"] == 1
 
         await db_session.refresh(version)
         new_qual = version.last_qualification
-        assert new_qual["audit_provision_respawn_count"] == 1
-        assert new_qual["audit_task_id"] != str(audit_task.id)
+        assert new_qual["audit_infra_respawn_count"] == 1
+        assert new_qual["audit_task_id"] != original_audit_id
 
+        # No QualificationVerdict — verdict not rendered on respawn.
         count = (
             await db_session.execute(
                 select(sa_func.count()).where(
@@ -9692,6 +9926,7 @@ class TestFinalizeInfraFailure:
         ).scalar()
         assert count == 0
 
+        # No infra_failure ProjectMessage — transient respawn, not a hard failure.
         infra_msg_count = (
             await db_session.execute(
                 select(sa_func.count()).where(
@@ -9704,12 +9939,67 @@ class TestFinalizeInfraFailure:
         assert infra_msg_count == 0
 
     @pytest.mark.asyncio
-    async def test_audit_provision_failure_cap_exceeded_routes_to_infra_failure(
+    async def test_audit_agent_timeout_respawns_new_task(self, db_session):
+        """AGENT_TIMEOUT audit child is re-spawned with the same candidate_sha."""
+        from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "cafe5678" * 5
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "candidate_sha": candidate,
+                }
+            ],
+            vm_instance_id="vm-audit-timeout",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, AGENT_TIMEOUT)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "audit_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        assert version.last_qualification["audit_infra_respawn_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_audit_infra_respawn_cap_exceeded_routes_to_infra_failure(
         self, db_session
     ):
-        """At the cap, a transient audit infra failure falls through to infra_failure."""
+        """When audit_infra_respawn_count hits cap, fall through to infra_failure
+        with label 'audit_infra_respawn_cap_exceeded'."""
         from app.failure_classification import PROVISION_FAILURE, persist_failure_category
-        from app.release_qualifier import _MAX_AUDIT_PROVISION_RESPAWNS
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
 
         project, version = await _make_project_and_version(db_session)
         audit_task = Task(
@@ -9718,12 +10008,12 @@ class TestFinalizeInfraFailure:
             payloads=[
                 {
                     "type": "release_audit",
-                    "base_branch": "main",
-                    "diff_range": "main...cafe5678",
-                    "candidate_sha": "cafe5678" * 5,
+                    "base_branch": "automain",
+                    "diff_range": "automain...dead1234",
+                    "candidate_sha": "dead1234" * 5,
                 }
             ],
-            vm_instance_id="vm-audit-provision-cap",
+            vm_instance_id="vm-audit-infra-cap",
             status=TaskStatus.FAILED,
             context={"release_version_id": str(version.id)},
         )
@@ -9738,14 +10028,15 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            "candidate_sha": "cafe5678" * 5,
+            "candidate_sha": "dead1234" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
             "started_at": "2026-05-19T00:00:00",
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": None,
             "prior_infra_streak": 0,
-            "audit_provision_respawn_count": _MAX_AUDIT_PROVISION_RESPAWNS,
+            # At the cap — next failure must route to infra_failure.
+            "audit_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
         }
         db_session.add(version)
         await db_session.commit()
@@ -9755,195 +10046,12 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
 
         assert result["status"] == "infra_failure"
-        assert result["error"] == "audit_provision_respawn_cap_exceeded"
+        assert result["error"] == "audit_infra_respawn_cap_exceeded"
 
         await db_session.refresh(version)
         assert version.phase == "stabilize"
         assert version.last_qualification["status"] == "infra_failure"
-        assert (
-            version.last_qualification["error"]
-            == "audit_provision_respawn_cap_exceeded"
-        )
-
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
-
-    @pytest.mark.asyncio
-    async def test_challenge_provision_failure_respawns_new_task(
-        self, db_session
-    ):
-        """FAILED challenge classified as transient infra respawns instead of
-        falling through to infra_failure."""
-        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
-
-        project, version = await _make_project_and_version(db_session)
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs={
-                "audit_score": 1.0,
-                "test_erosion": {"deleted_test_files": []},
-            },
-            smoke_logs={
-                "passed": True,
-                "tests": [{"name": "startup", "status": "pass"}],
-                "suites": {"startup": {"passed": True}},
-            },
-        )
-        challenge_task = Task(
-            project_id=project.id,
-            title="audit-challenge",
-            payloads=[
-                {
-                    "type": "release_audit_challenge",
-                    "base_branch": "main",
-                    "diff_range": "main...feedfeed",
-                    "candidate_sha": version.last_qualification["candidate_sha"],
-                }
-            ],
-            vm_instance_id="vm-challenge-provision",
-            status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(challenge_task)
-        await db_session.commit()
-        await db_session.refresh(challenge_task)
-
-        persist_failure_category(challenge_task, PROVISION_FAILURE)
-        db_session.add(challenge_task)
-        await db_session.commit()
-        await db_session.refresh(challenge_task)
-
-        version.last_qualification = {
-            **version.last_qualification,
-            "challenge_task_id": str(challenge_task.id),
-            "audit_challenge_task_id": str(challenge_task.id),
-            "audit_challenge_provision_respawn_count": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "audit_challenge_provision_respawned"
-        assert result["respawn_count"] == 1
-        assert result["challenge_task_id"] != str(challenge_task.id)
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["audit_challenge_provision_respawn_count"] == 1
-        assert new_qual["challenge_task_id"] != str(challenge_task.id)
-
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
-
-        infra_msg_count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.context["event_type"].as_string()
-                    == "release_infra_failure",
-                )
-            )
-        ).scalar()
-        assert infra_msg_count == 0
-
-    @pytest.mark.asyncio
-    async def test_challenge_provision_failure_cap_exceeded_routes_to_infra_failure(
-        self, db_session
-    ):
-        """At the cap, a transient challenge infra failure falls through to infra_failure."""
-        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
-        from app.release_qualifier import (
-            _MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS,
-        )
-
-        project, version = await _make_project_and_version(db_session)
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs={
-                "audit_score": 1.0,
-                "test_erosion": {"deleted_test_files": []},
-            },
-            smoke_logs={
-                "passed": True,
-                "tests": [{"name": "startup", "status": "pass"}],
-                "suites": {"startup": {"passed": True}},
-            },
-        )
-        challenge_task = Task(
-            project_id=project.id,
-            title="audit-challenge",
-            payloads=[
-                {
-                    "type": "release_audit_challenge",
-                    "base_branch": "main",
-                    "diff_range": "main...faceface",
-                    "candidate_sha": version.last_qualification["candidate_sha"],
-                }
-            ],
-            vm_instance_id="vm-challenge-provision-cap",
-            status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(challenge_task)
-        await db_session.commit()
-        await db_session.refresh(challenge_task)
-
-        persist_failure_category(challenge_task, PROVISION_FAILURE)
-        db_session.add(challenge_task)
-        await db_session.commit()
-        await db_session.refresh(challenge_task)
-
-        version.last_qualification = {
-            **version.last_qualification,
-            "challenge_task_id": str(challenge_task.id),
-            "audit_challenge_task_id": str(challenge_task.id),
-            "audit_challenge_provision_respawn_count": _MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "audit_challenge_provision_respawn_cap_exceeded"
-
-        await db_session.refresh(version)
-        assert version.phase == "stabilize"
-        assert version.last_qualification["status"] == "infra_failure"
-        assert (
-            version.last_qualification["error"]
-            == "audit_challenge_provision_respawn_cap_exceeded"
-        )
-
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        assert version.last_qualification["error"] == "audit_infra_respawn_cap_exceeded"
 
     # -----------------------------------------------------------------------
     # Malformed audit artifact shapes — each must produce either a real verdict
@@ -10212,6 +10320,7 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
         from app.failure_classification import persist_failure_category
         from app.reaper import _heartbeat_stale_cutoff
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
         from app.time_utils import _utcnow
 
         project, version = await _make_project_and_version(
@@ -10260,6 +10369,9 @@ class TestReaperInducedAuditHeartbeatTimeout:
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": None,
             "prior_infra_streak": 0,
+            # At the respawn cap so the AGENT_TIMEOUT routes to infra_failure
+            # rather than re-spawning (same-candidate respawn hardening).
+            "audit_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
         }
         db_session.add(version)
         await db_session.commit()
@@ -10298,15 +10410,10 @@ class TestReaperInducedAuditHeartbeatTimeout:
         assert version.status == "open"
         assert version.phase == "stabilize"
 
-        # (d) Error label carries the heartbeat_timeout enrichment from
-        #     agent_failure_category_raw — distinguishes VM heartbeat death
-        #     from code-defect failures in operator notifications.
-        assert "audit_task_failed" in result["error"], (
-            f"expected 'audit_task_failed' prefix, got {result['error']!r}"
-        )
-        assert "heartbeat_timeout" in result["error"], (
-            f"expected 'heartbeat_timeout' enrichment in error label, "
-            f"got {result['error']!r}"
+        # (d) Error label reflects cap-exceeded path — respawn budget exhausted
+        #     before routing to infra_failure.
+        assert result["error"] == "audit_infra_respawn_cap_exceeded", (
+            f"expected 'audit_infra_respawn_cap_exceeded', got {result['error']!r}"
         )
 
         # (e) consecutive_infra_errors is incremented (0 prior → 1).
@@ -11599,8 +11706,6 @@ async def test_resolved_qualification_triggers_strategic_review(
     [
         {"status": "pending_auto_merge"},  # promotion still in flight
         {"status": "audit_rate_limit_respawned", "respawn_count": 1},  # transient
-        {"status": "audit_provision_respawned", "respawn_count": 1},  # transient
-        {"status": "audit_challenge_provision_respawned", "respawn_count": 1},  # transient
         {"status": "wrong_phase"},  # no-op
         None,  # read-only no-op finalize
     ],

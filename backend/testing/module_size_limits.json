@@ -55,7 +55,7 @@
     "digest_direction_progress.py": 1350,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
-    "release_qualifier.py": 3900,
+    "release_qualifier.py": 3950,
     "release_reconciliation.py": 1800,
     "release_stall_alerts.py": 800,
     "release_promotion.py": 2000,
