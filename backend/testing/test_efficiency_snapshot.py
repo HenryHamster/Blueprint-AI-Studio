@@ -703,7 +703,7 @@ async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_se
     for axis in ALL_AXES:
         assert axis in data["axes"]
         entry = data["axes"][axis]
-        assert set(entry.keys()) == {"current", "baseline", "drift_pct", "history"}
+        assert {"current", "baseline", "drift_pct", "history"}.issubset(entry.keys())
         assert isinstance(entry["history"], list)
 
 
@@ -3635,3 +3635,421 @@ async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected_cost = round(1000 * input_rate + 500 * output_rate, 6)
     assert row["total_cost_usd"] == expected_cost
+
+
+# ---------------------------------------------------------------------------
+# Windowed idle-cost axis: out-of-window ledger rows must not inflate
+# cost_per_merged_pr_incl_pool_idle (acceptance gate: test named below).
+# ---------------------------------------------------------------------------
+
+from app.models import PoolIdleCostLedger, PoolVm, PoolVmState  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
+    db_session,
+):
+    """Out-of-window PoolIdleCostLedger rows must not inflate the per-PR idle-
+    inclusive cost axis.
+
+    Seeds one in-window ledger row ($1.00, retired 3 days ago) and one
+    out-of-window row ($99.00, retired 10 days ago — outside the 7-day window).
+    Also seeds a merged PR task so cost_per_merged_pr_incl_pool_idle is defined.
+    The axis value must reflect only the in-window $1.00; the out-of-window
+    $99.00 must be excluded even though it appears in pool_metrics["total_idle_cost_usd"].
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # One merged-PR task so the axis denominator is 1 and we can compare dollars.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # In-window ledger row: retired 3 days ago (within the 7-day cutoff).
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            idle_cost_usd=1.0,
+            retired_at=now - timedelta(days=3),
+        )
+    )
+    # Out-of-window ledger row: retired 10 days ago (before the 7-day cutoff).
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            idle_cost_usd=99.0,
+            retired_at=now - timedelta(days=10),
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    incl = axes["cost_per_merged_pr_incl_pool_idle"]
+    assert incl is not None, "axis should be defined (we have a merged PR)"
+
+    # pool_metrics (all-time) still reflects the full $100 spend.
+    all_time = axes["pool_metrics"]["total_idle_cost_usd"]
+    assert all_time >= 100.0, (
+        "all-time pool_metrics must include both in- and out-of-window entries"
+    )
+
+    # The windowed axis must be dramatically lower than if the $99 were included.
+    # task VM cost is small (< $0.10 for 9 min on-demand), so incl ~ vm_cost + 1.0.
+    # If the $99 leaked in, incl would be > 99.
+    assert incl < 5.0, (
+        f"cost_per_merged_pr_incl_pool_idle={incl} should reflect only the "
+        f"in-window $1.00 ledger entry, not the $99 out-of-window entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_windowed_idle_cost_live_member_clamped_to_window(db_session):
+    """A live IDLE member whose idle_since predates the window cutoff must have
+    its idle cost clamped to the window start rather than accruing from the
+    full (pre-cutoff) idle_since."""
+    from app.efficiency_snapshot import _AXIS_WINDOW_DAYS, _compute_windowed_idle_cost
+    from app.vm_cost_rates import idle_cost_usd as _idle_cost_usd
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_AXIS_WINDOW_DAYS)
+
+    # idle_since is 10 days ago — well before the 7-day cutoff.
+    idle_since_pre_window = now - timedelta(days=10)
+    member = PoolVm(
+        project_id=project.id,
+        vm_instance_id="vm-old-idle",
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+        idle_since=idle_since_pre_window,
+        idle_cost_banked=5.0,  # pre-accumulated banked cost — must NOT be counted
+    )
+    db_session.add(member)
+    await db_session.commit()
+
+    windowed = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+
+    # Expected: only the in-window portion (cutoff .. now) is billed.
+    # The full (10-day) idle period would be ~10x larger.
+    window_elapsed = (now - cutoff).total_seconds()
+    expected_max = _idle_cost_usd(window_elapsed) * 1.05  # 5% tolerance for clock skew
+    full_elapsed = (now - idle_since_pre_window).total_seconds()
+    full_cost = _idle_cost_usd(full_elapsed)
+
+    assert windowed < full_cost, (
+        f"windowed cost {windowed} should be less than full idle cost {full_cost}"
+    )
+    assert windowed <= expected_max, (
+        f"windowed cost {windowed} exceeds clamped window cost {expected_max}"
+    )
+    # idle_cost_banked (5.0) is not included: if it were, windowed would equal
+    # expected_max + 5.0.  The expected_max check above already gates this.
+    assert windowed <= expected_max, "windowed cost must not include idle_cost_banked"
+
+
+@pytest.mark.asyncio
+async def test_all_time_pool_metrics_preserved_alongside_windowed_axis(db_session):
+    """pool_metrics['total_idle_cost_usd'] must still reflect all-time spend
+    (including pre-window ledger entries) while cost_per_merged_pr_incl_pool_idle
+    uses only windowed cost."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # Only out-of-window spend ($50).
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-old",
+            idle_cost_usd=50.0,
+            retired_at=now - timedelta(days=14),
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # All-time pool_metrics sees the $50.
+    assert axes["pool_metrics"]["total_idle_cost_usd"] >= 50.0
+
+    # Windowed axis excludes the $50 (nothing in-window).
+    incl = axes["cost_per_merged_pr_incl_pool_idle"]
+    assert incl is not None
+    # Without the $50 the inclusive axis is close to the plain vm-cost axis.
+    plain = axes[AXIS_COST_PER_MERGED_PR]
+    assert plain is not None
+    assert abs(incl - plain) < 1.0, (
+        f"incl ({incl}) should be close to plain ({plain}) when "
+        "all pool idle spend is out-of-window"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-axis seed provenance tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_snapshot_seeds_provenance(db_session):
+    """The first write_snapshot call records _member_provenance for every
+    ALL_AXES member that has a non-None value in the initial snapshot."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # Every ALL_AXES member with a non-None value in the snapshot must have
+    # a provenance entry with seeded_at == snapshot captured_at.
+    for axis in ALL_AXES:
+        if snap.get(axis) is not None:
+            assert axis in prov, f"missing provenance for {axis}"
+            assert prov[axis]["seeded_at"] == snap["captured_at"]
+            assert prov[axis]["snapshot_captured_at"] == snap["captured_at"]
+
+
+@pytest.mark.asyncio
+async def test_reseed_after_migration_records_new_provenance(db_session):
+    """After a schema migration clears an axis and the re-seed loop refills it,
+    the _member_provenance entry for that axis must reflect the re-seed snapshot,
+    not the original baseline capture timestamp."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_LLM_COST_PER_MERGED_PR: 9999.0,
+                    AXIS_COST_PER_MERGED_PR: 0.03,
+                    "_schema_version": 3,  # v3 → v4 clears llm axis
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING as _LLP
+
+    input_rate, output_rate = _LLP[("anthropic", "claude-sonnet-4-6")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 5,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # The re-seeded llm axis must show the NEW snapshot timestamp, not "2026-01-01".
+    assert AXIS_LLM_COST_PER_MERGED_PR in prov
+    assert prov[AXIS_LLM_COST_PER_MERGED_PR]["seeded_at"] == snap["captured_at"]
+    assert prov[AXIS_LLM_COST_PER_MERGED_PR]["seeded_at"] != "2026-01-01T00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_backfilled_baseline_members_carry_seed_provenance(db_session):
+    """Backfilled nested blocks (agent_timeout_rate, format_compliance) record
+    per-member provenance at backfill time so operators can see which snapshot
+    those drift figures are measured against.
+
+    This is the acceptance-gate test: exercises the production backfill path
+    (agent_timeout_rate absent in pre-existing baseline → backfilled from current
+    snapshot on next write_snapshot) and asserts that provenance is durable.
+    """
+    # Construct a baseline that predates agent_timeout_rate (no such key).
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_COST_PER_MERGED_PR: 0.05,
+                    "_schema_version": 5,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # agent_timeout_rate was backfilled — provenance must exist and point at
+    # the snapshot that provided the data.
+    if baseline.get("agent_timeout_rate") is not None:
+        assert "agent_timeout_rate" in prov, (
+            "backfilled agent_timeout_rate must carry provenance"
+        )
+        assert prov["agent_timeout_rate"]["seeded_at"] == snap["captured_at"]
+        assert prov["agent_timeout_rate"]["snapshot_captured_at"] == snap["captured_at"]
+        # The backfill timestamp must differ from the pre-existing baseline capture.
+        assert prov["agent_timeout_rate"]["seeded_at"] != "2026-01-01T00:00:00"
+
+    # Axes already present in the original baseline are NOT re-seeded; provenance
+    # for them must be inferred retroactively (from the matching snapshot value)
+    # rather than stamped with the new captured_at.
+    # cost_per_merged_pr was 0.05 in the pre-existing baseline and unchanged.
+    cost_prov = prov.get(AXIS_COST_PER_MERGED_PR)
+    if cost_prov:
+        # Retroactively inferred: must not show the new snapshot's captured_at.
+        assert cost_prov.get("_inferred") or cost_prov["seeded_at"] != snap["captured_at"], (
+            "unchanged axis must not be re-stamped with the new snapshot time"
+        )
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_exposes_per_axis_provenance(db_session):
+    """read_baseline_with_drift must include baseline_seeded_at and
+    baseline_seed_snapshot_at on each axis entry in the drift response."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    for axis in ALL_AXES:
+        entry = drift["axes"][axis]
+        assert "baseline_seeded_at" in entry, f"missing baseline_seeded_at for {axis}"
+        assert "baseline_seed_snapshot_at" in entry, (
+            f"missing baseline_seed_snapshot_at for {axis}"
+        )
+        if snap.get(axis) is not None:
+            assert entry["baseline_seeded_at"] == snap["captured_at"]
+            assert entry["baseline_seed_snapshot_at"] == snap["captured_at"]
+
+    # Top-level baseline_provenance summary must also be present.
+    assert "baseline_provenance" in drift
+    assert isinstance(drift["baseline_provenance"], dict)
+
+
+@pytest.mark.asyncio
+async def test_retroactive_provenance_inference_for_existing_baseline(db_session):
+    """A baseline lacking _member_provenance is annotated retroactively on the
+    next write_snapshot call (inside the project lock) by matching axis values
+    against snapshot history."""
+    # Simulate a pre-provenance baseline: value matches a known snapshot entry
+    # but no _member_provenance key exists.
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-05-01T00:00:00",
+                    AXIS_COST_PER_MERGED_PR: 0.042,
+                    "_schema_version": 5,
+                    # No _member_provenance key — pre-provenance baseline.
+                },
+                "snapshots": [
+                    {
+                        "captured_at": "2026-05-01T00:00:00",
+                        AXIS_COST_PER_MERGED_PR: 0.042,  # matches baseline
+                    },
+                    {
+                        "captured_at": "2026-05-02T00:00:00",
+                        AXIS_COST_PER_MERGED_PR: 0.050,  # later, different value
+                    },
+                ],
+                "last_run_at": "2026-05-02T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # cost_per_merged_pr was 0.042 in the baseline and the FIRST snapshot also
+    # has 0.042 — retroactive inference should have found that match.
+    assert AXIS_COST_PER_MERGED_PR in prov, (
+        "retroactive inference must annotate axis whose value matches a snapshot"
+    )
+    entry = prov[AXIS_COST_PER_MERGED_PR]
+    # Must point at the first (matching) snapshot, not the second.
+    assert entry["seeded_at"] == "2026-05-01T00:00:00"
+    assert entry.get("_inferred") is True

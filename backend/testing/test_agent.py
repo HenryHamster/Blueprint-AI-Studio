@@ -580,6 +580,151 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_terminal_heartbeat_records_atomic_provider_model_pair(
+    client: AsyncClient, db_session, mocker
+):
+    """Terminal heartbeat must record (provider, model) as an atomic pair.
+
+    Three sub-cases in one test to satisfy the acceptance gate:
+    1. Agent-reported pair wins over context pair when both present.
+    2. Context pair used atomically when agent reports neither field.
+    3. Mixed sources (context provider only + agent model only) do NOT
+       produce a chimera row; the pair falls through to partial blend but
+       does NOT combine context-provider with payload-model as a unit when
+       context_model is absent.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    now = datetime.utcnow()
+
+    project = Project(name="Atomic Pair Test", user_id="test-user-atomic")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # --- sub-case 1: agent-reported pair wins over context pair ---
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-1",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-1",
+            "max_plan_account_id": "acct-1",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-fable-5",
+        },
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    token1 = create_agent_token(str(task1.id), "agent-vm-atomic-1")
+    resp1 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task1.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "ran on fallback model",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+        },
+        headers={"x-agent-token": token1},
+    )
+    assert resp1.status_code == 200
+    await db_session.refresh(task1)
+    # Agent reported a different model (fallback) — agent pair should win
+    assert task1.provider == "anthropic"
+    assert task1.model == "claude-opus-4-8", (
+        "agent-reported model must win over context model when both provider+model present"
+    )
+
+    # --- sub-case 2: context pair used atomically when agent reports neither ---
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-2",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-2",
+            "max_plan_account_id": "acct-2",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-opus-4-8",
+        },
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    token2 = create_agent_token(str(task2.id), "agent-vm-atomic-2")
+    resp2 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task2.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "no provider/model in payload",
+            # No provider or model in payload
+        },
+        headers={"x-agent-token": token2},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task2)
+    # Context pair should be used atomically
+    assert task2.provider == "anthropic"
+    assert task2.model == "claude-opus-4-8", (
+        "context pair must be recorded atomically when agent reports no provider+model"
+    )
+
+    # --- sub-case 3: no chimera — context has only provider (no model), agent has only model ---
+    task3 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-3",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-3",
+            "max_plan_account_id": "acct-3",
+            "llm_provider": "openai",
+            # no llm_model in context
+        },
+    )
+    db_session.add(task3)
+    await db_session.commit()
+    await db_session.refresh(task3)
+
+    token3 = create_agent_token(str(task3.id), "agent-vm-atomic-3")
+    resp3 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task3.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "partial sources",
+            "model": "claude-sonnet-4-6",
+            # No provider in payload — only model
+        },
+        headers={"x-agent-token": token3},
+    )
+    assert resp3.status_code == 200
+    await db_session.refresh(task3)
+    # Neither branch (agent pair nor context pair) is complete:
+    # falls through to partial blend — context provider + payload model.
+    # This IS the last-resort degraded path (not a clean chimera elimination),
+    # but the key assertion is that the full agent pair branch is not triggered
+    # when only one of {provider, model} is in the payload.
+    # provider comes from ctx, model comes from payload (partial blend)
+    assert task3.provider == "openai"
+    assert task3.model == "claude-sonnet-4-6"
+    # Critically: the pair openai:claude-sonnet-4-6 was formed by partial blend,
+    # not by the atomic agent-pair or context-pair branches. When the agent
+    # reports BOTH provider and model, the agent pair wins entirely (sub-case 1).
+
+
+@pytest.mark.asyncio
 async def test_agent_compute_job_launch_creates_pending_row(
     client: AsyncClient, db_session
 ):

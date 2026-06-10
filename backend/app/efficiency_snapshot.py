@@ -451,6 +451,53 @@ async def compute_pool_idle_cost(
     }
 
 
+async def _compute_windowed_idle_cost(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    cutoff: datetime,
+) -> float:
+    """Sum pool idle cost scoped to the same window as the efficiency axes.
+
+    Ledger rows (retired members): sum ``idle_cost_usd`` where ``retired_at >=
+    cutoff`` — spend from members that were fully reaped before the window
+    started is excluded.
+
+    Live IDLE members: accrue ``(now - max(idle_since, cutoff))`` seconds so
+    only the portion of idle time that falls inside the window is counted.
+    ``idle_cost_banked`` aggregates past idle periods without per-period
+    timestamps, so it is intentionally excluded; only the current in-progress
+    idle period (idle_since .. now) contributes, clamped to the cutoff.
+    """
+    now = _utcnow()
+
+    # Retired members: only ledger rows whose retirement falls within the window.
+    ledger_stmt = select(
+        func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
+    ).where(
+        PoolIdleCostLedger.project_id == project_id,
+        PoolIdleCostLedger.retired_at >= cutoff,
+    )
+    windowed_retired = float(
+        (await session.execute(ledger_stmt)).scalar() or 0.0
+    )
+
+    # Live IDLE members: current idle period clamped to the window start.
+    member_stmt = select(PoolVm).where(
+        PoolVm.project_id == project_id,
+        PoolVm.state == PoolVmState.IDLE,
+        PoolVm.idle_since.isnot(None),
+    )
+    members = list((await session.execute(member_stmt)).scalars().all())
+    windowed_live = 0.0
+    for m in members:
+        effective_start = max(m.idle_since, cutoff)  # type: ignore[arg-type]
+        elapsed = (now - effective_start).total_seconds()
+        if elapsed > 0:
+            windowed_live += idle_cost_usd(elapsed)
+
+    return round(windowed_retired + windowed_live, 6)
+
+
 def compute_pool_cost_amortization(
     idle_cost_usd: float, funnel: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -1937,9 +1984,17 @@ async def compute_current_axes(
     # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
     # axis look better while real spend rises. Kept SEPARATE from the immutable
     # AXIS_COST_PER_MERGED_PR baseline (drift comparisons stay apples-to-apples).
+    #
+    # Use a windowed idle cost (same 7-day window as the task-cost numerator and
+    # merged-PR denominator) so the all-time monotonically-growing idle accumulator
+    # cannot ratchet the axis upward independently of current pool behavior.
+    # pool_metrics["total_idle_cost_usd"] is preserved in the snapshot payload as
+    # the durable all-time spend figure ("teardown never erases measured spend").
+    axis_cutoff = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
+    windowed_idle = await _compute_windowed_idle_cost(session, project_id, axis_cutoff)
     total_vm_cost, merged = _cost_and_merges(tasks)
     cost_incl_pool_idle: float | None = (
-        round((total_vm_cost + pool_metrics["total_idle_cost_usd"]) / merged, 4)
+        round((total_vm_cost + windowed_idle) / merged, 4)
         if merged
         else None
     )
@@ -2024,8 +2079,51 @@ async def write_snapshot(
 
         if not container.get("baseline"):
             container["baseline"] = dict(snapshot)
+            # Record per-member provenance for the initial seed so every
+            # member carries a durable "seeded from which snapshot" annotation.
+            _prov: Dict[str, Any] = {}
+            for _axis in ALL_AXES:
+                if snapshot.get(_axis) is not None:
+                    _prov[_axis] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
+            for _key in ("agent_timeout_rate", FORMAT_COMPLIANCE_KEY):
+                if snapshot.get(_key) is not None:
+                    _prov[_key] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
+            container["baseline"]["_member_provenance"] = _prov
         else:
             baseline = dict(container["baseline"])
+            # Per-member provenance: records when each baseline member was seeded
+            # (or re-seeded after a migration) and from which snapshot's data it
+            # came.  Missing on pre-provenance baselines — see retroactive
+            # inference below.
+            provenance: Dict[str, Any] = dict(
+                baseline.get("_member_provenance") or {}
+            )
+            # Retroactive annotation: if provenance is empty and snapshots already
+            # exist, scan the snapshot history to find the earliest snapshot whose
+            # value matches each current baseline member.  This annotates patchwork
+            # baselines (where individual members were re-seeded after the original
+            # capture date) without a separate migration.  Runs once; subsequent
+            # calls find provenance already populated and skip this block.
+            existing_snapshots = list(container.get("snapshots") or [])
+            if not provenance and existing_snapshots:
+                for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+                    _bval = baseline.get(_member)
+                    if _bval is None:
+                        continue
+                    for _snap in existing_snapshots:
+                        if _snap.get(_member) == _bval:
+                            provenance[_member] = {
+                                "seeded_at": _snap.get("captured_at"),
+                                "snapshot_captured_at": _snap.get("captured_at"),
+                                "_inferred": True,
+                            }
+                            break
             # One-time migration: baselines captured before the heartbeat-beacon fix
             # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
             # beacon rather than true dispatch-to-claim latency. Clear it so the
@@ -2066,6 +2164,10 @@ async def write_snapshot(
             for axis in ALL_AXES:
                 if baseline.get(axis) is None and snapshot.get(axis) is not None:
                     baseline[axis] = snapshot[axis]
+                    provenance[axis] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
             # agent_timeout_rate is a nested block, not a member of ALL_AXES, so
             # the re-seed loop above never reaches it. Backfill it for baselines
             # that predate this measure (the live, daily-snapshotted Blueprint
@@ -2076,11 +2178,20 @@ async def write_snapshot(
                 and snapshot.get("agent_timeout_rate") is not None
             ):
                 baseline["agent_timeout_rate"] = snapshot["agent_timeout_rate"]
+                provenance["agent_timeout_rate"] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
             if (
                 baseline.get(FORMAT_COMPLIANCE_KEY) is None
                 and snapshot.get(FORMAT_COMPLIANCE_KEY) is not None
             ):
                 baseline[FORMAT_COMPLIANCE_KEY] = snapshot[FORMAT_COMPLIANCE_KEY]
+                provenance[FORMAT_COMPLIANCE_KEY] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            baseline["_member_provenance"] = provenance
             container["baseline"] = baseline
 
         snapshots = list(container.get("snapshots") or [])
@@ -2190,6 +2301,25 @@ async def read_baseline_with_drift(
         if snap.get("pool_dispatch_funnel")
     ]
 
+    # Per-member provenance: records when each baseline member was seeded and
+    # from which snapshot's window its value came.  For baselines that predate
+    # provenance recording, infer retroactively on the read path (not persisted
+    # here — the next write_snapshot will persist it inside the lock).
+    member_provenance: Dict[str, Any] = dict(baseline.get("_member_provenance") or {})
+    if not member_provenance and snapshots:
+        for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+            _bval = baseline.get(_member)
+            if _bval is None:
+                continue
+            for _snap in snapshots:
+                if _snap.get(_member) == _bval:
+                    member_provenance[_member] = {
+                        "seeded_at": _snap.get("captured_at"),
+                        "snapshot_captured_at": _snap.get("captured_at"),
+                        "_inferred": True,
+                    }
+                    break
+
     axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
         cur = latest.get(axis)
@@ -2209,11 +2339,14 @@ async def read_baseline_with_drift(
             {"captured_at": snap.get("captured_at"), "value": snap.get(axis)}
             for snap in snapshots
         ]
+        _aprov = member_provenance.get(axis) or {}
         axes[axis] = {
             "current": cur,
             "baseline": base,
             "drift_pct": drift_pct,
             "history": history,
+            "baseline_seeded_at": _aprov.get("seeded_at"),
+            "baseline_seed_snapshot_at": _aprov.get("snapshot_captured_at"),
         }
 
     # Idle-inclusive cost-per-merged-PR as a companion trended axis. The
@@ -2347,6 +2480,14 @@ async def read_baseline_with_drift(
         "axes": axes,
         "agent_timeout_rate": agent_timeout_rate,
         FORMAT_COMPLIANCE_KEY: format_compliance,
+        # Per-member seed provenance: keyed by member name (ALL_AXES + nested
+        # blocks), each value carries seeded_at / snapshot_captured_at so every
+        # consumer can see which reference date each drift figure is measured from.
+        "baseline_provenance": {
+            k: v
+            for k, v in member_provenance.items()
+            if not str(k).startswith("_")
+        },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),

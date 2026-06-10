@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, PoolVmState, Task, TaskStatus
+from app.models import PoolIdleCostLedger, Project, PoolVmState, Task, TaskStatus
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
@@ -1029,8 +1029,9 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
     """A pool-origin warm start moves the efficiency axes: vm_reuse_rate rises to
     1.0 (the COMPLETED task's ``_timing.warm_start`` participates as a warm VM),
     and ``cost_per_merged_pr_incl_pool_idle`` strictly exceeds the pool-exclusive
-    ``cost_per_merged_pr`` because the member's banked idle spend is folded into
-    the net-cost numerator. This is the enablement-confidence assertion cluster 1
+    ``cost_per_merged_pr`` because in-window pool idle spend (a ledger row whose
+    ``retired_at`` falls inside the 7-day axis window) is folded into the
+    net-cost numerator. This is the enablement-confidence assertion cluster 1
     did not make: the measured lift is genuinely pool-origin AND the idle cost is
     accounted, not hidden."""
     from app.warm_pool import register_pool_vm
@@ -1043,8 +1044,11 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         await db_session.refresh(project)
 
         # A pool member carrying banked idle spend (the IDLE->LEASED settle banked
-        # it in production; we set it directly to keep the cost delta deterministic
-        # and idle_since=None so no live accrual perturbs the exact comparison).
+        # it in production; we set it directly and idle_since=None so no live
+        # accrual perturbs the exact comparison). The windowed axis intentionally
+        # excludes timestampless ``idle_cost_banked``, so this member only feeds
+        # the all-time ``pool_idle_cost_usd`` metric — the axis delta below comes
+        # from the deterministic in-window ledger row instead.
         member = await register_pool_vm(
             db_session,
             vm_instance_id=f"agent-vm-axis-{uuid.uuid4().hex}",
@@ -1057,6 +1061,19 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         member.idle_since = None
         member.idle_cost_banked = 0.02
         db_session.add(member)
+
+        # In-window idle spend: a retired member's ledger row whose retired_at
+        # falls inside the 7-day axis window. _compute_windowed_idle_cost sums
+        # exactly these rows into the pool-inclusive numerator, keeping the
+        # cost delta deterministic (no clock-dependent live accrual).
+        db_session.add(
+            PoolIdleCostLedger(
+                project_id=project.id,
+                vm_instance_id="agent-vm-axis-retired",
+                idle_cost_usd=0.02,
+                retired_at=datetime.utcnow() - timedelta(days=1),
+            )
+        )
 
         # A COMPLETED, merged task that was served WARM by the pool: it has a
         # provisioned->stopped VM interval (so cost_per_merged_pr is computable),
@@ -1088,7 +1105,7 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         assert axes[AXIS_VM_REUSE_RATE] == 1.0
 
         # Pool-inclusive cost strictly exceeds pool-exclusive cost: the $0.02 of
-        # banked idle spend is folded into the net numerator (0.12 vs 0.10).
+        # in-window ledger idle spend is folded into the net numerator.
         cost_excl = axes["cost_per_merged_pr"]
         cost_incl = axes["cost_per_merged_pr_incl_pool_idle"]
         assert cost_excl is not None and cost_incl is not None

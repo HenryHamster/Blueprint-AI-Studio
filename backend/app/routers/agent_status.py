@@ -2217,9 +2217,20 @@ async def update_agent_status(
             await session.flush()
 
         # Persist runtime LLM telemetry on Task for durable analytics.
+        # Resolve (provider, model) as an atomic pair to prevent chimera rows
+        # (e.g. openai:claude-opus-4-8) where sources are blended per-field.
+        # Priority: agent-reported pair (what actually ran, including CLI fallbacks)
+        # > dispatch-time context pair > partial blend as last-resort degradation.
         _ctx_terminal = dict(task.context or {})
-        _provider = _ctx_terminal.get("llm_provider") or payload.provider
-        _model = _ctx_terminal.get("llm_model") or payload.model
+        _ctx_provider = _ctx_terminal.get("llm_provider")
+        _ctx_model = _ctx_terminal.get("llm_model")
+        if payload.provider and payload.model:
+            _provider, _model = payload.provider, payload.model
+        elif _ctx_provider and _ctx_model:
+            _provider, _model = _ctx_provider, _ctx_model
+        else:
+            _provider = _ctx_provider or payload.provider
+            _model = _ctx_model or payload.model
         task.provider = str(_provider) if _provider else None
         task.account_id = str(acct_id) if acct_id else None
         task.model = str(_model) if _model else None
