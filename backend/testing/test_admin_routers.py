@@ -28,6 +28,8 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectStatus,
+    PoolVm,
+    PoolVmState,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -8130,6 +8132,131 @@ class TestClearDeployFailed:
 
         await db_session.refresh(version)
         assert version.serving_status == "deploy_failed"
+
+
+class TestAgentServingShas:
+    """GET /agent-serving-shas exposes read-only agent image provenance."""
+
+    @pytest.mark.asyncio
+    async def test_viewer_can_read_agent_serving_shas_with_drift_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving SHAs")
+        project.github_owner = "owner"
+        project.github_repo = "repo"
+        db_session.add(project)
+
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            status="open",
+            last_qualification={"candidate_sha": "b" * 40},
+        )
+        served_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="promoted",
+            served_sha="a" * 40,
+            served_at=datetime.now(timezone.utc),
+        )
+        member = PoolVm(
+            vm_instance_id="agent-vm-serving-sha",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            agent_source_sha="a" * 40,
+            agent_image_name="agent-image-a",
+            agent_image_build_ts=1781049600,
+        )
+        db_session.add(open_version)
+        db_session.add(served_version)
+        db_session.add(member)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="token",
+            ),
+            patch(
+                "app.github_refs.get_branch_sha",
+                new_callable=AsyncMock,
+                side_effect=["c" * 40, "d" * 40],
+            ),
+            patch(
+                "app.compute.get_current_agent_image",
+                return_value={
+                    "image_name": "agent-image-a",
+                    "source_git_sha": "a" * 40,
+                    "build_ts": 1781049600,
+                },
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/agent-serving-shas"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["backend_served_sha"] == "a" * 40
+        assert data["active_candidate_sha"] == "b" * 40
+        assert data["integration_head_sha"] == "c" * 40
+        assert data["promotion_head_sha"] == "d" * 40
+        assert data["current_image"]["source_git_sha"] == "a" * 40
+        bucket = data["fleet"]["buckets"][0]
+        assert bucket["source_sha"] == "a" * 40
+        assert bucket["matches_backend_served"] is True
+        assert bucket["matches_current_image"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_serving_shas_degrades_when_external_context_unavailable(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving Graceful")
+        member = PoolVm(
+            vm_instance_id="agent-vm-serving-unknown",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        with patch("app.compute.get_current_agent_image", return_value=None):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/agent-serving-shas"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["current_image"] is None
+        assert data["integration_head_sha"] is None
+        assert data["fleet"]["unknown_count"] == 1
+        assert data["fleet"]["buckets"][0]["source_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_agent_serving_shas_requires_project_access(
+        self, override_get_session, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving Private")
+
+        async def other_user():
+            return {
+                "user_id": "not-a-member",
+                "email": "other@example.com",
+                "role": "user",
+            }
+
+        app.dependency_overrides[get_current_user] = other_user
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/projects/{project.id}/agent-serving-shas"
+                )
+            assert resp.status_code == 404
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
 
 
 class TestVersionLifecycleInfraFailureFields:

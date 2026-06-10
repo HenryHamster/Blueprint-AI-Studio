@@ -7496,7 +7496,7 @@ async def test_adversarial_gate_disabled_by_flag(db_session, mocker):
 async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     db_session, mocker
 ):
-    """A terminal failed sidecar must defer the finding and spawn nothing."""
+    """Failed sidecars retry once, then defer the finding without spawning work."""
     from app.research_completion import _finding_hash
     from app.schemas import AgentStatusPayload
     from app.task_lifecycle import _resolve_quality_grader_completion
@@ -7561,7 +7561,8 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     await _resolve_quality_grader_completion(grader, payload, db_session)
     await db_session.refresh(task)
 
-    # No implementation children — deferred, not spawned.
+    # First wholesale sidecar failure gets one bounded retry, but still no
+    # implementation children.
     children = (
         (
             await db_session.execute(
@@ -7573,11 +7574,53 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     )
     assert children == [], "adversarial-failed finding must not spawn"
 
-    # The failed finding must appear in deferred_findings (for the next cycle).
+    retry_graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id,
+                    _Task.id.notin_([task.id, grader.id]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(retry_graders) == 1
+    retry_grader = retry_graders[0]
+    assert (retry_grader.context or {}).get("adversarial_grader") is True
+    assert task.context.get("_adversarial_wholesale_retry_count") == 1
+    assert (task.context or {}).get("deferred_findings") in (None, [])
+
+    retry_grader.status = TaskStatus.FAILED
+    db_session.add(retry_grader)
+    await db_session.commit()
+    retry_payload = AgentStatusPayload(
+        task_id=retry_grader.id,
+        status=TaskStatus.FAILED,
+        logs=None,
+    )
+    await _resolve_quality_grader_completion(retry_grader, retry_payload, db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "retry-exhausted finding must not spawn"
+
+    # After the bounded retry is exhausted, the failed finding must appear in
+    # deferred_findings for the next cycle.
     deferred = (task.context or {}).get("deferred_findings", [])
     assert any(
         d.get("title") == hs["title"] for d in deferred
     ), "failed finding must be in deferred_findings"
+    assert task.context.get("research_spawn_gate_wholesale_retry_exhausted") is True
     # _adversarial_verdict must be stripped from the deferred entry.
     for d in deferred:
         assert "_adversarial_verdict" not in d, "_adversarial_verdict must be cleared on deferral"
@@ -7699,13 +7742,15 @@ async def test_adversarial_gate_defers_recovered_deferred_finding_on_fail_verdic
 
 
 @_pytest.mark.asyncio
-async def test_adversarial_gate_defers_missing_hash_without_child(db_session, mocker):
-    """Fail-closed (acceptance test): if grader output is missing a finding's hash,
-    that finding must NOT spawn and must be recorded as deferred with adversarial_gate reason."""
+async def test_adversarial_gate_wholesale_non_response_rechallenges_once(
+    db_session, mocker
+):
+    """A wholesale grader non-response parks the source and retries exactly once."""
     from app.research_completion import _finding_hash
     from test_autonomous_research import _patch_research_externals
 
-    _project, direction, task = await _grader_project_and_task(db_session, "d-adv05")
+    project, direction, task = await _grader_project_and_task(db_session, "d-adv05")
+    project.vision = {"_research_spawn_count": 7, "purpose": "keep-me"}
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._is_high_stakes_finding",
@@ -7715,17 +7760,20 @@ async def test_adversarial_gate_defers_missing_hash_without_child(db_session, mo
     hs = _high_stakes_finding(direction["id"], "Fail-closed missing-hash finding")
     fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
 
-    # Adversarial grader returned an empty verdict dict — hash absent → fail-closed.
+    # Adversarial grader returned no usable verdicts for a non-empty manifest:
+    # infrastructure failure, not a per-finding refutation.
     task.plan_output = [hs]
     task.status = TaskStatus.COMPLETED
     task.context = {
         **(task.context or {}),
         ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {},  # empty — absent hash must default to fail-closed
+            "finding_verdicts": {},
             "grader_task_id": "test-grader-002",
+            "parse_outcome": "no_hash_matches",
         },
         "_adversarial_challenged_hashes": [fhash],
     }
+    db_session.add(project)
     db_session.add(task)
     await db_session.commit()
 
@@ -7736,21 +7784,31 @@ async def test_adversarial_gate_defers_missing_hash_without_child(db_session, mo
 
     await _handle_research_completion(task, "", db_session)
     await db_session.refresh(task)
+    await db_session.refresh(project)
 
-    children = (
+    all_tasks = (
         (
             await db_session.execute(
-                _select(_Task).where(_Task.parent_task_id == task.id)
+                _select(_Task).where(_Task.project_id == task.project_id)
             )
         )
         .scalars()
         .all()
     )
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
     assert len(children) == 0, "absent hash in verdict → fail-closed → finding must NOT spawn"
-    deferred = (task.context or {}).get("deferred_findings", [])
-    assert any(d.get("title") == hs["title"] for d in deferred), (
-        "absent-hash finding must appear in deferred_findings under adversarial_gate"
-    )
+    assert len(graders) == 1
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_adversarial_grader") == str(graders[0].id)
+    assert task.context.get("_adversarial_wholesale_retry_count") == 1
+    assert task.context.get(ADVERSARIAL_GATE_VERDICT_KEY) is None
+    assert task.context.get("_adversarial_challenged_hashes") == [fhash]
+    assert task.context.get("research_spawn_gate_challenged_count") == 1
+    assert task.context.get("research_spawn_gate_unresolved_count") == 1
+    assert task.context.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
+    assert (task.context or {}).get("deferred_findings") in (None, [])
+    assert project.vision["_research_spawn_count"] == 7
 
 
 @_pytest.mark.asyncio
@@ -7859,7 +7917,7 @@ async def test_adversarial_gate_deferral_decays_or_escalates_after_threshold(
 
 @_pytest.mark.asyncio
 async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocker):
-    """Fail-closed: a hash absent from grader output must NOT produce a child task."""
+    """A second wholesale non-response exhausts the retry and fails closed."""
     from app.research_completion import _finding_hash
     from test_autonomous_research import _patch_research_externals
 
@@ -7881,8 +7939,10 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
         ADVERSARIAL_GATE_VERDICT_KEY: {
             "finding_verdicts": {},
             "grader_task_id": "test-grader-explicit-001",
+            "parse_outcome": "no_hash_matches",
         },
         "_adversarial_challenged_hashes": [fhash],
+        "_adversarial_wholesale_retry_count": 1,
     }
     db_session.add(task)
     await db_session.commit()
@@ -7907,9 +7967,150 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
     assert len(children) == 0, "fail-closed: absent hash must NOT produce a child task"
     # The unresolved finding must be deferred, not silently dropped.
     deferred = (task.context or {}).get("deferred_findings", [])
-    assert any(d.get("title") == hs["title"] for d in deferred), (
+    matching = [d for d in deferred if d.get("title") == hs["title"]]
+    assert matching, (
         "absent-hash finding must be deferred, not silently dropped"
     )
+    assert matching[0].get("adversarial_gate_reason") == "no_hash_matches"
+    assert task.context.get("research_spawn_gate_wholesale_retry_exhausted") is True
+    assert task.context.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_partial_verdict_defers_only_skipped_hash(
+    db_session, mocker
+):
+    """A valid partial verdict array is per-finding fail-closed, not wholesale."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-partial")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    passed = _high_stakes_finding(direction["id"], "Partial explicit pass")
+    skipped = _high_stakes_finding(direction["id"], "Partial skipped hash")
+    pass_hash = _finding_hash(
+        passed["title"], passed.get("description", "") or passed.get("prompt", "")
+    )
+    skipped_hash = _finding_hash(
+        skipped["title"], skipped.get("description", "") or skipped.get("prompt", "")
+    )
+    findings = [passed, skipped]
+    task.plan_output = findings
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                pass_hash: {"passed": True, "reason": "grounded", "explicit": True},
+                skipped_hash: {
+                    "passed": False,
+                    "reason": "fail-closed: no verdict returned for this finding",
+                    "explicit": False,
+                    "unresolved_reason": "no_hash_matches",
+                },
+            },
+            "grader_task_id": "test-grader-partial-001",
+            "parse_outcome": "ok",
+        },
+        "_adversarial_challenged_hashes": [pass_hash, skipped_hash],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert len(graders) == 0
+    assert len(children) == 1
+    assert children[0].title == passed["title"]
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert [d.get("title") for d in deferred if d.get("title") == skipped["title"]] == [
+        skipped["title"]
+    ]
+    assert task.context.get("_adversarial_wholesale_retry_count") is None
+    assert task.context.get("research_spawn_gate_unresolved_count") == 1
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_malformed_known_verdict_token_fails_closed(
+    db_session, mocker
+):
+    """Malformed known verdict tokens are per-entry failures, not wholesale retries."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-bad-token")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Malformed verdict token")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                fhash: {
+                    "passed": False,
+                    "reason": "fail-closed: no verdict returned for this finding",
+                    "explicit": False,
+                    "unresolved_reason": "verdict_unrecognized",
+                }
+            },
+            "grader_task_id": "test-grader-bad-token-001",
+            "parse_outcome": "ok",
+        },
+        "_adversarial_challenged_hashes": [fhash],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[hs])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [t for t in all_tasks if t.parent_task_id == task.id]
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert children == []
+    assert graders == []
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len([d for d in deferred if d.get("title") == hs["title"]]) == 1
+    assert (
+        deferred[0].get("adversarial_gate_reason") == "verdict_unrecognized"
+    )
+    assert task.context.get("_adversarial_wholesale_retry_count") is None
 
 
 @_pytest.mark.asyncio

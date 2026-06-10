@@ -69,6 +69,8 @@ from app.finding_deduplication import (
 )
 from app.task_blocked import NEED_REF_MAX_LEN
 from app.task_evaluators import (
+    ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+    ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES,
     CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
@@ -229,6 +231,8 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 # Max length of an individual sampled reason string (challenger reasons are
 # already truncated to 480 chars upstream; trim further for the compact sample).
 _SPAWN_GATE_REASON_MAX_LEN = 200
+_ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
+_ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
 
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
@@ -2329,6 +2333,85 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             "_adversarial_challenged_hashes"
         ) or []
         _challenged_hashes_set: set[str] = set(_challenged_hashes_ctx)
+        _explicit_verdicts = [
+            v for v in _adv_verdicts.values() if isinstance(v, dict) and v.get("explicit")
+        ]
+        _wholesale_parse_outcome = _spawn_gate_parse_outcome
+        if _wholesale_parse_outcome is None and _challenged_hashes_set and not _adv_verdicts:
+            # Legacy gate records predate parse_outcome; an empty verdict map for
+            # a non-empty manifest is equivalent to the parser finding no matches.
+            _wholesale_parse_outcome = ADVERSARIAL_PARSE_NO_HASH_MATCHES
+        _wholesale_non_response = (
+            bool(_challenged_hashes_set)
+            and not _explicit_verdicts
+            and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
+        )
+        if _wholesale_non_response:
+            _retry_count = int(
+                (task.context or {}).get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) or 0
+            )
+            if _retry_count < _ADVERSARIAL_WHOLESALE_RETRY_LIMIT:
+                _retry_findings = []
+                for _f in findings:
+                    _fhash = _fh(
+                        str(_f.get("title", "")),
+                        str(_f.get("description", "") or _f.get("prompt", "")),
+                    )
+                    if _fhash in _challenged_hashes_set:
+                        _retry_findings.append({**_f, "hash": _fhash})
+                _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
+                    _retry_findings
+                )
+                _retry_hashes = [
+                    item["hash"]
+                    for item in _manifest_items
+                    if item.get("hash") in _challenged_hashes_set
+                ]
+                if _retry_hashes:
+                    _ctx = dict(task.context or {})
+                    _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
+                    _ctx[_ADVERSARIAL_WHOLESALE_RETRY_KEY] = _retry_count + 1
+                    _ctx["_adversarial_challenged_hashes"] = _retry_hashes
+                    _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                        _wholesale_parse_outcome
+                    )
+                    _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                    _ctx["research_spawn_gate_refuted_count"] = 0
+                    _ctx["research_spawn_gate_survived_count"] = 0
+                    _ctx["research_spawn_gate_explicit_pass_count"] = 0
+                    _ctx["research_spawn_gate_fail_open_count"] = 0
+                    _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
+                    _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                    task.context = _ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+                    await session.flush()
+                    adv_grader = await spawn_forward_quality_grader(
+                        task,
+                        _manifest_json,
+                        session,
+                        adversarial_mode=True,
+                        finding_hashes=_retry_hashes,
+                    )
+                    if adv_grader is not None:
+                        logger.warning(
+                            "[RESEARCH] Task %s deferred wholesale adversarial "
+                            "non-response (%s) and spawned bounded retry grader %s",
+                            task.id,
+                            _wholesale_parse_outcome,
+                            adv_grader.id,
+                        )
+                        return
+                    # If the single-shot guard refuses a retry, continue into the
+                    # fail-closed path; high-stakes work still must not spawn.
+            else:
+                _ctx = dict(task.context or {})
+                _ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+                _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                    _wholesale_parse_outcome
+                )
+                task.context = _ctx
+                flag_modified(task, "context")
 
         for _f in findings:
             _fhash = _fh(
@@ -2362,7 +2445,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 else:
                     # Hash in manifest but absent from grader output: fail-closed.
                     _passed = False
-                    _reason = "fail-closed: no verdict returned for this finding"
+                    _reason = (
+                        _wholesale_parse_outcome
+                        if _wholesale_non_response and _wholesale_parse_outcome
+                        else "fail-closed: no verdict returned for this finding"
+                    )
                     _explicit = False
             elif isinstance(_verdict_obj, bool):
                 # Normalise legacy bool verdicts so old stored context still works.

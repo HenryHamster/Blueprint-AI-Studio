@@ -448,11 +448,48 @@ async def _resolve_quality_grader_completion(
             grader_logs, all_hashes, completed=completed
         )
         failed_count = sum(1 for v in finding_verdicts.values() if not v["passed"])
-        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
+        gate_record = {
             "finding_verdicts": finding_verdicts,
             "grader_task_id": str(grader.id),
             "parse_outcome": parse_outcome,
         }
+        try:
+            from app.compute import get_vm_runtime_fingerprint, get_vm_source_sha
+            from app.models import PoolVm
+
+            vm_id = grader.vm_instance_id
+            if vm_id:
+                gate_record["grader_vm_instance_id"] = vm_id
+                source_sha = get_vm_source_sha(vm_id)
+                runtime_fp = get_vm_runtime_fingerprint(vm_id)
+                pool_vm = (
+                    (
+                        await session.execute(
+                            select(PoolVm).where(PoolVm.vm_instance_id == vm_id)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if pool_vm is not None:
+                    source_sha = source_sha or pool_vm.agent_source_sha
+                    runtime_fp = runtime_fp or pool_vm.agent_runtime_fingerprint
+                    if pool_vm.agent_image_name:
+                        gate_record["grader_agent_image_name"] = pool_vm.agent_image_name
+                    if pool_vm.agent_image_build_ts is not None:
+                        gate_record["grader_agent_image_build_ts"] = (
+                            pool_vm.agent_image_build_ts
+                        )
+                if source_sha:
+                    gate_record["grader_agent_source_sha"] = source_sha
+                if runtime_fp:
+                    gate_record["grader_agent_runtime_fingerprint"] = runtime_fp
+        except Exception:
+            logger.debug(
+                "[GRADER] Failed to attach adversarial grader runtime provenance",
+                exc_info=True,
+            )
+        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
         grader.latest_status_message = (
             f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "

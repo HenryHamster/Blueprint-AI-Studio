@@ -1468,6 +1468,52 @@ export interface VersionLifecycleResponse {
   challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;
 }
 
+export interface AgentServingShaBucket {
+  source_sha: string | null;
+  count: number;
+  warm_pool_count: number;
+  task_vm_count: number;
+  image_names: string[];
+  latest_build_ts: number | null;
+  last_heartbeat_at: string | null;
+  matches_backend_served?: boolean;
+  matches_active_candidate?: boolean;
+  matches_integration_head?: boolean;
+  matches_current_image?: boolean;
+}
+
+export interface AgentServingShaFleet {
+  total_observed: number;
+  unknown_count: number;
+  mixed: boolean;
+  buckets: AgentServingShaBucket[];
+}
+
+export interface AgentCurrentImage {
+  image_name: string | null;
+  source_git_sha: string | null;
+  build_ts: number | null;
+}
+
+export interface AgentServingShasResponse {
+  fleet: AgentServingShaFleet;
+  current_image: AgentCurrentImage | null;
+  backend_served_sha: string | null;
+  active_candidate_sha: string | null;
+  integration_branch: string | null;
+  integration_head_sha: string | null;
+  promotion_target: string | null;
+  promotion_head_sha: string | null;
+}
+
+export async function fetchAgentServingShas(
+  projectId: string,
+): Promise<AgentServingShasResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/agent-serving-shas`);
+  if (!res.ok) throw new Error(`Failed to fetch agent serving SHAs: ${res.status}`);
+  return res.json();
+}
+
 export interface SetPromotionEnabledResponse {
   project_id: string;
   override: boolean | null;

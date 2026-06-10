@@ -8,6 +8,8 @@ get_stale_image_vms() always returned an empty list. This test asserts
 the field names line up end-to-end and that record_vm_image is invoked.
 """
 
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient
 
@@ -329,3 +331,62 @@ async def test_persist_pool_vm_image_state_updates_pool_member(db_session):
     assert member.agent_runtime_fingerprint == "f" * 64
     assert member.agent_source_sha == "0123456789abcdef0123456789abcdef01234567"
     assert member.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_fleet_source_sha_snapshot_merges_pool_and_task_vms(db_session):
+    """Snapshot groups live PoolVm rows and in-memory task VMs without double-counting."""
+    import app.compute as _compute
+    from app.models import PoolVm, PoolVmState
+
+    project = Project(name="Fleet SHA Snapshot", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pool_known = PoolVm(
+        vm_instance_id="agent-vm-snapshot-pool-known",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        agent_source_sha="a" * 40,
+        agent_image_name="agent-image-a",
+        agent_image_build_ts=100,
+        last_heartbeat_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+    pool_unknown = PoolVm(
+        vm_instance_id="agent-vm-snapshot-pool-unknown",
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        agent_image_name="agent-image-legacy",
+        agent_image_build_ts=90,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-snapshot-task",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(pool_known)
+    db_session.add(pool_unknown)
+    db_session.add(task)
+    await db_session.commit()
+
+    _compute.record_vm_source_sha("agent-vm-snapshot-pool-known", "b" * 40)
+    _compute.record_vm_source_sha("agent-vm-snapshot-task", "c" * 40)
+    _compute.record_vm_image("agent-vm-snapshot-task", "agent-image-c", 110)
+    try:
+        snapshot = await _compute.agent_fleet_source_sha_snapshot(
+            db_session, project.id
+        )
+    finally:
+        _compute._clear_vm_heartbeat_state("agent-vm-snapshot-pool-known")
+        _compute._clear_vm_heartbeat_state("agent-vm-snapshot-task")
+
+    assert snapshot["total_observed"] == 3
+    assert snapshot["unknown_count"] == 1
+    assert snapshot["mixed"] is True
+    by_sha = {bucket["source_sha"]: bucket for bucket in snapshot["buckets"]}
+    assert by_sha["a" * 40]["warm_pool_count"] == 1
+    assert by_sha["a" * 40]["task_vm_count"] == 0
+    assert by_sha["c" * 40]["task_vm_count"] == 1
+    assert by_sha[None]["count"] == 1

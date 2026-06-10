@@ -1033,6 +1033,111 @@ async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
     return any(sha == promoted_sha for sha in _vm_source_shas.values())
 
 
+async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
+    """Return a read-only source-SHA distribution for live agent VMs.
+
+    Durable ``PoolVm`` rows are the restart-safe source for warm-pool members.
+    The in-memory heartbeat caches add short-lived task VMs that have no pool
+    registry row. Missing ``agent_source_sha`` is preserved as an explicit
+    unknown bucket so older/pre-marker images do not look healthy by omission.
+    """
+    observations: dict[str, dict] = {}
+    try:
+        from sqlalchemy import select
+
+        from app.models import PoolVm, Task, TaskStatus
+        from app.warm_pool import LIVE_POOL_STATES
+
+        stmt = select(PoolVm).where(PoolVm.state.in_(LIVE_POOL_STATES))
+        if project_id is not None:
+            stmt = stmt.where(PoolVm.project_id == project_id)
+        members = (await session.execute(stmt)).scalars().all()
+        for member in members:
+            vm_id = member.vm_instance_id
+            if not vm_id:
+                continue
+            observations[vm_id] = {
+                "vm_id": vm_id,
+                "source_sha": member.agent_source_sha,
+                "image_name": member.agent_image_name,
+                "build_ts": member.agent_image_build_ts,
+                "last_heartbeat_at": member.last_heartbeat_at.isoformat()
+                if member.last_heartbeat_at
+                else None,
+                "kind": "warm_pool",
+            }
+
+        cached_vm_ids = set(_vm_source_shas) | set(_vm_images)
+        if cached_vm_ids:
+            task_stmt = select(Task.vm_instance_id).where(
+                Task.vm_instance_id.in_(cached_vm_ids),
+                Task.status.in_((TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)),
+            )
+            if project_id is not None:
+                task_stmt = task_stmt.where(Task.project_id == project_id)
+            task_vm_ids = (await session.execute(task_stmt)).scalars().all()
+            for vm_id in task_vm_ids:
+                if not vm_id or vm_id in observations:
+                    continue
+                image_name, build_ts = _vm_images.get(vm_id, (None, None))
+                observations[vm_id] = {
+                    "vm_id": vm_id,
+                    "source_sha": _vm_source_shas.get(vm_id),
+                    "image_name": image_name,
+                    "build_ts": build_ts,
+                    "last_heartbeat_at": None,
+                    "kind": "task_vm",
+                }
+    except Exception as e:
+        logger.debug(f"[COMPUTE] agent_fleet_source_sha_snapshot failed: {e}")
+
+    buckets: dict[str | None, dict] = {}
+    for obs in observations.values():
+        sha = obs.get("source_sha")
+        bucket = buckets.setdefault(
+            sha,
+            {
+                "source_sha": sha,
+                "count": 0,
+                "warm_pool_count": 0,
+                "task_vm_count": 0,
+                "image_names": [],
+                "latest_build_ts": None,
+                "last_heartbeat_at": None,
+            },
+        )
+        bucket["count"] += 1
+        if obs.get("kind") == "warm_pool":
+            bucket["warm_pool_count"] += 1
+        else:
+            bucket["task_vm_count"] += 1
+        image_name = obs.get("image_name")
+        if image_name and image_name not in bucket["image_names"]:
+            bucket["image_names"].append(image_name)
+        build_ts = obs.get("build_ts")
+        if build_ts is not None and (
+            bucket["latest_build_ts"] is None or build_ts > bucket["latest_build_ts"]
+        ):
+            bucket["latest_build_ts"] = build_ts
+        heartbeat_at = obs.get("last_heartbeat_at")
+        if heartbeat_at and (
+            bucket["last_heartbeat_at"] is None
+            or heartbeat_at > bucket["last_heartbeat_at"]
+        ):
+            bucket["last_heartbeat_at"] = heartbeat_at
+
+    buckets_out = sorted(
+        buckets.values(),
+        key=lambda b: (b["source_sha"] is None, -b["count"], b["source_sha"] or ""),
+    )
+    return {
+        "total_observed": len(observations),
+        "unknown_count": sum(1 for obs in observations.values() if not obs.get("source_sha")),
+        "mixed": len([b for b in buckets_out if b["source_sha"]]) > 1,
+        "buckets": buckets_out,
+    }
+
+
 async def persist_pool_vm_image_state(
     session,
     vm_instance_id: str,

@@ -69,6 +69,21 @@ QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 # Absent hash → fail-closed (passed=False, explicit=False): only an explicit pass
 # from the challenger allows spawning; missing/malformed/non-completed → unspawned.
 ADVERSARIAL_GATE_VERDICT_KEY = "adversarial_gate"
+ADVERSARIAL_PARSE_OK = "ok"
+ADVERSARIAL_PARSE_CHALLENGER_FAILED = "challenger_failed"
+ADVERSARIAL_PARSE_EMPTY_LOGS = "empty_logs"
+ADVERSARIAL_PARSE_NO_JSON_ARRAY = "no_json_array"
+ADVERSARIAL_PARSE_INVALID_JSON = "invalid_json"
+ADVERSARIAL_PARSE_NO_HASH_MATCHES = "no_hash_matches"
+ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES = frozenset(
+    {
+        ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+    }
+)
 
 # Context key written on a spawned safeguard-challenge task, pointing at the
 # safeguard audit task whose merge-gate decision it challenges.
@@ -1033,25 +1048,37 @@ def parse_adversarial_finding_verdicts(
         }
 
     if not completed:
-        return {h: _default_entry("challenger_failed") for h in finding_hashes}, "challenger_failed"
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_CHALLENGER_FAILED)
+            for h in finding_hashes
+        }, ADVERSARIAL_PARSE_CHALLENGER_FAILED
     if not logs or not logs.strip():
-        return {h: _default_entry("empty_logs") for h in finding_hashes}, "empty_logs"
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_EMPTY_LOGS) for h in finding_hashes
+        }, ADVERSARIAL_PARSE_EMPTY_LOGS
 
     from app.task_completion import _extract_last_json_array
 
     text = logs.strip()
     json_str = _extract_last_json_array(text, "hash", "verdict")
     if not json_str:
-        return {h: _default_entry("no_json_array") for h in finding_hashes}, "no_json_array"
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_NO_JSON_ARRAY)
+            for h in finding_hashes
+        }, ADVERSARIAL_PARSE_NO_JSON_ARRAY
 
     try:
         parsed = json.loads(json_str)
         if not isinstance(parsed, list):
             raise ValueError("not a list")
     except (json.JSONDecodeError, ValueError):
-        return {h: _default_entry("invalid_json") for h in finding_hashes}, "invalid_json"
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_INVALID_JSON) for h in finding_hashes
+        }, ADVERSARIAL_PARSE_INVALID_JSON
 
-    result: dict[str, dict] = {h: _default_entry("no_hash_matches") for h in finding_hashes}
+    result: dict[str, dict] = {
+        h: _default_entry(ADVERSARIAL_PARSE_NO_HASH_MATCHES) for h in finding_hashes
+    }
     matched_any = False
     for item in parsed:
         if not isinstance(item, dict):
@@ -1072,8 +1099,8 @@ def parse_adversarial_finding_verdicts(
             matched_any = True
 
     if not matched_any:
-        return result, "no_hash_matches"
-    return result, "ok"
+        return result, ADVERSARIAL_PARSE_NO_HASH_MATCHES
+    return result, ADVERSARIAL_PARSE_OK
 
 
 def build_forward_quality_grader_prompt(
