@@ -15,6 +15,7 @@ import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFa
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
+import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   parseMergeTestVerdict,
   deriveMergeTestOutcome,
@@ -23,14 +24,6 @@ import {
 } from '../utils/mergeTestVerdict';
 
 const WIDE_FINISHED_WINDOW_MINUTES = 10_080;
-
-const ANALYSIS_FALLBACK_REASON_LABELS: Record<string, string> = {
-  'precondition-not-met': 'LLM credentials missing — analysis skipped',
-  'analysis-disabled': 'LLM analysis disabled',
-  'no-evidence': 'No durable artifacts/metrics to analyze',
-  'llm-error': 'LLM analysis failed',
-  'citations-ungrounded': 'Analysis citations did not ground',
-};
 
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -504,6 +497,7 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
     citation_count?: number;
     source_kind?: string;
     analysis_mode?: string;
+    unavailable_cause?: string | null;
     forward_quality_verdict?: { passed?: boolean; reason?: string } | null;
     compute_acceptance_grade?: string | null;
     compute_acceptance_reason?: string;
@@ -566,10 +560,11 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
               no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
             };
             const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
-            const fallbackReason = !isAcceptance && typeof doc.analysis_fallback_reason === 'string'
-              ? doc.analysis_fallback_reason
-              : undefined;
-            const fallbackLabel = fallbackReason ? ANALYSIS_FALLBACK_REASON_LABELS[fallbackReason] : undefined;
+            const analysisCauseLabel = !isAcceptance ? formatComputeAnalysisCauseLabel({
+              unavailableCause: doc.unavailable_cause,
+              analysisFallbackReason: doc.analysis_fallback_reason,
+              analysisMode: doc.analysis_mode,
+            }) : null;
             const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
               ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
             const cls = isAcceptance
@@ -579,14 +574,14 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
               <span className="inline-flex items-center gap-1 flex-wrap">
                 <span
                   className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
-                  title={fallbackLabel ? `${tooltip} · ${fallbackLabel}` : tooltip}
+                  title={analysisCauseLabel ? `${tooltip} · ${analysisCauseLabel}` : tooltip}
                 >
                   {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
                   {isAcceptance ? 'Acceptance' : 'Measured only'}
                 </span>
-                {fallbackLabel && (
+                {analysisCauseLabel && (
                   <span className="text-[10px] text-amber-200/80 leading-tight break-words max-w-[18rem]">
-                    {fallbackLabel}
+                    {analysisCauseLabel}
                   </span>
                 )}
               </span>

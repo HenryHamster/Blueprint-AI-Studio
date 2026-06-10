@@ -2315,6 +2315,34 @@ export async function killComputeJob(jobId: string): Promise<ComputeJob> {
   return data.compute_job;
 }
 
+export type AnalyzeComputeJobStatus = 'upgraded' | 'analysis_unavailable';
+
+export interface AnalyzeComputeJobEnvelope {
+  status: AnalyzeComputeJobStatus;
+  reason?: string | null;
+  analysis_mode?: string | null;
+  knowledge_document_id?: string | null;
+  [key: string]: unknown;
+}
+
+export async function analyzeComputeJob(jobId: string): Promise<AnalyzeComputeJobEnvelope> {
+  const res = await apiFetch(
+    `/api/admin/compute-jobs/${encodeURIComponent(jobId)}/analyze`,
+    { method: 'POST' },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.error?.message || data?.detail || `Failed to analyze compute job: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to analyze compute job: ${res.status}`);
+  }
+  const status = data?.status === 'analysis_unavailable' ? 'analysis_unavailable' : 'upgraded';
+  return {
+    ...data,
+    status,
+    reason: typeof data?.reason === 'string' ? data.reason : data?.reason ?? null,
+  };
+}
+
 // --- Knowledge documents (durable, queryable home for web_research output) ---
 
 /** A single knowledge document. List responses omit `body`; get-by-id includes it. */
@@ -2476,9 +2504,13 @@ export interface KnowledgeDocument {
   knowledge_acceptance_evidence?: boolean;
   compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
   compute_acceptance_reason?: string;
+  /** Mirror of the backend analysis mode for compute_experiment documents. */
+  analysis_mode?: string | null;
   /** Concrete compute-analysis fallback cause mirrored from the backend verdict.
    *  Present only for measured-only compute_experiment docs that fell back. */
   analysis_fallback_reason?: string | null;
+  /** Explicit unavailable cause mirrored from the backend verdict. */
+  unavailable_cause?: string | null;
   /** Durable origin provenance (backend `serialize_origin_provenance`): whether the
    *  producing task came from a research finding, and the second-opinion decision that
    *  allowed or rejected its dispatch. Absent on older backend responses — treat a

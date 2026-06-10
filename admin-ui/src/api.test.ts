@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { previewOnboardProject, createComputeExperiment, fetchComputeJobs } from './api';
+import { previewOnboardProject, createComputeExperiment, fetchComputeJobs, analyzeComputeJob } from './api';
 
 vi.mock('./firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
@@ -107,5 +107,37 @@ describe('fetchComputeJobs', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
+  });
+});
+
+describe('analyzeComputeJob', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('posts to the analyze endpoint and preserves upgraded envelopes', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ status: 'upgraded', analysis_mode: 'llm', extra: 'field' }), { status: 200 }),
+    );
+
+    await expect(analyzeComputeJob('job-1')).resolves.toMatchObject({
+      status: 'upgraded',
+      analysis_mode: 'llm',
+      extra: 'field',
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/compute-jobs/job-1/analyze');
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('POST');
+  });
+
+  it('returns analysis_unavailable envelopes with a reason', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ status: 'analysis_unavailable', reason: 'analysis-disabled' }), { status: 200 }),
+    );
+
+    await expect(analyzeComputeJob('job-2')).resolves.toMatchObject({
+      status: 'analysis_unavailable',
+      reason: 'analysis-disabled',
+    });
   });
 });

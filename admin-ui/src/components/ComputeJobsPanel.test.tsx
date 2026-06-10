@@ -12,11 +12,13 @@ import type { ComputeRpcDiagnostic } from '../api';
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
+const analyzeComputeJob = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
   killComputeJob: (...args: unknown[]) => killComputeJob(...args),
+  analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
 }));
 
@@ -110,6 +112,7 @@ describe('ComputeJobsPanel render + kill', () => {
   afterEach(() => {
     fetchComputeJobs.mockReset();
     killComputeJob.mockReset();
+    analyzeComputeJob.mockReset();
     resolveArtifactDownloadUrl.mockReset();
     vi.restoreAllMocks();
   });
@@ -173,6 +176,38 @@ describe('ComputeJobsPanel render + kill', () => {
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('Killed by operator');
     expect(queryByText('Kill')).toBeNull();
+  });
+
+  test('run analysis shows upgraded feedback and refreshes the job list', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', analysis_mode: 'llm' });
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('Analysis upgraded');
+    await waitFor(() => expect(analyzeComputeJob).toHaveBeenCalledWith('job-1'));
+    await waitFor(() => expect(fetchComputeJobs).toHaveBeenCalledTimes(2));
+  });
+
+  test('run analysis surfaces unavailable cause labels', async () => {
+    const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'analysis_unavailable', reason: 'analysis-disabled' });
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('Analysis unavailable: Analysis disabled');
+  });
+
+  test('run analysis surfaces backend errors inline', async () => {
+    const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockRejectedValue(new Error('analysis endpoint failed: upstream 503'));
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('analysis endpoint failed: upstream 503');
   });
 
   test('renders a safe terminal result link', async () => {

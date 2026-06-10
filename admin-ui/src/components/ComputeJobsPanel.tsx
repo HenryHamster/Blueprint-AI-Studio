@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
-import { fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
+import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
+import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -39,6 +40,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const load = useCallback(
@@ -89,6 +92,46 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
       }
     },
     [],
+  );
+
+  const handleAnalyze = useCallback(
+    async (job: ComputeJob) => {
+      setAnalyzingId(job.id);
+      setAnalysisFeedback((prev) => ({
+        ...prev,
+        [job.id]: { kind: 'running', message: 'Running analysis…' },
+      }));
+      try {
+        const result = await analyzeComputeJob(job.id);
+        if (result.status === 'analysis_unavailable') {
+          const causeLabel = formatComputeAnalysisCauseLabel({ unavailableCause: result.reason ?? null });
+          setAnalysisFeedback((prev) => ({
+            ...prev,
+            [job.id]: {
+              kind: 'analysis_unavailable',
+              message: causeLabel ? `Analysis unavailable: ${causeLabel}` : 'Analysis unavailable',
+            },
+          }));
+        } else {
+          setAnalysisFeedback((prev) => ({
+            ...prev,
+            [job.id]: { kind: 'upgraded', message: 'Analysis upgraded' },
+          }));
+        }
+      } catch (e) {
+        setAnalysisFeedback((prev) => ({
+          ...prev,
+          [job.id]: {
+            kind: 'error',
+            message: e instanceof Error ? e.message : 'Failed to analyze compute job',
+          },
+        }));
+      } finally {
+        setAnalyzingId(null);
+        await load();
+      }
+    },
+    [load],
   );
 
   if (!projectId) return null;
@@ -201,18 +244,46 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
                 </div>
-                {active && (
-                  <button
-                    onClick={() => void handleKill(job)}
-                    disabled={killingId === job.id}
-                    className="shrink-0 min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
-                    title="Kill this compute job"
-                  >
-                    <Square className="w-3 h-3" />
-                    {killingId === job.id ? 'Killing…' : 'Kill'}
-                  </button>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {!active && (
+                    <button
+                      onClick={() => void handleAnalyze(job)}
+                      disabled={analyzingId === job.id}
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      title="Run analysis for this terminal compute job"
+                    >
+                      <Cpu className="w-3 h-3" />
+                      {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
+                    </button>
+                  )}
+                  {active && (
+                    <button
+                      onClick={() => void handleKill(job)}
+                      disabled={killingId === job.id}
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      title="Kill this compute job"
+                    >
+                      <Square className="w-3 h-3" />
+                      {killingId === job.id ? 'Killing…' : 'Kill'}
+                    </button>
+                  )}
+                </div>
               </div>
+              {analysisFeedback[job.id] && (
+                <div
+                  className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${
+                    analysisFeedback[job.id].kind === 'error'
+                      ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                      : analysisFeedback[job.id].kind === 'analysis_unavailable'
+                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                        : analysisFeedback[job.id].kind === 'upgraded'
+                          ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                          : 'border-violet-500/30 bg-violet-500/10 text-violet-200'
+                  }`}
+                >
+                  {analysisFeedback[job.id].message}
+                </div>
+              )}
               {job.artifact_id && (
                 <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
                   <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />

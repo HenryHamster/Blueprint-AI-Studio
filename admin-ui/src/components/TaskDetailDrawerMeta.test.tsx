@@ -1441,8 +1441,53 @@ describe('DetailsTab — Compute Experiment Contract', () => {
     render(<DetailsTab task={task} />);
     const badge = screen.getByText('Measured only');
     expect(badge).toBeInTheDocument();
-    expect(badge.closest('[title]')?.getAttribute('title')).toContain('LLM credentials missing');
-    expect(screen.getByText('LLM credentials missing — analysis skipped')).toBeInTheDocument();
+    expect(badge.closest('[title]')?.getAttribute('title')).toContain('Missing credentials');
+    expect(screen.getByText('Missing credentials — analysis skipped')).toBeInTheDocument();
+  });
+
+  it('prefers unavailable_cause labels over fallback reasons', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-4',
+          title: 'Unavailable Analysis',
+          summary: 'Analysis could not run.',
+          citation_count: 0,
+          analysis_mode: 'unavailable',
+          unavailable_cause: 'analysis-disabled',
+          analysis_fallback_reason: 'precondition-not-met',
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'measured_only',
+          compute_acceptance_reason: 'analysis_mode_not_llm',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Measured only')).toBeInTheDocument();
+    expect(screen.getByText('Analysis disabled')).toBeInTheDocument();
+    expect(screen.queryByText('Missing credentials — analysis skipped')).toBeNull();
+  });
+
+  it('renders legacy measured-only compute docs without cause fields', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-5',
+          title: 'Legacy Measured Summary',
+          summary: 'Older backend response without cause metadata.',
+          citation_count: 1,
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'measured_only',
+          compute_acceptance_reason: 'analysis_mode_not_llm',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Measured only')).toBeInTheDocument();
+    expect(screen.queryByText('Analysis disabled')).toBeNull();
+    expect(screen.queryByText('Missing credentials — analysis skipped')).toBeNull();
   });
 
   it('does not show acceptance grade badge for non-compute documents', () => {

@@ -58,6 +58,7 @@ const measuredOnlyComputeDoc = {
   knowledge_acceptance_evidence: false,
   compute_acceptance_grade: 'measured_only',
   compute_acceptance_reason: 'analysis_mode_not_llm',
+  unavailable_cause: 'analysis-disabled',
   analysis_fallback_reason: 'precondition-not-met',
   forward_quality_verdict: {
     passed: true,
@@ -534,7 +535,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     expect(acceptanceCard?.textContent).not.toContain('LLM credentials missing');
     expect(measuredCard && findBadge(measuredCard, 'Measured only')).toBeTruthy();
     expect(measuredCard?.textContent).toContain('Compute');
-    expect(measuredCard?.textContent).toContain('LLM credentials missing — analysis skipped');
+    expect(measuredCard?.textContent).toContain('Analysis disabled');
 
     // Open the acceptance-grade document — its badge also renders in the detail meta row.
     if (!acceptanceCard) throw new Error('expected acceptance compute card');
@@ -554,7 +555,30 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const detailText = (host as HTMLDivElement).textContent ?? '';
     expect(detailText).toContain('Measured only');
-    expect(detailText).toContain('LLM credentials missing — analysis skipped');
+    expect(detailText).toContain('Analysis disabled');
+  });
+
+  test('legacy measured-only compute docs render without cause metadata', async () => {
+    const legacyMeasuredOnlyComputeDoc = {
+      ...measuredOnlyComputeDoc,
+      id: 'doc-compute-experiment-legacy-measured',
+      title: 'Legacy fallback summary',
+      unavailable_cause: null,
+      analysis_fallback_reason: null,
+      forward_quality_verdict: {
+        ...measuredOnlyComputeDoc.forward_quality_verdict,
+        analysis_mode: 'deterministic',
+      },
+    };
+    await renderList([legacyMeasuredOnlyComputeDoc]);
+
+    const docCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Legacy fallback summary'),
+    );
+    expect(docCard).toBeTruthy();
+    expect(docCard?.textContent).toContain('Measured only');
+    expect(docCard?.textContent).not.toContain('Analysis disabled');
+    expect(docCard?.textContent).not.toContain('Missing credentials');
   });
 
   test('non-acceptance grade is absent for documents without the compute grade', async () => {
