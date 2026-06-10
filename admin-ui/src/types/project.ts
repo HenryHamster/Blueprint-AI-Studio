@@ -165,6 +165,16 @@ export interface CapabilityAdoptionVerdict {
   };
 }
 
+export interface RepoOverview {
+  tech_stack?: string | null;
+  directory_layout?: string | null;
+  first_steps_summary?: string | null;
+  entry_points?: string | null;
+  test_layout?: string | null;
+  key_conventions?: string | null;
+  environment_requirements?: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -200,6 +210,10 @@ export interface Project {
   /** Durable adopt-or-reject verdicts for capability trials.
    *  Present on detail endpoint; absent on list endpoint. */
   capability_adoption_verdicts?: Record<string, CapabilityAdoptionVerdict>;
+  /** Design doc produced by the bootstrap agent. `repo_overview` holds the
+   *  structured summary of the repository (tech stack, layout, first steps).
+   *  Present on detail endpoint when a bootstrap has completed. */
+  design_doc?: { repo_overview?: RepoOverview } | null;
 }
 
 export interface AutoRemediationConfig {

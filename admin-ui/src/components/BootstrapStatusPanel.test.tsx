@@ -52,9 +52,11 @@ function makeCommandsResponse(stale = false): BuildConfigCommandsResponse {
         detected_test_cmd: 'npm test',
         detected_build_cmd: 'npm run build',
         detected_install_cmd: 'npm install',
+        detected_lint_cmd: null,
         confirmed_test_cmd: stale ? 'npm test' : null,
         confirmed_build_cmd: null,
         confirmed_install_cmd: null,
+        confirmed_lint_cmd: null,
         commands_confirmed_at: stale ? '2026-01-01T00:00:00Z' : null,
         confirming_task_id: stale ? 'task-1' : null,
         commands_stale: stale,
@@ -214,6 +216,29 @@ describe('BootstrapStatusPanel', () => {
     await user.click(expandBtn);
     expect(screen.getAllByText('npm test').length).toBeGreaterThan(0);
     expect(screen.getByText('confirmed')).toBeTruthy();
+  });
+
+  test('renders lint columns in command audit table', async () => {
+    const user = userEvent.setup();
+    const response = makeCommandsResponse(false);
+    response.directories[0].detected_lint_cmd = 'npm run lint';
+    response.directories[0].confirmed_lint_cmd = 'npm run lint';
+    response.directories[0].commands_confirmed_at = '2026-06-01T10:00:00Z';
+    fetchBuildConfigCommands.mockResolvedValue(response);
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+    await waitFor(() => {
+      expect(fetchBuildConfigCommands).toHaveBeenCalled();
+    });
+    const expandBtn = screen.getByText(/Commands/);
+    await user.click(expandBtn);
+    expect(screen.getByText('Detected lint')).toBeTruthy();
+    expect(screen.getByText('Confirmed lint')).toBeTruthy();
+    expect(screen.getAllByText('npm run lint').length).toBeGreaterThan(0);
   });
 
   test('does not render retry control when bootstrap task is active', () => {
@@ -415,6 +440,93 @@ describe('BootstrapStatusPanel', () => {
       expect(screen.getByText(/A bootstrap is already running/)).toBeTruthy();
       expect(screen.queryByRole('button', { name: /refresh bootstrap/i })).toBeNull();
     });
+  });
+
+  test('renders Repo Overview section when bootstrap completed and repo_overview fields present', async () => {
+    const user = userEvent.setup();
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' },
+          design_doc: {
+            repo_overview: {
+              tech_stack: 'Node.js',
+              directory_layout: 'monorepo',
+              first_steps_summary: 'run npm install',
+            },
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    const overviewBtn = screen.getByRole('button', { name: /repo overview/i });
+    expect(overviewBtn).toBeTruthy();
+    await user.click(overviewBtn);
+    expect(screen.getByText('Node.js')).toBeTruthy();
+    expect(screen.getByText('monorepo')).toBeTruthy();
+    expect(screen.getByText('run npm install')).toBeTruthy();
+    expect(screen.getByText('Tech Stack')).toBeTruthy();
+    expect(screen.getByText('Directory Layout')).toBeTruthy();
+    expect(screen.getByText('First Steps')).toBeTruthy();
+  });
+
+  test('Repo Overview section is hidden when bootstrap_completed_at is absent', () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          design_doc: {
+            repo_overview: {
+              tech_stack: 'Node.js',
+              directory_layout: 'monorepo',
+              first_steps_summary: 'run npm install',
+            },
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.queryByRole('button', { name: /repo overview/i })).toBeNull();
+  });
+
+  test('Repo Overview section is hidden when design_doc is absent', () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.queryByRole('button', { name: /repo overview/i })).toBeNull();
+  });
+
+  test('Repo Overview toggle expands and collapses content', async () => {
+    const user = userEvent.setup();
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' },
+          design_doc: {
+            repo_overview: {
+              tech_stack: 'Python',
+              directory_layout: null,
+              first_steps_summary: null,
+            },
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    const overviewBtn = screen.getByRole('button', { name: /repo overview/i });
+    expect(screen.queryByText('Python')).toBeNull();
+    await user.click(overviewBtn);
+    expect(screen.getByText('Python')).toBeTruthy();
+    await user.click(overviewBtn);
+    expect(screen.queryByText('Python')).toBeNull();
   });
 
   test('refresh click error path surfaces error inline', async () => {

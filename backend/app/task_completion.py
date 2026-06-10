@@ -3816,6 +3816,9 @@ async def _handle_repo_bootstrap_completion(
     gate can proceed (the gate only defers while bootstrap is IN_PROGRESS/QUEUED).
     """
     _OVERVIEW_KEYS = ("tech_stack", "directory_layout", "first_steps_summary")
+    _OVERVIEW_OPTIONAL_KEYS = (
+        "entry_points", "test_layout", "key_conventions", "environment_requirements"
+    )
     _REVISION_KEYS = ("source_revision", "revision", "commit", "commit_sha")
     overview: dict[str, str] | None = None
     source_revision: str | None = None
@@ -3827,15 +3830,23 @@ async def _handle_repo_bootstrap_completion(
                 return value.strip()
         return None
 
+    def _build_overview(src: dict[str, Any]) -> dict[str, str]:
+        result = {k: str(src.get(k, "")) for k in _OVERVIEW_KEYS}
+        for k in _OVERVIEW_OPTIONAL_KEYS:
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                result[k] = v
+        return result
+
     ctx_overview = (task.context or {}).get("repo_overview")
     if isinstance(ctx_overview, dict) and any(k in ctx_overview for k in _OVERVIEW_KEYS):
-        overview = {k: str(ctx_overview.get(k, "")) for k in _OVERVIEW_KEYS}
+        overview = _build_overview(ctx_overview)
         source_revision = _extract_revision(ctx_overview)
     elif logs:
         try:
             parsed = json.loads(logs)
             if isinstance(parsed, dict) and any(k in parsed for k in _OVERVIEW_KEYS):
-                overview = {k: str(parsed.get(k, "")) for k in _OVERVIEW_KEYS}
+                overview = _build_overview(parsed)
                 source_revision = _extract_revision(parsed)
         except (json.JSONDecodeError, TypeError):
             pass

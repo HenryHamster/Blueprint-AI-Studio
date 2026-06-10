@@ -99,6 +99,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshPending, setRefreshPending] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [overviewExpanded, setOverviewExpanded] = useState(false);
 
   useEffect(() => {
     setRetryOutcome(null);
@@ -126,6 +127,12 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
   if (state === 'none') return null;
 
   const completedAt = project.build_config?.bootstrap_completed_at;
+  const repoOverview = project.design_doc?.repo_overview;
+  const hasOverviewContent = !!(
+    repoOverview?.tech_stack ||
+    repoOverview?.directory_layout ||
+    repoOverview?.first_steps_summary
+  );
   const recoveryDetail = getRecoveryDetail(project);
   const retryState = retryOutcome?.state;
   const refreshState = refreshOutcome?.state;
@@ -260,6 +267,15 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
               {refreshPending ? 'Refreshing…' : 'Refresh bootstrap'}
             </button>
           )}
+          {completedAt && hasOverviewContent && (
+            <button
+              onClick={() => setOverviewExpanded(e => !e)}
+              className="flex items-center gap-1 text-[10px] text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
+            >
+              Repo Overview
+              {overviewExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            </button>
+          )}
           {commands !== null && commands.length > 0 && (
             <button
               onClick={() => setExpanded(e => !e)}
@@ -302,6 +318,81 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
         </p>
       )}
 
+      {overviewExpanded && completedAt && repoOverview && hasOverviewContent && (
+        <div className="mt-3 space-y-2">
+          {repoOverview.tech_stack && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Tech Stack
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.tech_stack}
+              </div>
+            </div>
+          )}
+          {repoOverview.directory_layout && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Directory Layout
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.directory_layout}
+              </div>
+            </div>
+          )}
+          {repoOverview.first_steps_summary && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                First Steps
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.first_steps_summary}
+              </div>
+            </div>
+          )}
+          {repoOverview.entry_points && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Entry Points
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.entry_points}
+              </div>
+            </div>
+          )}
+          {repoOverview.test_layout && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Test Layout
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.test_layout}
+              </div>
+            </div>
+          )}
+          {repoOverview.key_conventions && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Key Conventions
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.key_conventions}
+              </div>
+            </div>
+          )}
+          {repoOverview.environment_requirements && (
+            <div>
+              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+                Environment Requirements
+              </div>
+              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+                {repoOverview.environment_requirements}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {expanded && commands !== null && commands.length > 0 && (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-[10px] font-mono border-collapse">
@@ -313,6 +404,8 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
                 <th className="text-left py-1 pr-2 font-semibold">Confirmed test</th>
                 <th className="text-left py-1 pr-2 font-semibold">Detected build</th>
                 <th className="text-left py-1 pr-2 font-semibold">Confirmed build</th>
+                <th className="text-left py-1 pr-2 font-semibold">Detected lint</th>
+                <th className="text-left py-1 pr-2 font-semibold">Confirmed lint</th>
                 <th className="text-left py-1 font-semibold">Status</th>
               </tr>
             </thead>
@@ -337,6 +430,14 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
                   <td className="py-1 pr-2 max-w-[120px] truncate" title={dir.confirmed_build_cmd ?? ''}>
                     {dir.confirmed_build_cmd
                       ? <span className="text-emerald-400">{dir.confirmed_build_cmd}</span>
+                      : <span className="text-neutral-600">—</span>}
+                  </td>
+                  <td className="py-1 pr-2 text-neutral-400 max-w-[120px] truncate" title={dir.detected_lint_cmd ?? ''}>
+                    {dir.detected_lint_cmd ?? <span className="text-neutral-600">none</span>}
+                  </td>
+                  <td className="py-1 pr-2 max-w-[120px] truncate" title={dir.confirmed_lint_cmd ?? ''}>
+                    {dir.confirmed_lint_cmd
+                      ? <span className="text-emerald-400">{dir.confirmed_lint_cmd}</span>
                       : <span className="text-neutral-600">—</span>}
                   </td>
                   <td className="py-1">

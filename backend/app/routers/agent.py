@@ -3534,6 +3534,12 @@ async def claim_task(
                 "directory_layout": _raw_overview["directory_layout"],
                 "first_steps_summary": _raw_overview["first_steps_summary"],
             }
+            for _opt_field in (
+                "entry_points", "test_layout", "key_conventions", "environment_requirements"
+            ):
+                _opt_val = _raw_overview.get(_opt_field)
+                if isinstance(_opt_val, str) and _opt_val:
+                    _repo_overview[_opt_field] = _opt_val
             _bootstrap_completed_at = (project_for_playbook.build_config or {}).get(
                 "bootstrap_completed_at"
             )
@@ -3561,6 +3567,10 @@ async def claim_task(
                 "tech_stack",
                 "directory_layout",
                 "first_steps_summary",
+                "entry_points",
+                "test_layout",
+                "key_conventions",
+                "environment_requirements",
             ],
             "completion_payload_field": "repo_overview",
             "build_config_writeback_endpoint": (
@@ -3568,7 +3578,7 @@ async def claim_task(
             ),
             "completion_steps": [
                 "Read listed files to understand project structure",
-                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary",
+                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary, entry_points (main runnable scripts/services and their purposes), test_layout (where tests live, unit/integration/e2e organization, and run commands), key_conventions (branch naming, commit style, required review steps), environment_requirements (required env vars, system deps, version constraints beyond install_cmd)",
                 "Confirm working build/test commands by running them",
                 "Write confirmed commands back via the build_config_writeback_endpoint",
                 "Post COMPLETED with repo_overview in the completion payload",

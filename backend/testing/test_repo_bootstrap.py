@@ -626,6 +626,110 @@ class TestRepoBootstrapDesignDocPersistence:
         )
 
     @pytest.mark.asyncio
+    async def test_bootstrap_overview_persists_optional_fields(self, db_session):
+        """Bootstrap completion persists all 7 overview fields when the agent
+        provides them; absent optional fields are gracefully omitted."""
+        import json as _json
+        from app.task_completion import _handle_repo_bootstrap_completion
+        from app.strategic_spawning import _design_doc_index, _agent_view_design_doc
+
+        project = Project(
+            name="acme/full-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="full-overview",
+            build_config={"language": "typescript"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/full-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        overview_logs = _json.dumps({
+            "tech_stack": "TypeScript, Node.js",
+            "directory_layout": "src/ — source; tests/ — test suite",
+            "first_steps_summary": "npm install && npm test",
+            "entry_points": "src/index.ts — main server; src/cli.ts — CLI tool",
+            "test_layout": "tests/unit — unit tests; tests/integration — integration; npm test runs all",
+            "key_conventions": "branch: feat/<name>; commits: conventional commits; PRs require one review",
+            "environment_requirements": "Node >= 18; DATABASE_URL required; .env.example provided",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        await db_session.refresh(project)
+
+        stored = (project.design_doc or {}).get("repo_overview", {})
+        assert stored.get("tech_stack") == "TypeScript, Node.js"
+        assert stored.get("entry_points") == "src/index.ts — main server; src/cli.ts — CLI tool"
+        assert stored.get("test_layout") == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
+        assert stored.get("key_conventions") == "branch: feat/<name>; commits: conventional commits; PRs require one review"
+        assert stored.get("environment_requirements") == "Node >= 18; DATABASE_URL required; .env.example provided"
+
+        # Verify optional fields appear inline in the strategic index.
+        agent_view = _agent_view_design_doc(project.design_doc)
+        index = _design_doc_index(agent_view)
+        entry = {e["key"]: e for e in index.get("sections", [])}.get("repo_overview", {})
+        assert entry.get("entry_points") == "src/index.ts — main server; src/cli.ts — CLI tool"
+        assert entry.get("test_layout") == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
+        assert entry.get("key_conventions") == "branch: feat/<name>; commits: conventional commits; PRs require one review"
+        assert entry.get("environment_requirements") == "Node >= 18; DATABASE_URL required; .env.example provided"
+
+        # Partial path: only 3 required fields → optional fields absent from stored doc.
+        project3 = Project(
+            name="acme/partial-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="partial-overview",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project3)
+        await db_session.flush()
+
+        bootstrap_task3 = Task(
+            project_id=project3.id,
+            title="Bootstrap: acme/partial-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task3)
+        await db_session.commit()
+        await db_session.refresh(project3)
+        await db_session.refresh(bootstrap_task3)
+
+        partial_logs = _json.dumps({
+            "tech_stack": "Python",
+            "directory_layout": "backend/ — app",
+            "first_steps_summary": "pip install -r requirements.txt && pytest",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task3, partial_logs, db_session)
+        await db_session.refresh(project3)
+
+        stored3 = (project3.design_doc or {}).get("repo_overview", {})
+        assert stored3.get("tech_stack") == "Python"
+        assert "entry_points" not in stored3, "Optional field absent when not provided"
+        assert "test_layout" not in stored3, "Optional field absent when not provided"
+        assert "key_conventions" not in stored3, "Optional field absent when not provided"
+        assert "environment_requirements" not in stored3, "Optional field absent when not provided"
+
+    @pytest.mark.asyncio
     async def test_bootstrap_without_overview_records_degraded_marker(self, db_session):
         """Completing a bootstrap with no parseable overview records bootstrap_degraded_reason
         in build_config (explicit degraded marker, not silent clean success) and does NOT

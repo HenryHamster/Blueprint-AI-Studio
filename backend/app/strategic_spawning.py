@@ -331,10 +331,13 @@ def _design_doc_index(doc: dict | None) -> dict:
             if isinstance(warning, str) and warning.strip():
                 entry["presence_warning"] = warning
         elif isinstance(value, dict) and key == "repo_overview":
-            # repo_overview is a first-class bootstrap section: carry tech_stack,
-            # directory_layout, and first_steps_summary inline so the first
-            # strategic cycle has actual repo context without a fetch round-trip.
-            for field in ("tech_stack", "directory_layout", "first_steps_summary"):
+            # repo_overview is a first-class bootstrap section: carry all overview
+            # fields inline so the first strategic cycle has actual repo context
+            # without a fetch round-trip. Optional fields are included when present.
+            for field in (
+                "tech_stack", "directory_layout", "first_steps_summary",
+                "entry_points", "test_layout", "key_conventions", "environment_requirements",
+            ):
                 raw = value.get(field)
                 if isinstance(raw, str) and raw.strip():
                     collapsed = " ".join(raw.split())

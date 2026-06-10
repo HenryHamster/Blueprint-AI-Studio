@@ -2345,9 +2345,11 @@ export interface BuildConfigCommandEntry {
   detected_test_cmd: string | null;
   detected_build_cmd: string | null;
   detected_install_cmd: string | null;
+  detected_lint_cmd: string | null;
   confirmed_test_cmd: string | null;
   confirmed_build_cmd: string | null;
   confirmed_install_cmd: string | null;
+  confirmed_lint_cmd: string | null;
   commands_confirmed_at: string | null;
   confirming_task_id: string | null;
   commands_stale: boolean;
