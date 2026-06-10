@@ -91,13 +91,52 @@ export function setup(): (() => void) | undefined {
     }
 
     if (mutations.length > 0) {
-      throw new Error(
+      const restoreErrors: string[] = [];
+
+      // Restore hooks to their original state.
+      for (const hook of BLOCKED_HOOKS) {
+        const hookPath = path.join(WATCH_WORKSPACE, '.git', 'hooks', hook);
+        const beforeContent = beforeState.hooks[hook];
+        try {
+          if (beforeContent === null) {
+            // Hook was not present before; delete it if it exists now.
+            try {
+              fs.unlinkSync(hookPath);
+            } catch {
+              // Already absent, which is the desired state.
+            }
+          } else {
+            // Hook existed before; restore its content.
+            fs.writeFileSync(hookPath, beforeContent, { mode: 0o755 });
+          }
+        } catch (err) {
+          restoreErrors.push(`Failed to restore ${hookPath}: ${(err as Error).message}`);
+        }
+      }
+
+      // Restore origin URL if it changed.
+      if (beforeState.originUrl !== afterState.originUrl && beforeState.originUrl !== null) {
+        try {
+          execSync(`git remote set-url origin "${beforeState.originUrl}"`, {
+            cwd: WATCH_WORKSPACE,
+            stdio: 'ignore',
+          });
+        } catch (err) {
+          restoreErrors.push(`Failed to restore origin URL: ${(err as Error).message}`);
+        }
+      }
+
+      // Throw the mutation error, optionally noting any restore failures.
+      const errorMsg =
         `[workspace-guard] Test suite mutated real VM git state in ${WATCH_WORKSPACE}:\n` +
         mutations.map(m => `  - ${m}`).join('\n') +
         '\n\nA test is running a subprocess against the real workspace instead of an\n' +
         'isolated temp dir. Fix: pass AGENT_WORKSPACE pointing to a mkdtempSync\n' +
-        'dir in the subprocess invocation.',
-      );
+        'dir in the subprocess invocation.' +
+        (restoreErrors.length > 0
+          ? '\n\nRestore attempts (best-effort):\n' + restoreErrors.map(e => `  - ${e}`).join('\n')
+          : '\n\nState has been restored.');
+      throw new Error(errorMsg);
     }
   };
 }

@@ -33,7 +33,6 @@ backend/.testmondata*
 /blocked
 /gh-token
 /check
-/check.args
 /pr
 /done
 /fail
