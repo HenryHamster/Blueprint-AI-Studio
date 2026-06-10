@@ -77,6 +77,22 @@ vi.mock('./code-change.js', () => ({
   runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The '../index.js' mock above uses importOriginal, which loads the REAL index
+// module graph — prior-knowledge.js gets instantiated there bound to the real
+// apiGet, so the index mock never reaches its fetchers. Left unmocked, a test
+// with knowledge/artifact prerequisites runs the real apiGet retry/backoff
+// (~16s against nothing) and times out. Mock the fetchers directly (fail-soft
+// null, same as an unreachable backend) and keep the pure section builders real
+// so prompt-text assertions exercise the genuine output.
+vi.mock('./prior-knowledge.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./prior-knowledge.js')>();
+  return {
+    ...actual,
+    fetchKnowledgeDocumentById: vi.fn().mockResolvedValue(null),
+    fetchArtifactDownloadUrl: vi.fn().mockResolvedValue(null),
+  };
+});
+
 vi.mock('../build-config.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../build-config.js')>();
   return { ...actual };

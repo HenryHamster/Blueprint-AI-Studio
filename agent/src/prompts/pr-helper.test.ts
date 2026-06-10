@@ -146,7 +146,10 @@ esac
     const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
       const bin = `${dir}/bin`;
       realFs.mkdirSync(bin, { recursive: true });
-      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\necho "$*" > /tmp/workspace/check.args\nexit 0\n', { mode: 0o755 });
+      // mkdir -p: /tmp/workspace exists on agent VMs (it IS the workspace) but
+      // not on CI runners — without it the redirection fails and the assertion
+      // below reads a file that was never written.
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nmkdir -p /tmp/workspace\necho "$*" > /tmp/workspace/check.args\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
   *"rev-parse --verify origin/production"*) exit 0 ;;

@@ -586,7 +586,7 @@ jobs:
   agent:
     name: CI / Agent
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     steps:
@@ -641,3 +641,12 @@ jobs:
             echo "::error::Agent type check failed"
             exit 1
           fi
+
+      # Blocking — the vitest suite silently went red on automain while only
+      # tsc gated this job (reports 063e94c5 / 6637f511). Unlike the typecheck
+      # above there is no main-baseline forgiveness: a red agent suite blocks
+      # the PR that would merge it. Runs after the typecheck baseline steps so
+      # a test failure on a main push still records the typecheck baseline.
+      - name: Unit tests
+        working-directory: ./agent
+        run: npx vitest run
