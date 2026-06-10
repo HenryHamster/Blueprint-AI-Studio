@@ -25,6 +25,7 @@ from app.efficiency_snapshot import (
     _compute_cold_start_breakdown_p50,
     _compute_llm_cost_pricing_coverage,
     _last_run_due,
+    _task_llm_attempts,
     compute_current_axes,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
@@ -1664,6 +1665,207 @@ def test_llm_cost_pricing_coverage_counts_missing_attempt_attribution():
     assert result["unattributed_tasks"] == 2
     assert result["coverage_fraction"] == 0.0
     assert result["unpriced_combos"] == []
+
+
+# ---------------------------------------------------------------------------
+# Atomic (provider, model) pair resolution in _task_llm_attempts
+# ---------------------------------------------------------------------------
+
+
+def test_task_llm_attempts_resolves_provider_model_pair_atomically():
+    """The canonical acceptance test: half-filled rows degrade cleanly; complete
+    pairs use the attempt's own values; provider-switching retries never blend
+    halves from different sources into chimera combos."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Attempt 1: full pair from a different provider (e.g. a retry that switched).
+    # Must use the attempt's own pair, NOT the task's current provider.
+    # Attempt 2: provider set, model absent → half-filled → must degrade to (None, None).
+    # Attempt 3: model set, provider absent → half-filled → must degrade to (None, None).
+    # Attempt 4: neither set → must fall back to task's pair as a whole.
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        },
+        {
+            "provider": "fakeprovider",
+            "model": None,
+            "llm_input_tokens": 200,
+            "llm_output_tokens": 80,
+            "llm_call_count": 1,
+        },
+        {
+            "provider": None,
+            "model": "claude-opus-4-8",
+            "llm_input_tokens": 300,
+            "llm_output_tokens": 120,
+            "llm_call_count": 1,
+        },
+        {
+            "llm_input_tokens": 400,
+            "llm_output_tokens": 160,
+            "llm_call_count": 2,
+        },
+    ]
+
+    result = _task_llm_attempts(task)
+
+    # Four banked attempts (no live tokens); order matches history.
+    assert len(result) == 4
+
+    # Attempt 1: full pair → uses attempt's own pair, not task's anthropic pair.
+    p0, m0, _in0, _out0, _c0 = result[0]
+    assert (p0, m0) == ("openai", "gpt-5.4"), f"expected openai:gpt-5.4, got {p0}:{m0}"
+
+    # Attempt 2: provider-only half-filled → (None, None); no chimera with task.model.
+    p1, m1, _in1, _out1, _c1 = result[1]
+    assert (p1, m1) == (None, None), (
+        f"expected (None, None) for provider-only row, got {p1}:{m1}"
+    )
+
+    # Attempt 3: model-only half-filled → (None, None); no chimera with task.provider.
+    p2, m2, _in2, _out2, _c2 = result[2]
+    assert (p2, m2) == (None, None), (
+        f"expected (None, None) for model-only row, got {p2}:{m2}"
+    )
+
+    # Attempt 4: neither field → falls back to task's pair as a whole.
+    p3, m3, _in3, _out3, _c3 = result[3]
+    assert (p3, m3) == ("anthropic", "claude-sonnet-4-6"), (
+        f"expected task fallback anthropic:claude-sonnet-4-6, got {p3}:{m3}"
+    )
+
+    # Validate that the cost breakdown never contains chimera combos.
+    breakdown = compute_llm_cost_breakdown([task])
+    combo_keys = {entry["model"] for entry in breakdown["by_model"]}
+    assert "claude-opus-4-8" not in combo_keys, "chimera model from model-only row leaked"
+    assert "gpt-5.4" in combo_keys  # legitimate pair must still appear
+
+
+def test_task_llm_attempts_no_chimera_half_filled_provider_only():
+    """Provider-only attempt row degrades to (None, None); task.model not spliced in."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": None,
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, _in, _out, _c = result[0]
+    assert (p, m) == (None, None), f"provider-only row must yield (None, None), got {p}:{m}"
+    # Specifically: must NOT be openai:claude-opus-4-8 (chimera).
+    assert not (p == "openai" and m == "claude-opus-4-8")
+
+
+def test_task_llm_attempts_no_chimera_half_filled_model_only():
+    """Model-only attempt row degrades to (None, None); task.provider not spliced in."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task.attempt_history = [
+        {
+            "provider": None,
+            "model": "gpt-5.4",
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, _in, _out, _c = result[0]
+    assert (p, m) == (None, None), f"model-only row must yield (None, None), got {p}:{m}"
+    # Specifically: must NOT be anthropic:gpt-5.4 (chimera).
+    assert not (p == "anthropic" and m == "gpt-5.4")
+
+
+def test_task_llm_attempts_full_pair_used_atomically():
+    """Attempt with both fields uses its own pair, not the task's current values."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "llm_input_tokens": 500,
+            "llm_output_tokens": 200,
+            "llm_call_count": 3,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, in_tok, out_tok, calls = result[0]
+    assert p == "openai" and m == "gpt-5.4", f"expected openai:gpt-5.4, got {p}:{m}"
+    assert in_tok == 500 and out_tok == 200 and calls == 3
+
+
+def test_task_llm_attempts_neither_field_falls_back_to_task():
+    """Attempt with neither provider nor model falls back to task's pair as a whole."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-haiku-4-5",
+    )
+    task.attempt_history = [
+        {
+            "llm_input_tokens": 300,
+            "llm_output_tokens": 100,
+            "llm_call_count": 2,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, in_tok, out_tok, calls = result[0]
+    assert p == "anthropic" and m == "claude-haiku-4-5", (
+        f"expected task fallback anthropic:claude-haiku-4-5, got {p}:{m}"
+    )
+    assert in_tok == 300 and out_tok == 100 and calls == 2
 
 
 def test_compute_llm_cost_breakdown_priced_and_unpriced():
@@ -3871,7 +4073,8 @@ async def test_windowed_idle_cost_live_member_clamped_to_window(db_session):
     db_session.add(member)
     await db_session.commit()
 
-    windowed = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+    result = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+    windowed = result["total"]
 
     # Expected: only the in-window portion (cutoff .. now) is billed.
     # The full (10-day) idle period would be ~10x larger.
@@ -3889,6 +4092,10 @@ async def test_windowed_idle_cost_live_member_clamped_to_window(db_session):
     # idle_cost_banked (5.0) is not included: if it were, windowed would equal
     # expected_max + 5.0.  The expected_max check above already gates this.
     assert windowed <= expected_max, "windowed cost must not include idle_cost_banked"
+
+    # by_account must contain the member's account.
+    assert "acct-1" in result["by_account"], "by_account should contain the member account"
+    assert result["by_account"]["acct-1"]["total_idle_cost_usd"] == windowed
 
 
 @pytest.mark.asyncio
@@ -3938,6 +4145,131 @@ async def test_all_time_pool_metrics_preserved_alongside_windowed_axis(db_sessio
     assert abs(incl - plain) < 1.0, (
         f"incl ({incl}) should be close to plain ({plain}) when "
         "all pool idle spend is out-of-window"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
+    """Acceptance gate: read_baseline_with_drift's pool_cost_amortization must
+    use windowed idle cost, NOT the all-time snapshot value.
+
+    Seeds a PoolIdleCostLedger row that was retired BEFORE the pool funnel
+    window (i.e. out-of-window pre-window spend) and one that was retired
+    WITHIN the window. After writing a snapshot and calling
+    read_baseline_with_drift, the pool_cost_amortization.pool_idle_cost_usd
+    must reflect only the in-window spend — the large out-of-window row must
+    not inflate it. The pool_idle_cost_usd in the snapshot (all-time) is
+    deliberately larger, confirming the amortization view switched sources.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Merged task so write_snapshot has real data to persist.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # In-window ledger row: retired 2 hours ago (inside any 24h window).
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            idle_cost_usd=0.50,
+            retired_at=now - timedelta(hours=2),
+        )
+    )
+    # Out-of-window row: retired 48 hours ago (outside a 24h window).
+    # This simulates the all-time accumulator that previously inflated the guard.
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            idle_cost_usd=50.0,
+            retired_at=now - timedelta(hours=48),
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    amort = drift["pool_cost_amortization"]
+
+    # The snapshot's all-time pool_idle_cost_usd should include both rows.
+    snapshot_all_time = drift.get("pool_idle_cost_usd") or 0.0
+    assert snapshot_all_time >= 50.0, (
+        "snapshot pool_idle_cost_usd must include all-time spend"
+    )
+
+    # The amortization view must use only the windowed (in-window) spend.
+    amort_idle = amort["pool_idle_cost_usd"]
+    assert amort_idle < 5.0, (
+        f"pool_cost_amortization.pool_idle_cost_usd={amort_idle} should reflect "
+        f"only the in-window $0.50 ledger entry, not the $50 out-of-window entry. "
+        f"All-time snapshot was {snapshot_all_time}"
+    )
+    assert amort_idle >= 0.49, (
+        f"pool_cost_amortization.pool_idle_cost_usd={amort_idle} should include "
+        "the in-window $0.50 ledger row"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_windowed_idle_cost_fleet_wide(db_session):
+    """project_id=None (fleet-wide) includes IDLE members from multiple projects."""
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
+
+    now = _utcnow()
+    cutoff = now - timedelta(hours=24)
+
+    proj_a = make_project(design_doc={})
+    proj_b = make_project(design_doc={})
+    db_session.add(proj_a)
+    db_session.add(proj_b)
+    await db_session.commit()
+    await db_session.refresh(proj_a)
+    await db_session.refresh(proj_b)
+
+    # One IDLE member per project, both idle for 1 hour (well within 24h window).
+    for project in (proj_a, proj_b):
+        db_session.add(
+            PoolVm(
+                project_id=project.id,
+                vm_instance_id=f"vm-fleet-{project.id}",
+                account_id="acct-fleet",
+                provider="anthropic",
+                model="claude-opus-4-8",
+                state=PoolVmState.IDLE,
+                idle_since=now - timedelta(hours=1),
+            )
+        )
+    await db_session.commit()
+
+    # Fleet-wide result (project_id=None) must sum both members.
+    fleet_result = await _compute_windowed_idle_cost(db_session, None, cutoff)
+    fleet_total = fleet_result["total"]
+
+    # Per-project result for proj_a alone must be about half of fleet.
+    proj_a_result = await _compute_windowed_idle_cost(db_session, proj_a.id, cutoff)
+    proj_a_total = proj_a_result["total"]
+
+    assert proj_a_total > 0, "proj_a windowed cost should be positive"
+    assert fleet_total > proj_a_total, (
+        f"fleet total ({fleet_total}) should exceed single-project total ({proj_a_total})"
+    )
+    # With both members having equal idle time the fleet total should be ~2x proj_a.
+    assert abs(fleet_total - 2 * proj_a_total) < 0.001, (
+        f"fleet ({fleet_total}) should be ~2x proj_a ({proj_a_total}) with equal idle time"
     )
 
 

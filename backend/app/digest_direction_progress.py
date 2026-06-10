@@ -19,7 +19,7 @@ from app.direction_outcomes import (
     proven_merged_count,
     verified_merged_count,
 )
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, get_task_cost_by_provider_model
 from app.task_evaluators import (
     CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -280,11 +280,8 @@ async def compute_direction_progress(
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
-    from app.routers.admin_analytics import (
-        ON_DEMAND_RATE,
-        SPOT_RATE,
-        _derive_completed_at,
-    )
+    from app.routers.admin_analytics import _derive_completed_at  # noqa: PLC0415
+    from app.vm_cost_rates import get_vm_rate_per_second  # noqa: PLC0415
 
     direction_progress_list: List[Dict[str, Any]] = []
     direction_portfolio_composition: List[Dict[str, Any]] = []
@@ -696,8 +693,10 @@ async def compute_direction_progress(
                 and t.vm_stopped_at >= window_start
             ):
                 continue
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            t_cost = get_vm_rate_per_second(
+                machine_type=t.__dict__.get("vm_machine_type"),
+                spot=bool(t.vm_spot),
+            ) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
             dir_cost += t_cost
             if t.vm_spot:
                 dir_spot_cost += t_cost
@@ -709,12 +708,14 @@ async def compute_direction_progress(
             cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
             type_key = (t.first_payload or {}).get("type", "create")
             cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
-            provider_key = t.provider or "unknown"
-            model_key = t.model or "unknown"
-            pm_key = f"{provider_key}|{model_key}"
-            cost_by_provider_model[pm_key] = (
-                cost_by_provider_model.get(pm_key, 0.0) + t_cost
-            )
+            # Use pair-atomic helper for provider/model breakdown so chimera keys
+            # (e.g. openai|claude-opus-4-8 from independently-resolved columns)
+            # cannot appear. Banked attempt_history costs are included via window_start.
+            pm_costs = get_task_cost_by_provider_model(t, window_start=window_start)
+            for pm_key, pm_cost in pm_costs.items():
+                cost_by_provider_model[pm_key] = (
+                    cost_by_provider_model.get(pm_key, 0.0) + pm_cost
+                )
         cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
         cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
         cost_by_type = {k: round(v, 4) for k, v in cost_by_type.items()}

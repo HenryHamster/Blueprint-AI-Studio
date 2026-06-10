@@ -37,7 +37,14 @@ from app.acceptance_gate import (
     classify_merged_acceptance,
 )
 from app.landed_signal import is_merged_completion
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import (
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+    get_task_cost_by_provider_model,
+)
 from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -959,29 +966,21 @@ async def _update_direction_research_outcomes(
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
             return True
         return bool((ct.first_payload or {}).get("pr_number"))
-    # Per-(provider, model) cost rollup: keyed by f"{provider}|{model}", values
-    # in USD. Uses VM-runtime × spot/on-demand rate (matching admin_digest math)
-    # so values are consistent even when Task.estimated_cost_usd is unbackfilled
-    # for older rows. Tasks missing both provider and model bucket under
-    # "unknown|unknown" so legacy entries degrade without dropping cost.
-    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE  # noqa: PLC0415
-
+    # Per-(provider, model) cost rollup using the shared pair-atomic helper so
+    # both this path and the digest path stay consistent and cannot produce
+    # chimera keys (e.g. openai|claude-opus-4-8 from independently-resolved
+    # columns). Banked attempt_history costs are included; the live span is
+    # included when it exists. Both cost axes (breakdown + total) are derived
+    # from the same helper output so estimated_cost_usd == sum(breakdown).
     cost_by_provider_model: dict[str, float] = {}
     cycle_cost_total = 0.0
     for ct in child_tasks_rows:
-        if not (ct.vm_provisioned_at and ct.vm_stopped_at):
-            continue
-        rate = SPOT_RATE if ct.vm_spot else ON_DEMAND_RATE
-        t_cost = rate * (ct.vm_stopped_at - ct.vm_provisioned_at).total_seconds()
-        if t_cost <= 0:
-            continue
-        provider_key = ct.provider or "unknown"
-        model_key = ct.model or "unknown"
-        bucket_key = f"{provider_key}|{model_key}"
-        cost_by_provider_model[bucket_key] = (
-            cost_by_provider_model.get(bucket_key, 0.0) + t_cost
-        )
-        cycle_cost_total += t_cost
+        ct_costs = get_task_cost_by_provider_model(ct)
+        for bucket_key, t_cost in ct_costs.items():
+            cost_by_provider_model[bucket_key] = (
+                cost_by_provider_model.get(bucket_key, 0.0) + t_cost
+            )
+            cycle_cost_total += t_cost
     if cost_by_provider_model:
         entry["cost_by_provider_model"] = {
             k: round(v, 4) for k, v in cost_by_provider_model.items()

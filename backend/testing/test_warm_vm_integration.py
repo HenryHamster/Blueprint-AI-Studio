@@ -1474,3 +1474,63 @@ async def test_warm_pool_cost_guard_drains_and_blocks_lease(
         assert await get_pool_vm(db_session, pool_vm_id) is None
         cost = await compute_pool_idle_cost(db_session, project_id=project.id)
         assert cost["retired_idle_cost_usd"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_cost_guard_ignores_pre_window_idle_spend(db_session, mocker):
+    """Pre-window idle spend must NOT trip the cost guard's materiality floor.
+
+    Seeds only a PoolIdleCostLedger row retired BEFORE the guard's window, so
+    the windowed idle cost is $0. Even with dispatches below the min_hit_rate
+    and idle_cost_usd set to a tiny floor, the guard must NOT engage because
+    the windowed spend never crosses the floor. This regression-tests the fix
+    that switches evaluate_pool_cost_guard from compute_pool_idle_cost (all-time)
+    to _compute_windowed_idle_cost.
+    """
+    from app.warm_pool_maintainer import evaluate_pool_cost_guard
+    from app.warm_backlog_reuse import record_pool_lease_miss
+
+    project = Project(name="Cost Guard Window Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow()
+
+    # A ledger row retired BEFORE the 24h guard window (50 hours ago).
+    # All-time compute_pool_idle_cost would see this; windowed must not.
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-pre-window",
+            idle_cost_usd=100.0,
+            retired_at=now - timedelta(hours=50),
+        )
+    )
+    await db_session.commit()
+
+    # Seed a low eligible hit rate (3 misses, 0 hits) so the hit-rate condition
+    # is breached — only the idle-spend floor blocks engagement.
+    for _ in range(3):
+        record_pool_lease_miss("no_idle_member")
+
+    # Set a very low floor ($0.10) so even a tiny in-window spend would trip it.
+    # The pre-window ledger row is $100 — if it leaked through, the guard engages.
+    cfg_override = {
+        "warm_pool_cost_guard_enabled": True,
+        "warm_pool_cost_guard_min_hit_rate": 0.50,
+        "warm_pool_cost_guard_min_dispatches": 1,
+        "warm_pool_cost_guard_min_idle_cost_usd": 0.10,
+        "warm_pool_cost_guard_window_hours": 24,
+    }
+
+    guard = await evaluate_pool_cost_guard(db_session, runtime_config=cfg_override)
+
+    assert not guard["engaged"], (
+        "Cost guard must NOT engage when ALL idle spend is pre-window. "
+        f"idle_cost_usd={guard['idle_cost_usd']}, min_idle_cost_usd=0.10"
+    )
+    assert guard["idle_cost_usd"] < 0.10, (
+        f"Windowed idle_cost_usd={guard['idle_cost_usd']} should be < $0.10; "
+        "the pre-window $100 ledger row must not be counted"
+    )

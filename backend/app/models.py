@@ -1568,6 +1568,63 @@ def get_task_total_vm_cost_usd(
     ) + get_task_current_attempt_vm_cost_usd(task, stopped_at=stopped_at)
 
 
+def get_task_cost_by_provider_model(
+    task: Task,
+    *,
+    window_start: datetime | None = None,
+) -> dict[str, float]:
+    """Return per-(provider, model) VM cost breakdown for a task.
+
+    Iterates attempt_history for banked attempts and the live span for the
+    current attempt. Provider/model pairs are resolved atomically per attempt
+    (both from the same source), so impossible 'chimera' buckets like
+    openai|claude-opus-4-8 cannot appear. An unresolvable pair degrades to
+    'unknown|unknown' as a whole, never a half-resolved key.
+
+    When window_start is provided, banked attempts whose recorded vm_stopped_at
+    falls before window_start are excluded. The live span is always included when
+    it exists (digest callers filter tasks by vm_stopped_at before calling).
+    """
+    result: dict[str, float] = {}
+
+    for attempt in task.attempt_history or []:
+        cost = float(attempt.get("vm_runtime_cost_usd") or 0.0)
+        if cost <= 0:
+            continue
+        if window_start is not None:
+            stopped_at_str = attempt.get("vm_stopped_at")
+            if stopped_at_str:
+                try:
+                    stopped_dt = datetime.fromisoformat(stopped_at_str)
+                    # Strip tz if present (stored timestamps are naive UTC)
+                    if stopped_dt.tzinfo is not None:
+                        stopped_dt = stopped_dt.replace(tzinfo=None)
+                    if stopped_dt < window_start:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+        provider = attempt.get("provider")
+        model = attempt.get("model")
+        if provider and model:
+            bucket = f"{provider}|{model}"
+        else:
+            bucket = "unknown|unknown"
+        result[bucket] = result.get(bucket, 0.0) + cost
+
+    # Live (un-banked) current attempt
+    live_cost = get_task_current_attempt_vm_cost_usd(task)
+    if live_cost > 0:
+        provider = task.provider
+        model = task.model
+        if provider and model:
+            bucket = f"{provider}|{model}"
+        else:
+            bucket = "unknown|unknown"
+        result[bucket] = result.get(bucket, 0.0) + live_cost
+
+    return result
+
+
 def get_task_total_vm_cost_usd_or_none(
     task: Task, *, stopped_at: datetime | None = None
 ) -> float | None:

@@ -4197,6 +4197,86 @@ async def test_digest_retry_recovery_cost_from_prior_attempts(
 
 
 @pytest.mark.asyncio
+async def test_compute_direction_progress_cost_by_provider_model_uses_attempt_history(
+    client: AsyncClient, db_session
+):
+    """cost_by_provider_model in direction_progress reflects attempt_history,
+    not a chimera key from independently-resolved Task.provider/Task.model columns.
+
+    Sets up two tasks:
+    - One with banked attempt_history entries (provider-switch retry) — no live span.
+    - One with only a live span (first attempt) under a distinct provider pair.
+
+    Asserts:
+    (a) No chimera key appears.
+    (b) Each attempt's cost lands under its OWN recorded pair.
+    (c) Banked earlier-attempt cost is NOT lost.
+    """
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-pm", "text": "D", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    attempt1_cost = 0.010
+
+    # Task that retried: attempt 1 (anthropic/claude-opus-4-7) banked in
+    # attempt_history, final attempt 2 (openai/gpt-5.4) still has a live span
+    # (banking only clears vm_provisioned_at/stopped_at for intermediate attempts).
+    retried = make_task(
+        project_id=project.id,
+        title="retried-pm",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "scope": "small"}],
+        context={"direction_id": "dir-pm"},
+        provider="openai",
+        model="gpt-5.4",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    )
+    retried.attempt_history = [
+        {
+            "vm_provisioned_at": (now - timedelta(hours=3)).isoformat(),
+            "vm_stopped_at": (now - timedelta(hours=2)).isoformat(),
+            "vm_spot": False,
+            "vm_machine_type": "e2-standard-2",
+            "provider": "anthropic",
+            "model": "claude-opus-4-7",
+            "vm_runtime_cost_usd": attempt1_cost,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+    ]
+    db_session.add(retried)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+    dp_list = body.get("direction_progress", [])
+    assert dp_list, "direction_progress must be present"
+    dp = dp_list[0]
+    by_pm = dp.get("cost_by_provider_model") or {}
+
+    # (a) No chimera keys
+    assert "anthropic|gpt-5.4" not in by_pm, "chimera key must not appear"
+    assert "openai|claude-opus-4-7" not in by_pm, "chimera key must not appear"
+
+    # (b) Each attempt's own pair present
+    assert "anthropic|claude-opus-4-7" in by_pm, "attempt-1 pair must appear"
+    assert "openai|gpt-5.4" in by_pm, "attempt-2 pair must appear"
+
+    # (c) Banked earlier-attempt cost not lost
+    assert by_pm["anthropic|claude-opus-4-7"] == pytest.approx(attempt1_cost, abs=1e-4)
+    # Live span for openai|gpt-5.4 computed by the helper; just verify it's > 0
+    assert by_pm["openai|gpt-5.4"] > 0
+
+
+@pytest.mark.asyncio
 async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session):
     """escalation_outcome_summary aggregates escalation_outcomes across directions and recent history."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()

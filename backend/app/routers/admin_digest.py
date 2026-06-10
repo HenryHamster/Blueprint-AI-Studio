@@ -351,6 +351,8 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
+                    Task.attempt_history_db,
                     # Token telemetry for the per-effort/per-model LLM efficiency
                     # rollup (compute_effort_model_efficiency). api_call_summary is
                     # accessed directly (not via __dict__), so it MUST be loaded
@@ -410,6 +412,8 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
+                    Task.attempt_history_db,
                     # Token telemetry for the per-effort/per-model LLM efficiency
                     # rollup (compute_effort_model_efficiency).
                     Task.api_call_summary,

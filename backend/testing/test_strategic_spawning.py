@@ -11814,6 +11814,28 @@ def test_summarize_efficiency_snapshot_includes_agent_timeout_rate():
     assert "denominator" not in atr
 
 
+def test_summarize_efficiency_snapshot_forwards_axis_seed_provenance():
+    """Axis provenance is preserved when it differs from baseline_captured_at."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "axes": {
+            "llm_cost_per_merged_pr": {
+                "current": 1.2,
+                "baseline": 0.9,
+                "drift_pct": 33.3,
+                "baseline_seeded_at": "2026-04-12T00:00:00",
+                "history": [],
+            }
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    axis = result["axes"]["llm_cost_per_merged_pr"]
+    assert axis["seeded_at"] == "2026-04-12T00:00:00"
+    assert "baseline_seeded_at" not in axis
+
+
 def test_summarize_efficiency_snapshot_omits_blocks_when_absent():
     """format_compliance and agent_timeout_rate keys are absent when raw snapshot lacks them."""
     from app.strategic_spawning import _summarize_efficiency_snapshot

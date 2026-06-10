@@ -942,12 +942,17 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             trimmed_axes[axis] = data
             continue
         history = data.get("history") or []
+        seeded_at = data.get("baseline_seeded_at")
+        if seeded_at == snapshot.get("baseline_captured_at"):
+            seeded_at = None
         trimmed_axes[axis] = {
             "current": data.get("current"),
             "baseline": data.get("baseline"),
             "drift_pct": data.get("drift_pct"),
             "history_tail": history[-_EFFICIENCY_SNAPSHOT_HISTORY_TAIL:],
         }
+        if seeded_at:
+            trimmed_axes[axis]["seeded_at"] = seeded_at
     result: dict = {
         "axes": trimmed_axes,
         "baseline_captured_at": snapshot.get("baseline_captured_at"),

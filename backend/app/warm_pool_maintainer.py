@@ -206,7 +206,7 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
     all of that, so the guard only acts on demand the pool could actually serve
     and can recover once real warm starts resume.
     """
-    from app.efficiency_snapshot import compute_pool_idle_cost
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
     from app.warm_backlog_reuse import get_pool_funnel_snapshot
 
     cfg = _cost_guard_config(runtime_config)
@@ -215,7 +215,11 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
     total = funnel.get("eligible_dispatches", 0)
     raw_hit_rate = funnel.get("pool_hit_rate")
     raw_total = funnel.get("total_dispatches", 0)
-    idle_cost = (await compute_pool_idle_cost(session)).get("total_idle_cost_usd", 0.0)
+    # Use windowed idle cost (same window as the dispatch funnel) so the
+    # all-time monotonically-growing accumulator does not permanently latch the
+    # materiality floor True after the pool crosses $1 in lifetime spend.
+    _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
+    idle_cost = (await _compute_windowed_idle_cost(session, None, _guard_cutoff))["total"]
 
     engaged = (
         cfg["enabled"]

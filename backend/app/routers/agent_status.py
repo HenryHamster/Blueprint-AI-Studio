@@ -2229,8 +2229,10 @@ async def update_agent_status(
         elif _ctx_provider and _ctx_model:
             _provider, _model = _ctx_provider, _ctx_model
         else:
-            _provider = _ctx_provider or payload.provider
-            _model = _ctx_model or payload.model
+            # No complete pair from either source — do not blend halves across
+            # sources; that manufactures chimera (provider, model) combos that
+            # poison cost attribution.  Degrade to (None, None) instead.
+            _provider, _model = None, None
         task.provider = str(_provider) if _provider else None
         task.account_id = str(acct_id) if acct_id else None
         task.model = str(_model) if _model else None
@@ -2278,17 +2280,22 @@ async def update_agent_status(
                 # Provider-aware teardown defer: a reused VM is locked to the
                 # LLM provider/account/model frozen into its boot manifest (the
                 # warm claim only mints a fresh JWT — it never re-materializes
-                # credentials). The completing task ran on that boot identity, so
-                # task.provider/account_id/model (set just above) ARE the VM's
-                # boot identity. Pass it through so we only hold the VM for
-                # backlog work it can actually run warm — a task pinned/recorded
-                # to a different provider cold-dispatches instead. NO-OP for
+                # credentials). The completing task ran on that boot identity.
+                # Resolve each boot field independently here: the persisted
+                # task.provider/model pair above is atomic (a half-known pair
+                # degrades to None/None to keep cost buckets honest), but the
+                # compatibility gate checks provider and model separately, so a
+                # truthful single field (e.g. agent reported a provider with no
+                # model) must still filter backlog — None would disable the
+                # gate and hold the VM for work it cannot run warm. NO-OP for
                 # single-provider projects (the dominant case): their queued
                 # tasks carry no divergent constraint, so nothing is filtered.
+                _boot_provider = task.provider or _ctx_provider or payload.provider
+                _boot_model = task.model or _ctx_model or payload.model
                 vm_boot = {
-                    "provider": task.provider,
+                    "provider": str(_boot_provider) if _boot_provider else None,
                     "account_id": task.account_id,
-                    "model": task.model,
+                    "model": str(_boot_model) if _boot_model else None,
                 }
                 if await has_eligible_backlog_task(
                     session, task.project_id, old_vm_id, vm_boot=vm_boot

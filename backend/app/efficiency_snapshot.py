@@ -460,10 +460,18 @@ async def compute_pool_idle_cost(
 
 async def _compute_windowed_idle_cost(
     session: AsyncSession,
-    project_id: uuid.UUID,
+    project_id: uuid.UUID | None,
     cutoff: datetime,
-) -> float:
-    """Sum pool idle cost scoped to the same window as the efficiency axes.
+) -> Dict[str, Any]:
+    """Sum pool idle cost scoped to a rolling window.
+
+    When ``project_id`` is ``None``, the query spans every pool member
+    (fleet-wide); otherwise it is scoped to the given project. Returns a dict
+    with ``total`` (the windowed idle cost in USD) and ``by_account`` (windowed
+    per-account idle cost from live IDLE members, as ``{label: {"total_idle_cost_usd":
+    float}}``). Ledger carry-forward of already-reaped members has no account
+    attribution and is therefore excluded from per-account totals (but included
+    in ``total``).
 
     Ledger rows (retired members): sum ``idle_cost_usd`` where ``retired_at >=
     cutoff`` — spend from members that were fully reaped before the window
@@ -475,34 +483,41 @@ async def _compute_windowed_idle_cost(
     timestamps, so it is intentionally excluded; only the current in-progress
     idle period (idle_since .. now) contributes, clamped to the cutoff.
     """
+    from app.warm_backlog_reuse import _account_label
+
     now = _utcnow()
 
     # Retired members: only ledger rows whose retirement falls within the window.
     ledger_stmt = select(
         func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
-    ).where(
-        PoolIdleCostLedger.project_id == project_id,
-        PoolIdleCostLedger.retired_at >= cutoff,
-    )
+    ).where(PoolIdleCostLedger.retired_at >= cutoff)
+    if project_id is not None:
+        ledger_stmt = ledger_stmt.where(PoolIdleCostLedger.project_id == project_id)
     windowed_retired = float(
         (await session.execute(ledger_stmt)).scalar() or 0.0
     )
 
     # Live IDLE members: current idle period clamped to the window start.
     member_stmt = select(PoolVm).where(
-        PoolVm.project_id == project_id,
         PoolVm.state == PoolVmState.IDLE,
         PoolVm.idle_since.isnot(None),
     )
+    if project_id is not None:
+        member_stmt = member_stmt.where(PoolVm.project_id == project_id)
     members = list((await session.execute(member_stmt)).scalars().all())
     windowed_live = 0.0
+    by_account: Dict[str, Any] = {}
     for m in members:
         effective_start = max(m.idle_since, cutoff)  # type: ignore[arg-type]
         elapsed = (now - effective_start).total_seconds()
         if elapsed > 0:
-            windowed_live += idle_cost_usd(elapsed)
+            cost = idle_cost_usd(elapsed)
+            windowed_live += cost
+            label = _account_label(m.account_id)
+            acc = by_account.setdefault(label, {"total_idle_cost_usd": 0.0})
+            acc["total_idle_cost_usd"] = round(acc["total_idle_cost_usd"] + cost, 6)
 
-    return round(windowed_retired + windowed_live, 6)
+    return {"total": round(windowed_retired + windowed_live, 6), "by_account": by_account}
 
 
 def compute_pool_cost_amortization(
@@ -1016,10 +1031,20 @@ def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, in
             if input_tokens > 0 or output_tokens > 0
             else []
         )
+    def _resolve_pair(attempt: dict) -> tuple[str | None, str | None]:
+        ap = attempt.get("provider")
+        am = attempt.get("model")
+        if ap and am:
+            return ap, am
+        if not ap and not am:
+            return task.provider, task.model
+        # Half-filled row: one source has provider, another has model.
+        # Blending across sources manufactures chimera combos; degrade instead.
+        return None, None
+
     attempts = [
         (
-            attempt.get("provider") or task.provider,
-            attempt.get("model") or task.model,
+            *_resolve_pair(attempt),
             _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
@@ -2015,7 +2040,7 @@ async def compute_current_axes(
     windowed_idle = await _compute_windowed_idle_cost(session, project_id, axis_cutoff)
     total_vm_cost, merged = _cost_and_merges(tasks)
     cost_incl_pool_idle: float | None = (
-        round((total_vm_cost + windowed_idle) / merged, 4)
+        round((total_vm_cost + windowed_idle["total"]) / merged, 4)
         if merged
         else None
     )
@@ -2269,6 +2294,17 @@ async def read_baseline_with_drift(
         raise ValueError(f"Project {project_id} not found")
 
     pool_funnel = get_pool_funnel_snapshot()
+
+    # Compute windowed idle cost over the SAME window as the pool dispatch
+    # funnel so cost_per_pool_hit_usd uses commensurable numerator and
+    # denominator. Pre-window all-time ledger carry-forward is excluded.
+    _amortization_window_hours = int(pool_funnel.get("window_hours") or 24)
+    _amortization_cutoff = _utcnow() - timedelta(hours=_amortization_window_hours)
+    _windowed_idle_result = await _compute_windowed_idle_cost(
+        session, project_id, _amortization_cutoff
+    )
+    _pool_amortization_windowed_idle_usd = _windowed_idle_result["total"]
+    _pool_amortization_windowed_by_account = _windowed_idle_result["by_account"]
 
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
@@ -2544,21 +2580,24 @@ async def read_baseline_with_drift(
         # can confirm BOTH halves of the goal — reuse lift above the floor AND no
         # cost regression — from one place.
         "warm_start_origin_breakdown": latest.get("warm_start_origin_breakdown"),
-        # Cost-amortization companion: the latest snapshot's pool idle cost
-        # against the live (instance-local) pool dispatch funnel, so operators
-        # can see whether idle spend is being amortized by warm-start hits — the
-        # same signal the maintainer's cost-aware auto-drain guard acts on.
+        # Cost-amortization companion: windowed pool idle cost (same window as
+        # the pool dispatch funnel) against the live (instance-local) pool
+        # dispatch funnel, so operators can see whether idle spend is being
+        # amortized by warm-start hits — the same signal the maintainer's
+        # cost-aware auto-drain guard acts on. Uses _compute_windowed_idle_cost
+        # rather than the all-time snapshot field so lifetime idle spend from
+        # before the window does NOT inflate cost_per_pool_hit_usd.
         "pool_cost_amortization": compute_pool_cost_amortization(
-            latest.get("pool_idle_cost_usd") or 0.0,
+            _pool_amortization_windowed_idle_usd,
             pool_funnel,
         ),
-        # Per-account-mix view: joins the latest snapshot's per-account idle cost
-        # with the per-account dispatch funnel so an operator can answer, PER
-        # ACCOUNT, warm-vs-cold dispatch counts, hit rate, idle cost, and cost
-        # per warm start during a controlled enable — pool lift is read off the
-        # funnel hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
+        # Per-account-mix view: joins windowed per-account idle cost with the
+        # per-account dispatch funnel so an operator can answer, PER ACCOUNT,
+        # warm-vs-cold dispatch counts, hit rate, idle cost, and cost per warm
+        # start during a controlled enable — pool lift is read off the funnel
+        # hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
         "pool_cost_amortization_by_account": compute_pool_cost_amortization_by_account(
-            (latest.get("pool_metrics") or {}).get("by_account") or {},
+            _pool_amortization_windowed_by_account,
             pool_funnel,
         ),
         # Synthesized per-project warm-pool PAYOFF VERDICT: folds the LIFT half

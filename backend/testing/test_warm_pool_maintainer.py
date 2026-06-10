@@ -675,9 +675,9 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
     the raw fleet-wide rate, so a deliberately raw-low value here is paired with
     a matching eligible value to drive engagement."""
     mocker.patch(
-        "app.efficiency_snapshot.compute_pool_idle_cost",
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
         new_callable=mocker.AsyncMock,
-        return_value={"total_idle_cost_usd": 5.0},
+        return_value={"total": 5.0, "by_account": {}},
     )
     snap = mocker.patch("app.warm_backlog_reuse.get_pool_funnel_snapshot")
 
@@ -713,9 +713,9 @@ async def test_evaluate_cost_guard_holds_below_min_dispatches(db_session, warm_p
     must not drain on noise before enough ELIGIBLE dispatches accumulate. A large
     raw fleet-wide volume must NOT substitute for eligible volume here."""
     mocker.patch(
-        "app.efficiency_snapshot.compute_pool_idle_cost",
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
         new_callable=mocker.AsyncMock,
-        return_value={"total_idle_cost_usd": 5.0},
+        return_value={"total": 5.0, "by_account": {}},
     )
     mocker.patch(
         "app.warm_backlog_reuse.get_pool_funnel_snapshot",
