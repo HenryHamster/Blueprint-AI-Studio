@@ -13284,6 +13284,64 @@ class TestComputeExperimentTaskLaunch:
         assert task.requires_approval is False
         assert task.latest_status_message is None
 
+    @pytest.mark.asyncio
+    async def test_require_live_release_persists_live_proof_in_payload(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(require_live_release=True),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["live_proof"] is True
+
+    @pytest.mark.asyncio
+    async def test_require_live_release_default_omits_live_proof(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert "live_proof" not in payload
+
 
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.

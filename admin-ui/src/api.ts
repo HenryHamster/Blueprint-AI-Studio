@@ -210,6 +210,7 @@ export interface ComputeExperimentLaunchRequest {
   hypothesis?: string;
   metric?: string;
   success_criterion?: ComputeSuccessCriterion;
+  require_live_release?: boolean;
   model?: string;
   effort?: string;
 }

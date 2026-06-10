@@ -33,6 +33,7 @@ export interface ComputeExperimentForm {
   successMetric: string;
   successOperator: ComputeSuccessOperator;
   successThreshold: string;
+  requireLiveRelease: boolean;
 }
 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
@@ -49,6 +50,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     successMetric: '',
     successOperator: '>=',
     successThreshold: '',
+    requireLiveRelease: false,
   };
 }
 
@@ -341,6 +343,7 @@ export function useTaskModal(
       ...(hypothesis ? { hypothesis } : {}),
       ...(metric ? { metric } : {}),
       ...(successCriterion ? { success_criterion: successCriterion } : {}),
+      ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
     };

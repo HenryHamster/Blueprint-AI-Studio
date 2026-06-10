@@ -443,6 +443,18 @@ export function NewTaskModal({
                 </div>
                 <p className="text-[10px] text-neutral-600 mt-1">Leave blank to launch without a machine-checkable goal.</p>
               </div>
+              <div className="mt-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={computeExperiment.requireLiveRelease}
+                    onChange={e => setComputeExperiment(f => ({ ...f, requireLiveRelease: e.target.checked }))}
+                    className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
+                  />
+                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Require live release</span>
+                  <span className="text-[11px] text-neutral-600 normal-case font-normal tracking-normal">(block until promoted release is serving-confirmed)</span>
+                </label>
+              </div>
             </div>
           )}
           <div className="mb-4">

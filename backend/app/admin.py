@@ -1375,6 +1375,7 @@ class ComputeExperimentTaskPayload(BaseModel):
     hypothesis: str | None = None
     metric: str | None = None
     success_criterion: ComputeSuccessCriterion | None = None
+    require_live_release: bool = False
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -1863,6 +1864,7 @@ async def create_compute_experiment_task(
             )
             if launch_contract.get(k) is not None
         },
+        **({"live_proof": True} if payload.require_live_release else {}),
     }
     try:
         task_payload = validate_task_payload(task_payload_raw)

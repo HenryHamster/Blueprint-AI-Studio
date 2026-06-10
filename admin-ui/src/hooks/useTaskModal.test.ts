@@ -976,4 +976,55 @@ describe('useTaskModal', () => {
       'error',
     );
   });
+
+  it('handleCreateTask sends require_live_release when requireLiveRelease is set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        requireLiveRelease: true,
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.require_live_release).toBe(true);
+  });
+
+  it('handleCreateTask omits require_live_release when requireLiveRelease is false', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).not.toHaveProperty('require_live_release');
+  });
 });
