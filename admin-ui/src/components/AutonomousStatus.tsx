@@ -33,6 +33,8 @@ interface ProjectAutonomousStatus {
   last_research_at: string | null;
   tasks_spawned_last_hour: number;
   rate_limit: number;
+  fleet_default_rate_limit?: number;
+  rate_limit_source?: 'project_override' | 'fleet_default';
 }
 
 interface BlockingGuard {
@@ -957,11 +959,19 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   {/* Rate limit usage */}
                   <div className="flex items-center justify-between text-[11px] text-neutral-500">
                     <span>Tasks this hour</span>
-                    <span className="font-mono">
+                    <span className="font-mono flex items-center gap-1">
                       <span className={p.tasks_spawned_last_hour >= p.rate_limit ? 'text-amber-400' : ''}>
                         {p.tasks_spawned_last_hour}
                       </span>
                       /{p.rate_limit}
+                      {p.rate_limit_source === 'project_override' && (
+                        <span
+                          className="ml-1 px-1 rounded text-[9px] bg-neutral-700 text-neutral-300"
+                          title={`Project override (fleet default: ${p.fleet_default_rate_limit ?? '?'})`}
+                        >
+                          override
+                        </span>
+                      )}
                     </span>
                   </div>
                 </div>

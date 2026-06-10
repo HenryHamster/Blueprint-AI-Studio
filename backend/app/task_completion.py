@@ -2416,6 +2416,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             "task_updated",
             {"task_id": str(task.id), "status": task.status},
         )
+        from app.cost_ceiling import check_daily_cost_ceiling
+
+        await check_daily_cost_ceiling(task, session)
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):

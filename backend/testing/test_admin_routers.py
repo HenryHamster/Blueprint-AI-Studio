@@ -2536,8 +2536,21 @@ class TestAutonomousMode:
     async def test_get_autonomous_status(self, client: AsyncClient, db_session):
         """Returns autonomous status summary across all user projects."""
         from app.shared_state import runtime_config
+        from datetime import timedelta
+        from app.models import _utcnow
 
         project = await _make_project(db_session, name="Auto Project")
+
+        # Seed a non-research orchestrator task to confirm all ORCHESTRATOR tasks count.
+        non_research_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "plan"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=_utcnow() - timedelta(minutes=30),
+        )
+        db_session.add(non_research_task)
+        await db_session.commit()
 
         resp = await client.get("/api/admin/autonomous-status")
         assert resp.status_code == 200
@@ -2547,11 +2560,36 @@ class TestAutonomousMode:
         assert str(project.id) in by_id
         entry = by_id[str(project.id)]
         # Freshly created project: autonomous_enabled defaults True (model default),
-        # no failures and no autonomous tasks spawned yet, rate_limit mirrors config.
+        # no failures, rate_limit mirrors global config, source is fleet_default.
         assert entry["autonomous_enabled"] is True
         assert entry["consecutive_failures"] == 0
-        assert entry["tasks_spawned_last_hour"] == 0
+        # The non-research ORCHESTRATOR task counts toward the hour budget.
+        assert entry["tasks_spawned_last_hour"] == 1
         assert entry["rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["fleet_default_rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["rate_limit_source"] == "fleet_default"
+
+    @pytest.mark.asyncio
+    async def test_get_autonomous_status_project_override(self, client: AsyncClient, db_session):
+        """Project with build_config override reports the override cap and correct source."""
+        from app.shared_state import runtime_config
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Override Project")
+        project.build_config = {"max_autonomous_tasks_per_hour": 5}
+        flag_modified(project, "build_config")
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        resp = await client.get("/api/admin/autonomous-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        by_id = {p["project_id"]: p for p in data["projects"]}
+        assert str(project.id) in by_id
+        entry = by_id[str(project.id)]
+        assert entry["rate_limit"] == 5
+        assert entry["fleet_default_rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["rate_limit_source"] == "project_override"
 
     @pytest.mark.asyncio
     async def test_get_direction_task_counts(self, client: AsyncClient, db_session):

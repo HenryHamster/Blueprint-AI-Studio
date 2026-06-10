@@ -1298,6 +1298,7 @@ async def get_autonomous_status(
     current_user: dict = Depends(get_current_user),
 ):
     from app.shared_state import autonomous_failure_counts, runtime_config
+    from app.autonomous_research import project_parallelism_cap
 
     projects = (
         (
@@ -1313,21 +1314,21 @@ async def get_autonomous_status(
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
 
-    # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
+    # Count ALL orchestrator tasks per project in the last hour (mirrors the per-project
+    # rate guard in autonomous_research.py which counts all ORCHESTRATOR-created tasks).
     user_pids = _user_project_ids(current_user["user_id"])
-    research_count_rows = (
+    orch_count_rows = (
         await session.execute(
             select(Task.project_id, func.count().label("cnt"))
             .where(
                 Task.project_id.in_(user_pids),
                 Task.created_by == "ORCHESTRATOR",
                 Task.created_at >= one_hour_ago,
-                Task.payloads[0]["type"].astext == "research",
             )
             .group_by(Task.project_id)
         )
     ).all()
-    tasks_per_project: dict = {row.project_id: row.cnt for row in research_count_rows}
+    tasks_per_project: dict = {row.project_id: row.cnt for row in orch_count_rows}
 
     # Batch query: most recent autonomous task per project
     last_research_subq = (
@@ -1348,9 +1349,23 @@ async def get_autonomous_status(
         row.project_id: row.max_created_at for row in last_research_rows
     }
 
+    fleet_default = runtime_config["max_autonomous_tasks_per_hour"]
     result = []
     for project in projects:
         project_id_str = str(project.id)
+        effective_cap = project_parallelism_cap(
+            project,
+            "max_autonomous_tasks_per_hour",
+            "max_autonomous_tasks_per_hour",
+            12,
+        )
+        bc = getattr(project, "build_config", None) or {}
+        override_val = bc.get("max_autonomous_tasks_per_hour")
+        has_override = (
+            isinstance(override_val, int)
+            and not isinstance(override_val, bool)
+            and override_val >= 1
+        )
         result.append(
             {
                 "project_id": project_id_str,
@@ -1363,7 +1378,9 @@ async def get_autonomous_status(
                 if last_research_map.get(project.id)
                 else None,
                 "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
-                "rate_limit": runtime_config["max_autonomous_tasks_per_hour"],
+                "rate_limit": effective_cap,
+                "fleet_default_rate_limit": fleet_default,
+                "rate_limit_source": "project_override" if has_override else "fleet_default",
             }
         )
 

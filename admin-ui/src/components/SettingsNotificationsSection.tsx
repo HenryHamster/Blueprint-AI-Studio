@@ -14,7 +14,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'APPROVAL_NEEDED', label: 'Approval Needed', description: 'When a task requires manual approval', defaultOn: true },
   { key: 'PR_MERGED', label: 'PR Merged', description: 'When a pull request is merged', defaultOn: false },
   { key: 'DEPLOY_HEALTH_ALERT', label: 'Deploy Health Alert', description: 'Deployment state changes and health alerts', defaultOn: true },
-  { key: 'BUDGET_EXCEEDED', label: 'Budget Exceeded', description: 'When projected cost exceeds budget ceiling', defaultOn: false },
+  { key: 'BUDGET_EXCEEDED', label: 'Budget Exceeded', description: 'When actual daily spend exceeds the cost ceiling', defaultOn: false },
   { key: 'AUTO_FIX_SPAWNED', label: 'CI Auto-Fix Spawned', description: 'When Blueprint auto-spawns a fix task for a CI failure', defaultOn: false },
   { key: 'AUTO_FIX_MERGED', label: 'CI Auto-Fix Merged', description: 'When a Blueprint auto-remediation fix PR is merged', defaultOn: false },
   { key: 'REMEDIATION_ESCALATED', label: 'Remediation Escalation', description: 'When a direction exhausts remediation and needs manual intervention', defaultOn: true },
@@ -134,7 +134,7 @@ export function SettingsNotificationsSection({
               className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
             <p className="text-[11px] text-neutral-600 mt-1">
-              {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will alert and pause autonomous tasks if daily cost exceeds $${dailyCostCeilingUsd}.`}
+              {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will raise a warning alert (and send a notification, if enabled) when daily spend exceeds $${dailyCostCeilingUsd}. Autonomous tasks keep running.`}
             </p>
           </>
         ) : (

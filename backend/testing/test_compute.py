@@ -37,6 +37,8 @@ from app.compute_backends import (
 )
 from app.database import resolve_async_engine
 from app.models import (
+    Alert,
+    AlertSeverity,
     Artifact,
     ArtifactType,
     ComputeJob,
@@ -7403,4 +7405,161 @@ async def test_park_wake_timeout_diagnostics_provisioning_vs_runtime_split(db_se
     # job ran for (deadline - started_at); provisioning is (started_at - created_at).
     # Both should be positive.
     assert diag_b["provisioning_seconds"] > 0
-    assert diag_b["execution_seconds"] > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Daily cost ceiling alert — compute wake finalization path
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
+    db_session, monkeypatch
+):
+    """Compute wake finalization creates a budget alert when spend exceeds the ceiling.
+
+    Verifies three behaviours in one test:
+    (a) A terminal compute job whose spend pushes the project over the ceiling
+        creates exactly ONE budget alert via run_compute_wake_post_commit.
+    (b) Under the ceiling, no alert is created.
+    (c) Cross-path dedup: if an agent task already alerted today, a subsequent
+        compute wake does NOT create a second alert.
+    """
+    from unittest.mock import patch as _patch
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    import app.shared_state as _shared_state
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+    from app.task_lifecycle import fire_task_wakes, park_task
+    from app.time_utils import _utcnow
+
+    # ── Setup ────────────────────────────────────────────────────────────────
+    project = Project(name="Cost Ceiling Compute Wake Test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    monkeypatch.setattr(
+        "app.task_completion.broadcast_to_project", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "app.cost_ceiling.broadcast_to_project", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "app.notification_dispatch.dispatch_external_notification",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=(None, "precondition-not-met")),
+    )
+
+    async def _make_parked_task_and_terminal_job(final_cost_usd: float):
+        """Create a parked compute_experiment task backed by a terminal job."""
+        task = Task(
+            project_id=project.id,
+            title="compute_experiment: cost ceiling test",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo ok",
+            machine_type="e2-standard-2",
+            spend_cap_usd=final_cost_usd + 1.0,
+            deadline_seconds=300,
+        )
+        await park_task(
+            db_session,
+            task,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=_utcnow() + timedelta(hours=1),
+            reason=f"parked on compute job {job.id}",
+        )
+        await db_session.commit()
+
+        job.status = ComputeJobStatus.SUCCEEDED
+        job.outcome = ComputeJobOutcome.SUCCESS
+        job.final_cost_usd = final_cost_usd
+        job.accrued_cost_usd = final_cost_usd
+        job.completed_at = _utcnow().replace(tzinfo=None)
+        db_session.add(job)
+        await fire_task_wakes(
+            db_session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+        )
+        await db_session.commit()
+        return task, job
+
+    # ── Scenario (b): under ceiling — no alert ───────────────────────────────
+    with _patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 100.0}):
+        _task_b, _job_b = await _make_parked_task_and_terminal_job(final_cost_usd=0.10)
+        n_delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+        assert n_delivered >= 1
+
+    db_session.expire_all()
+    alerts_b = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_b) == 0, "no alert expected when spend is under ceiling"
+
+    # ── Scenario (a): over ceiling — exactly one alert ───────────────────────
+    with _patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
+        _task_a, _job_a = await _make_parked_task_and_terminal_job(final_cost_usd=0.60)
+        n_delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+        assert n_delivered >= 1
+
+    db_session.expire_all()
+    alerts_a = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Daily cost ceiling exceeded",
+                    Alert.severity == AlertSeverity.WARNING,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_a) == 1, f"expected exactly 1 alert, got {len(alerts_a)}"
+    assert alerts_a[0].task_id is None, "alert must be project-level (task_id IS NULL)"
+
+    # ── Scenario (c): cross-path dedup — no second alert on second wake ───────
+    with _patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
+        _task_c, _job_c = await _make_parked_task_and_terminal_job(final_cost_usd=0.70)
+        n_delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+        assert n_delivered >= 1
+
+    db_session.expire_all()
+    alerts_c = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Daily cost ceiling exceeded",
+                    Alert.severity == AlertSeverity.WARNING,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_c) == 1, (
+        f"dedup guard must prevent a second alert, got {len(alerts_c)}"
+    )

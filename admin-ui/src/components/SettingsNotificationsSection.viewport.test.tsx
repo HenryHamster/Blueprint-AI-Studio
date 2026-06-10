@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
@@ -100,6 +100,41 @@ describe('SettingsNotificationsSection — viewport regression', () => {
         );
       });
     });
+  });
+
+  // Backend contract: `_check_daily_cost_ceiling` (agent_status.py) raises a
+  // WARNING alert and fires an optional BUDGET_EXCEEDED notification when daily
+  // spend exceeds the ceiling — it does NOT pause autonomous tasks or stop
+  // dispatch. The active-ceiling help copy must mirror that alert-only behavior
+  // and must not promise a pause that the pipeline never performs.
+  test('renders_daily_cost_ceiling_as_alert_only', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <SettingsNotificationsSection
+            webhookUrl=""
+            onUpdateWebhookUrl={() => {}}
+            enabledEvents={[]}
+            onUpdateEnabledEvents={() => {}}
+            throttleSeconds={0}
+            onUpdateThrottleSeconds={() => {}}
+            dailyCostCeilingUsd={50}
+            onUpdateDailyCostCeiling={() => {}}
+            isAdmin={true}
+          />
+        );
+      });
+    });
+
+    const copy = host?.textContent ?? '';
+    // Truthful today: alert + optional notification, work continues.
+    expect(copy).toContain('warning alert');
+    expect(copy).toContain('Autonomous tasks keep running');
+    // Must not promise enforcement the backend does not perform.
+    expect(copy.toLowerCase()).not.toContain('pause autonomous');
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

@@ -1057,9 +1057,9 @@ async def cost_db(mocker):
         expire_on_commit=False,
     )
 
-    # Suppress broadcasts
+    # Suppress broadcasts (patched at cost_ceiling where the call actually happens)
     mocker.patch(
-        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+        "app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock
     )
     # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
     mocker.patch(

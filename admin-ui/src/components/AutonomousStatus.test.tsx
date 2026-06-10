@@ -28,6 +28,8 @@ function makeProject(overrides: {
   last_research_at?: string | null;
   tasks_spawned_last_hour?: number;
   rate_limit?: number;
+  fleet_default_rate_limit?: number;
+  rate_limit_source?: 'project_override' | 'fleet_default';
 } = {}) {
   return {
     project_id: 'proj-1',
@@ -37,6 +39,8 @@ function makeProject(overrides: {
     last_research_at: null,
     tasks_spawned_last_hour: 3,
     rate_limit: 10,
+    fleet_default_rate_limit: 10,
+    rate_limit_source: 'fleet_default' as const,
     ...overrides,
   };
 }
@@ -144,6 +148,24 @@ describe('AutonomousStatus expanded dropdown', () => {
     await renderExpanded([makeProject({ tasks_spawned_last_hour: 5, rate_limit: 10 })]);
     expect(screen.getByText('Tasks this hour')).toBeTruthy();
     expect(screen.getByText('/10')).toBeTruthy();
+  });
+
+  it('shows override badge when rate_limit_source is project_override', async () => {
+    await renderExpanded([makeProject({
+      rate_limit: 5,
+      fleet_default_rate_limit: 12,
+      rate_limit_source: 'project_override',
+    })]);
+    expect(screen.getByText('override')).toBeTruthy();
+  });
+
+  it('does not show override badge when rate_limit_source is fleet_default', async () => {
+    await renderExpanded([makeProject({
+      rate_limit: 12,
+      fleet_default_rate_limit: 12,
+      rate_limit_source: 'fleet_default',
+    })]);
+    expect(screen.queryByText('override')).toBeNull();
   });
 
   it('shows never for last research when null', async () => {
