@@ -850,19 +850,21 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     expect(call.status).toBe('COMPLETED');
   });
 
-  it('adversarial_grader unrecognized verdict on first attempt triggers warning not silent fail', async () => {
+  it('adversarial_grader unrecognized verdict on first attempt triggers re-ask (not silent fail)', async () => {
     // First attempt returns parseable JSON but with an unrecognized verdict string.
-    // repairStructuredOutput will see it as parseable (retry===null) — the vocabulary
-    // gate must still fire and log a warning instead of silently fail-closing the finding.
+    // The validateParsedValue hook rejects it, triggering a bounded re-ask.
+    // The re-ask here also returns unrecognized vocab, so the raw first output is passed through.
     const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"still holds at HEAD"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+    // Re-ask also returns unrecognized vocab → raw passthrough (first run's lastResultText).
     vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
 
     await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    // No repair re-ask: the first-attempt JSON was structurally parseable.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    // Vocab miss now triggers a re-ask — two calls expected.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
 
-    // A warning must have been logged — not a silent fail.
+    // The helper emits a schema-validation warning via validateParsedValue.
     const warnCall = vi.mocked(sendLog).mock.calls.find(
       ([, msg]) => typeof msg === 'string' && msg.includes('[WARNING]') && msg.includes('unrecognized'),
     );
@@ -872,6 +874,30 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.logs).toContain('agree');
+  });
+
+  it('first attempt unrecognized vocab triggers re-ask; re-ask with recognized verdicts posts repaired array', async () => {
+    const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"looks good"},{"hash":"def456","verdict":"disagree","reason":"not present"}]';
+    const RECOGNIZED_RETRY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"},{"hash":"def456","verdict":"fail","reason":"premise no longer present"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: RECOGNIZED_RETRY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Vocab miss on first attempt must trigger exactly one re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    // The repaired recognized array must be posted, not the unrecognized first attempt.
+    const posted = JSON.parse(call.logs as string) as Array<{hash: string; verdict: string}>;
+    const recognized = new Set(['pass', 'passed', 'approve', 'approved', 'fail', 'failed', 'reject', 'rejected']);
+    for (const item of posted) {
+      expect(recognized.has(item.verdict.toLowerCase())).toBe(true);
+    }
+    expect(call.logs).not.toContain('agree');
+    expect(call.logs).not.toContain('disagree');
   });
 });
 

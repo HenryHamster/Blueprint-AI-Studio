@@ -788,28 +788,29 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
       disallowedTools,
       retryStatus: 'Repairing adversarial challenge verdict array...',
       schemaLabel: 'research_spawn_adversarial_challenge',
+      validateParsedValue: (value) => {
+        const arr = value as Array<Record<string, unknown>>;
+        const unrecognized = arr
+          .map(item => {
+            const raw = item['verdict'];
+            return (typeof raw === 'string' ? raw : '').trim().toLowerCase();
+          })
+          .filter(v => !RECOGNIZED_VERDICTS.has(v));
+        if (unrecognized.length > 0) {
+          return {
+            ok: false,
+            reason: 'parsed_array_missing_key',
+            detail: `unrecognized verdict strings: ${unrecognized.join(', ')}`,
+          };
+        }
+        return { ok: true };
+      },
     });
-    // Vocabulary gate: repaired array is only usable when every verdict is in the
-    // backend-recognized set. An unrecognized verdict (e.g. "agree"/"disagree") would
-    // be silently dropped by parse_adversarial_finding_verdicts, treating the finding
-    // as fail-closed "verdict_unrecognized" — indistinguishable from a repair failure.
-    // Fall through to raw output in that case so the miss is observable.
-    const hasOnlyRecognizedVerdicts = (arr: Array<Record<string, unknown>>): boolean =>
-      arr.every(item => {
-        const raw = item['verdict'];
-        const v = (typeof raw === 'string' ? raw : '').trim().toLowerCase();
-        return RECOGNIZED_VERDICTS.has(v);
-      });
     let challengeLogs: string;
-    if (repaired.value !== null && repaired.retry !== null && hasOnlyRecognizedVerdicts(repaired.value)) {
+    if (repaired.value !== null && repaired.retry !== null) {
       // A focused re-ask succeeded with recognized verdicts — post the repaired array.
       challengeLogs = sanitize(JSON.stringify(repaired.value));
     } else {
-      // First attempt was parseable but has unrecognized verdict strings — warn so the
-      // miss is observable instead of silently producing a fail-closed backend outcome.
-      if (repaired.retry === null && repaired.value !== null && !hasOnlyRecognizedVerdicts(repaired.value)) {
-        sendLog(ws, `[WARNING] adversarial_grader: first-attempt verdict array contains unrecognized verdict strings — backend will fail-close these findings as verdict_unrecognized.\n`);
-      }
       // First attempt was already parseable (retry===null), repair failed, or
       // exitCode!==0 — pass raw output through unchanged.
       challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));

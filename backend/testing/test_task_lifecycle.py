@@ -8595,3 +8595,213 @@ async def test_sweep_stranded_skips_non_terminal_sidecar(tl_db, mocker):
     assert source.status == TaskStatus.EVALUATING, (
         "source must remain EVALUATING when sidecar is still live"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Adversarial Gate Challenger Provenance
+#
+# The adversarial gate verdict record should carry challenger runtime provenance
+# (grader VM instance id, agent source SHA, runtime fingerprint, image name, build
+# timestamp) to establish an evidence chain proving whether a verdict was produced
+# by a post-fix agent image. Provenance is best-effort: lookup failures do not
+# prevent the verdict from being written.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_adversarial_gate_includes_grader_provenance_from_pool_vm(tl_db, mocker):
+    """Adversarial gate record includes provenance fields from PoolVm when vm_instance_id exists."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from app.models import PoolVm
+
+    session, _ = tl_db
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+
+    # Mock the in-memory cache lookups to return None (forces fallback to PoolVm row).
+    mocker.patch(
+        "app.compute.get_vm_source_sha",
+        return_value=None,
+    )
+    mocker.patch(
+        "app.compute.get_vm_runtime_fingerprint",
+        return_value=None,
+    )
+
+    # Create a PoolVm row with provenance data.
+    pool_vm = PoolVm(
+        vm_instance_id=grader.vm_instance_id,
+        project_id=_project.id,
+        agent_source_sha="abc123def456789abcdef",
+        agent_runtime_fingerprint="runtime-fp-xyz",
+        agent_image_name="agent-image-v1.0.0",
+        agent_image_build_ts=1234567890,
+    )
+    session.add(pool_vm)
+    await session.commit()
+
+    # Set up the challenged hashes explicitly so parsing works.
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        QUALITY_GRADER_SOURCE_KEY: str(source.id),
+        "adversarial_grader": True,
+        "_adversarial_challenged_hashes": ["finding-hash-1"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-1", "verdict": "pass", "reason": "valid"}]',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+
+    # Verify provenance fields are present in the adversarial gate record.
+    gate_record = (source.context or {}).get("adversarial_gate") or {}
+    assert gate_record.get("grader_vm_instance_id") == grader.vm_instance_id
+    assert gate_record.get("grader_agent_source_sha") == "abc123def456789abcdef"
+    assert gate_record.get("grader_agent_runtime_fingerprint") == "runtime-fp-xyz"
+    assert gate_record.get("grader_agent_image_name") == "agent-image-v1.0.0"
+    assert gate_record.get("grader_agent_image_build_ts") == 1234567890
+    # Verdict and parse_outcome should also be present.
+    assert "finding_verdicts" in gate_record
+    assert gate_record.get("parse_outcome") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_adversarial_gate_fallback_provenance_from_cache(tl_db, mocker):
+    """Adversarial gate uses in-memory cache when available, falls back to PoolVm for fields cache lacks."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from app.models import PoolVm
+
+    session, _ = tl_db
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+
+    # Mock: cache has source_sha but not runtime_fingerprint.
+    mocker.patch(
+        "app.compute.get_vm_source_sha",
+        return_value="cached-source-sha-abc123",
+    )
+    mocker.patch(
+        "app.compute.get_vm_runtime_fingerprint",
+        return_value=None,
+    )
+
+    # PoolVm row provides fallback for runtime_fingerprint and image metadata.
+    pool_vm = PoolVm(
+        vm_instance_id=grader.vm_instance_id,
+        project_id=_project.id,
+        agent_source_sha="poolvm-source-sha-ignored",  # Cache takes precedence
+        agent_runtime_fingerprint="poolvm-runtime-fp",  # Falls back here
+        agent_image_name="poolvm-agent-image",
+        agent_image_build_ts=9999,
+    )
+    session.add(pool_vm)
+    await session.commit()
+
+    # Set up the challenged hashes explicitly.
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        QUALITY_GRADER_SOURCE_KEY: str(source.id),
+        "adversarial_grader": True,
+        "_adversarial_challenged_hashes": ["finding-hash-2"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-2", "verdict": "fail", "reason": "issue"}]',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+
+    gate_record = (source.context or {}).get("adversarial_gate") or {}
+    # Cache value takes precedence.
+    assert gate_record.get("grader_agent_source_sha") == "cached-source-sha-abc123"
+    # Fallback to PoolVm for missing cache value.
+    assert gate_record.get("grader_agent_runtime_fingerprint") == "poolvm-runtime-fp"
+    # Image metadata comes from PoolVm.
+    assert gate_record.get("grader_agent_image_name") == "poolvm-agent-image"
+    assert gate_record.get("grader_agent_image_build_ts") == 9999
+
+
+@pytest.mark.asyncio
+async def test_adversarial_gate_provenance_lookup_failure_doesnt_prevent_verdict(
+    tl_db, mocker
+):
+    """Provenance lookup failure (exception) doesn't prevent verdict from being written."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+
+    # Mock provenance lookups to raise an exception (best-effort should catch it).
+    mocker.patch(
+        "app.compute.get_vm_source_sha",
+        side_effect=RuntimeError("Cache lookup failed"),
+    )
+
+    # Set up the challenged hashes explicitly.
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        QUALITY_GRADER_SOURCE_KEY: str(source.id),
+        "adversarial_grader": True,
+        "_adversarial_challenged_hashes": ["finding-hash-3"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-3", "verdict": "pass", "reason": "valid"}]',
+    )
+    # This should not raise; provenance is best-effort.
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+
+    gate_record = (source.context or {}).get("adversarial_gate") or {}
+    # Verdict and parse_outcome must be present even if provenance lookup failed.
+    assert "finding_verdicts" in gate_record, (
+        "verdict must be written even when provenance lookup fails"
+    )
+    assert gate_record.get("parse_outcome") == "ok"
+    assert gate_record.get("finding_verdicts", {}).get("finding-hash-3", {}).get("passed") is True
+    # Provenance fields may or may not be present, but absence is OK.
+    # (The exception is caught and logged at debug level)
