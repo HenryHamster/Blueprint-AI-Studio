@@ -1326,6 +1326,49 @@ export const CAPABILITY_DECLARATION_DOC = [
   '**Shared capability vocabulary (applies to this and every other task type):** you may declare a `provides_capability` stamp (a capability your work ADVERTISES) and/or a `prerequisite` capability ref (a capability your work DEPENDS ON). BOTH must be drawn from the AVAILABLE CAPABILITIES list above when one fits — the registry is the shared namespace, and the resolver matches EXACTLY (no fuzzy matching), so a free-prose name a different lane will never reproduce leaves the dependency stranded. Use the SAME kebab-case convention and propose a NEW name ONLY for a genuinely new capability absent from the list. An off-registry ref is still accepted (never rejected) and flagged advisory for the strategist to fold into the registry.',
 ].join('\n');
 
+// Mirrors the backend's plan-child allowlist: PLAN_SUBTASK_TYPES (the
+// PR-producing implementation subtypes) ∪ PLAN_KNOWLEDGE_SUBTASK_TYPES (the
+// knowledge-prerequisite subtypes) in backend/app/task_capabilities.py. Keep in
+// sync when registering a new plan-spawnable type.
+const PLAN_CHILD_TYPE_VOCABULARY = new Set([
+  'create', 'refactor', 'migrate', 'qa',
+  'web_research', 'design', 'compute_experiment',
+]);
+
+// The plan prompt asks for conventional-commit TITLES ("fix: ...") while the
+// backend's plan-child registry has no "fix" TYPE (a plan child cannot carry
+// the pre-existing PR context a fix task needs) — models conflate the two, and
+// a single off-vocabulary type used to FAIL the whole plan downstream when a
+// later subtask depended on the skipped producer (plan_completion's
+// unsatisfiable-dependency check). Coerce loudly to "create" — the documented
+// default and the exact semantics of a fresh plan child — instead of shipping
+// a plan the backend must reject. Non-JSON or schema-less input passes through
+// untouched (the raw-output fallback path; the backend owns parsing it).
+export function normalizePlanSubtaskTypes(planJson: string, log?: (msg: string) => void): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(planJson);
+  } catch {
+    return planJson;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as Record<string, unknown>).subtasks)) {
+    return planJson;
+  }
+  const plan = parsed as Record<string, unknown> & { subtasks: unknown[] };
+  let changed = false;
+  for (const sub of plan.subtasks) {
+    if (!sub || typeof sub !== 'object' || Array.isArray(sub)) continue;
+    const subtask = sub as Record<string, unknown>;
+    const rawType = subtask.type;
+    if (rawType === undefined || rawType === null) continue; // backend defaults to "create"
+    if (typeof rawType === 'string' && PLAN_CHILD_TYPE_VOCABULARY.has(rawType)) continue;
+    log?.(`[PLAN] Subtask ${JSON.stringify(String(subtask.title ?? ''))} requested off-vocabulary type ${JSON.stringify(rawType)} — coercing to "create" so the plan stays spawnable\n`);
+    subtask.type = 'create';
+    changed = true;
+  }
+  return changed ? JSON.stringify(plan) : planJson;
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1469,7 +1512,7 @@ Rules:
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
-- The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs.
+- The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs. The type field must be EXACTLY one of those values (or a knowledge-prerequisite type below). "fix" is NOT a valid subtask type — a bug-fixing subtask is type "create" even when its TITLE uses the "fix:" conventional-commit prefix (titles and types are independent; a plan child always starts from a fresh branch, which is what "create" means).
 - EMPIRICAL PREREQUISITE (optional, additive): besides the implementation subtypes above, a plan MAY emit a measurement prerequisite subtask of type="compute_experiment" when a later subtask should "measure this first, then act on the verdict". It does NOT produce a PR — it launches a budgeted, auto-torn-down compute job and persists a durable MEASURED VERDICT as knowledge. It carries a launch contract: "command" (the experiment to run), a positive "spend_cap_usd", a positive "deadline_seconds", and an OPTIONAL "success_criterion": {"metric", "operator", "threshold"}. A later implementation subtask consumes the verdict by naming this subtask's index in its depends_on_indices — it is handed the experiment's knowledge at launch. A MEASURED NEGATIVE result (success_criterion honestly missed) is still consumable evidence: the dependent still runs and acts on the verdict. Only a BROKEN run that produced no usable verdict cancels the dependent follow-on work.
 - acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - prerequisite (OPTIONAL, default null): a FOUNDATION this subtask depends on that is built OUTSIDE this plan (another lane / an already-built capability). Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` or \`{"kind": "capability", "ref": "<capability-name>"}\`. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to whichever task advertises it (the matcher is EXACT). Use depends_on_indices — NOT prerequisite — to order subtasks WITHIN this plan; prerequisite is only for cross-lane/cross-plan foundations.
@@ -1516,6 +1559,10 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
       logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
   }
+
+  // Coerce off-vocabulary subtask types (notably "fix") to "create" before the
+  // backend parses the plan — see normalizePlanSubtaskTypes for why.
+  logs = normalizePlanSubtaskTypes(logs, (m) => sendLog(ws, m));
 
   // Backend's _handle_plan_completion parses `logs` on COMPLETED and creates
   // children with the correct plan branch. No agent-side spawn is needed —

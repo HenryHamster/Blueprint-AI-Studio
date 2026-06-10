@@ -61,6 +61,63 @@ def _set_review_loop_terminal_outcome(
     flag_modified(task, "context")
 
 
+# Escalation kinds that flag the chain original ``requires_approval`` while the
+# review-fix loop KEEPS RUNNING (stuck cycle / standoff / repeat-fingerprint
+# halt). These holds exist to point an operator at a loop that looks like it is
+# not converging — but the loop is not stopped by them, so when it demonstrably
+# converges anyway (a later review APPROVEs, or the PR merges) the hold is
+# stale and must be released. Left in place, the recovery sweep's 2h
+# approval-gate timeout FAILs a healthy parent out from under its own in-flight
+# fix chain (research 6506582b / PR #9179, 2026-06-09). ``cap_exhausted`` is
+# deliberately NOT in this set: that path closes the PR and terminalizes the
+# chain, so nothing can legitimately converge afterwards.
+_RESOLVABLE_ESCALATION_GATE_KINDS = frozenset(
+    {"stuck", "standoff", "repeat_fingerprint_halt"}
+)
+
+
+def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bool:
+    """Release a stale stuck/standoff/repeat-fingerprint approval hold.
+
+    Pure mutation (mirrors :func:`_set_review_loop_terminal_outcome`): the
+    caller owns the row lock and the commit. Only touches holds whose recorded
+    terminal-outcome breadcrumb is one of the resolvable escalation kinds —
+    spend/budget holds, branch-safety holds, and any hold without a matching
+    breadcrumb are left untouched. Returns ``True`` iff the gate was released.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    if not orig.requires_approval:
+        return False
+    ctx = dict(orig.context or {})
+    from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
+
+    if ctx.get("approval_hold_reason") == SPEND_BUDGET_APPROVAL_HOLD_REASON:
+        return False
+    outcome = ctx.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY) or {}
+    if outcome.get("kind") not in _RESOLVABLE_ESCALATION_GATE_KINDS:
+        return False
+    orig.requires_approval = False
+    # Drop the timer baseline too — a later, unrelated hold must start fresh,
+    # not inherit this hold's elapsed time.
+    ctx.pop("_approval_set_at", None)
+    ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = {
+        **outcome,
+        "resolved": True,
+        "resolved_by": resolved_by,
+        "resolved_at": _utcnow().isoformat(),
+    }
+    orig.context = ctx
+    flag_modified(orig, "context")
+    logger.info(
+        "[PIPELINE] Released %s approval hold on %s (%s)",
+        outcome.get("kind"),
+        str(orig.id)[:8],
+        resolved_by,
+    )
+    return True
+
+
 _CHURN_NARROW_FOCUS_PREFIX = (
     "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
     "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "

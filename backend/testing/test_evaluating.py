@@ -3991,3 +3991,157 @@ async def test_ci_backstop_fires_after_defer_window_and_exhausted_retries(
         f"retries (no permanent wedge), got {parent.status}: "
         f"{parent.latest_status_message!r}"
     )
+
+
+# ── Approval-gate timeout: bounded active-chain defer ─────────────────────────
+
+
+def _chain_busy_fix_child(project_id, parent_id, *, status=TaskStatus.EVALUATING):
+    """A fix child still working the chain's PR — the de99593a shape: parked in
+    CI-wait (EVALUATING), which _chain_has_active_pipeline_work does not count."""
+    return Task(
+        project_id=project_id,
+        parent_task_id=parent_id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9179,
+                "original_task_id": str(parent_id),
+                "prompt": "fix CI on the rollup PR",
+            }
+        ],
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_defers_while_chain_busy(eval_db, mocker):
+    """A review-escalation hold past the 2h window must NOT FAIL the parent
+    while its review/fix chain still has non-terminal work for the PR —
+    including a fix child parked in CI-wait (EVALUATING). Regression test for
+    research 6506582b / PR #9179 (2026-06-09): the parent was FAILED at the
+    bare 2h mark while fix iteration 3 was actively waiting on CI."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Approval Gate Busy Chain", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=3).isoformat(),
+            "review_loop": {"pr_number": 9179, "base_branch": "automain"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    fix_child = _chain_busy_fix_child(project.id, parent.id)
+    eval_db.add(fix_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Approval-gate timeout must defer while the chain is busy, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    assert parent.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_fails_past_defer_ceiling_even_if_busy(
+    eval_db, mocker
+):
+    """The active-chain defer is BOUNDED: past 2h + APPROVAL_GATE_DEFER_WINDOW
+    (6h) the original unconditional FAILED terminalization applies even with a
+    busy chain, so a genuinely wedged loop still terminates."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Approval Gate Ceiling", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=9).isoformat(),
+            "review_loop": {"pr_number": 9179, "base_branch": "automain"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    fix_child = _chain_busy_fix_child(project.id, parent.id)
+    eval_db.add(fix_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Past the hard ceiling the approval-gate timeout must still fire, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_still_fails_when_chain_quiescent(
+    eval_db, mocker
+):
+    """With NO live chain work (only a terminal fix child), the 2h timeout
+    keeps today's behavior exactly: FAILED."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Approval Gate Quiescent", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=3).isoformat(),
+            "review_loop": {"pr_number": 9179, "base_branch": "automain"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    done_fix = _chain_busy_fix_child(
+        project.id, parent.id, status=TaskStatus.COMPLETED
+    )
+    eval_db.add(done_fix)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"A quiescent chain must keep the 2h FAILED terminalization, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
