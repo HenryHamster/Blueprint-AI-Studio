@@ -914,6 +914,8 @@ async def reset_account_rate_limits(
         mem_account = _account_by_id.get(account_id)
         if mem_account:
             mem_account.pop("disabled_models", None)
+            mem_account.pop("startup_failure_cooldown_at", None)
+            mem_account.pop("startup_failure_events", None)
             mem_account["enabled"] = True
             mem_account.pop("disabled_at", None)
             mem_account.pop("rl_hit_count", None)

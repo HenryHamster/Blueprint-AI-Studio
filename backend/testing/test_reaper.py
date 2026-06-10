@@ -1129,6 +1129,73 @@ async def test_provision_task_specific_failure_burns_budget(
     assert t.status == TaskStatus.QUEUED
 
 
+@pytest.mark.asyncio
+async def test_provision_noninfra_startup_failure_calls_record_account_startup_failure(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Non-infra agent-startup failure → record_account_startup_failure called with
+    the account ID from task context and the provision zone."""
+    mocker.patch("app.reaper.get_provision_error", return_value="startup-script exit 1")
+    mocker.patch("app.reaper.get_vm_zone", return_value="us-east1-a")
+
+    record_mock = mocker.patch(
+        "app.max_plan_pool.record_account_startup_failure", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-non-infra-sf",
+        status=TaskStatus.PROVISIONING,
+        started_at=datetime.utcnow() - timedelta(minutes=16),
+        latest_status_message="agent /entrypoint.sh returned 1",
+        context={
+            "provision_zone": "us-east1-a",
+            "max_plan_account_id": "acct-startup-test",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    record_mock.assert_awaited_once_with("acct-startup-test", "us-east1-a")
+
+
+@pytest.mark.asyncio
+async def test_provision_infra_failure_does_not_call_record_account_startup_failure(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Infra-wide failure → record_account_startup_failure must NOT be called."""
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value="us-east1-a")
+
+    record_mock = mocker.patch(
+        "app.max_plan_pool.record_account_startup_failure", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-infra-sf",
+        status=TaskStatus.PROVISIONING,
+        started_at=datetime.utcnow() - timedelta(minutes=16),
+        latest_status_message="QUOTA exceeded: cpus_all_regions",
+        context={
+            "provision_zone": "us-east1-a",
+            "max_plan_account_id": "acct-infra-test",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    record_mock.assert_not_awaited()
+
+
 # ── Rate-limit detection ─────────────────────────────────────────────────
 
 

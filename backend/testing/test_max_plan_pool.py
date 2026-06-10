@@ -21,11 +21,15 @@ from app.max_plan_pool import (
     _OUTCOME_WINDOW_SECONDS,
     _QUARANTINE_COOLDOWN_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
+    _STARTUP_FAILURE_COOLDOWN_SECONDS,
+    _STARTUP_FAILURE_THRESHOLD,
     _USAGE_HEADROOM_NEUTRAL,
     _USAGE_SNAPSHOT_TTL_SECONDS,
     _account_at_cap,
     _account_available_for_model,
     _account_by_id,
+    _account_state_for_model,
+    _build_rate_limit_state_blob,
     _apply_usage_gate,
     _cached_usage_snapshot,
     _check_quarantine_trigger,
@@ -40,6 +44,7 @@ from app.max_plan_pool import (
     _max_plan_pools,
     _maybe_schedule_usage_refresh,
     _normalize_rl_model,
+    _pending_cap_persists,
     _pending_rl_persists,
     _prune_health_events,
     _refresh_usage_snapshot,
@@ -55,6 +60,8 @@ from app.max_plan_pool import (
     disable_account_model,
     get_account_health_stats,
     get_all_account_health_summaries,
+    record_account_startup_failure,
+    recheck_disabled_accounts,
     select_max_plan_account,
     select_max_plan_account_balanced,
     summarize_pool_state,
@@ -83,6 +90,7 @@ def _autoclean_pool_state():
 
     _max_plan_pools.clear()
     _account_by_id.clear()
+    _pending_cap_persists.clear()
     _account_failure_log.clear()
 
 
@@ -2594,3 +2602,424 @@ class TestNoIOUnderLock:
         assert acct.get("usage_probe_inflight") is True
         await asyncio.sleep(0)  # let the fire-and-forget task run
         assert ran["count"] == 1
+
+
+# ── record_account_startup_failure / startup-failure breaker ────────────────
+
+
+def _pool_acct(acct_id: str, **kw) -> dict:
+    """Create an account dict and register it in _account_by_id for breaker tests."""
+    entry = {
+        "id": acct_id,
+        "name": acct_id,
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+    }
+    entry.update(kw)
+    _account_by_id[acct_id] = entry
+    return entry
+
+
+@pytest.mark.asyncio
+class TestRecordAccountStartupFailure:
+    async def _record_n(self, acct_id: str, zones: list[str], n: int | None = None) -> None:
+        """Record n startup failures cycling through zones list."""
+        count = n if n is not None else _STARTUP_FAILURE_THRESHOLD
+        for i in range(count):
+            await record_account_startup_failure(acct_id, zones[i % len(zones)])
+
+    async def test_multi_zone_failures_trip_breaker(self):
+        acct = _pool_acct("a")
+        await self._record_n("a", ["us-central1-b", "us-central1-c"])
+        assert acct.get("startup_failure_cooldown_at") is not None
+        reason = acct.get("disabled_reason", "")
+        assert reason.startswith("startup-failure cooldown")
+        assert "a" in _pending_cap_persists
+
+    async def test_single_zone_failures_do_not_trip_breaker(self):
+        acct = _pool_acct("a")
+        await self._record_n("a", ["us-central1-b"], n=_STARTUP_FAILURE_THRESHOLD + 2)
+        assert acct.get("startup_failure_cooldown_at") is None
+
+    async def test_below_threshold_no_trip(self):
+        acct = _pool_acct("a")
+        await self._record_n(
+            "a",
+            ["us-central1-b", "us-central1-c"],
+            n=_STARTUP_FAILURE_THRESHOLD - 1,
+        )
+        assert acct.get("startup_failure_cooldown_at") is None
+
+    async def test_exactly_threshold_trips_breaker(self):
+        acct = _pool_acct("a")
+        await self._record_n(
+            "a",
+            ["us-central1-b", "us-central1-c"],
+            n=_STARTUP_FAILURE_THRESHOLD,
+        )
+        assert acct.get("startup_failure_cooldown_at") is not None
+
+    async def test_already_in_cooldown_does_not_reset_timer(self):
+        acct = _pool_acct("a")
+        await self._record_n("a", ["us-central1-b", "us-central1-c"])
+        first_cooldown_at = acct["startup_failure_cooldown_at"]
+        # Record more failures — timer should not move
+        await self._record_n("a", ["us-central1-b", "us-central1-c"])
+        assert acct["startup_failure_cooldown_at"] == first_cooldown_at
+
+    async def test_unknown_account_is_noop(self):
+        # Should not raise
+        await record_account_startup_failure("unknown-account-id", "us-central1-b")
+
+    async def test_zone_wide_storm_different_accounts_not_blamed(self):
+        """Zone-wide storm: many accounts each fail once in the same zone.
+        No single account reaches the multi-zone threshold, so none are tripped."""
+        for i in range(10):
+            _pool_acct(f"acct-{i}")
+            # Each account gets failures only in one zone (zone-wide signature)
+            await self._record_n(f"acct-{i}", ["us-central1-b"], n=_STARTUP_FAILURE_THRESHOLD + 1)
+        # No account should be in startup-failure cooldown
+        for i in range(10):
+            assert _account_by_id[f"acct-{i}"].get("startup_failure_cooldown_at") is None
+
+
+@pytest.mark.asyncio
+class TestStartupFailureAccountState:
+    async def test_account_unavailable_during_cooldown(self):
+        acct = _pool_acct("a")
+        now = datetime.utcnow()
+        acct["startup_failure_cooldown_at"] = now - timedelta(seconds=10)
+        # 10 seconds elapsed < 30min cooldown → unavailable
+        state = _account_state_for_model(acct, "claude-opus-4-8", now=now)
+        assert state == "unavailable"
+
+    async def test_account_available_after_cooldown_expires(self):
+        acct = _pool_acct("a")
+        now = datetime.utcnow()
+        expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
+        acct["startup_failure_cooldown_at"] = expired_at
+        state = _account_state_for_model(acct, "claude-opus-4-8", now=now)
+        assert state != "unavailable"
+
+    async def test_no_cooldown_account_healthy(self):
+        acct = _pool_acct("a")
+        state = _account_state_for_model(acct, "claude-opus-4-8")
+        assert state == "healthy"
+
+
+@pytest.mark.asyncio
+class TestRecheckClearsStartupCooldown:
+    async def test_recheck_clears_expired_cooldown(self, monkeypatch):
+        acct = _pool_acct("a")
+        now = datetime.utcnow()
+        expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
+        acct["startup_failure_cooldown_at"] = expired_at
+        acct["disabled_reason"] = "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
+
+        # Patch DB calls so we don't need a real DB session
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtx(),
+        )
+        await recheck_disabled_accounts()
+
+        assert acct.get("startup_failure_cooldown_at") is None
+        # disabled_reason is cleared (queued for DB persist)
+        assert acct.get("disabled_reason") is None
+        assert "a" in _pending_cap_persists
+
+    async def test_recheck_does_not_clear_active_cooldown(self, monkeypatch):
+        acct = _pool_acct("a")
+        now = datetime.utcnow()
+        acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # recent
+        acct["disabled_reason"] = "startup-failure cooldown: ..."
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtx(),
+        )
+        await recheck_disabled_accounts()
+
+        # Still in cooldown
+        assert acct.get("startup_failure_cooldown_at") is not None
+
+    async def test_persist_retry_during_active_cooldown_preserves_reason(
+        self, monkeypatch
+    ):
+        """Regression: _pending_rl_persists retry must not wipe disabled_reason
+        while a startup-failure cooldown is still active (enabled=True accounts
+        that carry a disabled_reason for UI visibility)."""
+        acct = _pool_acct("a")
+        now = datetime.utcnow()
+        acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # active
+        expected_reason = "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        acct["disabled_reason"] = expected_reason
+
+        # Simulate a previously failed rl-persist that queued a retry
+        if "a" not in _pending_rl_persists:
+            _pending_rl_persists.append("a")
+
+        fake_db_acct = _FakeDbAcct()
+        fake_db_acct.disabled_reason = expected_reason
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtxWithAcct(fake_db_acct),
+        )
+        await recheck_disabled_accounts()
+
+        # In-memory reason must be preserved
+        assert acct.get("disabled_reason") == expected_reason
+        # DB-side reason must NOT have been wiped
+        assert fake_db_acct.disabled_reason == expected_reason
+
+
+class _FakeDbAcct:
+    """Minimal stub for a DB MaxPlanAccount row."""
+
+    rate_limit_state = None
+    enabled = True
+    disabled_reason = None
+    disabled_at = None
+    daily_task_count = 0
+    daily_task_count_reset_at = None
+
+
+class _FakeAsyncSessionCtxWithAcct:
+    """Fake session that returns a stub DB account from get()."""
+
+    def __init__(self, db_acct: _FakeDbAcct):
+        self._db_acct = db_acct
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    async def get(self, *_a, **_k):
+        return self._db_acct
+
+    async def commit(self):
+        pass
+
+    def add(self, *_):
+        pass
+
+
+class _FakeAsyncSessionCtx:
+    """Minimal async context manager + session stub for tests that don't need DB."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    async def get(self, *_a, **_k):
+        return None
+
+    async def commit(self):
+        pass
+
+    def add(self, *_):
+        pass
+
+
+# ── _build_rate_limit_state_blob startup-failure coverage ───────────────────
+
+
+class TestBuildRateLimitStateBlobStartupFailure:
+    def test_startup_failure_cooldown_at_written_to_blob(self):
+        now = datetime.utcnow()
+        acct = _acct(startup_failure_cooldown_at=now)
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob is not None
+        assert "startup_failure_cooldown_at" in blob
+        assert blob["startup_failure_cooldown_at"] == now.isoformat()
+
+    def test_startup_failure_reason_written_to_blob(self):
+        now = datetime.utcnow()
+        reason = "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
+        acct = _acct(startup_failure_cooldown_at=now, disabled_reason=reason)
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob is not None
+        assert blob.get("startup_failure_disabled_reason") == reason
+
+    def test_non_startup_reason_not_written_to_blob(self):
+        now = datetime.utcnow()
+        acct = _acct(startup_failure_cooldown_at=now, disabled_reason="rate limit")
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob is not None
+        assert "startup_failure_disabled_reason" not in blob
+
+    def test_no_startup_cooldown_no_field_in_blob(self):
+        acct = _acct()
+        # No startup_failure_cooldown_at set
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob is None or "startup_failure_cooldown_at" not in (blob or {})
+
+    def test_blob_roundtrip_preserves_reason(self):
+        now = datetime.utcnow()
+        reason = "startup-failure cooldown: 3 agent-startup failure(s) in 120min across zones us-east1-b, us-west1-a"
+        acct = _acct(startup_failure_cooldown_at=now, disabled_reason=reason)
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob["startup_failure_cooldown_at"] == now.isoformat()
+        assert blob["startup_failure_disabled_reason"] == reason
+
+
+# ── load_max_plan_pool startup-failure restore ───────────────────────────────
+
+
+class _FakeMaxPlanAccount:
+    """Minimal stub that mimics a DB MaxPlanAccount row for load_max_plan_pool tests."""
+
+    def __init__(
+        self,
+        acct_id: str,
+        *,
+        rate_limit_state: dict | None = None,
+        disabled_reason: str | None = None,
+        enabled: bool = True,
+    ):
+        import uuid as _uuid
+        # uuid5 is deterministic across runs (no PYTHONHASHSEED dependency)
+        self.id = _uuid.uuid5(_uuid.NAMESPACE_DNS, acct_id)
+        self.name = acct_id
+        self.user_id = "user-1"
+        self.provider = None
+        self.auth_mode = None
+        self.secret_blob_ref = "sk-ant-test"
+        self.oauth_token = None
+        self.provider_metadata = {}
+        self.claude_config_json = None
+        self.enabled = enabled
+        self.total_tasks = 0
+        self.token_created_at = None
+        self.daily_task_cap = None
+        self.max_concurrent_tasks = None
+        self.auto_disable_after_rate_limits = None
+        self.daily_task_count = 0
+        self.daily_task_count_reset_at = None
+        self.disabled_reason = disabled_reason
+        self.disabled_at = None
+        self.rate_limit_state = rate_limit_state
+
+
+class _FakeLoadSession:
+    """Session stub for load_max_plan_pool: first execute() returns accounts, second returns tasks."""
+
+    def __init__(self, accounts: list, active_tasks: list | None = None):
+        self._accounts = accounts
+        self._active_tasks = active_tasks or []
+        self._call_count = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    async def execute(self, _stmt):
+        self._call_count += 1
+        if self._call_count == 1:
+            return _FakeScalarsResult(self._accounts)
+        return _FakeScalarsResult(self._active_tasks)
+
+    async def commit(self):
+        pass
+
+    def add(self, *_):
+        pass
+
+
+class _FakeScalarsResult:
+    def __init__(self, items):
+        self._items = items
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._items)
+
+
+@pytest.mark.asyncio
+class TestLoadMaxPlanPoolStartupFailureRestore:
+    async def _load_with_accounts(self, accounts: list, monkeypatch) -> None:
+        from app import max_plan_pool as mpp
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: _FakeLoadSession(accounts))
+        await mpp.load_max_plan_pool()
+
+    async def test_active_cooldown_restored_from_rate_limit_state(self, monkeypatch):
+        """load_max_plan_pool must restore startup_failure_cooldown_at from rate_limit_state."""
+        now = datetime.utcnow()
+        active_at = (now - timedelta(seconds=60)).isoformat()
+        acct = _FakeMaxPlanAccount(
+            "acct-a",
+            rate_limit_state={"startup_failure_cooldown_at": active_at},
+            disabled_reason=None,
+        )
+        await self._load_with_accounts([acct], monkeypatch)
+        entry = _account_by_id[str(acct.id)]
+        assert entry.get("startup_failure_cooldown_at") is not None
+
+    async def test_active_cooldown_restores_reason_from_blob(self, monkeypatch):
+        """disabled_reason from startup_failure_disabled_reason must survive restart."""
+        now = datetime.utcnow()
+        active_at = (now - timedelta(seconds=60)).isoformat()
+        reason = "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        acct = _FakeMaxPlanAccount(
+            "acct-a",
+            rate_limit_state={
+                "startup_failure_cooldown_at": active_at,
+                "startup_failure_disabled_reason": reason,
+            },
+            disabled_reason=None,
+        )
+        await self._load_with_accounts([acct], monkeypatch)
+        entry = _account_by_id[str(acct.id)]
+        assert (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+
+    async def test_active_cooldown_fallback_reason_when_no_blob_reason(self, monkeypatch):
+        """A cooldown without a persisted reason still gets a generic disabled_reason."""
+        now = datetime.utcnow()
+        active_at = (now - timedelta(seconds=60)).isoformat()
+        acct = _FakeMaxPlanAccount(
+            "acct-a",
+            rate_limit_state={"startup_failure_cooldown_at": active_at},
+            disabled_reason=None,
+        )
+        await self._load_with_accounts([acct], monkeypatch)
+        entry = _account_by_id[str(acct.id)]
+        assert (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+
+    async def test_expired_cooldown_clears_stale_disabled_reason(self, monkeypatch):
+        """An expired persisted cooldown must not leave a stale startup-failure reason."""
+        now = datetime.utcnow()
+        expired_at = (now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 120)).isoformat()
+        reason = "startup-failure cooldown: 5 failures across zones"
+        acct = _FakeMaxPlanAccount(
+            "acct-a",
+            rate_limit_state={"startup_failure_cooldown_at": expired_at},
+            disabled_reason=reason,
+        )
+        await self._load_with_accounts([acct], monkeypatch)
+        entry = _account_by_id[str(acct.id)]
+        # Cooldown must be gone
+        assert entry.get("startup_failure_cooldown_at") is None
+        # Stale reason must be cleared
+        assert not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+
+    async def test_no_startup_cooldown_in_rate_limit_state_leaves_entry_unset(self, monkeypatch):
+        """Accounts without a startup cooldown in rate_limit_state remain unaffected."""
+        acct = _FakeMaxPlanAccount(
+            "acct-a",
+            rate_limit_state={"disabled_models": {}},
+            disabled_reason=None,
+        )
+        await self._load_with_accounts([acct], monkeypatch)
+        entry = _account_by_id[str(acct.id)]
+        assert entry.get("startup_failure_cooldown_at") is None

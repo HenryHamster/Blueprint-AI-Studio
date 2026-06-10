@@ -2298,6 +2298,17 @@ async def reaper_service():
                                 record_zone_failure(
                                     prov_zone, reason="AGENT_STARTUP_FAILURE"
                                 )
+                                # Feed startup failure into per-account health/breaker.
+                                # Only when not is_infra (global outage already handled
+                                # upstream); multi-zone check is inside the function.
+                                if not is_infra and failed_acct:
+                                    from app.max_plan_pool import (
+                                        record_account_startup_failure,
+                                    )
+
+                                    await record_account_startup_failure(
+                                        failed_acct, prov_zone
+                                    )
                             else:
                                 # No provision_zone — VM may never have been created, or the
                                 # fallback chain couldn't resolve one.

@@ -648,6 +648,14 @@ _HEALTH_SCORE_DISQUALIFY_THRESHOLD = -4
 _SUCCESS_RATE_DEPRIORITIZE_MARGIN = 0.20
 _LATENCY_MIN_SAMPLES = 3
 
+# Startup-failure breaker: an account that consistently fails to start agents
+# (VM created but agent never claims) across multiple zones is account-sick,
+# not zone-sick. These constants gate the per-account cooldown.
+_STARTUP_FAILURE_WINDOW_SECONDS = 2 * 3600  # 2h rolling window for event collection
+_STARTUP_FAILURE_THRESHOLD = 5  # consecutive failures to trip the cooldown
+_STARTUP_FAILURE_MIN_ZONES = 2  # multi-zone signature required (single-zone = zone fault)
+_STARTUP_FAILURE_COOLDOWN_SECONDS = 30 * 60  # flat 30min cooldown after tripping
+
 
 def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> float:
     """Compute a rolling 24h health score. Higher is healthier.
@@ -927,9 +935,9 @@ async def load_max_plan_pool():
             }
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
+            now = _utcnow()
             db_disabled_models = rl_state.get("disabled_models", {})
             if db_disabled_models:
-                now = _utcnow()
                 restored_dm = {}
                 for model_name, info in db_disabled_models.items():
                     at_str = info.get("at")
@@ -986,6 +994,35 @@ async def load_max_plan_pool():
                             )
                 if restored_oe:
                     entry["outcome_events"] = restored_oe
+            # Restore startup-failure cooldown if still active
+            sf_at_str = rl_state.get("startup_failure_cooldown_at")
+            if sf_at_str:
+                try:
+                    sf_at_dt = datetime.fromisoformat(sf_at_str)
+                    elapsed = (now - sf_at_dt).total_seconds()
+                    if elapsed < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+                        entry["startup_failure_cooldown_at"] = sf_at_dt
+                        # Restore the reason text from the blob; if the cap-persist
+                        # hadn't flushed disabled_reason before the restart, reconstruct
+                        # it so the admin health UI always shows why the account is benched.
+                        sf_reason = rl_state.get("startup_failure_disabled_reason") or ""
+                        if sf_reason.startswith("startup-failure cooldown"):
+                            if not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown"):
+                                entry["disabled_reason"] = sf_reason
+                        elif not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown"):
+                            entry["disabled_reason"] = "startup-failure cooldown: agent-startup failures detected"
+                        logger.info(
+                            f"[STARTUP] Restored startup-failure cooldown for {acct.name}: "
+                            f"{(_STARTUP_FAILURE_COOLDOWN_SECONDS - elapsed):.0f}s remaining"
+                        )
+                    else:
+                        # Cooldown expired — clear stale disabled_reason so the UI
+                        # doesn't show an indefinite startup-failure reason after restart.
+                        reason = entry.get("disabled_reason") or ""
+                        if reason.startswith("startup-failure cooldown"):
+                            entry["disabled_reason"] = None
+                except (ValueError, TypeError):
+                    pass
             _max_plan_pools.setdefault(acct.user_id, []).append(entry)
             _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
@@ -1140,6 +1177,12 @@ def _account_state_for_model(
         return "unavailable"
     if not acct.get("enabled", True):
         return "unavailable"
+    # Startup-failure cooldown: account tripped the multi-zone breaker.
+    sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+    if sf_cooldown_at is not None:
+        _now = now or _utcnow()
+        if (_now - sf_cooldown_at).total_seconds() < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+            return "unavailable"
     # Availability filter: only consult when we have a concrete model.
     # account_has_model returns True, False, or None (unknown); False is
     # the only value that forces a skip.
@@ -1793,6 +1836,12 @@ def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
         }
     if pruned_outcomes:
         out["outcome_events"] = pruned_outcomes
+    sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+    if sf_cooldown_at is not None:
+        out["startup_failure_cooldown_at"] = sf_cooldown_at.isoformat()
+        sf_reason = acct.get("disabled_reason") or ""
+        if sf_reason.startswith("startup-failure cooldown"):
+            out["startup_failure_disabled_reason"] = sf_reason
     return out if out else None
 
 
@@ -2943,6 +2992,63 @@ async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
         return True
 
 
+async def record_account_startup_failure(acct_id: str, zone: str) -> None:
+    """Record an agent-startup failure (VM created, agent never claimed) for an account.
+
+    Tracks rolling startup failure events per account. When an account accumulates
+    >= _STARTUP_FAILURE_THRESHOLD failures across >= _STARTUP_FAILURE_MIN_ZONES distinct
+    zones within _STARTUP_FAILURE_WINDOW_SECONDS, a flat cooldown is set.
+
+    The multi-zone requirement is the key conservative guard: failures in a single
+    zone blame the zone (not the account), while multi-zone failures with a single
+    account are account-side. Callers must NOT call this when is_infra=True (global
+    outage) — that distinction belongs to the reaper.
+    """
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None:
+            return
+
+        now = _utcnow()
+
+        # Record this failure event and prune to the rolling window
+        events = acct.setdefault("startup_failure_events", [])
+        events.append({"at": now, "zone": zone})
+        cutoff = now - timedelta(seconds=_STARTUP_FAILURE_WINDOW_SECONDS)
+        acct["startup_failure_events"] = [e for e in events if e["at"] > cutoff]
+        events = acct["startup_failure_events"]
+
+        # Already in cooldown — record the event but don't reset the timer
+        sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+        if sf_cooldown_at and (now - sf_cooldown_at).total_seconds() < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+            return
+
+        # Not enough failures to consider tripping
+        if len(events) < _STARTUP_FAILURE_THRESHOLD:
+            return
+
+        # Require the multi-zone signature: single-zone failures blame the zone
+        zones = {e["zone"] for e in events}
+        if len(zones) < _STARTUP_FAILURE_MIN_ZONES:
+            return
+
+        # Trip the breaker — flat cooldown, visible in UI via disabled_reason
+        acct["startup_failure_cooldown_at"] = now
+        reason = (
+            f"startup-failure cooldown: {len(events)} agent-startup failure(s) in "
+            f"{_STARTUP_FAILURE_WINDOW_SECONDS // 60}min across zones "
+            f"{', '.join(sorted(zones))}"
+        )
+        acct["disabled_reason"] = reason
+        _pending_cap_persists.add(acct_id)
+        logger.warning(
+            f"[POOL] Account {acct['name']} startup-failure breaker tripped — "
+            f"{len(events)} failures across {len(zones)} zone(s) "
+            f"({_STARTUP_FAILURE_COOLDOWN_SECONDS // 60}min cooldown): {', '.join(sorted(zones))}"
+        )
+        await _persist_rate_limit_state_best_effort(acct_id, "startup-failure cooldown")
+
+
 async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
     """Clear cascade-scoped disabled_models entries after a successful task.
 
@@ -3176,6 +3282,20 @@ async def recheck_disabled_accounts():
         now = _utcnow()
 
         for acct in _account_by_id.values():
+            # Clear expired startup-failure cooldowns
+            sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+            if sf_cooldown_at and (now - sf_cooldown_at).total_seconds() >= _STARTUP_FAILURE_COOLDOWN_SECONDS:
+                acct.pop("startup_failure_cooldown_at", None)
+                reason = acct.get("disabled_reason") or ""
+                if reason.startswith("startup-failure cooldown"):
+                    acct["disabled_reason"] = None
+                    _pending_cap_persists.add(acct["id"])
+                logger.info(
+                    f"[POOL] Startup-failure cooldown cleared for {acct['name']} "
+                    f"({_STARTUP_FAILURE_COOLDOWN_SECONDS // 60}min elapsed)"
+                )
+                changed_accounts.append(acct)
+
             # Legacy full-account disable (backward compat)
             if not acct.get("enabled", True):
                 disabled_at = acct.get("disabled_at")
@@ -3211,8 +3331,16 @@ async def recheck_disabled_accounts():
                         db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
                         db_acct.enabled = acct.get("enabled", True)
                         if acct.get("enabled", True):
-                            db_acct.disabled_reason = None
-                            acct["disabled_reason"] = None
+                            # Guard: don't wipe disabled_reason while a startup-failure
+                            # cooldown is still active — that reason is visible in the UI
+                            # and managed by the cap-persist path, not this rl-persist path.
+                            sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+                            has_active_sf_cooldown = sf_cooldown_at is not None and (
+                                _utcnow() - sf_cooldown_at
+                            ).total_seconds() < _STARTUP_FAILURE_COOLDOWN_SECONDS
+                            if not has_active_sf_cooldown:
+                                db_acct.disabled_reason = None
+                                acct["disabled_reason"] = None
                             db_acct.disabled_at = None
                         else:
                             db_acct.disabled_at = acct.get("disabled_at")
