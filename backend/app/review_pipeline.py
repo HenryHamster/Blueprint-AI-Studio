@@ -33,6 +33,17 @@ from app.spawn_calibration import (
     _compute_scope_overflow_warning,
 )
 
+# Issue-ledger: derives per-region DEMANDED/APPLIED/CONTESTED state from
+# review_history. Side-effect-free; re-exported here so callers importing from
+# app.review_pipeline keep working.
+from app.issue_ledger import (  # noqa: F401
+    CONTESTED_JACCARD_THRESHOLD,
+    ISSUE_LEDGER_MAX_CONTESTED,
+    build_issue_ledger,
+    format_contested_regions_for_fix,
+    format_contested_regions_for_review,
+)
+
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
 # are re-exported here so existing callers/tests that import them from
 # app.review_pipeline keep working unchanged.
@@ -1910,6 +1921,21 @@ async def _spawn_pipeline_task(
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     type_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
 
+    # Reviewer-model pin: once the first review in a chain uses a specific model,
+    # all subsequent reviews on the same chain reuse it. Prevents model-rotation
+    # from introducing reviewer personality drift mid-chain. Gated on the
+    # "pin_reviewer_model" runtime flag (default on). Carry-forward always happens
+    # (fix spawns thread it through review_loop so the next review sees it).
+    _pin_reviewer = bool(_runtime_config.get("pin_reviewer_model", True))
+    reviewer_model_for_chain = source_loop.get("reviewer_model") if _pin_reviewer else None
+    if task_type == "review" and _pin_reviewer:
+        if reviewer_model_for_chain:
+            # Use the pinned model from a prior review in this chain.
+            type_model = reviewer_model_for_chain
+        elif type_model:
+            # First review in the chain — stamp the resolved type_model as the pin.
+            reviewer_model_for_chain = type_model
+
     if task_type == "review":
         title = f"Review PR #{pr_number}"
         payload_data = {
@@ -2314,6 +2340,35 @@ async def _spawn_pipeline_task(
                 )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
+    # Contested-region detection: derive the issue ledger from review_history and
+    # inject guidance when the same code region has been demanded, fixed, then
+    # demanded *differently* — the oscillation shape the stuck/churn detectors miss.
+    # Fix prompt: prepend a contested-region prefix (topmost, before churn/mid-budget
+    # prefixes that were prepended above, so the most actionable signal reads first).
+    # Review prompt: append — mirrors the overflow_instruction pattern below.
+    # Ledger is serialized into review_loop regardless of task_type so the full
+    # history of contested regions is visible to reviewers and fix agents alike.
+    _issue_ledger: dict = {}
+    if new_review_history:
+        _issue_ledger = build_issue_ledger(new_review_history)
+        _contested = _issue_ledger.get("contested") or []
+        if _contested:
+            if task_type == "fix":
+                contested_fix_prefix = format_contested_regions_for_fix(
+                    _contested, base_branch
+                )
+                if contested_fix_prefix:
+                    logger.info(
+                        f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
+                        f"{len(_contested)} region(s). Injecting fix-prompt prefix."
+                    )
+                    payload_data["prompt"] = contested_fix_prefix + (
+                        payload_data.get("prompt") or ""
+                    )
+                    fix_prompt = contested_fix_prefix + (fix_prompt or "")
+            # Review-prompt injection happens after validate_internal_payload
+            # (same placement as overflow_instruction — see below).
+
     # Graduated scope-budget pressure cap: a medium- or large-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its
     # production file budget. Activation is at SCOPE_PRESSURE_WARN_THRESHOLD
@@ -2498,6 +2553,23 @@ async def _spawn_pipeline_task(
                 + "\n\n"
                 + overflow_instruction
             ).strip()
+    # Contested-region review-prompt injection: append after overflow_instruction
+    # so the reviewer sees both when scope overflow is also present.
+    if task_type == "review" and _issue_ledger.get("contested"):
+        contested_review_appendix = format_contested_regions_for_review(
+            _issue_ledger["contested"], base_branch
+        )
+        if contested_review_appendix:
+            logger.info(
+                f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
+                f"{len(_issue_ledger['contested'])} region(s). "
+                f"Appending review-prompt guidance."
+            )
+            payload_data["original_prompt"] = (
+                (payload_data.get("original_prompt") or "").strip()
+                + "\n\n"
+                + contested_review_appendix
+            ).strip()
     # Persist the scope-budget hard cap (either newly triggered this spawn or
     # carried forward from a prior spawn) so _max_review_iterations enforces
     # it on subsequent review/fix iterations for this chain.
@@ -2614,6 +2686,22 @@ async def _spawn_pipeline_task(
         **(
             {"fix_agent_responses": accumulated_responses}
             if accumulated_responses
+            else {}
+        ),
+        # Issue ledger: carries contested regions across iterations so each fix/review
+        # agent sees the full oscillation history without re-deriving from history.
+        # Only written when the ledger has at least one contested region.
+        **(
+            {"issue_ledger": _issue_ledger}
+            if _issue_ledger.get("contested")
+            else {}
+        ),
+        # Reviewer-model pin: first review stamps the resolved model; subsequent
+        # reviews and fix tasks carry it forward so all reviews on the chain use
+        # the same model (prevents reviewer personality drift mid-chain).
+        **(
+            {"reviewer_model": reviewer_model_for_chain}
+            if reviewer_model_for_chain
             else {}
         ),
         # First-pass minor-only marker: when set, the fix-completion handler

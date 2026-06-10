@@ -11863,3 +11863,651 @@ async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocke
         f"lane_counts={lane_counts_stored!r}"
     )
     assert lane_counts_stored.get("ci") == 4 or "ci=4" in detail
+
+# ── Issue ledger: contested-region injection ──────────────────────────────────
+
+
+def _contest_issue(
+    description: str,
+    file: str = "backend/app/task_evaluators.py",
+    line: int = 42,
+    severity: str = "CRITICAL",
+) -> dict:
+    return {"description": description, "severity": severity, "file": file, "line": line}
+
+
+@pytest.mark.asyncio
+async def test_contested_region_injects_fix_prompt_prefix(db_session, mocker):
+    """When review_history contains a contested region (demanded → applied → differently
+    demanded), _spawn_pipeline_task must prepend the CONTESTED-REGIONS prefix to the
+    fix task's prompt."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # iter 0: region A demanded with description D1
+    # iter 1: region A absent → APPLIED
+    # iter 2: region A reappears with very different description D2 → CONTESTED
+    contested_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("replace old constants with new enum")],
+        },
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("unrelated issue on different file")],
+        },
+        {
+            "iteration": 2,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("revert to original frozenset constants")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9400,
+                "branch": "contested1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9400,
+                "branch": "contested1",
+                "base_branch": "main",
+                "review_history": contested_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # current_issues uses a different description to avoid triggering the
+    # stuck-cycle detector (which compares last 2 history entries).
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9400,
+        branch="contested1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix these issues.",
+        current_feedback="revert to original frozenset constants",
+        current_issues=[_issue("add missing type annotation")],
+    )
+
+    assert result is not None and created is True
+    prompt = (result.payloads[0] if result.payloads else {}).get("prompt") or ""
+    assert "CONTESTED" in prompt
+    # Contested prefix should be first (topmost)
+    assert prompt.index("CONTESTED") < prompt.index("Fix these issues.")
+
+
+@pytest.mark.asyncio
+async def test_contested_region_appends_review_prompt_guidance(db_session, mocker):
+    """When contested regions exist, the review task's original_prompt gets the
+    CONTESTED-REGIONS appendix directing the reviewer to reconcile prior demands."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Descriptions must have Jaccard < 0.5 to trigger CONTESTED (not RE_DEMANDED).
+    # "remove deprecated call site" vs "add back original method": 0 common tokens.
+    contested_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("remove deprecated call site")],
+        },
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("unrelated issue on different file")],
+        },
+        {
+            "iteration": 2,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("add back original method implementation")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9401,
+                "branch": "contested2",
+                "base_branch": "automain",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 3,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9401,
+                "branch": "contested2",
+                "base_branch": "automain",
+                "review_history": contested_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9401,
+        branch="contested2",
+        base_branch="automain",
+        original_task_id=str(original_task.id),
+        original_prompt="Review this PR for correctness.",
+    )
+
+    assert result is not None and created is True
+    original_prompt = (result.payloads[0] if result.payloads else {}).get(
+        "original_prompt"
+    ) or ""
+    assert "CONTESTED" in original_prompt
+    # Reconcile language and base-diff instruction must be present
+    assert "reconcil" in original_prompt.lower() or "coexist" in original_prompt.lower()
+    assert "git diff" in original_prompt
+    assert "origin/automain" in original_prompt
+
+
+@pytest.mark.asyncio
+async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
+    """When contested regions exist, review_loop['issue_ledger'] is written with
+    the contested list so future spawns can access the full oscillation history."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    contested_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("use list instead of frozenset")],
+        },
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("unrelated issue")],
+        },
+        {
+            "iteration": 2,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_contest_issue("revert back to frozenset")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9402,
+                "branch": "contested3",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9402,
+                "branch": "contested3",
+                "base_branch": "main",
+                "review_history": contested_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9402,
+        branch="contested3",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix.",
+        current_feedback="revert back to frozenset",
+        # current_issues is a new issue (different from the last history entry)
+        # to avoid triggering the stuck-cycle detector.
+        current_issues=[_issue("update docstring format")],
+    )
+
+    assert result is not None and created is True
+    spawned_loop = (result.context or {}).get("review_loop", {})
+    ledger = spawned_loop.get("issue_ledger")
+    assert ledger is not None
+    assert len(ledger["contested"]) >= 1
+    c = ledger["contested"][0]
+    assert c["file"] == "backend/app/task_evaluators.py"
+    assert "frozenset" in c["demanded_description"] or "frozenset" in c["reappeared_description"]
+
+
+@pytest.mark.asyncio
+async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker):
+    """When review_history has no contested regions, review_loop must NOT contain
+    an 'issue_ledger' key (avoid polluting context with empty dicts)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    normal_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("fix null check")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9403,
+                "branch": "clean1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9403,
+                "branch": "clean1",
+                "base_branch": "main",
+                "review_history": normal_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9403,
+        branch="clean1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix null check.",
+        current_feedback="fix null check",
+        # Different description from the history entry to avoid stuck-cycle detection.
+        current_issues=[_issue("add type annotation")],
+    )
+
+    assert result is not None and created is True
+    spawned_loop = (result.context or {}).get("review_loop", {})
+    assert "issue_ledger" not in spawned_loop
+
+
+# ── Reviewer-model pin ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reviewer_model_pin_stamped_on_first_review(db_session, mocker):
+    """First review spawn in a chain with a type_model stamps reviewer_model
+    into review_loop so subsequent reviews reuse the same model."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    from app.shared_state import runtime_config
+
+    runtime_config["task_type_models"] = {"review": "claude-opus-pinned"}
+    runtime_config["pin_reviewer_model"] = True
+    try:
+        project = await _make_db_project(db_session)
+        original_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        )
+        db_session.add(original_task)
+        await db_session.commit()
+        await db_session.refresh(original_task)
+
+        source_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "create",
+                    "pr_number": 9410,
+                    "branch": "pin1",
+                    "base_branch": "main",
+                    "original_task_id": str(original_task.id),
+                }
+            ],
+            context={
+                "scope": "medium",
+                "review_loop": {
+                    "iteration": 0,
+                    "original_task_id": str(original_task.id),
+                    "pr_number": 9410,
+                    "branch": "pin1",
+                    "base_branch": "main",
+                },
+            },
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        result, created = await _spawn_pipeline_task(
+            source_task,
+            "review",
+            db_session,
+            pr_number=9410,
+            branch="pin1",
+            base_branch="main",
+            original_task_id=str(original_task.id),
+        )
+
+        assert result is not None and created is True
+        spawned_loop = (result.context or {}).get("review_loop", {})
+        assert spawned_loop.get("reviewer_model") == "claude-opus-pinned"
+        # Payload model should also be set
+        model_in_payload = (result.payloads[0] if result.payloads else {}).get("model")
+        assert model_in_payload == "claude-opus-pinned"
+    finally:
+        runtime_config.pop("task_type_models", None)
+        runtime_config.pop("pin_reviewer_model", None)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_model_pin_reused_on_subsequent_review(db_session, mocker):
+    """When source_loop already has a reviewer_model, subsequent review spawns
+    reuse that model even if the runtime config has a different model set."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    from app.shared_state import runtime_config
+
+    runtime_config["task_type_models"] = {"review": "claude-new-model"}
+    runtime_config["pin_reviewer_model"] = True
+    try:
+        project = await _make_db_project(db_session)
+        original_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        )
+        db_session.add(original_task)
+        await db_session.commit()
+        await db_session.refresh(original_task)
+
+        # source_loop already has reviewer_model from iter 1's review spawn
+        source_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 9411,
+                    "branch": "pin2",
+                    "base_branch": "main",
+                    "original_task_id": str(original_task.id),
+                }
+            ],
+            context={
+                "scope": "medium",
+                "review_loop": {
+                    "iteration": 1,
+                    "original_task_id": str(original_task.id),
+                    "pr_number": 9411,
+                    "branch": "pin2",
+                    "base_branch": "main",
+                    "reviewer_model": "claude-original-pinned",
+                },
+            },
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        result, created = await _spawn_pipeline_task(
+            source_task,
+            "review",
+            db_session,
+            pr_number=9411,
+            branch="pin2",
+            base_branch="main",
+            original_task_id=str(original_task.id),
+            current_feedback="prev feedback",
+        )
+
+        assert result is not None and created is True
+        spawned_loop = (result.context or {}).get("review_loop", {})
+        # Must reuse the pinned model, NOT the new runtime config model
+        assert spawned_loop.get("reviewer_model") == "claude-original-pinned"
+        model_in_payload = (result.payloads[0] if result.payloads else {}).get("model")
+        assert model_in_payload == "claude-original-pinned"
+    finally:
+        runtime_config.pop("task_type_models", None)
+        runtime_config.pop("pin_reviewer_model", None)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_model_pin_disabled_via_config(db_session, mocker):
+    """When pin_reviewer_model=False, source_loop's reviewer_model is NOT used
+    and review_loop does not stamp reviewer_model."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    from app.shared_state import runtime_config
+
+    runtime_config["task_type_models"] = {"review": "claude-new-model"}
+    runtime_config["pin_reviewer_model"] = False
+    try:
+        project = await _make_db_project(db_session)
+        original_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        )
+        db_session.add(original_task)
+        await db_session.commit()
+        await db_session.refresh(original_task)
+
+        source_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 9412,
+                    "branch": "pin3",
+                    "base_branch": "main",
+                    "original_task_id": str(original_task.id),
+                }
+            ],
+            context={
+                "scope": "medium",
+                "review_loop": {
+                    "iteration": 1,
+                    "original_task_id": str(original_task.id),
+                    "pr_number": 9412,
+                    "branch": "pin3",
+                    "base_branch": "main",
+                    "reviewer_model": "claude-old-pinned",
+                },
+            },
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        result, created = await _spawn_pipeline_task(
+            source_task,
+            "review",
+            db_session,
+            pr_number=9412,
+            branch="pin3",
+            base_branch="main",
+            original_task_id=str(original_task.id),
+            current_feedback="prev feedback",
+        )
+
+        assert result is not None and created is True
+        spawned_loop = (result.context or {}).get("review_loop", {})
+        # Pin disabled → no reviewer_model stamped by review spawn
+        assert spawned_loop.get("reviewer_model") is None
+        # Payload uses the current runtime model, not the pinned one
+        model_in_payload = (result.payloads[0] if result.payloads else {}).get("model")
+        assert model_in_payload == "claude-new-model"
+    finally:
+        runtime_config.pop("task_type_models", None)
+        runtime_config.pop("pin_reviewer_model", None)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_model_carried_forward_in_fix_spawn(db_session, mocker):
+    """Fix spawns carry reviewer_model forward into review_loop so the next
+    review spawn can find it."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Review task with reviewer_model stamped
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9413,
+                "branch": "pin4",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9413,
+                "branch": "pin4",
+                "base_branch": "main",
+                "reviewer_model": "claude-pinned-abc",
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9413,
+        branch="pin4",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix the issue.",
+        current_feedback="fix this",
+        current_issues=[_issue("fix this")],
+    )
+
+    assert result is not None and created is True
+    spawned_loop = (result.context or {}).get("review_loop", {})
+    # Fix spawn carries reviewer_model forward for the next review to find
+    assert spawned_loop.get("reviewer_model") == "claude-pinned-abc"
