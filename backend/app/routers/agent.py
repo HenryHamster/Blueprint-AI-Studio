@@ -3514,6 +3514,33 @@ async def claim_task(
     else:
         response["build_config"] = {}
 
+    # Inject repo_overview for downstream code-change and review tasks so agents
+    # know the tech stack and layout discovered during repo_bootstrap without
+    # re-discovering it from scratch. Omitted entirely when absent so the claim
+    # shape is byte-identical for projects that never ran bootstrap.
+    _REPO_OVERVIEW_TASK_TYPES = {
+        "create", "fix", "refactor", "migrate", "qa", "docs", "review"
+    }
+    if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
+        _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
+        if (
+            isinstance(_raw_overview, dict)
+            and isinstance(_raw_overview.get("tech_stack"), str) and _raw_overview["tech_stack"]
+            and isinstance(_raw_overview.get("directory_layout"), str) and _raw_overview["directory_layout"]
+            and isinstance(_raw_overview.get("first_steps_summary"), str) and _raw_overview["first_steps_summary"]
+        ):
+            _repo_overview: dict = {
+                "tech_stack": _raw_overview["tech_stack"],
+                "directory_layout": _raw_overview["directory_layout"],
+                "first_steps_summary": _raw_overview["first_steps_summary"],
+            }
+            _bootstrap_completed_at = (project_for_playbook.build_config or {}).get(
+                "bootstrap_completed_at"
+            )
+            if _bootstrap_completed_at:
+                _repo_overview["bootstrap_completed_at"] = _bootstrap_completed_at
+            response["repo_overview"] = _repo_overview
+
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
     # for the agent to read README/manifests, produce a repo overview payload,
     # and write back confirmed build/test commands.

@@ -236,6 +236,27 @@ export function formatProjectVision(vision: Record<string, unknown> | undefined)
 // below already surfaces task.strategic_intent (purpose, current focus, context,
 // constraints), so calling this here too would double-render the same payload.
 // Returns '' when the payload is absent or empty so no bare header is emitted.
+// Render the repo_overview block shipped by the backend at claim time.
+// Shows tech stack, directory layout, first steps, and a freshness signal when
+// available. Presence-gated: returns '' when any required field is absent so the
+// prompt is byte-identical for projects that never ran bootstrap.
+export function formatRepoOverview(overview: unknown): string {
+  if (!overview || typeof overview !== 'object') return '';
+  const o = overview as Record<string, unknown>;
+  const techStack = typeof o.tech_stack === 'string' ? o.tech_stack.trim() : '';
+  const dirLayout = typeof o.directory_layout === 'string' ? o.directory_layout.trim() : '';
+  const firstSteps = typeof o.first_steps_summary === 'string' ? o.first_steps_summary.trim() : '';
+  if (!techStack || !dirLayout || !firstSteps) return '';
+  const lines: string[] = ['## Repo Overview'];
+  lines.push(`**Tech stack:** ${techStack}`);
+  lines.push(`**Directory layout:** ${dirLayout}`);
+  lines.push(`**First steps:** ${firstSteps}`);
+  const completedAt = typeof o.bootstrap_completed_at === 'string' ? o.bootstrap_completed_at.trim() : '';
+  if (completedAt) lines.push(`**Bootstrapped:** ${completedAt}`);
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
 export function formatStrategicIntent(intent: Record<string, unknown> | undefined): string {
   if (!intent || typeof intent !== 'object') return '';
   const lines: string[] = ['## Operator Steering'];
@@ -304,6 +325,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       prefix += siLines.join('\n') + '\n';
     }
   }
+
+  // Repo Overview — tech stack, directory layout, and first steps discovered
+  // during repo_bootstrap. Presence-gated: no-op when absent.
+  prefix += formatRepoOverview(task.repo_overview);
 
   // Existing knowledge documents — a compact, body-omitted index of
   // web_research / design output so the strategist / research agent knows what

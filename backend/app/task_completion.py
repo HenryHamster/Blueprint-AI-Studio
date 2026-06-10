@@ -40,6 +40,11 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.repo_bootstrap import (
+    BOOTSTRAP_RECOVERY_MAX_ATTEMPTS,
+    coerce_recovery_attempts,
+    next_recovery_backoff,
+)
 from app.compute_jobs import (
     _is_durable_artifact_uri,
     get_compute_job_for_task,
@@ -3776,17 +3781,34 @@ async def _handle_repo_bootstrap_completion(
     gate can proceed (the gate only defers while bootstrap is IN_PROGRESS/QUEUED).
     """
     _OVERVIEW_KEYS = ("tech_stack", "directory_layout", "first_steps_summary")
+    _REVISION_KEYS = ("source_revision", "revision", "commit", "commit_sha")
     overview: dict[str, str] | None = None
+    source_revision: str | None = None
+
+    def _extract_revision(src: dict[str, Any]) -> str | None:
+        for key in _REVISION_KEYS:
+            value = src.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     ctx_overview = (task.context or {}).get("repo_overview")
     if isinstance(ctx_overview, dict) and any(k in ctx_overview for k in _OVERVIEW_KEYS):
         overview = {k: str(ctx_overview.get(k, "")) for k in _OVERVIEW_KEYS}
+        source_revision = _extract_revision(ctx_overview)
     elif logs:
         try:
             parsed = json.loads(logs)
             if isinstance(parsed, dict) and any(k in parsed for k in _OVERVIEW_KEYS):
                 overview = {k: str(parsed.get(k, "")) for k in _OVERVIEW_KEYS}
+                source_revision = _extract_revision(parsed)
         except (json.JSONDecodeError, TypeError):
             pass
+
+    # Provenance derives from the bootstrap task payload (branch) plus any
+    # revision the agent reported (optional). The branch the overview describes
+    # is the integration_branch the bootstrap ran against.
+    source_branch = (task.first_payload or {}).get("integration_branch") or None
 
     async with project_lock(session, task.project_id, skip_locked=False) as project:
         if project is None:
@@ -3800,21 +3822,43 @@ async def _handle_repo_bootstrap_completion(
         build_config = dict(project.build_config or {})
 
         if overview:
+            now_iso = _utcnow().isoformat()
+            # Provenance carried alongside the overview so downstream agents see
+            # freshness (refreshed time + the branch/revision the overview
+            # describes). Nested under the repo_overview block so a refresh
+            # replaces both the content and its provenance atomically.
+            provenance: Dict[str, Any] = {
+                "refreshed_at": now_iso,
+                "source_branch": source_branch,
+                "source_revision": source_revision,
+            }
+            overview_block: Dict[str, Any] = {**overview, "provenance": provenance}
+
             def _mutate_design_doc(doc: Dict[str, Any]) -> None:
                 existing_overview = doc.get("repo_overview")
-                if existing_overview != overview:
+                if existing_overview != overview_block:
                     meta = dict(doc.get("_meta") or {"revision": 0})
-                    doc["repo_overview"] = overview
+                    doc["repo_overview"] = overview_block
                     meta["revision"] = meta.get("revision", 0) + 1
-                    meta["last_updated"] = _utcnow().isoformat()
+                    meta["last_updated"] = now_iso
                     doc["_meta"] = meta
 
             session.expire(project, ["design_doc"])
             await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
 
             if not build_config.get("bootstrap_completed_at"):
-                build_config["bootstrap_completed_at"] = _utcnow().isoformat()
+                build_config["bootstrap_completed_at"] = now_iso
+            # Mirror provenance into build_config so the admin UI (which reads
+            # project.build_config) can surface overview freshness.
+            build_config["bootstrap_overview_refreshed_at"] = now_iso
+            build_config["bootstrap_overview_source_branch"] = source_branch
+            build_config["bootstrap_overview_source_revision"] = source_revision
             build_config.pop("bootstrap_degraded_reason", None)
+            build_config.pop("bootstrap_recovery_next_at", None)
+            build_config.pop("bootstrap_recovery_exhausted_at", None)
+            build_config.pop("bootstrap_recovery_last_degraded_at", None)
+            build_config["bootstrap_recovery_attempts"] = 0
+            build_config["bootstrap_recovery_state"] = "completed"
             logger.info(
                 "[BOOTSTRAP] Persisted repo_overview and stamped bootstrap_completed_at "
                 "for project %s (task %s)",
@@ -3823,7 +3867,26 @@ async def _handle_repo_bootstrap_completion(
             )
         else:
             if not build_config.get("bootstrap_completed_at"):
+                now = _utcnow()
+                attempts = (
+                    coerce_recovery_attempts(
+                        build_config.get("bootstrap_recovery_attempts")
+                    )
+                    + 1
+                )
                 build_config["bootstrap_degraded_reason"] = "overview_missing"
+                build_config["bootstrap_recovery_attempts"] = attempts
+                build_config["bootstrap_recovery_last_degraded_at"] = now.isoformat()
+                if attempts >= BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
+                    build_config["bootstrap_recovery_state"] = "exhausted"
+                    build_config["bootstrap_recovery_exhausted_at"] = now.isoformat()
+                    build_config.pop("bootstrap_recovery_next_at", None)
+                else:
+                    build_config["bootstrap_recovery_state"] = "backoff"
+                    build_config["bootstrap_recovery_next_at"] = (
+                        now + next_recovery_backoff(attempts)
+                    ).isoformat()
+                    build_config.pop("bootstrap_recovery_exhausted_at", None)
                 logger.warning(
                     "[BOOTSTRAP] No repo_overview in completion payload for project %s "
                     "(task %s) — recording degraded marker",

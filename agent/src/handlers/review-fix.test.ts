@@ -331,6 +331,53 @@ describe('handleFix — operator steering (strategic_intent)', () => {
   });
 });
 
+// ── handleFix: repo overview ─────────────────────────────────────────────────
+describe('handleFix — repo overview (repo_overview)', () => {
+  const histWithIssue = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'fix this', file: 'a.ts', line: 5 }],
+  }];
+
+  it('prepends ## Repo Overview into the fix prompt when repo_overview is present', async () => {
+    await handleFix(
+      'task-fix-repo-overview',
+      { branch: 'feat/r', base_branch: 'main', pr_number: 9, prompt: 'address review' },
+      {
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithIssue } },
+        repo_overview: {
+          tech_stack: 'Python, FastAPI, React',
+          directory_layout: 'backend/ agent/ admin-ui/',
+          first_steps_summary: 'pip install && npm install',
+          bootstrap_completed_at: '2026-01-15T10:00:00Z',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Repo Overview');
+    expect(prompt).toContain('**Tech stack:** Python, FastAPI, React');
+    expect(prompt).toContain('**Directory layout:** backend/ agent/ admin-ui/');
+    expect(prompt).toContain('**First steps:** pip install && npm install');
+    expect(prompt).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
+    // existing review context still present
+    expect(prompt).toContain('[MAJOR] [a.ts:5] fix this');
+  });
+
+  it('omits ## Repo Overview from the fix prompt when repo_overview is absent', async () => {
+    await handleFix(
+      'task-fix-no-repo-overview',
+      { branch: 'feat/r', base_branch: 'main', pr_number: 10, prompt: 'address review' },
+      {
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithIssue } },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Repo Overview');
+  });
+});
+
 // ── handleFix: stale-premise / provenance notice ───────────────────────────
 describe('handleFix — provenance / stale-premise notice', () => {
   const hist = [{
@@ -1243,6 +1290,42 @@ describe('handleReview — project vision and strategic intent (direction goal)'
     expect(prompt).not.toContain('## Operator Steering');
     // But the review still works with base content
     expect(prompt).toContain('Review the changes');
+  });
+
+  it('surfaces repo overview in the review prompt when repo_overview is present', async () => {
+    await handleReview(
+      'task-review-repo-overview',
+      basePayload,
+      {
+        context: { scope: 'medium' },
+        repo_overview: {
+          tech_stack: 'Python, FastAPI, React',
+          directory_layout: 'backend/ agent/ admin-ui/',
+          first_steps_summary: 'pip install && npm install',
+          bootstrap_completed_at: '2026-01-15T10:00:00Z',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Repo Overview');
+    expect(prompt).toContain('**Tech stack:** Python, FastAPI, React');
+    expect(prompt).toContain('**Directory layout:** backend/ agent/ admin-ui/');
+    expect(prompt).toContain('**First steps:** pip install && npm install');
+    expect(prompt).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
+  });
+
+  it('omits repo overview from the review prompt when repo_overview is absent', async () => {
+    await handleReview(
+      'task-review-no-repo-overview',
+      basePayload,
+      { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Repo Overview');
   });
 });
 

@@ -3626,6 +3626,7 @@ async def _sweep_bootstrap_recovery() -> None:
             # bootstrap_completed_at: absent key or null → IS NULL → eligible.
             # repo_is_empty: absent key or 'false' → coalesce to 'false' → != 'true' → eligible.
             # ORDER BY id gives consistent ordering so new projects aren't missed.
+            now_iso = _utcnow().isoformat()
             result = await session.execute(
                 select(Project).where(
                     Project.is_self_repo.is_(False),
@@ -3634,6 +3635,20 @@ async def _sweep_bootstrap_recovery() -> None:
                     func.coalesce(
                         Project.build_config['repo_is_empty'].as_string(), 'false'
                     ) != 'true',
+                    func.coalesce(
+                        Project.build_config['bootstrap_recovery_state'].as_string(), ''
+                    ) != 'exhausted',
+                    Project.build_config['bootstrap_recovery_exhausted_at']
+                    .as_string()
+                    .is_(None),
+                    or_(
+                        Project.build_config['bootstrap_recovery_next_at']
+                        .as_string()
+                        .is_(None),
+                        Project.build_config[
+                            'bootstrap_recovery_next_at'
+                        ].as_string() <= now_iso,
+                    ),
                 ).order_by(Project.id).limit(_BOOTSTRAP_SWEEP_BATCH_SIZE)
             )
             candidates = result.scalars().all()
@@ -3645,12 +3660,13 @@ async def _sweep_bootstrap_recovery() -> None:
                     session,
                     is_first_bootstrap=False,
                     spawn_reason="recovery_sweep",
+                    automatic_recovery=True,
                 )
                 if spawn_result.outcome == "spawned":
                     spawned += 1
 
+            await session.commit()
             if spawned:
-                await session.commit()
                 logger.info(
                     "[BOOTSTRAP-RECOVERY] Enqueued %d recovery bootstrap task(s)", spawned
                 )

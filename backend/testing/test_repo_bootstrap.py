@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token
 from app.main import app
@@ -736,11 +737,20 @@ class TestRepoBootstrapCompletionSeam:
         assert resp.status_code == 200
 
         await db_session.refresh(project)
-        assert (project.design_doc or {}).get("repo_overview") == {
-            "tech_stack": "Python, FastAPI",
-            "directory_layout": "backend/ API; agent/ worker",
-            "first_steps_summary": "pip install -r requirements.txt && pytest",
-        }
+        stored_overview = (project.design_doc or {}).get("repo_overview") or {}
+        # Core overview fields are persisted verbatim...
+        assert stored_overview.get("tech_stack") == "Python, FastAPI"
+        assert stored_overview.get("directory_layout") == "backend/ API; agent/ worker"
+        assert (
+            stored_overview.get("first_steps_summary")
+            == "pip install -r requirements.txt && pytest"
+        )
+        # ...alongside a provenance block stamping freshness. (source_branch is
+        # None here because this task's payload carries no integration_branch;
+        # the refresh path test below exercises a populated source branch.)
+        provenance = stored_overview.get("provenance") or {}
+        assert provenance.get("refreshed_at"), "overview provenance must stamp refreshed_at"
+        assert "source_branch" in provenance
 
         from app.strategic_spawning import _agent_view_design_doc, _design_doc_index
 
@@ -1126,6 +1136,160 @@ class TestSpawnBootstrapTaskHelper:
         assert result.outcome == "spawned", (
             f"Expected 'spawned' for a project with no bootstrap task, got {result.outcome!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_automatic_recovery_respects_backoff(self, db_session):
+        """Automatic recovery does not spawn before bootstrap_recovery_next_at."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        project = _make_external_project(
+            db_session,
+            name="acme/backoff-bootstrap",
+            build_config={
+                "language": "python",
+                "bootstrap_degraded_reason": "overview_missing",
+                "bootstrap_recovery_attempts": 1,
+                "bootstrap_recovery_state": "backoff",
+                "bootstrap_recovery_next_at": "2099-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason="recovery_sweep",
+            automatic_recovery=True,
+        )
+
+        assert result.outcome == "not_eligible"
+        assert result.reason == "bootstrap_recovery_backoff"
+
+    @pytest.mark.asyncio
+    async def test_operator_retry_bypasses_exhausted_recovery(self, db_session):
+        """Operator retry can enqueue one task even after automatic recovery exhausts."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        project = _make_external_project(
+            db_session,
+            name="acme/operator-exhausted-bootstrap",
+            build_config={
+                "language": "python",
+                "bootstrap_degraded_reason": "overview_missing",
+                "bootstrap_recovery_attempts": 3,
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason="operator_retry",
+        )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+
+        second = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason="operator_retry",
+        )
+
+        assert second.outcome == "already_active"
+
+    @pytest.mark.asyncio
+    async def test_repeated_degraded_bootstrap_does_not_auto_respawn_unbounded(
+        self, db_session
+    ):
+        """Automatic recovery stops after repeated no-overview bootstrap completions."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = _make_external_project(
+            db_session,
+            name="acme/repeated-degraded-bootstrap",
+            build_config={"language": "python"},
+        )
+        await db_session.flush()
+
+        task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/repeated-degraded-bootstrap",
+            description="Initial bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(task)
+        await db_session.flush()
+        await db_session.refresh(task)
+
+        for expected_attempt in (1, 2, 3):
+            await _handle_repo_bootstrap_completion(task, "", db_session)
+            await db_session.refresh(project)
+            build_config = dict(project.build_config or {})
+            assert build_config.get("bootstrap_recovery_attempts") == expected_attempt
+
+            if expected_attempt == 3:
+                break
+
+            build_config["bootstrap_recovery_next_at"] = "2020-01-01T00:00:00"
+            project.build_config = build_config
+            db_session.add(project)
+            await db_session.commit()
+
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+                automatic_recovery=True,
+            )
+            await db_session.commit()
+            assert result.outcome == "spawned"
+            assert result.task_id is not None
+
+            task = await db_session.get(Task, uuid.UUID(result.task_id))
+            assert task is not None
+            task.status = TaskStatus.COMPLETED
+            db_session.add(task)
+            await db_session.flush()
+
+        await db_session.refresh(project)
+        build_config = project.build_config or {}
+        assert build_config.get("bootstrap_recovery_state") == "exhausted"
+        assert build_config.get("bootstrap_recovery_exhausted_at") is not None
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason="recovery_sweep",
+            automatic_recovery=True,
+        )
+        await db_session.commit()
+
+        assert result.outcome == "not_eligible"
+        assert result.reason == "bootstrap_recovery_exhausted"
+        queued = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        ).scalars().all()
+        assert queued == []
 
 
 class TestBootstrapRetryEndpoint:
@@ -1532,4 +1696,337 @@ class TestBootstrapSweepDirect:
         assert len(bootstrap_tasks) == 1, (
             f"Sweep must not create a duplicate when bootstrap is already active, "
             f"got {len(bootstrap_tasks)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Operator refresh path: re-bootstrap an already-completed project
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_queued_bootstrap_task(db_session, project_id) -> Task:
+    """Return the single QUEUED repo_bootstrap task for a project."""
+    tasks = (
+        await db_session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                Task.status == TaskStatus.QUEUED,
+            )
+        )
+    ).scalars().all()
+    assert len(tasks) == 1, f"Expected exactly one QUEUED bootstrap task, got {len(tasks)}"
+    return tasks[0]
+
+
+class TestBootstrapRefresh:
+    """Tests for the operator refresh path (spawn_reason='operator_refresh')."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_completed_project_replaces_overview_with_provenance(
+        self, db_session
+    ):
+        """A refresh of a COMPLETED project spawns a new bootstrap, and on completion
+        REPLACES the prior repo_overview and stamps provenance (refreshed time + the
+        source branch the overview describes)."""
+        import json as _json
+        from app.repo_bootstrap import REFRESH_SPAWN_REASON, spawn_bootstrap_task
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-completed",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+                "bootstrap_recovery_state": "completed",
+            },
+        )
+        # Seed a prior (stale) overview the refresh must replace.
+        project.design_doc = {
+            "repo_overview": {
+                "tech_stack": "OLD stack",
+                "directory_layout": "OLD layout",
+                "first_steps_summary": "OLD steps",
+            },
+            "_meta": {"revision": 1},
+        }
+        flag_modified(project, "design_doc")
+        await db_session.flush()
+        await db_session.commit()
+
+        # The refresh bypasses the already-completed gate and spawns a task.
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason=REFRESH_SPAWN_REASON,
+        )
+        await db_session.commit()
+
+        assert result.outcome == "spawned", (
+            f"Refresh must spawn for a completed project, got {result.outcome!r}: {result.reason}"
+        )
+        await db_session.refresh(project)
+        # bootstrap_completed_at is preserved (first-bootstrap gate semantics intact).
+        assert (project.build_config or {}).get("bootstrap_completed_at") == "2026-01-01T00:00:00"
+
+        task = await _fetch_queued_bootstrap_task(db_session, project.id)
+        assert task.first_payload["is_first_bootstrap"] is False
+        assert (task.context or {}).get("bootstrap_reason") == REFRESH_SPAWN_REASON
+
+        # Complete the refreshed bootstrap with a NEW overview + reported revision.
+        new_overview = _json.dumps({
+            "tech_stack": "NEW Python 3.12, FastAPI",
+            "directory_layout": "NEW backend/ — API; admin-ui/ — React",
+            "first_steps_summary": "NEW pip install && pytest",
+            "source_revision": "abc1234",
+        })
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_repo_bootstrap_completion(task, new_overview, db_session)
+        await db_session.refresh(project)
+
+        stored = (project.design_doc or {})["repo_overview"]
+        assert stored["tech_stack"] == "NEW Python 3.12, FastAPI", (
+            "refresh must REPLACE the prior overview content"
+        )
+        assert stored["directory_layout"] == "NEW backend/ — API; admin-ui/ — React"
+        # Provenance stamped into the design_doc overview block.
+        provenance = stored.get("provenance") or {}
+        assert provenance.get("refreshed_at"), "design_doc provenance must stamp refreshed_at"
+        assert provenance.get("source_branch") == "main", (
+            "source_branch must be the bootstrap task's integration_branch"
+        )
+        assert provenance.get("source_revision") == "abc1234"
+
+        # Provenance also mirrored into build_config for the admin UI.
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_overview_refreshed_at"), (
+            "build_config must carry bootstrap_overview_refreshed_at"
+        )
+        assert bc.get("bootstrap_overview_source_branch") == "main"
+        assert bc.get("bootstrap_overview_source_revision") == "abc1234"
+
+    @pytest.mark.asyncio
+    async def test_refresh_idempotent_when_bootstrap_already_active(self, db_session):
+        """Refresh returns already_active and creates no duplicate when a bootstrap runs."""
+        from app.repo_bootstrap import REFRESH_SPAWN_REASON, spawn_bootstrap_task
+
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-active",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+
+        active_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/refresh-active",
+            description="Active bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(active_task)
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason=REFRESH_SPAWN_REASON,
+        )
+
+        assert result.outcome == "already_active", (
+            f"Refresh must be idempotent against an active bootstrap, got {result.outcome!r}"
+        )
+        tasks = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                )
+            )
+        ).scalars().all()
+        assert len(tasks) == 1, "Refresh must not create a duplicate bootstrap task"
+
+    @pytest.mark.asyncio
+    async def test_refresh_does_not_arm_auto_retry(self, db_session):
+        """Refresh is one-shot: it must NOT schedule automatic recovery / auto-retry."""
+        from app.repo_bootstrap import REFRESH_SPAWN_REASON, spawn_bootstrap_task
+
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-no-autoretry",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=False,
+            spawn_reason=REFRESH_SPAWN_REASON,
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert result.outcome == "spawned"
+        bc = project.build_config or {}
+        # No backoff timer armed and a clear non-automatic recovery marker.
+        assert "bootstrap_recovery_next_at" not in bc, (
+            "Refresh must NOT arm the automatic-recovery backoff timer"
+        )
+        assert bc.get("bootstrap_recovery_state") == "operator_refresh"
+        assert bc.get("bootstrap_recovery_attempts") == 0
+
+    @pytest.mark.asyncio
+    async def test_brand_new_project_first_bootstrap_gate_unchanged(self, db_session):
+        """A brand-new (never-bootstrapped) project is unaffected by the refresh path:
+        a normal recovery spawn still works and the strategic gate still defers until
+        the FIRST bootstrap completes."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        # Never-bootstrapped project: no bootstrap_completed_at. A normal
+        # (non-refresh) spawn enqueues the first bootstrap as usual.
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-brand-new",
+            build_config={"language": "python"},
+        )
+        await db_session.flush()
+
+        result = await spawn_bootstrap_task(
+            project,
+            db_session,
+            is_first_bootstrap=True,
+            spawn_reason="onboard",
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert result.outcome == "spawned"
+        # The refresh path did not retroactively stamp completion or a refresh marker.
+        bc = project.build_config or {}
+        assert "bootstrap_completed_at" not in bc, (
+            "First bootstrap must not pre-stamp bootstrap_completed_at"
+        )
+        assert bc.get("bootstrap_recovery_state") != "operator_refresh"
+
+    @pytest.mark.asyncio
+    async def test_refresh_endpoint_spawns_for_completed_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Refresh endpoint returns spawned for a completed (healthy) project."""
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-endpoint-completed",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+            add_membership=True,
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/bootstrap/refresh"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "spawned", f"Unexpected state: {body}"
+        assert body["task_id"] is not None
+
+        await _fetch_queued_bootstrap_task(db_session, project.id)
+
+    @pytest.mark.asyncio
+    async def test_refresh_endpoint_already_active(
+        self, client: AsyncClient, db_session
+    ):
+        """Refresh endpoint returns already_active when a bootstrap is running."""
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-endpoint-active",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+            add_membership=True,
+        )
+        await db_session.flush()
+
+        active_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/refresh-endpoint-active",
+            description="Active bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(active_task)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/bootstrap/refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "already_active"
+
+    @pytest.mark.asyncio
+    async def test_refresh_endpoint_not_eligible_for_self_repo(
+        self, client: AsyncClient, db_session
+    ):
+        """Refresh endpoint returns not_eligible for a self-repo project."""
+        project = _make_external_project(
+            db_session,
+            name="self/refresh-repo",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+            is_self_repo=True,
+            add_membership=True,
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/bootstrap/refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "not_eligible"
+
+    @pytest.mark.asyncio
+    async def test_refresh_endpoint_owner_gated(
+        self, client: AsyncClient, db_session
+    ):
+        """Refresh endpoint is owner-gated: a non-member is denied access."""
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-endpoint-nonmember",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00",
+            },
+            add_membership=False,
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/bootstrap/refresh"
+        )
+        assert resp.status_code in (403, 404), (
+            f"Non-owner must be denied, got {resp.status_code}"
         )

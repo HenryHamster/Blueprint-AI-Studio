@@ -2086,6 +2086,119 @@ async def test_claim_response_includes_writeback_endpoint_when_directories_prese
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_includes_repo_overview_for_downstream_task(
+    client: AsyncClient, db_session
+):
+    """Claim response includes repo_overview with provenance when design_doc has it."""
+    project = Project(
+        name="Repo Overview Test",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc={
+            "repo_overview": {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "backend/ frontend/",
+                "first_steps_summary": "pip install && npm install",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-repo-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "repo_overview" in data
+    ro = data["repo_overview"]
+    assert ro["tech_stack"] == "Python, FastAPI"
+    assert ro["directory_layout"] == "backend/ frontend/"
+    assert ro["first_steps_summary"] == "pip install && npm install"
+    assert ro["bootstrap_completed_at"] == "2026-01-15T10:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_repo_overview_when_absent(
+    client: AsyncClient, db_session
+):
+    """Claim response omits repo_overview key when design_doc has no repo_overview."""
+    project = Project(
+        name="No Repo Overview Test",
+        user_id="test-user-123",
+        build_config={},
+        design_doc={"other_key": "value"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-no-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_repo_overview_for_repo_bootstrap_task(
+    client: AsyncClient, db_session
+):
+    """Claim response omits repo_overview for repo_bootstrap tasks (only downstream tasks get it)."""
+    project = Project(
+        name="Bootstrap Task Test",
+        user_id="test-user-123",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc={
+            "repo_overview": {
+                "tech_stack": "Python",
+                "directory_layout": "src/",
+                "first_steps_summary": "pip install",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        vm_instance_id="agent-vm-bootstrap-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bootstrap-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_session):
     """The claim response surfaces build_config.repo_is_empty as top-level repo_is_empty.
 

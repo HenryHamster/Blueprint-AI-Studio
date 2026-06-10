@@ -65,6 +65,18 @@ export interface BuildConfig {
    *  fully succeeding (e.g. partial failure). When set and bootstrap_completed_at
    *  is absent, the project bootstrap is in a degraded state. */
   bootstrap_degraded_reason?: string | null;
+  bootstrap_recovery_attempts?: number | null;
+  bootstrap_recovery_state?: 'backoff' | 'exhausted' | 'operator_retry' | 'completed' | string | null;
+  bootstrap_recovery_next_at?: string | null;
+  bootstrap_recovery_last_degraded_at?: string | null;
+  bootstrap_recovery_exhausted_at?: string | null;
+  /** ISO timestamp stamped when a refresh bootstrap completed and replaced the
+   *  prior repo_overview. Absent/null means no refresh has run yet. */
+  bootstrap_overview_refreshed_at?: string | null;
+  /** Branch the refreshed overview describes (set alongside bootstrap_overview_refreshed_at). */
+  bootstrap_overview_source_branch?: string | null;
+  /** Commit SHA the refreshed overview was captured at (optional; may be absent). */
+  bootstrap_overview_source_revision?: string | null;
 }
 
 export interface StagingBranchPrefixesConfig {

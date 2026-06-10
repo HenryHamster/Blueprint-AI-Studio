@@ -364,4 +364,53 @@ describe('buildContextPrefix self-review calibration', () => {
     });
     expect(prefix).not.toContain('## Self-review calibration');
   });
+
+  // repo_overview rendering
+  it('renders ## Repo Overview with all fields when repo_overview is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Python, FastAPI, React',
+        directory_layout: 'backend/ agent/ admin-ui/',
+        first_steps_summary: 'Run pip install and npm install',
+        bootstrap_completed_at: '2026-01-15T10:00:00Z',
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).toContain('**Tech stack:** Python, FastAPI, React');
+    expect(prefix).toContain('**Directory layout:** backend/ agent/ admin-ui/');
+    expect(prefix).toContain('**First steps:** Run pip install and npm install');
+    expect(prefix).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
+  });
+
+  it('omits ## Repo Overview when repo_overview is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+    });
+    expect(prefix).not.toContain('## Repo Overview');
+  });
+
+  it('omits ## Repo Overview when a required field is missing', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix' }],
+      repo_overview: {
+        tech_stack: 'Python',
+        // directory_layout and first_steps_summary missing
+      },
+    });
+    expect(prefix).not.toContain('## Repo Overview');
+  });
+
+  it('renders ## Repo Overview without bootstrapped line when bootstrap_completed_at is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix' }],
+      repo_overview: {
+        tech_stack: 'TypeScript, Node',
+        directory_layout: 'src/ tests/',
+        first_steps_summary: 'npm install && npm test',
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).not.toContain('**Bootstrapped:**');
+  });
 });

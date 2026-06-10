@@ -8,10 +8,12 @@ import type { BuildConfigCommandsResponse, BootstrapRetryResponse } from '../api
 
 const fetchBuildConfigCommands = vi.fn();
 const retryProjectBootstrap = vi.fn();
+const refreshProjectBootstrap = vi.fn();
 
 vi.mock('../api', () => ({
   fetchBuildConfigCommands: (...args: unknown[]) => fetchBuildConfigCommands(...args),
   retryProjectBootstrap: (...args: unknown[]) => retryProjectBootstrap(...args),
+  refreshProjectBootstrap: (...args: unknown[]) => refreshProjectBootstrap(...args),
 }));
 
 function makeProject(overrides: Partial<Project> = {}): Project {
@@ -250,6 +252,43 @@ describe('BootstrapStatusPanel', () => {
     expect(screen.getByText(/design doc section write failed/)).toBeTruthy();
   });
 
+  test('shows automatic recovery backoff metadata for degraded bootstrap', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_degraded_reason: 'overview_missing',
+            bootstrap_recovery_attempts: 1,
+            bootstrap_recovery_state: 'backoff',
+            bootstrap_recovery_next_at: '2026-06-01T12:00:00Z',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Automatic retry after/)).toBeTruthy();
+  });
+
+  test('shows exhausted automatic recovery while keeping operator retry visible', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_degraded_reason: 'overview_missing',
+            bootstrap_recovery_attempts: 3,
+            bootstrap_recovery_state: 'exhausted',
+            bootstrap_recovery_exhausted_at: '2026-06-01T12:00:00Z',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Automatic recovery exhausted after 3 attempts/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /retry bootstrap/i })).toBeTruthy();
+  });
+
   test('shows completed (not degraded) when bootstrap_completed_at is set even if bootstrap_degraded_reason is present', async () => {
     fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
     render(
@@ -292,5 +331,109 @@ describe('BootstrapStatusPanel', () => {
     expect(screen.getByText(/Bootstrap failed/)).toBeTruthy();
     expect(screen.getByText(/cycles running without repo memory/)).toBeTruthy();
     expect(screen.queryByText(/Bootstrap degraded/)).toBeNull();
+  });
+
+  test('renders Refresh bootstrap button in COMPLETED state', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByRole('button', { name: /refresh bootstrap/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /retry bootstrap/i })).toBeNull();
+  });
+
+  test('renders provenance block when bootstrap_overview_refreshed_at is present in COMPLETED state', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_overview_refreshed_at: '2026-06-05T09:00:00Z',
+            bootstrap_overview_source_branch: 'main',
+            bootstrap_overview_source_revision: 'abc1234def5678',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Refreshed/)).toBeTruthy();
+    expect(screen.getByText('main')).toBeTruthy();
+    expect(screen.getByText('abc1234')).toBeTruthy();
+  });
+
+  test('refresh click happy path: spawned outcome transitions to pending and shows message', async () => {
+    const user = userEvent.setup();
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    refreshProjectBootstrap.mockResolvedValue({
+      state: 'spawned',
+      task_id: 'task-refresh-1',
+      reason: null,
+    } satisfies BootstrapRetryResponse);
+
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: /refresh bootstrap/i }));
+
+    await waitFor(() => {
+      expect(refreshProjectBootstrap).toHaveBeenCalledWith('proj-1');
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Bootstrap refresh queued as task-refresh-1/)).toBeTruthy();
+      expect(screen.getByText(/Bootstrap pending/)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /refresh bootstrap/i })).toBeNull();
+    });
+  });
+
+  test('refresh click already_active outcome shows inline message and transitions to pending', async () => {
+    const user = userEvent.setup();
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    refreshProjectBootstrap.mockResolvedValue({
+      state: 'already_active',
+      task_id: 'task-running-1',
+      reason: null,
+    } satisfies BootstrapRetryResponse);
+
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: /refresh bootstrap/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/A bootstrap is already running/)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /refresh bootstrap/i })).toBeNull();
+    });
+  });
+
+  test('refresh click error path surfaces error inline', async () => {
+    const user = userEvent.setup();
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    refreshProjectBootstrap.mockRejectedValue(new Error('Server unavailable'));
+
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: /refresh bootstrap/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Server unavailable/)).toBeTruthy();
+    });
+    expect(screen.getByRole('button', { name: /refresh bootstrap/i })).toBeTruthy();
   });
 });

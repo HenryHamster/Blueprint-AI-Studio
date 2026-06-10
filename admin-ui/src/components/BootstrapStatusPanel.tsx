@@ -7,7 +7,7 @@ import type {
   BuildConfigCommandEntry,
   BuildConfigCommandsResponse,
 } from '../api';
-import { fetchBuildConfigCommands, retryProjectBootstrap } from '../api';
+import { fetchBuildConfigCommands, retryProjectBootstrap, refreshProjectBootstrap } from '../api';
 import { formatAbsolute } from '../utils/time';
 
 interface Props {
@@ -41,6 +41,18 @@ function deriveBootstrapState(project: Project, tasks: Task[]): BootstrapState {
   return 'retryable';
 }
 
+function getRefreshOutcomeMessage(outcome: RetryOutcome): string {
+  if (outcome.state === 'spawned') {
+    return outcome.task_id
+      ? `Bootstrap refresh queued as ${outcome.task_id}.`
+      : 'Bootstrap refresh queued.';
+  }
+  if (outcome.state === 'already_active') {
+    return 'A bootstrap is already running.';
+  }
+  return 'This project is not eligible for a bootstrap refresh.';
+}
+
 function getRetryOutcomeMessage(outcome: RetryOutcome): string {
   if (outcome.state === 'spawned') {
     return outcome.task_id
@@ -58,6 +70,24 @@ function getRetryOutcomeMessage(outcome: RetryOutcome): string {
   return 'This project is not eligible for bootstrap recovery.';
 }
 
+function getRecoveryDetail(project: Project): string | null {
+  const cfg = project.build_config;
+  if (!cfg?.bootstrap_degraded_reason) return null;
+  const attempts = cfg.bootstrap_recovery_attempts ?? 0;
+  if (cfg.bootstrap_recovery_state === 'exhausted') {
+    return attempts > 0
+      ? `Automatic recovery exhausted after ${attempts} attempts; operator retry is still available.`
+      : 'Automatic recovery exhausted; operator retry is still available.';
+  }
+  if (cfg.bootstrap_recovery_next_at) {
+    return `Automatic retry after ${formatAbsolute(cfg.bootstrap_recovery_next_at)}.`;
+  }
+  if (attempts > 0) {
+    return `Automatic recovery attempt ${attempts} recorded.`;
+  }
+  return null;
+}
+
 export function BootstrapStatusPanel({ project, tasks }: Props) {
   const state = deriveBootstrapState(project, tasks);
   const [commands, setCommands] = useState<BuildConfigCommandEntry[] | null>(null);
@@ -65,12 +95,18 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
   const [retryOutcome, setRetryOutcome] = useState<RetryOutcome | null>(null);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [retryPending, setRetryPending] = useState(false);
+  const [refreshOutcome, setRefreshOutcome] = useState<RetryOutcome | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshPending, setRefreshPending] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     setRetryOutcome(null);
     setRetryError(null);
     setRetryPending(false);
+    setRefreshOutcome(null);
+    setRefreshError(null);
+    setRefreshPending(false);
   }, [project.id]);
 
   useEffect(() => {
@@ -90,20 +126,27 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
   if (state === 'none') return null;
 
   const completedAt = project.build_config?.bootstrap_completed_at;
+  const recoveryDetail = getRecoveryDetail(project);
   const retryState = retryOutcome?.state;
+  const refreshState = refreshOutcome?.state;
   const displayState: BootstrapState =
-    retryState === 'spawned'
+    retryState === 'spawned' || retryState === 'already_active'
       ? 'pending'
-      : retryState === 'already_active'
-        ? 'pending'
-        : retryState === 'already_completed'
-        ? 'completed'
-        : state;
+      : retryState === 'already_completed'
+      ? 'completed'
+      : refreshState === 'spawned' || refreshState === 'already_active'
+      ? 'pending'
+      : state;
   const retryOutcomeMessage = retryOutcome ? getRetryOutcomeMessage(retryOutcome) : null;
+  const refreshOutcomeMessage = refreshOutcome ? getRefreshOutcomeMessage(refreshOutcome) : null;
   const showRetryButton =
     !retryPending &&
     !retryOutcome &&
     (state === 'degraded' || state === 'retryable');
+  const showRefreshButton =
+    !refreshPending &&
+    !refreshOutcome &&
+    state === 'completed';
 
   const handleRetry = async () => {
     setRetryPending(true);
@@ -115,6 +158,19 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
       setRetryError(err instanceof Error ? err.message : 'Failed to retry bootstrap');
     } finally {
       setRetryPending(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshPending(true);
+    setRefreshError(null);
+    try {
+      const outcome = await refreshProjectBootstrap(project.id);
+      setRefreshOutcome(outcome);
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : 'Failed to refresh bootstrap');
+    } finally {
+      setRefreshPending(false);
     }
   };
 
@@ -143,17 +199,40 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
                 Completed {formatAbsolute(completedAt)}
               </div>
             )}
+            {displayState === 'completed' && (
+              project.build_config?.bootstrap_overview_refreshed_at ||
+              project.build_config?.bootstrap_overview_source_branch
+            ) && (
+              <div className="text-[10px] text-neutral-400 mt-0.5">
+                {project.build_config?.bootstrap_overview_refreshed_at && (
+                  <>Refreshed {formatAbsolute(project.build_config.bootstrap_overview_refreshed_at)}</>
+                )}
+                {project.build_config?.bootstrap_overview_source_branch && (
+                  <> · branch <span className="font-mono text-neutral-300">{project.build_config.bootstrap_overview_source_branch}</span></>
+                )}
+                {project.build_config?.bootstrap_overview_source_revision && (
+                  <> @ <span className="font-mono text-neutral-300">{project.build_config.bootstrap_overview_source_revision.slice(0, 7)}</span></>
+                )}
+              </div>
+            )}
             {displayState === 'pending' && (
               <div className="text-[11px] text-amber-300">
                 Bootstrap pending — implementation tasks deferred until complete
               </div>
             )}
             {displayState === 'degraded' && (
-              <div className="text-[11px] text-red-300">
-                {project.build_config?.bootstrap_degraded_reason
-                  ? `Bootstrap degraded — ${project.build_config.bootstrap_degraded_reason}`
-                  : 'Bootstrap failed — cycles running without repo memory'}
-              </div>
+              <>
+                <div className="text-[11px] text-red-300">
+                  {project.build_config?.bootstrap_degraded_reason
+                    ? `Bootstrap degraded — ${project.build_config.bootstrap_degraded_reason}`
+                    : 'Bootstrap failed — cycles running without repo memory'}
+                </div>
+                {recoveryDetail && (
+                  <div className="text-[10px] text-neutral-400">
+                    {recoveryDetail}
+                  </div>
+                )}
+              </>
             )}
             {displayState === 'retryable' && (
               <div className="text-[11px] text-amber-300">
@@ -170,6 +249,15 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
               className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-200 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
             >
               {retryPending ? 'Retrying…' : 'Retry bootstrap'}
+            </button>
+          )}
+          {showRefreshButton && (
+            <button
+              onClick={handleRefresh}
+              disabled={refreshPending}
+              className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
+            >
+              {refreshPending ? 'Refreshing…' : 'Refresh bootstrap'}
             </button>
           )}
           {commands !== null && commands.length > 0 && (
@@ -193,6 +281,18 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
       {retryError && (
         <p className="mt-2 text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
           {retryError}
+        </p>
+      )}
+
+      {refreshOutcomeMessage && (
+        <p className="mt-2 text-[10px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-1 break-words">
+          {refreshOutcomeMessage}
+        </p>
+      )}
+
+      {refreshError && (
+        <p className="mt-2 text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
+          {refreshError}
         </p>
       )}
 

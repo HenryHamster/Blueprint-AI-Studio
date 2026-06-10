@@ -718,6 +718,22 @@ class BuildConfig(BaseModel):
     # structured overview. Preserved through build_config validation so routine
     # saves do not erase the truth.
     bootstrap_degraded_reason: str | None = None
+    # Stateful automatic repo_bootstrap recovery metadata. These fields are
+    # maintained by repo_bootstrap/task_completion so automatic sweeps can back
+    # off and eventually stop while operator retry remains available.
+    bootstrap_recovery_attempts: int | None = Field(None, ge=0)
+    bootstrap_recovery_state: str | None = None
+    bootstrap_recovery_next_at: str | None = None
+    bootstrap_recovery_last_degraded_at: str | None = None
+    bootstrap_recovery_exhausted_at: str | None = None
+    # Provenance for the persisted repo_overview, stamped by
+    # _handle_repo_bootstrap_completion whenever a bootstrap completes with a
+    # structured overview. Surfaced by the admin UI (which reads
+    # project.build_config) so operators can see overview freshness and which
+    # branch/revision it describes. All nullable for backward compatibility.
+    bootstrap_overview_refreshed_at: str | None = None
+    bootstrap_overview_source_branch: str | None = None
+    bootstrap_overview_source_revision: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

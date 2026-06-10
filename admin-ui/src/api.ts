@@ -2009,6 +2009,21 @@ export async function retryProjectBootstrap(
   return res.json();
 }
 
+export async function refreshProjectBootstrap(
+  projectId: string,
+): Promise<BootstrapRetryResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/bootstrap/refresh`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to refresh bootstrap: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to refresh bootstrap: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Owner-only project cancel. Marks the project terminal, cancels all active
  * tasks, and tears down their VMs. Idempotent on the server: already-terminal
