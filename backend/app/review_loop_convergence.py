@@ -404,6 +404,7 @@ async def _handle_cap_exhaustion(
     session: AsyncSession,
     *,
     scope: str,
+    lane_counts: dict | None = None,
 ) -> None:
     """Terminal handler when the review-fix iteration cap is hit.
 
@@ -429,8 +430,16 @@ async def _handle_cap_exhaustion(
     from app.routers.agent_status import record_task_result
     from app.shared_state import record_direction_result
 
-    cap_label = "global" if scope == "global" else "per-chain"
-    source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
+    cap_label = scope if scope in ("global", "per-chain") else scope
+    _lane_detail = (
+        "; ".join(f"{k}={v}" for k, v in sorted(lane_counts.items()))
+        if lane_counts
+        else ""
+    )
+    source_task.latest_status_message = (
+        f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
+        + (f" [{_lane_detail}]" if _lane_detail else "")
+    )
     session.add(source_task)
 
     try:
@@ -665,6 +674,7 @@ async def _handle_cap_exhaustion(
     orig.latest_status_message = (
         f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
         f"PR #{pr_number} auto-closed, manual review required"
+        + (f" [{_lane_detail}]" if _lane_detail else "")
     )
     persist_failure_category(orig, CODE_ERROR)
     ctx = dict(orig.context or {})
@@ -674,13 +684,15 @@ async def _handle_cap_exhaustion(
     ctx["pr_rejection_note"] = (
         f"Auto-closed by Blueprint: review-fix cap exhausted after {iterations} iterations"
     )
+    _terminal_detail = cap_label + (f"; {_lane_detail}" if _lane_detail else "")
     ctx["review_loop_terminal_outcome"] = {
         "kind": "cap_exhausted",
         "reason": "review_cap_exhausted",
         "pr_number": pr_number,
         "iterations": iterations,
         "scope": scope,
-        "detail": cap_label,
+        "detail": _terminal_detail,
+        "lane_counts": lane_counts or {},
         "recorded_at": _utcnow().isoformat(),
     }
     orig.context = ctx
@@ -691,7 +703,7 @@ async def _handle_cap_exhaustion(
         pr_number=pr_number,
         iterations=iterations,
         scope=scope,
-        detail=cap_label,
+        detail=_terminal_detail,
     )
     session.add(orig)
     try:

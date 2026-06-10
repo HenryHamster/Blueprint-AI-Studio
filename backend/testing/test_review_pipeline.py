@@ -11331,3 +11331,535 @@ def test_clear_gate_noop_when_gate_not_set():
     ctx_before = dict(task.context)
     assert not clear_review_escalation_approval_gate(task, resolved_by="x")
     assert task.context == ctx_before
+
+
+# ── classify_iteration_lane ───────────────────────────────────────────────────
+
+
+class TestClassifyIterationLane:
+    """Unit tests for classify_iteration_lane — pure function, no DB."""
+
+    def _task(self, payload_type: str = "fix", fix_reason: str = "") -> Task:
+        ctx: dict = {}
+        if fix_reason:
+            ctx["review_loop"] = {"fix_reason": fix_reason}
+        return make_task(
+            payloads=[{"type": payload_type, "pr_number": 1}],
+            context=ctx,
+        )
+
+    def test_panel_review_is_arbitration(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
+        t = self._task(payload_type="panel_review")
+        assert classify_iteration_lane(t) == LANE_ARBITRATION
+
+    def test_merge_conflict_is_conflict(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_CONFLICT
+        t = self._task(fix_reason="merge_conflict")
+        assert classify_iteration_lane(t) == LANE_CONFLICT
+
+    def test_update_branch_failed_is_conflict(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_CONFLICT
+        t = self._task(fix_reason="update_branch_failed")
+        assert classify_iteration_lane(t) == LANE_CONFLICT
+
+    def test_ci_failure_is_ci(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_CI
+        t = self._task(fix_reason="ci_failure")
+        assert classify_iteration_lane(t) == LANE_CI
+
+    def test_code_review_is_review_convergence(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+        t = self._task(fix_reason="code_review")
+        assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
+
+    def test_no_fix_reason_is_review_convergence(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+        t = self._task()
+        assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
+
+    def test_review_type_is_review_convergence(self):
+        from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+        t = self._task(payload_type="review")
+        assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
+
+    def test_panel_review_overrides_fix_reason(self):
+        """payload_type=panel_review takes priority regardless of fix_reason."""
+        from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
+        ctx = {"review_loop": {"fix_reason": "ci_failure"}}
+        t = make_task(
+            payloads=[{"type": "panel_review", "pr_number": 1}],
+            context=ctx,
+        )
+        assert classify_iteration_lane(t) == LANE_ARBITRATION
+
+
+# ── per-lane sub-cap tests ─────────────────────────────────────────────────────
+
+
+def _mock_lane_cap_github(mocker):
+    """Set up GitHub mocks for lane-cap tests that route through _handle_cap_exhaustion."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+
+@pytest.mark.asyncio
+async def test_conflict_lane_sub_cap_blocks_spawn(db_session, mocker):
+    """Conflict-lane sub-cap (default 4): once 4 merge-conflict/update-branch
+    fix iterations have run, a 5th merge-conflict spawn is blocked even when the
+    global cap has not been reached. The review_convergence lane is unaffected."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _mock_lane_cap_github(mocker)
+
+    from app.review_pipeline import SPAWN_REASON_CAP
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 4 completed merge-conflict fix iterations — reaches the conflict sub-cap.
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9100, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 9100, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Attempt a 5th merge-conflict spawn — must be blocked by sub-cap.
+    mocker.patch.dict(runtime_config, {"review_lane_cap_conflict": 4})
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9100,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_reason="merge_conflict",
+    )
+
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CAP
+
+
+@pytest.mark.asyncio
+async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, mocker):
+    """Conflict-lane sub-cap on a rollup PR → routes to preserve-for-handmerge
+    (orig.requires_approval=True, failure_detail='review_cap_preserved_for_handmerge',
+    PR left open / not closed)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    # PR lookup returns a clean, non-empty, open rollup PR — preservable.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "open", "changed_files": 3, "mergeable_state": "clean"},
+    )
+    close_pr_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import SPAWN_REASON_CAP
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session)
+    # Rollup original task: _is_rollup_review=True makes it recognisable by
+    # _pr_is_preservable_on_cap and _is_rollup_chain_source.
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large", "_is_rollup_review": True},
+        requires_approval=False,
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 4 completed merge-conflict fix iterations — reaches the conflict sub-cap.
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9110, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 9110, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "_is_rollup_review": True, "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    mocker.patch.dict(runtime_config, {"review_lane_cap_conflict": 4})
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9110,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_reason="merge_conflict",
+    )
+
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CAP
+
+    # Preserve-for-handmerge path: orig flagged, PR NOT closed.
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+    assert (original_task.context or {}).get("failure_detail") == "review_cap_preserved_for_handmerge"
+    close_pr_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_conflict_lane_exhaustion_does_not_block_review_convergence(db_session, mocker):
+    """Conflict lane exhausted → review_convergence spawns are unaffected."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _mock_lane_cap_github(mocker)
+
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Conflict lane at cap.
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9101, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 9101, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    mocker.patch.dict(runtime_config, {"review_lane_cap_conflict": 4})
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9101,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # review_convergence lane → not blocked by conflict sub-cap.
+    assert result is not None and created is True, (
+        "review_convergence spawn must not be blocked by conflict lane exhaustion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_arbitration_lane_exhaustion_routes_as_standoff(db_session, mocker):
+    """Arbitration lane cap (default 2): once 2 panel_review iterations have run,
+    a 3rd panel_review spawn routes to the standoff escalation path (SPAWN_REASON_STUCK)
+    rather than the global cap path."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import SPAWN_REASON_STUCK
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 2 completed panel_review tasks — arbitration lane at cap.
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "panel_review", "pr_number": 9102, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "panel_review", "pr_number": 9102, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    mocker.patch.dict(runtime_config, {"review_lane_cap_arbitration": 2})
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "panel_review",
+        db_session,
+        pr_number=9102,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None
+    assert created is False
+    # Arbitration exhaustion routes as standoff, not cap.
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_STUCK
+    # The original task should be marked requires_approval.
+    await db_session.refresh(original_task)
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert terminal_outcome.get("kind") == "standoff"
+    assert terminal_outcome.get("reason") == "arbitration_lane_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_non_review_collective_cap_blocks_ci_spawn(db_session, mocker):
+    """Non-review collective cap (default 8): with 4 conflict + 4 CI = 8 total
+    non-review iterations, a new CI fix spawn is blocked even if the CI sub-cap
+    hasn't been individually reached."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _mock_lane_cap_github(mocker)
+
+    from app.review_pipeline import SPAWN_REASON_CAP
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 4 conflict + 4 CI = 8 non-review iterations.
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
+        ))
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "ci_failure", "original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 8, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    mocker.patch.dict(runtime_config, {"review_lane_cap_non_review": 8, "review_lane_cap_ci": 6})
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9103,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_reason="ci_failure",
+    )
+
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CAP
+
+
+@pytest.mark.asyncio
+async def test_global_cap_still_bounded_with_lane_churn(db_session, mocker):
+    """Even if non-review lane churn doesn't hit sub-caps, the global cap still
+    applies. 16 review_convergence iterations on a large-scope PR blocks spawn."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _mock_lane_cap_github(mocker)
+
+    from app.review_pipeline import SPAWN_REASON_CAP
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    for _ in range(16):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review", "pr_number": 9104, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 9104, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9104,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CAP
+
+
+@pytest.mark.asyncio
+async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocker):
+    """When the global cap is hit, review_loop_terminal_outcome.detail must
+    include the per-lane breakdown string so fix_loop_telemetry can parse it."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _mock_lane_cap_github(mocker)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 8 code-review fixes + 4 CI fixes + 4 conflict fixes = 16 total (global cap).
+    for _ in range(8):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "code_review", "original_task_id": str(original_task.id)}},
+        ))
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "ci_failure", "original_task_id": str(original_task.id)}},
+        ))
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
+            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
+        ))
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={"scope": "large", "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9105,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    await db_session.refresh(original_task)
+    terminal = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    detail = terminal.get("detail", "")
+    lane_counts_stored = terminal.get("lane_counts") or {}
+    # Detail should carry the lane breakdown.
+    assert "conflict=" in detail or lane_counts_stored, (
+        f"Terminal outcome detail must include lane breakdown, got detail={detail!r}, "
+        f"lane_counts={lane_counts_stored!r}"
+    )
+    assert lane_counts_stored.get("ci") == 4 or "ci=4" in detail

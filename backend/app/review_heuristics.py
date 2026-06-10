@@ -639,3 +639,46 @@ def _feedback_jaccard(a: str, b: str) -> float:
     if not tokens_a or not tokens_b:
         return 0.0
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
+# ── Per-lane iteration cap accounting ─────────────────────────────────────────
+# Review-fix iteration budget lanes — mechanical churn (conflict resolution,
+# CI fixes, second-opinion arbitration) must not crowd out review-convergence
+# work. Each lane has a sub-cap; non-review lanes share a collective ceiling so
+# review_convergence always retains at least (global_cap - collective_ceil)
+# iterations regardless of churn volume.
+#
+# Lane values:
+#   conflict         — merge_conflict or update_branch_failed fix iterations
+#   ci               — ci_failure fix iterations
+#   arbitration      — panel_review (second-opinion/dispute) iterations
+#   review_convergence — everything else (code-review fix + review tasks)
+LANE_CONFLICT = "conflict"
+LANE_CI = "ci"
+LANE_ARBITRATION = "arbitration"
+LANE_REVIEW_CONVERGENCE = "review_convergence"
+
+# Default sub-caps (runtime-config-tunable; see review_pipeline._LANE_CAPS).
+LANE_CAP_CONFLICT_DEFAULT = 4
+LANE_CAP_CI_DEFAULT = 6
+LANE_CAP_ARBITRATION_DEFAULT = 2
+LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
+
+
+def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821
+    """Classify a completed/failed pipeline task into its review-fix lane.
+
+    Used to compute per-lane iteration counts so sub-caps can be applied
+    alongside the global cap. The classifier is a pure function of the task's
+    payload type and ``review_loop.fix_reason``.
+    """
+    payload = (task.first_payload or {}) if hasattr(task, "first_payload") else {}
+    payload_type = payload.get("type", "")
+    if payload_type == "panel_review":
+        return LANE_ARBITRATION
+    fix_reason = (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")
+    if fix_reason in ("merge_conflict", "update_branch_failed"):
+        return LANE_CONFLICT
+    if fix_reason == "ci_failure":
+        return LANE_CI
+    return LANE_REVIEW_CONVERGENCE

@@ -40,6 +40,14 @@ from app.review_heuristics import (  # noqa: F401
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
+    LANE_ARBITRATION,
+    LANE_CAP_ARBITRATION_DEFAULT,
+    LANE_CAP_CI_DEFAULT,
+    LANE_CAP_CONFLICT_DEFAULT,
+    LANE_CAP_NON_REVIEW_DEFAULT,
+    LANE_CI,
+    LANE_CONFLICT,
+    LANE_REVIEW_CONVERGENCE,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -60,6 +68,7 @@ from app.review_heuristics import (  # noqa: F401
     _reconcile_narrow_focus_with_fix_all,
     _repeating_issue_descriptions,
     _stuck_thresholds,
+    classify_iteration_lane,
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
@@ -1372,11 +1381,13 @@ async def _spawn_pipeline_task(
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
         )
         type_match = func.json_extract(Task.payloads, "$[0].type").in_(
-            ("review", "fix")
+            ("review", "fix", "panel_review")
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-        type_match = Task.payloads[0]["type"].as_string().in_(("review", "fix"))
+        type_match = Task.payloads[0]["type"].as_string().in_(
+            ("review", "fix", "panel_review")
+        )
     pr_pipeline_tasks = (
         (
             await session.execute(
@@ -1585,6 +1596,62 @@ async def _spawn_pipeline_task(
         return True
 
     pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))
+
+    # ── Per-lane iteration counts ───────────────────────────────────────────
+    # Count existing iterations by lane (applying the same infra-class cap
+    # exemption) so sub-cap checks can block mechanical churn before it crowds
+    # out review-convergence work.
+    lane_counts: dict[str, int] = {
+        LANE_CONFLICT: 0,
+        LANE_CI: 0,
+        LANE_ARBITRATION: 0,
+        LANE_REVIEW_CONVERGENCE: 0,
+    }
+    for _lt in pr_pipeline_tasks:
+        if _counts_toward_cap(_lt):
+            _lane = classify_iteration_lane(_lt)
+            lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
+    non_review_total = (
+        lane_counts[LANE_CONFLICT]
+        + lane_counts[LANE_CI]
+        + lane_counts[LANE_ARBITRATION]
+    )
+
+    # Runtime-config-tunable sub-caps.
+    _lane_cap_conflict = _runtime_config.get(
+        "review_lane_cap_conflict", LANE_CAP_CONFLICT_DEFAULT
+    )
+    _lane_cap_ci = _runtime_config.get("review_lane_cap_ci", LANE_CAP_CI_DEFAULT)
+    _lane_cap_arbitration = _runtime_config.get(
+        "review_lane_cap_arbitration", LANE_CAP_ARBITRATION_DEFAULT
+    )
+    _lane_cap_non_review = _runtime_config.get(
+        "review_lane_cap_non_review", LANE_CAP_NON_REVIEW_DEFAULT
+    )
+
+    def _lane_breakdown_detail() -> str:
+        return (
+            f"conflict={lane_counts[LANE_CONFLICT]}/{_lane_cap_conflict}, "
+            f"ci={lane_counts[LANE_CI]}/{_lane_cap_ci}, "
+            f"arbitration={lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration}, "
+            f"non_review={non_review_total}/{_lane_cap_non_review}, "
+            f"review_convergence={lane_counts[LANE_REVIEW_CONVERGENCE]}"
+        )
+
+    # Classify the upcoming spawn's lane so we can gate on the right sub-cap.
+    _spawn_lane = classify_iteration_lane(source_task)
+    # For the upcoming spawn, fix_reason and task_type determine the lane more
+    # precisely than source_task's completed context (which may be from a prior
+    # review or a different fix iteration). Override with spawn parameters.
+    if task_type == "panel_review":
+        _spawn_lane = LANE_ARBITRATION
+    elif fix_reason in ("merge_conflict", "update_branch_failed"):
+        _spawn_lane = LANE_CONFLICT
+    elif fix_reason == "ci_failure":
+        _spawn_lane = LANE_CI
+    elif task_type in ("review", "fix") and fix_reason in ("", "code_review"):
+        _spawn_lane = LANE_REVIEW_CONVERGENCE
+
     # Load direction data for direction-aware cap adjustment.
     direction_data: dict | None = None
     direction_id = (source_task.context or {}).get("direction_id")
@@ -1615,10 +1682,137 @@ async def _spawn_pipeline_task(
             pr_iterations,
             session,
             scope="global",
+            lane_counts=lane_counts,
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
         session.add(source_task)
         return (None, False)
+
+    # ── Per-lane sub-cap checks ─────────────────────────────────────────────
+    # Block a spawn when its lane's sub-cap is exhausted or non-review lanes
+    # collectively hit the collective ceiling. These fire before the global cap
+    # so mechanical churn never starves review-convergence work.
+    # Arbitration exhaustion → standoff escalation (mirrors the is_standoff
+    # path). Conflict/CI exhaustion routes to _handle_cap_exhaustion which
+    # uses _pr_is_preservable_on_cap to preserve rollup work.
+    _lane_exhausted: str | None = None
+    if _spawn_lane == LANE_ARBITRATION and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration:
+        _lane_exhausted = LANE_ARBITRATION
+    elif _spawn_lane == LANE_CONFLICT and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict:
+        _lane_exhausted = LANE_CONFLICT
+    elif _spawn_lane == LANE_CI and lane_counts[LANE_CI] >= _lane_cap_ci:
+        _lane_exhausted = LANE_CI
+    elif _spawn_lane != LANE_REVIEW_CONVERGENCE and non_review_total >= _lane_cap_non_review:
+        _lane_exhausted = "non_review_collective"
+
+    if _lane_exhausted is not None:
+        _detail = _lane_breakdown_detail()
+        if _lane_exhausted == LANE_ARBITRATION:
+            # Arbitration lane exhausted → treat as standoff escalation.
+            logger.warning(
+                f"[PIPELINE] PR #{pr_number} arbitration lane exhausted "
+                f"({lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration} iterations). "
+                f"Lane breakdown: {_detail}"
+            )
+            try:
+                _ae_orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                if _ae_orig:
+                    if _runtime_config.get("require_approval_gates", True):
+                        _ae_orig.requires_approval = True
+                    _ae_orig.latest_status_message = (
+                        f"Arbitration lane cap reached ({lane_counts[LANE_ARBITRATION]} "
+                        f"second-opinion iterations) — review-fix loop escalated for "
+                        f"manual resolution on PR #{pr_number}. {_detail}"
+                    )
+                    _set_review_loop_terminal_outcome(
+                        _ae_orig,
+                        kind="standoff",
+                        reason="arbitration_lane_exhausted",
+                        pr_number=pr_number,
+                        iterations=pr_iterations,
+                        detail=_detail,
+                    )
+                    session.add(_ae_orig)
+                    await session.commit()
+                    # Durable operator alert — fires regardless of
+                    # approval-gate state (mirrors the existing standoff path).
+                    try:
+                        from app.alert_dispatch import (
+                            _maybe_create_escalation_alert,
+                        )
+
+                        await _maybe_create_escalation_alert(
+                            _ae_orig,
+                            session,
+                            pr_number=pr_number,
+                            reason="arbitration_lane_exhausted",
+                            iteration=pr_iterations,
+                        )
+                    except Exception as _alert_err:  # noqa: BLE001
+                        logger.warning(
+                            f"[PIPELINE] Failed to create escalation alert for "
+                            f"arbitration-lane exhaustion on PR #{pr_number}: {_alert_err}",
+                            exc_info=True,
+                        )
+                    try:
+                        import asyncio as _asyncio
+                        from app.notification_dispatch import (
+                            dispatch_external_notification,
+                        )
+
+                        _asyncio.ensure_future(  # noqa: RUF006
+                            dispatch_external_notification(
+                                _ae_orig.project_id,
+                                "APPROVAL_NEEDED",
+                                {
+                                    "task_id": str(_ae_orig.id),
+                                    "task_title": _ae_orig.title
+                                    or str(_ae_orig.id)[:8],
+                                    "pr_number": pr_number,
+                                    "iteration": pr_iterations,
+                                    "reason": "Arbitration lane cap reached — manual review required",
+                                },
+                            )
+                        )
+                    except Exception as _ne:  # noqa: BLE001
+                        logger.warning(
+                            f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed "
+                            f"(arbitration-lane): {_ne}"
+                        )
+            except Exception as _ae_err:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Failed to mark arbitration-lane exhaustion on "
+                    f"{resolved_original_id[:8]}: {_ae_err}",
+                    exc_info=True,
+                )
+            _set_spawn_reason(source_task, SPAWN_REASON_STUCK)
+            session.add(source_task)
+            return (None, False)
+        else:
+            # Conflict or CI lane exhausted (or non-review collective cap) →
+            # route to _handle_cap_exhaustion. For rollup PRs,
+            # _pr_is_preservable_on_cap returns True → preserve work.
+            _scope_label = (
+                f"{_lane_exhausted}-lane"
+                if _lane_exhausted in (LANE_CONFLICT, LANE_CI)
+                else "non-review-collective"
+            )
+            logger.warning(
+                f"[PIPELINE] PR #{pr_number} {_scope_label} lane cap exhausted. "
+                f"Lane breakdown: {_detail}"
+            )
+            await _handle_cap_exhaustion(
+                source_task,
+                resolved_original_id,
+                pr_number,
+                pr_iterations,
+                session,
+                scope=_scope_label,
+                lane_counts=lane_counts,
+            )
+            _set_spawn_reason(source_task, SPAWN_REASON_CAP)
+            session.add(source_task)
+            return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain).
     # Rollup PRs use the same elevated cap as the global check above — without
@@ -1642,6 +1836,7 @@ async def _spawn_pipeline_task(
             per_chain_cap,
             session,
             scope="per-chain",
+            lane_counts=lane_counts,
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
         session.add(source_task)
