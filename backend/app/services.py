@@ -193,11 +193,12 @@ async def gcp_cleanup_service():
                             f"[GCP CLEANUP] Partial failure: deleted {len(cleanup_result.deleted)}, "
                             f"failed {len(cleanup_result.failed)}: {cleanup_result.failed}"
                         )
-                    # Cache total GCP VM count for orchestrator concurrency check
-                    if hasattr(cleanup_result, "total_gcp_vms"):
+                    # Cache agent-VM count for orchestrator concurrency check
+                    # (compute-job VMs are excluded — they don't consume dispatch slots)
+                    if hasattr(cleanup_result, "agent_vm_count"):
                         import app.vm_lifecycle as _vm_lifecycle
 
-                        _vm_lifecycle._last_gcp_vm_count = cleanup_result.total_gcp_vms
+                        _vm_lifecycle._last_gcp_vm_count = cleanup_result.agent_vm_count
                         _vm_lifecycle._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
                     logger.exception("[GCP CLEANUP] Cycle timed out after 270s")

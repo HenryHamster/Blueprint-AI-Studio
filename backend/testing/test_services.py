@@ -935,14 +935,14 @@ async def test_gcp_cleanup_handles_timeout_gracefully(gcp_db, mocker):
 
 @pytest.mark.asyncio
 async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
-    """When cleanup returns total_gcp_vms, the global VM count cache should be updated."""
+    """When cleanup returns agent_vm_count, the global VM count cache should be updated."""
     project = await _make_project(gcp_db)
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
 
     mock_result = MagicMock()
     mock_result.deleted = ["agent-vm-orphan"]
     mock_result.failed = []
-    mock_result.total_gcp_vms = 5
+    mock_result.agent_vm_count = 5
     mocker.patch(
         "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
     )
@@ -968,6 +968,7 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     mock_result.deleted = []
     mock_result.failed = ["agent-vm-bad-1", "agent-vm-bad-2"]
     mock_result.total_gcp_vms = 3
+    mock_result.agent_vm_count = 3
     mocker.patch(
         "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
     )

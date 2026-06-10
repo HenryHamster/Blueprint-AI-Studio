@@ -2793,10 +2793,11 @@ async def _delete_gcp(vm_instance_id: str):
 class CleanupResult:
     """Structured result from orphan cleanup."""
 
-    __slots__ = ("deleted", "failed", "orphan_count", "total_gcp_vms")
+    __slots__ = ("agent_vm_count", "deleted", "failed", "orphan_count", "total_gcp_vms")
 
     def __init__(self):
         self.total_gcp_vms: int = 0
+        self.agent_vm_count: int = 0
         self.orphan_count: int = 0
         self.deleted: list[str] = []
         self.failed: list[str] = []
@@ -2835,6 +2836,7 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         all_vms.extend(zr)
 
     result.total_gcp_vms = len(all_vms)
+    result.agent_vm_count = sum(1 for name, _, _ in all_vms if name.startswith("agent-vm-"))
     orphans = [
         (name, zone, status) for name, zone, status in all_vms if name not in active_set
     ]

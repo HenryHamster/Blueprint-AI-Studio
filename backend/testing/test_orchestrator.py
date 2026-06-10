@@ -2897,6 +2897,62 @@ class TestProjectConcurrencyCap:
         )
 
 
+class TestComputeJobVMDispatchHeadroom:
+    """Compute-job VMs must not consume agent dispatch slots (direction d-9d6c2c94).
+
+    _get_actual_gcp_vm_count must only count agent-vm-* instances; compute-job-vm-*
+    instances must be excluded so GPU jobs do not starve agent task dispatch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_compute_job_vms_excluded_from_dispatch_headroom(self, mocker):
+        """slots_available = max_concurrent_vms - agent_vms (NOT - agent_vms - compute_job_vms).
+
+        Setup: max_concurrent_vms=5, 2 agent-vm-* VMs live, 3 compute-job-vm-* VMs live.
+        Expected: slots_available = 5 - 2 = 3 (not 5 - 2 - 3 = 0).
+        """
+        import app.vm_lifecycle as _vm_lifecycle_mod
+
+        # Mix of agent and compute-job VMs returned from zone listing
+        mixed_vms = [
+            ("agent-vm-aaa", "us-central1-a", "RUNNING"),
+            ("agent-vm-bbb", "us-central1-a", "RUNNING"),
+            ("compute-job-vm-gpu1", "us-central1-a", "RUNNING"),
+            ("compute-job-vm-gpu2", "us-central1-a", "RUNNING"),
+            ("compute-job-vm-gpu3", "us-central1-a", "RUNNING"),
+        ]
+
+        mocker.patch("app.compute.LOCAL_MODE", False)
+        mocker.patch(
+            "app.compute.FALLBACK_ZONES",
+            [("us-central1-a", "us-central1")],
+        )
+        mocker.patch(
+            "app.compute._list_vms_in_zone",
+            return_value=mixed_vms,
+        )
+
+        # Force cache expiry by patching the globals so they're restored post-test
+        mocker.patch.object(_vm_lifecycle_mod, "_last_gcp_vm_check", 0.0)
+        mocker.patch.object(
+            _vm_lifecycle_mod, "_last_gcp_vm_count", _vm_lifecycle_mod._last_gcp_vm_count
+        )
+
+        count = await _vm_lifecycle_mod._get_actual_gcp_vm_count()
+        assert count == 2, (
+            f"Expected 2 (only agent-vm-* instances), got {count} — "
+            "compute-job-vm-* instances must be excluded from the dispatch headroom count"
+        )
+
+        # Verify slots_available formula: max_concurrent_vms - agent_vm_count
+        max_concurrent_vms = 5
+        slots_available = max(0, max_concurrent_vms - count)
+        assert slots_available == 3, (
+            f"Expected slots_available=3 (5 - 2 agent VMs), got {slots_available} — "
+            "compute-job VMs must not consume agent dispatch slots"
+        )
+
+
 class TestBatchedDepRowsSurviveCommit:
     """The N+1 dependency-fetch fix batches ALL dep rows in one IN(...) query
     in a separate session, then DETACHES them (expunge_all) so they survive the
