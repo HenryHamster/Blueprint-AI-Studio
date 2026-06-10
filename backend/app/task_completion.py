@@ -83,7 +83,7 @@ from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
 )
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
@@ -2552,6 +2552,41 @@ async def _handle_compute_experiment_completion(
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
         delivery = compute_result["artifact_delivery"]
+        # Tier-2 strict gate, prerequisite mode: a prerequisite that explicitly
+        # requested require_durable_artifact, or that declares downstream_artifact
+        # acceptance evidence (implying it must hand a durable artifact to its
+        # dependent), must NOT complete as satisfied unless a durable artifact was
+        # actually delivered. Mirrors the normal-mode gate at the Tier-2 block
+        # below. Ordinary prerequisites (no flag, no downstream_artifact evidence)
+        # stay fail-soft and complete on measurement alone.
+        evidence = read_acceptance_evidence(task.first_payload)
+        require_durable = bool(
+            (task.first_payload or {}).get("require_durable_artifact")
+        ) or (evidence is not None and evidence.kind == "downstream_artifact")
+        if require_durable and not delivery["delivered"]:
+            miss_reason = (
+                f"require_durable_artifact: no durable artifact delivered "
+                f"(durability={delivery['durability']})"
+            )
+            record_failed_gate(
+                task,
+                EvaluationVerdict(False, miss_reason, "artifact-delivery"),
+            )
+            logger.info(
+                "[COMPUTE] Prerequisite-mode task %s failed Tier-2 "
+                "durable-artifact gate: %s",
+                task.id,
+                miss_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
             f", artifact_delivery={delivery['durability']}"

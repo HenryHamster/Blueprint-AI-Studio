@@ -3157,3 +3157,156 @@ async def test_require_durable_artifact_gate_fails_with_linked_transient_artifac
     delivery = task.plan_output["compute_result"]["artifact_delivery"]
     assert delivery["delivered"] is False
     assert delivery["durability"] == "transient"
+
+
+# ── require_durable_artifact Tier 2 gate — PREREQUISITE mode ────────────────
+
+
+def _prerequisite_context(extra: dict | None = None) -> dict:
+    ctx = dict(extra or {})
+    ctx[COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY] = (
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_require_durable_artifact_fails_without_durable_uri(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode + require_durable_artifact=True + no durable artifact →
+    FAILED. A measured verdict alone must NOT satisfy a prerequisite that demands
+    a durable artifact; the Tier-2 gate now also fires in the prerequisite path."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": True,
+        }
+    ]
+    task.context = _prerequisite_context()
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "artifact-delivery"
+    assert "require_durable_artifact" in gate["reason"]
+    assert "none" in gate["reason"]
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_require_durable_artifact_passes_with_durable_uri(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode + require_durable_artifact=True + gs:// durable artifact →
+    COMPLETED. The gate fires only on non-delivery; durable delivery still
+    completes."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": True,
+        }
+    ]
+    task.context = _prerequisite_context()
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    gs_uri = "gs://blueprint-agent-artifacts/compute-jobs/prereq-result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=gs_uri),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is True
+    assert delivery["durability"] == "durable"
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_downstream_artifact_evidence_fails_without_durable_uri(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode + downstream_artifact acceptance evidence (no explicit
+    flag) + no durable artifact → FAILED. Declaring a downstream_artifact implies
+    the experiment must hand a durable artifact to its dependent."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    task.context = _prerequisite_context()
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "artifact-delivery"
+    assert "require_durable_artifact" in gate["reason"]
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_no_flag_remains_fail_soft_without_durable(
+    db_session, _quiet_compute_io
+):
+    """Prerequisite mode + no flag + no downstream_artifact evidence + no durable
+    artifact → COMPLETED. Ordinary prerequisites stay fail-soft; the gate must
+    not fire for them."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+        }
+    ]
+    task.context = _prerequisite_context()
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "none"

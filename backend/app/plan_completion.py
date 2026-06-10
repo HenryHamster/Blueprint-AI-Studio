@@ -909,6 +909,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "experiment",
                             "benchmark",
                             "metric",
+                            "hypothesis",
                             "cwd",
                             "env",
                             "accelerator",
@@ -918,6 +919,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "live_release_proof",
                             "live_release_proof_marker",
                             "requires_live_release",
+                            "require_durable_artifact",
                         )
                         if compute_contract.get(key) is not None
                     },

@@ -780,6 +780,67 @@ async def test_compute_experiment_prereq_propagates_live_proof_contract(
 
 
 @pytest.mark.asyncio
+async def test_compute_experiment_require_durable_artifact_forwarded_to_payload(
+    db_session, mocker, _quiet_mocks
+):
+    """A strict compute_experiment subtask carries its durable-artifact contract.
+
+    ``require_durable_artifact`` and ``hypothesis`` are declared on the subtask
+    definition and must travel through the launch-contract assembler onto the
+    spawned child's first_payload, where the completion gate can enforce the
+    strict durable-delivery requirement. Experiments that omit the flag remain
+    fail-soft (no field is stamped).
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Run the strict experiment",
+                    "prompt": "launch a durable-artifact compute job",
+                    "type": "compute_experiment",
+                    "command": "python strict_bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "require_durable_artifact": True,
+                    "hypothesis": "the optimized kernel beats the baseline by 10%",
+                },
+                {
+                    "title": "Run the fail-soft experiment",
+                    "prompt": "launch an ordinary compute job",
+                    "type": "compute_experiment",
+                    "command": "python soft_bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_title = {c.title: c for c in children}
+
+    strict_payload = by_title["Run the strict experiment"].first_payload or {}
+    assert strict_payload["type"] == "compute_experiment"
+    assert strict_payload["require_durable_artifact"] is True
+    assert strict_payload["hypothesis"] == (
+        "the optimized kernel beats the baseline by 10%"
+    )
+
+    soft_payload = by_title["Run the fail-soft experiment"].first_payload or {}
+    assert soft_payload["type"] == "compute_experiment"
+    assert "require_durable_artifact" not in soft_payload
+    assert "hypothesis" not in soft_payload
+
+
+@pytest.mark.asyncio
 async def test_implementation_child_can_depend_on_knowledge_prereq(
     db_session, mocker, _quiet_mocks
 ):

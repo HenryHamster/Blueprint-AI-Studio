@@ -4150,6 +4150,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "experiment",
                             "benchmark",
                             "metric",
+                            "hypothesis",
                             "cwd",
                             "env",
                             "accelerator",
@@ -4159,6 +4160,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "live_release_proof",
                             "live_release_proof_marker",
                             "requires_live_release",
+                            "require_durable_artifact",
                         )
                         if _cc.get(k) is not None
                     },
