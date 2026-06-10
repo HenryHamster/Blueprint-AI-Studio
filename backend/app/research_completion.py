@@ -1840,6 +1840,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # round-trip through the findings parser, fall back to the stored
         # findings directly so a PASSING grade can never silently spawn nothing.
         findings = [f for f in task.plan_output if isinstance(f, dict)]
+    if not findings and (task.context or {}).get("_research_spawn_pending") and isinstance(task.plan_output, list):
+        # Spawn-pending resume: a prior pass was interrupted mid-spawn (lock
+        # timeout / network error after _ensure_branch committed the marker).
+        # The sweep retry replays with the same agent logs, which may no longer
+        # parse cleanly. Fall back to the findings committed to plan_output on
+        # the first pass so the spawn can proceed without re-running the agent.
+        findings = [f for f in task.plan_output if isinstance(f, dict)]
+        logger.info(
+            "[RESEARCH] Task %s: resuming interrupted spawn from stored plan_output",
+            task.id,
+        )
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
@@ -2701,6 +2712,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     short_id = str(task.id).replace("-", "")[:8]
     research_branch_prefix = getattr(project_obj, "research_branch_prefix", "research/")
     research_branch = f"{research_branch_prefix}{short_id}"
+
+    # Stamp spawn-pending before _ensure_branch commits its row-lock release
+    # (task_completion.py ~line 1260). If spawn is interrupted mid-flight by a
+    # lock timeout or network error, this marker is already durable and tells the
+    # sweep retry to resume the spawn from task.plan_output instead of discarding
+    # the findings and re-running the agent.
+    _ctx_sp = dict(task.context or {})
+    _ctx_sp["_research_spawn_pending"] = True
+    task.context = _ctx_sp
+    flag_modified(task, "context")
 
     # Create staging branch for this research batch.
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
@@ -4766,6 +4787,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             .scalars()
             .first()
         )
+    # Clear spawn-pending atomically with the child-task spawn commit.
+    # Whether or not this pass spawned children, the spawn is completing
+    # successfully and future passes should not use the resume path.
+    _ctx_post = dict(task.context or {})
+    _ctx_post.pop("_research_spawn_pending", None)
+    task.context = _ctx_post
+    flag_modified(task, "context")
     if child_tasks or _has_prior_children:
         task.status = TaskStatus.EVALUATING
         task.context = {

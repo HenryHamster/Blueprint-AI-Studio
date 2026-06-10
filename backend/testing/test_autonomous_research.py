@@ -14016,3 +14016,238 @@ async def test_populated_design_doc_respects_architecture_cadence(
     # Verify design_doc_update was NOT called (no architecture on cycle 1)
     from app.strategic_spawning import _spawn_design_doc_update
     assert not _spawn_design_doc_update.called, "design_doc_update should not spawn on cycle 1 with populated design_doc"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spawn-pending idempotency — lock-timeout resilience
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_resume_uses_stored_plan_output(db_session, mocker):
+    """When _research_spawn_pending is set and logs produce no findings,
+    the handler falls back to task.plan_output so the interrupted spawn can finish."""
+    direction = _active_direction("d-spawn-res1", "Resume direction")
+    project = Project(
+        name="Spawn Pending Resume",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    finding = _make_finding(title="Stored finding", direction_id=direction["id"])
+
+    # Task already in post-_ensure_branch-commit state: marker and plan_output durable.
+    task = Task(
+        project_id=project.id,
+        title="Research: resume test",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction["id"],
+            }
+        ],
+        context={
+            "research_depth": 0,
+            "_research_spawn_pending": True,
+        },
+        plan_output=[finding],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "Stored finding should be spawned via spawn-pending resume path"
+
+    await db_session.refresh(task)
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending must be cleared after successful spawn"
+    )
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be EVALUATING after spawning children — not COMPLETED with zero children"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_marker_stamped_before_ensure_branch(db_session, mocker):
+    """_research_spawn_pending is set in task.context before _ensure_branch is called,
+    so _ensure_branch's internal commit makes it durable regardless of what follows."""
+    direction = _active_direction("d-spawn-stamp1", "Stamp direction")
+    project = Project(
+        name="Spawn Pending Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    captured_context: list[dict] = []
+
+    async def _capture_and_passthrough(task_obj, *_a, **_kw):
+        captured_context.append(dict(task_obj.context or {}))
+        return task_obj
+
+    mocker.patch("app.research_completion._ensure_branch", new=_capture_and_passthrough)
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    assert captured_context, "_ensure_branch should have been called"
+    assert captured_context[0].get("_research_spawn_pending") is True, (
+        "_research_spawn_pending must be True in task.context when _ensure_branch is called"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_marker_cleared_after_successful_spawn(db_session, mocker):
+    """_research_spawn_pending is absent from task.context after a successful spawn."""
+    direction = _active_direction("d-spawn-clr1", "Clear direction")
+    project = Project(
+        name="Spawn Pending Clear",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending must be absent after a successful spawn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_session, mocker):
+    """Simulate a lock timeout inside _ensure_branch on the first pass.
+
+    _ensure_branch's internal commit makes _research_spawn_pending and plan_output
+    durable before the error. A sweep retry (second call with empty logs) uses the
+    stored findings and completes the spawn, leaving exactly one child and the task
+    in EVALUATING — never COMPLETED with zero children.
+    """
+    direction = _active_direction("d-midspawn1", "Mid-spawn direction")
+    project = Project(
+        name="Mid-Spawn Replay",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    finding = _make_finding(title="Mid-spawn finding", direction_id=direction["id"])
+    task = await _make_research_task(project, direction, db_session)
+
+    # Common patches (same as _patch_research_externals but without _ensure_branch).
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    call_count = [0]
+
+    async def _ensure_branch_fail_then_pass(task_obj, *_a, **_kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # Simulate _ensure_branch committing the spawn-pending marker
+            # (task.context mutation already applied by the stamp code above it)
+            # then failing on the row-lock re-acquisition.
+            await db_session.commit()
+            raise RuntimeError("lock timeout: simulated LockNotAvailableError mid-spawn")
+        return task_obj
+
+    mocker.patch("app.research_completion._ensure_branch", new=_ensure_branch_fail_then_pass)
+
+    # Pass 1: handler commits plan_output + _research_spawn_pending, then _ensure_branch fails.
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    with pytest.raises(RuntimeError, match="lock timeout"):
+        await _handle_research_completion(task, "", db_session)
+
+    # Verify durable state after pass 1.
+    await db_session.refresh(task)
+    assert isinstance(task.plan_output, list) and len(task.plan_output) > 0, (
+        "plan_output must be committed before _ensure_branch"
+    )
+    assert (task.context or {}).get("_research_spawn_pending") is True, (
+        "_research_spawn_pending must be durable after _ensure_branch's internal commit"
+    )
+
+    # Pass 2: sweep retry with empty logs — resume path uses stored plan_output.
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "Exactly one child spawned on replay — not zero, not two"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be EVALUATING after successful replay — no childless-COMPLETED strand"
+    )
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending cleared after successful replay"
+    )

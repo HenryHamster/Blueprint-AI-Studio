@@ -5255,6 +5255,28 @@ async def _process_post_commit(
                         "connection refused",
                     ]
                 )
+                # Research task interrupted mid-spawn: findings are already committed
+                # to task.plan_output and _research_spawn_pending is durable in context.
+                # Requeuing the agent would discard those findings and start a new
+                # research cycle. Instead raise PostCommitFinalCommitFailed — which
+                # preserves the post_commit_pending marker so the sweep retries just
+                # the spawn from stored plan_output without re-running the agent.
+                if (
+                    is_transient
+                    and task_type == "research"
+                    and bool((task.context or {}).get("_research_spawn_pending"))
+                ):
+                    logger.warning(
+                        "[HANDLER] Research task %s: transient error mid-spawn; "
+                        "preserving post_commit_pending for sweep to retry spawn "
+                        "from stored findings (handler_exc=%r)",
+                        task_id,
+                        handler_exc,
+                    )
+                    raise PostCommitFinalCommitFailed(
+                        f"research mid-spawn transient error for {task_id}; "
+                        f"sweep retries spawn: {handler_exc!r}"
+                    )
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
                     # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
@@ -5294,6 +5316,30 @@ async def _process_post_commit(
                         task_type=(task.first_payload or {}).get("type", ""),
                     )
                 session.add(task)
+                # Commit QUEUED immediately — the subsequent helpers each call
+                # _rollback_and_refetch_task() on their own failures, which rolls
+                # back the whole transaction and discards any uncommitted status
+                # mutation, stranding the task as COMPLETED with work undispatched
+                # (prod incident 2026-05-29). Commit now so a later rollback cannot
+                # undo the requeue; then return early — all remaining helpers are
+                # terminal-only (COMPLETED/FAILED/CANCELLED) and are no-ops for a
+                # requeued task.
+                if task.status == TaskStatus.QUEUED:
+                    try:
+                        await session.commit()
+                    except Exception as _requeue_commit_exc:
+                        logger.error(
+                            "[HANDLER] Failed to commit QUEUED state for task %s: %r — "
+                            "preserving post_commit_pending for sweep retry",
+                            task_id,
+                            _requeue_commit_exc,
+                        )
+                        with contextlib.suppress(Exception):
+                            await session.rollback()
+                        raise PostCommitFinalCommitFailed(
+                            f"requeue commit failed for {task_id}: {_requeue_commit_exc!r}"
+                        ) from _requeue_commit_exc
+                    return {"status": "received"}
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [
