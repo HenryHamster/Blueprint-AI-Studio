@@ -39,8 +39,6 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.models import Project, QualificationVerdict
 from app.release_artifacts import (
-    AGENT_IMAGE_ARTIFACT_KIND,
-    BACKEND_REVISION_ARTIFACT_KIND,
     get_or_create_release_deploy_artifact,
 )
 from app.notification_dispatch import post_event_message
@@ -1588,14 +1586,35 @@ async def _record_promotion_success(
     version.promoted_at = now
     version.promoted_sha = effective_sha
     # Post-promotion serving confirmation: the merge landed, but the promotion
-    # is PROVISIONAL until deploy_health confirms the promoted SHA is actually
-    # serving in production.  Mark it "unconfirmed" and stamp a bounded
-    # confirmation deadline; the periodic release sweep resolves it to
-    # "serving_confirmed" or "deploy_failed".  Only the self-repo's deploy is
-    # observable via the DeploymentState singleton — for other projects leave
-    # serving_status NULL (NA) so the sweep never strands them waiting on a
-    # signal it cannot read.
-    if getattr(_record_project, "is_self_repo", False):
+    # is PROVISIONAL until the observable providers confirm the promoted SHA is
+    # actually serving.  Arm the version and create artifact rows for exactly the
+    # providers OBSERVABLE for this project (per-provider observability replaces
+    # the old ``is_self_repo`` gate):
+    #
+    #   * the baseline ``promotion_merge`` provider is observable for EVERY
+    #     GitHub project (its signal is the promotion target branch, reachable
+    #     via the project's own credentials), so every promotion gets armed and
+    #     resolves to at least a merge-persisted verdict — the v8 incident was
+    #     that a self-repo whose ``is_self_repo`` flag was False never armed at
+    #     all, leaving the pipeline unable to answer "did the last version ship?"
+    #   * the Cloud Run providers (``backend_revision`` / ``agent_image``) are
+    #     observable only for the project this deployment was built from (the
+    #     deploy-level identity), so they arm for the deploy's own repo and stay
+    #     out of an external project's aggregate.
+    #
+    # Arm whenever AT LEAST ONE required provider is observable.  When none is
+    # (e.g. a credential-less project), leave serving_status NULL (NA) so the
+    # sweep never strands the version waiting on a signal it cannot read —
+    # exactly the backward-compatible "un-armed → plain promoted" behavior.
+    # Deliberately does NOT read ``project.is_self_repo``.
+    from app.deploy_identity import deploy_repo_identity
+    from app.release_artifacts import observable_release_artifact_providers
+
+    _deploy_identity = deploy_repo_identity()
+    _observable_providers = observable_release_artifact_providers(
+        _record_project, _deploy_identity
+    )
+    if any(provider.required for provider in _observable_providers):
         version.serving_status = "unconfirmed"
         version.served_sha = None
         version.served_at = None
@@ -1604,24 +1623,17 @@ async def _record_promotion_success(
         version.deploy_confirm_deadline = now + timedelta(
             seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
         )
-        await get_or_create_release_deploy_artifact(
-            session,
-            version,
-            BACKEND_REVISION_ARTIFACT_KIND,
-            confirmation_deadline=version.deploy_confirm_deadline,
-        )
-        # Open the agent VM image serving window alongside the backend revision.
-        # The agent_image artifact is REQUIRED, so the aggregate serving status
-        # stays unconfirmed until BOTH the backend revision boots and the agent
-        # fleet is observed serving the promoted SHA (when the diff touched the
-        # bake paths) — a non-bake promotion's agent_image artifact confirms
-        # immediately so the aggregate tracks the backend revision alone.
-        await get_or_create_release_deploy_artifact(
-            session,
-            version,
-            AGENT_IMAGE_ARTIFACT_KIND,
-            confirmation_deadline=version.deploy_confirm_deadline,
-        )
+        # Open a serving window for exactly the observable providers.  Each
+        # required artifact must confirm before the aggregate reaches
+        # serving_confirmed; a provider that confirms immediately (e.g. a
+        # non-bake agent_image) keeps the aggregate tracking the slower ones.
+        for provider in _observable_providers:
+            await get_or_create_release_deploy_artifact(
+                session,
+                version,
+                provider.artifact_kind,
+                confirmation_deadline=version.deploy_confirm_deadline,
+            )
     session.add(version)
     # Phase 4: durable verdict-history row for a successful promotion.  This
     # only ever runs with promotion enabled (the dry_run branch returns earlier).

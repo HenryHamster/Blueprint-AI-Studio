@@ -19067,16 +19067,18 @@ async def test_record_promotion_success_stamps_unconfirmed_for_self_repo(db_sess
 async def test_record_promotion_success_leaves_serving_null_for_non_self_repo(
     db_session,
 ):
-    """A non-self-repo promotion leaves serving_status NULL (NA) — the deploy is
-    not observable via the DeploymentState singleton, so the sweep never strands
-    it waiting on a signal it cannot read."""
+    """A credential-less project (no GitHub repo) leaves serving_status NULL (NA)
+    — NO provider is observable for it (not even the merge baseline), so the
+    promotion is never armed and the sweep never strands it waiting on a signal
+    it cannot read. Arming is now driven by per-provider observability, not the
+    is_self_repo flag."""
     from app.release_promotion import _record_promotion_success
 
     project = Project(
-        name="Other-Repo",
+        name="No-Repo",
         user_id="or-user",
-        github_owner="acme",
-        github_repo="other",
+        github_owner=None,
+        github_repo=None,
         integration_branch="automain",
         promotion_target="main",
         is_self_repo=False,

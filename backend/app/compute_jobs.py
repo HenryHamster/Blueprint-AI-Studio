@@ -48,6 +48,7 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    Project,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -380,16 +381,29 @@ async def _resolve_live_release_evidence(
                 "live_proof": requirement,
             }
         )
+    project = await session.get(Project, project_id)
     aggregate, artifacts = summarize_release_artifacts(
         version,
         version.deploy_artifacts,
+        project=project,
     )
     required_artifacts = [
         artifact for artifact in artifacts if artifact.get("required")
     ]
-    required_artifacts_confirmed = all(
-        artifact.get("serving_status") == "serving_confirmed"
+    # Skip vacuous (serving_status None) required rows — an absent/legacy
+    # provider row is NA, not pending (mirrors summarize_required_artifact_gap
+    # and the aggregate projection, which exclude None-status evidence). A
+    # genuinely pending row carries a real status ("unconfirmed"/"deploy_failed"),
+    # not None, so it still blocks. Require at least one non-vacuous required
+    # artifact confirmed so a fully un-armed version never passes as "serving".
+    _observed_required = [
+        artifact
         for artifact in required_artifacts
+        if artifact.get("serving_status") is not None
+    ]
+    required_artifacts_confirmed = bool(_observed_required) and all(
+        artifact.get("serving_status") == "serving_confirmed"
+        for artifact in _observed_required
     )
     evidence = {
         "live_proof": requirement,

@@ -21,6 +21,7 @@ from app.models import (
     Project,
     QualificationVerdict,
 )
+from app.deploy_identity import deploy_repo_identity
 from app.release_artifacts import (
     BACKEND_REVISION_ARTIFACT_KIND,
     aggregate_required_artifact_status,
@@ -28,7 +29,7 @@ from app.release_artifacts import (
     artifact_is_unconfirmed,
     get_or_create_release_deploy_artifact,
     is_backend_revision_artifact,
-    iter_release_artifact_providers,
+    observable_release_artifact_providers,
     project_backend_revision_artifact,
     summarize_release_artifacts,
 )
@@ -105,7 +106,16 @@ async def _refresh_release_artifact_rows(
     mutated = False
     backend_artifact = None
 
-    for provider in iter_release_artifact_providers():
+    # Iterate only the providers OBSERVABLE for this version's project (the
+    # deploy-level identity), not every registered provider.  This is the same
+    # set armed at promotion: a non-observable provider (e.g. a Cloud Run signal
+    # for an external project) must never get a row created or checked here, or
+    # its unconfirmed row would strand the aggregate on a signal nothing can
+    # read.  Resolving the deploy identity once per call keeps the sweep cheap.
+    project = await session.get(Project, version.project_id)
+    deploy_identity = deploy_repo_identity()
+
+    for provider in observable_release_artifact_providers(project, deploy_identity):
         artifact, created = await get_or_create_release_deploy_artifact(
             session,
             version,
@@ -1257,6 +1267,7 @@ async def _confirm_serving_or_fail(
             _aggregate_summary, _artifact_evidence = summarize_release_artifacts(
                 version,
                 [artifact for _provider, artifact in provider_rows],
+                project=await session.get(Project, version.project_id),
             )
             await _record_post_promotion_outcome(
                 session, version, "deploy_failed", _now

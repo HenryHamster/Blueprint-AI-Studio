@@ -100,6 +100,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
+        "deploy_repo_identity",
         "drift_over_claim_consistency_threshold",
         "drift_over_claim_min_claims",
         "drift_stall_min_claims",
@@ -327,6 +328,7 @@ async def get_settings(
             _runtime_config
         )
         in ("balanced", "preferred"),
+        "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
         "providers": _build_provider_catalog(_runtime_config),
         # Published, backend-owned task-capability contract. Operator/agent
         # surfaces consume this map instead of maintaining private task-type
@@ -1512,6 +1514,30 @@ async def _apply_settings(
             )
         _runtime_config["cross_provider_fallback_enabled"] = val
         _runtime_config["provider_selection_mode"] = "preferred" if val else "exclusive"
+    if "deploy_repo_identity" in payload:
+        # Deploy-level identity: the "owner/repo" this deployment serves. Accept
+        # a non-empty "owner/repo" string, or null/"" to clear it (no deploy
+        # identity → only the merge-level provider is observable). Validated as a
+        # well-formed slug pair so a malformed value can't silently mis-gate
+        # which project's Cloud Run serving signals are observable.
+        val = payload["deploy_repo_identity"]
+        if val is None or (isinstance(val, str) and not val.strip()):
+            _runtime_config["deploy_repo_identity"] = None
+        elif isinstance(val, str) and "/" in val:
+            owner, _, repo = val.strip().partition("/")
+            if not owner.strip() or not repo.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="deploy_repo_identity must be 'owner/repo'",
+                )
+            _runtime_config["deploy_repo_identity"] = (
+                f"{owner.strip()}/{repo.strip()}"
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="deploy_repo_identity must be 'owner/repo' or null",
+            )
     if "provider_settings_defaults" in payload:
         val = payload["provider_settings_defaults"]
         if not isinstance(val, dict):
@@ -2161,6 +2187,13 @@ async def _apply_settings(
                         _runtime_config
                     )
                     in ("balanced", "preferred"),
+                    # Persist the deploy-level identity so an operator override
+                    # survives a Cloud Run restart (config-sync reads it back on
+                    # boot; otherwise the in-memory value reverts to the env
+                    # default).
+                    "deploy_repo_identity": _runtime_config.get(
+                        "deploy_repo_identity"
+                    ),
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),

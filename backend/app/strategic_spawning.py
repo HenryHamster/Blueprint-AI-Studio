@@ -34,6 +34,7 @@ from app.models import (
     ProjectMessage,
     SystemMaturity,
 )
+from app.deploy_identity import project_matches_deploy_identity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.release_artifacts import (
     summarize_release_artifacts,
@@ -130,18 +131,21 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
             )
 
 
-def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _version_serving_summary(
+    version, project=None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     aggregate, artifacts = summarize_release_artifacts(
         version,
         getattr(version, "deploy_artifacts", None),
+        project=project,
     )
     return aggregate, artifacts
 
 
-def _strategic_recent_version_entry(version) -> dict[str, Any]:
+def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
     from app.release_version import summarize_qualification_state as _summarize
 
-    aggregate, artifacts = _version_serving_summary(version)
+    aggregate, artifacts = _version_serving_summary(version, project)
     return {
         "version_number": version.version_number,
         "status": version.status,
@@ -4233,7 +4237,7 @@ async def _spawn_strategic_review(
                 )
             if _open_version is not None:
                 _open_aggregate, _open_artifacts = _version_serving_summary(
-                    _open_version
+                    _open_version, project
                 )
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
@@ -4292,7 +4296,7 @@ async def _spawn_strategic_review(
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        _strategic_recent_version_entry(version)
+                        _strategic_recent_version_entry(version, project)
                         for version in _closed
                     ]
             except Exception:
@@ -4340,13 +4344,15 @@ async def _spawn_strategic_review(
                     "[STRATEGIC] promoted-version lookup failed; continuing"
                 )
             # Deployed SHA: the orchestrator's own DeploymentState tracks the live
-            # self-repo container. For a non-self-repo project it is meaningless,
-            # so fall back to the latest promoted SHA (their deploy follows
-            # promotion, not this orchestrator's container).
+            # container of the repo THIS deployment was built from. It is
+            # meaningful only for the project that IS the deploy identity
+            # (deploy-level observability) — for any other project it is
+            # meaningless, so fall back to the latest promoted SHA (their deploy
+            # follows promotion, not this orchestrator's container).
             _deployed_sha: str | None = None
             _deployed_revision: str | None = None
             _deploy_status: str | None = None
-            # Rollback provenance — only meaningful for the self-repo's own
+            # Rollback provenance — only meaningful for the deploy's own
             # DeploymentState. Surfaced so the strategist sees WHY the pipeline
             # rolled back (which SHA, how many consecutive rollbacks, the
             # reason) and can prioritize stabilization rather than spawn more
@@ -4354,7 +4360,10 @@ async def _spawn_strategic_review(
             _rolled_back_from_sha: str | None = None
             _rollback_count: int = 0
             _rollback_reason: str | None = None
-            if getattr(project, "is_self_repo", False):
+            # De-gated from project.is_self_repo to the deploy-level identity:
+            # the strategist gets positive serving evidence wherever the live
+            # DeploymentState actually corresponds to the project's repo.
+            if project_matches_deploy_identity(project):
                 try:
                     _ds = await session.get(DeploymentState, 1)
                     if _ds is not None:
@@ -4373,7 +4382,7 @@ async def _spawn_strategic_review(
             _promoted_gap: str | None = None
             if _promoted_v is not None:
                 _promoted_aggregate, _promoted_artifacts = _version_serving_summary(
-                    _promoted_v
+                    _promoted_v, project
                 )
                 _promoted_gap = summarize_required_artifact_gap(_promoted_artifacts)
             # Real serving SHA only — NEVER a promoted_sha stand-in. Fall back to
@@ -4710,7 +4719,9 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
-                    _prior_aggregate, _prior_artifacts = _version_serving_summary(_v)
+                    _prior_aggregate, _prior_artifacts = _version_serving_summary(
+                        _v, project
+                    )
                     _prior_serving_status = _prior_aggregate["serving_status"]
                     _prior_deploy_reason = _prior_aggregate["reason_code"]
                     _prior_artifact_gap = summarize_required_artifact_gap(
@@ -4873,7 +4884,7 @@ async def _spawn_strategic_review(
             )
         if _latest_promoted_version is not None:
             _latest_promoted_aggregate, _latest_promoted_artifacts = (
-                _version_serving_summary(_latest_promoted_version)
+                _version_serving_summary(_latest_promoted_version, project)
             )
             _latest_artifact_gap = summarize_required_artifact_gap(
                 _latest_promoted_artifacts

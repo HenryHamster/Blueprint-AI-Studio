@@ -822,7 +822,6 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     [
         ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
         ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
-        (None, None, "serving_confirmed", "waiting on required artifacts"),
     ],
 )
 async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
@@ -855,17 +854,14 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
                 served_identifier="abc123",
                 served_at=datetime.utcnow(),
             ),
-        ]
-    )
-    if artifact_status is not None:
-        db_session.add(
             ReleaseDeployArtifact(
                 version_id=version.id,
                 artifact_kind="agent_image",
                 serving_status=artifact_status,
                 reason_code=reason_code,
-            )
-        )
+            ),
+        ]
+    )
     task = Task(
         project_id=project.id,
         payloads=[{"type": TaskType.compute_experiment.value}],
@@ -898,6 +894,125 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
     evidence = detail["live_release_evidence"]
     assert evidence["release_version_number"] == 3
     assert evidence["aggregate_serving_status"] == expected_aggregate
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_live_proof_vacuous_absent_row_allows_launch(
+    client: AsyncClient,
+    db_session,
+):
+    """A missing (vacuous, None-status) required artifact row is treated as NA.
+
+    When the observed non-vacuous required rows are all confirmed, launch is
+    allowed even if other required provider rows are absent (e.g. agent_image not
+    armed for a non-self-repo project).
+    """
+    project = Project(name="Agent Compute Vacuous Row", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+        serving_status="serving_confirmed",
+        served_sha="abc123",
+    )
+    db_session.add(version)
+    await db_session.flush()
+    # Only backend_revision row; agent_image row intentionally absent.
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="serving_confirmed",
+            served_identifier="abc123",
+            served_at=datetime.utcnow(),
+        )
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-vacuous",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-vacuous")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_live_proof_fully_unarmed_blocks(
+    client: AsyncClient,
+    db_session,
+):
+    """A fully unarmed version (no required artifact rows at all) must block launch.
+
+    Even though all rows are vacuous (None status), the absence of any observed
+    confirmed required artifact means launch is blocked — we require at least one
+    non-vacuous confirmed row so a version that was never armed cannot silently pass.
+    """
+    project = Project(name="Agent Compute Unarmed", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+        # serving_status intentionally left None (unarmed promotion)
+    )
+    db_session.add(version)
+    await db_session.flush()
+    # No artifact rows at all — version was never armed for serving confirmation.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-unarmed",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-unarmed")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 412
+    detail = resp.json()["error"]["message"]
+    assert detail["error"] == "live_release_precondition_failed"
+    assert detail["reason"] == "release_not_serving_confirmed"
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert jobs == []
 

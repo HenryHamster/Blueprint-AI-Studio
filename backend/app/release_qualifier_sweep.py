@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -508,12 +508,6 @@ async def sweep_stuck_qualifications(
     required_artifact_kinds = required_release_artifact_kinds()
     unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
     if required_artifact_kinds:
-        required_artifact_exists = exists(
-            select(ReleaseDeployArtifact.id).where(
-                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
-                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
-            )
-        )
         pending_artifact_exists = exists(
             select(ReleaseDeployArtifact.id).where(
                 ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
@@ -524,21 +518,16 @@ async def sweep_stuck_qualifications(
                 ),
             )
         )
-        required_artifact_count = (
-            select(func.count(ReleaseDeployArtifact.id))
-            .where(
-                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
-                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
-            )
-            .scalar_subquery()
-        )
+        # NOTE: We do NOT compare artifact row count against len(required_artifact_kinds).
+        # Per-project observable arming intentionally creates only the observable provider
+        # subset (e.g. only promotion_merge for non-deploy GitHub projects). Comparing
+        # against the global required count would always match external projects as
+        # "missing rows" and re-enter _confirm_serving_or_fail forever after resolution.
+        # The serving_status=="unconfirmed" scalar catches newly-promoted versions before
+        # any rows exist; pending_artifact_exists catches versions with unresolved rows.
         unresolved_filter = or_(
             unresolved_filter,
             pending_artifact_exists,
-            and_(
-                required_artifact_exists,
-                required_artifact_count < len(required_artifact_kinds),
-            ),
         )
     unconfirmed_ids = list(
         (

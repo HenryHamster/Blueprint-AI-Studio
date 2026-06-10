@@ -7230,9 +7230,15 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
 
     await _ensure_releaseversion_table(db_session)
     _patch_spawning_deps(mocker)
+    # The DeploymentState read is now gated on the deploy-level identity (not
+    # is_self_repo): make this project the deploy identity so its live container
+    # SHA/status is observable to the strategist.
+    mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
 
     project = _make_project(
         is_self_repo=True,
+        github_owner="acme",
+        github_repo="widget",
         integration_branch="automain",
         promotion_target="main",
         vision={"purpose": "test purpose"},
@@ -7459,9 +7465,15 @@ async def _spawn_self_repo_with_deployment_state(
 
     await _ensure_releaseversion_table(db_session)
     _patch_spawning_deps(mocker)
+    # The DeploymentState read is now gated on the deploy-level identity (not
+    # is_self_repo): make this project the deploy identity so its live container
+    # state is observable to the strategist.
+    mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
 
     project = _make_project(
         is_self_repo=True,
+        github_owner="acme",
+        github_repo="widget",
         integration_branch="automain",
         promotion_target="main",
         vision={"purpose": "test purpose"},

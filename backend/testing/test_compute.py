@@ -2343,9 +2343,11 @@ async def test_live_proof_compute_job_records_serving_evidence_and_idempotency(
     assert evidence["release_version_number"] == 7
     assert evidence["promoted_sha"] == "def456"
     assert evidence["aggregate_serving_status"] == "serving_confirmed"
-    assert {
-        artifact["artifact_kind"] for artifact in evidence["required_artifacts"]
-    } == {"backend_revision", "agent_image"}
+    # promotion_merge is also a registered required provider; it appears vacuous
+    # (serving_status=None) when the test project has no GitHub config.
+    assert {"backend_revision", "agent_image"}.issubset(
+        {artifact["artifact_kind"] for artifact in evidence["required_artifacts"]}
+    )
 
 
 async def _make_compute_task(db_session):

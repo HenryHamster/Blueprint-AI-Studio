@@ -309,6 +309,16 @@ runtime_config: Dict = {
     #                 fall through when the earlier provider has no capacity.
     #   "exclusive" — first listed provider only; never fall back cross-provider.
     "provider_selection_mode": "balanced",
+    # Deploy-level identity: the ``"owner/repo"`` of the GitHub repo THIS
+    # deployment was built from. Determines which project's Cloud Run serving
+    # signals (backend_revision / agent_image artifact providers) and live
+    # DeploymentState reads are observable — replaces the per-project
+    # ``is_self_repo`` gate with a deploy-level property. Seeded from the
+    # ``DEPLOY_REPO_IDENTITY`` env (stamped on the Cloud Run revision alongside
+    # ``DEPLOY_SHA``); operator-settable live via PATCH /api/admin/settings.
+    # None ⇒ no deploy identity (only the merge-level promotion_merge provider
+    # is observable, for every GitHub project).
+    "deploy_repo_identity": (os.getenv("DEPLOY_REPO_IDENTITY", "").strip() or None),
     # DEPRECATED: legacy boolean superseded by provider_selection_mode. Kept
     # readable in GET/PATCH for backwards compat — True ≡ "preferred",
     # False ≡ "exclusive". If both keys are present, mode wins.
@@ -1097,6 +1107,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "autonomous_periodic_tasks",
                     "health_check_urls",
                     "notification_config",
+                    "deploy_repo_identity",
                 ):
                     if key in config_json:
                         _set(key, config_json[key])

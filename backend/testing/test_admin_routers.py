@@ -4833,6 +4833,32 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_deploy_repo_identity(self, client: AsyncClient):
+        """deploy_repo_identity accepts a normalized 'owner/repo', clears on null,
+        rejects malformed values, and round-trips on GET."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": " Acme/Widget "}
+        )
+        assert resp.status_code == 200, resp.text
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["deploy_repo_identity"] == "Acme/Widget"
+
+        # null clears it.
+        resp = await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": None}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["deploy_repo_identity"] is None
+
+        # Malformed values are rejected (no slash / empty component / wrong type).
+        for bad_val in ["no-slash", "acme/", "/widget", 123]:
+            bad = await client.patch(
+                "/api/admin/settings", json={"deploy_repo_identity": bad_val}
+            )
+            assert bad.status_code == 400, f"{bad_val!r} should be rejected"
+
+    @pytest.mark.asyncio
     async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
         """warm_continuity_enabled accepts booleans and rejects non-booleans; round-trips on GET."""
         resp = await client.patch(
@@ -7615,14 +7641,35 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_verify_path_clears_when_sha_serving(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """Promoted SHA genuinely observed serving → cleared without force."""
         from datetime import datetime, timezone
 
+        from app import release_artifacts as artifact_registry
         from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        # The backend_revision (Cloud Run) provider is observable only for the
+        # deploy-identity project; stamp the identity and scope the registry to
+        # backend so the deploy-health re-check drives the outcome without the
+        # merge/agent providers' GitHub lookups interfering.
+        mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: artifact_registry._ARTIFACT_PROVIDERS[
+                    BACKEND_REVISION_ARTIFACT_KIND
+                ]
+            },
+            clear=True,
+        )
 
         project = await _make_project(db_session)
+        project.github_owner = "acme"
+        project.github_repo = "widget"
+        db_session.add(project)
+        await db_session.commit()
         version = await self._make_deploy_failed_version(
             db_session, project.id, promoted_sha="liveserving999"
         )
@@ -8070,7 +8117,7 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_force_blocked_when_backend_reason_transitions_to_hard_failure(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """Regression: version scalar latched serving_sha_unobservable but the
         backend artifact's freshly-rechecked reason_code is sha_mismatch (a hard
@@ -8082,9 +8129,29 @@ class TestClearDeployFailed:
         → correctly rejects."""
         from datetime import datetime, timezone
 
+        from app import release_artifacts as artifact_registry
         from app.models import DeploymentState, DeploymentStatus
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        # backend_revision is observable only for the deploy identity; stamp it
+        # and scope the registry to backend so the fresh deploy-health re-check
+        # (sha_mismatch) drives the force-block decision.
+        mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: artifact_registry._ARTIFACT_PROVIDERS[
+                    BACKEND_REVISION_ARTIFACT_KIND
+                ]
+            },
+            clear=True,
+        )
 
         project = await _make_project(db_session)
+        project.github_owner = "acme"
+        project.github_repo = "widget"
+        db_session.add(project)
+        await db_session.commit()
         # Stale version scalar: latched as serving_sha_unobservable.
         version = await self._make_deploy_failed_version(
             db_session,

@@ -1326,6 +1326,7 @@ from app import release_artifacts as artifact_registry  # noqa: E402
 from app.release_artifacts import (  # noqa: E402
     AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
+    PROMOTION_MERGE_ARTIFACT_KIND,
     ReleaseArtifactProvider,
     _previously_deployed_sha,
     aggregate_required_artifact_status,
@@ -1553,16 +1554,28 @@ async def _set_deploy_state(db_session, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _default_agent_image_gate(request, mocker):
-    """Default the agent VM image serving gate to a non-bake promotion.
+def _default_agent_image_gate(request, mocker, monkeypatch):
+    """Default the deploy-observable serving gates so legacy tests stay green.
 
-    The ``agent_image`` provider is registered REQUIRED, so once imported it runs
-    for every promoted self-repo version the serving sweep touches.  Legacy
-    serving tests predate the gate and assert backend-only outcomes; this fixture
-    defaults the gate to "no bake-path change → confirm immediately" and stubs the
-    GitHub credential resolution + diff-base derivation so NO test hits the
-    network.  Patches target the lazy-import seams ``_check_agent_image_serving``
-    resolves at call time:
+    Two deploy-level invariants this module's serving tests depend on:
+
+    * **Deploy identity.** ``backend_revision`` / ``agent_image`` are now
+      observable only for the project matching the deploy-level identity (which
+      replaces the old ``is_self_repo`` gate). The serving tests promote an
+      ``acme/widget`` project, so stamp ``DEPLOY_REPO_IDENTITY`` to match — that
+      makes those Cloud Run providers observable exactly where the old
+      ``is_self_repo=True`` path used to arm them.
+    * **Baseline promotion_merge.** The new ``promotion_merge`` provider is
+      observable for EVERY GitHub project and confirms via a live GitHub
+      ancestry + check-runs lookup. Stub its provider ``check`` to confirm
+      immediately so the merge-level dimension never hits the network and the
+      pre-existing backend/agent serving assertions still drive the outcome.
+
+    The agent VM image gate itself defaults to a non-bake promotion ("no
+    bake-path change → confirm immediately") and the GitHub credential
+    resolution + diff-base derivation are stubbed so NO test hits the network.
+    Patches target the lazy-import seams ``_check_agent_image_serving`` resolves
+    at call time:
 
       * ``app.release_promotion._resolve_github_with_session`` — the lazy import
         inside the check (the module-level binding in ``release_reconciliation``
@@ -1572,10 +1585,33 @@ def _default_agent_image_gate(request, mocker):
         gate gets an observable base even when the test's DeploymentState has no
         ``prior_deploy_sha``.
 
-    Tests marked ``agent_image_gate`` opt OUT and drive the gate themselves so the
-    bake / fleet / indeterminate branches are exercised with exactly one patch per
-    seam (no fixture-vs-test override ambiguity).
+    Tests marked ``agent_image_gate`` opt OUT of the agent-image-specific stubs
+    and drive the gate themselves so the bake / fleet / indeterminate branches
+    are exercised with exactly one patch per seam (no fixture-vs-test override
+    ambiguity). The deploy-identity stamp and the promotion_merge stub apply to
+    ALL tests (including the opt-out ones) so the merge-level dimension never
+    interferes with the agent-image scenarios.
     """
+    import dataclasses
+
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+
+    async def _confirm_merge_immediately(_session, _version, _artifact, now):
+        return ("serving_confirmed", getattr(_version, "promoted_sha", None), now)
+
+    _merge_provider = artifact_registry._ARTIFACT_PROVIDERS.get(
+        artifact_registry.PROMOTION_MERGE_ARTIFACT_KIND
+    )
+    if _merge_provider is not None:
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                artifact_registry.PROMOTION_MERGE_ARTIFACT_KIND: dataclasses.replace(
+                    _merge_provider, check=_confirm_merge_immediately
+                )
+            },
+        )
+
     if request.node.get_closest_marker("agent_image_gate"):
         return
     mocker.patch(
@@ -3153,9 +3189,12 @@ async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
 
 @pytest.mark.asyncio
 async def test_self_repo_promotion_creates_both_serving_artifacts(db_session):
-    """A self-repo promotion opens the multi-artifact serving window: BOTH the
-    backend_revision and agent_image artifacts are created with the confirmation
-    deadline, alongside an unconfirmed version serving status."""
+    """A deploy-identity promotion opens the multi-artifact serving window: the
+    baseline promotion_merge AND both Cloud Run artifacts (backend_revision +
+    agent_image) are created with the confirmation deadline, alongside an
+    unconfirmed version serving status. The autouse fixture stamps
+    DEPLOY_REPO_IDENTITY=acme/widget so the deploy-level providers are observable
+    for this project — replacing the old is_self_repo arming gate."""
     project = Project(
         name="Promote-SelfRepo",
         user_id="promote-user",
@@ -3201,25 +3240,47 @@ async def test_self_repo_promotion_creates_both_serving_artifacts(db_session):
         .all()
     )
     kinds = {a.artifact_kind for a in artifacts}
-    assert kinds == {BACKEND_REVISION_ARTIFACT_KIND, AGENT_IMAGE_ARTIFACT_KIND}
+    assert kinds == {
+        PROMOTION_MERGE_ARTIFACT_KIND,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        AGENT_IMAGE_ARTIFACT_KIND,
+    }
     for a in artifacts:
         assert a.confirmation_deadline == version.deploy_confirm_deadline
 
 
 @pytest.mark.asyncio
-async def test_non_self_repo_promotion_creates_no_agent_image_artifact(db_session):
-    """(d) A non-self-repo promotion is unaffected: NO serving artifacts are
-    created (no agent_image) and serving_status stays NULL."""
-    _project, version = await _make_project_and_version(
-        db_session, integration_branch="automain", promotion_target="main"
+async def test_non_deploy_github_promotion_arms_merge_only(db_session):
+    """(d) An EXTERNAL GitHub project (not the deploy identity) is now armed at
+    the merge level: only the baseline ``promotion_merge`` artifact is created —
+    NOT the Cloud Run backend_revision / agent_image, which are observable only
+    for the deploy's own repo. serving_status flips to ``unconfirmed`` so the
+    pipeline can answer "did the last version ship?" for ANY promoted project,
+    replacing the old is_self_repo-only arming.
+
+    The autouse fixture stamps DEPLOY_REPO_IDENTITY=acme/widget; this project is
+    ``external/repo``, so it does NOT match the deploy identity."""
+    project = Project(
+        name="Reconcile-External",
+        user_id="reconcile-user",
+        github_owner="external",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
     )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     result = await _record_promotion_success(
         db_session,
         version,
         "cand" * 10,
         {"status": "promoted", "confidence": 0.9},
-        "https://github.com/acme/widget/pull/9",
+        "https://github.com/external/repo/pull/9",
         promoted_sha=_SHA_A,
         lock_released=False,
     )
@@ -3227,7 +3288,9 @@ async def test_non_self_repo_promotion_creates_no_agent_image_artifact(db_sessio
     assert result["status"] == "promoted"
 
     await db_session.refresh(version)
-    assert version.serving_status is None
+    # Armed at the merge level (no longer NULL/NA for an external project).
+    assert version.serving_status == "unconfirmed"
+    assert version.deploy_confirm_deadline is not None
 
     artifacts = (
         (
@@ -3240,7 +3303,9 @@ async def test_non_self_repo_promotion_creates_no_agent_image_artifact(db_sessio
         .scalars()
         .all()
     )
-    assert artifacts == []
+    # Only the baseline merge-level provider — the Cloud Run providers are
+    # unobservable for a non-deploy project, so they get no row.
+    assert {a.artifact_kind for a in artifacts} == {PROMOTION_MERGE_ARTIFACT_KIND}
 
 
 def test_summarize_skips_absent_required_non_backend_provider():
