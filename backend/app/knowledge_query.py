@@ -320,6 +320,7 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "release_evidence": verdict.get("release_evidence"),
+        "unavailable_cause": verdict.get("unavailable_cause"),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
         "origin_provenance": serialize_origin_provenance(doc),

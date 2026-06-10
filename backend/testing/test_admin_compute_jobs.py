@@ -18,8 +18,10 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    KnowledgeDocument,
     Project,
     ProjectMember,
+    SourceKind,
     Task,
     TaskStatus,
 )
@@ -402,6 +404,7 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
 
 
+
 _SENSITIVE_POLLING_METADATA = {
     "env": {"SECRET_KEY": "mysecret", "DATABASE_URL": "postgres://..."},
     "command": "python3 run_experiment.py --flag",
@@ -453,3 +456,161 @@ async def test_kill_compute_job_strips_sensitive_polling_metadata(
     assert "cwd" not in metadata
     # Non-sensitive fields survive (result_metrics is not mutated by the kill path)
     assert metadata.get("result_metrics") == {"accuracy": 0.95}
+
+
+# ---------------------------------------------------------------------------
+# Analyze endpoint tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_terminal_job_with_task(
+    session,
+    project,
+    *,
+    status=ComputeJobStatus.SUCCEEDED,
+    plan_output=None,
+    result_reference="gs://bucket/jobs/job-1/result.json",
+):
+    """Seed a terminal compute job with an optional plan_output on its task."""
+    task = Task(
+        project_id=project.id,
+        title="compute experiment task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp_v1"}],
+        plan_output=plan_output or {},
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=status,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.5,
+        result_reference=result_reference,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return task, job
+
+
+async def _seed_knowledge_doc(session, project, task):
+    """Seed a deterministic compute-experiment KnowledgeDocument for task."""
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title="Compute experiment: exp_v1 — SUCCESS",
+        summary="Outcome: SUCCESS.",
+        body="# Compute experiment verdict\n- **Outcome:** SUCCESS",
+        topic="exp_v1",
+        tags=["compute_experiment", "SUCCESS"],
+        source_citations=[],
+        forward_quality_verdict={
+            "strategy": "metric",
+            "outcome": "SUCCESS",
+            "analysis_mode": "deterministic",
+        },
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_missing_404(client: AsyncClient, db_session):
+    resp = await client.post(f"/api/admin/compute-jobs/{uuid.uuid4()}/analyze")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+    project = await _make_project(db_session, name="Analyze Viewer")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_terminal_job_with_task(db_session, project)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_nonterminal_returns_409(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Analyze Running")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.RUNNING)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_member_ok(client: AsyncClient, db_session):
+    """A terminal job returns 200 with status=upgraded when analysis succeeds (mocked)."""
+    project = await _make_project(db_session, name="Analyze Member OK")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+    doc = await _seed_knowledge_doc(db_session, project, task)
+
+    canned_envelope = {
+        "status": "upgraded",
+        "reason": None,
+        "analysis_mode": "llm",
+        "knowledge_document_id": str(doc.id),
+    }
+    with patch(
+        "app.knowledge_completion.analyze_compute_experiment_knowledge",
+        new=AsyncMock(return_value=canned_envelope),
+    ):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "upgraded"
+    assert body["analysis_mode"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_analyze_endpoint_persists_unavailable_cause(
+    client: AsyncClient, db_session
+):
+    """When analysis ends unavailable, the cause is stamped on the stored doc's
+    forward_quality_verdict without changing analysis_mode, and the endpoint
+    returns status=analysis_unavailable with the doc id."""
+    project = await _make_project(db_session, name="Analyze Unavailable")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+    doc = await _seed_knowledge_doc(db_session, project, task)
+    original_mode = doc.forward_quality_verdict.get("analysis_mode")
+
+    # Force the analysis-disabled path for deterministic behavior.
+    with patch.dict("os.environ", {"DISABLE_LLM_COMPUTE_ANALYSIS": "1"}):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "analysis_unavailable"
+    assert body["reason"] == "analysis-disabled"
+    assert body.get("knowledge_document_id") == str(doc.id)
+
+    # The stored doc must carry the unavailable_cause stamp.
+    await db_session.refresh(doc)
+    verdict = doc.forward_quality_verdict
+    assert verdict.get("unavailable_cause") == "analysis-disabled"
+    assert verdict.get("analysis_attempted_at") is not None
+    # analysis_mode must not have changed.
+    assert verdict.get("analysis_mode") == original_mode

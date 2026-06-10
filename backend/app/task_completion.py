@@ -40,7 +40,11 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
-from app.compute_jobs import get_compute_job_for_task, stamp_compute_job_result_reference
+from app.compute_jobs import (
+    _is_durable_artifact_uri,
+    get_compute_job_for_task,
+    stamp_compute_job_result_reference,
+)
 from app.artifact_prerequisites import (
     deliver_artifact_to_dependents,
     stamp_artifact_logical_key,
@@ -214,6 +218,41 @@ async def _stamp_compute_result_resource(
     if artifact is not None and artifact.storage_uri:
         resource["storage_uri"] = artifact.storage_uri
     return resource
+
+
+def _derive_artifact_delivery_record(resource: dict) -> dict:
+    """Derive artifact delivery classification from a stamped compute resource dict.
+
+    Returns a dict with:
+      delivered: True iff a durable-class URI is present in storage_uri or result_reference
+      durability: 'durable' | 'transient' | 'none'
+      artifact_id: str | None
+      result_reference: str | None
+    """
+    storage_uri = resource.get("storage_uri")
+    result_reference = resource.get("result_reference")
+    artifact_id = resource.get("artifact_id")
+    # Both storage_uri and result_reference must be validated against the durable-URI
+    # predicate: Artifact.storage_uri can be https:// (agent-supplied signed URLs) and
+    # is not guaranteed durable.
+    if (
+        (storage_uri and _is_durable_artifact_uri(storage_uri))
+        or (result_reference and _is_durable_artifact_uri(result_reference))
+    ):
+        durability = "durable"
+        delivered = True
+    elif result_reference:
+        durability = "transient"
+        delivered = False
+    else:
+        durability = "none"
+        delivered = False
+    record: dict = {"delivered": delivered, "durability": durability}
+    if artifact_id is not None:
+        record["artifact_id"] = artifact_id
+    if result_reference is not None:
+        record["result_reference"] = result_reference
+    return record
 
 
 def build_blueprint_pr_footer(
@@ -2503,12 +2542,16 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
-        compute_result.update(await _stamp_compute_result_resource(session, task, logs))
+        resource = await _stamp_compute_result_resource(session, task, logs)
+        compute_result.update(resource)
+        compute_result["artifact_delivery"] = _derive_artifact_delivery_record(resource)
         plan_output["compute_result"] = compute_result
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
+        delivery = compute_result["artifact_delivery"]
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
+            f", artifact_delivery={delivery['durability']}"
         )[:500]
         task.status = TaskStatus.COMPLETED
         logger.info(
@@ -2548,16 +2591,46 @@ async def _handle_compute_experiment_completion(
     measurement = _extract_compute_measurement(logs)
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
+    require_durable = bool((task.first_payload or {}).get("require_durable_artifact"))
     if measurement is not None:
         outcome, cost = measurement
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
-        compute_result.update(await _stamp_compute_result_resource(session, task, logs))
+        resource = await _stamp_compute_result_resource(session, task, logs)
+        compute_result.update(resource)
+        delivery = _derive_artifact_delivery_record(resource)
+        compute_result["artifact_delivery"] = delivery
         plan_output["compute_result"] = compute_result
+        task.plan_output = plan_output
+        flag_modified(task, "plan_output")
+        # Tier 2: opt-in strict gate — fail if no durable artifact delivered.
+        if require_durable and not delivery["delivered"]:
+            miss_reason = (
+                f"require_durable_artifact: no durable artifact delivered "
+                f"(durability={delivery['durability']})"
+            )
+            record_failed_gate(
+                task,
+                EvaluationVerdict(False, miss_reason, "artifact-delivery"),
+            )
+            logger.info(
+                "[COMPUTE] Task %s failed Tier-2 durable-artifact gate: %s",
+                task.id,
+                miss_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute experiment terminal: outcome={outcome}, "
-            f"final_cost=${cost}"
+            f"final_cost=${cost}, artifact_delivery={delivery['durability']}"
         )[:500]
     else:  # pragma: no cover - defensive; the gate guarantees a measurement
         task.latest_status_message = "Compute experiment completed"

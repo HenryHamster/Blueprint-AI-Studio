@@ -6,6 +6,7 @@ demand. Both are project-scoped through ``_get_user_project_with_role``: listing
 needs viewer, killing needs member.
 """
 
+import json
 import uuid
 from datetime import timedelta
 from typing import Any, Dict
@@ -18,8 +19,17 @@ from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import kill_compute_job, list_compute_jobs
 from app.database import get_session
-from app.models import Artifact, ComputeJob, Task
+from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
+
+_COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
+    {
+        ComputeJobStatus.SUCCEEDED,
+        ComputeJobStatus.FAILED,
+        ComputeJobStatus.CANCELLED,
+        ComputeJobStatus.TIMED_OUT,
+    }
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -139,3 +149,61 @@ async def kill_project_compute_job(
         if killed is None:
             raise HTTPException(status_code=404, detail="Compute job not found")
     return {"compute_job": serialize_compute_job_response_safe(killed)}
+
+
+@router.post("/compute-jobs/{job_id}/analyze")
+async def analyze_project_compute_job(
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Trigger optional LLM analysis for a terminal compute job (member+).
+
+    Resolves outcome/cost/criterion from the durable job+task state so the
+    analysis inputs can never disagree with what completion recorded. Returns
+    exactly the envelope that ``analyze_compute_experiment_knowledge`` persisted.
+    """
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    await _get_user_project_with_role(
+        job.project_id, current_user["user_id"], session, "member"
+    )
+    if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Compute job is not terminal (status={job.status}); analysis requires a terminal job",
+        )
+    if job.task_id is None:
+        raise HTTPException(status_code=409, detail="Compute job has no linked task")
+    task = await session.get(Task, job.task_id)
+    if task is None:
+        raise HTTPException(status_code=409, detail="Linked task not found")
+
+    compute_result = (task.plan_output or {}).get("compute_result") or {}
+    outcome = str(compute_result.get("outcome") or "")
+    if not outcome and job.outcome is not None:
+        outcome = job.outcome.value
+    if not outcome:
+        outcome = "unknown"
+    raw_cost = compute_result.get("final_cost_usd")
+    cost: float | None = float(raw_cost) if raw_cost is not None else None
+    criterion = compute_result.get("criterion")
+    if not isinstance(criterion, dict):
+        criterion = None
+
+    # Synthesize logs so _gather_compute_evidence resolves the job row identically
+    # to how completion did — the job_id is the stable pointer.
+    logs = json.dumps({"job_id": str(job.id)})
+
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
+    return await analyze_compute_experiment_knowledge(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=job.result_reference,
+        session=session,
+        logs=logs,
+    )

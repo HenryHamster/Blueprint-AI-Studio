@@ -702,6 +702,10 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # that finishes but misses its declared goal fails the gate honestly);
     # when absent, the gate preserves presence-based behavior.
     success_criterion: ComputeSuccessCriterion | None = None
+    # Optional strict-delivery gate. When True, completion FAILS unless the job
+    # links a COMPUTE_RESULT artifact whose storage URI is durable-class (gs://,
+    # s3://, az://, file:). Absent/False preserves existing fail-soft behavior.
+    require_durable_artifact: bool | None = None
 
 
 class WebResearchPayload(BasePayload):

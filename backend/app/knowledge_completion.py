@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -2049,11 +2050,45 @@ async def analyze_compute_experiment_knowledge(
         analysis = None
         reason = "llm-error"
     if analysis is None:
-        return {
+        _stamped_doc_id: str | None = None
+        try:
+            _existing = (
+                (
+                    await session.execute(
+                        select(KnowledgeDocument).where(
+                            KnowledgeDocument.project_id == task.project_id,
+                            KnowledgeDocument.source_task_id == task.id,
+                            KnowledgeDocument.source_kind
+                            == SourceKind.COMPUTE_EXPERIMENT.value,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if _existing is not None:
+                _stamped_doc_id = str(_existing.id)
+                _verdict = dict(_existing.forward_quality_verdict or {})
+                _verdict["unavailable_cause"] = reason or "unknown"
+                _verdict["analysis_attempted_at"] = datetime.now(timezone.utc).isoformat()
+                _existing.forward_quality_verdict = _verdict
+                flag_modified(_existing, "forward_quality_verdict")
+                session.add(_existing)
+                await session.commit()
+        except Exception:  # noqa: BLE001 — stamp must never block the caller
+            logger.warning(
+                "[COMPUTE] failed to stamp unavailable_cause for task %s",
+                task.id,
+                exc_info=True,
+            )
+        envelope: dict[str, Any] = {
             "status": "analysis_unavailable",
             "reason": reason or "unknown",
             "analysis_mode": "unavailable",
         }
+        if _stamped_doc_id is not None:
+            envelope["knowledge_document_id"] = _stamped_doc_id
+        return envelope
 
     doc = await _persist_compute_knowledge_document(
         task,

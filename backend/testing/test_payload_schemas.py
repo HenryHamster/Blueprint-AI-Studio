@@ -258,6 +258,22 @@ def test_compute_experiment_payload_rejects_unknown_criterion_operator():
     _invalid(raw)
 
 
+def test_compute_experiment_require_durable_artifact_accepted():
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "require_durable_artifact": True,
+    }
+    result = _valid(raw)
+    assert result["require_durable_artifact"] is True
+
+
+def test_compute_experiment_require_durable_artifact_absent_is_compatible():
+    raw = {"type": "compute_experiment", "command": "run-eval"}
+    result = _valid(raw)
+    assert "require_durable_artifact" not in result
+
+
 def test_verify_tests_payload_with_branch_and_pr_number():
     raw = {
         "type": "verify_tests",

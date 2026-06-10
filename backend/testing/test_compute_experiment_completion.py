@@ -2118,16 +2118,16 @@ async def test_compute_experiment_knowledge_falls_back_on_ungrounded_citation(
             session=db_session,
             logs=logs,
         )
-    assert result == {
-        "status": "analysis_unavailable",
-        "reason": "citations-ungrounded",
-        "analysis_mode": "unavailable",
-    }
-
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
+    assert result == {
+        "status": "analysis_unavailable",
+        "reason": "citations-ungrounded",
+        "analysis_mode": "unavailable",
+        "knowledge_document_id": str(docs[0].id),
+    }
     assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
     assert docs[0].source_citations == []
 
@@ -2532,16 +2532,16 @@ async def test_compute_knowledge_does_not_downgrade_llm_when_analysis_unavailabl
             session=db_session,
             logs=logs,
         )
-    assert unavailable == {
-        "status": "analysis_unavailable",
-        "reason": "precondition-not-met",
-        "analysis_mode": "unavailable",
-    }
-
     await db_session.refresh(task)
     docs_after_second = await _knowledge_docs_for(db_session, task)
     assert len(docs_after_second) == 1
     doc = docs_after_second[0]
+    assert unavailable == {
+        "status": "analysis_unavailable",
+        "reason": "precondition-not-met",
+        "analysis_mode": "unavailable",
+        "knowledge_document_id": str(doc.id),
+    }
 
     # The llm verdict and body must be preserved.
     assert doc.forward_quality_verdict["analysis_mode"] == "llm", (
@@ -2591,14 +2591,14 @@ async def test_explicit_analysis_reports_unavailable_when_precondition_not_met(
             session=db_session,
             logs=logs,
         )
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
     assert result == {
         "status": "analysis_unavailable",
         "reason": "precondition-not-met",
         "analysis_mode": "unavailable",
+        "knowledge_document_id": str(docs[0].id),
     }
-
-    docs = await _knowledge_docs_for(db_session, task)
-    assert len(docs) == 1
     verdict = docs[0].forward_quality_verdict
     assert verdict["analysis_mode"] == "deterministic"
     assert "fallback_reason" not in verdict
@@ -2628,14 +2628,14 @@ async def test_explicit_analysis_reports_unavailable_when_analysis_disabled(
             session=db_session,
             logs=logs,
         )
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
     assert result == {
         "status": "analysis_unavailable",
         "reason": "analysis-disabled",
         "analysis_mode": "unavailable",
+        "knowledge_document_id": str(docs[0].id),
     }
-
-    docs = await _knowledge_docs_for(db_session, task)
-    assert len(docs) == 1
     verdict = docs[0].forward_quality_verdict
     assert verdict["analysis_mode"] == "deterministic"
     assert "fallback_reason" not in verdict
@@ -2872,3 +2872,288 @@ async def test_real_evidence_rejects_http_artifact_location(
         "http(s) URLs must be rejected from durable evidence set; "
         "_gather_compute_evidence should return None (fallback)"
     )
+
+
+# ── artifact_delivery record stamping ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_record_durable_uri_stamped(
+    db_session, _quiet_compute_io
+):
+    """A gs:// result_reference creates a COMPUTE_RESULT Artifact; completion
+    stamps artifact_delivery={delivered: True, durability: durable, artifact_id, result_reference}
+    into compute_result."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    gs_uri = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=gs_uri),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is True
+    assert delivery["durability"] == "durable"
+    assert delivery["result_reference"] == gs_uri
+    # No logical_key in payload means no Artifact row is created, so artifact_id is absent.
+    assert "artifact_id" not in delivery
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_record_transient_uri_stamped(
+    db_session, _quiet_compute_io
+):
+    """An https:// result_reference stamps artifact_delivery={delivered: False, durability: transient}."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    https_uri = "https://signed.example.com/jobs/job-abc/result.json?token=xyz"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=https_uri),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "transient"
+    assert delivery["result_reference"] == https_uri
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_record_absent_stamped(db_session, _quiet_compute_io):
+    """No result_reference stamps artifact_delivery={delivered: False, durability: none}."""
+    task = await _make_compute_task(db_session)
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "none"
+
+
+# ── require_durable_artifact Tier 2 gate ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_require_durable_artifact_passes_with_durable_uri(
+    db_session, _quiet_compute_io
+):
+    """require_durable_artifact=True + gs:// result → COMPLETED."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": True,
+        }
+    ]
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    gs_uri = "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=gs_uri),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is True
+    assert delivery["durability"] == "durable"
+
+
+@pytest.mark.asyncio
+async def test_require_durable_artifact_gate_fails_without_durable_artifact(
+    db_session, _quiet_compute_io
+):
+    """require_durable_artifact=True + no artifact → FAILED with explicit miss reason."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": True,
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "artifact-delivery"
+    assert "require_durable_artifact" in gate["reason"]
+    assert "none" in gate["reason"]
+
+
+@pytest.mark.asyncio
+async def test_require_durable_artifact_false_does_not_gate(
+    db_session, _quiet_compute_io
+):
+    """require_durable_artifact absent/False + no artifact → COMPLETED (Tier 1 only)."""
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": False,
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_require_durable_artifact_gate_fails_with_linked_transient_artifact(
+    db_session, _quiet_compute_io
+):
+    """require_durable_artifact=True + linked Artifact with https:// storage_uri and
+    no durable result_reference → FAILED.
+
+    Artifact.storage_uri is not guaranteed durable (agents can supply https:// signed
+    URLs). The gate must apply the durable-URI predicate to storage_uri, not treat any
+    non-None storage_uri as durable.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "require_durable_artifact": True,
+        }
+    ]
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.25
+    job.final_cost_usd = 0.25
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+
+    # Attach an Artifact with a transient https:// storage_uri (no gs:// / s3:// etc.)
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="https://signed-download.example.com/result.tar.gz?token=xyz",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    job.artifact_id = artifact.id
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # result_reference is also transient (https://) — no durable URI anywhere.
+    https_ref = "https://example.com/jobs/result.json?token=abc"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=https_ref),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        "require_durable_artifact=True must fail when the linked Artifact has only "
+        "an https:// storage_uri (transient); _derive_artifact_delivery_record must "
+        "apply _is_durable_artifact_uri to storage_uri before marking delivered=True"
+    )
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "artifact-delivery"
+    assert "require_durable_artifact" in gate["reason"]
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "transient"

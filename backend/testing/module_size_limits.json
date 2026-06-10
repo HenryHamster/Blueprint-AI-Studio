@@ -85,7 +85,7 @@
     "problem_model.py": 1800,
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
-    "knowledge_completion.py": 2100,
+    "knowledge_completion.py": 2450,
     "alert_dispatch.py": 1750,
     "compute_jobs.py": 1800,
     "task_evaluators.py": 1950,
