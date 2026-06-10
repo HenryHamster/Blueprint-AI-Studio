@@ -9133,3 +9133,71 @@ async def test_trial_verdict_insufficient_accumulation_stays_continue_trial(db_s
     assert verdict["n_with"] == 5
     assert verdict["n_without"] == 2
     assert verdict["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_from_table_no_jsonb_needed(
+    client: AsyncClient, db_session
+):
+    """digest.latest_cycle is populated from the StrategicCycle table directly —
+    no vision._strategic_cycle_history JSONB wiring required (retired migration 0047)."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create and complete a cycle without touching vision JSONB at all.
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        directions_created=3,
+        directions_retired=1,
+        vision_updated=True,
+        summary_text="cycle summary",
+        memos_available=5,
+        memos_cited=2,
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is not None, "latest_cycle should be non-null when a completed cycle exists"
+    assert lc["cycle_id"] == cycle.id
+    assert lc["outcome"] == _sc.OUTCOME_COMPLETED
+    assert lc["directions_created"] == 3
+    assert lc["directions_retired"] == 1
+    assert lc["vision_updated"] is True
+    assert lc["summary_text"] == "cycle summary"
+    assert lc["memos_available"] == 5
+    assert lc["memos_cited"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_null_when_no_completed_cycles(
+    client: AsyncClient, db_session
+):
+    """digest.latest_cycle is null when no terminal (non-active) cycles exist."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a cycle but leave it in an active (in-progress) state.
+    await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is None, "latest_cycle should be null when only active cycles exist"

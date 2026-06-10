@@ -3611,16 +3611,13 @@ async def _handle_design_doc_completion(
             },
         }
         if cycle_id:
-            from app.research_completion import _update_cycle_history  # noqa: PLC0415
+            from app import strategic_cycle as _sc  # noqa: PLC0415
 
-            _update_cycle_history(
-                project,
+            await _sc.mark_failure(
+                session,
                 cycle_id,
-                {
-                    "phase1_completed_at": _utcnow().isoformat(),
-                    "outcome": "failed_phase2_spawn",
-                    "error": str(chain_exc)[:200],
-                },
+                phase="phase2_spawn",
+                reason=str(chain_exc)[:200],
             )
         flag_modified(project, "vision")
         session.add(project)

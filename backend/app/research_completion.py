@@ -50,7 +50,6 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_momentum_factor,
     _compute_acceptance_rate,
     _compute_productivity_score,
-    _update_cycle_history,
 )
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,

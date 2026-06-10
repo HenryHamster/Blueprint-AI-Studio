@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, text
+from sqlalchemy import desc, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -1201,48 +1201,56 @@ async def _compute_digest(
             _sft = (_proj.design_doc or {}).get("sr_false_attestation_trends")
             if _sft:
                 sr_false_attestation_trends = _sft
-            cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
-            completed_cycles = [
-                c
-                for c in cycle_history
-                if c.get("outcome") not in (None, "in_progress")
-            ]
-            if completed_cycles:
-                last = max(completed_cycles, key=lambda c: c.get("started_at") or "")
+            # Read the newest terminal cycle from the StrategicCycle table.
+            # Terminal = outcome not in ACTIVE_OUTCOMES (completed, failed_*, stalled_*).
+            # vision._strategic_cycle_history was retired in migration 0047.
+            _sc_stmt = (
+                select(StrategicCycle)
+                .where(
+                    StrategicCycle.project_id == project_id,
+                    StrategicCycle.outcome.not_in(
+                        list(_strategic_cycle.ACTIVE_OUTCOMES)
+                    ),
+                )
+                .order_by(desc(StrategicCycle.phase1_started_at))
+                .limit(1)
+            )
+            _sc_row = (await session.execute(_sc_stmt)).scalars().first()
+            if _sc_row is not None:
                 latest_cycle = {
-                    "cycle_id": last.get("cycle_id"),
-                    "started_at": last.get("started_at"),
-                    "completed_at": last.get("phase2_completed_at"),
-                    "outcome": last.get("outcome"),
-                    "directions_created": last.get("directions_created", 0),
-                    "directions_retired": last.get("directions_retired", 0),
-                    "vision_updated": last.get("vision_updated", False),
-                    "summary_text": last.get("summary_text"),
+                    "cycle_id": _sc_row.id,
+                    "started_at": _sc_row.phase1_started_at.isoformat()
+                    if _sc_row.phase1_started_at
+                    else None,
+                    "completed_at": _sc_row.phase2_completed_at.isoformat()
+                    if _sc_row.phase2_completed_at
+                    else None,
+                    "outcome": _sc_row.outcome,
+                    "directions_created": int(_sc_row.directions_created or 0),
+                    "directions_retired": int(_sc_row.directions_retired or 0),
+                    "vision_updated": bool(_sc_row.vision_updated),
+                    "summary_text": _sc_row.summary_text,
                 }
-                _cycle_id = last.get("cycle_id")
-                if _cycle_id:
-                    _sc_row = await session.get(StrategicCycle, _cycle_id)
-                    if _sc_row is not None:
-                        _ms = _sc_row.memo_stats()
-                        latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
-                            CYCLE_META_MEMOS_AVAILABLE
-                        ]
-                        latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
-                            CYCLE_META_MEMOS_CITED
-                        ]
-                        # Compact strategic-judgment-challenge summary when this
-                        # cycle carried a challenge record; omit entirely for
-                        # legacy cycles so absence never reads as a failure.
-                        _challenge_record = (_sc_row.cycle_metadata or {}).get(
-                            "strategic_judgment_challenge"
-                        )
-                        _challenge_summary = strategic_challenge_summary(
-                            _challenge_record
-                        )
-                        if _challenge_summary is not None:
-                            latest_cycle["strategic_judgment_challenge"] = (
-                                _challenge_summary
-                            )
+                _ms = _sc_row.memo_stats()
+                latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
+                    CYCLE_META_MEMOS_AVAILABLE
+                ]
+                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
+                    CYCLE_META_MEMOS_CITED
+                ]
+                # Compact strategic-judgment-challenge summary when this
+                # cycle carried a challenge record; omit entirely for
+                # legacy cycles so absence never reads as a failure.
+                _challenge_record = (_sc_row.cycle_metadata or {}).get(
+                    "strategic_judgment_challenge"
+                )
+                _challenge_summary = strategic_challenge_summary(
+                    _challenge_record
+                )
+                if _challenge_summary is not None:
+                    latest_cycle["strategic_judgment_challenge"] = (
+                        _challenge_summary
+                    )
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,

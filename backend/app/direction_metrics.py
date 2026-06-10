@@ -5,9 +5,7 @@ These operate on direction/project data structures and have no coupling to the
 research pipeline orchestration.
 """
 
-from typing import Any, Dict
-
-from sqlalchemy.orm.attributes import flag_modified
+from typing import Any
 
 from app.direction_outcomes import (
     consumed_merged_count,
@@ -797,14 +795,3 @@ def _compute_autonomy_threshold_state(d: dict) -> dict:
     }
 
 
-def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
-    """Find a cycle entry by cycle_id in project.vision and apply updates in-place."""
-    vision = dict(project.vision or {})
-    cycle_history = list(vision.get("_strategic_cycle_history") or [])
-    for entry in cycle_history:
-        if entry.get("cycle_id") == cycle_id:
-            entry.update(updates)
-            break
-    vision["_strategic_cycle_history"] = cycle_history
-    project.vision = vision
-    flag_modified(project, "vision")

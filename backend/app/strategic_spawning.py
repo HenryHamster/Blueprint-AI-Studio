@@ -2334,7 +2334,7 @@ async def _build_shipped_changes_manifest(
     """Build a manifest of merged tasks since the last architecture review.
 
     Uses design_doc._meta.last_updated as the cutoff, falling back to the
-    most recent phase1_completed_at from vision._strategic_cycle_history.
+    most recent phase1_completed_at from the StrategicCycle table.
     Returns a list of direction-grouped dicts, capped at 50 merged tasks.
     """
 
