@@ -12355,6 +12355,406 @@ async def test_undirected_guard_scoped_per_project(db_session):
     assert await _undirected_research_recently_active(p2.id, db_session) is True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _directed_research_recently_completed unit tests
+# (mirrors the undirected guard test block above)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _add_directed_research(
+    session, project_id, direction_id, *, status, age_minutes=0, status_log=None
+):
+    """Insert a directed research task for the given direction."""
+    t = Task(
+        project_id=project_id,
+        title=f"Research: direction-{direction_id}",
+        description="x",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": direction_id,
+                "directions": [],
+                "base_branch": "main",
+            }
+        ],
+        status_log=status_log or [],
+        status=status,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    session.add(t)
+    await session.commit()
+    if age_minutes:
+        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        session.add(t)
+        await session.commit()
+    return t
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_when_none_exist(db_session):
+    """Returns False when no research tasks for the direction exist at all."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await _directed_research_recently_completed(
+        project.id, "d-abc123", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_true_within_cooldown(db_session):
+    """Returns True when a COMPLETED research task exists within the cooldown window."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir001",
+            status=TaskStatus.COMPLETED,
+            age_minutes=30,  # within 120-min window
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir001", db_session
+        )
+        assert result is True
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_true_when_completion_recent_but_created_old(
+    db_session,
+):
+    """Uses the terminal timestamp, not created_at, for completed research cooldowns."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed_at = datetime.utcnow() - timedelta(minutes=15)
+        old_created = datetime.utcnow() - timedelta(hours=4)
+        task = Task(
+            project_id=project.id,
+            title="Research: direction-d-dir-old",
+            description="x",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": "d-dir-old",
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status_log=[{"t": completed_at.isoformat(), "s": "COMPLETED"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            created_at=old_created,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir-old", db_session
+        )
+        assert result is True
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_after_cooldown(db_session):
+    """Returns False when the COMPLETED task is older than the cooldown window."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir002",
+            status=TaskStatus.COMPLETED,
+            age_minutes=120,  # older than 60-min window
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir002", db_session
+        )
+        assert result is False
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_for_different_direction(db_session):
+    """Returns False when the COMPLETED task is on a different direction."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_directed_research(
+        db_session,
+        project.id,
+        "d-dir-A",
+        status=TaskStatus.COMPLETED,
+        age_minutes=10,
+    )
+    # Guard for a different direction should not be triggered.
+    result = await _directed_research_recently_completed(
+        project.id, "d-dir-B", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_active_not_completed(db_session):
+    """Returns False when only ACTIVE (non-COMPLETED) research exists — that path
+    is handled by the active-tasks lock, not this guard."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_directed_research(
+        db_session,
+        project.id,
+        "d-dir003",
+        status=TaskStatus.IN_PROGRESS,
+        age_minutes=5,
+    )
+    result = await _directed_research_recently_completed(
+        project.id, "d-dir003", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_scoped_per_project(db_session):
+    """A COMPLETED task in another project does not block this one."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    p1 = Project(name="P1", user_id="test-user-123")
+    p2 = Project(name="P2", user_id="test-user-123")
+    db_session.add_all([p1, p2])
+    await db_session.commit()
+    await db_session.refresh(p1)
+    await db_session.refresh(p2)
+
+    await _add_directed_research(
+        db_session,
+        p2.id,
+        "d-shared",
+        status=TaskStatus.COMPLETED,
+        age_minutes=10,
+    )
+    assert (
+        await _directed_research_recently_completed(p1.id, "d-shared", db_session)
+        is False
+    )
+    assert (
+        await _directed_research_recently_completed(p2.id, "d-shared", db_session)
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_disabled_by_zero_cooldown(db_session):
+    """Setting completed_research_cooldown_minutes <= 0 disables the guard."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 0
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir004",
+            status=TaskStatus.COMPLETED,
+            age_minutes=5,
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir004", db_session
+        )
+        assert result is False
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_skipped_when_completed_directed_research_within_cooldown(
+    db_session, mocker
+):
+    """_spawn_research_task skips a direction when a COMPLETED research task for
+    that direction exists within the completed_research_cooldown_minutes window.
+    This covers the gap where _handle_research_completion dies before setting
+    last_researched_at (incident 2026-06-10: 3x same-direction re-runs in 80 min)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-dedup01"
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    try:
+        project = Project(
+            name="Dedup Completed",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(direction_id)],
+            vision={"purpose": "test", "_research_spawn_count": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Simulate a recently-completed research task for this direction
+        completed = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.QUEUED,
+            )
+        )
+        queued = result.scalars().all()
+        assert len(queued) == 0, (
+            "Must not spawn a new research task when a COMPLETED one exists "
+            "within the cooldown window"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
+    db_session, mocker
+):
+    """_spawn_research_task allows a new spawn when the previous COMPLETED research
+    is older than the cooldown window."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-dedup02"
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    try:
+        project = Project(
+            name="Dedup Outside Window",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(direction_id)],
+            vision={"purpose": "test", "_research_spawn_count": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Old completed task — outside the 60-min window
+        old_completed = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(old_completed)
+        await db_session.commit()
+        old_completed.created_at = datetime.utcnow() - timedelta(minutes=90)
+        db_session.add(old_completed)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.QUEUED,
+            )
+        )
+        queued = result.scalars().all()
+        assert len(queued) == 1, (
+            "Should spawn a new research task when the completed one is outside "
+            "the cooldown window"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
 @pytest.mark.asyncio
 async def test_idle_research_skips_paused_project(db_session, mocker):
     """`_check_idle_research` must not spawn work for a paused project even when

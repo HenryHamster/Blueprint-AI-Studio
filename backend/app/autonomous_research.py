@@ -28,6 +28,7 @@ from app.payload_schemas import (
     PayloadTooLargeError,
     _MAX_PAYLOAD_BYTES,
 )
+from app.routers.admin_analytics import _derive_completed_at
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -239,6 +240,43 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
         )
     ).scalar() or 0
     return recent > 0
+
+
+async def _directed_research_recently_completed(
+    project_id, direction_id: str, session
+) -> bool:
+    """True when a directed research task for this direction COMPLETED within the
+    cooldown window.
+
+    Protects against re-commissioning when ``_handle_research_completion`` dies
+    before it can update ``last_researched_at`` on the direction — the
+    direction-level cooldown guard then sees no cooldown and allows a re-spawn
+    (incident 2026-06-10: tasks 55ed71f5 / 32758199 both completed childless
+    within 80 min of the successful cycle 63231d77 on the same direction).
+
+    Mirrors ``_undirected_research_recently_active`` for the directed case; the
+    undirected guard already covers all statuses, so this companion only checks
+    COMPLETED.  Set ``completed_research_cooldown_minutes`` <= 0 to disable.
+    """
+    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes", 120)
+    if cooldown_minutes <= 0:
+        return False
+    cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
+    completed = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status == TaskStatus.COMPLETED,
+                Task.payloads[0]["type"].as_string() == "research",
+                Task.payloads[0]["current_direction_id"].as_string()
+                == str(direction_id),
+            )
+        )
+    ).scalars()
+    for task in completed:
+        if _derive_completed_at(task) >= cutoff:
+            return True
+    return False
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -1724,6 +1762,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         current_dir_id = (
             None if chosen_direction is None else chosen_direction.get("id")
         )
+        # Guard: skip directed research that recently COMPLETED — covers the gap
+        # when _handle_research_completion fails before updating last_researched_at
+        # on the direction (incident 2026-06-10: 3x same-direction re-runs within
+        # 80 min). Undirected research is already covered by
+        # _undirected_research_recently_active above.
+        if current_dir_id is not None and await _directed_research_recently_completed(
+            project.id, current_dir_id, session
+        ):
+            logger.info(
+                "[AUTONOMOUS] Skipping research for project %s direction %s "
+                "— a research task on this direction completed within the "
+                "cooldown window.",
+                project.id,
+                current_dir_id,
+            )
+            continue
         direction_summaries = []
         for d in all_active_directions:
             summary: dict = {

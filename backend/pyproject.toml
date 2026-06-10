@@ -160,6 +160,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # retry pattern as review_learning.categorize_review_issues_llm. PERF203 is
 # suppressed because the try/except is the retry mechanism, not a performance issue.
 "app/knowledge_completion.py" = ["PERF203"]
+# autonomous_research.py re-exports _spawn_residual_fingerprint_remediation from
+# autonomous_research_residual via a mid-module import to satisfy existing callers
+# after the residual lane was extracted to its own module (circular-dependency /
+# load-order — same intentional pattern as main.py / services.py).
+"app/autonomous_research.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"
