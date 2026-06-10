@@ -790,6 +790,7 @@ async def _resolve_review_second_opinion(
             ),
             "primary_verdict": primary_verdict,
             "challenger_task_id": str(challenger.id),
+            "review_task_id": str(review.id),
         }
         ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
         review.context = ctx
@@ -837,10 +838,14 @@ async def _resolve_review_second_opinion(
 
     record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
     record["challenger_task_id"] = str(challenger.id)
+    record["review_task_id"] = str(review.id)
 
     ctx = dict(review.context or {})
     ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
     ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+    # Drop the parked snapshot too — it holds the PRE-reconciliation verdict +
+    # issues and has been consumed; leaving it invites stale reads downstream.
+    ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
     review.context = ctx
     flag_modified(review, "context")
     review.status = TaskStatus.COMPLETED
@@ -2703,6 +2708,34 @@ async def _process_post_commit(
                 _recon_record = (task.context or {}).get(
                     REVIEW_SECOND_OPINION_RECONCILIATION_KEY
                 )
+                if isinstance(_recon_record, dict) and _recon_record.get(
+                    "review_task_id"
+                ) != str(task.id):
+                    # The record belongs to a DIFFERENT review task (or predates
+                    # ownership stamping): it leaked in via a context copy, e.g.
+                    # the review→fix→review propagation. Adopting it would
+                    # clobber this review's fresh verdict with the earlier
+                    # iteration's verdict + verbatim issues — the identical
+                    # issue set then trips the stuck-cycle detector and falsely
+                    # parks the chain (PR #9243). Scrub the whole inherited
+                    # second-opinion family and run the gate fresh.
+                    logger.warning(
+                        "[REVIEW PIPELINE] PR #%s: ignoring second-opinion "
+                        "record inherited from review %s on review %s",
+                        pr_number,
+                        _recon_record.get("review_task_id"),
+                        task.id,
+                    )
+                    from app.task_completion import (
+                        REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS,
+                    )
+
+                    _scrubbed_ctx = dict(task.context or {})
+                    for _so_key in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS:
+                        _scrubbed_ctx.pop(_so_key, None)
+                    task.context = _scrubbed_ctx
+                    session.add(task)
+                    _recon_record = None
                 if _recon_record is not None:
                     # Re-entrant pass after reconciliation: adopt the reconciled
                     # verdict + surviving issue set, then fall through to the
@@ -2772,6 +2805,7 @@ async def _process_post_commit(
                                 "primary_verdict": verdict,
                                 "reconciled_verdict": verdict,
                                 "surviving_issues": issues,
+                                "review_task_id": str(task.id),
                             },
                         }
                         session.add(task)
@@ -2786,6 +2820,7 @@ async def _process_post_commit(
                             "primary_verdict": verdict,
                             "reconciled_verdict": verdict,
                             "surviving_issues": issues,
+                            "review_task_id": str(task.id),
                         },
                     }
                     session.add(task)
