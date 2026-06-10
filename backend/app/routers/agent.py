@@ -2157,6 +2157,7 @@ async def claim_task(
                             )
                             from app.source_ref_validation import (
                                 resolve_branch_verification_context,
+                                resolve_head_commit,
                             )
 
                             repo_root: str = (
@@ -2170,6 +2171,24 @@ async def claim_task(
                                     session, _pb_proj
                                 )
                             )
+                            grounding_kwargs = dict(verification_kwargs)
+                            if all(
+                                key in verification_kwargs
+                                for key in ("token", "owner", "repo", "branch")
+                            ):
+                                try:
+                                    resolved_sha = await resolve_head_commit(
+                                        **verification_kwargs
+                                    )
+                                except Exception:  # noqa: BLE001 — degrade, never block claim
+                                    logger.debug(
+                                        "[AGENT] Branch head SHA resolution skipped "
+                                        "(non-critical)",
+                                        exc_info=True,
+                                    )
+                                    resolved_sha = None
+                                if resolved_sha:
+                                    grounding_kwargs["sha"] = resolved_sha
                             # Recovery runs unconditionally — only scans entries
                             # already in the 'missing' state with a prior_status,
                             # so its GitHub API cost is much lower than the full
@@ -2183,9 +2202,32 @@ async def claim_task(
                                     doc, repo_root=repo_root, **verification_kwargs
                                 )
                                 doc = await ground_design_doc_systems_branch_aware(
-                                    doc, repo_root=repo_root, **verification_kwargs
+                                    doc, repo_root=repo_root, **grounding_kwargs
                                 )
-                                mark_branch_grounding_done(doc)
+                                meta = doc.get("_meta")
+                                grounding_diagnostic = None
+                                if isinstance(meta, dict):
+                                    grounding_diagnostic = meta.pop(
+                                        "grounding_diagnostic", None
+                                    )
+                                    if not meta:
+                                        doc.pop("_meta", None)
+                                if (
+                                    isinstance(grounding_diagnostic, dict)
+                                    and grounding_diagnostic.get("kind")
+                                    == "cap_breach"
+                                ):
+                                    logger.debug(
+                                        "[AGENT] Branch-aware design-doc grounding "
+                                        "cap breach: candidate_count=%s cap=%s "
+                                        "source=%s affected_keys=%s",
+                                        grounding_diagnostic.get("candidate_count"),
+                                        grounding_diagnostic.get("cap"),
+                                        grounding_diagnostic.get("source"),
+                                        grounding_diagnostic.get("affected_keys"),
+                                    )
+                                else:
+                                    mark_branch_grounding_done(doc)
                         except Exception:  # noqa: BLE001 — best-effort, never block claim
                             logger.debug(
                                 "[AGENT] Branch-aware design-doc grounding skipped "

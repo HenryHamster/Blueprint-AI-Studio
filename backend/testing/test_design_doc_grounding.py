@@ -2,7 +2,10 @@
 design-doc systems/capabilities, mirroring the playbook stale-ref sweep."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
+
+import pytest
 
 from app.playbook_learning import (
     branch_grounding_due,
@@ -12,6 +15,7 @@ from app.playbook_learning import (
     recover_grounding_downgrades,
     recover_grounding_downgrades_branch_aware,
 )
+from app.shared_state import runtime_config
 
 
 def _make_repo(tmp_path, *rel_paths):
@@ -59,12 +63,129 @@ def test_branch_aware_grounding_works_without_local_checkout(monkeypatch):
             owner="acme",
             repo="widget",
             branch="automain",
+            sha="deadbeef",
         )
     )
     entry = result["systems/auth"]
     assert entry["status"] == "missing"
     assert "integration branch" in entry["presence_warning"]
+    assert entry["grounding_provenance"]["source"] == "github-snapshot"
+    assert entry["grounding_provenance"]["branch"] == "automain"
+    assert entry["grounding_provenance"]["sha"] == "deadbeef"
+    assert entry["grounding_provenance"]["checked_at"]
     assert result["_meta"]["updated_by"] == "design-doc-grounding"
+
+
+def test_grounding_cap_breach_persists_no_downgrades_and_emits_diagnostic(
+    tmp_path, monkeypatch, caplog
+):
+    """Cap breaches leave entries untouched and surface a machine-readable diagnostic."""
+    repo_root = _make_repo(tmp_path, "backend/app/present.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone_auth.py"],
+        },
+        "systems/billing": {
+            "status": "functional",
+            "modules": ["backend/app/gone_billing.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+        "capabilities/search": {
+            "status": "partial",
+            "notes": "See backend/app/gone_search.py.",
+        },
+    }
+    monkeypatch.setitem(
+        runtime_config,
+        "playbook_design_doc_grounding_max_downgrades",
+        2,
+    )
+    caplog.set_level(logging.WARNING)
+    expected_keys = list(doc)
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    for key in expected_keys:
+        assert result[key]["status"] == doc[key]["status"]
+        assert "presence_warning" not in result[key]
+        assert "grounding_provenance" not in result[key]
+
+    diagnostic = result["_meta"]["grounding_diagnostic"]
+    assert diagnostic["kind"] == "cap_breach"
+    assert diagnostic["source"] == "local-disk"
+    assert diagnostic["candidate_count"] == 4
+    assert diagnostic["cap"] == 2
+    assert diagnostic["affected_keys"] == expected_keys
+    assert any("Grounding cap breach" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_branch_aware_grounding_cap_breach_persists_no_downgrades_and_emits_diagnostic(
+    monkeypatch, caplog
+):
+    """GitHub-snapshot cap breaches leave entries untouched and emit diagnostics."""
+    branch_exists = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        branch_exists,
+    )
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone_auth.py"],
+        },
+        "systems/billing": {
+            "status": "functional",
+            "modules": ["backend/app/gone_billing.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+        "capabilities/search": {
+            "status": "partial",
+            "notes": "See backend/app/gone_search.py.",
+        },
+    }
+    monkeypatch.setitem(
+        runtime_config,
+        "playbook_design_doc_grounding_max_downgrades",
+        2,
+    )
+    caplog.set_level(logging.WARNING)
+    expected_keys = list(doc)
+
+    result = await ground_design_doc_systems_branch_aware(
+        doc,
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        sha="deadbeef",
+        project_id="p1",
+    )
+
+    assert branch_exists.await_count == 4
+    for key in expected_keys:
+        assert result[key]["status"] == doc[key]["status"]
+        assert "presence_warning" not in result[key]
+        assert "grounding_provenance" not in result[key]
+
+    diagnostic = result["_meta"]["grounding_diagnostic"]
+    assert diagnostic["kind"] == "cap_breach"
+    assert diagnostic["source"] == "github-snapshot"
+    assert diagnostic["candidate_count"] == 4
+    assert diagnostic["cap"] == 2
+    assert diagnostic["affected_keys"] == expected_keys
+    assert diagnostic["indeterminate"] is True
+    assert any(
+        "Grounding cap breach on github-snapshot source" in record.message
+        for record in caplog.records
+    )
 
 
 def test_system_all_modules_absent_downgraded(tmp_path):
@@ -80,6 +201,8 @@ def test_system_all_modules_absent_downgraded(tmp_path):
     entry = result["systems/auth"]
     assert entry["status"] == "missing"
     assert "absent" in entry["presence_warning"]
+    assert entry["grounding_provenance"]["source"] == "local-disk"
+    assert entry["grounding_provenance"]["checked_at"]
     assert result["_meta"]["updated_by"] == "design-doc-grounding"
     assert result["_meta"]["revision"] == 1
 
