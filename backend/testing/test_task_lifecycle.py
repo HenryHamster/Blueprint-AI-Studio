@@ -8183,6 +8183,73 @@ async def test_second_opinion_unparseable_challenge_escalates(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_second_opinion_replayed_challenger_status_does_not_clobber(
+    tl_db, mocker
+):
+    """Regression (PRs #9303/#9308/#9319, 2026-06-10): a replayed terminal
+    status for an already-resolved challenger — an agent HTTP retry or the
+    post_commit_pending sweep re-firing while the first pass is still in (or
+    died during) the slow re-dispatch — carries no logs, so it fell into the
+    fail-closed branch and OVERWROTE the real reconciliation with a
+    "challenge unresolved — manual review required" escalation. The resolver
+    must treat the consumed AWAITING marker / durable reconciliation record
+    as authoritative and no-op any replay."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7785)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # First pass: confirming panel verdict reconciles and merges.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("APPROVE"),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec["state"] == "challenged_confirmed"
+    assert merge_mock.call_count == 1
+
+    # Replay 1: log-less COMPLETED (retry payloads carry no agent logs).
+    await _process_post_commit(
+        challenger.id,
+        AgentStatusPayload(task_id=challenger.id, status=TaskStatus.COMPLETED),
+        _session_factory=factory,
+    )
+    # Replay 2: a late FAILED (e.g. an agent shutdown self-terminate sync).
+    await _process_post_commit(
+        challenger.id,
+        AgentStatusPayload(task_id=challenger.id, status=TaskStatus.FAILED),
+        _session_factory=factory,
+    )
+
+    await session.refresh(review_task)
+    await session.refresh(original)
+    rec_after = (review_task.context or {}).get("review_second_opinion")
+    assert rec_after == rec, "replay must not rewrite the reconciliation record"
+    assert review_task.status == TaskStatus.COMPLETED
+    assert "manual review required" not in (review_task.latest_status_message or "")
+    assert not original.requires_approval, "replay must not flag manual approval"
+    assert merge_mock.call_count == 1, "replay must not re-merge"
+    assert not captured_spawn, "replay must not spawn anything"
+
+
+@pytest.mark.asyncio
 async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker):
     """Gate disabled → today's synchronous behavior, recorded as unchallenged."""
     mocker.patch.dict(
