@@ -361,6 +361,28 @@ describe('buildRepoMap', () => {
     expect(buildRepoMap(null)).toBe('');
   });
 
+  it('does not attribute cross-package basename collisions to the wrong package', () => {
+    // Both agent/src/index.ts and admin-ui/src/index.ts exist.
+    // agent/src/a.ts imports from './index.js' (relative → resolves to agent/src/index.ts).
+    // admin-ui/src/index.ts must NOT receive any in-degree from that import.
+    vi.mocked(execFileSync).mockReturnValue(
+      ['admin-ui/src/index.ts', 'agent/src/index.ts', 'agent/src/a.ts'].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('admin-ui/src/index.ts')) return "export function adminFn() {}";
+      if (p.endsWith('agent/src/index.ts')) return "export function agentFn() {}";
+      if (p.endsWith('agent/src/a.ts')) return "import { agentFn } from './index.js';";
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    // agent/src/index.ts is the hub (1 relative importer), should appear
+    expect(result).toContain('agent/src/index.ts');
+    // admin-ui/src/index.ts should NOT appear — it has no importers
+    expect(result).not.toContain('admin-ui/src/index.ts');
+  });
+
   it('is fail-soft when file reads throw', () => {
     vi.mocked(execFileSync).mockReturnValue('src/a.ts\nsrc/b.ts' as never);
     vi.mocked(fs.readFileSync).mockImplementation(() => {

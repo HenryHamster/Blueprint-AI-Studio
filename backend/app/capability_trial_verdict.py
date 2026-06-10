@@ -52,7 +52,34 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
         },
-    }
+    },
+    {
+        "cap_name": "module_interfaces",
+        "context_key": "_had_module_interfaces",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+        },
+    },
+    {
+        "cap_name": "related_tests",
+        "context_key": "_had_related_tests",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+        },
+    },
+    {
+        "cap_name": "affected_consumers",
+        "context_key": "_had_affected_consumers",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+        },
+    },
 ]
 
 

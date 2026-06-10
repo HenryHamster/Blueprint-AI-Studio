@@ -254,6 +254,53 @@ async def test_research_payload_includes_knowledge_index_scoped_to_direction(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_annotations_include_capability_proof_status(
+    db_session,
+):
+    """Spawned research payloads expose proof-annotated capability vocabulary."""
+    project = Project(
+        name="Capability Proof Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-proof-vocab")],
+        vision={"purpose": "test"},
+        problem_model={
+            "capabilities": [
+                {"name": "Repo Map", "status": "working"},
+                {"name": "Prompt Repair", "status": "planned"},
+            ]
+        },
+        capability_proof_records={
+            "repo-map": [
+                {
+                    "task_id": "task-proof-1",
+                    "proved_at": "2026-06-09T00:00:00",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_repo_map",
+                    "commit_sha": "abc123",
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    capabilities = research[0].first_payload["available_capabilities"]
+    assert capabilities == [
+        {"name": "repo-map", "status": "working", "proof_status": "proven"},
+        {"name": "prompt-repair", "status": "planned", "proof_status": "unproven"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_autonomous_research_stamps_idempotency_key(db_session):
     """A spawned directed research task carries the shared direction-scoped
     idempotency key; an undirected (cross-cutting) cycle carries the undirected

@@ -4313,3 +4313,92 @@ def compute_safeguard_shadow_metrics(
         "false_positive_rate": false_positive_rate,
         "cap_reached": cap_reached,
     }
+
+
+# Keys written by research_completion._record_research_survival_signal /
+# _attach_challenge_record — mirrored here to avoid a circular import.
+_RESEARCH_SURVIVING_KEY = "research_surviving_findings"
+_RESEARCH_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
+_RESEARCH_VERIFICATION_BASIS_TIERS = (
+    "code_verified",
+    "path_verified",
+    "pattern_inferred",
+    "deduced",
+)
+
+
+def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any]]:
+    """Aggregate research output-quality signals across the digest window.
+
+    Aggregates three complementary signals from the per-task JSONB that
+    research_completion writes at cycle end:
+
+    * ``surviving_rate`` — mean(research_surviving_findings / findings_dispatched)
+      per research task where both values are present (plan_output non-empty).
+    * ``challenge_agreement_rate`` — agrees / (agrees + disagrees + indeterminate)
+      accumulated across all finding_challenge_records entries in the window.
+    * ``verification_basis_distribution`` — count by basis tier across all
+      dispatched findings in qualifying tasks.
+
+    Tasks without ``research_surviving_findings`` in context OR with an empty/
+    missing ``plan_output`` are skipped (nil-safe). Returns ``None`` when no
+    qualifying tasks exist.
+    """
+    surviving_ratios: List[float] = []
+    agrees = disagrees = indeterminate = 0
+    basis_counts: Dict[str, int] = {tier: 0 for tier in _RESEARCH_VERIFICATION_BASIS_TIERS}
+
+    for task in tasks:
+        payload_type = (task.first_payload or {}).get("type")
+        if payload_type != "research":
+            continue
+        ctx = task.context or {}
+        if _RESEARCH_SURVIVING_KEY not in ctx:
+            continue
+        findings = [
+            f for f in (task.plan_output or []) if isinstance(f, dict)
+        ]
+        if not findings:
+            continue
+
+        surviving = ctx[_RESEARCH_SURVIVING_KEY]
+        total = len(findings)
+        try:
+            surviving_ratios.append(float(surviving) / float(total))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+        for record in (ctx.get(_RESEARCH_CHALLENGE_HISTORY_KEY) or []):
+            if not isinstance(record, dict):
+                continue
+            agreement = str(record.get("agreement") or "").lower()
+            if agreement == "agrees":
+                agrees += 1
+            elif agreement == "disagrees":
+                disagrees += 1
+            elif agreement == "indeterminate":
+                indeterminate += 1
+
+        for finding in findings:
+            basis = finding.get("verification_basis")
+            if basis in basis_counts:
+                basis_counts[basis] += 1
+
+    if not surviving_ratios:
+        return None
+
+    challenge_total = agrees + disagrees + indeterminate
+    challenge_agreement_rate = (
+        round(agrees / challenge_total, 3) if challenge_total > 0 else None
+    )
+
+    return {
+        "qualifying_task_count": len(surviving_ratios),
+        "surviving_rate": round(statistics.mean(surviving_ratios), 3),
+        "challenge_agreement_rate": challenge_agreement_rate,
+        "challenge_total": challenge_total,
+        "challenge_agrees": agrees,
+        "challenge_disagrees": disagrees,
+        "challenge_indeterminate": indeterminate,
+        "verification_basis_distribution": dict(basis_counts),
+    }

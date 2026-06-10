@@ -19,7 +19,20 @@ from typing import Any
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.capability_registry import compose_capability_markers, normalize_capability_name
+from app.capability_registry import (
+    annotate_capability_proof_status,
+    compose_capability_markers,
+    normalize_capability_name,
+)
+
+# Re-exported for back-compat: the annotation body lives in the IO-free
+# capability_registry leaf so every spawn path shares ONE implementation.
+__all__ = [
+    "annotate_capability_proof_status",
+    "enrich_problem_model_capability_proofs",
+    "record_capability_proof",
+    "should_record_capability_proof",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +101,57 @@ def should_record_capability_proof(task: Any, verdict: Any) -> bool:
                 if isinstance(item, str) and item.strip():
                     return True
     return False
+
+
+def _proof_entries_for_capability(
+    proof_records: Any, cap_name: str
+) -> list[dict[str, Any]]:
+    """Return a shallow-copied proof-entry list for one capability."""
+    if not isinstance(proof_records, dict):
+        return []
+    raw_entries = proof_records.get(cap_name)
+    if not isinstance(raw_entries, list):
+        return []
+    return [entry for entry in raw_entries if isinstance(entry, dict)]
+
+
+def enrich_problem_model_capability_proofs(
+    problem_model: Any, proof_records: Any
+) -> Any:
+    """Return a shallow-copied problem_model with capability proof evidence.
+
+    Each capability entry receives a ``proof_status`` field and, when proof
+    records exist, a ``proof_records`` list containing the durable entries.
+    Missing / empty / malformed records fail open to claimed-only.
+    """
+    if not isinstance(problem_model, dict):
+        return problem_model
+    capabilities = problem_model.get("capabilities")
+    if not isinstance(capabilities, list):
+        return dict(problem_model)
+
+    annotated = dict(problem_model)
+    annotated_caps: list[Any] = []
+    for entry in capabilities:
+        if not isinstance(entry, dict):
+            annotated_caps.append(entry)
+            continue
+        entry2 = dict(entry)
+        cap_name = entry2.get("name")
+        entries = (
+            _proof_entries_for_capability(proof_records, cap_name)
+            if isinstance(cap_name, str)
+            else []
+        )
+        entry2["proof_status"] = "proven" if entries else "unproven"
+        if entries:
+            entry2["proof_records"] = [
+                dict(proof_entry) for proof_entry in entries
+            ]
+        annotated_caps.append(entry2)
+
+    annotated["capabilities"] = annotated_caps
+    return annotated
 
 
 def record_capability_proof(task: Any, project: Any) -> list[str]:

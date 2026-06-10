@@ -718,66 +718,49 @@ class TestGetProject:
         assert data["build_config"].get("node_version") == "20"
 
     @pytest.mark.asyncio
-    async def test_detail_includes_capability_proof_summary_and_adoption_verdicts(
+    async def test_detail_includes_capability_proof_annotations(
         self, client: AsyncClient, db_session
     ):
-        """Project detail returns proof summaries and durable trial verdicts."""
+        """Project detail returns proof-enriched capabilities without changing the stored model."""
         from sqlalchemy.orm.attributes import flag_modified
 
-        project = await _make_project(db_session, name="Capability Evidence Detail")
-        project.capability_proof_records = {
-            "repo-map-navigation": [
-                {
-                    "proof_kind": "initial-claim",
-                    "proved_at": "2026-06-08T10:00:00Z",
-                    "commit_sha": "1111111",
-                },
-                {
-                    "proof_kind": "merge-test",
-                    "proved_at": "2026-06-09T12:00:00Z",
-                    "commit_sha": "abc1234",
-                },
+        project = await _make_project(db_session, name="Proof Detail")
+        project.problem_model = {
+            "revision": 3,
+            "capabilities": [
+                {"name": "language-aware repo map", "status": "working"},
+                {"name": "claimed only capability", "status": "partial"},
             ],
         }
-        project.capability_adoption_verdicts = {
-            "repo-map-navigation": {
-                "verdict": "adopt",
-                "lift": 0.123,
-                "n_with": 18,
-                "n_without": 17,
-                "thresholds": {
-                    "min_n_per_arm": 12,
-                    "adopt_lift": 0.08,
-                    "reject_lift": -0.04,
-                },
-            }
+        flag_modified(project, "problem_model")
+        project.capability_proof_records = {
+            "language-aware repo map": [
+                {
+                    "task_id": "task-proof-1",
+                    "proved_at": "2026-06-09T12:34:56Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_proof_recorded_on_named_test_proven",
+                    "commit_sha": "abc123def456",
+                }
+            ]
         }
         flag_modified(project, "capability_proof_records")
-        flag_modified(project, "capability_adoption_verdicts")
         db_session.add(project)
         await db_session.commit()
 
         resp = await client.get(f"/api/admin/projects/{project.id}")
-
         assert resp.status_code == 200
         data = resp.json()
-        assert data["capability_proof_summary"]["repo-map-navigation"] == {
-            "proof_count": 2,
-            "latest_proof_kind": "merge-test",
-            "latest_proved_at": "2026-06-09T12:00:00Z",
-            "latest_commit_sha": "abc1234",
-        }
-        assert data["capability_adoption_verdicts"]["repo-map-navigation"] == {
-            "verdict": "adopt",
-            "lift": 0.123,
-            "n_with": 18,
-            "n_without": 17,
-            "thresholds": {
-                "min_n_per_arm": 12,
-                "adopt_lift": 0.08,
-                "reject_lift": -0.04,
-            },
-        }
+        caps = data["problem_model"]["capabilities"]
+        assert caps[0]["proof_status"] == "proven"
+        assert caps[0]["proof_records"][0]["proof_kind"] == "named_test"
+        assert caps[0]["proof_records"][0]["proof_ref"].endswith(
+            "test_proof_recorded_on_named_test_proven"
+        )
+        assert caps[0]["proof_records"][0]["commit_sha"] == "abc123def456"
+        assert caps[0]["proof_records"][0]["proved_at"] == "2026-06-09T12:34:56Z"
+        assert caps[1]["proof_status"] == "unproven"
+        assert "proof_records" not in caps[1]
 
 
 class TestUpdateProject:

@@ -142,6 +142,11 @@ export interface StandardHandlerOpts {
   issueReference?: string;
   relatedFiles?: string[];
   runMigrationCheck?: boolean;
+  promptSectionFlags?: {
+    hadModuleInterfaces?: boolean;
+    hadRelatedTests?: boolean;
+    hadAffectedConsumers?: boolean;
+  };
 }
 
 /**
@@ -212,6 +217,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     captureBaseline = false,
     runSmallScopeAnalysis = false,
     includeTaskTypeHints = true,
+    promptSectionFlags,
   } = opts;
   // commitPrefix, prTitlePrefix, runLintFix, runSelfReview, lintContext,
   // issueReference, relatedFiles, runMigrationCheck are no longer
@@ -621,7 +627,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before Claude starts so short code-change tasks persist the
   // fingerprint even if they finish before the next periodic heartbeat.
-  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, had_repo_map: repoMap !== '' });
+  sendHeartbeatSync(taskId, statusRef.value, {
+    prompt_fingerprint: promptFingerprint,
+    had_repo_map: repoMap !== '',
+    ...(promptSectionFlags?.hadModuleInterfaces !== undefined && { had_module_interfaces: promptSectionFlags.hadModuleInterfaces }),
+    ...(promptSectionFlags?.hadRelatedTests !== undefined && { had_related_tests: promptSectionFlags.hadRelatedTests }),
+    ...(promptSectionFlags?.hadAffectedConsumers !== undefined && { had_affected_consumers: promptSectionFlags.hadAffectedConsumers }),
+  });
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with
@@ -885,6 +897,11 @@ export async function handleCreate(
     issueReference,
     relatedFiles,
     runMigrationCheck: true,
+    promptSectionFlags: {
+      hadModuleInterfaces: moduleInterfaceContext !== '',
+      hadRelatedTests: relatedTestContext !== '',
+      hadAffectedConsumers: affectedConsumersContext !== '',
+    },
   });
 }
 
@@ -946,6 +963,11 @@ export async function handleRefactor(
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
+    promptSectionFlags: {
+      hadModuleInterfaces: refactorModuleInterfaceContext !== '',
+      hadRelatedTests: refactorRelatedTestContext !== '',
+      hadAffectedConsumers: refactorAffectedConsumersContext !== '',
+    },
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
       `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorScopeBudgetNote}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.

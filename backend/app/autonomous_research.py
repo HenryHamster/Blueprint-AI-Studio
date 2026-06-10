@@ -60,7 +60,7 @@ from app.capability_demand import (
     missing_demand_prompt_hint,
 )
 from app.capability_registry import (
-    annotate_capability_proof_status,
+    annotate_capability_proof_status as _annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -1866,7 +1866,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # refs from the SAME shared namespace consumers draw from. Additive and
         # optional: omitted on the empty path, older agents ignore it and still
         # validate.
-        _available_capabilities = annotate_capability_proof_status(
+        _available_capabilities = _annotate_capability_proof_status(
             registry_capability_vocabulary(project.problem_model),
             getattr(project, "capability_proof_records", None),
         )
@@ -2511,7 +2511,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (  # noqa: E402
+from app.autonomous_research_residual import (  # noqa: E402 - intentional mid-file re-export
     _spawn_residual_fingerprint_remediation,
 )
 

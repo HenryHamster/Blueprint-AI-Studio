@@ -29,6 +29,7 @@ from app.digest_metrics import (
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
+    compute_research_output_quality,
     compute_safeguard_shadow_metrics,
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
@@ -4440,6 +4441,66 @@ def test_first_attempt_breakdowns_repo_map_no_flag_not_counted():
     assert result["repo_map_lift"] is None
 
 
+def _fa_section_task(*, succeeded: bool, flag_key: str, flag_val: bool | None) -> object:
+    """Task fixture for prompt-section breakdown tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if flag_val is not None:
+        ctx[flag_key] = flag_val
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_module_interfaces_rates():
+    """with/without_module_interfaces rates computed from _had_module_interfaces flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=True),
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_module_interfaces", flag_val=False),
+        _fa_section_task(succeeded=False, flag_key="_had_module_interfaces", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_module_interfaces"] == 1.0
+    assert result["without_module_interfaces"] == 0.0
+
+
+def test_first_attempt_breakdowns_related_tests_rates():
+    """with/without_related_tests rates computed from _had_related_tests flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_related_tests", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_related_tests", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_related_tests"] == 1.0
+    assert result["without_related_tests"] == 0.0
+
+
+def test_first_attempt_breakdowns_affected_consumers_rates():
+    """with/without_affected_consumers rates computed from _had_affected_consumers flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_affected_consumers", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_affected_consumers", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_affected_consumers"] == 1.0
+    assert result["without_affected_consumers"] == 0.0
+
+
+def test_first_attempt_breakdowns_section_flags_no_flag_not_counted():
+    """Tasks without section flags do not appear in either arm."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=None),
+        _fa_section_task(succeeded=False, flag_key="_had_related_tests", flag_val=None),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_module_interfaces"] is None
+    assert result["without_module_interfaces"] is None
+    assert result["with_related_tests"] is None
+    assert result["without_related_tests"] is None
+
+
 def test_first_attempt_breakdowns_repo_map_lift_computed_with_enough_samples_via_definitions():
     """repo_map_lift is computed via the definition-driven path when both arms have >= 5 samples."""
     tasks = (
@@ -4545,6 +4606,12 @@ def test_first_attempt_breakdowns_existing_playbook_keys_unaffected():
     assert "with_repo_map" in result
     assert "without_repo_map" in result
     assert "repo_map_lift" in result
+    assert "with_module_interfaces" in result
+    assert "without_module_interfaces" in result
+    assert "with_related_tests" in result
+    assert "without_related_tests" in result
+    assert "with_affected_consumers" in result
+    assert "without_affected_consumers" in result
 
 
 # ── Migration-serialization slot contention ─────────────────────────────────
@@ -5414,3 +5481,155 @@ def test_compute_safeguard_shadow_metrics_cap_reached():
     result = compute_safeguard_shadow_metrics(tasks)
     assert result["cap_reached"] is True
     assert result["observed_blocks"] == _SAFEGUARD_SHADOW_CAP
+
+
+# ---------------------------------------------------------------------------
+# compute_research_output_quality
+# ---------------------------------------------------------------------------
+
+def _make_research_task(
+    surviving: int | None = None,
+    findings: list | None = None,
+    challenge_records: list | None = None,
+) -> object:
+    """Build a minimal research Task fixture for output-quality tests."""
+    ctx = {}
+    if surviving is not None:
+        ctx["research_surviving_findings"] = surviving
+    if challenge_records is not None:
+        ctx["finding_challenge_records"] = challenge_records
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context=ctx,
+        plan_output=findings,
+    )
+
+
+def test_compute_research_output_quality_returns_none_no_research_tasks():
+    """No research tasks → None."""
+    tasks = [
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+        make_task(status=TaskStatus.FAILED, payloads=[{"type": "fix"}]),
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_returns_none_missing_survival_key():
+    """Research tasks without research_surviving_findings in context are skipped."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={},
+            plan_output=[{"title": "F1", "verification_basis": "deduced"}],
+        )
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_returns_none_empty_plan_output():
+    """Research tasks with empty plan_output are skipped."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"research_surviving_findings": 2},
+            plan_output=[],
+        )
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_surviving_rate():
+    """surviving_rate is the mean of per-task (surviving / total_findings) ratios."""
+    # task1: 2 surviving out of 4 findings → ratio 0.5
+    task1 = _make_research_task(
+        surviving=2,
+        findings=[
+            {"title": f"F{i}", "verification_basis": "deduced"} for i in range(4)
+        ],
+    )
+    # task2: 3 surviving out of 3 findings → ratio 1.0
+    task2 = _make_research_task(
+        surviving=3,
+        findings=[
+            {"title": f"G{i}", "verification_basis": "deduced"} for i in range(3)
+        ],
+    )
+    result = compute_research_output_quality([task1, task2])
+    assert result is not None
+    assert result["qualifying_task_count"] == 2
+    # mean(0.5, 1.0) = 0.75
+    assert result["surviving_rate"] == 0.75
+
+
+def test_compute_research_output_quality_challenge_agreement_rate():
+    """challenge_agreement_rate = agrees / (agrees + disagrees + indeterminate)."""
+    records = [
+        {"agreement": "agrees"},
+        {"agreement": "agrees"},
+        {"agreement": "disagrees"},
+        {"agreement": "indeterminate"},
+    ]
+    task = _make_research_task(
+        surviving=1,
+        findings=[{"title": "F1", "verification_basis": "deduced"}],
+        challenge_records=records,
+    )
+    result = compute_research_output_quality([task])
+    assert result is not None
+    assert result["challenge_agrees"] == 2
+    assert result["challenge_disagrees"] == 1
+    assert result["challenge_indeterminate"] == 1
+    assert result["challenge_total"] == 4
+    assert result["challenge_agreement_rate"] == round(2 / 4, 3)
+
+
+def test_compute_research_output_quality_challenge_agreement_rate_none_when_no_records():
+    """challenge_agreement_rate is None when no challenge records exist."""
+    task = _make_research_task(
+        surviving=1,
+        findings=[{"title": "F1", "verification_basis": "deduced"}],
+        challenge_records=[],
+    )
+    result = compute_research_output_quality([task])
+    assert result is not None
+    assert result["challenge_agreement_rate"] is None
+    assert result["challenge_total"] == 0
+
+
+def test_compute_research_output_quality_verification_basis_distribution():
+    """verification_basis_distribution counts each tier across all dispatched findings."""
+    findings = [
+        {"title": "A", "verification_basis": "code_verified"},
+        {"title": "B", "verification_basis": "path_verified"},
+        {"title": "C", "verification_basis": "pattern_inferred"},
+        {"title": "D", "verification_basis": "deduced"},
+        {"title": "E", "verification_basis": "deduced"},
+    ]
+    task = _make_research_task(surviving=3, findings=findings)
+    result = compute_research_output_quality([task])
+    assert result is not None
+    dist = result["verification_basis_distribution"]
+    assert dist["code_verified"] == 1
+    assert dist["path_verified"] == 1
+    assert dist["pattern_inferred"] == 1
+    assert dist["deduced"] == 2
+
+
+def test_compute_research_output_quality_skips_non_dict_findings_and_unknown_basis():
+    """Non-dict findings are skipped; unknown basis values don't appear in distribution."""
+    findings = [
+        "not-a-dict",
+        {"title": "X", "verification_basis": "unknown_tier"},
+        {"title": "Y", "verification_basis": "code_verified"},
+    ]
+    task = _make_research_task(surviving=1, findings=findings)
+    result = compute_research_output_quality([task])
+    assert result is not None
+    dist = result["verification_basis_distribution"]
+    assert dist["code_verified"] == 1
+    assert "unknown_tier" not in dist
+    # Only the one dict finding counts toward total
+    assert result["qualifying_task_count"] == 1

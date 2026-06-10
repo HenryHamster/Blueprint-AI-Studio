@@ -6612,6 +6612,76 @@ class TestAcceptanceEvidencePropagation:
         assert "acceptance_evidence" not in (child.context or {})
 
     @_pytest.mark.asyncio
+    async def test_design_child_payload_annotations_include_capability_proof_status(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import (
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        finding = _make_finding(title="Design proof surface", direction_id="d-ae-ctx04")
+        finding["type"] = "design"
+        project, _direction, _task = await _grader_project_and_task(
+            db_session, "d-ae-ctx04"
+        )
+        project.problem_model = {
+            "capabilities": [
+                {"name": "Repo Map", "status": "working"},
+                {"name": "Prompt Repair", "status": "planned"},
+            ]
+        }
+        project.capability_proof_records = {
+            "repo-map": [
+                {
+                    "task_id": "task-proof-1",
+                    "proved_at": "2026-06-09T00:00:00",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_repo_map",
+                    "commit_sha": "abc123",
+                }
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch("app.shared_state.tasks_active_gauge", 0)
+        mocker.patch("app.shared_state.tasks_queued_gauge", 0)
+        for path, value in (
+            ("app.research_completion.resolve_branch_verification_context", {}),
+            ("app.research_completion.resolve_head_commit", None),
+            ("app.research_completion.cited_paths_changed_since", False),
+            ("app.research_completion._summarize_ungrounded_claims_grounded", None),
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=value))
+
+        await _handle_research_completion(_task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == _task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        child = next(c for c in children if c.title == "Design proof surface")
+        assert child.first_payload["available_capabilities"] == [
+            {"name": "repo-map", "status": "working", "proof_status": "proven"},
+            {"name": "prompt-repair", "status": "planned", "proof_status": "unproven"},
+        ]
+
+    @_pytest.mark.asyncio
     async def test_finding_malformed_acceptance_evidence_is_dropped(
         self, db_session, mocker
     ):

@@ -4022,6 +4022,18 @@ async def agent_heartbeat(
         ctx = dict(task.context or {})
         ctx["_had_repo_map"] = req.had_repo_map
         task.context = ctx
+    if req.had_module_interfaces is not None and (task.context or {}).get("_had_module_interfaces") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_module_interfaces"] = req.had_module_interfaces
+        task.context = ctx
+    if req.had_related_tests is not None and (task.context or {}).get("_had_related_tests") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_related_tests"] = req.had_related_tests
+        task.context = ctx
+    if req.had_affected_consumers is not None and (task.context or {}).get("_had_affected_consumers") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_affected_consumers"] = req.had_affected_consumers
+        task.context = ctx
 
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
     # counters posted on every heartbeat — last write wins. Backwards-

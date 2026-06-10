@@ -612,48 +612,6 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
   }
 }
 
-const REPO_MAP_EXTS = ['.py', '.ts', '.tsx', '.js', '.jsx', '.mjs'];
-const repoMapBase = (file: string): string => file.split('/').pop()?.replace(/\.(py|ts|tsx|js|jsx|mjs)$/, '') ?? '';
-
-function resolveRepoMapImport(file: string, spec: string, trackedFiles: string[], trackedSet: Set<string>, byBase: Map<string, string[]>): string | null {
-  const pick = (paths: string[]): string | null => paths.find(p => trackedSet.has(p)) ?? null;
-  const uniqueBase = (base: string): string | null => byBase.get(base)?.length === 1 ? byBase.get(base)?.[0] ?? null : null;
-  const dirParts = file.includes('/') ? file.slice(0, file.lastIndexOf('/')).split('/') : [];
-  const resolve = (baseParts: string[], rel: string): string | null => {
-    const clean = rel.replace(/\.(py|ts|tsx|js|jsx|mjs)$/, '');
-    const base = [...baseParts, clean].filter(Boolean).join('/');
-    return pick([base, ...REPO_MAP_EXTS.map(ext => `${base}${ext}`), ...REPO_MAP_EXTS.map(ext => `${base}/index${ext}`)]);
-  };
-  if (spec.startsWith('./') || spec.startsWith('../')) {
-    const parts = [...dirParts];
-    let rest = spec;
-    while (rest.startsWith('../')) { if (parts.length === 0) return null; parts.pop(); rest = rest.slice(3); }
-    if (rest.startsWith('./')) rest = rest.slice(2);
-    const resolved = resolve(parts, rest);
-    return resolved ?? uniqueBase(repoMapBase(rest));
-  }
-  if (spec.startsWith('.')) {
-    const m = spec.match(/^(\.+)(.*)$/);
-    if (!m) return null;
-    const up = Math.max(0, m[1].length - 1);
-    const parts = dirParts.slice(0, Math.max(0, dirParts.length - up));
-    const rel = m[2].replaceAll('.', '/');
-    const resolved = resolve(parts, rel);
-    if (resolved) return resolved;
-    const dotted = rel || repoMapBase(spec);
-    return trackedFiles.find(f => f === `${dotted}.py` || f.endsWith(`/${dotted}.py`) || f === `${dotted}/__init__.py` || f.endsWith(`/${dotted}/__init__.py`))
-      ?? uniqueBase(repoMapBase(rel || spec));
-  }
-  if (spec.includes('.')) {
-    const rel = spec.replaceAll('.', '/');
-    const resolved = resolve([], rel);
-    if (resolved) return resolved;
-    return trackedFiles.find(f => f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`))
-      ?? uniqueBase(repoMapBase(rel));
-  }
-  return uniqueBase(repoMapBase(spec));
-}
-
 /**
  * Scans all tracked Python/TypeScript source files to build a language-aware
  * repo map: ranks modules by import-graph centrality (in-degree — how many
@@ -682,13 +640,9 @@ export function buildRepoMap(ws: WebSocket | null): string {
 
     if (allFiles.length === 0) return '';
 
-    const trackedSet = new Set(allFiles);
-    const byBase = new Map<string, string[]>();
-    for (const file of allFiles) {
-      const base = repoMapBase(file);
-      const bucket = byBase.get(base);
-      if (bucket) bucket.push(file); else byBase.set(base, [file]);
-    }
+    const fileSet = new Set(allFiles);
+
+    // inDegree is keyed on full file paths to avoid cross-package basename collisions
     const inDegree = new Map<string, number>();
 
     for (const file of allFiles) {
@@ -698,15 +652,43 @@ export function buildRepoMap(ws: WebSocket | null): string {
       } catch { continue; }
 
       const isPython = file.endsWith('.py');
+      const fileDir = file.split('/').slice(0, -1).join('/');
       for (const line of lines) {
-        let spec: string | null = null;
-        if (isPython) {
-          spec = line.match(/^from\s+([.\w]+)\s+import\s+/)?.[1] ?? line.match(/^import\s+([.\w]+)/)?.[1] ?? null;
+        let resolved: string | null = null;
+
+        if (!isPython) {
+          // Only resolve relative imports — package imports are not tracked files
+          const m = line.match(/from\s+['"]([^'"]+)['"]/);
+          if (m && m[1].startsWith('.')) {
+            const spec = m[1].replace(/\.(js|ts|tsx|jsx|mjs)$/, '');
+            const joined = fileDir ? fileDir + '/' + spec : spec;
+            const segments = joined.split('/');
+            const normalized: string[] = [];
+            for (const seg of segments) {
+              if (seg === '..') normalized.pop();
+              else if (seg !== '.') normalized.push(seg);
+            }
+            const candidateStem = normalized.join('/');
+            for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
+              if (fileSet.has(candidateStem + ext)) { resolved = candidateStem + ext; break; }
+            }
+            if (!resolved && fileSet.has(candidateStem)) resolved = candidateStem;
+          }
         } else {
-          spec = line.match(/from\s+['"]([^'"]+)['"]/)?.[1] ?? null;
+          // Python: resolve dotted module path to a unique tracked file
+          let dotted: string | null = null;
+          const m1 = line.match(/^from\s+\.*([\w.]+)\s+import\s+/);
+          if (m1) dotted = m1[1];
+          else { const m2 = line.match(/^import\s+([\w.]+)/); if (m2) dotted = m2[1]; }
+          if (dotted) {
+            const asPath = dotted.split('.').join('/') + '.py';
+            const matches = allFiles.filter(f => f === asPath || f.endsWith('/' + asPath));
+            // Drop ambiguous matches — only attribute when exactly one file matches
+            if (matches.length === 1) resolved = matches[0];
+          }
         }
-        const target = spec ? resolveRepoMapImport(file, spec, allFiles, trackedSet, byBase) : null;
-        if (target) inDegree.set(target, (inDegree.get(target) ?? 0) + 1);
+
+        if (resolved) inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
       }
     }
 
@@ -714,10 +696,11 @@ export function buildRepoMap(ws: WebSocket | null): string {
 
     const hubs = [...inDegree.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 20);
+      .slice(0, 20)
+      .map(([file]) => file);
 
     const sections: string[] = [];
-    for (const [relFile, count] of hubs) {
+    for (const relFile of hubs) {
       let content: string;
       try {
         content = fs.readFileSync(`${WORKSPACE}/${relFile}`, 'utf-8');
@@ -728,6 +711,7 @@ export function buildRepoMap(ws: WebSocket | null): string {
         : extractTypeScriptExports(content);
       if (exports.length === 0) continue;
 
+      const count = inDegree.get(relFile) ?? 0;
       sections.push(`**${relFile}** (imported by ${count}): ${exports.slice(0, 10).join(', ')}`);
     }
 

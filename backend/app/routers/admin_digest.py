@@ -66,6 +66,7 @@ from app.digest_metrics import (
     compute_direction_progress,
     compute_failure_grouping,  # noqa: F401  re-exported for external importers
     compute_format_compliance_metrics,
+    compute_research_output_quality,
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_migration_slot_contention,
@@ -1399,6 +1400,7 @@ async def _compute_digest(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
+    _research_output_quality = compute_research_output_quality(all_tasks)
 
     # Migration-serialization-slot contention (read-only) — surfaces whether a
     # migration task currently holds the per-project slot and for how long, how
@@ -1543,4 +1545,5 @@ async def _compute_digest(
         "capability_adoption_verdicts": get_trial_verdicts(_digest_project)
         if _digest_project is not None
         else {},
+        "research_output_quality": _research_output_quality,
     }

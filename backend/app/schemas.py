@@ -357,6 +357,13 @@ class HeartbeatRequest(BaseModel):
     # standard handler registers it; used to compute with/without repo-map
     # first-attempt success breakdowns in the digest.
     had_repo_map: bool | None = None
+    # Whether module-interface, related-test, and affected-consumer sections
+    # were non-empty and injected into the agent prompt. Write-once flags
+    # mirroring had_repo_map; older agents that omit these fields leave the
+    # task.context key absent (fail-open).
+    had_module_interfaces: bool | None = None
+    had_related_tests: bool | None = None
+    had_affected_consumers: bool | None = None
 
 
 class ComputeJobResponse(BaseModel):

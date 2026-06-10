@@ -38,6 +38,7 @@ from app.ci_resolution import (
     compute_merge_verification_verdict,
     merge_gate_runtime_block,
 )
+from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 
@@ -204,6 +205,10 @@ async def get_project(
         raise HTTPException(status_code=404, detail="Project not found")
     project, role = row
     problem_model_dict = project.problem_model or {}
+    proof_problem_model = enrich_problem_model_capability_proofs(
+        problem_model_dict,
+        getattr(project, "capability_proof_records", None),
+    )
     size_health = None
     if problem_model_dict:
         try:
@@ -222,7 +227,7 @@ async def get_project(
         "directions": project.directions,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": problem_model_dict,
+        "problem_model": proof_problem_model,
         "problem_model_size_health": size_health,
         "running_update": project.running_update,
         "running_update_acknowledged_at": (

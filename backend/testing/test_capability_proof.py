@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
+    annotate_capability_proof_status,
+    enrich_problem_model_capability_proofs,
     record_capability_proof,
     should_record_capability_proof,
 )
@@ -339,3 +341,57 @@ class TestTrialMeasurementProducesDurableAdoptionVerdict:
         stored = get_trial_verdicts(project)
         assert stored["repo_map"]["verdict"] == "adopt"
         assert stored["repo_map"]["n_with"] == 40
+
+
+class TestCapabilityProofViews:
+    def test_annotate_capability_proof_status_is_fail_open(self):
+        vocab = [
+            {"name": "cap-proven", "status": "working"},
+            {"name": "cap-claimed", "status": "planned"},
+        ]
+        proof_records = {
+            "cap-proven": [
+                {
+                    "task_id": "task-1",
+                    "proved_at": "2026-06-09T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_proof_recorded_on_named_test_proven",
+                    "commit_sha": "abc123",
+                }
+            ],
+            "cap-claimed": [],
+        }
+
+        annotated = annotate_capability_proof_status(vocab, proof_records)
+
+        assert annotated[0]["proof_status"] == "proven"
+        assert annotated[1]["proof_status"] == "unproven"
+        assert "proof_status" not in vocab[0]
+
+    def test_enrich_problem_model_capability_proofs_adds_evidence(self):
+        problem_model = {
+            "revision": 7,
+            "capabilities": [
+                {"name": "cap-proven", "status": "working"},
+                {"name": "cap-claimed", "status": "partial"},
+            ],
+        }
+        proof_records = {
+            "cap-proven": [
+                {
+                    "task_id": "task-1",
+                    "proved_at": "2026-06-09T00:00:00Z",
+                    "proof_kind": "downstream_artifact",
+                    "proof_ref": "art-123",
+                    "commit_sha": "def456",
+                }
+            ]
+        }
+
+        enriched = enrich_problem_model_capability_proofs(problem_model, proof_records)
+
+        assert enriched is not problem_model
+        assert enriched["capabilities"][0]["proof_status"] == "proven"
+        assert enriched["capabilities"][0]["proof_records"][0]["proof_ref"] == "art-123"
+        assert enriched["capabilities"][1]["proof_status"] == "unproven"
+        assert "proof_records" not in enriched["capabilities"][1]

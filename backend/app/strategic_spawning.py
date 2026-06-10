@@ -45,7 +45,7 @@ from app.capability_demand import (
 )
 from app.capability_trial_verdict import get_trial_verdicts
 from app.capability_registry import (
-    annotate_capability_proof_status,
+    annotate_capability_proof_status as _annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -782,12 +782,6 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
     entries.sort(key=lambda x: x.get("at") or "", reverse=True)
     return entries[:_OPERATOR_OVERRIDES_MAX]
 
-
-# Back-compat alias: the proof-status annotation now lives in the IO-free
-# capability_registry leaf so every spawn path (strategic, design, research,
-# plan/finding) can call it without importing this module. The two call sites
-# below and the existing test import keep using this name.
-_annotate_capability_proof_status = annotate_capability_proof_status
 
 
 async def _verify_capability_backing_paths(

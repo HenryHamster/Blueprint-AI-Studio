@@ -163,6 +163,72 @@ describe('ProblemModelViewer — viewport regression', () => {
     });
   });
 
+  test('renders proven capability proof evidence and badge text', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel({
+            capabilities: [
+              {
+                name: 'language-aware repo map',
+                status: 'working',
+                notes: 'Builds a graph of tracked source files and call sites',
+                proof_status: 'proven',
+                proof_records: [
+                  {
+                    task_id: 'task-proof-123',
+                    proved_at: '2026-06-09T12:34:56Z',
+                    proof_kind: 'named_test',
+                    proof_ref: 'backend/testing/test_capability_proof.py::test_proof_recorded_on_named_test_proven',
+                    commit_sha: 'abc123def4567890fedcba',
+                  },
+                ],
+              },
+            ],
+          })}
+          {...defaultProps}
+        />
+      );
+    });
+
+    expect(host.textContent).toContain('Proven');
+    expect(host.textContent).toContain('named_test');
+    expect(host.textContent).toContain('test_proof_recorded_on_named_test_proven');
+    expect(host.textContent).toContain('2026-06-09T12:34:56Z');
+    expect(host.textContent).toContain('abc123def456');
+  });
+
+  test('renders claimed-only capabilities when proof records are absent', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel({
+            capabilities: [
+              { name: 'unproven capability', status: 'partial', notes: 'No durable proof record yet' },
+            ],
+          })}
+          {...defaultProps}
+        />
+      );
+    });
+
+    expect(host.textContent).toContain('Claimed only');
+    expect(host.textContent).not.toContain('named_test');
+    expect(host.textContent).not.toContain('downstream_artifact');
+  });
+
   test('renders with multiple gaps, capabilities, and friction without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
