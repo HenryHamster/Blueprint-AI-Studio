@@ -2701,9 +2701,6 @@ async def _required_children_terminal(
 
     try:
         audit_task_id = uuid.UUID(str(audit_task_id_raw))
-        challenge_task_id = (
-            uuid.UUID(str(challenge_task_id_raw)) if challenge_task_id_raw else None
-        )
         smoketest_task_id = (
             uuid.UUID(str(smoketest_task_id_raw))
             if smoketest_required and smoketest_task_id_raw
