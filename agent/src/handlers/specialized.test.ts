@@ -715,7 +715,7 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     ...BASE_TASK,
     context: { adversarial_grader: true, _adversarial_challenged_hashes: ['abc123', 'def456'] },
   };
-  const VERDICT_ARRAY = '[{"hash":"abc123","verdict":"agree","reason":"still holds at HEAD"},{"hash":"def456","verdict":"disagree","reason":"premise no longer present"}]';
+  const VERDICT_ARRAY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"},{"hash":"def456","verdict":"fail","reason":"premise no longer present"}]';
   const VERDICT_ARRAY_PARSED: unknown[] = JSON.parse(VERDICT_ARRAY) as unknown[];
 
   beforeEach(() => {
@@ -796,6 +796,57 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     expectCalledWith(recordFormatRepairSuccess, 'research_spawn_adversarial_challenge');
     // Confirm the repair path succeeded and the result was posted.
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+  });
+
+  it('repair re-ask prompt constrains verdict vocabulary to "pass" or "fail"', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The repair re-ask (second call) must explicitly name "pass" and "fail" as
+    // the only accepted verdict values so the model emits backend-recognized tokens.
+    const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reaskPrompt).toContain('"pass"');
+    expect(reaskPrompt).toContain('"fail"');
+  });
+
+  it('repairs adversarial challenge verdicts with backend-recognized pass-fail tokens', async () => {
+    // Verifies the full round-trip: malformed first attempt, repaired with "pass"/"fail"
+    // vocabulary, and the posted logs parse as the correct recognized verdicts.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I reviewed the findings but returned no JSON.', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const posted = JSON.parse(call.logs as string) as Array<{hash: string; verdict: string; reason: string}>;
+    // Every verdict in the posted array must be a backend-recognized token.
+    const recognized = new Set(['pass', 'passed', 'approve', 'approved', 'fail', 'failed', 'reject', 'rejected']);
+    for (const item of posted) {
+      expect(recognized.has(item.verdict.toLowerCase())).toBe(true);
+    }
+    // Both hashes must be present with appropriate verdicts.
+    expect(posted.find(i => i.hash === 'abc123')?.verdict).toBe('pass');
+    expect(posted.find(i => i.hash === 'def456')?.verdict).toBe('fail');
+  });
+
+  it('repaired array with unrecognized verdicts ("agree"/"disagree") falls through to raw output', async () => {
+    const BAD_VERDICT_ARRAY = '[{"hash":"abc123","verdict":"agree","reason":"still holds"},{"hash":"def456","verdict":"disagree","reason":"not present"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    // Repair re-ask returns unrecognized vocabulary.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: BAD_VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    // The repaired array with unrecognized verdicts must NOT be posted as the
+    // successful-repair result — the raw repair output is passed through instead.
+    expect(call.logs).not.toBe(JSON.stringify(JSON.parse(BAD_VERDICT_ARRAY)));
+    // The status must still be COMPLETED (exitCode was 0).
     expect(call.status).toBe('COMPLETED');
   });
 });

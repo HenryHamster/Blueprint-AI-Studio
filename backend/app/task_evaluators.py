@@ -1002,10 +1002,10 @@ def parse_adversarial_finding_verdicts(
     if not logs or not logs.strip():
         return {h: _default_entry("empty_logs") for h in finding_hashes}, "empty_logs"
 
-    from app.task_completion import _extract_json_array
+    from app.task_completion import _extract_last_json_array
 
     text = logs.strip()
-    json_str = _extract_json_array(text, "hash", "verdict")
+    json_str = _extract_last_json_array(text, "hash", "verdict")
     if not json_str:
         return {h: _default_entry("no_json_array") for h in finding_hashes}, "no_json_array"
 

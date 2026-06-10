@@ -114,7 +114,11 @@ export function deriveSidecarBadge(sidecar: Task, primary: Task): SidecarBadge |
         const verdicts = gate?.finding_verdicts;
         if (verdicts && typeof verdicts === 'object') {
           const all = Object.values(verdicts as Record<string, unknown>);
-          const passed = all.filter(v => v === true).length;
+          const resolveVerdict = (v: unknown): boolean =>
+            v !== null && typeof v === 'object'
+              ? (v as Record<string, unknown>)['passed'] === true
+              : v === true;
+          const passed = all.filter(resolveVerdict).length;
           const tone: SidecarTone = passed === all.length ? 'positive' : passed === 0 ? 'negative' : 'mixed';
           return badge(backref.kind, `gate ${passed}/${all.length}`, tone, `Adversarial gate: ${passed} of ${all.length} challenged findings survived`);
         }

@@ -8382,6 +8382,54 @@ async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, 
 
 
 @pytest.mark.asyncio
+async def test_resolver_uses_grader_hashes_when_source_hashes_are_missing(
+    tl_db, mocker
+):
+    """If source-side challenge hashes are lost, grader-side hashes still resolve."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        QUALITY_GRADER_SOURCE_KEY: str(source.id),
+        "adversarial_grader": True,
+        "_adversarial_challenged_hashes": ["grader-only-hash-001"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            '[{"hash": "grader-only-hash-001", "verdict": "pass", '
+            '"reason": "well-grounded"}]'
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+
+    verdict = (source.context or {}).get("adversarial_gate") or {}
+    assert verdict.get("parse_outcome") == "ok"
+    assert verdict.get("finding_verdicts", {}).get("grader-only-hash-001", {}).get(
+        "passed"
+    ) is True
+    assert "awaiting_adversarial_grader" not in (source.context or {})
+
+
+@pytest.mark.asyncio
 async def test_sweep_stranded_safeguard_challenge_cancelled(tl_db, mocker):
     """A CANCELLED safeguard challenge with no status POST must resolve the parked safeguard."""
     from app.services import _sweep_stranded_sidecar_sources

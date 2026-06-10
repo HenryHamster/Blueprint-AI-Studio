@@ -770,12 +770,17 @@ export async function handleInvestigate(
     const hashListStr = challengedHashes.length > 0
       ? ` The following finding hashes must each appear in the array: ${challengedHashes.map(h => JSON.stringify(h)).join(', ')}.`
       : '';
+    const RECOGNIZED_VERDICTS = new Set([
+      'pass', 'passed', 'approve', 'approved',
+      'fail', 'failed', 'reject', 'rejected',
+    ]);
     const repaired = await repairStructuredOutput<Array<Record<string, unknown>>>({
       mode: 'array',
       requiredKeys: ['hash', 'verdict'],
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior adversarial challenge response did not end with a parseable JSON verdict array.
-Return ONLY the JSON array. Each element must have "hash", "verdict", and "reason" fields.${hashListStr} No markdown, prose, or code fences.`,
+Return ONLY the JSON array. Each element must have "hash", "verdict", and "reason" fields.
+The "verdict" value MUST be exactly "pass" or "fail" — no other values are accepted.${hashListStr} No markdown, prose, or code fences.`,
       ws,
       statusRef,
       model,
@@ -784,9 +789,20 @@ Return ONLY the JSON array. Each element must have "hash", "verdict", and "reaso
       retryStatus: 'Repairing adversarial challenge verdict array...',
       schemaLabel: 'research_spawn_adversarial_challenge',
     });
+    // Vocabulary gate: repaired array is only usable when every verdict is in the
+    // backend-recognized set. An unrecognized verdict (e.g. "agree"/"disagree") would
+    // be silently dropped by parse_adversarial_finding_verdicts, treating the finding
+    // as fail-closed "verdict_unrecognized" — indistinguishable from a repair failure.
+    // Fall through to raw output in that case so the miss is observable.
+    const hasOnlyRecognizedVerdicts = (arr: Array<Record<string, unknown>>): boolean =>
+      arr.every(item => {
+        const raw = item['verdict'];
+        const v = (typeof raw === 'string' ? raw : '').trim().toLowerCase();
+        return RECOGNIZED_VERDICTS.has(v);
+      });
     let challengeLogs: string;
-    if (repaired.value !== null && repaired.retry !== null) {
-      // A focused re-ask succeeded — post the repaired (now-parseable) array.
+    if (repaired.value !== null && repaired.retry !== null && hasOnlyRecognizedVerdicts(repaired.value)) {
+      // A focused re-ask succeeded with recognized verdicts — post the repaired array.
       challengeLogs = sanitize(JSON.stringify(repaired.value));
     } else {
       // First attempt was already parseable (retry===null), repair failed, or

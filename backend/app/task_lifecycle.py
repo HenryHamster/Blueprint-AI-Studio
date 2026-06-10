@@ -343,6 +343,36 @@ async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
         )
 
 
+def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[str]:
+    """Return the challenged hashes for an adversarial grader completion.
+
+    Prefer the hashes persisted on the source task at park time, then the
+    grader-side copy (for crash/recovery gaps), then the legacy plan_output
+    fallback for parked sources that predate the persistence fix.
+    """
+    from app.finding_deduplication import finding_hash as _fh
+
+    _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
+    if isinstance(_stored_hashes, list) and _stored_hashes:
+        return [h for h in _stored_hashes if isinstance(h, str)]
+
+    _grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
+    if isinstance(_grader_hashes, list) and _grader_hashes:
+        return [h for h in _grader_hashes if isinstance(h, str)]
+
+    stored_findings = source.plan_output or []
+    if isinstance(stored_findings, dict):
+        stored_findings = stored_findings.get("findings") or []
+    return [
+        _fh(
+            str(f.get("title", "")),
+            str(f.get("description", "") or f.get("prompt", "")),
+        )
+        for f in stored_findings
+        if isinstance(f, dict)
+    ]
+
+
 async def _resolve_quality_grader_completion(
     grader: Task, payload: AgentStatusPayload, session: AsyncSession
 ) -> None:
@@ -411,33 +441,9 @@ async def _resolve_quality_grader_completion(
 
     ctx = dict(source.context or {})
     if is_adversarial:
-        from app.finding_deduplication import finding_hash as _fh
-
-        # Prefer hashes persisted at park time: these include prior_deferred
-        # findings that were prepended AFTER plan_output was written. Without
-        # this, a verdict for a recovered deferred finding is silently ignored
-        # (unknown hash) and that finding gets a fail-open pass on re-entry.
-        _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
-        if isinstance(_stored_hashes, list) and _stored_hashes:
-            all_hashes = [h for h in _stored_hashes if isinstance(h, str)]
-        else:
-            # Second fallback: check the grader's own context — the manifest builder
-            # stamps finding_hashes there so completion routing can recover even when
-            # the source-side post-spawn context write was lost (e.g. a crash between
-            # spawn and the subsequent source.context commit).
-            _grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
-            if isinstance(_grader_hashes, list) and _grader_hashes:
-                all_hashes = [h for h in _grader_hashes if isinstance(h, str)]
-            else:
-                # Final fallback for tasks parked before this fix.
-                stored_findings = source.plan_output or []
-                if isinstance(stored_findings, dict):
-                    stored_findings = stored_findings.get("findings") or []
-                all_hashes = [
-                    _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
-                    for f in stored_findings
-                    if isinstance(f, dict)
-                ]
+        # Prefer the source-side persisted hashes, then the grader copy written
+        # at spawn time, then the legacy plan_output reconstruction.
+        all_hashes = _resolve_adversarial_challenged_hashes(source, grader)
         finding_verdicts, parse_outcome = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )

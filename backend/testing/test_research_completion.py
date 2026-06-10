@@ -6778,6 +6778,20 @@ class TestIsHighStakesFinding:
             self._f(scope="large", type="design_doc_observation")
         )
 
+    def test_description_only_high_risk_finding_is_challenged_before_spawn(self):
+        """A finding with only a non-empty description (no prompt) but high-stakes
+        properties (scope=large, risk=high) should be eligible for challenge."""
+        # Finding with description but empty/no prompt + scope=large → should be high-stakes
+        finding = {
+            "title": "Refactor auth",
+            "description": "The auth module has a critical bug that affects security.",
+            # No prompt or empty prompt
+            "type": "improvement",
+            "scope": "large",
+            "risk": "low",
+        }
+        assert _is_high_stakes_finding(finding) is True
+
     def test_empty_prompt_is_not_high_stakes(self):
         assert not _is_high_stakes_finding(self._f(scope="large", prompt="   "))
 
@@ -7027,6 +7041,83 @@ class TestParseAdversarialFindingVerdicts:
         assert result["abc123"]["explicit"] is False
         assert result["abc123"]["unresolved_reason"] == "verdict_unrecognized"
         assert outcome == "ok"  # hash was found; verdict token was just unrecognized
+
+    def test_adversarial_parser_uses_final_verdict_after_echoed_schema(self):
+        """Parser must use the LAST verdict array, not an echoed schema/template.
+
+        The adversarial challenge prompt includes an example JSON snippet:
+          [{"hash": "<finding_hash from input>", "verdict": "pass" | "fail", ...}]
+        If the agent echoes it back (or includes it in reasoning) before emitting
+        the real final verdicts, the parser must pick the real final array.
+        """
+        template_array = (
+            '[{"hash": "<finding_hash from input>", "verdict": "pass | fail", '
+            '"reason": "<one-sentence justification>"}]'
+        )
+        real_array = (
+            '[{"hash": "real_hash_abc", "verdict": "fail", '
+            '"reason": "premise is stale at HEAD"}]'
+        )
+        logs = (
+            "I will now evaluate each finding.\n\n"
+            "Here is the expected output format:\n"
+            f"{template_array}\n\n"
+            "After careful review, my verdicts are:\n"
+            f"{real_array}"
+        )
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["real_hash_abc"])
+        assert outcome == "ok"
+        assert result["real_hash_abc"]["passed"] is False
+        assert result["real_hash_abc"]["explicit"] is True
+        assert result["real_hash_abc"]["reason"] == "premise is stale at HEAD"
+
+    def test_multiple_arrays_last_with_real_hashes_wins(self):
+        """When multiple arrays exist but only the last has known hashes, use the last."""
+        first_array = '[{"hash": "unrelated_hash", "verdict": "pass", "reason": "ok"}]'
+        real_array = '[{"hash": "real_hash_xyz", "verdict": "pass", "reason": "solid evidence"}]'
+        logs = f"First pass:\n{first_array}\n\nFinal verdict:\n{real_array}"
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["real_hash_xyz"])
+        assert outcome == "ok"
+        assert result["real_hash_xyz"]["passed"] is True
+        assert result["real_hash_xyz"]["explicit"] is True
+
+    def test_template_placeholder_hash_does_not_match_real_hashes(self):
+        """The template placeholder <finding_hash from input> must not match real hashes."""
+        template_array = (
+            '[{"hash": "<finding_hash from input>", "verdict": "pass", '
+            '"reason": "example"}]'
+        )
+        real_array = '[{"hash": "abc999", "verdict": "fail", "reason": "stale"}]'
+        logs = f"Schema:\n{template_array}\n\nVerdict:\n{real_array}"
+        result, outcome = parse_adversarial_finding_verdicts(logs, ["abc999"])
+        assert outcome == "ok"
+        assert result["abc999"]["passed"] is False
+        assert result["abc999"]["explicit"] is True
+
+
+def test_adversarial_parser_uses_final_verdict_after_echoed_schema():
+    """Standalone acceptance test for the last-array fix.
+
+    This is the required named acceptance test: an echoed schema/template array
+    before a valid final verdict array must not shadow the real verdicts.
+    """
+    template = (
+        '[{"hash": "<finding_hash from input>", "verdict": "pass | fail", '
+        '"reason": "<justification>"}]'
+    )
+    real = '[{"hash": "h_live_123", "verdict": "pass", "reason": "confirmed at HEAD"}]'
+    logs = (
+        "ADVERSARIAL CHALLENGE RESPONSE\n\n"
+        "Expected output schema (for reference):\n"
+        f"{template}\n\n"
+        "After thorough investigation, my final verdicts:\n"
+        f"{real}"
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, ["h_live_123"])
+    assert outcome == "ok", f"expected ok, got {outcome!r}"
+    assert result["h_live_123"]["passed"] is True
+    assert result["h_live_123"]["explicit"] is True
+    assert result["h_live_123"]["reason"] == "confirmed at HEAD"
 
 
 def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
@@ -7336,10 +7427,10 @@ async def test_adversarial_gate_disabled_by_flag(db_session, mocker):
 
 
 @_pytest.mark.asyncio
-async def test_adversarial_grader_completion_parses_real_output_and_defers_failed_finding(
+async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     db_session, mocker
 ):
-    """Live adversarial prompt uses hash and a real fail verdict defers the finding."""
+    """A terminal failed sidecar must defer the finding and spawn nothing."""
     from app.research_completion import _finding_hash
     from app.schemas import AgentStatusPayload
     from app.task_lifecycle import _resolve_quality_grader_completion
@@ -7393,16 +7484,13 @@ async def test_adversarial_grader_completion_parses_real_output_and_defers_faile
     assert "prompt" not in manifest_item
     assert "actionability_grade" not in manifest_item
 
-    grader.status = TaskStatus.COMPLETED
+    grader.status = TaskStatus.FAILED
     db_session.add(grader)
     await db_session.commit()
     payload = AgentStatusPayload(
         task_id=grader.id,
-        status=TaskStatus.COMPLETED,
-        logs=(
-            '[{"hash": "' + fhash + '", "verdict": "fail", '
-            '"reason": "premise wrong"}]'
-        ),
+        status=TaskStatus.FAILED,
+        logs=None,
     )
     await _resolve_quality_grader_completion(grader, payload, db_session)
     await db_session.refresh(task)
@@ -7759,9 +7847,13 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
 
 
 @_pytest.mark.asyncio
-async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
-    """Spawned children carry spawn-gate telemetry and the parent tracks cycle counts."""
+async def test_adversarial_gate_real_pass_resolver_spawns_child_with_telemetry(
+    db_session, mocker
+):
+    """A real spawn/resolver pass must record telemetry on the challenged child."""
     from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-adv06")
@@ -7787,24 +7879,6 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     )
     task.plan_output = [high_pass, high_fail, low]
     task.status = TaskStatus.COMPLETED
-    task.context = {
-        **(task.context or {}),
-        ADVERSARIAL_GATE_VERDICT_KEY: {
-            "finding_verdicts": {
-                pass_hash: {
-                    "passed": True,
-                    "reason": "well-grounded",
-                    "explicit": True,
-                },
-                fail_hash: {
-                    "passed": False,
-                    "reason": "stale premise",
-                    "explicit": True,
-                },
-            },
-            "grader_task_id": "test-grader-telemetry-001",
-        },
-    }
     db_session.add(task)
     await db_session.commit()
 
@@ -7814,6 +7888,38 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     )
 
     await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {}).get("awaiting_adversarial_grader")
+
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+    grader = graders[0]
+    assert (grader.context or {}).get("adversarial_grader") is True
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            "["
+            '{"hash": "' + pass_hash + '", "verdict": "pass", "reason": "well-grounded"},'
+            '{"hash": "' + fail_hash + '", "verdict": "fail", "reason": "stale premise"}'
+            "]"
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
     await db_session.refresh(task)
 
     children = (
@@ -7839,6 +7945,8 @@ async def test_challenged_spawn_telemetry_recorded(db_session, mocker):
     assert (unchallenged.context or {}).get("research_spawn_gate_reason") is None
     assert (unchallenged.context or {}).get("research_spawn_gate_explicit") is None
 
+    adv_gate = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY) or {}
+    assert adv_gate.get("parse_outcome") == "ok"
     assert (task.context or {}).get("research_spawn_gate_challenged_count") == 2
     assert (task.context or {}).get("research_spawn_gate_refuted_count") == 1
     assert (task.context or {}).get("research_spawn_gate_survived_count") == 1
@@ -8191,6 +8299,109 @@ async def test_high_stakes_finding_default_on_adversarial_rejudgment(
     ), "Phase 2b (FAIL): failed finding must appear in deferred_findings"
     for d in deferred:
         assert "_adversarial_verdict" not in d, "Phase 2b: _adversarial_verdict must be cleared"
+
+
+@_pytest.mark.asyncio
+async def test_malformed_stored_adversarial_verdict_fails_closed(db_session, mocker):
+    """Malformed verdict records (missing/null/string passed values) fail-closed.
+
+    Legacy boolean verdicts and explicit structured records with valid pass/fail
+    booleans keep their current behavior. But missing, null, string, or otherwise
+    invalid 'passed' values must not default to allowing a challenged finding to spawn —
+    they must fail-closed (defer the finding, do not spawn).
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-malformed-verdict"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    # Create multiple high-stakes findings to test different malformed verdict cases
+    hs1 = _high_stakes_finding(direction["id"], "Finding with missing passed key")
+    hs2 = _high_stakes_finding(direction["id"], "Finding with null passed value")
+    hs3 = _high_stakes_finding(direction["id"], "Finding with string passed value")
+    hs4 = _high_stakes_finding(direction["id"], "Finding with valid true verdict")
+    hs5 = _high_stakes_finding(direction["id"], "Finding with false passed verdict")
+
+    findings = [hs1, hs2, hs3, hs4, hs5]
+
+    # Compute hashes for verdict assignment
+    fhash1 = _finding_hash(hs1["title"], hs1.get("description", "") or hs1.get("prompt", ""))
+    fhash2 = _finding_hash(hs2["title"], hs2.get("description", "") or hs2.get("prompt", ""))
+    fhash3 = _finding_hash(hs3["title"], hs3.get("description", "") or hs3.get("prompt", ""))
+    fhash4 = _finding_hash(hs4["title"], hs4.get("description", "") or hs4.get("prompt", ""))
+    fhash5 = _finding_hash(hs5["title"], hs5.get("description", "") or hs5.get("prompt", ""))
+
+    # Set up the task with malformed verdict records
+    task.plan_output = findings
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                fhash1: {"reason": "tested"},  # Missing "passed" key -> fail-closed
+                fhash2: {"passed": None, "reason": "tested"},  # Null passed -> fail-closed
+                fhash3: {"passed": "true", "reason": "tested"},  # String passed -> fail-closed
+                fhash4: {"passed": True, "reason": "valid", "explicit": True},  # Valid True -> spawn
+                fhash5: {"passed": False, "reason": "refuted", "explicit": True},  # Valid False -> defer
+            },
+            "grader_task_id": "mock-grader-malformed",
+        },
+        "_adversarial_challenged_hashes": [fhash1, fhash2, fhash3, fhash4, fhash5],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=findings,
+    )
+
+    # Re-entry with malformed verdicts
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Only the finding with valid True verdict should spawn
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    spawned_titles = [c.title for c in children]
+
+    assert len(spawned_titles) == 1, (
+        "Only the finding with valid True verdict should spawn; "
+        f"got {len(spawned_titles)}: {spawned_titles}"
+    )
+    assert hs4["title"] in spawned_titles, (
+        "Only the finding with valid True verdict should spawn"
+    )
+
+    # All malformed and false-verdict findings should be deferred
+    deferred = (task.context or {}).get("deferred_findings", [])
+    deferred_titles = [d.get("title") for d in deferred]
+
+    for finding in [hs1, hs2, hs3, hs5]:
+        assert finding["title"] in deferred_titles, (
+            f"Finding '{finding['title']}' with malformed/false verdict must be deferred"
+        )
+
+    # Verify internal verdict keys are cleared from deferred findings
+    for d in deferred:
+        assert "_adversarial_verdict" not in d, (
+            "_adversarial_verdict must be cleared from deferred findings"
+        )
+
 
 class TestResolveResearchFindingsForSurface:
     """resolve_research_findings_for_surface: canonical challenge-enriched findings

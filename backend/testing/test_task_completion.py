@@ -26,6 +26,7 @@ from fastapi import HTTPException
 from app.task_completion import (
     _parse_plan_output,
     _extract_json_array,
+    _extract_last_json_array,
     _inject_build_on_deps,
     _inject_file_overlap_deps,
     _log_file_overlaps,
@@ -283,6 +284,52 @@ class TestExtractJsonArray:
         """An empty array [] doesn't contain the required key — returns None."""
         result = _extract_json_array("[]", "severity")
         assert result is None
+
+
+# ── _extract_last_json_array ─────────────────────────────────────────────────
+
+
+class TestExtractLastJsonArray:
+    def test_single_array_returns_it(self):
+        text = json.dumps([{"hash": "abc", "verdict": "pass"}])
+        result = _extract_last_json_array(text, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "abc"
+
+    def test_two_arrays_returns_last(self):
+        first = json.dumps([{"hash": "template", "verdict": "pass | fail"}])
+        second = json.dumps([{"hash": "real_hash", "verdict": "fail"}])
+        result = _extract_last_json_array(first + "\n\n" + second, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "real_hash"
+
+    def test_only_first_matches_required_keys(self):
+        """When only the first array has the required keys, return it (only match)."""
+        first = json.dumps([{"hash": "abc", "verdict": "pass"}])
+        second = json.dumps([{"unrelated": "data"}])
+        result = _extract_last_json_array(first + " " + second, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "abc"
+
+    def test_returns_none_when_required_key_absent(self):
+        text = json.dumps([{"title": "no hash key here"}])
+        result = _extract_last_json_array(text, "hash", "verdict")
+        assert result is None
+
+    def test_three_arrays_returns_third(self):
+        a1 = json.dumps([{"hash": "h1", "verdict": "pass"}])
+        a2 = json.dumps([{"hash": "h2", "verdict": "fail"}])
+        a3 = json.dumps([{"hash": "h3", "verdict": "pass"}])
+        result = _extract_last_json_array(a1 + " " + a2 + " " + a3, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "h3"
+
+    def test_empty_input_returns_none(self):
+        assert _extract_last_json_array("", "hash") is None
 
 
 # ── _inject_file_overlap_deps ────────────────────────────────────────────────

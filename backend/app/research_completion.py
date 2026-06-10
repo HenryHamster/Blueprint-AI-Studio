@@ -1361,7 +1361,9 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
         return False
     if finding.get("type") in _NON_SPAWNING_FINDING_TYPES:
         return False
-    if not str(finding.get("prompt") or "").strip():
+    # A finding must have either a prompt or description to potentially spawn work.
+    # A description-only high-stakes finding warrants challenge before spawn.
+    if not str(finding.get("prompt") or finding.get("description") or "").strip():
         return False
     if finding.get("already_spawned"):
         return False
@@ -2364,9 +2366,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _reason = ""
                 _explicit = True
             else:
-                _passed = bool(_verdict_obj.get("passed", True))
+                # Validate "passed" is actually a boolean; malformed/missing -> fail-closed
+                passed_value = _verdict_obj.get("passed")
+                _passed = passed_value if isinstance(passed_value, bool) else False
                 _reason = str(_verdict_obj.get("reason") or "")
-                _explicit = bool(_verdict_obj.get("explicit", True))
+                # Validate "explicit" is actually a boolean; malformed/missing -> implicit
+                explicit_value = _verdict_obj.get("explicit")
+                _explicit = explicit_value if isinstance(explicit_value, bool) else False
             if not _passed:
                 _f["_adversarial_verdict"] = "fail"
                 if not _explicit:

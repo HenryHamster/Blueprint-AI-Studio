@@ -91,6 +91,86 @@ describe('deriveSidecarBadge — grader', () => {
     expect(deriveSidecarBadge(adversarial, primary)).toMatchObject({ text: 'gate 2/3', tone: 'mixed' });
   });
 
+  it('uses structured adversarial gate verdicts for adversarial graders (all pass → positive)', () => {
+    const adversarial = makeTask({
+      ...sidecar,
+      context: { quality_grader_for_task_id: 'source-1', adversarial_grader: true },
+    });
+    const primary = makeTask({
+      id: 'source-1',
+      context: {
+        adversarial_gate: {
+          finding_verdicts: {
+            a: { passed: true, reason: 'survived' },
+            b: { passed: true, reason: 'survived' },
+          },
+        },
+      },
+    });
+    expect(deriveSidecarBadge(adversarial, primary)).toMatchObject({ text: 'gate 2/2', tone: 'positive' });
+  });
+
+  it('uses structured adversarial gate verdicts for adversarial graders (mixed → mixed)', () => {
+    const adversarial = makeTask({
+      ...sidecar,
+      context: { quality_grader_for_task_id: 'source-1', adversarial_grader: true },
+    });
+    const primary = makeTask({
+      id: 'source-1',
+      context: {
+        adversarial_gate: {
+          finding_verdicts: {
+            a: { passed: true, reason: 'survived' },
+            b: { passed: false, reason: 'refuted' },
+            c: { passed: true, reason: 'survived' },
+          },
+        },
+      },
+    });
+    expect(deriveSidecarBadge(adversarial, primary)).toMatchObject({ text: 'gate 2/3', tone: 'mixed' });
+  });
+
+  it('uses structured adversarial gate verdicts for adversarial graders (all fail → negative)', () => {
+    const adversarial = makeTask({
+      ...sidecar,
+      context: { quality_grader_for_task_id: 'source-1', adversarial_grader: true },
+    });
+    const primary = makeTask({
+      id: 'source-1',
+      context: {
+        adversarial_gate: {
+          finding_verdicts: {
+            a: { passed: false, reason: 'refuted' },
+            b: { passed: false, reason: 'refuted' },
+          },
+        },
+      },
+    });
+    expect(deriveSidecarBadge(adversarial, primary)).toMatchObject({ text: 'gate 0/2', tone: 'negative' });
+  });
+
+  it('retains legacy boolean compat alongside structured records for adversarial graders', () => {
+    const adversarial = makeTask({
+      ...sidecar,
+      context: { quality_grader_for_task_id: 'source-1', adversarial_grader: true },
+    });
+    const primary = makeTask({
+      id: 'source-1',
+      context: {
+        adversarial_gate: {
+          finding_verdicts: {
+            a: true,
+            b: false,
+            c: { passed: true, reason: 'survived' },
+            d: { passed: false, reason: 'refuted' },
+          },
+        },
+      },
+    });
+    // legacy: a=true, b=false; structured: c=passed, d=failed → 2 of 4 passed
+    expect(deriveSidecarBadge(adversarial, primary)).toMatchObject({ text: 'gate 2/4', tone: 'mixed' });
+  });
+
   it('is pending while the grader is in flight', () => {
     const inflight = makeTask({ ...sidecar, status: 'QUEUED' });
     expect(deriveSidecarBadge(inflight, makeTask({ id: 'source-1' }))).toMatchObject({ tone: 'pending' });
