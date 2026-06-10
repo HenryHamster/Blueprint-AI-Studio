@@ -693,6 +693,64 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_architecture_cycle_triggers_on_first_cycle_with_empty_design_doc(
+    db_session, mocker
+):
+    """Architecture cycle should trigger on the first strategic cycle when the
+    design_doc is empty (has no systems), ensuring newly-onboarded projects create
+    architectural context before spending cycles on undirected research.
+
+    Regression check: with default arch_frequency=3, cycle 1 normally satisfies
+    (1 % 3 == 1 != 0), so is_architecture_cycle would be False. The empty-design_doc
+    override ensures the architecture phase runs despite the modulo check, giving
+    fresh projects a design_doc to anchor subsequent research."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Empty Design Doc Architecture Trigger",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch01", "Test direction")],
+        vision={"purpose": "test"},
+        design_doc={},  # Empty: no systems key, should trigger architecture
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior strategic task older than strategic_max_interval (180min) so the
+    # wall-clock backstop promotes force_strategic=True, which triggers the strategic
+    # spawn regardless of the modulo counter.
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=200),
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert design_doc_mock.called, (
+        "architecture cycle must trigger on first strategic cycle when design_doc "
+        "is empty (has no systems)"
+    )
+    # When architecture cycle triggers, it calls _spawn_design_doc_update, not
+    # _spawn_strategic_review. Strategic review comes as a completion-chain task
+    # after design_doc_update completes.
+    assert not strategic_review_mock.called
+
+
+@pytest.mark.asyncio
 async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mocker):
     """Companion: with no strategic cycle due (backstop not firing, force_strategic
     stays False), an all-paused direction set is correctly skipped — the guard only
@@ -766,6 +824,7 @@ async def test_refresh_marker_bypasses_spawn_cooldown_and_clears(db_session, moc
                 "count": 1,
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -906,6 +965,7 @@ async def test_operator_refresh_fires_despite_tripped_breaker(db_session, mocker
                 "origin": "operator",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1096,6 +1156,7 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
                 "excerpt": "Please refocus on the auth bug.",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1164,6 +1225,7 @@ async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
                 # no excerpt — no message text was preserved
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1222,6 +1284,7 @@ async def test_qualification_consumed_posts_no_acted_confirmation(db_session, mo
                 # no origin → legacy qualification
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1352,6 +1415,7 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
                 "origin": "operator",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11344,6 +11408,7 @@ async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mock
         directions=[_active_direction("d-backstop01", "Test direction")],
         # purpose set → not force_strategic; count=1 → 1 % 6 != 0 → modulo inactive
         vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11435,6 +11500,7 @@ async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
         autonomous_enabled=True,
         directions=[_active_direction(dir_id, "Busy direction")],
         vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -12643,6 +12709,7 @@ async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_i
                 "origin": "qualification",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -12754,6 +12821,7 @@ async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session,
                 "origin": "operator",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()

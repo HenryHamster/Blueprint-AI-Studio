@@ -1282,9 +1282,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             "_strategic_cycle_count", 0
         ) + 1
         arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
+        # Architecture cycle triggers on the modulo counter OR when this is the first
+        # strategic cycle and design_doc is empty (no systems), ensuring newly-onboarded
+        # projects build architectural context on their first strategic pass rather than
+        # spending cycles on undirected research. Design_doc stores systems as keys
+        # like "systems/sys-id" (not under a "systems" key).
+        design_doc = project.design_doc or {}
+        has_design_doc_systems = any(
+            k.startswith("systems/") for k in design_doc if isinstance(k, str)
+        )
+        is_first_cycle = strategic_cycle_count == 1
         is_architecture_cycle = (
             arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
-        )
+        ) or (is_first_cycle and not has_design_doc_systems)
 
         spawned = False
         try:

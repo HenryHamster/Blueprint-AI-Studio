@@ -3506,6 +3506,10 @@ async def claim_task(
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
         response["build_config"] = project_for_playbook.build_config
+        if project_for_playbook.build_config.get("directories"):
+            response["build_config_writeback_endpoint"] = (
+                f"PATCH /api/agent/projects/{_claimed_project_id}/build-config/commands"
+            )
     else:
         response["build_config"] = {}
 

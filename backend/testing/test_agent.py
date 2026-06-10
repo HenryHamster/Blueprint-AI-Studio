@@ -1939,6 +1939,38 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
+async def test_claim_response_includes_writeback_endpoint_when_directories_present(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Build Config Writeback Test",
+        user_id="test-user-123",
+        build_config={"directories": [{"path": "frontend", "type": "node"}]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-writeback-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-writeback-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert (
+        resp.json()["build_config_writeback_endpoint"]
+        == f"PATCH /api/agent/projects/{project.id}/build-config/commands"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_session):
     """The claim response surfaces build_config.repo_is_empty as top-level repo_is_empty.
 
