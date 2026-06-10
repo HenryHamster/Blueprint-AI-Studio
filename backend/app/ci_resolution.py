@@ -1227,6 +1227,7 @@ async def resolve_pr_ci_status(
             "source": "branch_head",
             "state": direct_state,
             "details": direct.get("details", []),
+            "failed_logs": direct.get("failed_logs", "") if direct_state == _CI_RED else "",
         }
     if direct_state == _CI_PENDING:
         return {
@@ -1346,6 +1347,7 @@ async def resolve_pr_ci_status(
             "source": "merge_sha",
             "state": _CI_RED,
             "details": (first_red_result or {}).get("details", []),
+            "failed_logs": (first_red_result or {}).get("failed_logs", ""),
         }
     if first_green_sha is not None:
         return {

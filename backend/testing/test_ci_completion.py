@@ -3772,3 +3772,109 @@ async def test_orig_positive_ancestry_stamps_as_before(db_session, mocker):
     assert STRANDED_LANDING_REASON_KEY not in ctx
     assert alerts == []
     alert_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Guard: ci_errors must never produce an empty code block in the PR comment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_comment_never_has_empty_code_block(db_session, mocker):
+    """Regression for CI poll path posting empty ``` code blocks.
+
+    Before the fix, the orchestrator hardcoded failed_logs='' in the ci_result
+    for the red path, which caused handle_ci_completion to post:
+        **Blueprint CI**: Checks failed.
+
+        ```
+
+        ```
+
+    Fix agents had no failing-test selectors so they pushed blind guesses and
+    burned the review-fix iteration cap (incident 2026-06-10, PRs #9308/#9353).
+
+    The guard in handle_ci_completion must substitute failing check names (or a
+    fallback message) whenever failed_logs is blank, ensuring the code block is
+    never empty.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    comment_mock = mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="CI failure comment fallback", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cases = [
+        (
+            {
+                "failed_logs": "",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "ci-build", "conclusion": "failure"}],
+            },
+            "CI checks failed: ci-build",
+        ),
+        (
+            {
+                "failed_logs": None,
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [],
+            },
+            "no detail available",
+        ),
+        (
+            {
+                "failed_logs": "   ",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [],
+            },
+            "no detail available",
+        ),
+        (
+            {
+                "failed_logs": "",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {"name": "backend", "conclusion": "failure"},
+                    {"name": "frontend", "conclusion": "failure"},
+                    {"name": "lint", "conclusion": "success"},  # non-failure excluded
+                ],
+            },
+            "CI checks failed: backend, frontend",
+        ),
+    ]
+    for index, (ci_result, expected_substring) in enumerate(cases, start=1):
+        task = _make_task(db_session, project, pr_number=8000 + index)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await handle_ci_completion(
+            task=task,
+            ci_result=ci_result,
+            gh_token="fake-token",
+            owner="owner",
+            repo="repo",
+            session=db_session,
+            source="poll",
+        )
+
+        comment_body = comment_mock.call_args_list[-1].args[4]
+        assert "```\n\n```" not in comment_body, (
+            f"Empty code block for ci_result={ci_result!r}: {comment_body!r}"
+        )
+        assert expected_substring in comment_body, (
+            f"Expected {expected_substring!r} in comment for ci_result={ci_result!r}: {comment_body!r}"
+        )

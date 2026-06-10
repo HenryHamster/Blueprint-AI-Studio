@@ -1695,7 +1695,18 @@ async def handle_ci_completion(
                 )
                 return False
 
-        ci_errors = ci_result.get("failed_logs", "CI checks failed")
+        ci_errors = ci_result.get("failed_logs", "") or ""
+        if not ci_errors.strip():
+            _fail_detail_names = ", ".join(
+                d.get("name", "")
+                for d in (ci_result.get("details") or [])
+                if d.get("conclusion") == "failure"
+            )
+            ci_errors = (
+                f"CI checks failed: {_fail_detail_names}"
+                if _fail_detail_names
+                else "no detail available (see workflow run)"
+            )
 
         # ── C2 lock-window break (CI-failure path) ──
         # The task row has been held FOR UPDATE since ~1341. ``create_pr_comment``

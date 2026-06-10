@@ -115,6 +115,39 @@ from app.time_utils import (
 logger = logging.getLogger("blueprint")
 
 
+def _ci_result_from_resolved_pr_ci_status(resolved: dict) -> dict | None:
+    """Build the ci_result handoff for terminal resolver states."""
+    state = resolved.get("state")
+    if state == "green":
+        return {
+            "status": "completed",
+            "conclusion": "success",
+            "details": resolved.get("details", []),
+            "failed_logs": "",
+        }
+    if state != "red":
+        return None
+
+    failed_logs = resolved.get("failed_logs", "")
+    if not failed_logs:
+        fail_check_names = ", ".join(
+            d.get("name", "")
+            for d in resolved.get("details", [])
+            if d.get("conclusion") == "failure"
+        )
+        failed_logs = (
+            f"CI checks failed: {fail_check_names}"
+            if fail_check_names
+            else "CI checks failed (see workflow run)"
+        )
+    return {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": resolved.get("details", []),
+        "failed_logs": failed_logs,
+    }
+
+
 def _clear_retry_after_state(task_or_ctx) -> None:
     """Clear retry_after hold and its reset counter on a Task or context dict.
 
@@ -5479,20 +5512,11 @@ async def orchestrator_worker():
                             )
                             _r_state = _resolved["state"]
                             _r_source = _resolved["source"]
-                            if _r_state == "green":
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "success",
-                                    "details": _resolved.get("details", []),
-                                    "failed_logs": "",
-                                }
-                            elif _r_state == "red":
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "failure",
-                                    "details": _resolved.get("details", []),
-                                    "failed_logs": "",
-                                }
+                            _terminal_ci_result = _ci_result_from_resolved_pr_ci_status(
+                                _resolved
+                            )
+                            if _terminal_ci_result is not None:
+                                ci_result = _terminal_ci_result
                             elif _r_state == "no_checks":
                                 # CI is *definitively* absent: the branch HEAD
                                 # and every reachable PR-event SHA were queried

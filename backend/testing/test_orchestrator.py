@@ -34,6 +34,47 @@ from testing.factories import make_project, make_task
 _TEST_USER = "test-user-123"
 
 
+def test_resolved_red_ci_status_handoff_preserves_failed_logs():
+    from app.orchestrator import _ci_result_from_resolved_pr_ci_status
+
+    result = _ci_result_from_resolved_pr_ci_status(
+        {
+            "state": "red",
+            "source": "branch_head",
+            "failed_logs": "FAILED testing/test_foo.py::test_bar",
+            "details": [{"name": "CI / Backend", "conclusion": "failure"}],
+        }
+    )
+
+    assert result == {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [{"name": "CI / Backend", "conclusion": "failure"}],
+        "failed_logs": "FAILED testing/test_foo.py::test_bar",
+    }
+
+
+def test_resolved_red_ci_status_handoff_falls_back_to_check_names():
+    from app.orchestrator import _ci_result_from_resolved_pr_ci_status
+
+    result = _ci_result_from_resolved_pr_ci_status(
+        {
+            "state": "red",
+            "source": "branch_head",
+            "failed_logs": "",
+            "details": [
+                {"name": "CI / Backend", "conclusion": "failure"},
+                {"name": "CI / Frontend", "conclusion": "failure"},
+                {"name": "Detect changes", "conclusion": "success"},
+            ],
+        }
+    )
+
+    assert result is not None
+    assert result["conclusion"] == "failure"
+    assert result["failed_logs"] == "CI checks failed: CI / Backend, CI / Frontend"
+
+
 # ── Helper: redirect AsyncSessionLocal to the test database ─────────────────
 
 

@@ -1062,6 +1062,85 @@ async def test_branch_head_has_checks_red_returns_red(mocker):
 
 
 @pytest.mark.asyncio
+async def test_branch_head_red_threads_failed_logs(mocker):
+    """Regression for CI poll-path spawning blind fix tasks: resolve_pr_ci_status
+    must include failed_logs in the return dict when state=red so the orchestrator
+    can populate ci_result['failed_logs'] with real detail.
+
+    Before the fix the orchestrator hardcoded failed_logs='' and fix agents had no
+    failing-test selectors to run."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "ci-build", "conclusion": "failure"}],
+                "failed_logs": "  [ci-build] Failing tests:\n    FAILED testing/test_foo.py::test_bar",
+            }
+        ),
+    )
+
+    result = await ci_resolution.resolve_pr_ci_status(
+        pr_number=42,
+        branch_sha="branch_head_red_logs",
+        token="tok",
+        owner="o",
+        repo="r",
+    )
+
+    assert result["state"] == "red"
+    assert result["source"] == "branch_head"
+    assert "failed_logs" in result
+    assert "test_foo.py::test_bar" in result["failed_logs"]
+
+
+@pytest.mark.asyncio
+async def test_merge_sha_red_threads_failed_logs(mocker):
+    """Regression: resolve_pr_ci_status must include failed_logs when state=red
+    via the PR-event merge SHA (merge_sha source) as well as the branch_head source."""
+    pr_head_sha = "pr_event_red_sha"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "bare_branch_head":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        # PR-event SHA: failed with logs
+        return {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [{"name": "backend", "conclusion": "failure"}],
+            "failed_logs": "  [backend] Failing tests:\n    FAILED testing/test_bar.py::test_baz",
+        }
+
+    mocker.patch("app.github.get_check_runs_cached", side_effect=_check_runs_side_effect)
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "merged_at": None,
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+
+    result = await ci_resolution.resolve_pr_ci_status(
+        pr_number=42,
+        branch_sha="bare_branch_head",
+        token="tok",
+        owner="o",
+        repo="r",
+    )
+
+    assert result["state"] == "red"
+    assert result["source"] == "merge_sha"
+    assert "failed_logs" in result
+    assert "test_bar.py::test_baz" in result["failed_logs"]
+
+
+@pytest.mark.asyncio
 async def test_branch_head_in_progress_returns_pending(mocker):
     """Branch HEAD has in-progress checks → ci_passed=False, state=pending.
     Stays on branch_head source — we have a real signal, just not final yet."""
