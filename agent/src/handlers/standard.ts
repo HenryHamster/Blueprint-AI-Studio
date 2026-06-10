@@ -397,21 +397,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // ── Deterministic repo-map holdback arm ──────────────────────────────────
   // A fraction of tasks (configurable via runtime_config.repo_map_holdback_fraction,
   // injected into project_metadata at claim time) are assigned to the "without repo
-  // map" arm. The assignment is stable per-task (same taskId always maps to the same
-  // arm) so retries stay in the same arm and the trial is not confounded by per-attempt
-  // randomness. Setting the fraction to 0.0 restores unconditional injection.
+  // map" arm. The assignment is computed from a stable djb2 hash of the task ID,
+  // independent of whether buildRepoMap returns content. This ensures intent-to-treat
+  // analysis can use the assignment signal rather than the receipt boolean.
+  // repoMapArm=true → treatment (map injected); false → holdback; null → no trial.
   const projectMetaForHoldback = task.project_metadata as Record<string, unknown> | undefined;
   const holdbackFraction = typeof projectMetaForHoldback?.repo_map_holdback_fraction === 'number'
     ? projectMetaForHoldback.repo_map_holdback_fraction
     : 0.0;
-  if (holdbackFraction > 0 && repoMap !== '') {
+  let repoMapArm: boolean | null = null;
+  if (holdbackFraction > 0) {
     // djb2 hash of the taskId string → stable float in [0, 1)
     let h = 5381;
     for (let i = 0; i < taskId.length; i++) {
       h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
     }
     const taskHash = h / 0xffffffff;
-    if (taskHash < holdbackFraction) {
+    repoMapArm = taskHash >= holdbackFraction; // true = treatment, false = holdback
+    if (!repoMapArm) {
       sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
       repoMap = '';
     }
@@ -627,13 +630,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before Claude starts so short code-change tasks persist the
   // fingerprint even if they finish before the next periodic heartbeat.
-  sendHeartbeatSync(taskId, statusRef.value, {
+  // Send both the arm assignment (intent-to-treat) and receipt (compliance).
+  const _heartbeatOpts: Record<string, unknown> = {
     prompt_fingerprint: promptFingerprint,
     had_repo_map: repoMap !== '',
     ...(promptSectionFlags?.hadModuleInterfaces !== undefined && { had_module_interfaces: promptSectionFlags.hadModuleInterfaces }),
     ...(promptSectionFlags?.hadRelatedTests !== undefined && { had_related_tests: promptSectionFlags.hadRelatedTests }),
     ...(promptSectionFlags?.hadAffectedConsumers !== undefined && { had_affected_consumers: promptSectionFlags.hadAffectedConsumers }),
-  });
+  };
+  if (repoMapArm !== null) {
+    _heartbeatOpts.repo_map_arm = repoMapArm;
+  }
+  sendHeartbeatSync(taskId, statusRef.value, _heartbeatOpts);
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with

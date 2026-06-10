@@ -16,9 +16,11 @@ from app.models import (
     ReleaseVersion,
 )
 from app.routers.admin_analytics import _derive_completed_at
+from app.routers.admin_digest import _compute_digest
 from app.digest_metrics import (
     compute_remediation_and_patterns,
     compute_remediation_funnel,
+    compute_trial_arm_accumulation,
 )
 from app.sr_review_quality_metrics import (
     _stash_projected_task_fields,
@@ -8875,3 +8877,257 @@ async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
         ]["false_attestation_rate"]
         == 0.05
     )
+
+
+# ── Cumulative capability-trial accumulation ─────────────────────────────────
+
+
+def _arm_task(project_id, *, had_repo_map, first_attempt_succeeded, days_ago, idx):
+    """A terminal task carrying both trial-arm flags, backdated by ``days_ago``."""
+    created = _utcnow() - timedelta(days=days_ago)
+    return make_task(
+        project_id=project_id,
+        title=f"arm-task-{idx}",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=created,
+        context={
+            "_had_repo_map": had_repo_map,
+            "_first_attempt_succeeded": first_attempt_succeeded,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_counts_cumulatively(db_session):
+    """The aggregate counts every flagged terminal task regardless of age, and is
+    project-scoped + ignores tasks missing either arm flag."""
+    project = make_project()
+    other = make_project()
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    tasks = []
+    # WITH arm: 8 tasks, 6 first-attempt successes — spread across many days so no
+    # single 24h window could hold them.
+    for i in range(8):
+        tasks.append(
+            _arm_task(
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=(i < 6),
+                days_ago=i + 1,
+                idx=i,
+            )
+        )
+    # WITHOUT arm: 5 tasks, 1 first-attempt success.
+    for i in range(5):
+        tasks.append(
+            _arm_task(
+                project.id,
+                had_repo_map=False,
+                first_attempt_succeeded=(i < 1),
+                days_ago=i + 1,
+                idx=100 + i,
+            )
+        )
+    # Noise that must NOT be counted: a task missing the arm flag, and a task on a
+    # different project.
+    tasks.append(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},  # no _had_repo_map
+        )
+    )
+    tasks.append(
+        _arm_task(
+            other.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=1,
+            idx=999,
+        )
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session, project_id=project.id, context_key="_had_repo_map"
+    )
+    assert accum["with_n"] == 8
+    assert accum["with_succ"] == 6
+    assert accum["without_n"] == 5
+    assert accum["without_succ"] == 1
+    assert accum["with_rate"] == 0.75
+    assert accum["without_rate"] == 0.2
+    assert accum["lift"] == 0.55
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_empty_arm_yields_none_rate(db_session):
+    """An empty arm reports a None rate and None lift (cannot decide)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Only WITH-arm tasks present.
+    db_session.add_all(
+        [
+            _arm_task(
+                project.id, had_repo_map=True, first_attempt_succeeded=True,
+                days_ago=1, idx=i,
+            )
+            for i in range(3)
+        ]
+    )
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session, project_id=project.id, context_key="_had_repo_map"
+    )
+    assert accum["with_n"] == 3
+    assert accum["without_n"] == 0
+    assert accum["without_rate"] is None
+    assert accum["lift"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
+    """When assignment_key is provided, partitioning uses COALESCE(assignment_key,
+    context_key) — a treatment-assigned task with no actual map still lands in WITH arm,
+    and legacy tasks (no assignment_key) fall back to the receipt key."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # Treatment-assigned, received map → WITH arm, success
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Treatment-assigned, NO map (empty map case) → still WITH arm, failure
+        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        # Holdback-assigned, had map anyway → WITHOUT arm, success
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Legacy task (no assignment key) — falls back to receipt key, WITH arm
+        _task({"_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Legacy task (no assignment key) — falls back to receipt key, WITHOUT arm
+        _task({"_had_repo_map": False, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+    # WITH arm: 2 assigned + 1 legacy receipt = 3 tasks, 2 successes
+    assert accum["with_n"] == 3
+    assert accum["with_succ"] == 2
+    # WITHOUT arm: 1 assigned holdback + 1 legacy receipt = 2 tasks, 1 success
+    assert accum["without_n"] == 2
+    assert accum["without_succ"] == 1
+    assert accum["with_rate"] == round(2 / 3, 2)
+    assert accum["without_rate"] == 0.5
+    assert accum["lift"] == round(round(2 / 3, 2) - 0.5, 2)
+
+
+@pytest.mark.asyncio
+async def test_trial_verdict_accumulates_across_windows_to_decision(db_session):
+    """With per-arm tasks spread across MULTIPLE 24h windows (more than any single
+    window holds under the min-N=30 threshold), the verdict converges to a decided
+    adopt — driven by the cumulative basis, not the (empty) digest window — and the
+    recorded entry exposes that cumulative basis distinct from window_hours."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = []
+    # 35 WITH-arm successes and 35 WITHOUT-arm failures, every one backdated 2–8
+    # days so the 24h digest window sees NONE of them. No single window holds the
+    # 30-per-arm minimum, so a windowed decision basis would stay continue-trial.
+    for i in range(35):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=True, first_attempt_succeeded=True,
+                days_ago=2 + (i % 7), idx=i,
+            )
+        )
+    for i in range(35):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=False, first_attempt_succeeded=False,
+                days_ago=2 + (i % 7), idx=200 + i,
+            )
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    # Windowed breakdown is empty (all tasks are older than 24h) — proving the
+    # decision did NOT come from the window.
+    fasr = result["first_attempt_success_rate"]
+    assert fasr["with_repo_map_n"] == 0
+    assert fasr["without_repo_map_n"] == 0
+
+    await db_session.refresh(project)
+    verdict = project.capability_adoption_verdicts["repo_map"]
+    assert verdict["verdict"] == "adopt"
+    assert verdict["n_with"] == 35
+    assert verdict["n_without"] == 35
+    assert verdict["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+    # window_hours still describes the dashboard window, NOT the decision basis.
+    assert verdict["window_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_trial_verdict_insufficient_accumulation_stays_continue_trial(db_session):
+    """Below the min-N-per-arm threshold the cumulative verdict stays continue-trial
+    (insufficient_data) and still records the auditable accumulation basis."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = [
+        _arm_task(
+            project.id, had_repo_map=True, first_attempt_succeeded=True,
+            days_ago=2, idx=i,
+        )
+        for i in range(5)
+    ] + [
+        _arm_task(
+            project.id, had_repo_map=False, first_attempt_succeeded=False,
+            days_ago=2, idx=100 + i,
+        )
+        for i in range(2)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    await db_session.refresh(project)
+    verdict = project.capability_adoption_verdicts["repo_map"]
+    assert verdict["verdict"] == "continue-trial"
+    assert verdict["verdict_reason"] == "insufficient_data"
+    assert verdict["n_with"] == 5
+    assert verdict["n_without"] == 2
+    assert verdict["accumulation_basis"] == "cumulative_terminal_arm_tasks"

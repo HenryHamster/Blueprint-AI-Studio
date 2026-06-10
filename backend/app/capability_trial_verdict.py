@@ -37,16 +37,24 @@ def _default_config() -> dict[str, Any]:
     }
 
 
-class TrialDefinition(TypedDict):
+class _TrialDefinitionRequired(TypedDict):
     cap_name: str
     context_key: str
     thresholds: dict[str, Any]
+
+
+class TrialDefinition(_TrialDefinitionRequired, total=False):
+    # Optional: when present, arm partitioning uses this key for intent-to-treat
+    # assignment rather than the receipt key (context_key). Fallback to context_key
+    # for legacy tasks that pre-date the assignment field.
+    assignment_key: str
 
 
 TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "repo_map",
         "context_key": "_had_repo_map",
+        "assignment_key": "_repo_map_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -96,6 +104,7 @@ def evaluate_trial_verdict(
     config: dict[str, Any] | None = None,
     window_hours: int | None = None,
     evaluated_at: str | None = None,
+    accumulation_basis: str | None = None,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -107,14 +116,20 @@ def evaluate_trial_verdict(
     n_without:      Number of tasks in the WITHOUT-capability arm.
     config:         Optional threshold overrides.  Missing keys fall back to
                     module defaults.
-    window_hours:   Measurement window used to derive the rates (informational).
+    window_hours:   Dashboard measurement window (informational only — describes
+                    the digest display window, NOT the decision basis).
     evaluated_at:   ISO-8601 timestamp string (caller-supplied so tests are
                     deterministic).  When None the entry omits evaluated_at.
+    accumulation_basis: Label naming WHAT population produced ``lift``/``n_with``/
+                    ``n_without`` (e.g. ``"cumulative_terminal_arm_tasks"``), so a
+                    reader can tell the decision came from cumulative-since-activation
+                    counts rather than a single ``window_hours`` digest window.
+                    When None the entry omits the key.
 
     Returns
     -------
     A dict with: verdict, verdict_reason, lift, n_with, n_without, window_hours,
-    thresholds, and optionally evaluated_at.
+    thresholds, and optionally evaluated_at and accumulation_basis.
     """
     cfg = _default_config()
     if config:
@@ -135,6 +150,8 @@ def evaluate_trial_verdict(
             "reject_lift": reject_threshold,
         },
     }
+    if accumulation_basis is not None:
+        entry["accumulation_basis"] = accumulation_basis
     if evaluated_at is not None:
         entry["evaluated_at"] = evaluated_at
 

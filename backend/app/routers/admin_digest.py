@@ -58,6 +58,7 @@ from app.digest_metrics import (
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_trial_arm_accumulation,
     compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
@@ -1375,21 +1376,36 @@ async def _compute_digest(
     )
 
     # --- Capability trial verdict (write-through side-effect) ---
-    # Evaluate the repo-map trial based on current arm measurements and persist a
-    # durable adopt/reject/continue-trial verdict on the project.  Only runs when
-    # a specific project is in scope (no-op for cross-project digests).
+    # Persist a durable adopt/reject/continue-trial verdict on the project.  Only
+    # runs when a specific project is in scope (no-op for cross-project digests).
+    #
+    # The DECISION basis is CUMULATIVE, not windowed: at realistic task volume the
+    # holdback (without-)arm never reaches the min-N threshold inside any single
+    # digest window, so a windowed basis emits continue-trial forever.  We instead
+    # evaluate over ALL terminal tasks carrying the trial's arm flag since the trial
+    # began (a bounded aggregate count that does NOT widen the digest's own task
+    # scan).  The WINDOWED per-arm rates/counts in ``_first_attempt_success_rate``
+    # (``trial_breakdowns``, ``with_{cap}_n``, …) are left untouched for dashboard
+    # display — only the decision basis changes.
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
         _verdict_evaluated_at = _tv_utcnow().isoformat()
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
+            _accum = await compute_trial_arm_accumulation(
+                session,
+                project_id=project_id,
+                context_key=_td["context_key"],
+                assignment_key=_td.get("assignment_key"),
+            )
             _verdict_entry = evaluate_trial_verdict(
-                lift=_first_attempt_success_rate.get(f"{_cap}_lift"),
-                n_with=_first_attempt_success_rate.get(f"with_{_cap}_n", 0),
-                n_without=_first_attempt_success_rate.get(f"without_{_cap}_n", 0),
+                lift=_accum["lift"],
+                n_with=_accum["with_n"],
+                n_without=_accum["without_n"],
                 window_hours=hours,
                 evaluated_at=_verdict_evaluated_at,
                 config=_td["thresholds"],
+                accumulation_basis="cumulative_terminal_arm_tasks",
             )
             record_trial_verdict(_digest_project, _cap, _verdict_entry)
         try:

@@ -4614,6 +4614,110 @@ def test_first_attempt_breakdowns_existing_playbook_keys_unaffected():
     assert "without_affected_consumers" in result
 
 
+# ── _compute_first_attempt_breakdowns: repo-map assignment (intent-to-treat) ─
+
+
+def _fa_rm_arm_task(
+    *, succeeded: bool, repo_map_arm: bool | None, had_repo_map: bool | None
+) -> object:
+    """Task fixture for repo-map assignment-vs-receipt tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if repo_map_arm is not None:
+        ctx["_repo_map_arm"] = repo_map_arm
+    if had_repo_map is not None:
+        ctx["_had_repo_map"] = had_repo_map
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_repo_map_assignment_not_receipt():
+    """Intent-to-treat: treatment arm uses _repo_map_arm assignment, not _had_repo_map receipt.
+
+    A task assigned to treatment (_repo_map_arm=True) but with no actual map
+    (_had_repo_map=False) counts in the treatment arm for lift purposes.
+    """
+    # 5 treatment-assigned tasks: all succeeded, but only 4 actually got the map
+    treatment_tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 4
+        + [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=False)] * 1
+    )
+    # 5 holdback-assigned tasks: none succeeded
+    holdback_tasks = [
+        _fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)
+    ] * 5
+    tasks = treatment_tasks + holdback_tasks
+    result = _compute_first_attempt_breakdowns(tasks)
+    # Treatment arm should have 5 (assigned), not 4 (received)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["with_rate"] == 1.0
+    assert result["trial_breakdowns"]["repo_map"]["without_rate"] == 0.0
+    assert result["repo_map_lift"] == 1.0
+    # Flat alias keys preserved
+    assert result["with_repo_map_n"] == 5
+    assert result["without_repo_map_n"] == 5
+
+
+def test_first_attempt_breakdowns_repo_map_legacy_fallback():
+    """Legacy tasks without _repo_map_arm fall back to _had_repo_map for arm assignment."""
+    legacy_with = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+    legacy_without = [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    result = _compute_first_attempt_breakdowns(legacy_with + legacy_without)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    assert result["repo_map_lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_repo_map_assignment_overrides_receipt():
+    """When _repo_map_arm is present it wins over _had_repo_map for arm assignment."""
+    # Task assigned to holdback (_repo_map_arm=False) but had a map anyway
+    # (could happen if the trial was reconfigured mid-run). Should count as holdback.
+    holdback_with_map = _fa_rm_arm_task(
+        succeeded=True, repo_map_arm=False, had_repo_map=True
+    )
+    # 5 treatment tasks + 5 holdback tasks to pass the min-sample gate
+    treatment_tasks = [
+        _fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)
+    ] * 5
+    holdback_tasks = [holdback_with_map] + [
+        _fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)
+    ] * 4
+    result = _compute_first_attempt_breakdowns(treatment_tasks + holdback_tasks)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+
+
+def test_first_attempt_breakdowns_repo_map_compliance_subdict_present():
+    """compliance sub-dict is present in trial_breakdowns['repo_map'] when assignment key differs."""
+    tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 4
+        + [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=False)] * 1
+        + [_fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert "compliance" in bd
+    # 4 of 5 treatment tasks had the map → 80%
+    assert bd["compliance"]["with_rate"] == 0.8
+    # 1 of 5 treatment tasks did NOT have the map → 20%
+    assert bd["compliance"]["without_rate"] == 0.2
+
+
+def test_first_attempt_breakdowns_repo_map_compliance_all_compliant():
+    """compliance.with_rate is 1.0 when all treatment-arm tasks received the map."""
+    tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 5
+        + [_fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert bd["compliance"]["with_rate"] == 1.0
+    assert bd["compliance"]["without_rate"] == 0.0
+
+
 # ── Migration-serialization slot contention ─────────────────────────────────
 
 

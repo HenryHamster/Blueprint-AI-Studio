@@ -4070,6 +4070,14 @@ async def agent_heartbeat(
         ctx["_had_affected_consumers"] = req.had_affected_consumers
         task.context = ctx
 
+    # Write-once repo-map arm-assignment flag. Records the deterministic
+    # holdback vs treatment assignment independently of receipt; used for
+    # intent-to-treat arm partitioning in digest_metrics.
+    if req.repo_map_arm is not None and (task.context or {}).get("_repo_map_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_repo_map_arm"] = req.repo_map_arm
+        task.context = ctx
+
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
     # counters posted on every heartbeat — last write wins. Backwards-
     # compatible: older agents that don't ship these fields leave the column

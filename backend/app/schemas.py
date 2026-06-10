@@ -354,9 +354,15 @@ class HeartbeatRequest(BaseModel):
     format_repair_successes_by_schema: Dict[str, int] | None = None
     # Whether the language-aware repo map was non-empty and injected into the
     # agent prompt for this task. Set once on the first heartbeat after the
-    # standard handler registers it; used to compute with/without repo-map
-    # first-attempt success breakdowns in the digest.
+    # standard handler registers it; used as the receipt/compliance signal
+    # for the repo-map capability trial.
     had_repo_map: bool | None = None
+    # Deterministic arm-assignment flag for the repo-map capability trial.
+    # True = treatment arm (task was assigned to receive the repo map),
+    # False = holdback arm. Separate from had_repo_map so intent-to-treat
+    # analysis uses assignment, not receipt. Only present when a trial is
+    # actively running (holdback_fraction > 0); older agents omit this field.
+    repo_map_arm: bool | None = None
     # Whether module-interface, related-test, and affected-consumer sections
     # were non-empty and injected into the agent prompt. Write-once flags
     # mirroring had_repo_map; older agents that omit these fields leave the

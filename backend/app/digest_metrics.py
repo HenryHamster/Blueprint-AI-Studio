@@ -160,8 +160,26 @@ def _compute_first_attempt_breakdowns(
     for _td in _defs:
         _cap = _td["cap_name"]
         _ctx_key = _td["context_key"]
-        _with_arm = [t for t in measured if (t.context or {}).get(_ctx_key) is True]
-        _without_arm = [t for t in measured if (t.context or {}).get(_ctx_key) is False]
+        # Intent-to-treat: when an assignment key is present, partition on
+        # assignment; fall back to the receipt key for legacy tasks that
+        # pre-date the assignment field (i.e. _assign_key is absent).
+        _assign_key = _td.get("assignment_key", _ctx_key)
+        _with_arm = [
+            t for t in measured
+            if (t.context or {}).get(_assign_key) is True
+            or (
+                (t.context or {}).get(_assign_key) is None
+                and (t.context or {}).get(_ctx_key) is True
+            )
+        ]
+        _without_arm = [
+            t for t in measured
+            if (t.context or {}).get(_assign_key) is False
+            or (
+                (t.context or {}).get(_assign_key) is None
+                and (t.context or {}).get(_ctx_key) is False
+            )
+        ]
         _with_rate = _fa_rate(_with_arm)
         _without_rate = _fa_rate(_without_arm)
         _lift_val: float | None = (
@@ -174,13 +192,29 @@ def _compute_first_attempt_breakdowns(
             )
             else None
         )
-        trial_breakdowns[_cap] = {
+        _trial_entry: Dict[str, Any] = {
             "lift": _lift_val,
             "with_n": len(_with_arm),
             "without_n": len(_without_arm),
             "with_rate": _with_rate,
             "without_rate": _without_rate,
         }
+        # Compliance sub-dict: among treatment-arm tasks, what fraction actually
+        # received the capability (receipt key True). Only present when assignment
+        # and receipt keys differ, so adding it does not break consumers that only
+        # check the existing flat keys.
+        if _assign_key != _ctx_key:
+            _receipt_n = len(_with_arm)
+            _receipt_true = sum(
+                1 for t in _with_arm if (t.context or {}).get(_ctx_key) is True
+            )
+            _trial_entry["compliance"] = {
+                "with_rate": round(_receipt_true / _receipt_n, 2) if _receipt_n else None,
+                "without_rate": round((_receipt_n - _receipt_true) / _receipt_n, 2)
+                if _receipt_n
+                else None,
+            }
+        trial_breakdowns[_cap] = _trial_entry
 
     def _lift(flag, tasks):
         tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
@@ -296,6 +330,114 @@ def _compute_first_attempt_breakdowns(
         "by_scope": by_scope,
         "trend": trend,
         "first_attempt_by_review_category": first_attempt_by_review_category,
+    }
+
+
+def _json_truthy(value: Any) -> bool:
+    """Normalize a JSON-extracted boolean across dialects.
+
+    SQLite ``json_extract`` returns integer 1/0 for JSON true/false; PostgreSQL
+    ``->>`` (``.astext``) returns the strings ``'true'``/``'false'``. ORM-loaded
+    values may also arrive as native ``bool``. Treat all truthy encodings the same.
+    """
+    return value in (True, 1, "true", "1")
+
+
+async def compute_trial_arm_accumulation(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID | None",
+    context_key: str,
+    assignment_key: "str | None" = None,
+) -> Dict[str, Any]:
+    """Cumulative per-arm first-attempt-success counts over a trial's whole life.
+
+    The capability-trial verdict must accumulate evidence over the life of the
+    trial rather than re-deriving arms from a single sliding digest window — at
+    realistic task volume the without-arm never reaches the min-N threshold inside
+    any one window, so a windowed basis can never decide.
+
+    Intent-to-treat partitioning: when ``assignment_key`` is provided (e.g.
+    ``_repo_map_arm``), arm membership uses COALESCE(assignment_key, context_key),
+    matching the windowed ``_compute_first_attempt_breakdowns`` path.  Tasks that
+    carry the assignment key are partitioned by it; legacy tasks that pre-date the
+    assignment field fall back to the receipt key (``context_key``).  This ensures
+    a treatment-assigned task with an empty map (_repo_map_arm=true,
+    _had_repo_map=false) lands in the WITH arm, not the WITHOUT arm.
+
+    This runs a dialect-aware SQL AGGREGATE (``func.count()`` GROUP BY the arm-flag
+    value and the first-attempt-success value, project-filtered, over terminal
+    COMPLETED/FAILED tasks that carry at least one arm indicator and
+    ``_first_attempt_succeeded``).  An aggregate count never materializes
+    JSONB-heavy rows, so scanning the full trial history is bounded and safe — it
+    does NOT widen the digest's own capped terminal-task scan.
+
+    Returns a dict with cumulative ``with_n``, ``without_n``, ``with_succ``,
+    ``without_succ``, ``with_rate``, ``without_rate`` and ``lift``
+    (with-arm rate − without-arm rate), where rates are ``None`` for an empty arm.
+    """
+    _assign_key = assignment_key if assignment_key else context_key
+    if resolve_dialect_name(session) == "sqlite":
+        _primary_expr = func.json_extract(Task.context, f"$.{_assign_key}")
+        _fallback_expr = func.json_extract(Task.context, f"$.{context_key}")
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _assign_key != context_key
+            else _primary_expr
+        )
+        succ_expr = func.json_extract(Task.context, "$._first_attempt_succeeded")
+    else:
+        _primary_expr = Task.context[_assign_key].astext
+        _fallback_expr = Task.context[context_key].astext
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _assign_key != context_key
+            else _primary_expr
+        )
+        succ_expr = Task.context["_first_attempt_succeeded"].astext
+
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        arm_expr.is_not(None),
+        succ_expr.is_not(None),
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    stmt = (
+        select(arm_expr, succ_expr, func.count())
+        .where(*filters)
+        .group_by(arm_expr, succ_expr)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    with_n = with_succ = without_n = without_succ = 0
+    for arm_val, succ_val, cnt in rows:
+        cnt = int(cnt)
+        if _json_truthy(arm_val):
+            with_n += cnt
+            if _json_truthy(succ_val):
+                with_succ += cnt
+        else:
+            without_n += cnt
+            if _json_truthy(succ_val):
+                without_succ += cnt
+
+    with_rate = round(with_succ / with_n, 2) if with_n else None
+    without_rate = round(without_succ / without_n, 2) if without_n else None
+    lift = (
+        round(with_rate - without_rate, 2)
+        if with_rate is not None and without_rate is not None
+        else None
+    )
+    return {
+        "with_n": with_n,
+        "without_n": without_n,
+        "with_succ": with_succ,
+        "without_succ": without_succ,
+        "with_rate": with_rate,
+        "without_rate": without_rate,
+        "lift": lift,
     }
 
 

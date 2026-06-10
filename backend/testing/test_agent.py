@@ -1482,6 +1482,104 @@ async def test_agent_heartbeat_had_repo_map_write_once(
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_persists_repo_map_arm_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with repo_map_arm=True persists _repo_map_arm=True to task.context."""
+    project = Project(name="Heartbeat Repo Map Arm True", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_repo_map_arm") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_repo_map_arm_false(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with repo_map_arm=False persists _repo_map_arm=False to task.context."""
+    project = Project(name="Heartbeat Repo Map Arm False", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-false",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-false")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_repo_map_arm") is False
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_repo_map_arm_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with repo_map_arm=False does not overwrite an already-set flag."""
+    project = Project(name="Heartbeat Repo Map Arm Write Once", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_repo_map_arm": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_repo_map_arm") is True
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(
     client: AsyncClient, db_session
 ):

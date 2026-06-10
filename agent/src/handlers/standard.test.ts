@@ -61,6 +61,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
     buildRetryContext: vi.fn().mockReturnValue(''),
+    buildRepoMap: vi.fn().mockReturnValue(''),
     buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
     parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
     parseAnalysisPlanTestFiles: vi.fn().mockReturnValue([]),
@@ -150,9 +151,9 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata } from './standard.js';
-import { setupWorkspace, runClaudeCode } from '../index.js';
+import { setupWorkspace, runClaudeCode, sendHeartbeatSync } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
@@ -4107,5 +4108,88 @@ describe('operator_requested_review_for branch-existence check', () => {
     expectCalledWith(prepareWorkspaceForRole,
       expect.objectContaining({ baseBranch: 'trunk' }),
     );
+  });
+});
+
+// ── Repo-map arm assignment heartbeat ────────────────────────────────────────
+// TASK_ID = 'task-123' has a djb2 hash of ~0.782.
+//   fraction=0.5  → 0.782 >= 0.5 → treatment arm (repoMapArm=true)
+//   fraction=1.0  → 0.782 <  1.0 → holdback arm  (repoMapArm=false)
+
+/** Extract the sendHeartbeatSync options dict that contains had_repo_map. */
+function capturedRepoMapHeartbeatOpts(): Record<string, unknown> | undefined {
+  const calls = vi.mocked(sendHeartbeatSync).mock.calls;
+  const call = calls.find(([, , opts]) => opts != null && typeof opts === 'object' && 'had_repo_map' in opts);
+  return call ? (call[2] as Record<string, unknown>) : undefined;
+}
+
+describe('repo-map arm assignment in sendHeartbeatSync', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('sends repo_map_arm=false and had_repo_map=false when holdback arm assigned with empty buildRepoMap', async () => {
+    vi.mocked(buildRepoMap).mockReturnValue('');
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: { repo_map_holdback_fraction: 1.0 },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(false);
+    expect(opts?.repo_map_arm).toBe(false);
+  });
+
+  it('sends repo_map_arm=true and had_repo_map=true when treatment arm with non-empty repo map', async () => {
+    vi.mocked(buildRepoMap).mockReturnValue('some-repo-map-content');
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: { repo_map_holdback_fraction: 0.5 },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(true);
+    expect(opts?.repo_map_arm).toBe(true);
+  });
+
+  it('sends repo_map_arm=true and had_repo_map=false when treatment arm with empty buildRepoMap result', async () => {
+    // Treatment arm assigned (fraction=0.5, TASK_ID hash=0.782 >= 0.5) but buildRepoMap returns ''
+    vi.mocked(buildRepoMap).mockReturnValue('');
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: { repo_map_holdback_fraction: 0.5 },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(false);
+    expect(opts?.repo_map_arm).toBe(true);
+  });
+
+  it('omits repo_map_arm when holdbackFraction is 0 (no trial running)', async () => {
+    vi.mocked(buildRepoMap).mockReturnValue('');
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: { repo_map_holdback_fraction: 0.0 },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(false);
+    expect(opts?.repo_map_arm).toBeUndefined();
   });
 });

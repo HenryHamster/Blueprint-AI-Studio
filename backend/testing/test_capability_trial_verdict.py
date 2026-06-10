@@ -115,6 +115,26 @@ class TestEvaluateTrialVerdict:
         )
         assert entry["window_hours"] == 72
 
+    def test_accumulation_basis_propagated_distinct_from_window(self):
+        # The auditable evidence basis must be recorded DISTINCT from window_hours:
+        # window_hours describes the dashboard window; accumulation_basis names the
+        # population that actually produced the decision counts.
+        entry = evaluate_trial_verdict(
+            lift=0.06, n_with=42, n_without=37,
+            window_hours=24,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+        )
+        assert entry["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+        assert entry["window_hours"] == 24
+        # The cumulative counts that drove the decision are auditable on the entry.
+        assert entry["n_with"] == 42
+        assert entry["n_without"] == 37
+        assert entry["verdict"] == "adopt"
+
+    def test_accumulation_basis_omitted_when_not_supplied(self):
+        entry = evaluate_trial_verdict(lift=0.06, n_with=30, n_without=30)
+        assert "accumulation_basis" not in entry
+
     def test_configurable_min_n_respected(self):
         # With a lower min_n threshold the arms qualify earlier.
         entry = evaluate_trial_verdict(
@@ -438,6 +458,34 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == -0.09
 
+    def test_cumulative_continue_trial_cannot_self_revert_decided_adopt(self):
+        # Guard semantics must hold for entries built via the cumulative path: an
+        # insufficient-data continue-trial carrying accumulation_basis must NOT
+        # supersede a prior decided adopt.
+        project = _make_project()
+        prior = evaluate_trial_verdict(
+            lift=0.08, n_with=40, n_without=40,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+        )
+        assert prior["verdict"] == "adopt"
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        incoming = evaluate_trial_verdict(
+            lift=None, n_with=12, n_without=3,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+        )
+        assert incoming["verdict"] == "continue-trial"
+        assert incoming["verdict_reason"] == "insufficient_data"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Prior adopt stands; cumulative basis does not weaken the guard.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["accumulation_basis"]
+            == "cumulative_terminal_arm_tasks"
+        )
+
     def test_overwrites_adopt_for_ambiguous_lift(self):
         project = _make_project()
         prior = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
@@ -606,6 +654,7 @@ class TestGetTrialDefinitions:
         defs = get_trial_definitions()
         rm = next(td for td in defs if td["cap_name"] == "repo_map")
         assert rm["context_key"] == "_had_repo_map"
+        assert rm["assignment_key"] == "_repo_map_arm"
         assert "thresholds" in rm
         assert "min_n_per_arm" in rm["thresholds"]
         assert "adopt_lift" in rm["thresholds"]
