@@ -150,3 +150,30 @@ def get_trial_verdicts(project: Any) -> dict[str, Any]:
     if isinstance(verdicts, dict):
         return verdicts
     return {}
+
+
+def get_effective_holdback_fraction(
+    verdicts: Any,
+    cap_name: str,
+    default_fraction: float,
+) -> float:
+    """Return the holdback fraction to apply for a capability, based on its verdict.
+
+    - ``adopt``          → 0.0 (stop holding back; use the capability for all tasks)
+    - ``reject``         → 1.0 (always hold back; do not use the capability)
+    - anything else      → ``default_fraction`` (trial still in progress)
+
+    Falls back to ``default_fraction`` when ``verdicts`` is not a dict, when
+    ``cap_name`` is absent, or when the entry lacks a ``"verdict"`` key.
+    """
+    if not isinstance(verdicts, dict):
+        return default_fraction
+    entry = verdicts.get(cap_name)
+    if not isinstance(entry, dict):
+        return default_fraction
+    verdict = entry.get("verdict")
+    if verdict == "adopt":
+        return 0.0
+    if verdict == "reject":
+        return 1.0
+    return default_fraction

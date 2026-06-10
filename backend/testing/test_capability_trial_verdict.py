@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
+    get_effective_holdback_fraction,
     get_trial_verdicts,
     record_trial_verdict,
 )
@@ -220,3 +221,48 @@ class TestGetTrialVerdicts:
         project = MagicMock(spec=[])
         result = get_trial_verdicts(project)
         assert result == {}
+
+
+# ── get_effective_holdback_fraction ──────────────────────────────────────────
+
+
+class TestGetEffectiveHoldbackFraction:
+    def _verdicts(self, verdict: str) -> dict:
+        return {"repo_map": {"verdict": verdict, "lift": 0.0, "n_with": 40, "n_without": 40}}
+
+    def test_effective_holdback_adopt_returns_zero(self):
+        result = get_effective_holdback_fraction(self._verdicts("adopt"), "repo_map", 0.5)
+        assert result == 0.0
+
+    def test_effective_holdback_reject_returns_one(self):
+        result = get_effective_holdback_fraction(self._verdicts("reject"), "repo_map", 0.5)
+        assert result == 1.0
+
+    def test_effective_holdback_continue_returns_default(self):
+        result = get_effective_holdback_fraction(self._verdicts("continue-trial"), "repo_map", 0.3)
+        assert result == 0.3
+
+    def test_effective_holdback_missing_cap_returns_default(self):
+        result = get_effective_holdback_fraction({"other_cap": {"verdict": "adopt"}}, "repo_map", 0.4)
+        assert result == 0.4
+
+    def test_effective_holdback_none_verdicts_returns_default(self):
+        result = get_effective_holdback_fraction(None, "repo_map", 0.25)
+        assert result == 0.25
+
+    def test_effective_holdback_empty_dict_returns_default(self):
+        result = get_effective_holdback_fraction({}, "repo_map", 0.1)
+        assert result == 0.1
+
+    def test_effective_holdback_entry_missing_verdict_key_returns_default(self):
+        verdicts = {"repo_map": {"lift": 0.06, "n_with": 40, "n_without": 40}}
+        result = get_effective_holdback_fraction(verdicts, "repo_map", 0.5)
+        assert result == 0.5
+
+    def test_effective_holdback_adopt_ignores_default(self):
+        result = get_effective_holdback_fraction(self._verdicts("adopt"), "repo_map", 0.99)
+        assert result == 0.0
+
+    def test_effective_holdback_reject_ignores_default(self):
+        result = get_effective_holdback_fraction(self._verdicts("reject"), "repo_map", 0.0)
+        assert result == 1.0

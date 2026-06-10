@@ -138,6 +138,7 @@ def _strategic_event_completion_summary(
         or getattr(cycle, "tasks_spawned", 0)
         or 0
     )
+    adoption_declared = int(ctx.get("_strategic_adoption_declared") or 0)
     pm_changed = (
         bool(ctx.get("_strategic_problem_model_set"))
         if problem_model_changed is None
@@ -172,6 +173,8 @@ def _strategic_event_completion_summary(
             if d.get("status") == "active"
         ),
     }
+    if adoption_declared > 0:
+        summary["adoption_declared_count"] = adoption_declared
     # Compact strategic-judgment-challenge summary: rides the completion dict into
     # the websocket payload and digest. The full bounded record stays in
     # cycle_metadata for drill-down; only {mode, verdict, warned/blocked counts}
@@ -2912,6 +2915,7 @@ async def _handle_strategic_completion(
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
     tasks_spawned = (task.context or {}).get("_strategic_tasks_spawned", 0)
+    adoption_declared = int((task.context or {}).get("_strategic_adoption_declared", 0))
     api_was_used = (
         (task.context or {}).get("_strategic_vision_set", False)
         or vision_rev > spawned_vision_rev
@@ -2929,6 +2933,7 @@ async def _handle_strategic_completion(
         cycle_id = (task.context or {}).get("strategic_cycle_id")
         dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
+        adoption_declared = int(adoption_declared or 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
         # Collect rationales regardless of cycle_id so synthesized memos always
@@ -2940,8 +2945,16 @@ async def _handle_strategic_completion(
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
             ) or vision_rev > spawned_vision_rev
+            _adoption_suffix = (
+                f", {adoption_declared} capability adoption decision(s) declared"
+                if adoption_declared
+                else ""
+            )
             _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
-            _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
+            _summary = (
+                f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, "
+                f"{dirs_retired} retired{_adoption_suffix}{_spawn_suffix}"
+            )
             created_rationales = _collect_rationales(
                 project, created_ids, _CREATED_NOTE_PREFIX
             )
@@ -3085,8 +3098,17 @@ async def _handle_strategic_completion(
                 f"on successful cycle (project {project.id})"
             )
         session.add(project)
+        _adoption_suffix_msg = (
+            f", {adoption_declared} capability adoption decision(s) declared"
+            if adoption_declared
+            else ""
+        )
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
-        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired{_spawn_suffix_msg}"
+        task.latest_status_message = (
+            f"Strategic review complete — vision rev {vision_rev}, {active_dirs} "
+            f"active directions, {dirs_created} created, {dirs_retired} retired"
+            f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
+        )
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
@@ -3151,6 +3173,7 @@ async def _handle_strategic_completion(
         )
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
+            f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
         )
         return
 

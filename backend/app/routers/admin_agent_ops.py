@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.capability_trial_verdict import record_trial_verdict
 from app.database import get_session
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
@@ -2496,6 +2497,76 @@ async def strategic_operation(
         )
         return _resp(
             {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
+        )
+
+    elif payload.op == "declare_capability_adoption":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "declare_capability_adoption: data must be "
+                    '{"cap_name": str, "verdict": "adopt" | "reject" | "continue-trial", "rationale": str | None}'
+                ),
+            )
+        cap_name = data.get("cap_name")
+        verdict = data.get("verdict")
+        rationale = data.get("rationale")
+        if not isinstance(cap_name, str) or not cap_name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="declare_capability_adoption: cap_name must be a non-empty string",
+            )
+        if not isinstance(verdict, str) or verdict not in (
+            "adopt",
+            "reject",
+            "continue-trial",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "declare_capability_adoption: verdict must be one of "
+                    "'adopt', 'reject', or 'continue-trial'"
+                ),
+            )
+        if rationale is not None and not isinstance(rationale, str):
+            raise HTTPException(
+                status_code=400,
+                detail="declare_capability_adoption: rationale must be a string or null",
+            )
+        entry: dict[str, Any] = {
+            "verdict": verdict,
+            "evidence_source": "strategic_review",
+            "evaluated_at": _utcnow().isoformat(),
+        }
+        rationale_text = rationale.strip() if isinstance(rationale, str) else ""
+        if rationale_text:
+            entry["rationale"] = rationale_text
+        record_trial_verdict(project, cap_name.strip(), entry)
+        await session.flush()
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_adoption_declared": ctx.get("_strategic_adoption_declared", 0)
+            + 1,
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Declared capability adoption for %s=%s (%s) on project %s",
+            cap_name.strip(),
+            verdict,
+            entry["evidence_source"],
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "declare_capability_adoption",
+                "cap_name": cap_name.strip(),
+                "verdict": verdict,
+            }
         )
 
     elif payload.op == "cite_memos":

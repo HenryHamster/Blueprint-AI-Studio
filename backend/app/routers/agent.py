@@ -104,6 +104,19 @@ def _truncate_vm_instance_id(vm_instance_id: object) -> str:
     return f"{value[:12]}..."
 
 
+def _effective_repo_map_holdback(project: object) -> float:
+    """Return the repo_map holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("repo_map_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "repo_map", default)
+
+
 def _log_agent_auth_reject(
     reason: str,
     *,
@@ -880,9 +893,7 @@ async def claim_task(
             "enable_self_improvement": project.enable_self_improvement,
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
-            "repo_map_holdback_fraction": float(
-                _shared_state.runtime_config.get("repo_map_holdback_fraction", 0.0)
-            ),
+            "repo_map_holdback_fraction": _effective_repo_map_holdback(project),
         }
 
     task_type = _claimed_first_payload.get("type", "")
