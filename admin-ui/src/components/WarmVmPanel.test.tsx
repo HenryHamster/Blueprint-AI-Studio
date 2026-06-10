@@ -784,6 +784,7 @@ describe('WarmVmPanel — cost-guard + warm-breaker callouts', () => {
           idle_cost_usd: 5.0,
           min_hit_rate: 0.1,
           min_idle_cost_usd: 1.0,
+          window_hours: 24,
         },
       },
     };
@@ -798,9 +799,50 @@ describe('WarmVmPanel — cost-guard + warm-breaker callouts', () => {
     // hit rate 2% vs floor 10%.
     expect(screen.getByTestId('pool-cost-guard-hit-rate').textContent).toContain('2%');
     expect(screen.getByTestId('pool-cost-guard-hit-rate').textContent).toContain('floor 10%');
-    // idle spend $5.00 vs floor $1.00.
+    // idle spend $5.00 with 24h window label vs floor $1.00.
     expect(screen.getByTestId('pool-cost-guard-idle-cost').textContent).toContain('$5.00');
+    expect(screen.getByTestId('pool-cost-guard-idle-cost').textContent).toContain('24h window');
     expect(screen.getByTestId('pool-cost-guard-idle-cost').textContent).toContain('$1.00');
+  });
+
+  test('idle-spend label is absent when window_hours is omitted (backward-compat)', async () => {
+    const stateGuardNoWindow: WarmVmStateResponse = {
+      ...baseState,
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 2,
+        idle_count: 2,
+        funnel: {
+          window_hours: 24,
+          pool_lease_hits: 1,
+          cold_dispatches: 49,
+          total_dispatches: 50,
+          pool_hit_rate: 0.02,
+          lease_miss_by_reason: {},
+          lease_miss_total: 0,
+        },
+        cost_guard: {
+          engaged: true,
+          reason: 'draining',
+          hit_rate: 0.02,
+          total_dispatches: 50,
+          idle_cost_usd: 5.0,
+          min_hit_rate: 0.1,
+          min_idle_cost_usd: 1.0,
+          // window_hours intentionally omitted to test older-backend compat
+        },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateGuardNoWindow), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-cost-guard-banner');
+    const idleCost = screen.getByTestId('pool-cost-guard-idle-cost');
+    expect(idleCost.textContent).toContain('$5.00');
+    expect(idleCost.textContent).not.toContain('window');
   });
 
   test('does not render the cost-guard banner when disengaged or omitted', async () => {

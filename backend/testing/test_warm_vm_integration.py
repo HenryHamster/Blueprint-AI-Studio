@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import AsyncClient
 
-from app.models import PoolIdleCostLedger, Project, PoolVmState, Task, TaskStatus
+from app.models import PoolIdleCostLedger, PoolIdleSpan, Project, PoolVmState, Task, TaskStatus
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
@@ -1029,8 +1029,8 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
     """A pool-origin warm start moves the efficiency axes: vm_reuse_rate rises to
     1.0 (the COMPLETED task's ``_timing.warm_start`` participates as a warm VM),
     and ``cost_per_merged_pr_incl_pool_idle`` strictly exceeds the pool-exclusive
-    ``cost_per_merged_pr`` because in-window pool idle spend (a ledger row whose
-    ``retired_at`` falls inside the 7-day axis window) is folded into the
+    ``cost_per_merged_pr`` because in-window pool idle spend (a PoolIdleSpan row
+    whose ``settled_at`` falls inside the 7-day axis window) is folded into the
     net-cost numerator. This is the enablement-confidence assertion cluster 1
     did not make: the measured lift is genuinely pool-origin AND the idle cost is
     accounted, not hidden."""
@@ -1048,7 +1048,7 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         # accrual perturbs the exact comparison). The windowed axis intentionally
         # excludes timestampless ``idle_cost_banked``, so this member only feeds
         # the all-time ``pool_idle_cost_usd`` metric — the axis delta below comes
-        # from the deterministic in-window ledger row instead.
+        # from the deterministic in-window span row instead.
         member = await register_pool_vm(
             db_session,
             vm_instance_id=f"agent-vm-axis-{uuid.uuid4().hex}",
@@ -1062,10 +1062,21 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         member.idle_cost_banked = 0.02
         db_session.add(member)
 
-        # In-window idle spend: a retired member's ledger row whose retired_at
-        # falls inside the 7-day axis window. _compute_windowed_idle_cost sums
-        # exactly these rows into the pool-inclusive numerator, keeping the
-        # cost delta deterministic (no clock-dependent live accrual).
+        # In-window idle spend: a settled PoolIdleSpan row whose settled_at falls
+        # inside the 7-day axis window. _compute_windowed_idle_cost sums exactly
+        # these rows into the pool-inclusive numerator, keeping the cost delta
+        # deterministic (no clock-dependent live accrual).
+        # The corresponding PoolIdleCostLedger row is also seeded so that the
+        # all-time pool_idle_cost_usd metric remains accurate.
+        db_session.add(
+            PoolIdleSpan(
+                project_id=project.id,
+                vm_instance_id="agent-vm-axis-retired",
+                started_at=datetime.utcnow() - timedelta(days=1, hours=1),
+                settled_at=datetime.utcnow() - timedelta(days=1),
+                cost_usd=0.02,
+            )
+        )
         db_session.add(
             PoolIdleCostLedger(
                 project_id=project.id,

@@ -2032,6 +2032,30 @@ class PoolIdleCostLedger(SQLModel, table=True):
     )
 
 
+class PoolIdleSpan(SQLModel, table=True):
+    """Durable per-settled-idle-span log for windowed pool idle cost attribution.
+
+    Written by settle_pool_vm_idle_cost (when a session is provided) each time
+    an idle span is banked onto PoolVm.idle_cost_banked, and by
+    retire_and_delete_pool_vm for the final idle span at teardown.  Enables
+    _compute_windowed_idle_cost to filter on settled_at (exact span end) rather
+    than on PoolIdleCostLedger.retired_at (member teardown time), eliminating
+    lump-attribution distortion for long-lived members with multiple idle cycles.
+    Append-only INSERT is concurrency-safe (no accumulator contention).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    vm_instance_id: str = Field(sa_column=Column(String, nullable=False))
+    # Exact start/end of this idle span.
+    started_at: datetime = Field(sa_column=Column(NaiveUTCDateTime, nullable=False))
+    settled_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True)
+    )
+    cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+    reason: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+
+
 class TaskHistory(SQLModel, table=True):
     """
     Audit trail for task modifications, splits, and spawns.

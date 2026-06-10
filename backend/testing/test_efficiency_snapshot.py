@@ -20,6 +20,7 @@ from app.efficiency_snapshot import (
     FORMAT_COMPLIANCE_KEY,
     FORMAT_COMPLIANCE_RATE_KEY,
     LLM_TOKEN_PRICING,
+    METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _compute_cold_start_breakdown_p50,
@@ -731,6 +732,94 @@ async def test_read_baseline_with_drift_history_reflects_snapshots(db_session):
         for entry in hist:
             assert "captured_at" in entry
             assert "value" in entry
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_definition_version_and_change_boundary(db_session):
+    """Snapshots must stamp metric_def_version; read path must expose def_version
+    per history point so consumers can detect metric-definition discontinuities.
+
+    Acceptance requirement: new snapshots carry the current METRIC_DEF_VERSION,
+    the drift response exposes def_version on every history point, and a version
+    advance (simulated by back-patching an older snapshot) creates a visible
+    boundary (distinct def_version values) in the history series.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # First snapshot — written by the current writer, carries METRIC_DEF_VERSION.
+    snap1 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap1.get("metric_def_version") == METRIC_DEF_VERSION, (
+        f"write_snapshot must stamp metric_def_version={METRIC_DEF_VERSION!r}; "
+        f"got {snap1.get('metric_def_version')!r}"
+    )
+
+    # Second snapshot — also written by current writer, same version.
+    snap2 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap2.get("metric_def_version") == METRIC_DEF_VERSION
+
+    # Simulate a pre-existing snapshot from a prior definition era by back-
+    # patching the first stored snapshot to an older version string.  This models
+    # the real scenario: persisted snapshots 2026-06-06..09 have no version stamp
+    # (metric_def_version absent), while future snapshots carry v6.
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models import Project
+
+    proj = await db_session.get(Project, project.id)
+    assert proj is not None
+    doc = dict(proj.design_doc or {})
+    container = dict(doc.get("efficiency_baseline") or {})
+    snapshots = list(container.get("snapshots") or [])
+    assert len(snapshots) >= 2, "expected at least 2 snapshots to be stored"
+    # Remove version from first snapshot to simulate a pre-v6 era entry.
+    snapshots[0] = {k: v for k, v in snapshots[0].items() if k != "metric_def_version"}
+    container["snapshots"] = snapshots
+    doc["efficiency_baseline"] = container
+    proj.design_doc = doc
+    flag_modified(proj, "design_doc")
+    await db_session.commit()
+
+    # Now read back via the public API and verify def_version is surfaced.
+    result = await read_baseline_with_drift(db_session, project.id)
+
+    for axis in ALL_AXES:
+        hist = result["axes"][axis]["history"]
+        assert len(hist) >= 2, f"{axis}: expected >= 2 history entries"
+        # Every entry must carry the def_version key (value may be None for
+        # pre-stamping snapshots — that's the correct signal for old entries).
+        for entry in hist:
+            assert "def_version" in entry, (
+                f"{axis}: history entry missing 'def_version' key: {entry!r}"
+            )
+        # The first entry (back-patched to no version) must surface None,
+        # the last entry must surface the current version — a visible boundary.
+        first_version = hist[0]["def_version"]
+        last_version = hist[-1]["def_version"]
+        assert first_version is None, (
+            f"{axis}: expected None def_version for pre-stamping snapshot, "
+            f"got {first_version!r}"
+        )
+        assert last_version == METRIC_DEF_VERSION, (
+            f"{axis}: expected {METRIC_DEF_VERSION!r} on latest snapshot, "
+            f"got {last_version!r}"
+        )
+
+    # Also verify the cost_per_merged_pr_incl_pool_idle_axis history carries
+    # def_version for the same discontinuity detection requirement.
+    incl_axis = result.get("cost_per_merged_pr_incl_pool_idle_axis") or {}
+    incl_hist = incl_axis.get("history") or []
+    for entry in incl_hist:
+        assert "def_version" in entry, (
+            f"cost_per_merged_pr_incl_pool_idle_axis history entry missing "
+            f"'def_version': {entry!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -3968,19 +4057,20 @@ async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
 # cost_per_merged_pr_incl_pool_idle (acceptance gate: test named below).
 # ---------------------------------------------------------------------------
 
-from app.models import PoolIdleCostLedger, PoolVm, PoolVmState  # noqa: E402
+from app.models import PoolIdleCostLedger, PoolIdleSpan, PoolVm, PoolVmState  # noqa: E402
 
 
 @pytest.mark.asyncio
 async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
     db_session,
 ):
-    """Out-of-window PoolIdleCostLedger rows must not inflate the per-PR idle-
+    """Out-of-window PoolIdleSpan rows must not inflate the per-PR idle-
     inclusive cost axis.
 
-    Seeds one in-window ledger row ($1.00, retired 3 days ago) and one
-    out-of-window row ($99.00, retired 10 days ago — outside the 7-day window).
-    Also seeds a merged PR task so cost_per_merged_pr_incl_pool_idle is defined.
+    Seeds one in-window span ($1.00, settled 3 days ago) and one out-of-window
+    span ($99.00, settled 10 days ago — outside the 7-day window).  Also seeds
+    PoolIdleCostLedger rows (all-time carry-forward) and a merged PR task so
+    cost_per_merged_pr_incl_pool_idle is defined.
     The axis value must reflect only the in-window $1.00; the out-of-window
     $99.00 must be excluded even though it appears in pool_metrics["total_idle_cost_usd"].
     """
@@ -4002,7 +4092,27 @@ async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
     )
     db_session.add(task)
 
-    # In-window ledger row: retired 3 days ago (within the 7-day cutoff).
+    # In-window span: settled 3 days ago (within the 7-day cutoff).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            started_at=now - timedelta(days=3, hours=1),
+            settled_at=now - timedelta(days=3),
+            cost_usd=1.0,
+        )
+    )
+    # Out-of-window span: settled 10 days ago (before the 7-day cutoff).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            started_at=now - timedelta(days=10, hours=1),
+            settled_at=now - timedelta(days=10),
+            cost_usd=99.0,
+        )
+    )
+    # All-time ledger carry-forward (both entries) so pool_metrics sees the full spend.
     db_session.add(
         PoolIdleCostLedger(
             project_id=project.id,
@@ -4011,7 +4121,6 @@ async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
             retired_at=now - timedelta(days=3),
         )
     )
-    # Out-of-window ledger row: retired 10 days ago (before the 7-day cutoff).
     db_session.add(
         PoolIdleCostLedger(
             project_id=project.id,
@@ -4038,7 +4147,7 @@ async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
     # If the $99 leaked in, incl would be > 99.
     assert incl < 5.0, (
         f"cost_per_merged_pr_incl_pool_idle={incl} should reflect only the "
-        f"in-window $1.00 ledger entry, not the $99 out-of-window entry"
+        f"in-window $1.00 span entry, not the $99 out-of-window entry"
     )
 
 
@@ -4149,18 +4258,10 @@ async def test_all_time_pool_metrics_preserved_alongside_windowed_axis(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
-    """Acceptance gate: read_baseline_with_drift's pool_cost_amortization must
-    use windowed idle cost, NOT the all-time snapshot value.
+async def test_pool_cost_amortization_excludes_pre_window_idle_spend(db_session):
+    """read_baseline_with_drift must use windowed idle cost, not all-time."""
+    from app.vm_cost_rates import idle_cost_usd as _idle_cost_usd
 
-    Seeds a PoolIdleCostLedger row that was retired BEFORE the pool funnel
-    window (i.e. out-of-window pre-window spend) and one that was retired
-    WITHIN the window. After writing a snapshot and calling
-    read_baseline_with_drift, the pool_cost_amortization.pool_idle_cost_usd
-    must reflect only the in-window spend — the large out-of-window row must
-    not inflate it. The pool_idle_cost_usd in the snapshot (all-time) is
-    deliberately larger, confirming the amortization view switched sources.
-    """
     project = make_project(design_doc={})
     db_session.add(project)
     await db_session.commit()
@@ -4179,7 +4280,17 @@ async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
     )
     db_session.add(task)
 
-    # In-window ledger row: retired 2 hours ago (inside any 24h window).
+    # In-window span: settled 2 hours ago (inside any 24h window).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            started_at=now - timedelta(hours=3),
+            settled_at=now - timedelta(hours=2),
+            cost_usd=0.50,
+        )
+    )
+    # All-time ledger carry-forward for the in-window span and an old one.
     db_session.add(
         PoolIdleCostLedger(
             project_id=project.id,
@@ -4188,14 +4299,23 @@ async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
             retired_at=now - timedelta(hours=2),
         )
     )
-    # Out-of-window row: retired 48 hours ago (outside a 24h window).
-    # This simulates the all-time accumulator that previously inflated the guard.
     db_session.add(
         PoolIdleCostLedger(
             project_id=project.id,
             vm_instance_id="vm-out-of-window",
             idle_cost_usd=50.0,
             retired_at=now - timedelta(hours=48),
+        )
+    )
+    db_session.add(
+        PoolVm(
+            project_id=project.id,
+            vm_instance_id="vm-live-old",
+            account_id="acct-live",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+            idle_since=now - timedelta(days=10),
         )
     )
     await db_session.commit()
@@ -4205,7 +4325,6 @@ async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
     drift = await read_baseline_with_drift(db_session, project.id)
     amort = drift["pool_cost_amortization"]
 
-    # The snapshot's all-time pool_idle_cost_usd should include both rows.
     snapshot_all_time = drift.get("pool_idle_cost_usd") or 0.0
     assert snapshot_all_time >= 50.0, (
         "snapshot pool_idle_cost_usd must include all-time spend"
@@ -4220,7 +4339,15 @@ async def test_pool_cost_amortization_uses_windowed_idle_cost(db_session):
     )
     assert amort_idle >= 0.49, (
         f"pool_cost_amortization.pool_idle_cost_usd={amort_idle} should include "
-        "the in-window $0.50 ledger row"
+        "the in-window $0.50 span row"
+    )
+    # Per-account breakdown: live idle member's in-window clamped cost is attributed
+    # to acct-live. The window is 24h (get_pool_funnel_snapshot default); member is
+    # idle 10 days so its contribution is clamped to exactly 24h.
+    amort_by_account = drift["pool_cost_amortization_by_account"]
+    live_expected = _idle_cost_usd(24 * 3600)
+    assert amort_by_account["acct-live"]["pool_idle_cost_usd"] == pytest.approx(
+        live_expected, rel=0.05
     )
 
 
@@ -4270,6 +4397,106 @@ async def test_compute_windowed_idle_cost_fleet_wide(db_session):
     # With both members having equal idle time the fleet total should be ~2x proj_a.
     assert abs(fleet_total - 2 * proj_a_total) < 0.001, (
         f"fleet ({fleet_total}) should be ~2x proj_a ({proj_a_total}) with equal idle time"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acceptance gate: PoolIdleSpan-based windowed attribution (exact span counts)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_windowed_idle_cost_counts_settled_spans_exactly(db_session):
+    """_compute_windowed_idle_cost must include spans whose settled_at is within
+    the window and exclude spans settled before the cutoff — even when both span
+    to the same retired member (verifying per-span attribution, not lump
+    retirement attribution).
+
+    Regression: the old PoolIdleCostLedger approach attributed the member's
+    FULL lifetime banked cost to the retirement window, so a long-lived member
+    that accrued $5 over 5 days but retired at day 0 would contribute $5 to any
+    window it retired into, regardless of when the cost actually accrued.
+
+    This test seeds three PoolIdleSpan rows for the same vm:
+      - span A: settled 5 days ago (outside the 7-day window) — excluded
+      - span B: settled 3 days ago (inside the 7-day window) — included
+      - span C: settled 1 day ago (inside the 7-day window) — included
+
+    The windowed total must match span B + span C exactly.
+    Also verifies that project_id scoping works (a second project's spans are
+    excluded from the first project's windowed result).
+    """
+    from app.efficiency_snapshot import _AXIS_WINDOW_DAYS, _compute_windowed_idle_cost
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_AXIS_WINDOW_DAYS)
+
+    project = make_project(design_doc={})
+    other_project = make_project(design_doc={})
+    db_session.add(project)
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other_project)
+
+    span_a_cost = 0.10  # out-of-window
+    span_b_cost = 0.25  # in-window
+    span_c_cost = 0.40  # in-window
+
+    # Span A: settled before the window cutoff — must be excluded.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=_AXIS_WINDOW_DAYS + 2),
+            settled_at=now - timedelta(days=_AXIS_WINDOW_DAYS + 1),
+            cost_usd=span_a_cost,
+        )
+    )
+    # Span B: settled 3 days ago (inside the window) — must be included.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=4),
+            settled_at=now - timedelta(days=3),
+            cost_usd=span_b_cost,
+        )
+    )
+    # Span C: settled 1 day ago (inside the window) — must be included.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=2),
+            settled_at=now - timedelta(days=1),
+            cost_usd=span_c_cost,
+        )
+    )
+    # A span from another project must not bleed into project's windowed total.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=other_project.id,
+            vm_instance_id="vm-other-project",
+            started_at=now - timedelta(days=2),
+            settled_at=now - timedelta(days=1),
+            cost_usd=50.0,
+        )
+    )
+    await db_session.commit()
+
+    result = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+
+    expected = round(span_b_cost + span_c_cost, 6)
+    assert result["total"] == pytest.approx(expected, abs=1e-6), (
+        f"windowed total {result['total']} should equal span_b+span_c "
+        f"({expected}); span_a ({span_a_cost}) must be excluded"
+    )
+
+    # Fleet-wide query (project_id=None) adds the other-project span.
+    fleet_result = await _compute_windowed_idle_cost(db_session, None, cutoff)
+    assert fleet_result["total"] > result["total"], (
+        "fleet-wide total should exceed project-scoped total"
     )
 
 

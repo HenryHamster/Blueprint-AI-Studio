@@ -24,6 +24,7 @@ import app.shared_state as _shared_state
 import app.warm_pool_maintainer as _wpm
 from app.models import (
     PoolIdleCostLedger,
+    PoolIdleSpan,
     PoolVm,
     PoolVmState,
     Project,
@@ -356,6 +357,51 @@ async def test_retire_carries_banked_idle_cost_to_ledger(db_session, warm_pool_o
     cost = await compute_pool_idle_cost(db_session, project.id)
     assert cost["retired_idle_cost_usd"] == pytest.approx(1.25)
     assert cost["settled_idle_cost_usd"] == pytest.approx(1.25)
+
+
+@pytest.mark.asyncio
+async def test_retire_writes_pool_idle_span_for_final_accrual(
+    db_session, warm_pool_on, mocker
+):
+    """retire_and_delete_pool_vm must write a PoolIdleSpan row for the final
+    idle interval so _compute_windowed_idle_cost can attribute the spend to
+    the exact span end time rather than the member's retirement timestamp."""
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
+
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+
+    project = await _make_project(db_session)
+    member = await _register(db_session, project, "agent-vm-span", PoolVmState.IDLE)
+    now = _utcnow()
+    # Member has been idle for 2 hours — this span must become a PoolIdleSpan row.
+    member.idle_since = now - timedelta(hours=2)
+    db_session.add(member)
+    await db_session.commit()
+
+    ok = await retire_and_delete_pool_vm(
+        db_session, member, reason="pool_idle_ttl", claim_grace_seconds=300
+    )
+    assert ok is True
+
+    # A PoolIdleSpan row must have been written for the 2-hour span.
+    spans = (await db_session.execute(select(PoolIdleSpan))).scalars().all()
+    assert len(spans) == 1, f"expected 1 PoolIdleSpan row, got {len(spans)}"
+    span = spans[0]
+    assert span.vm_instance_id == "agent-vm-span"
+    assert span.cost_usd > 0
+    assert span.reason == "pool_idle_ttl"
+    # The span's settled_at must be recent (within a few seconds).
+    span_age = (now - span.settled_at).total_seconds()
+    assert abs(span_age) < 10, f"settled_at too far from now: {span_age}s"
+
+    # The span must appear in the windowed idle cost (window covers the last 24h).
+    cutoff = now - timedelta(hours=24)
+    windowed = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+    assert windowed["total"] == pytest.approx(span.cost_usd, rel=0.01), (
+        f"windowed total {windowed['total']} should equal the span cost {span.cost_usd}"
+    )
 
 
 @pytest.mark.asyncio
@@ -695,6 +741,9 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
     # against (default config: 10% hit-rate floor, $1 idle-spend floor).
     assert engaged["min_hit_rate"] == pytest.approx(0.10)
     assert engaged["min_idle_cost_usd"] == pytest.approx(1.0)
+    # window_hours is the rolling window idle_cost_usd was computed over; the
+    # panel labels the windowed figure so it cannot be misread as lifetime spend.
+    assert engaged["window_hours"] == 24
 
     # Healthy eligible hit rate (40%) → disengage, provisioning resumes next tick.
     snap.return_value = {
@@ -747,15 +796,26 @@ async def test_evaluate_cost_guard_ignores_out_of_scope_noise(db_session, warm_p
         record_pool_lease_hit,
         record_pool_lease_miss,
     )
+    from app.vm_cost_rates import idle_cost_usd as _idle_cost_usd
 
     _pool_lease_hit_events.clear()
     _pool_cold_dispatch_events.clear()
     _pool_lease_miss_events.clear()
 
-    # Idle spend above the floor so only the hit-rate gate decides engagement.
     project = await _make_project(db_session)
     member = await _register(db_session, project, "agent-vm-noise", PoolVmState.IDLE)
-    member.idle_since = _utcnow() - timedelta(hours=2)
+    now = _utcnow()
+    member.idle_since = now - timedelta(days=10)
+    # A settled span from 2 hours ago (within the 24h guard window).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="agent-vm-inwindow",
+            started_at=now - timedelta(hours=3),
+            settled_at=now - timedelta(hours=2),
+            cost_usd=0.5,
+        )
+    )
     db_session.add(member)
     await db_session.commit()
 
@@ -774,11 +834,10 @@ async def test_evaluate_cost_guard_ignores_out_of_scope_noise(db_session, warm_p
     _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 0.0
 
     guard = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
-    # Raw rate is below the 10% floor, but the eligible rate (90%) is not, so the
-    # guard stays disengaged — the whole point of the fix.
     assert guard["raw_hit_rate"] is not None and guard["raw_hit_rate"] < 0.10
     assert guard["hit_rate"] == 0.9
     assert guard["engaged"] is False
+    assert guard["idle_cost_usd"] == pytest.approx(0.5 + _idle_cost_usd(24 * 3600), rel=0.05)
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from app.landed_signal import (
 )
 from app.models import (
     PoolIdleCostLedger,
+    PoolIdleSpan,
     PoolVm,
     PoolVmState,
     Project,
@@ -235,6 +236,15 @@ _AXIS_WINDOW_DAYS = 7
 # Cap snapshot history length (~1 year of daily snapshots).
 _SNAPSHOT_HISTORY_MAX = 365
 
+# Metric-definition version stamp applied to every new snapshot.  Increment
+# this whenever a metric's computation changes in a way that produces a
+# discontinuity in the persisted history series, so consumers (dashboard,
+# strategist) can annotate the boundary rather than treating it as real drift.
+#
+# v6: cost_per_merged_pr_incl_pool_idle switched from the all-time pool idle
+#     accumulator to a windowed figure matching the dispatch-funnel window.
+METRIC_DEF_VERSION = "v6"
+
 
 async def _load_recent_tasks(
     session: AsyncSession,
@@ -335,7 +345,7 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> float | None:
 
 
 def settle_pool_vm_idle_cost(
-    member: PoolVm, *, now: datetime | None = None
+    member: PoolVm, *, now: datetime | None = None, session=None
 ) -> float:
     """Bank elapsed idle cost onto ``member.idle_cost_banked``; return the amount.
 
@@ -344,17 +354,32 @@ def settle_pool_vm_idle_cost(
     ``idle_since`` to ``now`` so the same span is never billed twice. A no-op
     (returns 0.0) when the member is not currently idle or no time has elapsed.
     The caller owns the transaction (commit).
+
+    When ``session`` is provided, also appends a ``PoolIdleSpan`` row so the
+    windowed idle-cost query can filter on settled_at rather than on the
+    member's retirement timestamp, eliminating lump-attribution distortion.
     """
     if member.idle_since is None:
         return 0.0
     if now is None:
         now = _utcnow()
-    elapsed = (now - member.idle_since).total_seconds()
+    started_at = member.idle_since
+    elapsed = (now - started_at).total_seconds()
     if elapsed <= 0:
         return 0.0
     cost = idle_cost_usd(elapsed)
     member.idle_cost_banked = (member.idle_cost_banked or 0.0) + cost
     member.idle_since = now
+    if session is not None:
+        session.add(
+            PoolIdleSpan(
+                project_id=member.project_id,
+                vm_instance_id=member.vm_instance_id,
+                started_at=started_at,
+                settled_at=now,
+                cost_usd=cost,
+            )
+        )
     return cost
 
 
@@ -473,28 +498,28 @@ async def _compute_windowed_idle_cost(
     attribution and is therefore excluded from per-account totals (but included
     in ``total``).
 
-    Ledger rows (retired members): sum ``idle_cost_usd`` where ``retired_at >=
-    cutoff`` — spend from members that were fully reaped before the window
-    started is excluded.
+    Span rows (settled spans): sum ``cost_usd`` where ``settled_at >= cutoff``
+    — each completed idle period has an exact settled_at timestamp, so only
+    spans that ended inside the window are counted; pre-window spans of
+    in-window retirees are excluded rather than lump-attributed.
 
     Live IDLE members: accrue ``(now - max(idle_since, cutoff))`` seconds so
-    only the portion of idle time that falls inside the window is counted.
-    ``idle_cost_banked`` aggregates past idle periods without per-period
-    timestamps, so it is intentionally excluded; only the current in-progress
-    idle period (idle_since .. now) contributes, clamped to the cutoff.
+    only the portion of the current in-progress idle period that falls inside
+    the window is counted. ``idle_cost_banked`` aggregates past idle periods
+    (already present in PoolIdleSpan rows) and is intentionally excluded here.
     """
     from app.warm_backlog_reuse import _account_label
 
     now = _utcnow()
 
-    # Retired members: only ledger rows whose retirement falls within the window.
-    ledger_stmt = select(
-        func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
-    ).where(PoolIdleCostLedger.retired_at >= cutoff)
+    # Settled spans: only rows whose settlement timestamp falls within the window.
+    span_stmt = select(
+        func.coalesce(func.sum(PoolIdleSpan.cost_usd), 0.0)
+    ).where(PoolIdleSpan.settled_at >= cutoff)
     if project_id is not None:
-        ledger_stmt = ledger_stmt.where(PoolIdleCostLedger.project_id == project_id)
+        span_stmt = span_stmt.where(PoolIdleSpan.project_id == project_id)
     windowed_retired = float(
-        (await session.execute(ledger_stmt)).scalar() or 0.0
+        (await session.execute(span_stmt)).scalar() or 0.0
     )
 
     # Live IDLE members: current idle period clamped to the window start.
@@ -2110,7 +2135,11 @@ async def write_snapshot(
     # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
     captured_at = _utcnow().isoformat()
-    snapshot: Dict[str, Any] = {"captured_at": captured_at, **axes}
+    snapshot: Dict[str, Any] = {
+        "captured_at": captured_at,
+        "metric_def_version": METRIC_DEF_VERSION,
+        **axes,
+    }
 
     # Lock the project row for the read-modify-write so concurrent background
     # writers (e.g. sr_blind_spots, playbook_learning) cannot clobber each
@@ -2393,7 +2422,11 @@ async def read_baseline_with_drift(
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
         history = [
-            {"captured_at": snap.get("captured_at"), "value": snap.get(axis)}
+            {
+                "captured_at": snap.get("captured_at"),
+                "value": snap.get(axis),
+                "def_version": snap.get("metric_def_version"),
+            }
             for snap in snapshots
         ]
         _aprov = member_provenance.get(axis) or {}
@@ -2439,6 +2472,7 @@ async def read_baseline_with_drift(
             {
                 "captured_at": snap.get("captured_at"),
                 "value": snap.get("cost_per_merged_pr_incl_pool_idle"),
+                "def_version": snap.get("metric_def_version"),
             }
             for snap in snapshots
         ],

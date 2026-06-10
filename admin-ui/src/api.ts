@@ -1024,6 +1024,7 @@ export async function previewOnboardProject(
 export interface EfficiencyHistoryPoint {
   captured_at: string | null;
   value: number | null;
+  def_version?: string | null;
 }
 
 export interface EfficiencyAxis {

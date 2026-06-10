@@ -33,6 +33,7 @@ from sqlalchemy import func, or_, select, update
 from app.database import AsyncSessionLocal
 from app.models import (
     PoolIdleCostLedger,
+    PoolIdleSpan,
     PoolVm,
     PoolVmState,
     Project,
@@ -253,6 +254,10 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
         # disengaging the guard. Additive — existing consumers ignore them.
         "min_hit_rate": cfg["min_hit_rate"],
         "min_idle_cost_usd": cfg["min_idle_cost_usd"],
+        # Rolling window the idle_cost_usd was computed over (same window as the
+        # dispatch funnel). Additive — lets the panel label the windowed figure
+        # so it cannot be misread as lifetime idle spend.
+        "window_hours": cfg["window_hours"],
     }
 
 
@@ -373,9 +378,12 @@ async def retire_and_delete_pool_vm(
     # efficiency_snapshot.settle_pool_vm_idle_cost; teardown never erases spend.
     from app.vm_cost_rates import idle_cost_usd
 
+    # Capture idle_since now so we can write the PoolIdleSpan row later (after
+    # winning the claim) with the exact span boundary rather than None.
+    idle_since_snapshot = member.idle_since
     accrued = 0.0
-    if member.idle_since is not None:
-        elapsed = (now - member.idle_since).total_seconds()
+    if idle_since_snapshot is not None:
+        elapsed = (now - idle_since_snapshot).total_seconds()
         if elapsed > 0:
             accrued = idle_cost_usd(elapsed)
     banked = (member.idle_cost_banked or 0.0) + accrued
@@ -436,6 +444,19 @@ async def retire_and_delete_pool_vm(
                     project_id=fresh.project_id,
                     vm_instance_id=vm_id,
                     idle_cost_usd=carried,
+                    reason=reason,
+                )
+            )
+        # Write the final idle span so _compute_windowed_idle_cost can attribute
+        # this accrual to the exact span end time rather than lump it at retirement.
+        if accrued > 0 and idle_since_snapshot is not None:
+            session.add(
+                PoolIdleSpan(
+                    project_id=fresh.project_id,
+                    vm_instance_id=vm_id,
+                    started_at=idle_since_snapshot,
+                    settled_at=now,
+                    cost_usd=accrued,
                     reason=reason,
                 )
             )

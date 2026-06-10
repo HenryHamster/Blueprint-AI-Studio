@@ -310,9 +310,18 @@ function AxisSparkline({ history, favorableDirection }: {
   history: EfficiencyHistoryPoint[];
   favorableDirection: 'lower' | 'higher';
 }) {
-  const points = history
-    .filter((h): h is { captured_at: string; value: number } => h.value !== null)
-    .map(h => ({ v: h.value }));
+  // Track index positions where the metric definition version changes so we
+  // can render a vertical boundary in the sparkline at those discontinuities.
+  const defVersionBoundaries: number[] = [];
+  let prevVersion: string | null | undefined = undefined;
+  const points: Array<{ v: number; defChanged?: boolean }> = [];
+  for (const h of history) {
+    if (h.value === null) continue;
+    const changed = prevVersion !== undefined && h.def_version !== prevVersion;
+    points.push({ v: h.value, defChanged: changed });
+    if (changed) defVersionBoundaries.push(points.length - 1);
+    prevVersion = h.def_version;
+  }
   if (points.length < 2) return null;
   const first = points[0].v;
   const last = points[points.length - 1].v;
@@ -323,6 +332,9 @@ function AxisSparkline({ history, favorableDirection }: {
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={points} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
           <Line dataKey="v" stroke={color} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+          {defVersionBoundaries.map(idx => (
+            <ReferenceLine key={idx} x={idx} stroke="#f59e0b" strokeDasharray="3 2" strokeWidth={1} strokeOpacity={0.8} />
+          ))}
         </LineChart>
       </ResponsiveContainer>
     </div>

@@ -501,7 +501,7 @@ function PoolCostGuardBanner({ guard }: { guard: NonNullable<PoolMetrics['cost_g
             {' '}/ floor {Math.round(guard.min_hit_rate * 100)}%
           </span>
           <span data-testid="pool-cost-guard-idle-cost">
-            idle spend {fmtUsd(guard.idle_cost_usd)} / floor {fmtUsd(guard.min_idle_cost_usd)}
+            idle spend {fmtUsd(guard.idle_cost_usd)}{guard.window_hours != null ? ` (${guard.window_hours}h window)` : ''} / floor {fmtUsd(guard.min_idle_cost_usd)}
           </span>
           <span>dispatches {guard.total_dispatches}</span>
         </div>
