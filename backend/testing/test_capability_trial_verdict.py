@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
     get_effective_holdback_fraction,
+    get_trial_definitions,
     get_trial_verdicts,
     record_trial_verdict,
 )
@@ -146,6 +147,46 @@ class TestEvaluateTrialVerdict:
         assert entry["thresholds"]["min_n_per_arm"] == 30
         assert entry["thresholds"]["adopt_lift"] == 0.05
         assert entry["thresholds"]["reject_lift"] == -0.03
+
+    def test_verdict_reason_sufficient_data_adopt(self):
+        entry = evaluate_trial_verdict(
+            lift=0.06, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_verdict_reason_sufficient_data_reject(self):
+        entry = evaluate_trial_verdict(
+            lift=-0.05, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_verdict_reason_ambiguous_lift(self):
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "ambiguous_lift"
+
+    def test_verdict_reason_insufficient_data_none_lift(self):
+        entry = evaluate_trial_verdict(
+            lift=None, n_with=30, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_data"
+
+    def test_verdict_reason_insufficient_data_below_min_n(self):
+        entry = evaluate_trial_verdict(
+            lift=0.06, n_with=5, n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_data"
 
 
 # ── record_trial_verdict ─────────────────────────────────────────────────────
@@ -357,6 +398,132 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
         assert project.capability_adoption_verdicts["another_cap"]["verdict"] == "reject"
 
+    def test_preserves_prior_adopt_against_insufficient_data(self):
+        project = _make_project()
+        prior = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Incoming verdict: continue-trial with insufficient_data (one arm lost samples)
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 20,
+            "n_without": 2,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Prior adopt verdict must be preserved.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.08
+
+    def test_preserves_prior_reject_against_insufficient_data(self):
+        project = _make_project()
+        prior = {"verdict": "reject", "lift": -0.09, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Incoming verdict: continue-trial with insufficient_data
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 35,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Prior reject verdict must be preserved.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == -0.09
+
+    def test_overwrites_adopt_for_ambiguous_lift(self):
+        project = _make_project()
+        prior = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Incoming verdict: continue-trial with ambiguous_lift (sufficient data, but ambiguous)
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "lift": 0.02,
+            "n_with": 50,
+            "n_without": 50,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Should overwrite: ambiguous_lift with sufficient data supersedes prior adopt.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.02
+
+    def test_preserves_strategist_declared_against_insufficient_data(self):
+        project = _make_project()
+        prior = {
+            "verdict": "adopt",
+            "lift": 0.08,
+            "n_with": 40,
+            "n_without": 40,
+            "evidence_source": "strategic_review",
+        }
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Incoming verdict: continue-trial with insufficient_data
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 2,
+            "n_without": 40,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Strategist-declared verdict must be preserved.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+
+    def test_fresh_adopt_always_overwrites(self):
+        project = _make_project()
+        prior = {"verdict": "reject", "lift": -0.08, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Fresh adopt verdict
+        incoming = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.07,
+            "n_with": 50,
+            "n_without": 50,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Fresh adopt verdict should overwrite regardless of prior state.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.07
+
+    def test_fresh_reject_always_overwrites(self):
+        project = _make_project()
+        prior = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        # Fresh reject verdict
+        incoming = {
+            "verdict": "reject",
+            "verdict_reason": "sufficient_data",
+            "lift": -0.07,
+            "n_with": 50,
+            "n_without": 50,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        # Fresh reject verdict should overwrite regardless of prior state.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == -0.07
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 
@@ -423,3 +590,43 @@ class TestGetEffectiveHoldbackFraction:
     def test_effective_holdback_reject_ignores_default(self):
         result = get_effective_holdback_fraction(self._verdicts("reject"), "repo_map", 0.0)
         assert result == 1.0
+
+
+# ── get_trial_definitions ─────────────────────────────────────────────────────
+
+
+class TestGetTrialDefinitions:
+    def test_returns_repo_map_entry(self):
+        defs = get_trial_definitions()
+        assert len(defs) >= 1
+        caps = [td["cap_name"] for td in defs]
+        assert "repo_map" in caps
+
+    def test_repo_map_entry_has_required_fields(self):
+        defs = get_trial_definitions()
+        rm = next(td for td in defs if td["cap_name"] == "repo_map")
+        assert rm["context_key"] == "_had_repo_map"
+        assert "thresholds" in rm
+        assert "min_n_per_arm" in rm["thresholds"]
+        assert "adopt_lift" in rm["thresholds"]
+        assert "reject_lift" in rm["thresholds"]
+
+    def test_trial_definition_thresholds_fallback_to_defaults(self):
+        """Thresholds in the definition can be overridden per-capability via config."""
+        from app.capability_trial_verdict import (
+            _DEFAULT_ADOPT_LIFT,
+            _DEFAULT_MIN_N_PER_ARM,
+            _DEFAULT_REJECT_LIFT,
+        )
+        defs = get_trial_definitions()
+        rm = next(td for td in defs if td["cap_name"] == "repo_map")
+        # When thresholds are passed as-is to evaluate_trial_verdict, module defaults apply.
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_ADOPT_LIFT,
+            n_with=_DEFAULT_MIN_N_PER_ARM,
+            n_without=_DEFAULT_MIN_N_PER_ARM,
+            config=rm["thresholds"],
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["thresholds"]["adopt_lift"] == _DEFAULT_ADOPT_LIFT
+        assert entry["thresholds"]["reject_lift"] == _DEFAULT_REJECT_LIFT

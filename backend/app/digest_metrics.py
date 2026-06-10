@@ -19,6 +19,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.capability_trial_verdict import get_trial_definitions
 from app.database import resolve_dialect_name
 from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
@@ -125,6 +126,8 @@ _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
 def _compute_first_attempt_breakdowns(
     terminal_tasks: List[Task],
     prev_terminal_tasks: List[Task] | None = None,
+    *,
+    trial_definitions: list | None = None,
 ) -> Dict[str, Any]:
     """Compute overall first-attempt success rate plus playbook and arch-context
     effectiveness comparisons from a list of terminal tasks."""
@@ -149,13 +152,36 @@ def _compute_first_attempt_breakdowns(
     without_arch = [
         t for t in measured if (t.context or {}).get("_had_arch_context") is False
     ]
-    with_rm = [
-        t for t in measured if (t.context or {}).get("_had_repo_map") is True
-    ]
-    without_rm = [
-        t for t in measured if (t.context or {}).get("_had_repo_map") is False
-    ]
     sample_size = len(measured)
+
+    _defs = trial_definitions if trial_definitions is not None else get_trial_definitions()
+    _min_lift_sample = 5
+    trial_breakdowns: Dict[str, Any] = {}
+    for _td in _defs:
+        _cap = _td["cap_name"]
+        _ctx_key = _td["context_key"]
+        _with_arm = [t for t in measured if (t.context or {}).get(_ctx_key) is True]
+        _without_arm = [t for t in measured if (t.context or {}).get(_ctx_key) is False]
+        _with_rate = _fa_rate(_with_arm)
+        _without_rate = _fa_rate(_without_arm)
+        _lift_val: float | None = (
+            round(_with_rate - _without_rate, 2)
+            if (
+                _with_rate is not None
+                and _without_rate is not None
+                and len(_with_arm) >= _min_lift_sample
+                and len(_without_arm) >= _min_lift_sample
+            )
+            else None
+        )
+        trial_breakdowns[_cap] = {
+            "lift": _lift_val,
+            "with_n": len(_with_arm),
+            "without_n": len(_without_arm),
+            "with_rate": _with_rate,
+            "without_rate": _without_rate,
+        }
+
     def _lift(flag, tasks):
         tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         a = [t for t in tasks if (t.context or {}).get(flag) is True]
@@ -243,19 +269,14 @@ def _compute_first_attempt_breakdowns(
         )
         return round(succ / len(measured), 2)
 
-    with_rm_rate = _fa_rate(with_rm)
-    without_rm_rate = _fa_rate(without_rm)
-    _min_lift_sample = 5
-    repo_map_lift: float | None = (
-        round(with_rm_rate - without_rm_rate, 2)
-        if (
-            with_rm_rate is not None
-            and without_rm_rate is not None
-            and len(with_rm) >= _min_lift_sample
-            and len(without_rm) >= _min_lift_sample
-        )
-        else None
-    )
+    # Build flat alias keys from trial_breakdowns for backward compatibility.
+    _flat_trial: Dict[str, Any] = {}
+    for _cap, _bd in trial_breakdowns.items():
+        _flat_trial[f"{_cap}_lift"] = _bd["lift"]
+        _flat_trial[f"with_{_cap}_n"] = _bd["with_n"]
+        _flat_trial[f"without_{_cap}_n"] = _bd["without_n"]
+        _flat_trial[f"with_{_cap}"] = _bd["with_rate"]
+        _flat_trial[f"without_{_cap}"] = _bd["without_rate"]
 
     return {
         "overall": overall,
@@ -268,11 +289,8 @@ def _compute_first_attempt_breakdowns(
         "without_arch_context": _fa_rate(without_arch),
         "arch_context_lift": arch_context_lift,
         "arch_context_lift_trend": arch_context_lift_trend,
-        "with_repo_map": with_rm_rate,
-        "without_repo_map": without_rm_rate,
-        "with_repo_map_n": len(with_rm),
-        "without_repo_map_n": len(without_rm),
-        "repo_map_lift": repo_map_lift,
+        **_flat_trial,
+        "trial_breakdowns": trial_breakdowns,
         "sample_size": sample_size,
         "by_type": by_type,
         "by_scope": by_scope,

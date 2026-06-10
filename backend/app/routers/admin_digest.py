@@ -42,6 +42,7 @@ from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
+    get_trial_definitions,
     get_trial_verdicts,
     record_trial_verdict,
 )
@@ -1374,18 +1375,22 @@ async def _compute_digest(
     # a specific project is in scope (no-op for cross-project digests).
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
-        _rm_verdict_entry = evaluate_trial_verdict(
-            lift=_first_attempt_success_rate.get("repo_map_lift"),
-            n_with=_first_attempt_success_rate.get("with_repo_map_n", 0),
-            n_without=_first_attempt_success_rate.get("without_repo_map_n", 0),
-            window_hours=hours,
-            evaluated_at=_tv_utcnow().isoformat(),
-        )
-        record_trial_verdict(_digest_project, "repo_map", _rm_verdict_entry)
+        _verdict_evaluated_at = _tv_utcnow().isoformat()
+        for _td in get_trial_definitions():
+            _cap = _td["cap_name"]
+            _verdict_entry = evaluate_trial_verdict(
+                lift=_first_attempt_success_rate.get(f"{_cap}_lift"),
+                n_with=_first_attempt_success_rate.get(f"with_{_cap}_n", 0),
+                n_without=_first_attempt_success_rate.get(f"without_{_cap}_n", 0),
+                window_hours=hours,
+                evaluated_at=_verdict_evaluated_at,
+                config=_td["thresholds"],
+            )
+            record_trial_verdict(_digest_project, _cap, _verdict_entry)
         try:
             await session.flush()
         except Exception:
-            logger.warning("[CAPABILITY_TRIAL] failed to flush verdict for repo_map", exc_info=True)
+            logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
 
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks

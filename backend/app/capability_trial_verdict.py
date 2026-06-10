@@ -17,7 +17,7 @@ transition. The old entry is replaced, not appended.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -35,6 +35,30 @@ def _default_config() -> dict[str, Any]:
         "adopt_lift": _DEFAULT_ADOPT_LIFT,
         "reject_lift": _DEFAULT_REJECT_LIFT,
     }
+
+
+class TrialDefinition(TypedDict):
+    cap_name: str
+    context_key: str
+    thresholds: dict[str, Any]
+
+
+TRIAL_DEFINITIONS: list[TrialDefinition] = [
+    {
+        "cap_name": "repo_map",
+        "context_key": "_had_repo_map",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+        },
+    }
+]
+
+
+def get_trial_definitions() -> list[TrialDefinition]:
+    """Return the list of registered capability trial definitions."""
+    return TRIAL_DEFINITIONS
 
 
 def evaluate_trial_verdict(
@@ -62,8 +86,8 @@ def evaluate_trial_verdict(
 
     Returns
     -------
-    A dict with: verdict, lift, n_with, n_without, window_hours, thresholds,
-    and optionally evaluated_at.
+    A dict with: verdict, verdict_reason, lift, n_with, n_without, window_hours,
+    thresholds, and optionally evaluated_at.
     """
     cfg = _default_config()
     if config:
@@ -89,14 +113,18 @@ def evaluate_trial_verdict(
 
     if lift is None or n_with < min_n or n_without < min_n:
         entry["verdict"] = "continue-trial"
+        entry["verdict_reason"] = "insufficient_data"
         return entry
 
     if lift >= adopt_threshold:
         entry["verdict"] = "adopt"
+        entry["verdict_reason"] = "sufficient_data"
     elif lift <= reject_threshold:
         entry["verdict"] = "reject"
+        entry["verdict_reason"] = "sufficient_data"
     else:
         entry["verdict"] = "continue-trial"
+        entry["verdict_reason"] = "ambiguous_lift"
 
     return entry
 
@@ -109,12 +137,16 @@ def record_trial_verdict(
     """Upsert a trial verdict entry for ``cap_name`` into ``project.capability_adoption_verdicts``.
 
     A decided verdict (``adopt`` or ``reject``) is only superseded by another decided
-    verdict or an explicit strategist re-declaration.  A ``continue-trial`` write
-    (insufficient data or ambiguous lift) must never downgrade a decided verdict:
-    once ``adopt`` sets holdback to 0.0, the without-arm cannot repopulate, so the
-    system cannot re-derive that verdict from live data.  Reverting to ``continue-trial``
-    silently re-enables a rejected capability or silently reopens the holdback on an
-    adopted one.
+    verdict, an explicit strategist re-declaration (``evidence_source="strategic_review"``
+    on the incoming entry), or a ``continue-trial`` with ``verdict_reason="ambiguous_lift"``
+    (sufficient data present, but lift is inconclusive).  An insufficient-data
+    ``continue-trial`` must never downgrade a decided verdict: once ``adopt`` sets
+    holdback to 0.0, the without-arm cannot repopulate, so the system cannot re-derive
+    that verdict from live data.  Reverting to ``continue-trial`` silently re-enables a
+    rejected capability or silently reopens the holdback on an adopted one.
+
+    Strategist-declared prior verdicts (``evidence_source="strategic_review"`` on the
+    stored entry) are similarly protected from insufficient-data self-reverts.
 
     Callers must flush/commit the session after this call.
     """
@@ -123,12 +155,15 @@ def record_trial_verdict(
 
     prior = project.capability_adoption_verdicts.get(cap_name)
     prior_verdict = (prior or {}).get("verdict")
+    prior_source = (prior or {}).get("evidence_source")
     new_verdict = entry.get("verdict")
+    new_reason = entry.get("verdict_reason")
 
     if (
-        prior_verdict in ("adopt", "reject")
-        and new_verdict == "continue-trial"
+        new_verdict == "continue-trial"
         and entry.get("evidence_source") != "strategic_review"
+        and (prior_verdict in ("adopt", "reject") or prior_source == "strategic_review")
+        and new_reason != "ambiguous_lift"
     ):
         logger.info(
             "[CAPABILITY_TRIAL] skipping continue-trial write for %s — "

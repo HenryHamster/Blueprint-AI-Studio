@@ -4440,6 +4440,88 @@ def test_first_attempt_breakdowns_repo_map_no_flag_not_counted():
     assert result["repo_map_lift"] is None
 
 
+def test_first_attempt_breakdowns_repo_map_lift_computed_with_enough_samples_via_definitions():
+    """repo_map_lift is computed via the definition-driven path when both arms have >= 5 samples."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["trial_breakdowns"]["repo_map"]["lift"] == 1.0
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    # Flat alias keys remain for backward compatibility.
+    assert result["repo_map_lift"] == 1.0
+    assert result["with_repo_map_n"] == 5
+    assert result["without_repo_map_n"] == 5
+
+
+def test_first_attempt_breakdowns_trial_breakdowns_key_present():
+    """trial_breakdowns sub-dict is present and contains per-cap keys."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "trial_breakdowns" in result
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert "lift" in bd
+    assert "with_n" in bd
+    assert "without_n" in bd
+    assert "with_rate" in bd
+    assert "without_rate" in bd
+
+
+def test_first_attempt_breakdowns_legacy_keys_still_present():
+    """Flat legacy keys repo_map_lift / with_repo_map_n / without_repo_map_n remain."""
+    tasks = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 3
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "repo_map_lift" in result
+    assert "with_repo_map_n" in result
+    assert "without_repo_map_n" in result
+    assert "with_repo_map" in result
+    assert "without_repo_map" in result
+
+
+def _fa_test_cap_task(*, succeeded: bool, had_test_cap: bool | None) -> object:
+    """Task fixture for synthetic test_cap trial definition tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if had_test_cap is not None:
+        ctx["_had_test_cap"] = had_test_cap
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_second_trial_definition_independent():
+    """A second trial definition produces its own lift keys without affecting repo_map."""
+    _test_cap_def = {
+        "cap_name": "test_cap",
+        "context_key": "_had_test_cap",
+        "thresholds": {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
+    }
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+        + [_fa_test_cap_task(succeeded=True, had_test_cap=True)] * 5
+        + [_fa_test_cap_task(succeeded=False, had_test_cap=False)] * 5
+    )
+    from app.capability_trial_verdict import get_trial_definitions
+    combined_defs = get_trial_definitions() + [_test_cap_def]
+    result = _compute_first_attempt_breakdowns(tasks, trial_definitions=combined_defs)
+    # repo_map arm still correct
+    assert result["trial_breakdowns"]["repo_map"]["lift"] == 1.0
+    # test_cap arm independently computed — lift is None because < 5 pure test_cap tasks
+    # in each arm (mixed-context tasks don't contribute to both arms)
+    assert "test_cap" in result["trial_breakdowns"]
+    # Flat keys generated for test_cap
+    assert "test_cap_lift" in result
+    assert "with_test_cap_n" in result
+    assert "without_test_cap_n" in result
+
+
 def test_first_attempt_breakdowns_existing_playbook_keys_unaffected():
     """Adding repo-map keys does not remove or alter the existing playbook keys."""
     tasks = [
