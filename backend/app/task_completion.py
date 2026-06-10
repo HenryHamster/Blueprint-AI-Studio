@@ -50,6 +50,9 @@ from app.compute_experiment_contract import (
 )
 from app.task_capabilities import WRITE_TASK_TYPES
 from app.task_evaluators import (
+    REVIEW_SECOND_OPINION_AWAITING_KEY,
+    REVIEW_SECOND_OPINION_PARKED_KEY,
+    REVIEW_SECOND_OPINION_SOURCE_KEY,
     EvaluationVerdict,
     _extract_compute_measurement,
     evaluate_compute_success_criterion,
@@ -2613,6 +2616,20 @@ def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
 #   challenged_revised    same verdict direction, surviving issue set changed
 #   challenged_rejected   challenge overturns the verdict direction
 REVIEW_SECOND_OPINION_RECONCILIATION_KEY = "review_second_opinion"
+
+# The whole second-opinion key family is task-local state on a single review
+# task (or its challenger). None of it may ride the review→fix→review context
+# copy in review_pipeline._spawn_pipeline_task: an inherited reconciliation
+# record fires the single-shot re-entry override on the NEXT review task,
+# clobbering its fresh verdict with iteration-1's verdict + issues — the
+# identical issue set then trips the stuck-cycle detector and falsely parks
+# the chain (PR #9243). Spawn paths that copy context must exclude these.
+REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS = (
+    REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    REVIEW_SECOND_OPINION_AWAITING_KEY,
+    REVIEW_SECOND_OPINION_PARKED_KEY,
+    REVIEW_SECOND_OPINION_SOURCE_KEY,
+)
 
 
 def _review_issue_signature(issue: Any) -> str:

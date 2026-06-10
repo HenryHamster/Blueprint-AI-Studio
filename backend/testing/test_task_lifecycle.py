@@ -8271,3 +8271,98 @@ async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
         if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_task.id)
     ]
     assert len(challengers_after) == 1, "challenger must not recursively spawn the gate"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_inherited_record_does_not_clobber_verdict(
+    tl_db, mocker
+):
+    """Regression (PR #9243): a reconciliation record inherited from an EARLIER
+    review iteration (leaked via the review→fix→review context copy) must NOT
+    override this review's fresh verdict. Pre-fix, the inherited iteration-1
+    REQUEST_CHANGES + issues clobbered a genuine APPROVE, the verbatim issue
+    set tripped the stuck-cycle detector, and the chain falsely parked. The
+    foreign record must be scrubbed and the gate must run fresh."""
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+    from app.task_evaluators import (
+        REVIEW_SECOND_OPINION_AWAITING_KEY,
+        REVIEW_SECOND_OPINION_PARKED_KEY,
+    )
+
+    (
+        session,
+        factory,
+        project,
+        _original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7784)
+
+    stale_issues = [
+        {"description": "stale issue from iteration 1", "file": "app/x.py", "line": 1}
+    ]
+    inherited_ctx = dict(review_task.context or {})
+    inherited_ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
+        "state": "unchallenged",
+        "primary_verdict": "REQUEST_CHANGES",
+        "reconciled_verdict": "REQUEST_CHANGES",
+        "surviving_issues": stale_issues,
+        "review_task_id": str(uuid.uuid4()),  # a DIFFERENT (earlier) review task
+    }
+    inherited_ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
+        "verdict": "REQUEST_CHANGES",
+        "issues": stale_issues,
+    }
+    inherited_ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(uuid.uuid4())
+    review_task.context = inherited_ctx
+    session.add(review_task)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    # The fresh APPROVE must survive: gate runs fresh (park + challenger), the
+    # inherited REQUEST_CHANGES must NOT spawn a fix or short-circuit to act.
+    await session.refresh(review_task)
+    assert review_task.status == TaskStatus.EVALUATING, (
+        "fresh high-stakes APPROVE must park awaiting a challenge — the "
+        "inherited record must not pre-empt the gate"
+    )
+    assert not captured_spawn, (
+        "inherited iteration-1 REQUEST_CHANGES must not clobber the fresh "
+        "APPROVE into spawning a fix"
+    )
+    assert not merge_mock.called
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None, (
+        "the gate must run fresh for this review despite the inherited record"
+    )
+    parked = (review_task.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
+    assert parked.get("verdict") == "APPROVE", (
+        "the parked snapshot must capture THIS review's verdict, not the "
+        "inherited stale one"
+    )
+
+    # Confirming challenge → the reconciled APPROVE merges, and the record now
+    # belongs to this review task.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs=_panel_logs("APPROVE"),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    rec = (review_task.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+    assert rec is not None
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["review_task_id"] == str(review_task.id)
+    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
+    assert REVIEW_SECOND_OPINION_PARKED_KEY not in (review_task.context or {}), (
+        "the consumed parked snapshot must not linger after reconciliation"
+    )

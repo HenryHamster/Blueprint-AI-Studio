@@ -946,12 +946,16 @@ async def _spawn_verify_tests_task(
     )
 
     # Carry strategic context (direction_id, scope, …) but drop the parking
-    # task's review_loop and transient underscore-internal flags.
+    # task's review_loop, second-opinion state, and transient
+    # underscore-internal flags.
+    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
+
     source_ctx = source_task.context or {}
     propagated_ctx = {
         k: v
         for k, v in source_ctx.items()
         if k != "review_loop"
+        and k not in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
         and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
     }
     propagated_ctx["review_loop"] = {
@@ -2188,13 +2192,19 @@ async def _spawn_pipeline_task(
     propagated_scope = source_ctx.get("scope", source_loop.get("scope", "medium"))
     # Carry strategic context (direction_id, related_files, parent_context, scope, …)
     # from source task so fix/review agents see the same direction/intent the create
-    # task had. Skip underscore-prefixed internal flags (per-task transient state)
-    # and override review_loop below; exceptions in _PROPAGATE_UNDERSCORE_KEYS
-    # carry cross-iteration capability classifiers (e.g. rollup tags).
+    # task had. Skip underscore-prefixed internal flags (per-task transient state),
+    # the second-opinion key family (task-local: an inherited reconciliation
+    # record clobbers the next review's verdict with iteration-1's — see
+    # REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS), and override review_loop below;
+    # exceptions in _PROPAGATE_UNDERSCORE_KEYS carry cross-iteration capability
+    # classifiers (e.g. rollup tags).
+    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
+
     propagated_ctx = {
         k: v
         for k, v in source_ctx.items()
         if k != "review_loop"
+        and k not in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
         and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
     }
     propagated_ctx["scope"] = propagated_scope

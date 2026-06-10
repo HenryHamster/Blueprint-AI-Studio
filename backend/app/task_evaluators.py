@@ -220,10 +220,18 @@ async def spawn_review_second_opinion(
     from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
 
     ctx = dict(review_task.context or {})
-    if (
-        ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY)
-        or ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY) is not None
-    ):
+    _recon = ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+    # A reconciliation record only suppresses the gate when THIS review task
+    # owns it. A record carrying another task's id leaked in via a context copy
+    # (requeue clone, pipeline propagation) — honoring it would silently skip
+    # the challenge for a high-stakes verdict. Non-dict records are malformed;
+    # refuse spawning on them (fail toward single-shot, matching pre-ownership
+    # behavior).
+    _own_record = _recon is not None and (
+        not isinstance(_recon, dict)
+        or _recon.get("review_task_id") == str(review_task.id)
+    )
+    if ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY) or _own_record:
         # Challenge already in flight or already reconciled — never double-spawn.
         return None
 
