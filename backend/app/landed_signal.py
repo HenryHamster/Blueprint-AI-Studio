@@ -39,6 +39,13 @@ LANDED_SIGNAL_KEY = "pr_merged"
 LANDED_ON_INTEGRATION_KEY = "landed_on_integration"
 NON_MERGE_UNBLOCK_REASON_KEY = "_non_merge_unblock_reason"
 
+# Durable negative marker: a rollup whose merge commit was confirmed NOT to be an
+# ancestor of the project's integration branch (``is_ancestor_of`` -> False). The
+# rollup->integration merge never landed, so the task must NOT carry the shipped
+# badge. Recorded analogously to the landed signals above so the stranded state is
+# durable and visible to operators / analytics.
+STRANDED_LANDING_REASON_KEY = "rollup_landing_stranded"
+
 # Where the no-CI merge gate stamps WHY a PR merged without real test
 # verification. Lives under ``task.context["review_loop"]``; absent on a
 # verified/normal merge. The reason KEYS are minted in ``ci_resolution`` and
@@ -273,6 +280,33 @@ def mark_unblocked_non_merge(task: Task, *, reason: str) -> None:
         LANDED_SIGNAL_KEY: True,
         LANDED_ON_INTEGRATION_KEY: False,
         NON_MERGE_UNBLOCK_REASON_KEY: reason,
+    }
+
+
+def mark_stranded_non_landing(task: Task, *, reason: str) -> None:
+    """Stamp the durable negative marker for a rollup that did NOT land.
+
+    Used when an ancestry check definitively proves the rollup's merge commit is
+    not reachable from the integration branch (``is_ancestor_of`` -> False): the
+    rollup->integration merge never completed, so the work is stranded on a
+    staging branch. Records ``landed_on_integration=False`` and the stranded
+    reason WITHOUT setting the ``pr_merged`` unblock bit, so shipped / merge-rate
+    analytics never count it and the rollup does not converge on a false landing.
+
+    Idempotent: re-stamping the same definitive negative only re-writes the same
+    two keys. Callers gate on a DEFINITIVE negative before calling this, so a
+    previously-recorded true landing (whose ancestry check returns True) is never
+    routed here and cannot be flipped.
+    """
+    logger.warning(
+        "[LANDED] stranded non-landing for task %s: %s",
+        getattr(task, "id", None),
+        reason,
+    )
+    task.context = {
+        **(task.context or {}),
+        LANDED_ON_INTEGRATION_KEY: False,
+        STRANDED_LANDING_REASON_KEY: reason,
     }
 
 

@@ -54,6 +54,7 @@ from app.rollup_pr_verification import (  # noqa: F401 — re-exported for calle
     _record_rollup_failure_signals,
     _review_respawn_count,
     _verify_pr_merged,
+    verify_rollup_merge_landed,
 )
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
     _MERGE_QUEUE_UPDATE_AT_KEY,
@@ -351,6 +352,23 @@ async def _classify_merged_rollup_landing(
             merged_base_branch=target_branch,
             source=source,
         )
+    if landed:
+        # Branch-NAME equality above is necessary but NOT sufficient: confirm the
+        # rollup PR's merge commit actually reached the integration branch before
+        # the caller stamps the shipped badge. A DEFINITIVE negative strands the
+        # task (marker + operator alert recorded by the gate); indeterminate /
+        # missing-SHA / API-error preserves flag-trust so a transient outage
+        # never blocks completion.
+        verdict = await verify_rollup_merge_landed(
+            parent,
+            project,
+            session,
+            pr_number=pr_number,
+            integration_branch=integration_branch,
+            source=source,
+        )
+        if verdict == "stranded":
+            landed = False
     return landed, landed or promotion_landing
 
 
@@ -2127,8 +2145,12 @@ async def _check_and_trigger_rollup(
                                 if _terminal_rollup_merge
                                 else TaskStatus.EVALUATING
                             )
+                            # Read the POST-classify context so the durable stranded
+                            # marker written by _classify_merged_rollup_landing (via
+                            # mark_stranded_non_landing) survives this reset; resetting
+                            # from the pre-classify parent_ctx snapshot would clobber it.
                             parent.context = {
-                                **_clear_rollup_transient_state(parent_ctx),
+                                **_clear_rollup_transient_state(parent.context),
                             }
                             if _landed:
                                 apply_merged_landed_signal(
@@ -2910,8 +2932,15 @@ async def _check_and_trigger_rollup(
                             if _terminal_rollup_merge
                             else TaskStatus.EVALUATING
                         )
+                        # Read the POST-classify context: _classify_merged_rollup_landing
+                        # may have written the durable stranded marker
+                        # (landed_on_integration=False + STRANDED_LANDING_REASON_KEY) into
+                        # parent.context via mark_stranded_non_landing. Resetting from the
+                        # pre-classify parent_ctx snapshot would clobber that marker before
+                        # the commit below. _clear_rollup_transient_state preserves the
+                        # landing/stranded keys (they are not transient).
                         parent.context = {
-                            **_clear_rollup_transient_state(parent_ctx),
+                            **_clear_rollup_transient_state(parent.context),
                             "rollup_pr_url": rollup_pr_url,
                         }
                         if _landed:

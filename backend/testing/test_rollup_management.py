@@ -1583,3 +1583,325 @@ async def test_rollup_defers_when_sibling_is_parked(cleanup_db, mocker):
 
     # PARKED sibling kept active_count > 0 → no merge should have fired.
     mock_merge.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Ancestry gate folded into _classify_merged_rollup_landing: a rollup parent's
+# integration landing must be confirmed reachable before the shipped badge.
+# ---------------------------------------------------------------------------
+
+
+def _patch_rollup_ancestry_deps(
+    mocker, *, is_ancestor, merge_commit_sha="cafef00dbabe1234"
+):
+    """Arm the GitHub seams the classify-time ancestry gate consults."""
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": merge_commit_sha},
+    )
+    return mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=is_ancestor,
+    )
+
+
+async def _make_classify_parent(session, project_id):
+    return await _make_task(
+        session,
+        project_id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"rollup_pr_number": 4242},
+    )
+
+
+@pytest.mark.asyncio
+async def test_classify_strands_when_merge_commit_not_ancestor(cleanup_db, mocker):
+    """is_ancestor_of -> False: _classify must report NOT landed (and NOT
+    terminal), record the stranded marker, and raise an operator alert."""
+    from sqlmodel import select as _select
+
+    from app.models import Alert
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+    from app.rollup_management import _classify_merged_rollup_landing
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    anc = _patch_rollup_ancestry_deps(mocker, is_ancestor=False)
+
+    project = await _make_project(cleanup_db, integration_branch="automain")
+    parent = await _make_classify_parent(cleanup_db, project.id)
+
+    landed, terminal = await _classify_merged_rollup_landing(
+        parent,
+        project,
+        cleanup_db,
+        pr_number=4242,
+        target_branch="automain",
+        source="test.auto_merge_success",
+    )
+    await cleanup_db.commit()
+
+    anc.assert_awaited()
+    assert landed is False, "a non-ancestor merge must not count as landed"
+    assert terminal is False
+    ctx = parent.context or {}
+    assert ctx.get("pr_merged") is None
+    assert ctx.get("landed_on_integration") is False
+    assert STRANDED_LANDING_REASON_KEY in ctx
+    alerts = (
+        (await cleanup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_classify_indeterminate_ancestry_preserves_landing(cleanup_db, mocker):
+    """is_ancestor_of -> None: indeterminate ancestry must PRESERVE the
+    flag-trust landing (landed + terminal True) and neither strand nor alert."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+    from app.rollup_management import _classify_merged_rollup_landing
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    anc = _patch_rollup_ancestry_deps(mocker, is_ancestor=None)
+
+    project = await _make_project(cleanup_db, integration_branch="automain")
+    parent = await _make_classify_parent(cleanup_db, project.id)
+
+    landed, terminal = await _classify_merged_rollup_landing(
+        parent,
+        project,
+        cleanup_db,
+        pr_number=4242,
+        target_branch="automain",
+        source="test.auto_merge_success",
+    )
+
+    anc.assert_awaited()
+    assert landed is True
+    assert terminal is True
+    assert STRANDED_LANDING_REASON_KEY not in (parent.context or {})
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_classify_missing_merge_sha_preserves_landing(cleanup_db, mocker):
+    """No merge_commit_sha available -> indeterminate -> preserve flag-trust
+    landing without consulting is_ancestor_of (a transient gap never blocks)."""
+    from app.rollup_management import _classify_merged_rollup_landing
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": None},
+    )
+    anc = mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = await _make_project(cleanup_db, integration_branch="automain")
+    parent = await _make_classify_parent(cleanup_db, project.id)
+
+    landed, terminal = await _classify_merged_rollup_landing(
+        parent,
+        project,
+        cleanup_db,
+        pr_number=4242,
+        target_branch="automain",
+        source="test.auto_merge_success",
+    )
+
+    assert landed is True
+    assert terminal is True
+    anc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_classify_positive_ancestry_lands_as_before(cleanup_db, mocker):
+    """is_ancestor_of -> True: a confirmed integration landing reports landed +
+    terminal exactly as before the gate existed."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+    from app.rollup_management import _classify_merged_rollup_landing
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    anc = _patch_rollup_ancestry_deps(mocker, is_ancestor=True)
+
+    project = await _make_project(cleanup_db, integration_branch="automain")
+    parent = await _make_classify_parent(cleanup_db, project.id)
+
+    landed, terminal = await _classify_merged_rollup_landing(
+        parent,
+        project,
+        cleanup_db,
+        pr_number=4242,
+        target_branch="automain",
+        source="test.auto_merge_success",
+    )
+
+    anc.assert_awaited()
+    assert landed is True
+    assert terminal is True
+    assert STRANDED_LANDING_REASON_KEY not in (parent.context or {})
+    alert_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Strand-marker DURABILITY through the wrapper's context reset. The classify
+# helper writes landed_on_integration=False + STRANDED_LANDING_REASON_KEY into
+# parent.context, but both wrapper paths (_check_and_trigger_rollup's
+# auto_merge_success and existing_pr_merged branches) immediately reassign
+# parent.context. These tests drive the REAL wrapper end-to-end and assert the
+# marker survives the commit — i.e. the reset reads POST-classify context, not
+# a pre-classify snapshot. They would fail against the clobber regression where
+# the reset rebuilt context from a stale `parent_ctx` captured before classify.
+# ---------------------------------------------------------------------------
+
+
+def _stage_gpr_merged_then_sha(mocker, merge_commit_sha="cafef00dbabe1234"):
+    """Patch get_pull_request for the auto_merge_success wrapper: the first two
+    reads (resume validation, diff-size) report an open PR so control reaches the
+    merge; every later read (the ancestry merge_commit_sha fetch and beyond)
+    reports a merged PR carrying the SHA the ancestry gate inspects."""
+    calls = {"n": 0}
+
+    def _gpr(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"merged": False, "state": "open"}
+        if calls["n"] == 2:
+            return {"additions": 10, "deletions": 5, "merged": False, "state": "open"}
+        return {"merged": True, "merge_commit_sha": merge_commit_sha}
+
+    mocker.patch(
+        "app.github.get_pull_request", new_callable=AsyncMock, side_effect=_gpr
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_success_persists_stranded_marker_through_reset(
+    cleanup_db, mocker
+):
+    """Drive the REAL auto_merge_success wrapper with a non-ancestor merge
+    (is_ancestor_of -> False) and confirm the durable stranded marker written by
+    _classify_merged_rollup_landing survives the wrapper's `parent.context = {...}`
+    reset. Guards against the clobber regression that rebuilt context from a
+    pre-classify snapshot, dropping the marker before commit."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+    from app.rollup_management import _check_and_trigger_rollup
+
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    # Re-arm get_pull_request so the ancestry gate can resolve a merge SHA, and
+    # point the ancestry seam at a definitive non-ancestor result.
+    _stage_gpr_merged_then_sha(mocker)
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    anc = mocker.patch(
+        "app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False
+    )
+
+    # Coincide the integration branch with the rollup's default target
+    # (research/conflict-base) so the classify-time ancestry gate fires while the
+    # merge path runs exactly as in test_clean_single_head_migration_rollup_auto_merges.
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_awaited_once()
+    anc.assert_awaited()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    # The durable stranded marker must SURVIVE the wrapper's context reset.
+    assert ctx.get("landed_on_integration") is False
+    assert STRANDED_LANDING_REASON_KEY in ctx
+    # A stranded rollup must NOT carry the shipped badge and stays EVALUATING.
+    assert ctx.get("pr_merged") is None
+    assert parent.status == TaskStatus.EVALUATING
+    # The wrapper still re-stamps the rollup PR url it added during the reset.
+    assert ctx.get("rollup_pr_url")
+
+
+@pytest.mark.asyncio
+async def test_existing_pr_merged_persists_stranded_marker_through_reset(
+    cleanup_db, mocker
+):
+    """Drive the REAL existing_pr_merged wrapper (resume finds the rollup PR
+    already merged) with a non-ancestor merge and confirm the stranded marker
+    survives that path's separate `parent.context = {...}` reset. Same clobber
+    class as the auto_merge_success path, distinct code site."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+    from app.rollup_management import _check_and_trigger_rollup
+
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    # The resume-time existing-PR read already reports the PR merged, so the
+    # wrapper takes the existing_pr_merged branch and never calls merge again.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": "cafef00dbabe1234"},
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    anc = mocker.patch(
+        "app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False
+    )
+
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # The PR was already merged on resume; the wrapper must not re-merge it.
+    mock_merge.assert_not_called()
+    anc.assert_awaited()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("landed_on_integration") is False
+    assert STRANDED_LANDING_REASON_KEY in ctx
+    assert ctx.get("pr_merged") is None
+    assert parent.status == TaskStatus.EVALUATING
