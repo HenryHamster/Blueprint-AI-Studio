@@ -404,6 +404,17 @@ export async function runThinkerWithGate(
 
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
   if (!problemModelParseable) {
+    // Embed the thinker's prior analysis in the repair prompt so the fresh
+    // session can extract the real problem_model JSON rather than echoing
+    // schema-template placeholders (incident: a repair with no prior context
+    // persisted intent.purpose = "Provide a parseable problem_model JSON
+    // object..." and wiped constraints — PR #7435 / BUG_REPORT 8154c2d3).
+    const progressPath = `/tmp/research_progress_${taskId}.md`;
+    const progressBreadcrumb = fs.existsSync(progressPath)
+      ? `\n\n===== RESEARCH PROGRESS BREADCRUMB =====\n${fs.readFileSync(progressPath, 'utf8').slice(0, 10_000)}\n===== END BREADCRUMB =====`
+      : '';
+    const priorAnalysis = thinkerResult.allOutput.slice(-60_000);
+
     problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['intent'],
@@ -414,10 +425,18 @@ export async function runThinkerWithGate(
       },
       reopenPrompt: [
         'Your strategic run completed cleanly, but the required problem_model JSON was not parseable.',
-        'Output ONLY the problem_model JSON object now - no markdown, no explanation, no code fences.',
+        'IMPORTANT: this is a FRESH session — you do NOT have the previous conversation.',
+        'Your previous analysis output is reproduced verbatim below.',
+        'Find the problem_model JSON in it and output ONLY that JSON object now — no markdown, no explanation, no code fences.',
+        'Do NOT use placeholder or template values. Extract the real content from the analysis below.',
         `Write the JSON for ${problemModelPath}.`,
         'Schema reminder:',
         '{"intent":{"purpose":"...","current_focus":"..."},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
+        '',
+        '===== YOUR PREVIOUS ANALYSIS OUTPUT (verbatim) =====',
+        priorAnalysis,
+        '===== END PREVIOUS ANALYSIS OUTPUT =====',
+        progressBreadcrumb,
       ].join('\n'),
       ws,
       statusRef,

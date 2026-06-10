@@ -1307,17 +1307,48 @@ def _merge_operator_owned_fields(
         current.intent.source is not None
         and current.intent.source.type == "user_message"
     )
-    if purpose_was_operator and current.intent.purpose != baseline.intent.purpose:
-        if proposed.intent.purpose not in (
-            baseline.intent.purpose,
-            current.intent.purpose,
+    if purpose_was_operator:
+        # Always-protect: when purpose is operator-owned, an agent-proposed
+        # change is accepted ONLY when the agent supplies user_message
+        # provenance (indicating the user directly updated the purpose
+        # through the conversation thread). Without that, the agent must
+        # route intent changes through pending_user_confirmation instead of
+        # silently overwriting. This closes the repair-path clobber where a
+        # fresh repair session with no prior analysis context echoes
+        # schema-template placeholder text as the purpose
+        # (BUG_REPORT 8154c2d3 / PR #7435).
+        agent_has_user_message_source = (
+            proposed.intent.source is not None
+            and proposed.intent.source.type == "user_message"
+        )
+        if current.intent.purpose != baseline.intent.purpose:
+            # Mid-cycle operator edit: operator always wins regardless of
+            # what the agent proposed.
+            if proposed.intent.purpose not in (
+                baseline.intent.purpose,
+                current.intent.purpose,
+            ):
+                _record(
+                    "intent.purpose",
+                    current.intent.purpose,
+                    proposed.intent.purpose,
+                )
+            proposed.intent.purpose = current.intent.purpose
+            proposed.intent.source = current.intent.source
+        elif (
+            proposed.intent.purpose != current.intent.purpose
+            and not agent_has_user_message_source
         ):
-            _record(
-                "intent.purpose", current.intent.purpose, proposed.intent.purpose
-            )
-        proposed.intent.purpose = current.intent.purpose
-        # Keep operator provenance on the surviving purpose.
-        proposed.intent.source = current.intent.source
+            # No mid-cycle operator edit, but agent is trying to change an
+            # operator-owned purpose without user_message provenance — reject.
+            if proposed.intent.purpose != baseline.intent.purpose:
+                _record(
+                    "intent.purpose",
+                    current.intent.purpose,
+                    proposed.intent.purpose,
+                )
+            proposed.intent.purpose = current.intent.purpose
+            proposed.intent.source = current.intent.source
 
     # context — a mid-cycle change of current vs baseline can only be an
     # operator edit (a single strategic cycle runs at a time), so operator wins.

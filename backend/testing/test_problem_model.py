@@ -1709,31 +1709,64 @@ def test_apply_agent_update_operator_context_and_constraints_edit_wins():
     assert fields == {"context", "constraints"}
 
 
-def test_apply_agent_update_operator_untouched_field_takes_agent_value():
-    """When the operator did NOT touch a field (current == baseline), the agent's
-    new value applies even with a baseline supplied — no ledger entry."""
+def test_apply_agent_update_operator_purpose_rejected_without_user_message_provenance():
+    """Always-protect: when purpose is operator-owned (user_message source) and
+    current == baseline, an agent change without user_message provenance is
+    rejected to the ledger and the operator value is preserved."""
     baseline = _operator_seeded_current()
     current = _operator_seeded_current()  # identical to baseline → untouched
     proposed = {
         "intent": {
             "purpose": "Refined: reliable billing, fast onboarding.",
-            "current_focus": "x",
+            "current_focus": "Phase 2: invoicing.",
         },
     }
     new_raw, diff = apply_agent_update(
         current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
     )
+    # Purpose preserved — no user_message provenance on the proposed change.
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # Agent-owned current_focus still advances freely.
+    assert new_raw["intent"]["current_focus"] == "Phase 2: invoicing."
+    assert diff.get("intent_changed") is True  # current_focus changed
+    # Rejected purpose change recorded to the ledger.
+    ledger = new_raw["rejected_agent_edits"]
+    assert len(ledger) == 1
+    assert ledger[0]["field"] == "intent.purpose"
+    assert ledger[0]["agent_value"] == "Refined: reliable billing, fast onboarding."
+    assert ledger[0]["operator_value"] == "Ship a reliable billing system."
+
+
+def test_apply_agent_update_operator_purpose_allowed_with_user_message_provenance():
+    """Escape hatch: when the agent supplies user_message provenance on the
+    proposed intent, the purpose change is accepted even though it is
+    operator-owned (current == baseline, no mid-cycle edit)."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {
+            "purpose": "Refined: reliable billing, fast onboarding.",
+            "current_focus": "Phase 2: invoicing.",
+            "source": {"type": "user_message", "message_id": "m-42", "excerpt": "Please refine the billing goal"},
+        },
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Purpose accepted — agent supplied user_message provenance.
     assert new_raw["intent"]["purpose"] == "Refined: reliable billing, fast onboarding."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["intent"]["source"]["message_id"] == "m-42"
     assert diff.get("intent_changed") is True
-    # No conflict → no ledger key surfaced (byte-identical to pre-merge output).
     assert "rejected_agent_edits" not in new_raw
 
 
-def test_apply_agent_update_agent_only_change_to_operator_field_applies():
-    """Operator did not edit (current == baseline) but the agent changed an
-    operator-owned field: the agent's value applies, no rejection."""
+def test_apply_agent_update_agent_context_and_constraints_change_applies():
+    """When the operator did NOT touch a field (current == baseline), the agent's
+    new value applies even with a baseline supplied — no ledger entry."""
     baseline = _operator_seeded_current()
-    current = _operator_seeded_current()
+    current = _operator_seeded_current()  # identical to baseline → untouched
     proposed = {
         "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
         "context": {"project_type": "scale-up", "users": "SMBs"},
@@ -1742,7 +1775,9 @@ def test_apply_agent_update_agent_only_change_to_operator_field_applies():
     new_raw, _ = apply_agent_update(
         current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
     )
+    # Context: agent's change applies (not always-protected).
     assert new_raw["context"]["project_type"] == "scale-up"
+    # Constraints: no mid-cycle operator edit — agent's new value applies.
     assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant", "SOC2"]
     assert "rejected_agent_edits" not in new_raw
 
@@ -1838,6 +1873,81 @@ def test_apply_agent_update_ledger_carried_forward_and_capped():
     # Newest (this cycle's purpose conflict) retained at the end; oldest dropped.
     assert ledger[-1]["field"] == "intent.purpose"
     assert ledger[0]["i"] == 1  # entry 0 rolled off
+
+
+# ---------------------------------------------------------------------------
+# always-protect: repair-path clobber scenario (BUG_REPORT 8154c2d3)
+# ---------------------------------------------------------------------------
+
+
+def test_always_protect_repair_placeholder_purpose_rejected():
+    """Concrete repair-path clobber scenario: the JSON repair reopen runs as a
+    fresh session with no prior analysis context and echoes schema-template text
+    as intent.purpose. Because current.intent.source.type == 'user_message' and
+    the proposed intent carries no user_message provenance, the placeholder is
+    rejected and the operator's real purpose is preserved.
+    Note: constraints have no always-protect; the thinker-side fix (embedding
+    prior analysis in the repair prompt) prevents garbage constraints."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    placeholder = (
+        "Provide a parseable problem_model JSON object with all required "
+        "top-level keys for /tmp/problem_model_abc123.json"
+    )
+    proposed = {
+        "intent": {"purpose": placeholder, "current_focus": "x"},
+        "constraints": ["Provide all required top-level keys"],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Operator purpose is preserved; placeholder is rejected.
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # Purpose override recorded.
+    ledger = new_raw["rejected_agent_edits"]
+    fields = {e["field"] for e in ledger}
+    assert "intent.purpose" in fields
+    purpose_entry = next(e for e in ledger if e["field"] == "intent.purpose")
+    assert purpose_entry["agent_value"] == placeholder
+
+
+def test_always_protect_purpose_baseline_equal_no_ledger_when_agent_unchanged():
+    """When the agent does NOT attempt to change an operator-owned purpose
+    (proposed == current), no ledger entry is emitted."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {
+            "purpose": "Ship a reliable billing system.",  # same as current
+            "current_focus": "Phase 2.",
+        },
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_always_protect_empty_constraints_not_flagged():
+    """When current constraints are empty, an agent that also sends empty
+    constraints generates no ledger entry (nothing to protect)."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    # Operator cleared their constraints.
+    current["constraints"] = []
+    baseline_empty = dict(baseline)
+    baseline_empty["constraints"] = []
+    proposed = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "constraints": [],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline_empty
+    )
+    assert new_raw["constraints"] == []
+    assert "rejected_agent_edits" not in new_raw
 
 
 # ---------------------------------------------------------------------------
