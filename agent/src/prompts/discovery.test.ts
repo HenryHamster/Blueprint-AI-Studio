@@ -284,6 +284,34 @@ describe('buildRepoMap', () => {
     expect(result).toContain('hubFn');
   });
 
+  it('buildRepoMap does not collapse same-basename modules across monorepo packages', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      [
+        'packages/api/src/config.ts',
+        'packages/api/src/consumer-a.ts',
+        'packages/api/src/consumer-b.ts',
+        'packages/web/src/config.ts',
+        'packages/web/src/consumer.ts',
+      ].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('packages/api/src/config.ts')) return 'export function apiConfig() {}';
+      if (p.endsWith('packages/web/src/config.ts')) return 'export function webConfig() {}';
+      if (p.endsWith('consumer-a.ts')) return "import { apiConfig } from './config.js';";
+      if (p.endsWith('consumer-b.ts')) return "import { apiConfig } from './config.js';";
+      if (p.endsWith('consumer.ts')) return "import { webConfig } from './config.js';";
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    expect(result).toContain('**packages/api/src/config.ts** (imported by 2)');
+    expect(result).toContain('**packages/web/src/config.ts** (imported by 1)');
+    expect(result.indexOf('packages/api/src/config.ts')).toBeGreaterThan(-1);
+    expect(result.indexOf('packages/web/src/config.ts')).toBeGreaterThan(-1);
+    expect(result.indexOf('packages/api/src/config.ts')).toBeLessThan(result.indexOf('packages/web/src/config.ts'));
+  });
+
   it('output is capped at 3000 chars', () => {
     // Generate many files each exporting a long-named symbol
     const files = Array.from({ length: 30 }, (_, i) => `src/mod${i}.ts`);
