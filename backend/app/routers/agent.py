@@ -86,6 +86,7 @@ from app.claim_task_helpers import (
     _build_direction_narrative,
     _build_problem_model_summary,
     _build_direction_contract,
+    annotate_stale_build_config_dirs,
 )
 
 logger = logging.getLogger(__name__)
@@ -880,12 +881,13 @@ async def claim_task(
     # Add project metadata so agents can adapt to different project structures
     if project:
         _build_cfg = project.build_config or {}
+        _build_cfg_annotated = annotate_stale_build_config_dirs(_build_cfg)
         response["project_metadata"] = {
             "project_id": str(project.id),
             "project_name": project.name,
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
-            "build_config": _build_cfg,
+            "build_config": _build_cfg_annotated,
             "approval_gate_config": project.approval_gate_config or {},
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
@@ -3465,6 +3467,39 @@ async def claim_task(
     else:
         response["build_config"] = {}
 
+    # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
+    # for the agent to read README/manifests, seed design doc sections, and
+    # write back confirmed build/test commands.
+    if task_type == "repo_bootstrap":
+        _bootstrap_payload = _claimed_first_payload or {}
+        response["bootstrap_guidance"] = {
+            "files_to_read": [
+                "README.md", "README.rst", "README",
+                "package.json", "yarn.lock", "pnpm-lock.yaml",
+                "Makefile", "makefile", "GNUmakefile",
+                "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                ".github/workflows/*.yml",
+            ],
+            "design_doc_section": "_repo_overview",
+            "design_doc_section_fields": [
+                "tech_stack",
+                "directory_layout",
+                "first_steps_summary",
+            ],
+            "build_config_writeback_endpoint": (
+                f"PATCH /api/agent/projects/{_claimed_project_id}/build-config/commands"
+            ),
+            "completion_steps": [
+                "Read listed files to understand project structure",
+                "Write design doc section '_repo_overview' with tech_stack, directory_layout, first_steps_summary",
+                "Confirm working build/test commands by running them",
+                "Write confirmed commands back via the build_config_writeback_endpoint",
+            ],
+            "github_owner": _bootstrap_payload.get("github_owner", ""),
+            "github_repo": _bootstrap_payload.get("github_repo", ""),
+            "integration_branch": _bootstrap_payload.get("integration_branch", ""),
+        }
+
     # Fire-and-forget: create an in_progress Check Run for review tasks so the
     # Checks tab shows the review is underway.  Must not block the claim response.
     if task_type == "review":
@@ -4498,3 +4533,93 @@ async def agent_get_knowledge_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Knowledge document not found")
     return serialize_knowledge_document(doc, include_body=True)
+
+
+# ---------------------------------------------------------------------------
+# Agent build-config command write-back
+# ---------------------------------------------------------------------------
+
+
+class _ConfirmedCommandEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    path: str = Field(..., min_length=1)
+    confirmed_test_cmd: str | None = None
+    confirmed_build_cmd: str | None = None
+    confirmed_install_cmd: str | None = None
+
+
+class _BuildConfigCommandsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    task_id: uuid.UUID
+    entries: list[_ConfirmedCommandEntry]
+
+
+@router.patch("/projects/{project_id}/build-config/commands")
+@limiter.limit("30/minute")
+async def agent_write_back_build_config_commands(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: _BuildConfigCommandsRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent write-back endpoint for confirmed build/test/install commands.
+
+    Merges agent-verified commands into the per-directory confirmed_* fields
+    without overwriting operator-set test_cmd / build_cmd / install_cmd.
+    Sets commands_confirmed_at (UTC ISO) and confirming_task_id on each
+    updated entry.
+    """
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    project = await session.get(Project, project_id)
+    if not project or str(project.id) != str(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if str(task.project_id) != str(project_id):
+        raise HTTPException(status_code=403, detail="Task does not belong to project")
+
+    from app.build_config_detection import _normalize_dir_path
+
+    existing = dict(project.build_config or {})
+    directories = [dict(d) for d in (existing.get("directories") or [])]
+    index_by_path = {
+        _normalize_dir_path(d.get("path")): i for i, d in enumerate(directories)
+    }
+
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    task_id_str = str(payload.task_id)
+    updated_paths: list[str] = []
+
+    for entry in payload.entries:
+        norm = _normalize_dir_path(entry.path)
+        if norm not in index_by_path:
+            # Unknown path — skip rather than create synthetic entries from
+            # unverified agent input.
+            raise HTTPException(
+                status_code=404,
+                detail=f"Directory path not found in build config: {entry.path!r}",
+            )
+        idx = index_by_path[norm]
+        dir_entry = directories[idx]
+        if entry.confirmed_test_cmd is not None:
+            dir_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
+        if entry.confirmed_build_cmd is not None:
+            dir_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
+        if entry.confirmed_install_cmd is not None:
+            dir_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+        dir_entry["commands_confirmed_at"] = now_iso
+        dir_entry["confirming_task_id"] = task_id_str
+        directories[idx] = dir_entry
+        updated_paths.append(norm)
+
+    existing["directories"] = directories
+    project.build_config = existing
+    flag_modified(project, "build_config")
+    await session.commit()
+
+    return {"updated_paths": updated_paths, "commands_confirmed_at": now_iso}

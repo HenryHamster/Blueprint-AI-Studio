@@ -98,6 +98,34 @@ def apply_operator_build_config_overrides(
         if _cap_key in existing:
             detected[_cap_key] = existing[_cap_key]
 
+    # Merge per-directory agent-confirmed command fields back onto re-detected
+    # directories.  These are written by the agent write-back endpoint and are
+    # NOT derivable from repo contents, so they must survive re-detection.
+    _CONFIRMED_DIR_KEYS = (
+        "confirmed_test_cmd",
+        "confirmed_build_cmd",
+        "confirmed_install_cmd",
+        "commands_confirmed_at",
+        "confirming_task_id",
+    )
+    existing_dirs = existing.get("directories") or []
+    existing_by_path: Dict[str, Dict[str, Any]] = {}
+    for _d in existing_dirs:
+        if isinstance(_d, dict):
+            _norm = _normalize_dir_path(_d.get("path"))
+            existing_by_path[_norm] = _d
+    if existing_by_path:
+        detected_dirs = detected.get("directories") or []
+        for _entry in detected_dirs:
+            if not isinstance(_entry, dict):
+                continue
+            _norm = _normalize_dir_path(_entry.get("path"))
+            _ex = existing_by_path.get(_norm)
+            if _ex:
+                for _k in _CONFIRMED_DIR_KEYS:
+                    if _k in _ex and _ex[_k] is not None:
+                        _entry[_k] = _ex[_k]
+
     return detected
 
 

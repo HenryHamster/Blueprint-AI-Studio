@@ -1037,6 +1037,7 @@ async def _process_post_commit(
         _handle_compute_experiment_completion,
         _handle_self_audit_completion,
         _handle_memo_completion,
+        _handle_repo_bootstrap_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
     )
@@ -5007,6 +5008,7 @@ async def _process_post_commit(
                     "memo": _handle_memo_completion,
                     "web_research": _handle_web_research_completion,
                     "design": _handle_design_completion,
+                    "repo_bootstrap": _handle_repo_bootstrap_completion,
                 }
                 _capability = get_task_capability(task_type)
                 _handler_name = _capability.completion_handler if _capability else None

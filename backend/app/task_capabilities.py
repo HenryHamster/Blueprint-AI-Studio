@@ -40,6 +40,7 @@ class TaskType(str, Enum):
     compute_experiment = "compute_experiment"
     web_research = "web_research"
     design = "design"
+    repo_bootstrap = "repo_bootstrap"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -638,6 +639,28 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         cost_ceiling_usd=4.0,
         completion_handler="design",
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.repo_bootstrap,
+        "Repo Bootstrap",
+        "read_only",
+        default_category="strategic",
+        description=(
+            "One-time bootstrap for new external repos: reads project structure, "
+            "confirms build/test commands, and seeds design doc sections before "
+            "implementation tasks fan out."
+        ),
+        run_shape="single_agent",
+        output_kind="none",
+        requires_code=True,
+        requires_web=False,
+        evaluation_strategy="none",
+        cost_ceiling_usd=3.0,
+        completion_handler="repo_bootstrap",
+        completion_needs_locked_project=False,
+        strategic_phase=None,
+        filter_visible=False,
+        evaluation="none",
     ),
 )
 

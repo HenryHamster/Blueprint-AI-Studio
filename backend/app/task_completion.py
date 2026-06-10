@@ -3631,6 +3631,44 @@ async def _handle_design_doc_completion(
         )
 
 
+async def _handle_repo_bootstrap_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Handle repo_bootstrap task completion: stamp bootstrap_completed_at on build_config.
+
+    Called when a repo_bootstrap task reaches a terminal COMPLETED state. Marks
+    the project's build_config with the completion timestamp so the strategic spawn
+    gate knows bootstrap has finished and implementation tasks may proceed.
+    """
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        logger.warning(
+            "[BOOTSTRAP] Project %s not found for bootstrap task %s — skipping",
+            task.project_id,
+            task.id,
+        )
+        return
+
+    build_config = dict(project.build_config or {})
+    if build_config.get("bootstrap_completed_at"):
+        logger.info(
+            "[BOOTSTRAP] bootstrap_completed_at already set for project %s — skipping",
+            task.project_id,
+        )
+        return
+
+    build_config["bootstrap_completed_at"] = _utcnow().isoformat()
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+    logger.info(
+        "[BOOTSTRAP] Stamped bootstrap_completed_at for project %s (task %s)",
+        task.project_id,
+        task.id,
+    )
+
+
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:
     """Increment confirmed_count for playbook entries that guided this task's prompt.
 

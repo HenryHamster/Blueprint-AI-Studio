@@ -2674,3 +2674,49 @@ async def strategic_operation(
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
+
+
+# ---------------------------------------------------------------------------
+# Admin read endpoint: build-config confirmed commands
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/admin/projects/{project_id}/build-config/commands")
+async def admin_get_build_config_commands(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Return all directory entries with confirmed vs detected commands and staleness.
+
+    Allows operators to audit what commands have been agent-confirmed without
+    navigating the full build_config JSON.
+    """
+    from app.claim_task_helpers import is_commands_stale
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cfg = project.build_config or {}
+    directories = cfg.get("directories") or []
+    result = []
+    for entry in directories:
+        if not isinstance(entry, dict):
+            continue
+        confirmed_at = entry.get("commands_confirmed_at")
+        result.append(
+            {
+                "path": entry.get("path"),
+                "type": entry.get("type"),
+                "detected_test_cmd": entry.get("test_cmd"),
+                "detected_build_cmd": entry.get("build_cmd"),
+                "detected_install_cmd": entry.get("install_cmd"),
+                "confirmed_test_cmd": entry.get("confirmed_test_cmd"),
+                "confirmed_build_cmd": entry.get("confirmed_build_cmd"),
+                "confirmed_install_cmd": entry.get("confirmed_install_cmd"),
+                "commands_confirmed_at": confirmed_at,
+                "confirming_task_id": entry.get("confirming_task_id"),
+                "commands_stale": is_commands_stale(confirmed_at),
+            }
+        )
+    return {"project_id": str(project_id), "directories": result}

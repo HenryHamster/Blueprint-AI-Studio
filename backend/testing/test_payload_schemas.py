@@ -107,6 +107,7 @@ EXPECTED_TYPES = {
     "compute_experiment",
     "web_research",
     "design",
+    "repo_bootstrap",
 }
 
 

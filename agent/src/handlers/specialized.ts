@@ -941,3 +941,90 @@ Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with to
     logs,
   });
 }
+
+/**
+ * First-cycle repo bootstrap: reads project structure, confirms build/test commands,
+ * and seeds design doc sections before implementation tasks fan out.
+ *
+ * This is a read-only analysis task. The backend injects bootstrap_guidance into the
+ * claim response with structured instructions for what to read and write back.
+ * On COMPLETED, the backend completion handler stamps bootstrap_completed_at on
+ * build_config so the strategic spawn gate allows implementation tasks to proceed.
+ */
+export async function handleRepoBootstrap(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawBaseBranch = resolveBaseBranch(payload, task);
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+
+  statusRef.value = `Cloning ${owner}/${repo} for bootstrap...`;
+  sendLog(ws, `Starting repo bootstrap for ${owner}/${repo}...\n`);
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
+  writePlaybookHelper(taskId);
+  const fetchGuidance = provisionFetchHelper(taskId, task);
+  const disallowedTools = configureAgentPermissions('investigate');
+  const retryContext = buildRetryContext(task);
+  const contextPrefix = buildContextPrefix(task);
+  const contextSection = contextPrefix ? `${contextPrefix}\n` : '';
+
+  // Extract bootstrap_guidance injected by the backend claim handler.
+  const bootstrapGuidance = task.bootstrap_guidance as Record<string, unknown> | undefined;
+  const filesToRead = Array.isArray(bootstrapGuidance?.files_to_read)
+    ? (bootstrapGuidance.files_to_read as string[]).join('\n- ')
+    : 'README.md, package.json, Makefile, Dockerfile, .github/workflows/*.yml';
+  const writebackEndpoint = typeof bootstrapGuidance?.build_config_writeback_endpoint === 'string'
+    ? bootstrapGuidance.build_config_writeback_endpoint
+    : 'PATCH /api/agent/projects/{project_id}/build-config/commands';
+
+  const claudeMdContent = readClaudeMd();
+  const claudeMdSection = claudeMdContent ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
+
+  const bootstrapPrompt = `${contextSection}You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
+
+Your goal: read the repository structure, understand the tech stack and build system, confirm working build/test commands, and seed a design doc section so the first strategic cycle starts with grounded repo knowledge.
+
+## Files to read
+Read as many of these as exist:
+- ${filesToRead}
+
+Also read any detected build/CI manifests you find.
+
+## What to produce
+1. **Design doc section**: Write section \`_repo_overview\` to the project design doc using the write_design_doc_section tool with these fields:
+   - tech_stack: programming language(s), key frameworks, dependency manager
+   - directory_layout: brief description of top-level dirs and their purpose
+   - first_steps_summary: how to clone, install deps, run build, run tests
+
+2. **Confirm build/test commands**: Attempt to run the detected build and test commands. If they succeed, write them back using:
+   \`${writebackEndpoint}\`
+   with the confirmed commands per directory.
+
+3. **Status**: After completing both steps, post COMPLETED status. If you cannot read the repo or run commands, post your findings and complete with whatever you found.
+
+${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
+
+  const promptFingerprint = computePromptFingerprint('repo_bootstrap');
+  setCurrentPromptFingerprint(promptFingerprint);
+  sendHeartbeatSync(taskId, 'Running repo bootstrap...', { prompt_fingerprint: promptFingerprint });
+
+  const { exitCode, allOutput } = await runClaudeCode(
+    bootstrapPrompt, ws, statusRef, model, effort, disallowedTools
+  );
+
+  const summary = allOutput ? allOutput.slice(-500) : 'Bootstrap complete';
+  const rateLimitDetected = matchesRateLimit(allOutput || '');
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0
+      ? { artifact_type: 'ERROR_LOG', failure_category: rateLimitDetected ? 'rate_limited' : 'claude_code_failed' }
+      : { artifact_type: 'BOOTSTRAP_REPORT' }),
+    logs: sanitize(summary),
+  });
+}

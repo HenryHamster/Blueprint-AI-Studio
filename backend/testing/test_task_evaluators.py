@@ -84,6 +84,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "compute_experiment": "artifact-delivery",
         "web_research": "forward-quality",
         "design": "forward-quality",
+        "repo_bootstrap": "none",
     }
 
 

@@ -516,6 +516,14 @@ class BuildConfigDirectoryEntry(BaseModel):
     build_cmd: str | None = None
     test_cmd: str | None = None
     install_cmd: str | None = None
+    # Agent-confirmed commands (write-back from runtime verification).
+    # These are set by the write-back endpoint and never overwrite the
+    # operator-detected originals (test_cmd / build_cmd / install_cmd).
+    confirmed_test_cmd: str | None = None
+    confirmed_build_cmd: str | None = None
+    confirmed_install_cmd: str | None = None
+    commands_confirmed_at: str | None = None  # ISO 8601 UTC timestamp
+    confirming_task_id: str | None = None
 
 
 class MigrationConfig(BaseModel):
@@ -638,6 +646,11 @@ class BuildConfig(BaseModel):
     max_parallel_research: int | None = Field(None, ge=1, le=50)
     max_total_research: int | None = Field(None, ge=1, le=50)
     max_autonomous_tasks_per_hour: int | None = Field(None, ge=1, le=50)
+    # ISO timestamp stamped by _handle_repo_bootstrap_completion when a
+    # repo_bootstrap task finishes successfully. None (absent) means the bootstrap
+    # has not yet run or has not completed. The strategic spawn gate checks this
+    # to defer implementation tasks until the bootstrap has grounded repo knowledge.
+    bootstrap_completed_at: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

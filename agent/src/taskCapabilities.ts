@@ -42,6 +42,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'compute_experiment',
   'web_research',
   'design',
+  'repo_bootstrap',
 ] as const;
 
 export type AgentTaskType = (typeof AGENT_TASK_TYPE_IDS)[number];

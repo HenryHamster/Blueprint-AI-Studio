@@ -3690,6 +3690,35 @@ async def _spawn_strategic_review(
         )
         return False
 
+    # Guard: defer implementation spawning until repo_bootstrap completes.
+    # If bootstrap_completed_at is unset AND there is a pending bootstrap task,
+    # this project is still being onboarded — skip this cycle. If bootstrap has
+    # FAILED or is otherwise terminal, proceed gracefully (degraded path).
+    _build_cfg = project.build_config or {}
+    if not _build_cfg.get("bootstrap_completed_at") and not project.is_self_repo:
+        _pending_bootstrap = (
+            await session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    Task.status.in_([
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                    ]),
+                )
+                .limit(1)
+            )
+        ).first()
+        if _pending_bootstrap is not None:
+            logger.info(
+                "[STRATEGIC] Deferring strategic review for project %s — "
+                "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+                project.id,
+            )
+            return False
+
     # Build direction stats with rich data. Include `active` + `paused` +
     # `proposed`: paused entries are a strong user signal the strategic agent
     # should respect rather than re-propose; proposed entries exist so the

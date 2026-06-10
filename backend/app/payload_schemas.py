@@ -740,6 +740,22 @@ class DesignPayload(BasePayload):
     project_name: str | None = None
 
 
+class RepoBootstrapPayload(BasePayload):
+    """Payload for a one-time repo bootstrap task.
+
+    Auto-spawned at project onboarding time for non-self-repo, non-empty
+    projects. The agent reads repository structure, confirms build/test
+    commands (writing them back via PATCH /api/agent/projects/{id}/build-config/commands),
+    and seeds design doc sections before implementation tasks fan out.
+    """
+
+    type: Literal["repo_bootstrap"] = "repo_bootstrap"
+    github_owner: str = ""
+    github_repo: str = ""
+    integration_branch: str = ""
+    is_first_bootstrap: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -771,6 +787,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.compute_experiment: ComputeExperimentPayload,
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
+    TaskType.repo_bootstrap: RepoBootstrapPayload,
 }
 
 

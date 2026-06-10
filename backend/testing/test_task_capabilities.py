@@ -121,6 +121,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "memo": "memo",
         "web_research": "web_research",
         "design": "design",
+        "repo_bootstrap": "repo_bootstrap",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {
