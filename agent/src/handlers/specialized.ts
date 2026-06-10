@@ -1022,7 +1022,7 @@ Also read any detected build/CI manifests you find.
    The file must contain ONLY the JSON object, no markdown wrapping.
    Also include the same object in your terminal COMPLETED status payload as \`${completionPayloadField}\`.
 
-2. **Confirm build/test commands**: Attempt to run the detected build and test commands. If they succeed, write them back using:
+2. **Confirm build/test/lint commands**: Attempt to run the detected build and test commands. If they succeed, include them in the write-back. Also attempt to run the detected lint command for each directory (if one is present in the build config) — lint verification is best-effort: a lint command that fails or is absent should NOT block bootstrap from completing. If the lint command succeeds, include \`confirmed_lint_cmd\` in the per-directory write-back payload. Write back using:
    \`${writebackEndpoint}\`
    with the confirmed commands per directory.
 
@@ -1035,7 +1035,8 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
   sendHeartbeatSync(taskId, 'Running repo bootstrap...', { prompt_fingerprint: promptFingerprint });
 
   const { exitCode, allOutput } = await runClaudeCode(
-    bootstrapPrompt, ws, statusRef, model, effort, disallowedTools
+    bootstrapPrompt + PLAYBOOK_GUIDANCE + '\nNote: Save reusable setup/environment knowledge to the playbook — environment setup steps, build quirks, version requirements, install workarounds, required env vars, and test-setup knowledge a future agent would otherwise rediscover.\n',
+    ws, statusRef, model, effort, disallowedTools
   );
 
   const rateLimitDetected = matchesRateLimit(allOutput || '');

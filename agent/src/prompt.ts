@@ -60,7 +60,7 @@ export {
 } from './prompts/code-change-helpers.js';
 import { excludeAgentHelpers, isBlueprintSelfRepo } from './prompts/code-change-helpers.js';
 import { isPytestCmd } from './prompts/check-helper.js';
-import { effectiveTestCmd, effectiveBuildCmd } from './utils/test-runners.js';
+import { effectiveTestCmd, effectiveBuildCmd, effectiveLintCmd } from './utils/test-runners.js';
 export { excludeAgentHelpers };
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
@@ -1272,7 +1272,7 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
   const dirs = buildConfig.directories ?? [];
   const dirParts = dirs.map(d => {
     const path = d.path.replace(/\/$/, '');
-    const cmds = [d.lint_cmd, effectiveBuildCmd(d)].filter((c): c is string => !!c);
+    const cmds = [effectiveLintCmd(d), effectiveBuildCmd(d)].filter((c): c is string => !!c);
     return cmds.length
       ? `\`${path}/\` (${cmds.map(c => `\`${c}\``).join(', ')})`
       : `\`${path}/\``;

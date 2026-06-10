@@ -102,6 +102,7 @@ def apply_operator_build_config_overrides(
     # directories.  These are written by the agent write-back endpoint and are
     # NOT derivable from repo contents, so they must survive re-detection.
     _CONFIRMED_DIR_KEYS = (
+        "confirmed_lint_cmd",
         "confirmed_test_cmd",
         "confirmed_build_cmd",
         "confirmed_install_cmd",

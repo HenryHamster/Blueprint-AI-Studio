@@ -24,6 +24,7 @@ export interface DirectoryConfig {
   confirmed_test_cmd?: string;
   confirmed_build_cmd?: string;
   confirmed_install_cmd?: string;
+  confirmed_lint_cmd?: string;
   /** True when the confirmed commands are stale (re-detection ran after confirmation). */
   commands_stale?: boolean;
 }
@@ -53,6 +54,15 @@ export function effectiveBuildCmd(dir: DirectoryConfig): string | undefined {
 export function effectiveInstallCmd(dir: DirectoryConfig): string | undefined {
   if (dir.commands_stale !== true && dir.confirmed_install_cmd) return dir.confirmed_install_cmd;
   return dir.install_cmd;
+}
+
+/**
+ * Returns the effective lint command for a directory: the confirmed command when
+ * it is non-empty and not stale, otherwise the detected lint_cmd.
+ */
+export function effectiveLintCmd(dir: DirectoryConfig): string | undefined {
+  if (dir.commands_stale !== true && dir.confirmed_lint_cmd) return dir.confirmed_lint_cmd;
+  return dir.lint_cmd;
 }
 /** Project-specific Alembic/SQLModel migration layout. Lets a non-Blueprint
  *  repo onboard the `migrate` handler without inheriting Blueprint's

@@ -129,11 +129,32 @@ def test_build_config_directory_entry_defaults_none():
     from app.schemas import BuildConfigDirectoryEntry
 
     entry = BuildConfigDirectoryEntry(path="backend", type="python")
+    assert entry.confirmed_lint_cmd is None
     assert entry.confirmed_test_cmd is None
     assert entry.confirmed_build_cmd is None
     assert entry.confirmed_install_cmd is None
     assert entry.commands_confirmed_at is None
     assert entry.confirming_task_id is None
+
+
+def test_build_config_directory_entry_has_confirmed_lint_cmd():
+    """confirmed_lint_cmd is a first-class field with None default and round-trips correctly."""
+    from app.schemas import BuildConfigDirectoryEntry
+
+    entry = BuildConfigDirectoryEntry(
+        path=".",
+        type="python",
+        lint_cmd="ruff check .",
+        confirmed_lint_cmd="ruff check . --fix",
+        commands_confirmed_at="2026-01-01T00:00:00+00:00",
+    )
+    dumped = entry.model_dump(exclude_none=True)
+    assert dumped["confirmed_lint_cmd"] == "ruff check . --fix"
+    assert dumped["lint_cmd"] == "ruff check ."
+    # A None confirmed_lint_cmd is excluded from exclude_none dump
+    entry2 = BuildConfigDirectoryEntry(path=".", type="python")
+    dumped2 = entry2.model_dump(exclude_none=True)
+    assert "confirmed_lint_cmd" not in dumped2
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +647,102 @@ def test_empty_detection_confirmed_command_flips_verdict_to_tests_gated():
 
 
 @pytest.mark.asyncio
+async def test_write_back_confirmed_lint_cmd(client: AsyncClient, db_session):
+    """confirmed_lint_cmd is persisted and stamps commands_confirmed_at."""
+    project = Project(
+        name="Lint WriteBack Test",
+        user_id="test-user-123",
+        build_config={
+            "language": "python",
+            "directories": [{"path": ".", "type": "python", "lint_cmd": "ruff check ."}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-lint-1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-lint-1")
+    resp = await client.patch(
+        f"/api/agent/projects/{project.id}/build-config/commands",
+        json={
+            "task_id": str(task.id),
+            "entries": [{"path": ".", "confirmed_lint_cmd": "ruff check . --fix"}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "." in data["updated_paths"]
+    assert data["commands_confirmed_at"]
+
+    await db_session.refresh(project)
+    dirs = project.build_config["directories"]
+    assert dirs[0]["confirmed_lint_cmd"] == "ruff check . --fix"
+    # Original detected lint_cmd must not be overwritten
+    assert dirs[0]["lint_cmd"] == "ruff check ."
+    assert dirs[0]["confirming_task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_write_back_unknown_path_lint_only_creates_entry(
+    client: AsyncClient, db_session
+):
+    """An unknown path with only confirmed_lint_cmd (no test/build/install) creates a new entry."""
+    project = Project(
+        name="Lint Unknown Path Test",
+        user_id="test-user-123",
+        build_config={
+            "directories": [{"path": ".", "type": "python"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-lint-new-1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-lint-new-1")
+    resp = await client.patch(
+        f"/api/agent/projects/{project.id}/build-config/commands",
+        json={
+            "task_id": str(task.id),
+            "entries": [{"path": "frontend", "confirmed_lint_cmd": "eslint src/"}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "frontend" in data["updated_paths"]
+
+    await db_session.refresh(project)
+    dirs = project.build_config["directories"]
+    assert len(dirs) == 2
+    new_entry = next(d for d in dirs if d.get("path") == "frontend")
+    assert new_entry["confirmed_lint_cmd"] == "eslint src/"
+    assert new_entry["confirming_task_id"] == str(task.id)
+    # Detected lint_cmd must NOT be set on a freshly-created entry
+    assert "lint_cmd" not in new_entry
+
+
+@pytest.mark.asyncio
 async def test_write_back_empty_confirmed_cmd_unknown_path_skipped(
     client: AsyncClient, db_session
 ):
@@ -669,3 +786,37 @@ async def test_write_back_empty_confirmed_cmd_unknown_path_skipped(
     dirs = project.build_config["directories"]
     # No new directory was created
     assert len(dirs) == 1
+
+
+def test_redetection_preserves_confirmed_lint_cmd():
+    """Re-running detection after a prior confirmation preserves confirmed_lint_cmd."""
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+    existing = {
+        "language": "python",
+        "directories": [
+            {
+                "path": ".",
+                "type": "python",
+                "lint_cmd": "ruff check .",
+                "confirmed_lint_cmd": "ruff check . --fix",
+                "confirmed_test_cmd": "pytest -x",
+                "commands_confirmed_at": recent,
+                "confirming_task_id": "task-abc",
+            }
+        ],
+    }
+    detected = {
+        "language": "python",
+        "directories": [
+            {"path": ".", "type": "python", "lint_cmd": "ruff check ."},
+        ],
+    }
+    result = apply_operator_build_config_overrides(detected, existing)
+    dirs = result["directories"]
+    assert len(dirs) == 1
+    assert dirs[0]["confirmed_lint_cmd"] == "ruff check . --fix"
+    assert dirs[0]["confirmed_test_cmd"] == "pytest -x"
+    assert dirs[0]["commands_confirmed_at"] == recent
+    assert dirs[0]["confirming_task_id"] == "task-abc"

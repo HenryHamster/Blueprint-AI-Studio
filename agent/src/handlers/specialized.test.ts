@@ -1778,6 +1778,14 @@ describe('specialized handler task-specific content contracts', () => {
       expect(call.logs).toBe(JSON.stringify(repoOverview));
     });
 
+    it('repo_bootstrap prompt includes playbook seeding guidance', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('./playbook set');    // PLAYBOOK_GUIDANCE present
+      expect(p).toContain('environment setup'); // bootstrap-specific save note
+    });
+
     it.each([
       ['partial object', { tech_stack: 'TypeScript', directory_layout: 'agent/' }],
       ['array output', ['TypeScript', 'agent/', 'tests']],

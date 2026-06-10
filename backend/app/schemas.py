@@ -549,7 +549,8 @@ class BuildConfigDirectoryEntry(BaseModel):
     install_cmd: str | None = None
     # Agent-confirmed commands (write-back from runtime verification).
     # These are set by the write-back endpoint and never overwrite the
-    # operator-detected originals (test_cmd / build_cmd / install_cmd).
+    # operator-detected originals (lint_cmd / test_cmd / build_cmd / install_cmd).
+    confirmed_lint_cmd: str | None = None
     confirmed_test_cmd: str | None = None
     confirmed_build_cmd: str | None = None
     confirmed_install_cmd: str | None = None

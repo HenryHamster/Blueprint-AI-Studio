@@ -4629,6 +4629,7 @@ async def agent_get_knowledge_document(
 class _ConfirmedCommandEntry(BaseModel):
     model_config = ConfigDict(extra="ignore")
     path: str = Field(..., min_length=1)
+    confirmed_lint_cmd: str | None = None
     confirmed_test_cmd: str | None = None
     confirmed_build_cmd: str | None = None
     confirmed_install_cmd: str | None = None
@@ -4649,10 +4650,10 @@ async def agent_write_back_build_config_commands(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """Agent write-back endpoint for confirmed build/test/install commands.
+    """Agent write-back endpoint for confirmed lint/build/test/install commands.
 
     Merges agent-verified commands into the per-directory confirmed_* fields
-    without overwriting operator-set test_cmd / build_cmd / install_cmd.
+    without overwriting operator-set lint_cmd / test_cmd / build_cmd / install_cmd.
     Sets commands_confirmed_at (UTC ISO) and confirming_task_id on each
     updated entry.
     """
@@ -4692,6 +4693,7 @@ async def agent_write_back_build_config_commands(
             has_confirmed = any(
                 v is not None and str(v).strip()
                 for v in (
+                    entry.confirmed_lint_cmd,
                     entry.confirmed_test_cmd,
                     entry.confirmed_build_cmd,
                     entry.confirmed_install_cmd,
@@ -4700,6 +4702,8 @@ async def agent_write_back_build_config_commands(
             if not has_confirmed:
                 continue
             new_entry: dict = {"path": norm}
+            if entry.confirmed_lint_cmd is not None:
+                new_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
             if entry.confirmed_test_cmd is not None:
                 new_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
             if entry.confirmed_build_cmd is not None:
@@ -4714,6 +4718,8 @@ async def agent_write_back_build_config_commands(
             continue
         idx = index_by_path[norm]
         dir_entry = directories[idx]
+        if entry.confirmed_lint_cmd is not None:
+            dir_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
         if entry.confirmed_test_cmd is not None:
             dir_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
         if entry.confirmed_build_cmd is not None:
