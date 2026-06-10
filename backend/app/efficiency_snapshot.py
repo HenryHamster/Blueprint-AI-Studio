@@ -3040,3 +3040,50 @@ async def get_pool_hit_rate_estimate(
     return await estimate_pool_hit_rate(
         session, project_id, target_size=target_size, window_days=window_days
     )
+
+
+async def compute_project_window_spend_usd(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window_hours: int = 24,
+) -> float:
+    """Total (VM + LLM) spend for a project over a rolling window.
+
+    Includes both terminal and in-flight tasks so the figure reflects
+    real recent spend. Primary use case: the per-project spend ceiling gate
+    in autonomous_research.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.context,
+                Task.vm_spot,
+                Task.vm_machine_type,
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+                Task.api_call_summary,
+                Task.provider,
+                Task.model,
+            )
+        )
+    )
+    tasks = list((await session.execute(stmt)).scalars().all())
+    total = 0.0
+    for t in tasks:
+        total += get_task_total_vm_cost_usd(t)
+        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
+        if input_tokens or output_tokens:
+            key = ((t.provider or "").lower(), (t.model or "").lower())
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                in_rate, out_rate = pricing
+                total += input_tokens * in_rate + output_tokens * out_rate
+    return round(total, 6)

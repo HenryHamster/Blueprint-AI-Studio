@@ -10,7 +10,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
 import {
-  WORKSPACE, sendLog, sendHeartbeatSync, execFileAsync, errorFingerprint, git,
+  WORKSPACE, sendLog, sendHeartbeatSync, execFileAsync, errorFingerprint, git, apiPost,
 } from '../index.js';
 import { runClaudeCode } from '../providers/runners.js';
 import {
@@ -37,7 +37,7 @@ import {
 } from './diff-detection.js';
 import {
   type BuildConfig, type TestRunner,
-  detectTestRunners, isDockerRunner,
+  detectTestRunners, isDockerRunner, describeRunnerDirectory,
   parseFailingTests, buildTargetedPytestRunners,
   classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
   extractTestCoverage, runnerFromCommand,
@@ -86,6 +86,61 @@ function captureFixIterationDiffStat(): string {
 
 function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
+}
+
+type BuildDiscoveryEntry = {
+  path: string;
+  type: string;
+  test_cmd: string;
+  install_cmd?: string;
+  executed_successfully: true;
+};
+
+function toBuildDiscoveryEntry(runner: TestRunner): BuildDiscoveryEntry {
+  const descriptor = describeRunnerDirectory(runner);
+  const entry: BuildDiscoveryEntry = {
+    path: descriptor.path || '.',
+    type: descriptor.type,
+    test_cmd: descriptor.test_cmd,
+    executed_successfully: true,
+  };
+  if (runner.installCmd && runner.installCmd.trim()) {
+    entry.install_cmd = runner.installCmd.trim();
+  }
+  return entry;
+}
+
+async function postBuildDiscoveryReport(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  runners: TestRunner[],
+): Promise<void> {
+  if ((buildConfig?.directories ?? []).length > 0) return;
+  if (runners.length === 0) return;
+
+  const discovered_directories: BuildDiscoveryEntry[] = [];
+  const seen = new Set<string>();
+  for (const runner of runners) {
+    const entry = toBuildDiscoveryEntry(runner);
+    const key = [
+      entry.path,
+      entry.type,
+      entry.test_cmd,
+      entry.install_cmd ?? '',
+    ].join('\u0000');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    discovered_directories.push(entry);
+    if (discovered_directories.length >= 50) break;
+  }
+  if (discovered_directories.length === 0) return;
+
+  try {
+    await apiPost('/api/agent/build-config-discovery', { discovered_directories });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    sendLog(ws, `WARNING: build-config discovery report failed: ${msg.slice(0, 500)}\n`);
+  }
 }
 
 export function matchesTransientSetupFailure(message: string): boolean {
@@ -284,6 +339,7 @@ export async function captureTestBaseline(
 
   const baselineFailures = new Set<string>();
   const taskId = process.env.TASK_ID || '';
+  const successfulRunners: TestRunner[] = [];
 
   for (const runner of runners) {
     // For vitest, request the JSON reporter so we can extract failing
@@ -308,6 +364,7 @@ export async function captureTestBaseline(
         timeoutMs: runnerTimeout,
       });
       // Runner exited cleanly — no failures
+      successfulRunners.push(runner);
     } catch (err: unknown) {
       // execFileAsync sets killed=true and code='ETIMEDOUT' when the process is
       // terminated due to timeout; ENOENT-style errors (failure to spawn) also
@@ -319,6 +376,7 @@ export async function captureTestBaseline(
       );
       if (isTimeout) {
         sendLog(ws, `Test baseline timed out for [${runner.label}] — proceeding without baseline.\n`);
+        await postBuildDiscoveryReport(ws, buildConfig, successfulRunners);
         return null;
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -370,6 +428,8 @@ export async function captureTestBaseline(
       }
     }
   }
+
+  await postBuildDiscoveryReport(ws, buildConfig, successfulRunners);
 
   if (baselineFailures.size > 0) {
     sendLog(ws, `Baseline: ${baselineFailures.size} pre-existing failure(s) found — these will be excluded from test fix analysis.\n`);

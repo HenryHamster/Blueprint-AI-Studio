@@ -552,6 +552,33 @@ class BuildConfigDirectoryEntry(BaseModel):
     confirming_task_id: str | None = None
 
 
+class DiscoveredBuildCommandEntry(BaseModel):
+    """A single directory entry reported by an agent VM after run-time build detection.
+
+    Field names mirror ``BuildConfigDirectoryEntry`` so the merge in
+    ``persist_discovered_build_commands`` is mechanical. ``executed_successfully``
+    is the per-entry evidence gate — only entries with it True are persisted.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    path: str = Field(..., min_length=1, max_length=500)
+    type: str | None = Field(None, pattern="^(python|node|go|rust|other)$")
+    lint_cmd: str | None = Field(None, max_length=500)
+    build_cmd: str | None = Field(None, max_length=500)
+    test_cmd: str | None = Field(None, max_length=500)
+    install_cmd: str | None = Field(None, max_length=500)
+    executed_successfully: bool = False
+
+
+class BuildDiscoveryReport(BaseModel):
+    """Request body for POST /api/agent/build-config-discovery."""
+
+    model_config = ConfigDict(extra="ignore")
+    discovered_directories: List[DiscoveredBuildCommandEntry] = Field(
+        default_factory=list, max_length=50
+    )
+
+
 class MigrationConfig(BaseModel):
     """Per-project Alembic/migration layout override.
 
@@ -677,6 +704,11 @@ class BuildConfig(BaseModel):
     # has not yet run or has not completed. The strategic spawn gate checks this
     # to defer implementation tasks until the bootstrap has grounded repo knowledge.
     bootstrap_completed_at: str | None = None
+    # Per-project 24h rolling-window spend ceiling. When set, autonomous spawning
+    # is paused (and a deduped operator alert emitted) once the project's window
+    # spend meets or exceeds this value. None = disabled (today's behavior).
+    # Operator-created tasks are never blocked — this is a soft autonomous-only gate.
+    daily_spend_ceiling_usd: float | None = Field(None, gt=0)
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

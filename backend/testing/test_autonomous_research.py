@@ -12956,6 +12956,119 @@ async def test_research_payload_omits_demand_when_none(db_session):
     validate_internal_payload(dict(payload), "test_research_no_demand")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-project spend ceiling gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mocker):
+    """Spend ceiling gate blocks spawning when window spend >= ceiling, allows when below,
+    deduplicates alerts, and is a no-op when no ceiling is set.
+
+    Covers: tactical-research gate (end-to-end), alert deduplication, and the
+    unset-ceiling path. The acceptance selector for this task.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    # ── Part 1: ceiling exceeded → no spawn, alert created ──
+    project = Project(
+        name="Spend Ceiling Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend01")],
+        build_config={"daily_spend_ceiling_usd": 1.0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mock_spend = mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=1.5),
+    )
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(tasks) == 0, "No task should be spawned when spend ceiling is exceeded"
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    ceiling_alerts = [a for a in alerts if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts) == 1, "Exactly one spend-ceiling alert should be created"
+    assert "1.5000" in ceiling_alerts[0].message
+    assert "1.0000" in ceiling_alerts[0].message
+
+    # ── Part 2: alert deduplication — second call must not create a second alert ──
+    await _spawn_research_task(project, db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    ceiling_alerts2 = [a for a in alerts2 if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts2) == 1, "Alert must be deduplicated — still exactly one"
+
+    assert mock_spend.call_count >= 2, "Spend function should be called each gate evaluation"
+
+    # ── Part 3: spend below ceiling → task spawned ──
+    project2 = Project(
+        name="Spend Below Ceiling",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend02")],
+        build_config={"daily_spend_ceiling_usd": 10.0},
+        vision={"purpose": "test"},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=2.0),
+    )
+
+    await _spawn_research_task(project2, db_session)
+
+    result2 = await db_session.execute(
+        select(Task).where(Task.project_id == project2.id)
+    )
+    tasks2 = [t for t in result2.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(tasks2) >= 1, "Task should be spawned when spend is below ceiling"
+
+    # ── Part 4: no ceiling set → today's behavior, no alert, no spend query ──
+    project3 = Project(
+        name="No Ceiling",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend03")],
+        build_config={},  # no daily_spend_ceiling_usd
+        vision={"purpose": "test"},
+    )
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    # Re-patch to count calls cleanly for the no-ceiling assertion
+    no_ceiling_mock = mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=999.0),
+    )
+    await _spawn_research_task(project3, db_session)
+
+    assert no_ceiling_mock.call_count == 0, (
+        "compute_project_window_spend_usd must NOT be called when no ceiling is set"
+    )
+    # Also assert no spend-ceiling alerts for project3
+    alerts3 = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project3.id))
+    ).scalars().all()
+    ceiling_alerts3 = [a for a in alerts3 if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts3) == 0, "No alert when no ceiling is configured"
+
+
 @pytest.mark.asyncio
 async def test_research_payload_available_capabilities_carry_proof_status(db_session):
     """The research payload's available_capabilities entries carry the durable
@@ -13386,3 +13499,120 @@ async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, m
         "A strategic cycle must spawn when all directions are in refractory and "
         "force_strategic is set"
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_design_doc_forces_architecture_first_cycle(
+    db_session, mocker
+) -> None:
+    """When a project's design_doc has no architecture content (cycle 1), the
+    strategic spawn runs the full architecture-first pipeline (design_doc_update
+    -> strategic_review) regardless of the cycle-count modulus."""
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+
+    # Create a project with an empty design_doc (only config blocks, no architecture)
+    project = Project(
+        name="Empty Design Doc Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch-test-1")],
+        vision={"purpose": "test architecture bootstrapping", "_research_spawn_count": 6},
+        design_doc={
+            # Only config blocks (underscore-prefixed) — no real architecture content
+            "_auto_remediation": {"enabled": False},
+            "_issue_implementation": {"enabled": False},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Mock tactical research selection to avoid side effects
+    mocker.patch(
+        "app.direction_outcomes._update_direction_research_outcomes",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection._compute_research_anomalies",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    # Spawn on cycle 1 (modulus would normally NOT trigger architecture)
+    await _spawn_research_task(project, db_session)
+
+    # Verify design_doc_update was called (architecture-first pipeline)
+    from app.strategic_spawning import _spawn_design_doc_update
+    assert _spawn_design_doc_update.called, "design_doc_update should spawn on empty design_doc"
+
+    # Verify strategic_review was NOT called directly (it's spawned by design_doc_update completion)
+    from app.strategic_spawning import _spawn_strategic_review
+    assert not _spawn_strategic_review.called, "strategic_review should be deferred to design_doc_update completion"
+
+
+@pytest.mark.asyncio
+async def test_populated_design_doc_respects_architecture_cadence(
+    db_session, mocker
+) -> None:
+    """When a project's design_doc has architecture content, the modulus cadence
+    schedule continues unchanged (cycle 1 runs strategy-only, cycle 3 runs architecture)."""
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+
+    # Create a project with populated design_doc (has systems/* entries)
+    project = Project(
+        name="Populated Design Doc Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch-test-2")],
+        vision={"purpose": "test architecture cadence", "_strategic_cycle_count": 0, "_research_spawn_count": 6},
+        design_doc={
+            # Has real architecture content
+            "systems/auth": {
+                "description": "Authentication system",
+                "modules": ["app/auth.py"],
+                "status": "working",
+            },
+            "summary": {"architecture": "Core architecture overview"},
+            # Config blocks are OK alongside content
+            "_auto_remediation": {"enabled": False},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Mock tactical research selection
+    mocker.patch(
+        "app.direction_outcomes._update_direction_research_outcomes",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection._compute_research_anomalies",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    # Spawn on cycle 1 with architecture_review_frequency=3 (modulus 1 % 3 != 0)
+    await _spawn_research_task(project, db_session)
+
+    # Verify strategic_review was called (strategy-only, no architecture)
+    from app.strategic_spawning import _spawn_strategic_review
+    assert _spawn_strategic_review.called, "strategic_review should spawn on cycle 1 when design_doc is populated"
+
+    # Verify design_doc_update was NOT called (no architecture on cycle 1)
+    from app.strategic_spawning import _spawn_design_doc_update
+    assert not _spawn_design_doc_update.called, "design_doc_update should not spawn on cycle 1 with populated design_doc"

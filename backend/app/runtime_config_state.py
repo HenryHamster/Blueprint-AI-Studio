@@ -679,6 +679,16 @@ runtime_config: Dict = {
     # ``warm_pool.resolve_project_warm_pool_target``; set via
     # /api/admin/settings and the per-project warm-pool target endpoint.
     "warm_pool_target_size_by_project": {},
+    # Per-project concurrent-VM cap ({project_id: int}). OPTIONAL — an EMPTY map
+    # (the default) means NO per-project cap, preserving today's behavior exactly.
+    # A non-zero entry for a project bounds how many CONCURRENT VMs (PROVISIONING
+    # or IN_PROGRESS tasks) that single project may occupy. Candidates from a
+    # project at-or-over its cap are DEFERRED for that dispatch cycle (skip-not-
+    # block: stay QUEUED, never failed, never blocking other projects). They
+    # dispatch normally once the project's active count drops below the cap.
+    # Values are clamped to 1..50; 0 or absent means no cap for that project.
+    # Set via /api/admin/settings. Read by resolve_project_concurrency_cap.
+    "max_concurrent_tasks_by_project": {},
     # Hard ceiling on concurrent live (PROVISIONING/IDLE/LEASED) pool members
     # fleet-wide. The maintainer never provisions past this even if every
     # project is below its target — a dedicated pool budget distinct from the
@@ -1286,6 +1296,26 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set(
                             "warm_pool_target_size_by_project", normalized_targets
                         )
+                if "max_concurrent_tasks_by_project" in config_json:
+                    # Persisted per-project concurrent-VM cap. Normalize to a map of
+                    # trimmed, non-empty string project-id keys to ints clamped to
+                    # 1..50. Values of 0 or less mean "no cap" and are excluded so
+                    # resolve_project_concurrency_cap can treat a missing key as
+                    # "no cap" without distinguishing 0 from absent.
+                    raw_caps = config_json["max_concurrent_tasks_by_project"]
+                    if isinstance(raw_caps, dict):
+                        normalized_caps: dict[str, int] = {}
+                        for proj_key, proj_val in raw_caps.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            if ival > 0:
+                                normalized_caps[sid] = max(1, min(50, ival))
+                        _set("max_concurrent_tasks_by_project", normalized_caps)
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -1475,3 +1505,26 @@ def resolve_project_promotion_enabled(project_id) -> bool:
     if sid in per_project:
         return per_project[sid]
     return bool(runtime_config.get("promotion_enabled"))
+
+
+def resolve_project_concurrency_cap(project_id) -> int | None:
+    """Return the per-project concurrent-VM cap, or None if no cap is set.
+
+    Reads from ``max_concurrent_tasks_by_project`` in runtime_config.  An absent
+    or zero entry means no cap — returns None and the dispatch loop skips the
+    filter for that project (behavior-preserving for unconfigured projects).
+    Mirrors :func:`resolve_project_promotion_enabled` / the warm-pool resolver
+    pattern.
+    """
+    raw = runtime_config.get("max_concurrent_tasks_by_project") or {}
+    if not isinstance(raw, dict):
+        return None
+    sid = str(project_id)
+    val = raw.get(sid)
+    if val is None:
+        return None
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None

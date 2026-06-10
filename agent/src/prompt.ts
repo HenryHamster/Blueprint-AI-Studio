@@ -1399,7 +1399,7 @@ export const FIRST_TASK_GUIDANCE = `
 ## IMPORTANT: First Task on This Repository — Capture What You Learn
 
 This is the first agent task on this repository. There are no existing playbook entries.
-Everything you discover through trial and error is NEW knowledge that will benefit every future agent.
+Everything you discover through trial and error is NEW knowledge that will benefit every future agent, and verified build/test commands now also flow back into the backend automatically when you run them successfully.
 
 **Before you finish this task, use \`./playbook set\` to record:**
 - The exact build and test commands that worked (e.g. \`npm run build\`, \`pytest\`, \`make test\`)
@@ -1408,7 +1408,7 @@ Everything you discover through trial and error is NEW knowledge that will benef
 - Non-obvious directory structure or naming conventions
 - Any workarounds required to get things running
 
-These are high-value entries — saving even 2–3 facts now will save future agents hours of rediscovery.
+These are still high-value entries — the structured backend write is the durable path, and saving even 2–3 facts now will save future agents hours of rediscovery.
 
 \`\`\`bash
 ./playbook set "test-commands" "Run tests with: <command>"

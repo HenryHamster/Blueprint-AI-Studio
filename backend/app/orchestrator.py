@@ -75,6 +75,7 @@ from app.orchestrator_filters import (
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
+    apply_project_concurrency_cap,
     reorder_by_completion_priority,
     _project_fairness_weight,
     collect_dep_uuids,
@@ -2514,6 +2515,52 @@ async def orchestrator_worker():
                 eligible_ids = await cap_pipeline_slots(
                     eligible_ids, candidate_tasks, _runtime_config, session
                 )
+
+                # Step 2.92: Per-project concurrency cap — optional operator
+                # envelope that bounds how many CONCURRENT VMs (PROVISIONING or
+                # IN_PROGRESS tasks) a single project may hold. Candidates from a
+                # project at-or-over its cap are deferred (stay QUEUED, never
+                # failed) so another project's candidate can take the free slot.
+                # Projects with no configured cap are never filtered — behavior
+                # is byte-identical for existing unconfigured projects. Applied
+                # AFTER the pipeline-slot cap and BEFORE fairness so the fairness
+                # reorder never re-admits an already-capped project.
+                _active_by_project: dict = {}
+                for _t in active_tasks_result:
+                    _pid = _t.project_id
+                    _active_by_project[_pid] = _active_by_project.get(_pid, 0) + 1
+                _cap_by_project_raw = _runtime_config.get(
+                    "max_concurrent_tasks_by_project"
+                ) or {}
+                _cap_by_project: dict = {}
+                for _pid_str, _cap_val in _cap_by_project_raw.items():
+                    try:
+                        _cap_int = int(_cap_val)
+                    except (TypeError, ValueError):
+                        continue
+                    if _cap_int > 0:
+                        _cap_by_project[_pid_str] = _cap_int
+                if _cap_by_project:
+                    _str_project_by_id = {
+                        t.id: str(t.project_id) for t in candidate_tasks
+                    }
+                    _str_active_by_project = {
+                        str(pid): cnt for pid, cnt in _active_by_project.items()
+                    }
+                    _before_cap = len(eligible_ids)
+                    eligible_ids = apply_project_concurrency_cap(
+                        eligible_ids,
+                        _str_project_by_id,
+                        _str_active_by_project,
+                        _cap_by_project,
+                    )
+                    _deferred_cap = _before_cap - len(eligible_ids)
+                    if _deferred_cap:
+                        logger.info(
+                            "[ORCHESTRATOR] Per-project cap: deferred %d candidate(s) "
+                            "from at-cap projects",
+                            _deferred_cap,
+                        )
 
                 # Step 2.95: Per-project fairness — round-robin the eligible
                 # tasks across their owning projects BEFORE the slot cap below.

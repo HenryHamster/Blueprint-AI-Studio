@@ -4509,3 +4509,52 @@ async def test_retroactive_provenance_inference_for_existing_baseline(db_session
     # Must point at the first (matching) snapshot, not the second.
     assert entry["seeded_at"] == "2026-05-01T00:00:00"
     assert entry.get("_inferred") is True
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_sums_llm_cost(db_session):
+    """compute_project_window_spend_usd sums VM + LLM spend for tasks in the window."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Task with known LLM tokens, no VM cost (no vm_provisioned_at)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            created_at=now,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(1000 * in_rate + 500 * out_rate, 6)
+    assert total == expected, f"Expected LLM cost {expected}, got {total}"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_zero_for_empty_project(db_session):
+    """Zero tasks in window → 0.0 spend."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    assert total == 0.0

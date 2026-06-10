@@ -1524,6 +1524,17 @@ describe('captureTestBaseline timeout selection', () => {
     vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => ({}),
+      text: () => '',
+      headers: { get: () => null },
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('uses TEST_BASELINE_DOCKER_TIMEOUT (10min) for runners containing scripts/test-backend.sh', async () => {
@@ -1573,6 +1584,17 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
     vi.mocked(fs.existsSync).mockReset();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => ({}),
+      text: () => '',
+      headers: { get: () => null },
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   function fakeSelfRepoFs() {

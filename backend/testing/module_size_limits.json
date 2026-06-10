@@ -89,7 +89,8 @@
     "alert_dispatch.py": 1750,
     "compute_jobs.py": 1800,
     "task_evaluators.py": 1950,
-    "release_scoring.py": 1800
+    "release_scoring.py": 1800,
+    "runtime_config_state.py": 1750
   },
   "agent": {
     "index.ts": 4600,

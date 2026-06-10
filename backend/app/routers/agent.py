@@ -42,6 +42,7 @@ from app.models import (
 from app.time_utils import _to_naive_utc
 from app.schemas import (
     ArtifactDownloadResponse,
+    BuildDiscoveryReport,
     UploadUrlRequest,
     HeartbeatRequest,
     SpawnTaskRequest,
@@ -4677,3 +4678,43 @@ async def agent_write_back_build_config_commands(
     await session.commit()
 
     return {"updated_paths": updated_paths, "commands_confirmed_at": now_iso}
+
+
+@router.post("/build-config-discovery")
+@limiter.limit("30/minute")
+async def agent_build_config_discovery(
+    request: Request,
+    body: BuildDiscoveryReport,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Persist agent-discovered build commands into project build_config.
+
+    Called by the agent VM near task end when it has discovered runnable
+    test/lint/build/install commands from a full repo clone. Uses FILL-ONLY
+    semantics — never overwrites existing operator-set values. The call is
+    advisory: a malformed or no-evidence report produces a clean 200/no-op.
+    """
+    try:
+        project_id = await _resolve_token_project_id(session, token)
+        project = await session.get(Project, project_id)
+        if project is None:
+            return {"persisted": False}
+
+        from app.build_config_detection import persist_discovered_build_commands
+
+        persisted = await persist_discovered_build_commands(
+            project,
+            session,
+            [d.model_dump() for d in body.discovered_directories],
+        )
+        return {"persisted": persisted}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning(
+            "[BUILD_CONFIG] build-config-discovery endpoint error for token sub=%s",
+            token.get("sub"),
+            exc_info=True,
+        )
+        return {"persisted": False}

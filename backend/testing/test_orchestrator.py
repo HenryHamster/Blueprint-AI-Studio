@@ -2326,6 +2326,577 @@ class TestProjectFairness:
         assert _project_fairness_weight(-5) == 1  # negative → floor 1
 
 
+class TestProjectConcurrencyCap:
+    """Per-project concurrent-VM cap (Step 2.92).
+
+    Tests two levels:
+    1. Pure helper ``apply_project_concurrency_cap`` — boundary cases, same-project
+       multi-candidate, missing caps.
+    2. Dispatch-level ``test_per_project_vm_cap_defers_over_cap_project`` — a full
+       orchestrator cycle that proves an over-cap project's QUEUED candidate stays
+       QUEUED while a second project's candidate dispatches into the free slot.
+    """
+
+    # ── Pure-helper unit tests ────────────────────────────────────────────────
+
+    @staticmethod
+    def _cap(eligible, project_by_id, active_by_project_id, cap_by_project_id):
+        from app.orchestrator_filters import apply_project_concurrency_cap
+
+        return apply_project_concurrency_cap(
+            eligible, project_by_id, active_by_project_id, cap_by_project_id
+        )
+
+    def test_no_cap_passes_all_through(self):
+        """Empty cap dict → all candidates pass through unchanged (no-op)."""
+        ids = ["a", "b", "c"]
+        pbi = {"a": "P1", "b": "P1", "c": "P2"}
+        assert self._cap(ids, pbi, {"P1": 2}, {}) == ids
+
+    def test_project_at_cap_defers_its_candidate(self):
+        """Project with active==cap has its candidate deferred; other project passes."""
+        ids = ["p1_task", "p2_task"]
+        pbi = {"p1_task": "P1", "p2_task": "P2"}
+        active = {"P1": 1}
+        caps = {"P1": 1}  # P1 is at its cap
+        result = self._cap(ids, pbi, active, caps)
+        assert "p1_task" not in result
+        assert "p2_task" in result
+
+    def test_project_below_cap_admits_candidate(self):
+        """Project with active < cap admits the next candidate."""
+        ids = ["p1_task"]
+        pbi = {"p1_task": "P1"}
+        active = {"P1": 0}
+        caps = {"P1": 2}
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_task"]
+
+    def test_count_equals_cap_minus_one_admits_exactly_one(self):
+        """active == cap-1: exactly ONE candidate is admitted, the second deferred."""
+        ids = ["p1_a", "p1_b"]
+        pbi = {"p1_a": "P1", "p1_b": "P1"}
+        active = {"P1": 1}
+        caps = {"P1": 2}  # cap=2, active=1 → one slot left
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_a"]  # first admitted; second deferred (would push to 2)
+
+    def test_multiple_same_project_candidates_respect_cap_across_cycle(self):
+        """Two candidates from the same project in one cycle: admitted count
+        tracks within-cycle admissions so both can't slip past a cap of 1."""
+        ids = ["p1_a", "p1_b", "p2_x"]
+        pbi = {"p1_a": "P1", "p1_b": "P1", "p2_x": "P2"}
+        active = {"P1": 0}
+        caps = {"P1": 1}
+        result = self._cap(ids, pbi, active, caps)
+        # Only first P1 candidate admitted; second deferred; P2 never filtered.
+        assert "p1_a" in result
+        assert "p1_b" not in result
+        assert "p2_x" in result
+
+    def test_project_with_no_cap_never_filtered(self):
+        """A project absent from cap_by_project_id is never deferred."""
+        ids = ["uncapped_task"]
+        pbi = {"uncapped_task": "UNCAPPED"}
+        active = {"UNCAPPED": 99}
+        caps = {"OTHER": 1}
+        assert self._cap(ids, pbi, active, caps) == ["uncapped_task"]
+
+    def test_empty_eligible_returns_empty(self):
+        assert self._cap([], {}, {}, {"P1": 1}) == []
+
+    # ── Dispatch-level test ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @pytest.fixture()
+    def orch_cap_db(self, mocker):
+        """In-memory SQLite DB wired into the orchestrator, plus essential mocks."""
+        import asyncio
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from sqlalchemy.dialects.sqlite.base import (
+            SQLiteTypeCompiler as _SQLiteTypeCompiler,
+        )
+
+        if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
+            _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+                type_, **kw
+            )
+        import app.orchestrator as _orch_module
+
+        async def _build():
+            _engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.create_all)
+            _Session = sessionmaker(
+                bind=_engine,
+                class_=AsyncSession,
+                autocommit=False,
+                autoflush=False,
+                expire_on_commit=False,
+            )
+            mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+            mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+            mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
+            mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
+            mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
+            mocker.patch("app.routers.agent_status.record_task_result")
+            mocker.patch(
+                "app.deploy_health._check_monitoring_window", new_callable=AsyncMock
+            )
+            mocker.patch(
+                "app.deploy_health._check_external_health", new_callable=AsyncMock
+            )
+            mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
+            mocker.patch(
+                "app.autonomous_research._check_idle_research", new_callable=AsyncMock
+            )
+            mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
+            mocker.patch(
+                "app.alert_dispatch._create_orchestrator_error_alerts",
+                new_callable=AsyncMock,
+            )
+            mocker.patch(
+                "app.orchestrator._persist_zone_health", new_callable=AsyncMock
+            )
+            mocker.patch(
+                "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+            )
+            # The provision wrapper reaches Secret Manager and GCS via
+            # asyncio.gather BEFORE the (separately mocked) provision_agent_vm
+            # call. Both need real Google credentials: present on GCE agent
+            # VMs (ambient metadata creds) but absent in the CI container,
+            # where DefaultCredentialsError crashes the wrapper and resets the
+            # dispatched task to QUEUED. Patch both so every test in this
+            # class is hermetic and behaves identically in CI and on VMs.
+            mocker.patch(
+                "app.orchestrator.prepare_and_store_agent_secret",
+                new_callable=AsyncMock,
+                return_value="projects/test/secrets/agent/versions/1",
+            )
+            mocker.patch(
+                "app.orchestrator.upload_json_payload",
+                new_callable=AsyncMock,
+                return_value="gs://test-bucket/payloads/test.json",
+            )
+
+            now = self._naive_utcnow()
+            _orch_module._last_pool_refresh = now
+            _orch_module._last_zone_health_persist = now
+            _orch_module._last_orphan_check = now
+            _orch_module._last_evaluating_timeout_check = now
+            _shared_state.deploy_monitoring["task_results"].clear()
+            return _Session, _engine
+
+        loop = asyncio.new_event_loop()
+        try:
+            _Session, _engine = loop.run_until_complete(_build())
+        finally:
+            loop.close()
+        try:
+            yield _Session
+        finally:
+            import contextlib
+
+            async def _teardown():
+                with contextlib.suppress(Exception):
+                    await _engine.dispose()
+
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_teardown())
+            finally:
+                loop.close()
+
+    @staticmethod
+    async def _run_one_cycle(mocker):
+        import asyncio
+        import contextlib
+        import app.orchestrator as _orch_module
+        import app.pipeline_health_state as _pipeline_state
+
+        mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
+        with contextlib.suppress(asyncio.CancelledError):
+            await _orch_module.orchestrator_worker()
+
+        # Drain background provisioning coroutines the cycle spawned so
+        # dangling tasks don't race the post-cycle verify reads on the shared
+        # StaticPool connection. AWAIT them to completion rather than cancel:
+        # with provisioning fully mocked (provision_agent_vm, Secret Manager,
+        # GCS) the wrapper finishes promptly, while a cancel can land mid
+        # DB-query and poison the StaticPool connection — a reconnect to
+        # sqlite :memory: yields an empty database ("no such table: task").
+        _orphan_keys_before = set(_pipeline_state.background_tasks)
+        for _coro in list(_orch_module._provision_coroutines.values()):
+            _loop = _coro.get_loop()
+            if _loop.is_closed():
+                continue
+            with contextlib.suppress(BaseException):
+                await _coro
+        _orch_module._provision_coroutines.clear()
+        for _key in set(_pipeline_state.background_tasks) - _orphan_keys_before:
+            _orphan = _pipeline_state.background_tasks.pop(_key, None)
+            if _orphan is not None:
+                _orphan.cancel()
+                with contextlib.suppress(BaseException):
+                    await _orphan
+
+    @pytest.mark.asyncio
+    async def test_per_project_vm_cap_defers_over_cap_project(
+        self, orch_cap_db, mocker
+    ):
+        """Core acceptance test: a project AT its per-project cap has its QUEUED
+        candidate DEFERRED while a SECOND project's candidate dispatches into the
+        free fleet slot.  The over-cap project is NOT failed; its task stays QUEUED.
+        """
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+
+        # Patch provisioning so any selected task becomes PROVISIONING without a
+        # real GCP call.  The return value is ignored by the dispatch path.
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-cap-test",
+                    "name": "Cap Test Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        import app.orchestrator as _orch_module
+
+        # 2 slots total; project1 already occupies 1 (PROVISIONING) → 1 slot free.
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+        project1_id = None
+        p1_queued_id = None
+        p2_queued_id = None
+
+        async with orch_cap_db() as session:
+            # Project1: at its per-project cap of 1 (1 active task).
+            project1 = make_project(name="CapProject1", user_id=_TEST_USER)
+            project2 = make_project(name="CapProject2", user_id=_TEST_USER)
+            session.add(project1)
+            session.add(project2)
+            await session.commit()
+            await session.refresh(project1)
+            await session.refresh(project2)
+            project1_id = project1.id
+
+            # Project1 already has 1 active task (PROVISIONING) → at cap=1.
+            p1_active = make_task(
+                project_id=project1.id,
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id="vm-already-running",
+                payloads=[{"type": "create", "prompt": "active work"}],
+            )
+            # Project1's QUEUED candidate — should be DEFERRED.
+            p1_queued = make_task(
+                project_id=project1.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "queued for cap project"}],
+            )
+            # Project2's QUEUED candidate — should DISPATCH into the free slot.
+            p2_queued = make_task(
+                project_id=project2.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "queued for other project"}],
+            )
+            session.add(p1_active)
+            session.add(p1_queued)
+            session.add(p2_queued)
+            await session.commit()
+            await session.refresh(p1_queued)
+            await session.refresh(p2_queued)
+            p1_queued_id = p1_queued.id
+            p2_queued_id = p2_queued.id
+
+        # Configure the per-project cap for project1.
+        _orch_module._runtime_config["max_concurrent_tasks_by_project"] = {
+            str(project1_id): 1,
+        }
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_tasks_by_project", None)
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            p1_row = (
+                (await verify.execute(_select(Task).where(Task.id == p1_queued_id)))
+                .scalars()
+                .first()
+            )
+            p2_row = (
+                (await verify.execute(_select(Task).where(Task.id == p2_queued_id)))
+                .scalars()
+                .first()
+            )
+
+        assert p1_row is not None
+        assert p1_row.status == TaskStatus.QUEUED, (
+            f"Project1 (at cap) must stay QUEUED, got {p1_row.status}"
+        )
+        assert p2_row is not None
+        assert p2_row.status == TaskStatus.PROVISIONING, (
+            f"Project2 (no cap) must be dispatched PROVISIONING, got {p2_row.status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unset_cap_leaves_dispatch_unchanged(self, orch_cap_db, mocker):
+        """When no per-project cap is configured the dispatch result is identical
+        to today's behavior: every eligible QUEUED task may dispatch normally."""
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-nocap",
+                    "name": "NoCap Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        import app.orchestrator as _orch_module
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 4
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+        # Explicitly empty caps — no project is filtered.
+        _orch_module._runtime_config["max_concurrent_tasks_by_project"] = {}
+
+        queued_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="NoCap", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "uncapped task"}],
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            queued_id = task.id
+
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_tasks_by_project", None)
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .first()
+            )
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            f"Uncapped task must dispatch normally, got {row.status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_previously_deferred_task_dispatches_when_active_drops(
+        self, orch_cap_db, mocker
+    ):
+        """A task deferred because its project was at-cap dispatches on the next
+        cycle once the project's active count drops below the cap."""
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-deferred",
+                    "name": "Deferred Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        import app.orchestrator as _orch_module
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 3
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+        project_id = None
+        active_task_id = None
+        queued_id = None
+
+        async with orch_cap_db() as session:
+            project = make_project(name="DeferredProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            project_id = project.id
+
+            active_task = make_task(
+                project_id=project.id,
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id="vm-active",
+                payloads=[{"type": "create", "prompt": "already running"}],
+            )
+            queued_task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "waiting for slot"}],
+            )
+            session.add(active_task)
+            session.add(queued_task)
+            await session.commit()
+            await session.refresh(active_task)
+            await session.refresh(queued_task)
+            active_task_id = active_task.id
+            queued_id = queued_task.id
+
+        # Cycle 1: project at cap=1 (1 PROVISIONING) → QUEUED candidate deferred.
+        _orch_module._runtime_config["max_concurrent_tasks_by_project"] = {
+            str(project_id): 1,
+        }
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_tasks_by_project", None)
+
+        async with orch_cap_db() as mid_check:
+            row = (
+                (await mid_check.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .first()
+            )
+        assert row is not None
+        assert row.status == TaskStatus.QUEUED, (
+            f"Task must stay QUEUED when project is at cap; got {row.status}"
+        )
+
+        # Simulate the active task completing (COMPLETED) → project drops below cap.
+        async with orch_cap_db() as release:
+            active_row = (
+                (await release.execute(_select(Task).where(Task.id == active_task_id)))
+                .scalars()
+                .first()
+            )
+            active_row.status = TaskStatus.COMPLETED
+            release.add(active_row)
+            await release.commit()
+
+        # Cycle 2: project now has 0 active → under cap=1 → candidate dispatches.
+        _orch_module._runtime_config["max_concurrent_tasks_by_project"] = {
+            str(project_id): 1,
+        }
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_tasks_by_project", None)
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as final_check:
+            row = (
+                (await final_check.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .first()
+            )
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            f"Previously-deferred task must dispatch once active count drops; got {row.status}"
+        )
+
+
 class TestBatchedDepRowsSurviveCommit:
     """The N+1 dependency-fetch fix batches ALL dep rows in one IN(...) query
     in a separate session, then DETACHES them (expunge_all) so they survive the
@@ -3188,6 +3759,9 @@ class TestWarmVMSkipProvision:
         # the conflict we are eliminating.
         _orphan_keys_before = set(_pipeline_state.background_tasks)
         for _coro in list(_orch_module._provision_coroutines.values()):
+            _loop = _coro.get_loop()
+            if _loop.is_closed():
+                continue
             _coro.cancel()
             with contextlib.suppress(BaseException):
                 await _coro

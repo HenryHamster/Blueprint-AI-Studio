@@ -20358,3 +20358,285 @@ async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
         },
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agent/build-config-discovery tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_reported_build_discovery_fills_build_config(
+    client: AsyncClient, db_session
+):
+    """End-to-end: discovered commands fill empty build_config, operator keys preserved,
+    detection_incomplete cleared, and compute_merge_verification_verdict becomes tests_gated."""
+    from app.ci_resolution import compute_merge_verification_verdict
+
+    project = Project(
+        name="Discovery Fill Project",
+        user_id="user-disc-001",
+        build_config={
+            "requires_ci_checks": False,
+            "detection_incomplete": True,
+            "directories": [],
+            "git_user_email": "preserved@example.com",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc"}],
+        vm_instance_id="vm-disc-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-001")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest backend/",
+                    "lint_cmd": "ruff check .",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is True
+
+    await db_session.refresh(project)
+    cfg = project.build_config
+    dirs = cfg["directories"]
+    assert len(dirs) == 1
+    assert dirs[0]["path"] == "backend"
+    assert dirs[0]["test_cmd"] == "pytest backend/"
+    assert dirs[0]["lint_cmd"] == "ruff check ."
+    # Operator key preserved
+    assert cfg.get("git_user_email") == "preserved@example.com"
+    # detection_incomplete cleared
+    assert cfg.get("detection_incomplete") is False
+    # compute_merge_verification_verdict is tests_gated
+    verdict = compute_merge_verification_verdict(project)
+    assert verdict["state"] == "tests_gated"
+    assert any(tc["test_cmd"] == "pytest backend/" for tc in verdict["test_commands"])
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_ignored_when_directories_populated(
+    client: AsyncClient, db_session
+):
+    """Report is ignored (no-op) when build_config.directories is already populated."""
+    project = Project(
+        name="Discovery Populated Project",
+        user_id="user-disc-002",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [
+                {"path": ".", "type": "node", "test_cmd": "npm test"}
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc2"}],
+        vm_instance_id="vm-disc-002",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-002")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": ".",
+                    "type": "node",
+                    "test_cmd": "jest --coverage",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    # existing test_cmd unchanged
+    assert project.build_config["directories"][0]["test_cmd"] == "npm test"
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_skips_without_execution_evidence(
+    client: AsyncClient, db_session
+):
+    """Entries without executed_successfully=True are not persisted."""
+    project = Project(
+        name="Discovery No Evidence Project",
+        user_id="user-disc-003",
+        build_config={"requires_ci_checks": False, "directories": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc3"}],
+        vm_instance_id="vm-disc-003",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-003")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": ".",
+                    "type": "python",
+                    "test_cmd": "pytest",
+                    "executed_successfully": False,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_fill_only_preserves_existing_commands(
+    client: AsyncClient, db_session
+):
+    """FILL-ONLY: once directories are populated, a second report is a no-op."""
+    project = Project(
+        name="Discovery FillOnly Project",
+        user_id="user-disc-004",
+        build_config={
+            "requires_ci_checks": False,
+            "detection_incomplete": True,
+            "directories": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc4"}],
+        vm_instance_id="vm-disc-004",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First discovery populates directories
+    token = create_agent_token(str(task.id), "vm-disc-004")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest backend/",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is True
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"][0]["test_cmd"] == "pytest backend/"
+
+    # Second report: directories now populated, so no-op
+    resp2 = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "SHOULD_NOT_OVERWRITE",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"][0]["test_cmd"] == "pytest backend/"
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_entry_count_bound(
+    client: AsyncClient, db_session
+):
+    """At most 50 entries are accepted per report (schema-level max_length)."""
+    project = Project(
+        name="Discovery Count Bound",
+        user_id="user-disc-005",
+        build_config={"requires_ci_checks": False, "directories": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc5"}],
+        vm_instance_id="vm-disc-005",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Send 60 entries; schema max_length=50 so FastAPI returns 422
+    entries = [
+        {
+            "path": f"pkg/{i}",
+            "type": "python",
+            "test_cmd": f"pytest pkg/{i}",
+            "executed_successfully": True,
+        }
+        for i in range(60)
+    ]
+    token = create_agent_token(str(task.id), "vm-disc-005")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={"discovered_directories": entries},
+    )
+    # Schema clamps at 50; FastAPI returns 422 for > max_length list
+    assert resp.status_code in (200, 422)

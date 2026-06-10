@@ -424,6 +424,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if not project.autonomous_enabled or project.archived:
         return
 
+    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
+    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
+    if spend_ceiling_usd:
+        from app.efficiency_snapshot import compute_project_window_spend_usd
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        window_spend = await compute_project_window_spend_usd(session, project.id)
+        if window_spend >= spend_ceiling_usd:
+            logger.info(
+                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
+                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — pausing spawning"
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling_usd,
+            )
+            return
+
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
     # instructions. Agents discover the correct playbook entries by exploring
@@ -1279,6 +1299,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
         # Architecture stabilizes faster than strategy, so it runs less frequently.
+        # Additionally, if the design_doc is empty (no architecture content), force
+        # an architecture cycle to establish the baseline before strategy reasons
+        # about an unfamiliar codebase.
         strategic_cycle_count = (project.vision or {}).get(
             "_strategic_cycle_count", 0
         ) + 1
@@ -2355,6 +2378,26 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                 )
                 return
 
+    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
+    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
+    if spend_ceiling_usd:
+        from app.efficiency_snapshot import compute_project_window_spend_usd
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        window_spend = await compute_project_window_spend_usd(session, project.id)
+        if window_spend >= spend_ceiling_usd:
+            logger.info(
+                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
+                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — skipping periodic spawn (type={task_type})"
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling_usd,
+            )
+            return
+
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}
     )
@@ -2574,7 +2617,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (  # noqa: E402 - intentional mid-file re-export
+from app.autonomous_research_residual import (
     _spawn_residual_fingerprint_remediation,
 )
 
