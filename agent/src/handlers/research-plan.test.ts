@@ -1167,6 +1167,37 @@ describe('buildCapabilityVerificationSection', () => {
     expect(section).toContain('Verified');
     expect(section).toContain('**cap-verified**');
   });
+
+  it('renders provenance header when _computed_at and _branch_sha are present', () => {
+    const section = buildCapabilityVerificationSection({
+      '_computed_at': '2026-06-10T12:00:00',
+      '_branch_sha': 'abc1234567890',
+      'cap-verified': { status: 'verified', claimed_status: 'working', missing: [], present: ['a.py'] },
+    } as unknown as Record<string, Record<string, unknown>>);
+    expect(section).toContain('Verdicts computed 2026-06-10T12:00:00');
+    expect(section).toContain('abc123456789');
+    expect(section).not.toContain('STAMP MISSING');
+  });
+
+  it('warns STAMP MISSING for legacy payloads without provenance fields', () => {
+    const section = buildCapabilityVerificationSection({
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+    });
+    expect(section).toContain('STAMP MISSING');
+    expect(section).not.toContain('Verdicts computed');
+  });
+
+  it('skips provenance keys when iterating capability entries', () => {
+    const section = buildCapabilityVerificationSection({
+      '_computed_at': '2026-06-10T12:00:00',
+      '_branch_sha': 'abc123',
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+    } as unknown as Record<string, Record<string, unknown>>);
+    // _computed_at and _branch_sha should not appear as capability names
+    expect(section).not.toContain('**_computed_at**');
+    expect(section).not.toContain('**_branch_sha**');
+    expect(section).toContain('**cap-absent**');
+  });
 });
 
 describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
@@ -3256,10 +3287,10 @@ describe('normalizePlanSubtaskTypes', () => {
       ],
     };
     const logs: string[] = [];
-    const out = JSON.parse(normalizePlanSubtaskTypes(JSON.stringify(plan), (m) => logs.push(m)));
-    expect(out.subtasks[0].type).toBe('create');
-    expect(out.subtasks[0].title).toBe('fix: glob refs read as indeterminate not absent');
-    expect(out.subtasks[0].related_files).toEqual(['backend/app/design_docs.py']);
+    const out = JSON.parse(normalizePlanSubtaskTypes(JSON.stringify(plan), (m) => logs.push(m))) as { subtasks: Array<Record<string, unknown>> };
+    expect(out.subtasks[0]['type']).toBe('create');
+    expect(out.subtasks[0]['title']).toBe('fix: glob refs read as indeterminate not absent');
+    expect(out.subtasks[0]['related_files']).toEqual(['backend/app/design_docs.py']);
     expect(out.subtasks[1]).toEqual(plan.subtasks[1]);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('"fix"');
@@ -3293,8 +3324,8 @@ describe('normalizePlanSubtaskTypes', () => {
   it('coerces a non-string type value to "create"', () => {
     const out = JSON.parse(
       normalizePlanSubtaskTypes(JSON.stringify({ subtasks: [{ title: 't', type: 7 }] }))
-    );
-    expect(out.subtasks[0].type).toBe('create');
+    ) as { subtasks: Array<Record<string, unknown>> };
+    expect(out.subtasks[0]['type']).toBe('create');
   });
 
   it('passes non-JSON input through untouched (raw-output fallback path)', () => {

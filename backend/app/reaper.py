@@ -2892,6 +2892,24 @@ async def reaper_service():
                                     delay_minutes = min(
                                         2 ** (task.attempt_count - 1), 15
                                     ) * random.uniform(0.75, 1.25)
+                                if task_type == "research":
+                                    try:
+                                        from app.autonomous_research import (
+                                            refresh_research_task_verification,
+                                        )
+
+                                        _res_proj = await session.get(
+                                            Project, task.project_id
+                                        )
+                                        if _res_proj is not None:
+                                            await refresh_research_task_verification(
+                                                task, _res_proj, session
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "[REAPER] Failed to refresh research task verification for task %s",
+                                            task.id,
+                                        )
                                 task.context = reaper_ctx
                                 set_retry_after(task, delay_minutes)
                                 session.add(task)

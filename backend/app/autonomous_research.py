@@ -54,6 +54,7 @@ from app.source_ref_validation import (
     classify_paths_tristate,
     detect_absent_symbols,
     resolve_branch_verification_context,
+    resolve_head_commit,
 )
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
@@ -1894,6 +1895,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
+        # Stamp verification provenance — when and against which branch tip
+        # the verdicts were computed.  The agent surfaces these so an old stamp
+        # (from a task spawned hours or days ago and now being retried) is
+        # visibly discountable.  Resolved once; shared by both maps.
+        _v_computed_at = _utcnow().isoformat()
+        _v_branch_sha = await resolve_head_commit(**verification_kwargs)
+        if system_verification:
+            system_verification["_computed_at"] = _v_computed_at
+            system_verification["_branch_sha"] = _v_branch_sha
+        if capability_verification:
+            capability_verification["_computed_at"] = _v_computed_at
+            capability_verification["_branch_sha"] = _v_branch_sha
+
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
@@ -2655,3 +2669,134 @@ async def _check_idle_research():
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
+
+
+async def refresh_research_task_verification(
+    task: "Task",
+    project: "Project",
+    session: "AsyncSession",
+) -> None:
+    """Re-run the verification loops and stamp fresh provenance onto the task's payload.
+
+    Called by the reaper when retrying a research task so the agent never
+    executes stale spawn-time verdicts.  Mutates ``task.payloads[0]`` in-place
+    using ``flag_modified``; the caller's transaction owns the eventual commit.
+    No-ops when the task has no research payload or when verification context
+    cannot be resolved.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.playbook_lifecycle import _extract_file_paths
+
+    payloads = task.payloads
+    if not payloads or not isinstance(payloads, list):
+        return
+    payload = payloads[0]
+    if not isinstance(payload, dict) or payload.get("type") != "research":
+        return
+
+    doc = project.design_doc or {}
+    verification_kwargs = await resolve_branch_verification_context(session, project)
+
+    system_verification: dict = {}
+    for dkey in sorted(k for k in doc if isinstance(k, str) and k.startswith("systems/")):
+        dval = doc[dkey]
+        if not isinstance(dval, dict):
+            continue
+        modules = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+        if not modules:
+            continue
+        present, missing, indeterminate = await classify_paths_tristate(
+            modules, **verification_kwargs
+        )
+        if not missing and not indeterminate:
+            status = "verified"
+        elif not missing:
+            status = "unverified"
+        elif present or indeterminate:
+            status = "partial"
+        else:
+            status = "claimed_absent"
+        absent_symbols = await detect_absent_symbols(
+            dval.get("modules"),
+            [dval.get("description"), dval.get("notes")],
+            **verification_kwargs,
+        )
+        if absent_symbols and status != "claimed_absent":
+            status = "claimed_absent"
+        system_verification[dkey[len("systems/"):]] = {
+            "status": status,
+            "claimed_status": str(dval.get("status", "")),
+            "present": present,
+            "missing": missing,
+            **({"indeterminate": indeterminate} if indeterminate else {}),
+            **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+        }
+
+    _present_cap_statuses = {"working", "partial"}
+    capability_verification: dict = {}
+    for dkey in sorted(
+        k for k in doc if isinstance(k, str) and k.startswith("capabilities/")
+    ):
+        dval = doc[dkey]
+        if not isinstance(dval, dict):
+            continue
+        claimed = str(dval.get("status", "")).lower()
+        if claimed not in _present_cap_statuses:
+            continue
+        cap_paths = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+        for _field in ("notes", "description"):
+            _txt = dval.get(_field)
+            if isinstance(_txt, str) and _txt:
+                cap_paths.extend(_extract_file_paths(_txt))
+        cap_paths = list(dict.fromkeys(cap_paths))
+        if not cap_paths:
+            continue
+        present, missing, indeterminate = await classify_paths_tristate(
+            cap_paths, **verification_kwargs
+        )
+        if not missing and not indeterminate:
+            status = "verified"
+        elif not missing:
+            status = "unverified"
+        elif present or indeterminate:
+            status = "partial"
+        else:
+            status = "claimed_absent"
+        absent_symbols = await detect_absent_symbols(
+            dval.get("modules"),
+            [dval.get("notes"), dval.get("description")],
+            **verification_kwargs,
+        )
+        if absent_symbols and status != "claimed_absent":
+            status = "claimed_absent"
+        capability_verification[dkey[len("capabilities/"):]] = {
+            "status": status,
+            "claimed_status": str(dval.get("status", "")),
+            "present": present,
+            "missing": missing,
+            **({"indeterminate": indeterminate} if indeterminate else {}),
+            **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+        }
+
+    _v_computed_at = _utcnow().isoformat()
+    _v_branch_sha = await resolve_head_commit(**verification_kwargs)
+    if system_verification:
+        system_verification["_computed_at"] = _v_computed_at
+        system_verification["_branch_sha"] = _v_branch_sha
+        payload["system_verification"] = system_verification
+    else:
+        payload.pop("system_verification", None)
+
+    if capability_verification:
+        capability_verification["_computed_at"] = _v_computed_at
+        capability_verification["_branch_sha"] = _v_branch_sha
+        payload["capability_verification"] = capability_verification
+    else:
+        payload.pop("capability_verification", None)
+
+    flag_modified(task, "payloads")
+    logger.info(
+        "[AUTONOMOUS] Refreshed verification provenance for task %s (branch_sha=%s)",
+        task.id,
+        _v_branch_sha,
+    )

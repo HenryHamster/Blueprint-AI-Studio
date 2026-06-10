@@ -1288,10 +1288,14 @@ export function buildCapabilityVerificationSection(
   capVerif: Record<string, Record<string, unknown>> | undefined,
 ): string {
   if (!capVerif || typeof capVerif !== 'object' || Object.keys(capVerif).length === 0) return '';
+  const _pm = capVerif as Record<string, unknown>;
+  const computedAt = typeof _pm['_computed_at'] === 'string' ? _pm['_computed_at'] : null;
+  const branchSha = typeof _pm['_branch_sha'] === 'string' ? _pm['_branch_sha'] : null;
   const absent: string[] = [];
   const partial: string[] = [];
   const verified: string[] = [];
   for (const capName of Object.keys(capVerif).sort()) {
+    if (capName.startsWith('_')) continue;
     const v = capVerif[capName];
     const status = strVal(v.status as string);
     const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
@@ -1308,6 +1312,12 @@ export function buildCapabilityVerificationSection(
   }
   if (absent.length === 0 && partial.length === 0 && verified.length === 0) return '';
   const vlines: string[] = ['# CAPABILITY VERIFICATION (code existence vs. design-doc claims)'];
+  if (computedAt) {
+    const shaNote = branchSha ? ` against ${branchSha.slice(0, 12)}` : '';
+    vlines.push(`_Verdicts computed ${computedAt}${shaNote}. If this task was retried after a delay, the branch may have changed — treat older stamps as advisory._`);
+  } else {
+    vlines.push('_⚠️ STAMP MISSING — verdicts may be from an earlier run and could reflect a stale branch state._');
+  }
   vlines.push('The backend verified each design-doc capability\'s declared backing paths against the integration-branch file tree. Do NOT trust a capability\'s status over this evidence — if a capability is flagged below, treat its claimed status (working/partial) as unreliable, design from what actually exists, and do NOT propose improvements to behavior that is not built.');
   if (absent.length > 0) {
     vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
@@ -1414,7 +1424,8 @@ export function normalizePlanSubtaskTypes(planJson: string, log?: (msg: string) 
     const rawType = subtask.type;
     if (rawType === undefined || rawType === null) continue; // backend defaults to "create"
     if (typeof rawType === 'string' && PLAN_CHILD_TYPE_VOCABULARY.has(rawType)) continue;
-    log?.(`[PLAN] Subtask ${JSON.stringify(String(subtask.title ?? ''))} requested off-vocabulary type ${JSON.stringify(rawType)} — coercing to "create" so the plan stays spawnable\n`);
+    const titleStr = typeof subtask.title === 'string' ? subtask.title : '';
+    log?.(`[PLAN] Subtask ${JSON.stringify(titleStr)} requested off-vocabulary type ${JSON.stringify(rawType)} — coercing to "create" so the plan stays spawnable\n`);
     subtask.type = 'create';
     changed = true;
   }
@@ -1614,7 +1625,7 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   // Coerce off-vocabulary subtask types (notably "fix") to "create" before the
   // backend parses the plan — see normalizePlanSubtaskTypes for why.
-  logs = normalizePlanSubtaskTypes(logs, (m) => sendLog(ws, m));
+  logs = normalizePlanSubtaskTypes(logs, (m) => { sendLog(ws, m); });
 
   // Backend's _handle_plan_completion parses `logs` on COMPLETED and creates
   // children with the correct plan branch. No agent-side spawn is needed —
@@ -1932,10 +1943,14 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
   let systemVerificationSection = '';
   const sysVerif = payload.system_verification as Record<string, Record<string, unknown>> | undefined;
   if (sysVerif && Object.keys(sysVerif).length > 0) {
+    const _syspm = sysVerif as Record<string, unknown>;
+    const sysComputedAt = typeof _syspm['_computed_at'] === 'string' ? _syspm['_computed_at'] : null;
+    const sysBranchSha = typeof _syspm['_branch_sha'] === 'string' ? _syspm['_branch_sha'] : null;
     const absent: string[] = [];
     const partial: string[] = [];
     const verified: string[] = [];
     for (const sysId of Object.keys(sysVerif).sort()) {
+      if (sysId.startsWith('_')) continue;
       const v = sysVerif[sysId];
       const status = strVal(v.status as string);
       const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
@@ -1952,6 +1967,12 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     }
     if (absent.length > 0 || partial.length > 0 || verified.length > 0) {
       const vlines: string[] = ['# SYSTEM VERIFICATION (code existence vs. design-doc claims)'];
+      if (sysComputedAt) {
+        const shaNote = sysBranchSha ? ` against ${sysBranchSha.slice(0, 12)}` : '';
+        vlines.push(`_Verdicts computed ${sysComputedAt}${shaNote}. If this task was retried after a delay, the branch may have changed — treat older stamps as advisory._`);
+      } else {
+        vlines.push('_⚠️ STAMP MISSING — verdicts may be from an earlier run and could reflect a stale branch state._');
+      }
       vlines.push('The backend verified each design-doc system\'s declared module paths against the integration-branch file tree. Do NOT trust a system\'s status over this evidence — if a system is flagged below, treat its claimed status as unreliable and design from what actually exists.');
       if (absent.length > 0) {
         vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');

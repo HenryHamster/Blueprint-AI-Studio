@@ -12996,6 +12996,186 @@ async def test_research_payload_available_capabilities_carry_proof_status(db_ses
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Verification provenance — _computed_at / _branch_sha stamps
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_system_verification_carries_branch_sha_and_computed_at(
+    db_session, mocker
+):
+    """system_verification map carries _computed_at and _branch_sha provenance stamps."""
+    direction = _active_direction("d-prov-sys", "Improve real system")
+    project = Project(
+        name="ProvStamp Systems",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/real": {
+                "status": "mature",
+                "modules": ["backend/app/a.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/a.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="abc1234567890abc"),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None, "system_verification should be present"
+    assert sv["real"]["status"] == "verified"
+    assert "_computed_at" in sv, "_computed_at provenance stamp must be present"
+    assert sv["_branch_sha"] == "abc1234567890abc", "_branch_sha must match resolved SHA"
+    # Provenance keys are metadata, not system entries
+    assert "real" in sv
+    assert "_computed_at" not in sv["real"]
+
+
+@pytest.mark.asyncio
+async def test_system_verification_branch_sha_none_when_indeterminate(
+    db_session, mocker
+):
+    """When resolve_head_commit returns None, _branch_sha is None (not absent)."""
+    direction = _active_direction("d-prov-nosha", "Improve system")
+    project = Project(
+        name="ProvStamp NoSha",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/x": {
+                "status": "mature",
+                "modules": ["backend/app/x.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/x.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value=None),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None
+    assert "_computed_at" in sv
+    assert sv["_branch_sha"] is None
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_carries_branch_sha_and_computed_at(
+    db_session, mocker
+):
+    """capability_verification map carries _computed_at and _branch_sha stamps."""
+    direction = _active_direction("d-prov-cap", "Improve capability")
+    project = Project(
+        name="ProvStamp Caps",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/auth": {
+                "status": "working",
+                "modules": ["backend/app/auth.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/auth.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="deadbeef1234"),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification should be present"
+    assert cv["auth"]["status"] == "verified"
+    assert "_computed_at" in cv
+    assert cv["_branch_sha"] == "deadbeef1234"
+
+
+@pytest.mark.asyncio
+async def test_refresh_research_task_verification_overwrites_stale_stamp(
+    db_session, mocker
+):
+    """refresh_research_task_verification replaces stale provenance with a fresh stamp."""
+    from app.autonomous_research import refresh_research_task_verification
+
+    direction = _active_direction("d-refresh", "Refresh verification")
+    project = Project(
+        name="Refresh Verification",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "mature",
+                "modules": ["backend/app/api.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with stale spawn-time verification (old stamp, old SHA)
+    stale_sv = {
+        "api": {"status": "claimed_absent", "claimed_status": "mature", "present": [], "missing": ["backend/app/api.py"]},
+        "_computed_at": "2020-01-01T00:00:00",
+        "_branch_sha": "oldsha",
+    }
+    task = Task(
+        project_id=project.id,
+        title="Research: Refresh verification",
+        payloads=[{
+            "type": "research",
+            "base_branch": "main",
+            "directions": [direction],
+            "system_verification": stale_sv,
+        }],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_classify(mocker, present_paths={"backend/app/api.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="newsha123"),
+    )
+
+    await refresh_research_task_verification(task, project, db_session)
+
+    sv = task.first_payload.get("system_verification")
+    assert sv is not None
+    assert sv["api"]["status"] == "verified", "verification status should be refreshed"
+    assert sv["_branch_sha"] == "newsha123", "_branch_sha should be updated"
+    assert sv["_computed_at"] != "2020-01-01T00:00:00", "_computed_at should be updated"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Direction Refractory: prevents immediate re-research after terminal state
 # ─────────────────────────────────────────────────────────────────────────────
 

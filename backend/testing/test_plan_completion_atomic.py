@@ -372,14 +372,12 @@ async def test_registry_eligible_subtype_is_honored_not_downgraded(
 async def test_non_eligible_subtask_type_is_skipped_not_rewritten(
     db_session, mocker, _quiet_mocks
 ):
-    """A non-eligible requested child type is SKIPPED with a log, never silently
-    rewritten to ``create``.
+    """A non-coercible ineligible type is SKIPPED; a coercible synonym is coerced.
 
-    Two non-eligible kinds are exercised: a read-only type (``research``) and a
-    write type that needs a pre-existing PR context (``fix``). Neither may
-    masquerade as a successfully-spawned ``create``, and ``fix`` must not crash
-    the plan (it can't build a valid fix payload). The eligible sibling in the
-    same plan still spawns, proving the skip is per-subtask and observable.
+    ``research`` is non-coercible and non-eligible — it is skipped outright.
+    ``fix`` is a coercible synonym for fresh-work: it is coerced to ``create``
+    at plan ingestion rather than skipped, so it spawns alongside the eligible
+    sibling. Only ``research`` (neither coercible nor eligible) stays out.
     """
     plan_logs = json.dumps(
         {
@@ -399,12 +397,20 @@ async def test_non_eligible_subtask_type_is_skipped_not_rewritten(
         .scalars()
         .all()
     )
-    # Only the eligible subtask spawned; the non-eligible ones were skipped.
-    assert len(children) == 1, f"Expected 1 spawned child, got {len(children)}"
-    assert children[0].title == "Valid"
-    assert children[0].first_payload.get("type") == "create"
-    # The non-eligible types never masqueraded as a create.
-    assert {c.title for c in children} == {"Valid"}
+    # The eligible ``create`` and the coerced ``fix`` → ``create`` both spawn.
+    assert len(children) == 2, f"Expected 2 spawned children, got {len(children)}"
+    by_title = {c.title: c for c in children}
+    assert "Valid" in by_title, "Eligible 'create' subtask must spawn"
+    assert "NeedsPR" in by_title, "Coerced 'fix' → 'create' subtask must spawn"
+    assert "Bogus" not in by_title, "Non-coercible 'research' must not spawn"
+    assert by_title["Valid"].first_payload.get("type") == "create"
+    assert by_title["NeedsPR"].first_payload.get("type") == "create"
+    # The coerced child carries a traceability record.
+    coercion = (by_title["NeedsPR"].context or {}).get("type_coercion")
+    assert coercion is not None, "Coerced child must record the coercion in context"
+    assert coercion["original_type"] == "fix"
+    assert coercion["coerced_type"] == "create"
+    # No child is typed as research or fix.
     assert not any(
         c.first_payload.get("type") in {"research", "fix"} for c in children
     )
@@ -1759,3 +1765,229 @@ async def test_compute_experiment_subtask_carries_downstream_artifact_evidence(
     assert child_evidence is not None, "acceptance_evidence missing from compute_experiment payload"
     assert child_evidence["kind"] == "downstream_artifact"
     assert child_evidence["artifact_id"] == "benchmark-result-bundle"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Type coercion: mislabeled fresh-work synonyms → eligible plan-spawnable type
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_mislabeled_fresh_work_type_is_coerced_and_plan_spawns(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan with a mislabeled fresh-work subtask type spawns via coercion.
+
+    The canonical regression: plan emitting a fresh-work subtask typed 'fix'
+    (matching its conventional-commit title prefix) must not kill the plan with
+    'unsatisfiable dependency'. The 'fix' type is coerced to 'create' at plan
+    ingestion, the coercion is recorded on the child context for traceability,
+    and the child is spawned successfully.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "fix: apply the design-doc grounding integrity fix",
+                    "prompt": "implement the integrity fix",
+                    "type": "fix",
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.FAILED, (
+        f"Plan must not fail on mislabeled 'fix' type: {task.latest_status_message!r}"
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child after coercion, got {len(children)}"
+    child = children[0]
+    assert child.first_payload.get("type") == "create", (
+        f"Mislabeled 'fix' must be coerced to 'create', got {child.first_payload.get('type')!r}"
+    )
+    coercion = (child.context or {}).get("type_coercion")
+    assert coercion is not None, "type_coercion must be recorded on child context"
+    assert coercion["original_type"] == "fix"
+    assert coercion["coerced_type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_fix_type_coerced_to_create(db_session, mocker, _quiet_mocks):
+    """A subtask typed 'fix' is coerced to 'create' and spawns successfully."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {"title": "Fix the bug", "prompt": "patch it", "type": "fix"}
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].first_payload.get("type") == "create"
+
+
+@pytest.mark.asyncio
+async def test_test_type_coerced_to_qa(db_session, mocker, _quiet_mocks):
+    """A subtask typed 'test' (an unregistered synonym) is coerced to 'qa'."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {"title": "Add coverage", "prompt": "write tests", "type": "test"}
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].first_payload.get("type") == "qa"
+
+
+@pytest.mark.asyncio
+async def test_coercion_recorded_on_child_context(db_session, mocker, _quiet_mocks):
+    """original_type and coerced_type are present in child context after coercion."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {"title": "Feat: new thing", "prompt": "build it", "type": "feat"}
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    coercion = (children[0].context or {}).get("type_coercion")
+    assert coercion is not None, "type_coercion must be set on coerced child context"
+    assert coercion["original_type"] == "feat"
+    assert coercion["coerced_type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_cascade_skip_spawns_unrelated_siblings(db_session, mocker, _quiet_mocks):
+    """Cascade-skipped subtrees do not block unrelated siblings from spawning.
+
+    A skipped non-coercible producer (research) and its dependent are both
+    cascade-skipped, but an independent sibling still spawns.  The plan must NOT
+    be failed — only the dependent subtree is silenced.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Research foundation",
+                    "prompt": "research something",
+                    "type": "research",
+                },
+                {
+                    "title": "Implement on research",
+                    "prompt": "build on the research",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+                {
+                    "title": "Unrelated work",
+                    "prompt": "independent task",
+                    "type": "create",
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.FAILED, (
+        f"Plan must not fail when unrelated sibling can still spawn: "
+        f"{task.latest_status_message!r}"
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, (
+        f"Only the unrelated sibling should spawn, got {[c.title for c in children]}"
+    )
+    assert children[0].title == "Unrelated work"
+
+    # Cascade skip recorded on task context.
+    ctx = task.context or {}
+    cascade = ctx.get("plan_subtask_cascade_skipped")
+    assert cascade, "cascade_skipped must be recorded on task context"
+    cascade_titles = {entry["title"] for entry in cascade}
+    assert "Implement on research" in cascade_titles
+
+
+@pytest.mark.asyncio
+async def test_all_cascade_skipped_fails_plan(db_session, mocker, _quiet_mocks):
+    """When every subtask ends up cascade-skipped, the plan fails outright."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Research only",
+                    "prompt": "research something",
+                    "type": "research",
+                },
+                {
+                    "title": "Depends on research",
+                    "prompt": "build on it",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan must FAIL when all subtasks are cascade-skipped, got {task.status}"
+    )
+    assert "unsatisfiable dependency" in (task.latest_status_message or "").lower(), (
+        f"Expected 'unsatisfiable dependency' in error message, "
+        f"got {task.latest_status_message!r}"
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when all are cascade-skipped, got {len(children)}"
+    )

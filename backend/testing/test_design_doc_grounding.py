@@ -641,3 +641,131 @@ def test_recovery_runs_when_cooldown_not_elapsed(monkeypatch):
         )
     )
     assert not sweep_called, "downgrade sweep must not run when cooldown is active"
+
+
+# ---------------------------------------------------------------------------
+# Mass-downgrade guard tests
+# ---------------------------------------------------------------------------
+
+
+def _make_absent_doc(n_systems=0, n_capabilities=0):
+    """Build a doc with all entries pointing at a nonexistent path."""
+    doc = {}
+    for i in range(n_systems):
+        doc[f"systems/sys{i}"] = {
+            "status": "mature",
+            "modules": [f"backend/app/gone_sys{i}.py"],
+        }
+    for i in range(n_capabilities):
+        doc[f"capabilities/cap{i}"] = {
+            "status": "working",
+            "notes": f"See backend/app/gone_cap{i}.py for the implementation.",
+        }
+    return doc
+
+
+def test_mass_downgrade_sweep_aborts_above_bound_and_persists_nothing(tmp_path):
+    """Core acceptance test: candidates exceeding the cap trigger an abort; nothing is persisted."""
+    # 11 systems, all pointing at absent paths — exceeds the cap (max(3, ceil(11*0.10))=3).
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=11)
+    original_statuses = {k: v["status"] for k, v in doc.items()}
+    original_rev = (doc.get("_meta") or {}).get("revision", 0)
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # No entry should have been downgraded.
+    for key, orig_status in original_statuses.items():
+        assert result[key]["status"] == orig_status, f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key], f"{key} has unexpected warning"
+
+    # Revision must not have been bumped (abort does not count as a content update).
+    assert result["_meta"].get("revision", 0) == original_rev
+
+    # _meta must carry the cap-breach diagnostic.
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None, "grounding_diagnostic missing from _meta"
+    assert abort_info["candidate_count"] == 11
+    assert abort_info["kind"] == "cap_breach"
+
+
+def test_mass_downgrade_cap_aborts_when_exceeded(tmp_path):
+    """Cap fires when candidates exceed max(3, ceil(present_count * 0.10))."""
+    # 4 systems, all absent — cap = max(3, ceil(4*0.10)) = 3, candidates=4 > cap → breach.
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=4)
+    system_keys = list(doc.keys())
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # No entry should be downgraded when cap is breached.
+    for key in system_keys:
+        assert result[key]["status"] == "mature", f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key]
+
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None
+    assert abort_info["candidate_count"] == 4
+    assert abort_info["kind"] == "cap_breach"
+
+
+def test_below_limit_singleton_downgrade_succeeds(tmp_path):
+    """A single absent entry well below any limit is still downgraded normally."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/auth"]["status"] == "missing"
+    assert "presence_warning" in result["systems/auth"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
+    assert "grounding_diagnostic" not in result["_meta"]
+
+
+def test_limit_at_exact_threshold_does_not_abort(tmp_path):
+    """Exactly at the cap (== cap) is still allowed; abort fires at > cap."""
+    # 3 systems all absent — cap = max(3, ceil(3*0.10)) = 3, candidates=3 == cap → no abort.
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=3)
+    system_keys = list(doc.keys())
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # All 3 must be downgraded (== cap, not exceeded).
+    for key in system_keys:
+        assert result[key]["status"] == "missing", f"{key} was not downgraded"
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
+    assert "grounding_diagnostic" not in result["_meta"]
+
+
+def test_mass_downgrade_branch_aware_aborts(monkeypatch):
+    """Branch-aware variant aborts when all entries in a large doc would be downgraded."""
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=False),
+    )
+    doc = _make_absent_doc(n_systems=11)
+    original_statuses = {k: v["status"] for k, v in doc.items()}
+    original_rev = (doc.get("_meta") or {}).get("revision", 0)
+
+    result = asyncio.run(
+        ground_design_doc_systems_branch_aware(
+            doc,
+            repo_root="",
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+
+    for key, orig_status in original_statuses.items():
+        assert result[key]["status"] == orig_status, f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key]
+
+    assert result["_meta"].get("revision", 0) == original_rev
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None
+    assert abort_info["candidate_count"] == 11
