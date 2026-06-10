@@ -348,13 +348,19 @@ export function useTaskModal(
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
     };
     try {
-      await createComputeExperiment(body);
+      const response = await createComputeExperiment(body);
       setShowNewTaskModal(false);
       setNewTaskTitle('');
       setNewTaskPrompt('');
       setComputeExperiment(defaultComputeExperimentForm());
       clearDraft();
-      addToast('Compute experiment launched', 'success');
+      if (response.requires_approval) {
+        addToast('Compute experiment held for approval — it will not run until an operator approves it', 'success');
+      } else if (response.is_duplicate) {
+        addToast('Reusing an existing matching compute experiment', 'success');
+      } else {
+        addToast('Compute experiment launched', 'success');
+      }
       fetchTasksRef.current();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';

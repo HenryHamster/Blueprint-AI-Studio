@@ -231,6 +231,97 @@ async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session
     assert resp.status_code == 409
 
 
+async def _make_job_with_polling_metadata(session, project, polling_metadata):
+    """Seed a job whose polling_metadata carries the given dict (for redaction tests)."""
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        polling_metadata=polling_metadata,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return task, job
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_launch_secrets(client: AsyncClient, db_session):
+    """Operator list must not expose raw env values, command, or cwd, but must
+    preserve operator-useful keys like live_release_evidence, result_metrics,
+    and compute_rpc_diagnostic."""
+    project = await _make_project(db_session, name="Redact List")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run_experiment.py"],
+            "cwd": "/workspace",
+            "env": {"SECRET_TOKEN": "super-secret-value", "ANOTHER_VAR": "another-secret"},
+            "live_release_evidence": {"version": "v8", "metrics": {"cpm": 1.23}},
+            "result_metrics": {"accuracy": 0.95},
+            "compute_rpc_diagnostic": {"operation": "poll", "error_message": "timeout"},
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+
+    # Secret-bearing fields must be absent.
+    assert "command" not in pm
+    assert "cwd" not in pm
+
+    # Env keys are preserved but values are redacted.
+    assert set(pm["env"].keys()) == {"SECRET_TOKEN", "ANOTHER_VAR"}
+    assert pm["env"]["SECRET_TOKEN"] == "[REDACTED]"
+    assert pm["env"]["ANOTHER_VAR"] == "[REDACTED]"
+
+    # Operator-useful keys must survive redaction.
+    assert pm["live_release_evidence"] == {"version": "v8", "metrics": {"cpm": 1.23}}
+    assert pm["result_metrics"] == {"accuracy": 0.95}
+    assert pm["compute_rpc_diagnostic"]["operation"] == "poll"
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_redacts_launch_secrets(client: AsyncClient, db_session):
+    """Kill response must apply the same polling_metadata redaction as the list."""
+    project = await _make_project(db_session, name="Redact Kill")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+            "env": {"API_KEY": "top-secret"},
+            "live_release_evidence": {"version": "v8"},
+        },
+    )
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_job"]["polling_metadata"]
+
+    assert "command" not in pm
+    assert "cwd" not in pm
+    assert pm["env"] == {"API_KEY": "[REDACTED]"}
+    assert pm["live_release_evidence"] == {"version": "v8"}
+
+
 @pytest.mark.asyncio
 async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_session):
     """When a peer drives the job terminal during the lock-free RPC window,

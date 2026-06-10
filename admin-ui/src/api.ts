@@ -216,10 +216,12 @@ export interface ComputeExperimentLaunchRequest {
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
- * task. Kept loose (only `id` is relied on) so additive backend fields don't
- * force a frontend change. */
+ * task. Kept loose so additive backend fields don't force a frontend change. */
 export interface ComputeExperimentLaunchResponse {
   id: string;
+  status?: string;
+  requires_approval?: boolean;
+  is_duplicate?: boolean;
   [key: string]: unknown;
 }
 

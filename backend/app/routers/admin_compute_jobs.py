@@ -28,6 +28,26 @@ router = APIRouter(
 )
 
 
+def _redact_operator_polling_metadata(data: dict) -> dict:
+    """Remove secret-bearing launch fields from the operator-facing response.
+
+    Operators can see which env vars were set and all diagnostic/results keys,
+    but not the raw values (which may carry tokens/secrets), the launch command,
+    or the working directory. The agent-facing serializer is untouched — agents
+    still receive the full polling_metadata to actually execute the job.
+    """
+    pm = data.get("polling_metadata")
+    if not isinstance(pm, dict):
+        return data
+    # Remove fields that operators have no legitimate need for.
+    pm.pop("command", None)
+    pm.pop("cwd", None)
+    # Redact env values; keep keys so operators can see which variables were set.
+    if isinstance(pm.get("env"), dict):
+        pm["env"] = {k: "[REDACTED]" for k in pm["env"]}
+    return data
+
+
 def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
     """Build the additive operator-facing descriptor for a linked artifact.
 
@@ -74,7 +94,7 @@ async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[s
 
     payload: list[Dict[str, Any]] = []
     for job in jobs:
-        data = serialize_compute_job_response(job)
+        data = _redact_operator_polling_metadata(serialize_compute_job_response(job))
         title, task_type = titles.get(job.task_id, (None, None))
         data["task_title"] = title
         data["task_type"] = task_type
@@ -133,4 +153,4 @@ async def kill_project_compute_job(
         killed = await session.get(ComputeJob, job_id)
         if killed is None:
             raise HTTPException(status_code=404, detail="Compute job not found")
-    return {"compute_job": serialize_compute_job_response(killed)}
+    return {"compute_job": _redact_operator_polling_metadata(serialize_compute_job_response(killed))}

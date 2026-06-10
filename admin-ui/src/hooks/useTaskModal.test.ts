@@ -909,6 +909,47 @@ describe('useTaskModal', () => {
     expect(fetchTasksRef.current).toHaveBeenCalled();
   });
 
+  it('handleCreateComputeExperiment shows held-for-approval toast when requires_approval is true', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'ce-held', requires_approval: true, status: 'pending_approval' });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      'Compute experiment held for approval — it will not run until an operator approves it',
+      'success',
+    );
+    expect(addToast).not.toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateComputeExperiment shows duplicate toast when is_duplicate is true', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'ce-dup', is_duplicate: true, requires_approval: false, status: 'running' });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Reusing an existing matching compute experiment', 'success');
+    expect(addToast).not.toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
   it('handleCreateTask rejects a compute_experiment with an empty command', async () => {
     const addToast = vi.fn();
     const { result } = renderHook(() =>
