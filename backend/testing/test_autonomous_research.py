@@ -12925,3 +12925,216 @@ async def test_research_payload_available_capabilities_carry_proof_status(db_ses
     assert by_name["auth-core"]["proof_status"] == "proven"
     assert by_name["fraud-detect"]["proof_status"] == "unproven"
     validate_internal_payload(dict(payload), "test_research_proof_status")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction Refractory: prevents immediate re-research after terminal state
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refractory_blocks_immediate_respawn_after_terminal(db_session):
+    """A direction with refractory_until in the future must be excluded from
+    active_directions so no new research cycle spawns before the window elapses.
+
+    This is the primary fix for the 2026-06-10 incident where direction
+    'd-65919a0d' spawned 10 sequential research cycles in 9.5h — each new
+    cycle fired 20s-5min after the previous parent went terminal because
+    last_researched_at was never set for no-findings completions.
+    """
+    future = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+    direction = {
+        **_active_direction("d-refract1", "Direction in refractory"),
+        "refractory_until": future,
+        # last_researched_at absent to isolate the refractory check
+    }
+    project = Project(
+        name="Refractory Block Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 0, (
+        "No research should spawn while the direction's refractory_until is in the future"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refractory_expired_allows_respawn(db_session):
+    """A direction whose refractory_until is in the PAST (or absent) must be
+    eligible for re-research — operator/strategist clear the refractory by
+    removing or back-dating the field.
+    """
+    past = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    direction = {
+        **_active_direction("d-refract2", "Direction past refractory"),
+        "refractory_until": past,
+    }
+    project = Project(
+        name="Refractory Expired Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) >= 1, (
+        "Research should spawn when refractory_until is in the past (expired)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_findings_completion_stamps_saturation_and_refractory(
+    db_session, mocker
+):
+    """When a research task completes with no actionable findings, the direction
+    must be marked possibly_saturated=True and stamped with refractory_until so
+    it cannot be immediately re-selected.
+
+    This closes the blind spot where the early-return gate in
+    _handle_research_completion skipped _apply_direction_state_updates entirely,
+    leaving last_researched_at unset and the direction immediately re-eligible.
+    """
+    direction_id = "d-nofindings1"
+    direction = _active_direction(direction_id, "Direction yielding no findings")
+    project = Project(
+        name="No Findings Refractory",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: no findings direction",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Patch externals and make the research agent return NO findings
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion._ensure_branch",
+        new=AsyncMock(side_effect=lambda t, *a, **kw: t),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    # Reload the project to inspect the direction state
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    target = next((d for d in dirs if d.get("id") == direction_id), None)
+    assert target is not None, "Direction must still exist"
+    assert target.get("possibly_saturated") is True, (
+        "Direction must be marked saturated after no-findings completion"
+    )
+    assert target.get("last_researched_at") is not None, (
+        "last_researched_at must be set so the cooldown applies"
+    )
+    assert target.get("refractory_until") is not None, (
+        "refractory_until must be stamped to prevent immediate re-selection"
+    )
+    # The refractory must be in the future
+    refractory_dt = datetime.fromisoformat(target["refractory_until"])
+    assert refractory_dt > datetime.utcnow(), (
+        "refractory_until must be in the future after a no-findings completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, mocker):
+    """When ALL active directions are in refractory (no eligible directions this
+    cycle), the spawn loop must fire request_strategic_refresh exactly once via
+    the coalescing mechanism so the strategist can replenish the portfolio.
+
+    The strategist may explicitly re-open held directions by clearing
+    refractory_until; the 180-min wall-clock backstop remains the safety net.
+    """
+    request_strategic_refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    future = (datetime.utcnow() + timedelta(hours=6)).isoformat()
+    direction = {
+        **_active_direction("d-zeroelig1", "All-refractory direction"),
+        "refractory_until": future,
+    }
+    project = Project(
+        name="Zero Eligible — Strategic Trigger",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # The coalescing trigger must have been called (once per spawn tick)
+    assert request_strategic_refresh_mock.called, (
+        "request_strategic_refresh must be called when all active directions are in refractory"
+    )
+    call_count = request_strategic_refresh_mock.call_count
+    assert call_count == 1, (
+        f"request_strategic_refresh should be called exactly once per tick, got {call_count}"
+    )
+    # A strategic spawn should have fired because force_strategic was set
+    assert design_doc_mock.called or strategic_review_mock.called, (
+        "A strategic cycle must spawn when all directions are in refractory and "
+        "force_strategic is set"
+    )

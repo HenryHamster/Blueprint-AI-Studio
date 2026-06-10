@@ -99,6 +99,17 @@ def project_parallelism_cap(
     return _runtime_config.get(runtime_key, default)
 
 
+def _direction_in_refractory(d: dict, now: datetime) -> bool:
+    """Return True if the direction's refractory_until window is still active."""
+    refractory_until = d.get("refractory_until")
+    if not refractory_until:
+        return False
+    try:
+        return datetime.fromisoformat(refractory_until) > now
+    except (ValueError, TypeError):
+        return False
+
+
 # Sentinel segment for undirected (cross-cutting) research claims — undirected
 # cycles target no direction id but must still be claimable one-at-a-time.
 _CLAIM_UNDIRECTED = "cross-cutting"
@@ -844,7 +855,35 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     )
                     force_strategic = True
     if not active_directions and not force_strategic:
-        return
+        # When every active direction is held in refractory (none eligible this
+        # cycle), fire a coalesced strategic refresh so the strategist can
+        # replenish the portfolio or explicitly re-open a held direction.
+        # The strategist may clear refractory_until on a direction to bypass.
+        # The 180-min wall-clock backstop above remains the safety net.
+        _any_refractory = any(
+            _direction_in_refractory(d, now)
+            for d in (project.directions or [])
+            if d.get("status") == "active"
+        )
+        if _any_refractory:
+            from app.strategic_trigger import (
+                ORIGIN_QUALIFICATION as _OQ,
+                request_strategic_refresh as _req_strat,
+            )
+            await _req_strat(
+                session,
+                project.id,
+                reason="all active directions in refractory — strategist replenishment needed",
+                origin=_OQ,
+            )
+            force_strategic = True
+            logger.info(
+                "[AUTONOMOUS] All active directions in refractory for project %s; "
+                "fired strategic refresh trigger",
+                project.id,
+            )
+        else:
+            return
     # Pick up to N non-conflicting directions for parallel research.
     # active_directions preserves UI drag-order (index 0 = highest priority).
     # Build vision priority lookup: directions tagged with a system_id that appears

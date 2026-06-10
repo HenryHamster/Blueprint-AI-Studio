@@ -629,6 +629,23 @@ async def _process_direction_lifecycle_locked(
                     f"{'cleared needs_manual_intervention' if cleared else 'no intervention flag to clear'}"
                 )
                 directions_modified = True
+        # Refractory check: direction is held ineligible until refractory_until elapses.
+        # Set by research completion (standard window) or no-findings saturation (longer
+        # window). Strategist/operator can clear refractory_until to re-open the direction.
+        refractory_until = d.get("refractory_until")
+        if refractory_until:
+            try:
+                refractory_dt = datetime.fromisoformat(refractory_until)
+                remaining_m = (refractory_dt - now).total_seconds() / 60
+                if remaining_m > 0:
+                    logger.debug(
+                        "[RESEARCH] Skipping direction %s: refractory for %.1fm more",
+                        did,
+                        remaining_m,
+                    )
+                    continue
+            except (ValueError, TypeError):
+                pass  # malformed timestamp — skip the refractory check
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (

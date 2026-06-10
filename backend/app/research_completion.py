@@ -1187,6 +1187,44 @@ def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
     flag_modified(task, "context")
 
 
+async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> None:
+    """Stamp last_researched_at, possibly_saturated, and refractory_until on the direction.
+
+    Called in the no-actionable-findings early-return path, which skips
+    _apply_direction_state_updates entirely and therefore never sets
+    last_researched_at. Without this stamp, the direction is immediately
+    eligible for re-selection on the next post-merge hook (the 20s gap
+    observed in the 2026-06-10 incident where cycle 10 spawned 2 minutes
+    after cycle 9 completed with "no actionable findings").
+    """
+    direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
+        "current_direction_id"
+    )
+    if not direction_id or task.project_id is None:
+        return
+    now_iso = _utcnow().isoformat()
+    sat_refractory_min = _runtime_config.get("direction_saturation_refractory_minutes", 720)
+
+    def _apply_no_findings_refractory(dirs: list) -> None:
+        target = next((d for d in dirs if d.get("id") == direction_id), None)
+        if not target:
+            return
+        target["last_researched_at"] = now_iso
+        target["last_cycle_productive"] = False
+        target["consecutive_unproductive_cycles"] = (
+            int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+        )
+        # "No actionable findings" is direct saturation evidence — mark the direction
+        # and apply the longer refractory so the portfolio moves on.
+        target["possibly_saturated"] = True
+        if isinstance(sat_refractory_min, (int, float)) and sat_refractory_min > 0:
+            target["refractory_until"] = (
+                _utcnow() + timedelta(minutes=float(sat_refractory_min))
+            ).isoformat()
+
+    await with_directions_locked(session, task.project_id, _apply_no_findings_refractory)
+
+
 def _summarize_dispatch_outcome(
     spawned: int,
     total_findings: int,
@@ -1798,6 +1836,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
         _record_research_survival_signal(task, surviving=0)
+        # Stamp refractory on the direction before committing — this path skips
+        # _apply_direction_state_updates, so last_researched_at would otherwise
+        # never be set and the direction would be immediately eligible again.
+        await _stamp_no_findings_refractory(task, session)
         session.add(task)
         await session.commit()
         return
