@@ -6828,6 +6828,14 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
                         "research_spawn_gate_unchallenged_merged": 1,
                         "research_spawn_gate_unchallenged_merge_rate": 0.333,
                         "research_spawn_gate_parse_outcome": "no_hash_matches",
+                        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+                        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+                            {
+                                "hash": "excluded-hash",
+                                "title": "Budget-excluded finding",
+                                "reason": "manifest cap",
+                            }
+                        ],
                     }
                 ],
             }
@@ -6857,6 +6865,14 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
     assert gate["challenged_count"] == 2
     assert gate["refuted_count"] == 1
     assert gate["survived_count"] == 1
+    assert gate["manifest_excluded_fail_closed_count"] == 1
+    assert gate["manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "manifest cap",
+        }
+    ]
     assert gate["challenged_merge_rate"] == 0.5
     assert gate["unchallenged_merge_rate"] == 0.333
     assert gate["parse_outcome_distribution"] == {"no_hash_matches": 1}

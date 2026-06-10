@@ -5499,6 +5499,14 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
         "research_spawn_gate_fail_open_count": 1,
         "research_spawn_gate_unresolved_count": 1,
         "research_spawn_gate_parse_outcome": "no_hash_matches",
+        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+            {
+                "hash": "excluded-hash",
+                "title": "Budget-excluded finding",
+                "reason": "fail-closed: high-stakes finding was not admitted to the adversarial manifest",
+            }
+        ],
         "research_spawn_gate_refuted_reasons": [
             "stale premise",
             "no_hash_matches",
@@ -5556,6 +5564,14 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     assert entry["research_spawn_gate_fail_open_count"] == 1
     assert entry["research_spawn_gate_unresolved_count"] == 1
     assert entry["research_spawn_gate_parse_outcome"] == "no_hash_matches"
+    assert entry["research_spawn_gate_manifest_excluded_fail_closed_count"] == 1
+    assert entry["research_spawn_gate_manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "fail-closed: high-stakes finding was not admitted to the adversarial manifest",
+        }
+    ]
     # Denominators / sample sizes preserved (merge rates travel with them).
     assert entry["research_spawn_gate_challenged_spawned"] == 1
     assert entry["research_spawn_gate_challenged_merged"] == 1

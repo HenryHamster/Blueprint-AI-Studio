@@ -574,7 +574,8 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   const challenged = sg.challenged_count ?? sg.challenged ?? 0;
                   const refuted = sg.refuted_count ?? sg.refuted ?? 0;
                   const survived = sg.survived_count ?? sg.survived ?? 0;
-                  if (!challenged && !refuted && !survived) return null;
+                  const manifestExcluded = sg.manifest_excluded_fail_closed_count ?? 0;
+                  if (!challenged && !refuted && !survived && !manifestExcluded) return null;
                   const explicitPass = sg.explicit_pass_count ?? 0;
                   const failOpen = sg.fail_open_count ?? 0;
                   const unresolved = sg.unresolved_count ?? 0;
@@ -585,6 +586,8 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   const challengedDenom = `${sg.challenged_merged ?? 0}/${sg.challenged_spawned ?? 0}`;
                   const unchallengedDenom = `${sg.unchallenged_merged ?? 0}/${sg.unchallenged_spawned ?? 0}`;
                   const reasons = (sg.refuted_reasons ?? []).filter(Boolean);
+                  const excludedSamples = (sg.manifest_excluded_fail_closed_samples ?? [])
+                    .filter((sample) => sample && (sample.title || sample.reason));
                   const parseOutcomeEntries = Object.entries(sg.parse_outcome_distribution ?? {})
                     .filter(([, count]) => typeof count === 'number' && count > 0)
                     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
@@ -592,6 +595,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     <span className="text-[9px] text-neutral-500 flex flex-col gap-0.5">
                       <span>
                         Spawn gate: {challenged} challenged · {survived} survived ({explicitPass} explicit-pass · {failOpen} fail-open) · {refuted} refuted ({unresolved} unresolved)
+                        {manifestExcluded ? ` · ${manifestExcluded} manifest-excluded fail-closed` : ''}
                         {(sg.challenged_spawned ?? 0) > 0 || (sg.unchallenged_spawned ?? 0) > 0
                           ? ` · merge rate: ${challengedRate} challenged (${challengedDenom}) vs ${unchallengedRate} unchallenged (${unchallengedDenom})`
                           : ''}
@@ -599,6 +603,11 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                       {reasons.length > 0 && (
                         <span className="text-neutral-600 italic" title={reasons.join('\n')}>
                           refuted/unresolved reasons: {reasons.slice(0, 3).join('; ')}{reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}
+                        </span>
+                      )}
+                      {excludedSamples.length > 0 && (
+                        <span className="text-neutral-600 italic" title={excludedSamples.map((sample) => `${sample.title ?? sample.hash ?? 'finding'}: ${sample.reason ?? 'manifest-excluded fail-closed'}`).join('\n')}>
+                          manifest-excluded samples: {excludedSamples.slice(0, 3).map((sample) => sample.title || sample.reason || sample.hash).join('; ')}{excludedSamples.length > 3 ? ` (+${excludedSamples.length - 3} more)` : ''}
                         </span>
                       )}
                       {parseOutcomeEntries.length > 0 && (

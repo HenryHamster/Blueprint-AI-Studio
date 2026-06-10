@@ -223,6 +223,8 @@ _RESEARCH_SPAWN_GATE_PARENT_COUNT_FIELDS = (
     # Compact, capped, deduped sample of refuted/unresolved challenger reasons so
     # a degraded gate is visible at cycle-rollup without opening individual tasks.
     "research_spawn_gate_refuted_reasons",
+    "research_spawn_gate_manifest_excluded_fail_closed_count",
+    "research_spawn_gate_manifest_excluded_fail_closed_samples",
 )
 
 # Cap on the compact refuted/unresolved reasons sample persisted per cycle and
@@ -2318,6 +2320,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_fail_open_count = 0
     _spawn_gate_unresolved_count = 0
     _spawn_gate_refuted_reasons: list[str] = []
+    _spawn_gate_manifest_excluded_count = 0
+    _spawn_gate_manifest_excluded_samples: list[dict] = []
     _spawn_gate_parse_outcome = None
     if _adversarial_verdict_raw is not None:
         _spawn_gate_parse_outcome = _adversarial_verdict_raw.get("parse_outcome")
@@ -2438,6 +2442,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "to the adversarial manifest"
                         )
                         _explicit = False
+                        _spawn_gate_manifest_excluded_count += 1
+                        if len(_spawn_gate_manifest_excluded_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP:
+                            _spawn_gate_manifest_excluded_samples.append(
+                                {
+                                    "hash": _fhash,
+                                    "title": str(_f.get("title") or "")[:120],
+                                    "reason": _reason[:_SPAWN_GATE_REASON_MAX_LEN],
+                                }
+                            )
                     else:
                         # Finding was never in the challenge manifest (e.g. low-stakes).
                         # Do not gate it — no _adversarial_verdict stamp means it passes through.
@@ -4601,6 +4614,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _finding_give_up
         or _reproduce_rejected
         or _spawn_gate_challenged_count
+        or _spawn_gate_manifest_excluded_count
     ):
         ctx = dict(task.context or {})
         if _all_deferred:
@@ -4630,6 +4644,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons
             if _spawn_gate_parse_outcome:
                 ctx["research_spawn_gate_parse_outcome"] = _spawn_gate_parse_outcome
+        if _spawn_gate_manifest_excluded_count:
+            ctx["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
+                _spawn_gate_manifest_excluded_count
+            )
+            ctx["research_spawn_gate_manifest_excluded_fail_closed_samples"] = (
+                _spawn_gate_manifest_excluded_samples
+            )
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)

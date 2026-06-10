@@ -644,6 +644,12 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_parse_outcome": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (machine-readable adversarial parse classification for unresolved cycles)"
     },
+    "research_spawn_gate_manifest_excluded_fail_closed_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (manifest-excluded high-stakes fail-closed deferral count)"
+    },
+    "research_spawn_gate_manifest_excluded_fail_closed_samples": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (compact samples of high-stakes findings excluded from the bounded adversarial manifest)"
+    },
     "research_spawn_gate_challenged_spawned": {
         "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
     },
@@ -777,6 +783,38 @@ async def _update_direction_research_outcomes(
         research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
     )
     spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
+    spawn_gate_manifest_excluded_count = int(
+        research_task_ctx.get(
+            "research_spawn_gate_manifest_excluded_fail_closed_count"
+        )
+        or 0
+    )
+    spawn_gate_manifest_excluded_samples: list[dict] = []
+    _seen_spawn_gate_manifest_excluded: set[tuple[str, str]] = set()
+    for _sg_sample in (
+        research_task_ctx.get(
+            "research_spawn_gate_manifest_excluded_fail_closed_samples"
+        )
+        or []
+    ):
+        if not isinstance(_sg_sample, dict):
+            continue
+        _sample = {
+            "hash": str(_sg_sample.get("hash") or "")[:80],
+            "title": str(_sg_sample.get("title") or "")[:120],
+            "reason": str(_sg_sample.get("reason") or "")[
+                :_SPAWN_GATE_REASON_MAX_LEN
+            ],
+        }
+        _sample_key = (_sample["hash"], _sample["title"])
+        if (
+            (_sample["hash"] or _sample["title"])
+            and _sample_key not in _seen_spawn_gate_manifest_excluded
+            and len(spawn_gate_manifest_excluded_samples)
+            < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        ):
+            _seen_spawn_gate_manifest_excluded.add(_sample_key)
+            spawn_gate_manifest_excluded_samples.append(_sample)
     # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
     spawn_gate_refuted_reasons: list[str] = []
     _seen_spawn_gate_reasons: set[str] = set()
@@ -811,6 +849,13 @@ async def _update_direction_research_outcomes(
             entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
         if spawn_gate_parse_outcome:
             entry["research_spawn_gate_parse_outcome"] = spawn_gate_parse_outcome
+        if spawn_gate_manifest_excluded_count:
+            entry["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
+                spawn_gate_manifest_excluded_count
+            )
+            entry["research_spawn_gate_manifest_excluded_fail_closed_samples"] = (
+                spawn_gate_manifest_excluded_samples
+            )
 
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()

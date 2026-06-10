@@ -690,6 +690,7 @@ export function buildDirSummaryText(
       const explicitPass = Number(sgm.explicit_pass_count ?? 0);
       const failOpen = Number(sgm.fail_open_count ?? 0);
       const unresolved = Number(sgm.unresolved_count ?? 0);
+      const manifestExcluded = Number(sgm.manifest_excluded_fail_closed_count ?? 0);
       const cmr = sgm.challenged_merge_rate != null ? `${Math.round(Number(sgm.challenged_merge_rate) * 100)}%` : 'n/a';
       const umr = sgm.unchallenged_merge_rate != null ? `${Math.round(Number(sgm.unchallenged_merge_rate) * 100)}%` : 'n/a';
       // Preserve the merge-rate sample sizes so each percentage travels with its
@@ -702,7 +703,20 @@ export function buildDirSummaryText(
       const reasonsPart = reasons.length > 0
         ? `; refuted/unresolved reasons: ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}`
         : '';
-      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved) — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
+      const excludedSamples = Array.isArray(sgm.manifest_excluded_fail_closed_samples)
+        ? (sgm.manifest_excluded_fail_closed_samples as Array<Record<string, unknown>>)
+          .map(sample => {
+            if (typeof sample.title === 'string') return sample.title;
+            if (typeof sample.reason === 'string') return sample.reason;
+            if (typeof sample.hash === 'string') return sample.hash;
+            return '';
+          })
+          .filter(Boolean)
+        : [];
+      const excludedPart = manifestExcluded > 0
+        ? ` · ${manifestExcluded} manifest-excluded fail-closed${excludedSamples.length > 0 ? ` (${excludedSamples.slice(0, 3).join('; ')}${excludedSamples.length > 3 ? ` +${excludedSamples.length - 3} more` : ''})` : ''}`
+        : '';
+      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved)${excludedPart} — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
     }
 
     return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;

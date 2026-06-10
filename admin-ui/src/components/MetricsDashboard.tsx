@@ -231,6 +231,8 @@ interface EfficiencyAxisLocal {
   baseline: number | null;
   drift_pct: number | null;
   history?: Array<{ captured_at: string; value: number | null }>;
+  baseline_seeded_at?: string | null;
+  baseline_seed_snapshot_at?: string | null;
 }
 
 interface EfficiencyAxesLocal {
@@ -401,6 +403,10 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         const driftColor = getDriftColor(drift_pct, axisDef.favorableDirection);
         const driftArrow = drift_pct === null ? '—' : (drift_pct < 0 ? '↓' : '↑');
         const driftDisplay = drift_pct === null ? '—' : `${driftArrow} ${Math.abs(drift_pct).toFixed(1)}%`;
+        const { baseline_seeded_at, baseline_seed_snapshot_at } = axisData;
+        const reseedDate = baseline_seeded_at && baseline_seeded_at !== data.baseline_captured_at
+          ? baseline_seeded_at
+          : null;
         return (
           <div key={axisDef.key} className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
             <div className="flex justify-between items-center">
@@ -411,6 +417,14 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
                 <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
               </div>
             </div>
+            {reseedDate && (
+              <div data-testid={`axis-reseed-provenance-${axisDef.key}`} className="mt-0.5 text-[10px] text-neutral-500">
+                baseline re-seeded {new Date(reseedDate).toLocaleDateString()}
+                {baseline_seed_snapshot_at && (
+                  <span className="ml-1">(snapshot: {new Date(baseline_seed_snapshot_at).toLocaleDateString()})</span>
+                )}
+              </div>
+            )}
             {axisData.history && axisData.history.length >= 2 && (
               <AxisSparkline history={axisData.history} favorableDirection={axisDef.favorableDirection} />
             )}

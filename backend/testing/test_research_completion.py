@@ -8345,13 +8345,14 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
 
 
 @_pytest.mark.asyncio
-async def test_spawn_gate_counters_bounded_to_manifest_set(db_session, mocker):
-    """Counters reflect only manifest-challenged findings; excluded high-stakes do not drift.
+async def test_spawn_gate_records_manifest_excluded_fail_closed_category(
+    db_session, mocker
+):
+    """Manifest-excluded high-stakes findings are visible but do not drift counters.
 
     Scenario: 3 high-stakes findings exist. The manifest can only fit 2 (budget-bounded).
-    The excluded finding gets fail-closed but must NOT inflate the refuted counter.
-    survived = challenged - refuted must remain >= 0 and equal challenged manifest size
-    minus explicitly or implicitly refuted manifest findings.
+    The excluded finding gets fail-closed, is counted in its own category, and
+    must NOT inflate manifest-admitted refuted/survived arithmetic.
     """
     from app.research_completion import _finding_hash
     from test_autonomous_research import _patch_research_externals
@@ -8373,7 +8374,7 @@ async def test_spawn_gate_counters_bounded_to_manifest_set(db_session, mocker):
 
     hash1 = _h(hs_in_manifest_1)
     hash2 = _h(hs_in_manifest_2)
-    # hs_excluded is NOT in the manifest
+    excluded_hash = _h(hs_excluded)
 
     findings = [hs_in_manifest_1, hs_in_manifest_2, hs_excluded]
     task.plan_output = findings
@@ -8411,6 +8412,31 @@ async def test_spawn_gate_counters_bounded_to_manifest_set(db_session, mocker):
     assert (
         ctx["research_spawn_gate_survived_count"]
         == ctx["research_spawn_gate_challenged_count"] - ctx["research_spawn_gate_refuted_count"]
+    )
+    assert ctx.get("research_spawn_gate_manifest_excluded_fail_closed_count") == 1
+    samples = ctx.get("research_spawn_gate_manifest_excluded_fail_closed_samples") or []
+    assert samples == [
+        {
+            "hash": excluded_hash,
+            "title": "Budget-excluded high-stakes finding",
+            "reason": (
+                "fail-closed: high-stakes finding was not admitted "
+                "to the adversarial manifest"
+            ),
+        }
+    ]
+
+    deferred = {
+        d.get("title"): d
+        for d in (ctx.get("deferred_findings") or [])
+        if d.get("deferred_reason") == "adversarial_gate"
+    }
+    assert deferred["Budget-excluded high-stakes finding"]["finding_hash"] == excluded_hash
+    assert deferred["Budget-excluded high-stakes finding"][
+        "adversarial_gate_reason"
+    ] == (
+        "fail-closed: high-stakes finding was not admitted "
+        "to the adversarial manifest"
     )
 
 

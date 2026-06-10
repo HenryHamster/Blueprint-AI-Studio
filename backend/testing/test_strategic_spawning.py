@@ -1938,6 +1938,14 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
                         "research_spawn_gate_challenged_count": 5,
                         "research_spawn_gate_refuted_count": 2,
                         "research_spawn_gate_survived_count": 3,
+                        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+                        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+                            {
+                                "hash": "excluded-hash",
+                                "title": "Budget-excluded finding",
+                                "reason": "manifest cap",
+                            }
+                        ],
                         "research_spawn_gate_challenged_spawned": 3,
                         "research_spawn_gate_challenged_merged": 2,
                         "research_spawn_gate_unchallenged_spawned": 4,
@@ -1966,6 +1974,14 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     assert sgm["challenged"] == 5
     assert sgm["refuted"] == 2
     assert sgm["survived"] == 3
+    assert sgm["manifest_excluded_fail_closed_count"] == 1
+    assert sgm["manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "manifest cap",
+        }
+    ]
     assert sgm["challenged_merge_rate"] == round(2 / 3, 3)
     assert sgm["unchallenged_merge_rate"] == round(3 / 4, 3)
 

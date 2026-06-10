@@ -195,6 +195,12 @@ export interface Task {
     research_spawn_gate_fail_open_count?: number;
     research_spawn_gate_unresolved_count?: number;
     research_spawn_gate_refuted_reasons?: string[];
+    research_spawn_gate_manifest_excluded_fail_closed_count?: number;
+    research_spawn_gate_manifest_excluded_fail_closed_samples?: Array<{
+      hash?: string;
+      title?: string;
+      reason?: string;
+    }>;
     research_spawn_gate_challenged_spawned?: number;
     research_spawn_gate_challenged_merged?: number;
     research_spawn_gate_unchallenged_spawned?: number;
@@ -265,6 +271,12 @@ export interface ResearchSpawnGateAggregate {
   explicit_pass_count?: number;
   fail_open_count?: number;
   unresolved_count?: number;
+  manifest_excluded_fail_closed_count?: number;
+  manifest_excluded_fail_closed_samples?: Array<{
+    hash?: string;
+    title?: string;
+    reason?: string;
+  }>;
   // Preserved merge-rate sample sizes so a shown rate always travels with its
   // spawned/merged denominators.
   challenged_spawned?: number;
