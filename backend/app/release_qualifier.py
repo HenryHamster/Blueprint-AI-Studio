@@ -74,7 +74,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
-from app.failure_classification import RATE_LIMIT, classify_failure
+from app.failure_classification import PROVISION_FAILURE, RATE_LIMIT, classify_failure
 from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
@@ -1413,10 +1413,12 @@ async def run_qualification(
 # app.release_qualifier_audit and is re-exported above for back-compat.
 # ---------------------------------------------------------------------------
 
-# Maximum number of times a RATE_LIMIT-classified release_audit task will be
+# Maximum number of times a transient-infra-classified release_audit task will be
 # re-spawned per qualification run before falling through to _handle_infra_failure.
 _MAX_AUDIT_RL_RESPAWNS = 2
+_MAX_AUDIT_PROVISION_RESPAWNS = 2
 _MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS = 2
+_MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS = 2
 _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
     {
         "audit_challenge_missing",
@@ -1911,6 +1913,8 @@ async def _finalize_qualification(
     # whose artifact is absent or unparseable is also an infrastructure failure
     # (the agent ran but emitted no usable output) — checked after artifact
     # reading below.
+    from app.payload_schemas import PayloadTooLargeError
+
     _audit_task_obj: Task | None = None
     if audit_task_id:
         try:
@@ -1919,16 +1923,25 @@ async def _finalize_qualification(
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
             ):
-                # A RATE_LIMIT-classified FAILED audit is a transient account-credit
-                # failure, not a pipeline infrastructure failure.  Re-spawn the audit
-                # child with the same candidate_sha so the same snapshot is scored,
-                # and record the respawn count in last_qualification so the cap is
-                # visible to the operator.  Non-transient FAILED/CANCELLED tasks and
-                # exhausted respawns fall through to _handle_infra_failure as before.
+                # Transient infra failures (rate-limit or VM provision/startup death)
+                # are retryable. Re-spawn the audit child with the same candidate_sha
+                # so the same snapshot is scored, and record the respawn count in
+                # last_qualification so the cap is visible to the operator. Non-
+                # transient FAILED/CANCELLED tasks and exhausted respawns fall through
+                # to _handle_infra_failure as before.
                 rl_respawn_count = qual.get("audit_rl_respawn_count", 0)
+                provision_respawn_count = qual.get("audit_provision_respawn_count", 0)
+                audit_failure_label = (_audit_task_obj.context or {}).get(
+                    "failure_category"
+                )
+                audit_failure_class = (
+                    classify_failure(_audit_task_obj)
+                    if _audit_task_obj.status == TaskStatus.FAILED
+                    else None
+                )
                 if (
                     _audit_task_obj.status == TaskStatus.FAILED
-                    and classify_failure(_audit_task_obj) == RATE_LIMIT
+                    and audit_failure_class == RATE_LIMIT
                     and rl_respawn_count < _MAX_AUDIT_RL_RESPAWNS
                 ):
                     fp = _audit_task_obj.first_payload or {}
@@ -1970,16 +1983,66 @@ async def _finalize_qualification(
                         "status": "audit_rate_limit_respawned",
                         "respawn_count": new_count,
                     }
+                if (
+                    _audit_task_obj.status == TaskStatus.FAILED
+                    and audit_failure_class == PROVISION_FAILURE
+                    and audit_failure_label == PROVISION_FAILURE
+                    and provision_respawn_count < _MAX_AUDIT_PROVISION_RESPAWNS
+                ):
+                    fp = _audit_task_obj.first_payload or {}
+                    _project = await session.get(Project, version.project_id)
+                    _integration_branch = get_project_integration_branch(_project)
+                    new_base_branch = fp.get("base_branch", "") or _integration_branch
+                    new_diff_range = (
+                        fp.get("diff_range", "")
+                        or f"{_integration_branch}...{candidate_sha}"
+                    )
+                    new_audit_task = await _spawn_release_audit_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=new_base_branch,
+                        diff_range=new_diff_range,
+                        candidate_sha=candidate_sha,
+                    )
+                    new_count = provision_respawn_count + 1
+                    updated_qual = {
+                        **qual,
+                        "audit_task_id": str(new_audit_task.id),
+                        "audit_provision_respawn_count": new_count,
+                    }
+                    version.last_qualification = updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d audit task %s had transient infra failure; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        audit_task_id,
+                        new_audit_task.id,
+                        new_count,
+                        _MAX_AUDIT_PROVISION_RESPAWNS,
+                    )
+                    return {
+                        "status": "audit_provision_respawned",
+                        "respawn_count": new_count,
+                    }
                 infra_label = _enrich_infra_error(
                     f"audit_task_{_audit_task_obj.status.lower()}",
                     _audit_task_obj,
                 )
-                if (
-                    _audit_task_obj.status == TaskStatus.FAILED
-                    and classify_failure(_audit_task_obj) == RATE_LIMIT
+                if _audit_task_obj.status == TaskStatus.FAILED and (
+                    audit_failure_class == RATE_LIMIT
                     and rl_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                 ):
                     infra_label = "audit_rate_limit_respawn_cap_exceeded"
+                if _audit_task_obj.status == TaskStatus.FAILED and (
+                    audit_failure_class == PROVISION_FAILURE
+                    and audit_failure_label == PROVISION_FAILURE
+                    and provision_respawn_count >= _MAX_AUDIT_PROVISION_RESPAWNS
+                ):
+                    infra_label = "audit_provision_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,
@@ -2149,14 +2212,97 @@ async def _finalize_qualification(
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                 ):
+                    challenge_provision_respawn_count = int(
+                        qual.get("audit_challenge_provision_respawn_count") or 0
+                    )
+                    challenge_failure_label = (_challenge_task_obj.context or {}).get(
+                        "failure_category"
+                    )
+                    challenge_failure_class = (
+                        classify_failure(_challenge_task_obj)
+                        if _challenge_task_obj.status == TaskStatus.FAILED
+                        else None
+                    )
+                    if (
+                        _challenge_task_obj.status == TaskStatus.FAILED
+                        and challenge_failure_class == PROVISION_FAILURE
+                        and challenge_failure_label == PROVISION_FAILURE
+                        and challenge_provision_respawn_count
+                        < _MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS
+                    ):
+                        challenge_payload = _challenge_task_obj.first_payload or {}
+                        audit_payload = (
+                            _audit_task_obj.first_payload
+                            if _audit_task_obj is not None
+                            else {}
+                        )
+                        project = await session.get(Project, version.project_id)
+                        _integration_branch, promotion_target = (
+                            _lts_branch_names(project)
+                            if project is not None
+                            else ("", "main")
+                        )
+                        retry_base_branch = (
+                            challenge_payload.get("base_branch")
+                            or audit_payload.get("base_branch")
+                            or promotion_target
+                        )
+                        retry_diff_range = (
+                            challenge_payload.get("diff_range")
+                            or audit_payload.get("diff_range")
+                            or f"{retry_base_branch}...{candidate_sha}"
+                        )
+                        retry_task = await _spawn_release_audit_challenge_task(
+                            session,
+                            version.project_id,
+                            version_id=version.id,
+                            base_branch=retry_base_branch,
+                            diff_range=retry_diff_range,
+                            candidate_sha=candidate_sha,
+                        )
+                        new_respawn_count = challenge_provision_respawn_count + 1
+                        version.last_qualification = {
+                            **qual,
+                            "status": "pending",
+                            "challenge_task_id": str(retry_task.id),
+                            "audit_challenge_task_id": str(retry_task.id),
+                            "audit_challenge_provision_respawn_count": new_respawn_count,
+                            "audit_challenge_previous_task_id": challenge_task_id,
+                        }
+                        flag_modified(version, "last_qualification")
+                        session.add(version)
+                        await session.flush()
+                        logger.info(
+                            "[RELEASE_QUALIFIER] v%d challenge task %s had transient infra failure; "
+                            "re-spawned as %s (respawn %d/%d)",
+                            version.version_number,
+                            challenge_task_id,
+                            retry_task.id,
+                            new_respawn_count,
+                            _MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS,
+                        )
+                        return {
+                            "status": "audit_challenge_provision_respawned",
+                            "respawn_count": new_respawn_count,
+                            "challenge_task_id": str(retry_task.id),
+                        }
+                    infra_label = _enrich_infra_error(
+                        f"audit_challenge_task_{_challenge_task_obj.status.lower()}",
+                        _challenge_task_obj,
+                    )
+                    if (
+                        _challenge_task_obj.status == TaskStatus.FAILED
+                        and challenge_failure_class == PROVISION_FAILURE
+                        and challenge_failure_label == PROVISION_FAILURE
+                        and challenge_provision_respawn_count
+                        >= _MAX_AUDIT_CHALLENGE_PROVISION_RESPAWNS
+                    ):
+                        infra_label = "audit_challenge_provision_respawn_cap_exceeded"
                     return await _handle_infra_failure(
                         session,
                         version,
                         qual,
-                        _enrich_infra_error(
-                            f"audit_challenge_task_{_challenge_task_obj.status.lower()}",
-                            _challenge_task_obj,
-                        ),
+                        infra_label,
                     )
             except (ValueError, TypeError):
                 logger.warning(

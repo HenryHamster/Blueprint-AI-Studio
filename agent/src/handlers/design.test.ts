@@ -221,8 +221,8 @@ describe('handleDesign', () => {
 
     // Both helpers must be provisioned so the agent can escalate blockers and
     // persist collective memory during a codebase-grounded design session.
-    expect(vi.mocked(writePlaybookHelper)).toHaveBeenCalledWith(TASK_ID);
-    expect(vi.mocked(writeMessagesHelper)).toHaveBeenCalledWith(TASK_ID);
+    expectCalledWith(writePlaybookHelper, TASK_ID);
+    expectCalledWith(writeMessagesHelper, TASK_ID);
   });
 
   it('injects a Prior Knowledge section with prior-doc ids/titles/summaries when docs exist', async () => {
