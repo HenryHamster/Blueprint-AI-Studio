@@ -4222,6 +4222,75 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_second_opinion_state_not_propagated_to_spawned_tasks(
+    db_session, mocker
+):
+    """The second-opinion key family is task-local review state and must NOT
+    ride the review→fix→review context copy. Regression (PR #9243): an
+    inherited reconciliation record fired the single-shot re-entry override on
+    the next review task, clobbering its fresh APPROVE with iteration-1's
+    REQUEST_CHANGES + verbatim issues — which then tripped the stuck-cycle
+    detector and falsely parked the chain."""
+    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    second_opinion_ctx = {
+        "review_second_opinion": {
+            "state": "unchallenged",
+            "primary_verdict": "REQUEST_CHANGES",
+            "reconciled_verdict": "REQUEST_CHANGES",
+            "surviving_issues": [{"description": "iteration-1 issue"}],
+            "review_task_id": str(uuid.uuid4()),
+        },
+        "awaiting_review_second_opinion": str(uuid.uuid4()),
+        "review_second_opinion_parked": {"verdict": "REQUEST_CHANGES", "issues": []},
+        "review_second_opinion_for_task_id": str(uuid.uuid4()),
+    }
+    # The literal keys above must stay in lockstep with the canonical family —
+    # if a key is renamed or added, this test must be updated alongside it.
+    assert set(second_opinion_ctx) == set(REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 502,
+                "branch": "feat/so",
+                "base_branch": "main",
+                "prompt": "Review X",
+            }
+        ],
+        context={"direction_id": str(uuid.uuid4()), **second_opinion_ctx},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=502,
+        branch="feat/so",
+        base_branch="main",
+        fix_prompt="Address the review feedback",
+    )
+
+    assert created is True and result is not None
+    ctx = result.context or {}
+    for key in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS:
+        assert key not in ctx, (
+            f"task-local second-opinion key {key!r} must not propagate to "
+            f"spawned pipeline tasks"
+        )
+    assert ctx.get("direction_id"), "strategic context must still propagate"
+
+
+@pytest.mark.asyncio
 async def test_rollup_classifier_flags_propagate_to_spawned_fix(db_session, mocker):
     """Rollup-chain recognition must survive spawn-time propagation so the
     elevated iteration cap stays in force across every fix/review iteration.
