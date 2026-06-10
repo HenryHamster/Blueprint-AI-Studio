@@ -1,7 +1,8 @@
 """Tests for the pluggable per-type evaluation gate framework.
 
 Covers the registry-driven strategy resolver and the synchronous strategy
-implementations (none / forward-quality / metric / code-ci-review sentinel).
+implementations (none / forward-quality / metric / artifact-delivery /
+code-ci-review sentinel).
 The completion-path integration (memo/perf handlers acting on a failed gate)
 is exercised in test_memo_completion.py, test_perf_completion.py, and
 test_panel_review_completion.py.
@@ -19,6 +20,7 @@ from app.task_evaluators import (
     CODE_CI_REVIEW_KEY,
     CodeCiReviewStrategy,
     EvaluationVerdict,
+    ArtifactDeliveryStrategy,
     ForwardQualityStrategy,
     MetricStrategy,
     NoneStrategy,
@@ -38,7 +40,14 @@ def _task(task_type: str) -> Task:
 
 def test_every_task_type_declares_an_evaluation_strategy():
     """Each TaskType has an explicit, in-vocabulary evaluation declaration."""
-    valid = {"code-ci-review", "forward-quality", "metric", "structured-verdict", "none"}
+    valid = {
+        "code-ci-review",
+        "forward-quality",
+        "metric",
+        "artifact-delivery",
+        "structured-verdict",
+        "none",
+    }
     assert set(EVALUATION_STRATEGY_BY_TASK_TYPE) == {t.value for t in TaskType}
     for cap in TASK_CAPABILITIES:
         assert cap.evaluation in valid, (cap.id, cap.evaluation)
@@ -72,7 +81,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "release_audit_challenge": "none",
         "memo": "forward-quality",
         "verify_tests": "none",
-        "compute_experiment": "metric",
+        "compute_experiment": "artifact-delivery",
         "web_research": "forward-quality",
         "design": "forward-quality",
     }
@@ -229,7 +238,7 @@ def test_metric_perf_measurement_non_dict_element_fails_cleanly():
     assert "malformed" in v.reason.lower()
 
 
-# ── MetricStrategy: compute_experiment shape-awareness ──────────────────────
+# ── ArtifactDeliveryStrategy: compute_experiment shape-awareness ────────────
 
 
 def _compute_result(**overrides) -> str:
@@ -244,9 +253,9 @@ def _compute_result(**overrides) -> str:
     return json.dumps(base)
 
 
-def test_metric_compute_experiment_valid_result_passes():
-    """A terminal compute result (outcome + final cost) passes the metric gate."""
-    v = MetricStrategy().evaluate(
+def test_artifact_delivery_compute_experiment_valid_result_passes():
+    """A terminal compute result passes the artifact-delivery gate."""
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"), _compute_result()
     )
     assert v.passed is True
@@ -256,7 +265,7 @@ def test_metric_compute_experiment_valid_result_passes():
 def test_metric_compute_experiment_budget_kill_is_honest_terminal_pass():
     """A spend-cap kill carries an outcome + cost, so it is an honest terminal
     outcome that PASSES the gate (the experiment did its measured job)."""
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"),
         _compute_result(outcome="SPEND_CAP_EXCEEDED", status="FAILED"),
     )
@@ -264,7 +273,7 @@ def test_metric_compute_experiment_budget_kill_is_honest_terminal_pass():
 
 
 def test_metric_compute_experiment_deadline_kill_is_honest_terminal_pass():
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"),
         _compute_result(outcome="TIMED_OUT", status="TIMED_OUT"),
     )
@@ -276,13 +285,13 @@ def test_metric_compute_experiment_accrued_cost_fallback_passes():
     payload = json.dumps(
         {"job_id": "j", "outcome": "SUCCESS", "accrued_cost_usd": 0.1}
     )
-    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    v = ArtifactDeliveryStrategy().evaluate(_task("compute_experiment"), payload)
     assert v.passed is True
 
 
 def test_metric_compute_experiment_zero_cost_passes():
     """A measured cost of 0.0 is a real measurement (not 'no measurement')."""
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"), _compute_result(final_cost_usd=0.0)
     )
     assert v.passed is True
@@ -291,13 +300,13 @@ def test_metric_compute_experiment_zero_cost_passes():
 def test_metric_compute_experiment_missing_outcome_fails():
     """No terminal outcome → no terminal job state → gate fails closed."""
     payload = json.dumps({"job_id": "j", "final_cost_usd": 0.4})
-    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    v = ArtifactDeliveryStrategy().evaluate(_task("compute_experiment"), payload)
     assert v.passed is False
     assert "terminal" in v.reason.lower()
 
 
 def test_metric_compute_experiment_null_outcome_fails():
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"), _compute_result(outcome=None)
     )
     assert v.passed is False
@@ -306,12 +315,12 @@ def test_metric_compute_experiment_null_outcome_fails():
 def test_metric_compute_experiment_missing_cost_fails():
     """No measured final/accrued cost → gate fails closed."""
     payload = json.dumps({"job_id": "j", "outcome": "SUCCESS"})
-    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    v = ArtifactDeliveryStrategy().evaluate(_task("compute_experiment"), payload)
     assert v.passed is False
 
 
 def test_metric_compute_experiment_non_numeric_cost_fails():
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _task("compute_experiment"),
         _compute_result(final_cost_usd="n/a", accrued_cost_usd=None),
     )
@@ -320,7 +329,7 @@ def test_metric_compute_experiment_non_numeric_cost_fails():
 
 def test_metric_compute_experiment_empty_and_unparseable_fail():
     for bad in ("", "   ", "not json at all", "[1, 2, 3]"):
-        v = MetricStrategy().evaluate(_task("compute_experiment"), bad)
+        v = ArtifactDeliveryStrategy().evaluate(_task("compute_experiment"), bad)
         assert v.passed is False, bad
 
 
@@ -328,7 +337,7 @@ def test_metric_compute_experiment_does_not_use_perf_array_path():
     """A compute_experiment must NOT be accepted by the perf severity-array path —
     a severity array carries no terminal outcome and must fail the compute gate."""
     findings = json.dumps([{"severity": "high", "title": "x"}])
-    v = MetricStrategy().evaluate(_task("compute_experiment"), findings)
+    v = ArtifactDeliveryStrategy().evaluate(_task("compute_experiment"), findings)
     assert v.passed is False
 
 
@@ -359,7 +368,7 @@ def test_compute_criterion_met_passes_with_reason():
     carries — rather than injecting an experiment-domain metric the agent never
     emits."""
     artifact = _compute_result(final_cost_usd=0.42)
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _criterion_task("final_cost_usd", "<=", 0.9), artifact
     )
     assert v.passed is True
@@ -368,84 +377,90 @@ def test_compute_criterion_met_passes_with_reason():
 
 
 def test_compute_criterion_unmet_fails_with_operator_readable_reason():
-    """A declared criterion on a measurable metric that the result misses FAILS
-    the gate honestly (a genuinely-measured-but-unmet goal still fails closed)."""
+    """A declared criterion on a measurable metric that the result misses still
+    passes artifact delivery and records the unmet goal in the reason."""
     artifact = _compute_result(final_cost_usd=10.0)
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _criterion_task("final_cost_usd", "<=", 5.0), artifact
     )
-    assert v.passed is False
+    assert v.passed is True
     assert "not met" in v.reason
     assert "final_cost_usd=10.0" in v.reason
     assert "<= 5.0" in v.reason
 
 
 def test_compute_criterion_missing_measurable_metric_fails_closed():
-    """A declared criterion on a measurable metric absent from the result fails
-    closed — a measurable-but-unreported goal must not pass on presence alone."""
+    """An absent declared metric no longer gates delivered artifact completion."""
     # spend_cap_usd is a measurable key, but this result omits it.
     artifact = json.dumps({"job_id": "j", "outcome": "SUCCESS", "final_cost_usd": 0.4})
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _criterion_task("spend_cap_usd", ">=", 1.0), artifact
     )
-    assert v.passed is False
-    assert "not evaluable" in v.reason
+    assert v.passed is True
+    assert "not reported" in v.reason
 
 
 def test_compute_criterion_reported_metric_met_passes_with_goal_named():
     """A reported experiment-domain metric (accuracy) that the agent flattened to
     a top-level key and that MEETS its declared goal PASSES, naming the goal."""
     artifact = _compute_result(accuracy=0.93)
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("accuracy", ">=", 0.9), artifact
+    )
     assert v.passed is True
     assert "criterion met" in v.reason
     assert "accuracy >= 0.9" in v.reason
 
 
 def test_compute_criterion_reported_metric_unmet_fails():
-    """A reported experiment-domain metric that MISSES its declared goal FAILS the
-    gate, naming the metric, observed value, operator and threshold."""
+    """An unmet reported experiment metric passes artifact delivery but names
+    the unmet metric, observed value, operator, and threshold."""
     artifact = _compute_result(accuracy=0.83)
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
-    assert v.passed is False
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("accuracy", ">=", 0.9), artifact
+    )
+    assert v.passed is True
     assert "not met" in v.reason
     assert "accuracy=0.83" in v.reason
     assert ">= 0.9" in v.reason
 
 
 def test_compute_criterion_absent_reported_metric_fails_closed():
-    """A declared experiment-domain metric the command did NOT report (absent from
-    the artifact) FAILS CLOSED with an operator-readable reason — it must NOT
-    silently pass as 'unmeasurable'."""
+    """An absent experiment-domain metric is recorded without blocking delivery."""
     artifact = _compute_result()  # no 'accuracy' key reported
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
-    assert v.passed is False
-    assert "not evaluable" in v.reason
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("accuracy", ">=", 0.9), artifact
+    )
+    assert v.passed is True
+    assert "not reported" in v.reason
     assert "accuracy >= 0.9" in v.reason
-    assert "no numeric 'accuracy'" in v.reason
 
 
 def test_compute_criterion_non_numeric_reported_metric_fails_closed():
     """A declared metric present but non-numeric in the artifact fails closed."""
     artifact = _compute_result(accuracy="n/a")
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
-    assert v.passed is False
-    assert "not evaluable" in v.reason
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("accuracy", ">=", 0.9), artifact
+    )
+    assert v.passed is True
+    assert "not reported" in v.reason
 
 
 def test_compute_criterion_can_gate_on_cost_metric():
     """The criterion reads any measurable numeric result key by name, incl. cost."""
     artifact = _compute_result(final_cost_usd=10.0)
-    v = MetricStrategy().evaluate(
+    v = ArtifactDeliveryStrategy().evaluate(
         _criterion_task("final_cost_usd", "<=", 5.0), artifact
     )
-    assert v.passed is False
+    assert v.passed is True
     assert "final_cost_usd=10.0" in v.reason
 
 
 def test_compute_no_criterion_preserves_presence_based_pass():
     """With no declared criterion, the gate keeps its presence-based behavior."""
-    v = MetricStrategy().evaluate(_task("compute_experiment"), _compute_result())
+    v = ArtifactDeliveryStrategy().evaluate(
+        _task("compute_experiment"), _compute_result()
+    )
     assert v.passed is True
     assert "criterion" not in v.reason
 
@@ -466,7 +481,7 @@ def test_compute_malformed_criterion_is_ignored():
             }
         ]
     )
-    v = MetricStrategy().evaluate(task, _compute_result(accuracy=0.5))
+    v = ArtifactDeliveryStrategy().evaluate(task, _compute_result(accuracy=0.5))
     assert v.passed is True
 
 

@@ -5,7 +5,7 @@ work is represented honestly by the shared task capability contract. These
 tests drive a compute_experiment task across its full lifecycle — a budgeted
 ComputeJob is launched and polled by the substrate, the substrate enforces the
 spend-cap / wall-clock-deadline kills, and the task's terminal COMPUTE_RESULT
-artifact is gated by the registry-declared 'metric' forward gate via
+artifact is gated by the registry-declared 'artifact-delivery' forward gate via
 ``_handle_compute_experiment_completion``.
 
 The substrate's job-processing proofs (spend-cap / deadline / teardown) live in
@@ -75,22 +75,22 @@ def _quiet_compute_io(mocker):
 
 def test_compute_experiment_capability_is_honest():
     """The registry declaration matches the type's real behaviour: a
-    compute-substrate experiment, graded by a metric forward gate."""
+    compute-substrate experiment delivering a durable artifact/resource."""
     cap = get_task_capability("compute_experiment")
     assert cap is not None
     assert cap.requires_code is False
     assert cap.requires_compute is True
     assert cap.run_shape == "experiment_loop"
-    assert cap.output_kind == "verdict"
-    assert cap.evaluation == "metric"
+    assert cap.output_kind == "artifact"
+    assert cap.evaluation == "artifact-delivery"
     assert cap.completion_handler == "compute_experiment"
     # Derived maps stay in sync (registry is the single source of truth).
-    assert EVALUATION_STRATEGY_BY_TASK_TYPE["compute_experiment"] == "metric"
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE["compute_experiment"] == "artifact-delivery"
     assert RUN_SHAPE_BY_TASK_TYPE["compute_experiment"] == "experiment_loop"
     assert COMPLETION_HANDLER_BY_TASK_TYPE["compute_experiment"] == "compute_experiment"
 
 
-# ── Completion handler: forward metric gate ─────────────────────────────────
+# ── Completion handler: artifact-delivery gate ──────────────────────────────
 
 
 async def _make_compute_task(db_session) -> Task:
@@ -175,6 +175,7 @@ async def test_compute_completion_stamps_terminal_result_reference(
 
     await db_session.refresh(job)
     assert job.result_reference == result_reference
+    assert task.plan_output["compute_result"]["result_reference"] == result_reference
     # An https:// reference must not create an Artifact row even when the task
     # carries no downstream_artifact acceptance_evidence.
     assert job.artifact_id is None
@@ -365,6 +366,10 @@ async def test_compute_result_artifact_logical_key_delivered_to_dependent(
     assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
     assert artifact.logical_key == "experiment-result-bundle"
     assert artifact.storage_uri == result_reference
+    compute_result = task.plan_output["compute_result"]
+    assert compute_result["result_reference"] == result_reference
+    assert compute_result["artifact_id"] == str(artifact.id)
+    assert compute_result["storage_uri"] == result_reference
 
     await db_session.refresh(dependent)
     prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
@@ -511,7 +516,7 @@ async def test_grounded_negative_compute_knowledge_delivers_to_dependents(
         )
 
     assert doc is not None
-    assert doc.forward_quality_verdict["analysis_mode"] == "fallback"
+    assert doc.forward_quality_verdict["analysis_mode"] == "deterministic"
     assert artifact_uri in doc.source_citations
 
     await db_session.refresh(dependent)
@@ -778,7 +783,7 @@ async def test_compute_completion_no_terminal_outcome_fails_gate(
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert task.context["evaluation_gate"]["passed"] is False
-    assert task.context["evaluation_gate"]["strategy"] == "metric"
+    assert task.context["evaluation_gate"]["strategy"] == "artifact-delivery"
 
 
 @pytest.mark.asyncio
@@ -807,7 +812,7 @@ async def test_compute_completion_unparseable_fails_gate(
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
-    assert task.context["evaluation_gate"]["strategy"] == "metric"
+    assert task.context["evaluation_gate"]["strategy"] == "artifact-delivery"
 
 
 async def _make_compute_task_with_criterion(db_session, metric, op, threshold) -> Task:
@@ -884,11 +889,11 @@ async def test_compute_completion_reported_metric_met_records_goal(
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_reported_metric_unmet_fails_gate(
+async def test_compute_completion_reported_metric_unmet_completes_and_records(
     db_session, _quiet_compute_io
 ):
-    """A reported experiment metric that MISSES its declared goal FAILS the gate
-    and records the unmet criterion durably on task.context."""
+    """A reported experiment metric that misses its goal completes artifact
+    delivery and records the unmet criterion durably."""
     task = await _make_compute_task_with_criterion(
         db_session, "accuracy", ">=", 0.9
     )
@@ -898,9 +903,12 @@ async def test_compute_completion_reported_metric_unmet_fails_gate(
     )
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.FAILED
-    assert task.context["evaluation_gate"]["passed"] is False
-    assert "not met" in task.context["evaluation_gate"]["reason"]
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is False
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(0.83)
     ctx_criterion = task.context["compute_success_criterion"]
     assert ctx_criterion["met"] is False
     assert ctx_criterion["measurable"] is True
@@ -908,12 +916,11 @@ async def test_compute_completion_reported_metric_unmet_fails_gate(
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_unmet_criterion_fails_gate(
+async def test_compute_completion_unmet_criterion_completes_and_records_evidence(
     db_session, _quiet_compute_io
 ):
     """An experiment that finishes but misses its declared goal on a MEASURABLE
-    metric FAILS the gate honestly with an operator-readable reason, rather than
-    completing clean."""
+    metric completes artifact delivery and records honest negative evidence."""
     task = await _make_compute_task_with_criterion(
         db_session, "final_cost_usd", "<=", 5.0
     )
@@ -923,29 +930,35 @@ async def test_compute_completion_unmet_criterion_fails_gate(
     )
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.FAILED
-    assert task.context["evaluation_gate"]["passed"] is False
-    assert "not met" in task.context["evaluation_gate"]["reason"]
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is False
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(10.0)
     assert task.context["compute_success_criterion"]["met"] is False
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_absent_metric_fails_closed_and_records(
+async def test_compute_completion_absent_metric_completes_and_records(
     db_session, _quiet_compute_io
 ):
     """A declared experiment-domain metric the command did NOT report (absent from
-    the terminal artifact) FAILS the gate CLOSED — it must NOT silently complete
-    as 'unmeasurable'. The durable criterion records the metric was not
-    measurable (absent) and the gate reason is operator-readable."""
+    the terminal artifact) completes artifact delivery while recording the
+    metric was not measurable."""
     task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
 
     # Real terminal artifact shape: no 'accuracy' key reported.
     await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.FAILED
-    assert task.context["evaluation_gate"]["passed"] is False
-    assert "not evaluable" in task.context["evaluation_gate"]["reason"]
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is False
+    assert criterion["met"] is False
+    assert criterion["metric"] == "accuracy"
+    assert criterion["value"] is None
     ctx_criterion = task.context["compute_success_criterion"]
     assert ctx_criterion["measurable"] is False
     assert ctx_criterion["met"] is False
@@ -1109,9 +1122,8 @@ async def test_compute_knowledge_persistence_db_failure_stamps_plan_output_after
 async def test_compute_unmet_criterion_persists_honest_negative(
     db_session, _quiet_compute_io
 ):
-    """An experiment that finishes but misses its declared criterion FAILS the
-    gate yet still records an honest negative result as knowledge ("we tried X
-    and it did NOT meet the bar"), rather than silently dropping it."""
+    """An experiment that finishes but misses its declared criterion completes
+    and records an honest negative result as knowledge."""
     task = await _make_compute_task_with_identity(
         db_session, metric="accuracy", op=">=", threshold=0.9
     )
@@ -1121,7 +1133,7 @@ async def test_compute_unmet_criterion_persists_honest_negative(
     )
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.FAILED
+    assert task.status == TaskStatus.COMPLETED
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     doc = docs[0]
@@ -1688,14 +1700,16 @@ def _mock_anthropic_returning(citations: list[str]):
 async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acceptance_grade(
     db_session, mocker, _quiet_compute_io
 ):
-    """The PRIMARY path persists a cited LLM analysis over the durable artifacts.
+    """Completion persists deterministic knowledge; explicit analysis upgrades it.
 
     Runs a compute_experiment to terminal completion, simulates VM teardown,
     re-reads the durable artifact, and asserts the persisted KnowledgeDocument
-    carries REAL artifact/metric citations (resolving to durable evidence, not a
-    bare result_reference) and was produced by the LLM path. The paired fallback
-    run remains searchable measured knowledge, but not acceptance evidence.
+    first carries the deterministic artifact-resource result without an LLM call,
+    then carries REAL artifact/metric citations after the explicit LLM step.
+    The paired deterministic run remains searchable measured knowledge, but not
+    acceptance evidence.
     """
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
     from app.knowledge_query import (
         build_knowledge_index,
         fetch_knowledge_substance_index,
@@ -1726,6 +1740,18 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         result_reference=result_reference,
     )
 
+    with patch("anthropic.AsyncAnthropic", mock_cls):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    mock_create.assert_not_awaited()
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
+    assert "Compute experiment verdict" in docs[0].body
+
     with (
         patch.dict(
             os.environ,
@@ -1733,10 +1759,23 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         ),
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
-        await _handle_compute_experiment_completion(task, logs, db_session)
-
-    await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
+        analysis_result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=result_reference,
+            session=db_session,
+            logs=logs,
+        )
+    assert analysis_result["status"] == "upgraded"
 
     # The LLM was actually invoked over the assembled evidence.
     mock_create.assert_awaited_once()
@@ -1790,51 +1829,50 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is True
     assert substance[0].forward_quality_verdict["compute_acceptance_grade"] == "acceptance"
 
-    fallback_task = await _make_compute_task_with_identity(
+    deterministic_task = await _make_compute_task_with_identity(
         db_session, metric="accuracy", op=">=", threshold=0.9
     )
-    fallback_job, _ = await _setup_durable_job_with_artifact(
-        db_session, fallback_task
+    deterministic_job, _ = await _setup_durable_job_with_artifact(
+        db_session, deterministic_task
     )
-    fallback_logs = _result_artifact(
-        job_id=str(fallback_job.id),
+    deterministic_logs = _result_artifact(
+        job_id=str(deterministic_job.id),
         accuracy=0.93,
         result_reference=result_reference,
     )
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-        await _handle_compute_experiment_completion(
-            fallback_task, fallback_logs, db_session
-        )
+    await _handle_compute_experiment_completion(
+        deterministic_task, deterministic_logs, db_session
+    )
 
-    await db_session.refresh(fallback_task)
-    fallback_docs = await _knowledge_docs_for(db_session, fallback_task)
-    assert len(fallback_docs) == 1
-    fallback_verdict = fallback_docs[0].forward_quality_verdict
-    assert fallback_verdict["analysis_mode"] == "fallback"
-    assert fallback_verdict["knowledge_acceptance_evidence"] is False
-    assert fallback_verdict["compute_acceptance_grade"] == "measured_only"
-    assert fallback_verdict["compute_acceptance_reason"] == "analysis_mode_not_llm"
-    fallback_detail = serialize_knowledge_document(
-        fallback_docs[0], include_body=True
+    await db_session.refresh(deterministic_task)
+    deterministic_docs = await _knowledge_docs_for(db_session, deterministic_task)
+    assert len(deterministic_docs) == 1
+    deterministic_verdict = deterministic_docs[0].forward_quality_verdict
+    assert deterministic_verdict["analysis_mode"] == "deterministic"
+    assert deterministic_verdict["knowledge_acceptance_evidence"] is False
+    assert deterministic_verdict["compute_acceptance_grade"] == "measured_only"
+    assert deterministic_verdict["compute_acceptance_reason"] == "analysis_mode_not_llm"
+    deterministic_detail = serialize_knowledge_document(
+        deterministic_docs[0], include_body=True
     )
-    assert fallback_detail["knowledge_acceptance_evidence"] is False
-    assert fallback_detail["compute_acceptance_grade"] == "measured_only"
-    fallback_substance = await fetch_knowledge_substance_index(
-        db_session, fallback_task.project_id
+    assert deterministic_detail["knowledge_acceptance_evidence"] is False
+    assert deterministic_detail["compute_acceptance_grade"] == "measured_only"
+    deterministic_substance = await fetch_knowledge_substance_index(
+        db_session, deterministic_task.project_id
     )
-    assert fallback_substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is False
-    assert fallback_substance[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
+    assert deterministic_substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is False
+    assert deterministic_substance[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
     assert (
-        fallback_task.plan_output["knowledge_document"][
+        deterministic_task.plan_output["knowledge_document"][
             "knowledge_acceptance_evidence"
         ]
         is False
     )
     assert (
-        fallback_task.plan_output["knowledge_document"]["compute_acceptance_grade"]
+        deterministic_task.plan_output["knowledge_document"]["compute_acceptance_grade"]
         == "measured_only"
     )
-    assert evaluate_task_outcome(fallback_task).status == "neutral"
+    assert evaluate_task_outcome(deterministic_task).status == "neutral"
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2036,7 @@ async def test_compute_experiment_knowledge_falls_back_without_llm(
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     doc = docs[0]
-    assert doc.forward_quality_verdict["analysis_mode"] == "fallback"
+    assert doc.forward_quality_verdict["analysis_mode"] == "deterministic"
     assert doc.forward_quality_verdict["outcome"] == "SUCCESS"
     # Deterministic template: https:// result_reference is not a durable citation,
     # so source_citations is empty. The body is the hardcoded verdict markdown.
@@ -2010,8 +2048,9 @@ async def test_compute_experiment_knowledge_falls_back_without_llm(
 async def test_compute_experiment_knowledge_falls_back_on_ungrounded_citation(
     db_session, mocker, _quiet_compute_io
 ):
-    """If the LLM returns only an ungrounded / bare-result citation it fails the
-    citation gate and the deterministic document is persisted instead."""
+    """Ungrounded explicit analysis reports unavailable and leaves the doc intact."""
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     mocker.patch(
         "app.storage.generate_download_signed_url",
         new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
@@ -2042,12 +2081,33 @@ async def test_compute_experiment_knowledge_falls_back_on_ungrounded_citation(
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
         await _handle_compute_experiment_completion(task, logs, db_session)
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=result_reference,
+            session=db_session,
+            logs=logs,
+        )
+    assert result == {
+        "status": "analysis_unavailable",
+        "reason": "citations-ungrounded",
+        "analysis_mode": "unavailable",
+    }
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
-    assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
     assert docs[0].source_citations == []
 
 
@@ -2271,20 +2331,20 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
     assert artifact.artifact_type == ArtifactType.COMPUTE_RESULT
 
 
-# ── Reentry upgrade: fallback → llm ─────────────────────────────────────────
+# ── Explicit analysis upgrade: deterministic → llm ──────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
+async def test_compute_knowledge_explicit_analysis_upgrades_deterministic_to_llm(
     db_session, mocker, _quiet_compute_io
 ):
-    """A second persistence pass with a stronger LLM analysis upgrades the stored
-    fallback document in-place. Exactly ONE KnowledgeDocument row exists, its
-    content reflects the LLM analysis, and plan_output mirrors the upgraded values.
+    """The explicit LLM step upgrades the stored deterministic document in-place.
 
     This is the acceptance-evidence test: production code in
     _persist_compute_knowledge_document performs the upgrade (not a no-op).
     """
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     mocker.patch(
         "app.storage.generate_download_signed_url",
         new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
@@ -2309,24 +2369,23 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
 
     logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
 
-    # ── First pass: no ANTHROPIC_API_KEY → fallback document persisted ───────
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+    # ── Completion pass: deterministic document persisted, no LLM required ──
+    await _handle_compute_experiment_completion(task, logs, db_session)
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
 
     docs_after_first = await _knowledge_docs_for(db_session, task)
     assert len(docs_after_first) == 1
-    assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "deterministic"
     assert (
         docs_after_first[0].forward_quality_verdict["release_evidence"]
         == release_evidence
     )
-    fallback_body = docs_after_first[0].body
-    assert "Compute experiment verdict" in fallback_body
+    deterministic_body = docs_after_first[0].body
+    assert "Compute experiment verdict" in deterministic_body
 
-    # ── Second pass: LLM available → document upgraded to llm in-place ───────
+    # ── Explicit analysis: LLM available → document upgraded in-place ────────
     metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
     mock_cls, mock_create = _mock_anthropic_returning([artifact_uri, metric_ref])
 
@@ -2337,7 +2396,23 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
         ),
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+        analysis_result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert analysis_result["status"] == "upgraded"
 
     await db_session.refresh(task)
 
@@ -2349,7 +2424,7 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
     # Content reflects the LLM analysis, not the deterministic fallback.
     verdict = doc.forward_quality_verdict
     assert verdict["analysis_mode"] == "llm", (
-        "persisted doc must be upgraded from fallback to llm on reentry"
+        "persisted doc must be upgraded from deterministic to llm explicitly"
     )
     assert verdict["release_evidence"] == release_evidence
     assert artifact_uri in doc.source_citations
@@ -2371,11 +2446,12 @@ async def test_compute_knowledge_reentry_upgrades_fallback_to_llm(
 
 
 @pytest.mark.asyncio
-async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
+async def test_compute_knowledge_does_not_downgrade_llm_when_analysis_unavailable(
     db_session, mocker, _quiet_compute_io
 ):
-    """A persistence pass with a weaker fallback does NOT overwrite an existing
-    stronger LLM document. The stored row keeps its llm values unchanged."""
+    """An unavailable explicit analysis does NOT overwrite an existing LLM doc."""
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     mocker.patch(
         "app.storage.generate_download_signed_url",
         new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
@@ -2388,10 +2464,11 @@ async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
 
     logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
 
-    # ── First pass: LLM available → llm document persisted ───────────────────
+    # ── Completion persists deterministic; explicit analysis upgrades to llm ─
     metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
     mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
 
+    await _handle_compute_experiment_completion(task, logs, db_session)
     with (
         patch.dict(
             os.environ,
@@ -2399,7 +2476,23 @@ async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
         ),
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+        analysis_result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert analysis_result["status"] == "upgraded"
 
     await db_session.refresh(task)
     docs_after_first = await _knowledge_docs_for(db_session, task)
@@ -2407,9 +2500,22 @@ async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
     assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "llm"
     llm_body = docs_after_first[0].body
 
-    # ── Second pass: no API key → fallback path, must NOT downgrade ──────────
+    # ── Second analysis: no API key → unavailable, must NOT downgrade ────────
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+        unavailable = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion=None,
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert unavailable == {
+        "status": "analysis_unavailable",
+        "reason": "precondition-not-met",
+        "analysis_mode": "unavailable",
+    }
 
     await db_session.refresh(task)
     docs_after_second = await _knowledge_docs_for(db_session, task)
@@ -2418,7 +2524,7 @@ async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
 
     # The llm verdict and body must be preserved.
     assert doc.forward_quality_verdict["analysis_mode"] == "llm", (
-        "llm document must not be downgraded to fallback on reentry"
+        "llm document must not be downgraded when later analysis is unavailable"
     )
     assert doc.body == llm_body
     assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
@@ -2428,7 +2534,7 @@ async def test_compute_knowledge_does_not_downgrade_llm_to_fallback(
 async def test_compute_knowledge_same_mode_retry_is_idempotent(
     db_session, _quiet_compute_io
 ):
-    """Two identical fallback persistence calls result in exactly ONE row with
+    """Two identical deterministic persistence calls result in exactly ONE row with
     no errors — idempotent retry is safe."""
     task = await _make_compute_task(db_session)
     logs = _result_artifact()
@@ -2440,53 +2546,78 @@ async def test_compute_knowledge_same_mode_retry_is_idempotent(
     await db_session.refresh(task)
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
-    assert docs[0].forward_quality_verdict["analysis_mode"] == "fallback"
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
 
 
 @pytest.mark.asyncio
-async def test_fallback_verdict_records_skip_reason_when_precondition_not_met(
+async def test_explicit_analysis_reports_unavailable_when_precondition_not_met(
     db_session, _quiet_compute_io
 ):
-    """When the LLM precondition is not met (no API key), the persisted fallback
-    KnowledgeDocument's forward_quality_verdict includes a ``fallback_reason``
-    field naming why the LLM path was skipped."""
+    """No API key is reported honestly and leaves deterministic knowledge intact."""
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     task = await _make_compute_task(db_session)
     logs = _result_artifact()
 
+    await _handle_compute_experiment_completion(task, logs, db_session)
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion=None,
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert result == {
+        "status": "analysis_unavailable",
+        "reason": "precondition-not-met",
+        "analysis_mode": "unavailable",
+    }
 
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     verdict = docs[0].forward_quality_verdict
-    assert verdict["analysis_mode"] == "fallback"
-    assert verdict.get("fallback_reason") == "precondition-not-met", (
-        f"expected fallback_reason='precondition-not-met', got {verdict.get('fallback_reason')!r}"
-    )
+    assert verdict["analysis_mode"] == "deterministic"
+    assert "fallback_reason" not in verdict
 
 
 @pytest.mark.asyncio
-async def test_fallback_verdict_records_skip_reason_when_analysis_disabled(
+async def test_explicit_analysis_reports_unavailable_when_analysis_disabled(
     db_session, _quiet_compute_io
 ):
-    """When analysis is explicitly disabled via env, the fallback verdict names
-    ``analysis-disabled`` as the reason."""
+    """When analysis is disabled, the explicit step reports unavailable."""
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     task = await _make_compute_task(db_session)
     logs = _result_artifact()
 
+    await _handle_compute_experiment_completion(task, logs, db_session)
     with patch.dict(
         os.environ,
         {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": "1"},
     ):
-        await _handle_compute_experiment_completion(task, logs, db_session)
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion=None,
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert result == {
+        "status": "analysis_unavailable",
+        "reason": "analysis-disabled",
+        "analysis_mode": "unavailable",
+    }
 
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     verdict = docs[0].forward_quality_verdict
-    assert verdict["analysis_mode"] == "fallback"
-    assert verdict.get("fallback_reason") == "analysis-disabled", (
-        f"expected fallback_reason='analysis-disabled', got {verdict.get('fallback_reason')!r}"
-    )
+    assert verdict["analysis_mode"] == "deterministic"
+    assert "fallback_reason" not in verdict
 
 
 @pytest.mark.asyncio
@@ -2501,6 +2632,8 @@ async def test_compute_llm_strips_signed_url_when_durable_citation_also_present(
     included in the LLM prompt (for convenience) are stripped from storage even
     when the LLM explicitly cites them alongside real durable evidence.
     """
+    from app.knowledge_completion import analyze_compute_experiment_knowledge
+
     signed_url = "https://signed.storage.example.com/token=abc123/artifacts.tar.gz"
     mocker.patch(
         "app.storage.generate_download_signed_url",
@@ -2528,6 +2661,23 @@ async def test_compute_llm_strips_signed_url_when_durable_citation_also_present(
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
         await _handle_compute_experiment_completion(task, logs, db_session)
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=None,
+            session=db_session,
+            logs=logs,
+        )
+    assert result["status"] == "upgraded"
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED

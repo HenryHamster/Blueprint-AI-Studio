@@ -34,12 +34,13 @@ from app.github import (
     submit_pr_review,
 )
 from app.models import (
+    Artifact,
     Project,
     Task,
     TaskHistory,
     TaskStatus,
 )
-from app.compute_jobs import stamp_compute_job_result_reference
+from app.compute_jobs import get_compute_job_for_task, stamp_compute_job_result_reference
 from app.artifact_prerequisites import (
     deliver_artifact_to_dependents,
     stamp_artifact_logical_key,
@@ -159,6 +160,57 @@ def _extract_compute_result_reference(logs: str) -> Optional[str]:
         reference = reference.strip()
         return reference or None
     return None
+
+
+def _extract_compute_job_id(logs: str) -> Optional[uuid.UUID]:
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_job_id = payload.get("job_id")
+    if raw_job_id is None:
+        return None
+    try:
+        return uuid.UUID(str(raw_job_id))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _stamp_compute_result_resource(
+    session: AsyncSession, task: Task, logs: str
+) -> dict[str, Any]:
+    """Stamp and return durable resource identity for a compute result."""
+    resource: dict[str, Any] = {}
+    result_reference = _extract_compute_result_reference(logs)
+    if result_reference is not None:
+        resource["result_reference"] = result_reference
+    job_id = _extract_compute_job_id(logs)
+    if job_id is None:
+        return resource
+
+    if result_reference is not None:
+        job = await stamp_compute_job_result_reference(
+            session,
+            task_id=task.id,
+            job_id=job_id,
+            result_reference=result_reference,
+        )
+    else:
+        job = await get_compute_job_for_task(session, job_id=job_id, task_id=task.id)
+    if job is None:
+        return resource
+    if job.result_reference:
+        resource["result_reference"] = job.result_reference
+    if job.artifact_id is None:
+        return resource
+
+    artifact = await session.get(Artifact, job.artifact_id)
+    resource["artifact_id"] = str(job.artifact_id)
+    if artifact is not None and artifact.storage_uri:
+        resource["storage_uri"] = artifact.storage_uri
+    return resource
 
 
 def build_blueprint_pr_footer(
@@ -2448,32 +2500,13 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        compute_result.update(await _stamp_compute_result_resource(session, task, logs))
         plan_output["compute_result"] = compute_result
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
         )[:500]
-        result_reference = _extract_compute_result_reference(logs)
-        job_id = None
-        try:
-            payload = json.loads(logs)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict):
-            raw_job_id = payload.get("job_id")
-            if raw_job_id is not None:
-                try:
-                    job_id = uuid.UUID(str(raw_job_id))
-                except (TypeError, ValueError):
-                    job_id = None
-        if job_id is not None:
-            await stamp_compute_job_result_reference(
-                session,
-                task_id=task.id,
-                job_id=job_id,
-                result_reference=result_reference,
-            )
         task.status = TaskStatus.COMPLETED
         logger.info(
             "[COMPUTE] Prerequisite-mode task %s completed with measured verdict",
@@ -2492,14 +2525,10 @@ async def _handle_compute_experiment_completion(
     if not verdict.passed:
         record_failed_gate(task, verdict)
         logger.info(
-            "[COMPUTE] Task %s did not clear the metric gate: %s",
+            "[COMPUTE] Task %s did not clear the artifact-delivery gate: %s",
             task.id,
             verdict.reason,
         )
-        # Record an honest negative result: an experiment that produced a
-        # measurement but missed its declared criterion still becomes durable,
-        # queryable knowledge ("we tried X and it did NOT meet the bar"), so a
-        # later cycle does not re-pose the question and re-spend.
         await _finalize_compute_experiment(
             session,
             task,
@@ -2519,11 +2548,9 @@ async def _handle_compute_experiment_completion(
     if measurement is not None:
         outcome, cost = measurement
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
-        # The gate passed, so a declared success criterion (if any) was met —
-        # surface it on the durable result for the operator-visible summary.
-        # ``criterion`` was already computed above and recorded on task.context.
         if criterion is not None:
             compute_result["criterion"] = criterion
+        compute_result.update(await _stamp_compute_result_resource(session, task, logs))
         plan_output["compute_result"] = compute_result
         task.latest_status_message = (
             f"Compute experiment terminal: outcome={outcome}, "
@@ -2531,31 +2558,11 @@ async def _handle_compute_experiment_completion(
         )[:500]
     else:  # pragma: no cover - defensive; the gate guarantees a measurement
         task.latest_status_message = "Compute experiment completed"
-    result_reference = _extract_compute_result_reference(logs)
-    job_id = None
-    try:
-        payload = json.loads(logs)
-    except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        raw_job_id = payload.get("job_id")
-        if raw_job_id is not None:
-            try:
-                job_id = uuid.UUID(str(raw_job_id))
-            except (TypeError, ValueError):
-                job_id = None
-    if job_id is not None:
-        await stamp_compute_job_result_reference(
-            session,
-            task_id=task.id,
-            job_id=job_id,
-            result_reference=result_reference,
-        )
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
     task.status = TaskStatus.COMPLETED
     logger.info(
-        "[COMPUTE] Task %s passed the metric gate and completed", task.id
+        "[COMPUTE] Task %s delivered a compute artifact and completed", task.id
     )
     # Persist the measured verdict as durable, queryable knowledge so future
     # research/strategist cycles can discover that this experiment already ran

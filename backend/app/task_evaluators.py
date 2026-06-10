@@ -9,6 +9,7 @@ the agent's say-so.
 
 This module provides the FOUNDATION of a per-type forward gate. A small closed
 set of strategies (``none``, ``forward-quality``, ``metric``,
+``artifact-delivery``,
 ``structured-verdict``, plus the ``code-ci-review`` sentinel) each implement a
 cheap synchronous ``evaluate`` check, and ``resolve_evaluation_strategy`` picks
 the right one by reading the ``evaluation`` field DECLARED on each
@@ -444,14 +445,9 @@ class MetricStrategy:
     kills are honest terminal outcomes (they carry an ``outcome`` and a cost),
     so they PASS the gate — the experiment did its measured job.
 
-    On top of the presence check, when the experiment DECLARED a
-    ``success_criterion`` (a numeric metric/operator/threshold goal) the gate
-    ENFORCES it against the reported result: a criterion whose metric is present
-    as a numeric value in the COMPUTE_RESULT (a reserved cost/operational field
-    OR a command-reported experiment metric the agent flattens to a top-level
-    key) must actually be met to PASS; a declared metric that is absent or
-    non-numeric in the result FAILS CLOSED, never silently passing as
-    "unmeasurable".
+    Compute experiments now declare the separate ``artifact-delivery`` strategy.
+    This legacy type-aware branch remains presence-based for defensive callers
+    that instantiate MetricStrategy directly.
     """
 
     key = "metric"
@@ -517,29 +513,67 @@ class MetricStrategy:
             )
         outcome, cost = result
 
-        # Goal-level acceptance probe: when the experiment declared WHAT success
-        # means, ENFORCE it against the reported result. A declared metric that
-        # the result reports numerically (a reserved cost field OR a flattened
-        # command-reported experiment metric) must actually be met to pass; a
-        # metric absent / non-numeric in the result fails CLOSED (the goal was
-        # declared but the experiment reported nothing to check it against).
-        # ``met`` is False in BOTH cases, and ``_format_unmet_criterion``
-        # distinguishes them in the operator-readable reason. No declared
-        # criterion preserves the presence-based pass above.
         criterion = evaluate_compute_success_criterion(task, artifact_text)
-        if criterion is not None and not criterion["met"]:
-            return EvaluationVerdict(False, _format_unmet_criterion(criterion), self.key)
-
         reason = (
             f"compute experiment reached terminal outcome {outcome!r} "
             f"at measured cost ${cost}"
         )
         if criterion is not None:
+            status = "met" if criterion["met"] else "recorded as evidence"
             reason += (
-                f"; declared success criterion met "
+                f"; declared success criterion {status} "
                 f"({criterion['metric']} {criterion['operator']} "
                 f"{criterion['threshold']})"
             )
+        return EvaluationVerdict(True, reason, self.key)
+
+
+class ArtifactDeliveryStrategy:
+    """Check that a task delivered its durable artifact/resource.
+
+    For compute_experiment this is intentionally non-gating with respect to the
+    declared success criterion: a terminal, costed COMPUTE_RESULT is the durable
+    product even when the measured criterion is unmet or absent.
+    """
+
+    key = "artifact-delivery"
+
+    def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
+        task_type = _task_type_of(task)
+        if task_type != "compute_experiment":
+            return EvaluationVerdict(
+                True,
+                "artifact delivery gate has no special contract for this task type",
+                self.key,
+            )
+        result = _extract_compute_measurement(artifact_text)
+        if result is None:
+            return EvaluationVerdict(
+                False,
+                "compute experiment delivered no durable terminal result "
+                "(missing terminal outcome or measured final/accrued cost)",
+                self.key,
+            )
+        outcome, cost = result
+        reason = (
+            f"compute experiment delivered terminal result {outcome!r} "
+            f"at measured cost ${cost}"
+        )
+        criterion = evaluate_compute_success_criterion(task, artifact_text)
+        if criterion is not None:
+            if criterion["met"]:
+                reason += (
+                    f"; success criterion met ({criterion['metric']} "
+                    f"{criterion['operator']} {criterion['threshold']})"
+                )
+            elif criterion["measurable"]:
+                reason += f"; success criterion unmet ({_format_unmet_criterion(criterion)})"
+            else:
+                reason += (
+                    "; success criterion not reported "
+                    f"({criterion['metric']} {criterion['operator']} "
+                    f"{criterion['threshold']})"
+                )
         return EvaluationVerdict(True, reason, self.key)
 
 
@@ -576,6 +610,7 @@ _STRATEGIES_SRC: tuple[EvaluationStrategy, ...] = (
     CodeCiReviewStrategy(),
     ForwardQualityStrategy(),
     MetricStrategy(),
+    ArtifactDeliveryStrategy(),
     StructuredVerdictStrategy(),
 )
 _STRATEGIES: dict[str, EvaluationStrategy] = {s.key: s for s in _STRATEGIES_SRC}

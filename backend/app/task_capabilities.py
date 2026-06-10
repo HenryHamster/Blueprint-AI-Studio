@@ -58,12 +58,20 @@ AgentMode = Literal["write", "read_only"]
 #   "metric" — a check that the required measurement / structured result was
 #       actually produced and is within declared bounds (measurement-producing
 #       types). A report that produced no measurement fails.
+#   "artifact-delivery" — a non-gating durable-artifact/resource delivery check.
+#       A missing terminal artifact fails, but measured negative results pass
+#       with the metric outcome recorded as evidence.
 #   "structured-verdict" — a strict parse/shape gate for multi-lens verdict
 #       artifacts. Empty, unparseable, or incomplete verdicts fail.
 #   "none" — no forward gate (plan and any type with no meaningful artifact
 #       gate). Always passes.
 EvaluationStrategyKey = Literal[
-    "code-ci-review", "forward-quality", "metric", "structured-verdict", "none"
+    "code-ci-review",
+    "forward-quality",
+    "metric",
+    "artifact-delivery",
+    "structured-verdict",
+    "none",
 ]
 
 # What a task type ultimately produces. This is the declarative answer to
@@ -574,18 +582,19 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         # This reference type runs the long-running experiment_loop shape: the
         # agent launches a budgeted job and polls it to terminal state. It needs
         # the compute substrate, not a code checkout, and its durable product is
-        # a verdict (the terminal job outcome + final cost), graded by a metric
-        # forward gate that fails an experiment which produced no terminal,
-        # costed result. Dispatch is by the bespoke agent handler, so the
-        # experiment_loop run_shape is declarative only and does not change how
-        # the task is claimed/executed.
-        output_kind="verdict",
+        # the delivered COMPUTE_RESULT artifact/resource. The forward gate checks
+        # only that a terminal, costed result was delivered; success criteria are
+        # recorded as evidence and do not block artifact-resource completion.
+        # Dispatch is by the bespoke agent handler, so the experiment_loop
+        # run_shape is declarative only and does not change how the task is
+        # claimed/executed.
+        output_kind="artifact",
         requires_code=False,
         requires_compute=True,
-        evaluation_strategy="metric",
+        evaluation_strategy="none",
         cost_ceiling_usd=5.0,
         completion_handler="compute_experiment",
-        evaluation="metric",
+        evaluation="artifact-delivery",
         run_shape="experiment_loop",
     ),
     TaskCapability(

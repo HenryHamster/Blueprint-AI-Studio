@@ -1137,8 +1137,8 @@ async def _handle_knowledge_document_completion(
 
 
 # ---------------------------------------------------------------------------
-# Compute-experiment knowledge: a cited LLM analysis over the durable artifacts
-# is the PRIMARY producer; the deterministic verdict template is the fallback.
+# Compute-experiment knowledge: completion persists the deterministic
+# artifact-grounded document. Cited LLM analysis is an explicit optional upgrade.
 # ---------------------------------------------------------------------------
 
 # LLM analysis call shape — mirrors review_learning.categorize_review_issues_llm:
@@ -1165,10 +1165,9 @@ def _build_compute_experiment_document(
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
-    This is the historic hardcoded outcome/cost/criterion template, lifted into a
-    helper so it can be (a) persisted directly as the fallback when no LLM
-    analysis is possible and (b) handed to the LLM analysis pass as the structured
-    facts to ground its prose in. Returns a dict of
+    This is the hardcoded outcome/cost/criterion template, lifted into a helper
+    so it can be persisted at completion and handed to the explicit LLM analysis
+    pass as the structured facts to ground its prose in. Returns a dict of
     ``title``/``summary``/``body``/``topic``/``tags``/``citations`` plus the
     metric ``verdict_record`` so the persisted shape is identical to before.
     """
@@ -1299,9 +1298,9 @@ async def _compute_citation_grounding_stamp(
     logs: str | None,
     session: AsyncSession,
 ) -> dict[str, Any]:
-    """Build a citation-grounding stamp for the deterministic fallback document.
+    """Build a citation-grounding stamp for the deterministic document.
 
-    The fallback document's only citation is the ``result_reference``. This
+    The deterministic document's only citation is the ``result_reference``. This
     helper checks whether that reference is backed by a real durable :class:`Artifact`
     row by loading the :class:`ComputeJob` from ``logs`` and verifying its
     ``artifact_id``. Returns a ``_citation_grounding`` dict using the same shape
@@ -1356,9 +1355,9 @@ async def _gather_compute_evidence(
     ``gs://`` URI, an optional signed download URL, a per-metric reference, and
     the ``result_reference``.
 
-    Returns ``None`` (caller falls back to the deterministic document) whenever
-    there are no usable durable artifacts — an empty prefix, a failed job with
-    nothing durable, or no parseable job linkage at all. ``real_evidence`` is the
+    Returns ``None`` whenever there are no usable durable artifacts — an empty
+    prefix, a failed job with nothing durable, or no parseable job linkage at all.
+    ``real_evidence`` is the
     subset of citations that point at the artifact/metric — i.e. everything BUT a
     bare ``result_reference`` — so the caller can require the analysis to cite at
     least one piece of real evidence rather than only re-stating the reference.
@@ -1556,8 +1555,8 @@ async def _call_compute_analysis_llm(
     """Call the Anthropic API for the analysis, with a single JSON-parse retry.
 
     Returns the parsed JSON object on success, or ``None`` on a persistent parse
-    error or any API failure — the caller then falls back to the deterministic
-    document. Mirrors ``review_learning.categorize_review_issues_llm`` exactly.
+    error or any API failure. The explicit analysis caller reports that as
+    unavailable; it never persists deterministic output as if it were analysis.
     """
     for attempt in range(2):
         try:
@@ -1582,12 +1581,12 @@ async def _call_compute_analysis_llm(
                 logger.info("[COMPUTE] analysis parse error %s, retrying once", exc)
                 continue
             logger.info(
-                "[COMPUTE] analysis parse error on retry, using deterministic fallback"
+                "[COMPUTE] analysis parse error on retry; analysis unavailable"
             )
             return None
-        except Exception as exc:  # noqa: BLE001 — any API error ⇒ fallback
+        except Exception as exc:  # noqa: BLE001 — any API error ⇒ unavailable
             logger.info(
-                "[COMPUTE] analysis LLM call failed (%s), using deterministic fallback",
+                "[COMPUTE] analysis LLM call failed (%s); analysis unavailable",
                 exc,
             )
             return None
@@ -1605,17 +1604,13 @@ async def _analyze_compute_experiment_with_llm(
     session: AsyncSession,
     fallback: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str]:
-    """Produce a cited LLM analysis over the durable artifacts, or ``(None, reason)``.
+    """Produce a cited LLM analysis over durable artifacts, or ``(None, reason)``.
 
-    Returns ``(None, reason)`` — signalling the caller to persist the deterministic
-    fallback — when the analysis is opted out, the API key is absent, there are
-    no usable durable artifacts, the LLM call fails/times out, the output is
-    unparseable, or the produced document does not clear the SAME citation gate
-    the web_research/design lanes use (``_usable_citations``) AND ground itself in
-    at least one real artifact/metric citation rather than only the bare result
-    reference. ``reason`` is a compact machine-readable token identifying WHY the
-    fallback was chosen (e.g. ``"analysis-disabled"``, ``"precondition-not-met"``,
-    ``"no-evidence"``, ``"llm-error"``, ``"citations-ungrounded"``).
+    This helper is only used by the explicit analysis entry point, never by the
+    completion path. ``reason`` is a compact machine-readable token for why the
+    analysis was unavailable (for example ``"analysis-disabled"``,
+    ``"precondition-not-met"``, ``"no-evidence"``, ``"llm-error"``, or
+    ``"citations-ungrounded"``).
     """
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
         logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
@@ -1624,7 +1619,7 @@ async def _analyze_compute_experiment_with_llm(
     if not api_key:
         logger.info(
             "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
-            "(precondition-not-met); fallback document will be persisted",
+            "(precondition-not-met); analysis unavailable",
             task.id,
         )
         return None, "precondition-not-met"
@@ -1668,7 +1663,7 @@ async def _analyze_compute_experiment_with_llm(
     if not usable or not any(c in real_evidence for c in usable):
         logger.info(
             "[COMPUTE] analysis for task %s lacked grounded artifact citations; "
-            "using deterministic fallback",
+            "analysis unavailable",
             task.id,
         )
         return None, "citations-ungrounded"
@@ -1711,7 +1706,7 @@ async def _analyze_compute_experiment_with_llm(
     }, ""
 
 
-_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "llm": 1}
+_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "deterministic": 0, "llm": 1}
 
 
 def _incoming_mode_is_upgrade(
@@ -1720,11 +1715,11 @@ def _incoming_mode_is_upgrade(
     """True when ``incoming_mode`` is strictly stronger than the existing doc's mode.
 
     Reads ``analysis_mode`` from the existing doc's ``forward_quality_verdict``
-    JSON, defaulting to ``"fallback"`` if absent. A strictly higher
+    JSON, defaulting to ``"deterministic"`` if absent. A strictly higher
     ``_ANALYSIS_STRENGTH`` value is an upgrade; equal or lower is not.
     """
     existing_verdict = existing_doc.forward_quality_verdict or {}
-    existing_mode = str(existing_verdict.get("analysis_mode") or "fallback")
+    existing_mode = str(existing_verdict.get("analysis_mode") or "deterministic")
     return _ANALYSIS_STRENGTH.get(incoming_mode, 0) > _ANALYSIS_STRENGTH.get(
         existing_mode, 0
     )
@@ -1766,17 +1761,17 @@ async def _persist_compute_knowledge_document(
 ) -> KnowledgeDocument:
     """Persist one compute-experiment KnowledgeDocument, mirror a compact copy.
 
-    Shared by the LLM-analysis and deterministic-fallback paths so the persisted
-    shape is identical either way; ``mode`` (``"llm"``/``"fallback"``) is stamped
+    Shared by the LLM-analysis and deterministic paths so the persisted
+    shape is identical either way; ``mode`` (``"llm"``/``"deterministic"``) is stamped
     on the verdict and the mirrored plan_output so consumers can tell which path
     produced the document. NEVER mutates ``task.status``,
     ``latest_status_message``, or ``plan_output['compute_result']``.
 
     Idempotent on same-strength retries: a second call with the same (or weaker)
     mode returns the existing row unchanged. An incoming ``mode`` that is strictly
-    STRONGER (e.g. ``"llm"`` over an existing ``"fallback"``) upgrades the stored
+    STRONGER (e.g. ``"llm"`` over an existing ``"deterministic"``) upgrades the stored
     document's content and verdict in-place so the best available analysis always
-    wins, while a downgrade (``"fallback"`` over ``"llm"``) is a no-op.
+    wins, while a downgrade (``"deterministic"`` over ``"llm"``) is a no-op.
     """
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
@@ -1857,7 +1852,7 @@ async def _persist_compute_knowledge_document(
         doc = existing
         if _incoming_mode_is_upgrade(existing, mode):
             # Upgrade the stored document to the stronger analysis in-place.
-            # Never downgrades (fallback over llm is a no-op above).
+            # Never downgrades (deterministic over llm is a no-op above).
             doc.title = title
             doc.summary = summary
             doc.body = document["body"]
@@ -1914,6 +1909,43 @@ async def _persist_compute_knowledge_document(
     return doc
 
 
+async def _prepare_deterministic_compute_document(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> tuple[dict[str, Any], uuid.UUID | None]:
+    """Build the primary deterministic artifact-grounded compute document."""
+    document = _build_compute_experiment_document(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=result_reference,
+    )
+    try:
+        grounding_stamp = await _compute_citation_grounding_stamp(
+            result_reference, logs, session
+        )
+        document = dict(document)
+        document["_citation_grounding"] = grounding_stamp
+        if grounding_stamp.get("grounded", 0) == 0 and document.get("citations"):
+            document["citations"] = []
+    except Exception:  # noqa: BLE001 — grounding stamp must never break completion
+        logger.warning(
+            "[COMPUTE] citation grounding stamp failed for task %s; "
+            "persisting deterministic document without grounding detail",
+            task.id,
+            exc_info=True,
+        )
+    job = await _load_compute_job_from_logs(logs, session)
+    return document, job.id if job is not None else None
+
+
 async def persist_compute_experiment_knowledge(
     task: Task,
     *,
@@ -1924,10 +1956,10 @@ async def persist_compute_experiment_knowledge(
     session: AsyncSession,
     logs: str | None = None,
 ) -> KnowledgeDocument | None:
-    """Persist a ``compute_experiment`` verdict as a durable KnowledgeDocument.
+    """Persist a ``compute_experiment`` artifact result as durable knowledge.
 
     A ``compute_experiment`` runs a budgeted compute job and completes with a
-    measured verdict — a terminal ``outcome``, the measured metric value, whether
+    measured result — a terminal ``outcome``, the measured metric value, whether
     a declared success criterion was met, and the ``cost``. ``web_research`` and
     ``design`` results become first-class :class:`KnowledgeDocument` rows that are
     indexed, delivered to dependents, and injected as prior knowledge into future
@@ -1935,19 +1967,11 @@ async def persist_compute_experiment_knowledge(
     answer the SAME durable home, so a later cycle asking the same measurable
     question can discover that the experiment already ran and what it found.
 
-    The PRIMARY producer is now a cited LLM analysis pass
-    (:func:`_analyze_compute_experiment_with_llm`) that reads the job's durable
-    artifacts, preserved numeric metrics, and bounded command log and writes a
-    grounded document whose ``source_citations`` resolve to that durable evidence
-    — qualifying as acceptance evidence in the d-2dc81008 sense. It runs through
-    the SAME citation gate the web_research/design lanes use; when the LLM is
-    opted out / unavailable, the call errors or times out, the output is
-    unparseable, there are no usable durable artifacts, or the document fails the
-    citation gate, it falls back to the historic deterministic outcome/cost/
-    criterion template — preserving today's behaviour exactly, including the
-    honest negative-result document when the criterion was NOT met. The verdict
-    and mirrored plan_output record which mode (``llm`` vs ``fallback``) produced
-    the document.
+    The PRIMARY producer is the deterministic outcome/cost/criterion document.
+    It performs no LLM call and does not label itself as a degraded analysis.
+    Optional cited LLM analysis is available only through
+    :func:`analyze_compute_experiment_knowledge`, which is explicitly invoked and
+    non-gating.
 
     Invoked for BOTH the met-criterion success path AND the unmet-criterion fail
     path, so the system durably learns "we tried X and it did NOT meet the bar"
@@ -1960,19 +1984,52 @@ async def persist_compute_experiment_knowledge(
     handler owns those — and any failure is the caller's to swallow so durable
     knowledge can never break task completion.
     """
-    fallback = _build_compute_experiment_document(
+    document, compute_job_id = await _prepare_deterministic_compute_document(
         task,
         outcome=outcome,
         cost=cost,
         criterion=criterion,
         result_reference=result_reference,
+        session=session,
+        logs=logs,
+    )
+    return await _persist_compute_knowledge_document(
+        task,
+        document,
+        "deterministic",
+        session,
+        compute_job_id=compute_job_id,
     )
 
-    document = fallback
-    mode = "fallback"
-    fallback_reason: str | None = None
+
+async def analyze_compute_experiment_knowledge(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> dict[str, Any]:
+    """Explicitly run optional LLM analysis and upgrade the stored document.
+
+    This step is deliberately decoupled from completion. It never mutates task
+    status or ``plan_output["compute_result"]``; if credentials/evidence/output
+    are unavailable it reports that honestly and leaves the deterministic
+    document intact.
+    """
+    fallback, compute_job_id = await _prepare_deterministic_compute_document(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=result_reference,
+        session=session,
+        logs=logs,
+    )
     try:
-        analysis, _reason = await _analyze_compute_experiment_with_llm(
+        analysis, reason = await _analyze_compute_experiment_with_llm(
             task,
             outcome=outcome,
             cost=cost,
@@ -1982,66 +2039,34 @@ async def persist_compute_experiment_knowledge(
             session=session,
             fallback=fallback,
         )
-    except Exception:  # noqa: BLE001 — analysis must never break completion
+    except Exception:  # noqa: BLE001 — optional analysis must never gate callers
         logger.warning(
-            "[COMPUTE] LLM analysis pass raised for task %s; "
-            "using deterministic fallback",
+            "[COMPUTE] explicit LLM analysis raised for task %s",
             task.id,
             exc_info=True,
         )
         analysis = None
-        _reason = "llm-error"
-    if analysis is not None:
-        document = analysis
-        mode = "llm"
-    else:
-        fallback_reason = _reason or "unknown"
-        logger.info(
-            "[COMPUTE] task %s persisting fallback KnowledgeDocument "
-            "(analysis_mode=fallback, reason=%s)",
-            task.id,
-            fallback_reason,
-        )
-        # Fallback path: stamp citation grounding based on whether result_reference
-        # resolves to a real Artifact row via the ComputeJob. Best-effort — any
-        # error here is swallowed; the fallback document persists either way.
-        try:
-            grounding_stamp = await _compute_citation_grounding_stamp(
-                result_reference, logs, session
-            )
-            document = dict(document)
-            document["_citation_grounding"] = grounding_stamp
-            # Strip citations that have no backing Artifact row: a storage URI with
-            # no resolved artifact is not durable evidence. When grounded == 0 the
-            # fallback citations are cleared so the document is not treated as
-            # acceptance-grade cited evidence. (_is_durable_citation already
-            # excluded transient http(s):// URLs; this removes unresolved gs:// etc.)
-            if grounding_stamp.get("grounded", 0) == 0 and document.get("citations"):
-                document["citations"] = []
-        except Exception:  # noqa: BLE001 — grounding stamp must never break completion
-            logger.warning(
-                "[COMPUTE] citation grounding stamp failed for task %s; "
-                "persisting fallback without grounding detail",
-                task.id,
-                exc_info=True,
-            )
-        # Stamp the reason the LLM path was skipped so operators can diagnose
-        # misconfigured backends (e.g. missing ANTHROPIC_API_KEY).
-        if fallback_reason:
-            document = dict(document)
-            verdict_record = dict(document.get("verdict_record") or {})
-            verdict_record["fallback_reason"] = fallback_reason
-            document["verdict_record"] = verdict_record
+        reason = "llm-error"
+    if analysis is None:
+        return {
+            "status": "analysis_unavailable",
+            "reason": reason or "unknown",
+            "analysis_mode": "unavailable",
+        }
 
-    job = await _load_compute_job_from_logs(logs, session)
-    compute_job_id = job.id if job is not None else None
-    return await _persist_compute_knowledge_document(
+    doc = await _persist_compute_knowledge_document(
         task,
-        document,
-        mode,
+        analysis,
+        "llm",
         session,
         compute_job_id=compute_job_id,
     )
+    return {
+        "status": "upgraded",
+        "reason": None,
+        "analysis_mode": "llm",
+        "knowledge_document_id": str(doc.id),
+    }
 
 
 async def _handle_web_research_completion(
