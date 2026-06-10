@@ -401,10 +401,11 @@ describe('captureTestBaseline build-config discovery reporting', () => {
         s.endsWith('/packages/b/package.json')
       );
     });
+    const workspace = process.env.AGENT_WORKSPACE ?? '/tmp/workspace';
     mockReaddirSync.mockImplementation((p: fs.PathLike) => {
       const s = String(p);
-      if (s === '/tmp/workspace') return ['packages'] as unknown as string[];
-      if (s === '/tmp/workspace/packages') return ['a', 'b'] as unknown as string[];
+      if (s === workspace) return ['packages'] as unknown as string[];
+      if (s === `${workspace}/packages`) return ['a', 'b'] as unknown as string[];
       return [] as unknown as string[];
     });
     vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
@@ -499,6 +500,7 @@ describe('matchesSizeBreachSignature', () => {
 describe('testFixLoop — deterministic size-breach remediation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
   it('auto-bumps the cap via check_size_limits.py --fix and re-verifies — no LLM call', async () => {
