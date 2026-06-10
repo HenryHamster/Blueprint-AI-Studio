@@ -84,6 +84,7 @@ from app.digest_metrics import (
     compute_release_qualifier_infra_metrics,  # noqa: F401  re-exported for external importers
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
+    compute_problem_model_gc_health,
 )
 
 logger = logging.getLogger(__name__)
@@ -1449,6 +1450,12 @@ async def _compute_digest(
         migration_slot_contention=migration_slot_contention,
     )
 
+    problem_model_gc_health = None
+    if project_id:
+        problem_model_gc_health = await compute_problem_model_gc_health(
+            session, project_id
+        )
+
     return {
         "window_hours": hours,
         "tasks_truncated": tasks_capped,
@@ -1575,4 +1582,5 @@ async def _compute_digest(
         if _digest_project is not None
         else {},
         "research_output_quality": _research_output_quality,
+        "problem_model_gc_health": problem_model_gc_health,
     }

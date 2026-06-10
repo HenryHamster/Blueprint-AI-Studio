@@ -2913,6 +2913,30 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         for e in (dropped + trimmed)
     )
 
+    gap_memory_trimmed: list = packer_meta.get("gap_memory_trimmed") or []
+    gap_memory_trimmed_count: int = sum(
+        len(entry.get("gaps") or [])
+        for entry in gap_memory_trimmed
+        if isinstance(entry, dict)
+    )
+    gap_memory_hidden_entries: int = 0
+    for entry in gap_memory_trimmed:
+        if not isinstance(entry, dict):
+            continue
+        for gap in entry.get("gaps") or []:
+            if not isinstance(gap, dict):
+                continue
+            fields = gap.get("fields") or {}
+            if not isinstance(fields, dict):
+                continue
+            for field_val in fields.values():
+                if not isinstance(field_val, dict):
+                    continue
+                total = field_val.get("total") or 0
+                shown = field_val.get("shown") or 0
+                if isinstance(total, int) and isinstance(shown, int):
+                    gap_memory_hidden_entries += max(0, total - shown)
+
     return {
         "model_bytes": model_bytes,
         "capability_count": capability_count,
@@ -2920,6 +2944,8 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         "model_size_status": model_size_status,
         "directions_dropped_count": directions_dropped_count,
         "problem_model_truncated": problem_model_truncated,
+        "gap_memory_trimmed_count": gap_memory_trimmed_count,
+        "gap_memory_hidden_entries": gap_memory_hidden_entries,
     }
 
 

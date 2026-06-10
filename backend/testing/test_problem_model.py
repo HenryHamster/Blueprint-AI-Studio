@@ -3335,6 +3335,8 @@ def test_watermark_prevents_resurrection_on_subsequent_write():
     history_ts = [e["ts"] for e in gap_result["history"]]
     assert old_evt["ts"] not in history_ts
     assert new_evt["ts"] in history_ts
+    # Watermark must survive the write that omits it (durable / Defect 1)
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
 
 
 def test_compaction_observable_in_revision_log():
@@ -3464,3 +3466,198 @@ def test_gap_watermark_fields_default_none_byte_identical():
     dumped = _json.dumps(gap_out)
     assert "history_compacted_at" not in dumped
     assert "past_moves_compacted_at" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: watermark wipe — durable watermark must survive writes that omit it
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_durable_across_write_without_compaction_directive():
+    """Watermark survives a write that omits _compactions entirely — the
+    durable current watermark is carried forward monotonically (Defect 1)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: set watermark
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    assert after_first["gaps"][0]["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+    # Second write: no _compactions, no watermark field echoed
+    proposed_second = {"gaps": [_gap_with_history("g-1", [new_evt])]}
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must survive
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
+    # old_evt still excluded (watermark is effective)
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: stale-echo resurrection — proposed side must also be filtered
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_two_sided_filters_proposed_history_echoes():
+    """A stale echo that includes pre-compaction entries on the proposed side
+    cannot resurrect them — BOTH current and proposed history are filtered
+    before the union (Defect 2)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # Compact old_evt
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: agent echoes BOTH entries (stale view); no _compactions
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],  # old_evt echoed back!
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # old_evt must NOT be resurrected even though it was on the proposed side
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+    assert new_evt["ts"] in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# Defect 3: monotonic guard — stale directive cannot regress watermark
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_monotonic_stale_compaction_directive_cannot_regress():
+    """A _compactions directive with an older watermark cannot regress a
+    durable newer watermark (Defect 3 — monotonic guard in _apply_compactions)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new")
+
+    # First write: set watermark to 2026-05-01
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: directive with OLDER watermark (stale replay)
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-04-01T00:00:00Z"}],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must NOT have regressed
+    assert gap_result["history_compacted_at"] == "2026-05-01T00:00:00Z"
+    # old_evt still excluded
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# past_moves: replacement semantics and durable watermark
+# ---------------------------------------------------------------------------
+
+
+def test_past_moves_replacement_semantics_on_directive_write():
+    """When _compactions sets past_moves_watermark, proposed.past_moves replaces
+    the durable log (not unioned) — allowing actual compaction of past_moves."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old-1", "d-old-2", "d-new"]}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new"]}],
+        "_compactions": [{"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # Replacement semantics: only the agent's trimmed list survives, not the union
+    assert gap_result["past_moves"] == ["d-new"]
+    assert "d-old-1" not in gap_result["past_moves"]
+    assert "d-old-2" not in gap_result["past_moves"]
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    assert any(e.get("past_moves_watermark") for e in diff.get("gaps_history_compacted", []))
+
+
+def test_past_moves_compacted_at_durable_across_write_without_directive():
+    """past_moves_compacted_at survives a subsequent write that omits the
+    directive — the watermark is monotonically carried forward."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+    }
+    proposed_first = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new"]}],
+        "_compactions": [{"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    assert after_first["gaps"][0].get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+
+    # Second write: no _compactions directive
+    proposed_second = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new", "d-newer"]}],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must survive the write that omits it
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    # d-newer is added (union semantics without directive), d-new stays
+    assert "d-new" in gap_result["past_moves"]
+    assert "d-newer" in gap_result["past_moves"]
+
+
+# ---------------------------------------------------------------------------
+# Acceptance evidence: combined Defect 1 + Defect 2 scenario
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_survives_echo_omitting_field_and_filters_proposed_side():
+    """Combined acceptance test: watermark survives a write that omits it AND
+    filters the proposed side so a stale echo cannot resurrect compacted entries.
+
+    This verifies both Defect 1 (watermark wipe) and Defect 2 (stale-echo
+    resurrection via proposed side) in a single scenario matching the real
+    multi-write-per-cycle pattern."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: compact old_evt with watermark
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    gap_after_first = next(g for g in after_first["gaps"] if g["id"] == "g-1")
+    assert gap_after_first["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+    # Second write: agent sends the full pre-compaction view (stale echo); no directive,
+    # no watermark field echoed — simulates an agent whose context was built before or
+    # during the compaction write (common for multi-write cycles).
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],  # stale echo with old_evt
+        # deliberately omits history_compacted_at (not echoed by agent)
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Defect 1: watermark must survive even though the agent didn't echo it
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
+
+    # Defect 2: old_evt must NOT be resurrected even though it was on proposed side
+    history_ts = {e["ts"] for e in gap_result["history"]}
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts

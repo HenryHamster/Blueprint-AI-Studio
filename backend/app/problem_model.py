@@ -260,9 +260,11 @@ class Gap(BaseModel):
     has occurred; existing models validate unchanged."""
 
     past_moves_compacted_at: str | None = Field(default=None)
-    """ISO-8601 watermark for past_moves compaction.  Recorded for
-    observability; stored alongside ``history_compacted_at`` when the agent
-    compacts past_moves via the ``_compactions`` directive."""
+    """ISO-8601 watermark for past_moves compaction.  When a ``_compactions``
+    directive sets this for a gap, ``_merge_gap`` uses replacement semantics
+    for that write (``proposed.past_moves`` replaces the durable log rather
+    than unioning).  The watermark survives subsequent writes and is monotonic
+    (cannot be regressed by a stale directive)."""
 
 
 # ---------------------------------------------------------------------------
@@ -1532,7 +1534,7 @@ def _restore_floored_fields(
             setattr(proposed, name, getattr(current, name))
 
 
-def _merge_gap(current: Gap, proposed: Gap) -> Gap:
+def _merge_gap(current: Gap, proposed: Gap, past_moves_directive: bool = False) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
     trimmed tail echoed back by the agent cannot truncate the full record. The
@@ -1540,24 +1542,58 @@ def _merge_gap(current: Gap, proposed: Gap) -> Gap:
     :data:`GAP_PAST_MOVES_DURABLE_MAX` (oldest entries roll off) so the JSONB
     column cannot grow without limit across cycles.
 
-    When ``proposed.history_compacted_at`` is set, current history entries
-    with ``ts`` at or before the watermark are excluded before the union so
-    compacted entries cannot resurrect from the durable log."""
+    History compaction watermark contract (durable, two-sided, monotonic):
+    - The effective watermark is ``max(current.history_compacted_at,
+      proposed.history_compacted_at)`` so a write that omits the field cannot
+      regress a durable watermark (Defect 1 fix).
+    - BOTH ``current.history`` and ``proposed.history`` are filtered before the
+      union, so a stale echo carrying pre-compaction entries on the proposed side
+      cannot resurrect them (Defect 2 fix).
+
+    ``past_moves_directive`` signals that a ``_compactions`` directive with
+    ``past_moves_watermark`` was present for this gap in the current write.
+    When ``True``, replacement semantics apply: ``proposed.past_moves`` is used
+    directly rather than unioned with ``current.past_moves``.  Without the
+    directive, union semantics preserve the omission-never-deletes invariant."""
     merged = proposed.model_copy(deep=True)
 
-    # Respect history compaction watermark: exclude current entries at or before it
-    h_watermark = merged.history_compacted_at
-    current_history = (
-        [e for e in current.history if e.ts > h_watermark]
-        if h_watermark
-        else current.history
+    # History watermark: monotonic max of current and proposed.  A write that
+    # omits the field cannot regress a durable watermark.
+    effective_h_wm = max(
+        (wm for wm in (current.history_compacted_at, merged.history_compacted_at) if wm),
+        default=None,
     )
-    merged.history = _merge_append_log(current_history, proposed.history)[
+    merged.history_compacted_at = effective_h_wm
+
+    # Filter BOTH sides of the history union: a stale echo carrying
+    # pre-compaction entries on the proposed side cannot resurrect them.
+    if effective_h_wm:
+        current_history = [e for e in current.history if e.ts > effective_h_wm]
+        proposed_history = [e for e in proposed.history if e.ts > effective_h_wm]
+    else:
+        current_history = current.history
+        proposed_history = proposed.history
+    merged.history = _merge_append_log(current_history, proposed_history)[
         -GAP_HISTORY_DURABLE_MAX:
     ]
-    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
-        -GAP_PAST_MOVES_DURABLE_MAX:
-    ]
+
+    # past_moves watermark: monotonic max for observability/durability.
+    effective_pm_wm = max(
+        (wm for wm in (current.past_moves_compacted_at, merged.past_moves_compacted_at) if wm),
+        default=None,
+    )
+    merged.past_moves_compacted_at = effective_pm_wm
+
+    # past_moves compaction: when a _compactions directive named this gap with
+    # past_moves_watermark, use replacement semantics so the agent's explicit
+    # trimmed list becomes the new durable baseline.  Without the directive,
+    # union as before (omission-never-deletes invariant is preserved).
+    if past_moves_directive:
+        merged.past_moves = list(proposed.past_moves)[-GAP_PAST_MOVES_DURABLE_MAX:]
+    else:
+        merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
+            -GAP_PAST_MOVES_DURABLE_MAX:
+        ]
     return merged
 
 
@@ -1566,6 +1602,7 @@ def _merge_agent_owned_collections(
     proposed: ProblemModel,
     deletions: Any,
     floor: Any = None,
+    pm_compacted_gaps: set[str] | None = None,
 ) -> None:
     """Replace ``proposed``'s agent-owned collections with a non-destructive
     merge over ``current`` (mutates ``proposed`` in place). Removal is explicit
@@ -1593,9 +1630,10 @@ def _merge_agent_owned_collections(
     gap_floor_fields = tuple(f for f in _GAP_FLOOR_FIELDS if f in stripped_gap)
     caps_floored = bool(floor.get("summarized_capabilities"))
     friction_floored = bool(floor.get("summarized_friction"))
+    _pm_compacted = pm_compacted_gaps or set()
 
     def _merge_gap_preserving(c: Gap, p: Gap) -> Gap:
-        merged = _merge_gap(c, p)
+        merged = _merge_gap(c, p, p.id in _pm_compacted)
         if gap_floor_fields:
             _restore_floored_fields(c, merged, gap_floor_fields)
         return merged
@@ -1667,12 +1705,15 @@ def _apply_compactions(
         event: dict[str, Any] = {"gap_id": gap_id}
         h_wm = entry.get("history_watermark")
         if isinstance(h_wm, str) and h_wm:
-            gap.history_compacted_at = h_wm
-            event["history_watermark"] = h_wm
+            # Monotonic guard: a stale directive cannot regress an already-set watermark.
+            existing_h = gap.history_compacted_at or ""
+            gap.history_compacted_at = max(h_wm, existing_h) or None
+            event["history_watermark"] = gap.history_compacted_at
         pm_wm = entry.get("past_moves_watermark")
         if isinstance(pm_wm, str) and pm_wm:
-            gap.past_moves_compacted_at = pm_wm
-            event["past_moves_watermark"] = pm_wm
+            existing_pm = gap.past_moves_compacted_at or ""
+            gap.past_moves_compacted_at = max(pm_wm, existing_pm) or None
+            event["past_moves_watermark"] = gap.past_moves_compacted_at
         if len(event) > 1:  # at least one watermark was set
             events.append(event)
     return events
@@ -1794,10 +1835,16 @@ def apply_agent_update(
     # _merge_gap respects them when filtering current entries.
     compaction_events = _apply_compactions(proposed, compactions_raw)
 
+    # Derive the set of gaps that had a past_moves_watermark directive in THIS
+    # write — used by _merge_gap to trigger replacement semantics for past_moves.
+    pm_compacted_gaps = {
+        e["gap_id"] for e in compaction_events if "past_moves_watermark" in e
+    }
+
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
-    _merge_agent_owned_collections(current, proposed, deletions, floor_applied)
+    _merge_agent_owned_collections(current, proposed, deletions, floor_applied, pm_compacted_gaps)
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed

@@ -4597,3 +4597,83 @@ def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any
         "challenge_indeterminate": indeterminate,
         "verification_basis_distribution": dict(basis_counts),
     }
+
+
+async def compute_problem_model_gc_health(
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 10,
+) -> dict:
+    """Summarise per-cycle problem-model GC telemetry over the most recent cycles.
+
+    Queries the most recent ``limit`` terminal StrategicCycle rows for the project
+    and aggregates the ``model_gc_telemetry`` field stored in cycle_metadata.
+    Cycles without telemetry (old cycles predating the feature) are excluded from
+    aggregates but counted in ``cycles_sampled``.
+    """
+    from app.models import StrategicCycle
+    from app import strategic_cycle as _strategic_cycle
+    from sqlalchemy import desc
+
+    stmt = (
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project_id,
+            StrategicCycle.outcome.not_in(list(_strategic_cycle.ACTIVE_OUTCOMES)),
+        )
+        .order_by(desc(StrategicCycle.phase1_started_at))
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    cycles_sampled = len(rows)
+    cycles_with_telemetry = 0
+    latest_model_bytes = None
+    latest_model_size_status = None
+    latest_capability_count = None
+    latest_gap_count = None
+    problem_model_truncated_cycles = 0
+    directions_dropped_cycles = 0
+    gap_memory_trimmed_cycles = 0
+    any_truncated = False
+    any_gap_trim = False
+
+    for row in rows:
+        telem = (row.cycle_metadata or {}).get("model_gc_telemetry")
+        if telem is None:
+            continue
+        cycles_with_telemetry += 1
+        if cycles_with_telemetry == 1:
+            latest_model_bytes = telem.get("model_bytes")
+            latest_model_size_status = telem.get("model_size_status")
+            latest_capability_count = telem.get("capability_count")
+            latest_gap_count = telem.get("gap_count")
+        if telem.get("problem_model_truncated"):
+            problem_model_truncated_cycles += 1
+            any_truncated = True
+        if (telem.get("directions_dropped_count") or 0) > 0:
+            directions_dropped_cycles += 1
+        if (telem.get("gap_memory_trimmed_count") or 0) > 0:
+            gap_memory_trimmed_cycles += 1
+            any_gap_trim = True
+
+    if any_truncated:
+        trend = "degraded"
+    elif any_gap_trim:
+        trend = "trimming"
+    else:
+        trend = "healthy"
+
+    return {
+        "cycles_sampled": cycles_sampled,
+        "cycles_with_telemetry": cycles_with_telemetry,
+        "latest_model_bytes": latest_model_bytes,
+        "latest_model_size_status": latest_model_size_status,
+        "latest_capability_count": latest_capability_count,
+        "latest_gap_count": latest_gap_count,
+        "problem_model_truncated_cycles": problem_model_truncated_cycles,
+        "directions_dropped_cycles": directions_dropped_cycles,
+        "gap_memory_trimmed_cycles": gap_memory_trimmed_cycles,
+        "trend": trend,
+    }

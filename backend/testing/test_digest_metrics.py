@@ -8,9 +8,11 @@ import pytest
 from app.models import (
     TaskStatus,
     ReleaseVersion,
+    StrategicCycle,
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    compute_problem_model_gc_health,
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
@@ -5854,3 +5856,107 @@ async def test_trial_accumulation_no_composition_without_assignment_key(db_sessi
         # no assignment_key
     )
     assert "arm_composition" not in accum
+
+
+# ── compute_problem_model_gc_health ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_problem_model_gc_health_with_mixed_cycles(db_session):
+    """Aggregates correctly: 2 cycles with telemetry, 1 old cycle without."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    def _naive_utc():
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Newest cycle: has telemetry with gap memory trim
+    cycle1 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={
+            "model_gc_telemetry": {
+                "model_bytes": 50000,
+                "capability_count": 12,
+                "gap_count": 8,
+                "model_size_status": "healthy",
+                "directions_dropped_count": 0,
+                "problem_model_truncated": False,
+                "gap_memory_trimmed_count": 2,
+                "gap_memory_hidden_entries": 10,
+            }
+        },
+    )
+    # Second cycle: has telemetry with truncation
+    cycle2 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={
+            "model_gc_telemetry": {
+                "model_bytes": 90000,
+                "capability_count": 20,
+                "gap_count": 14,
+                "model_size_status": "oversized",
+                "directions_dropped_count": 1,
+                "problem_model_truncated": True,
+                "gap_memory_trimmed_count": 0,
+                "gap_memory_hidden_entries": 0,
+            }
+        },
+    )
+    # Third cycle: old cycle without any telemetry
+    cycle3 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={},
+    )
+    db_session.add_all([cycle1, cycle2, cycle3])
+    await db_session.commit()
+
+    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
+
+    assert result["cycles_sampled"] == 3
+    assert result["cycles_with_telemetry"] == 2
+    # latest fields come from the first row returned (newest first); since all have
+    # the same phase1_started_at the DB may return any order — check both options
+    assert result["latest_model_bytes"] in (50000, 90000)
+    assert result["latest_model_size_status"] in ("healthy", "oversized")
+    assert result["latest_capability_count"] in (12, 20)
+    assert result["latest_gap_count"] in (8, 14)
+    assert result["problem_model_truncated_cycles"] == 1
+    assert result["directions_dropped_cycles"] == 1
+    assert result["gap_memory_trimmed_cycles"] == 1
+    assert result["trend"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_problem_model_gc_health_no_cycles(db_session):
+    """Returns valid zero dict when project has no terminal cycles."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
+
+    assert result["cycles_sampled"] == 0
+    assert result["cycles_with_telemetry"] == 0
+    assert result["latest_model_bytes"] is None
+    assert result["latest_model_size_status"] is None
+    assert result["latest_capability_count"] is None
+    assert result["latest_gap_count"] is None
+    assert result["problem_model_truncated_cycles"] == 0
+    assert result["directions_dropped_cycles"] == 0
+    assert result["gap_memory_trimmed_cycles"] == 0
+    assert result["trend"] == "healthy"

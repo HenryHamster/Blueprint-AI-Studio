@@ -13717,3 +13717,92 @@ def test_compute_model_gc_telemetry_detects_problem_model_truncated():
 
     assert result["problem_model_truncated"] is True
     assert result["directions_dropped_count"] == 0
+
+
+def test_compute_model_gc_telemetry_gap_memory_trimmed_present():
+    """gap_memory_trimmed_count and gap_memory_hidden_entries reflect trimmed gap memory."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [
+                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
+                {"id": "g2", "name": "gap2", "description": "d", "evidence": "", "status": "active"},
+            ],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 100000,
+                "trimmed": [],
+                "dropped": [],
+                "gap_memory_trimmed": [
+                    {
+                        "key": "problem_model",
+                        "gaps": [
+                            {
+                                "gap_id": "g1",
+                                "fields": {
+                                    "history": {"shown": 3, "total": 8},
+                                    "past_moves": {"shown": 1, "total": 4},
+                                },
+                            },
+                            {
+                                "gap_id": "g2",
+                                "fields": {
+                                    "history": {"shown": 2, "total": 5},
+                                    "past_moves": {"shown": 0, "total": 3},
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["gap_memory_trimmed_count"] == 2
+    # hidden = (8-3) + (4-1) + (5-2) + (3-0) = 5 + 3 + 3 + 3 = 14
+    assert result["gap_memory_hidden_entries"] == 14
+
+
+def test_compute_model_gc_telemetry_gap_memory_absent():
+    """gap_memory_trimmed_count and gap_memory_hidden_entries default to 0 when absent."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 80000,
+                "trimmed": [],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["gap_memory_trimmed_count"] == 0
+    assert result["gap_memory_hidden_entries"] == 0
