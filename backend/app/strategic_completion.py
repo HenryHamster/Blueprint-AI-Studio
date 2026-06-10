@@ -2871,6 +2871,58 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
     return applied
 
 
+def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
+    """Compute per-cycle model-size and payload-truncation telemetry for cycle_metadata.
+
+    Reads from project.problem_model (durable, not the trimmed agent view) and
+    from the assembled payload's _packer_meta so the retirement monitor can verify
+    size thresholds and payload coverage without querying the task payload directly.
+    """
+    from app.problem_model import ProblemModel, compute_model_size_signal
+
+    raw_pm = project.problem_model or {}
+    try:
+        pm = ProblemModel.model_validate(raw_pm)
+        size_signal = compute_model_size_signal(pm)
+        model_bytes: int = size_signal["serialized_bytes"]
+        capability_count: int = size_signal["capability_count"]
+        gap_count: int = size_signal["active_gap_count"]
+        model_size_status: str = size_signal["model_size_status"]
+    except Exception:
+        model_bytes = len(json.dumps(raw_pm, default=str).encode())
+        capability_count = len(raw_pm.get("capabilities") or [])
+        gap_count = len([g for g in (raw_pm.get("gaps") or []) if isinstance(g, dict) and g.get("status") == "active"])
+        model_size_status = "unknown"
+
+    packer_meta: dict = {}
+    try:
+        first_payload = task.first_payload or {}
+        packer_meta = first_payload.get("_packer_meta") or {}
+    except Exception:
+        pass
+
+    dropped: list = packer_meta.get("dropped") or []
+    trimmed: list = packer_meta.get("trimmed") or []
+
+    directions_dropped_count: int = sum(
+        1 for e in dropped
+        if isinstance(e, dict) and "direction" in str(e.get("key", "")).lower()
+    )
+    problem_model_truncated: bool = any(
+        isinstance(e, dict) and "problem_model" in str(e.get("key", "")).lower()
+        for e in (dropped + trimmed)
+    )
+
+    return {
+        "model_bytes": model_bytes,
+        "capability_count": capability_count,
+        "gap_count": gap_count,
+        "model_size_status": model_size_status,
+        "directions_dropped_count": directions_dropped_count,
+        "problem_model_truncated": problem_model_truncated,
+    }
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
@@ -2980,6 +3032,15 @@ async def _handle_strategic_completion(
                 "created_predictions": created_predictions,
                 "retired_final_metrics": retired_final_metrics,
             }
+            try:
+                _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
+                    project, task
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to compute model_gc_telemetry (non-fatal)",
+                    exc_info=True,
+                )
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
             if _retirement_gate_verdicts is not None:

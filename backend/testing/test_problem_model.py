@@ -3256,3 +3256,211 @@ def test_absorbs_floor_field_not_wiped_by_skeleton_resubmit():
     }
     new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
     assert new_raw["capabilities"][0]["absorbs"] == ["ci-poll", "ci-resolve"]
+
+
+# ---------------------------------------------------------------------------
+# Gap-history compaction watermark
+# ---------------------------------------------------------------------------
+
+
+def _gap_with_history(gap_id: str, events: list[dict]) -> dict:
+    return {
+        "id": gap_id,
+        "name": f"gap {gap_id}",
+        "history": events,
+    }
+
+
+def _evt(ts: str, event: str = "note") -> dict:
+    return {"ts": ts, "event": event}
+
+
+def test_watermark_prevents_stale_echo_resurrection():
+    """Core invariant: entries at or before history_compacted_at are excluded
+    from the write-back union — a trimmed echo cannot resurrect them."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # Durable store: gap has both old and new history entries
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],
+    }
+    # Agent sets a compaction watermark that covers old_evt
+    proposed = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [
+            {"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # The old entry is compacted out; only the new entry survives
+    history_ts = [e["ts"] for e in gap_result["history"]]
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts
+    # Watermark is persisted on the gap
+    assert gap_result["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+
+def test_watermark_prevents_resurrection_on_subsequent_write():
+    """A second write without _compactions still excludes entries below the
+    persistent watermark — the watermark survives the round-trip."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: compact away old_evt
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],
+    }
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [
+            {"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: agent sends only new_evt (trimmed view); no _compactions
+    proposed_second = {
+        "revision": after_first["revision"],
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # old_evt is still excluded because the persisted watermark gates it out
+    history_ts = [e["ts"] for e in gap_result["history"]]
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts
+
+
+def test_compaction_observable_in_revision_log():
+    """Compaction events are recorded in the diff and the revision-log entry."""
+    current = {
+        "revision": 3,
+        "gaps": [_gap_with_history("g-x", [_evt("2026-01-01T00:00:00Z", "old")])],
+    }
+    proposed = {
+        "gaps": [_gap_with_history("g-x", [])],
+        "_compactions": [
+            {"gap_id": "g-x", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # Diff carries the event
+    assert "gaps_history_compacted" in diff
+    compacted_events = diff["gaps_history_compacted"]
+    assert any(e["gap_id"] == "g-x" for e in compacted_events)
+
+    # Revision log records it too
+    last_log = new_raw["revision_log"][-1]
+    assert "gaps_history_compacted" in last_log["changes"]
+
+
+def test_no_op_without_compaction_directive():
+    """No _compactions → output is byte-identical to pre-watermark behavior:
+    no watermark keys on gaps, merge is unchanged."""
+    evt = _evt("2026-04-01T00:00:00Z", "entry")
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [evt])],
+    }
+    proposed = {
+        "gaps": [_gap_with_history("g-1", [evt])],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # No watermark fields on output
+    assert "history_compacted_at" not in gap_result
+    assert "past_moves_compacted_at" not in gap_result
+    assert "gaps_history_compacted" not in diff
+    # History is unchanged (union of current + proposed)
+    assert any(e["ts"] == evt["ts"] for e in gap_result["history"])
+
+
+def test_watermark_on_trimmed_view():
+    """Agent receives a 5-entry trimmed view and can compact it: entries below
+    the watermark that ARE in the durable log are excluded, entries above are
+    preserved."""
+    # Durable: 10 history entries
+    all_events = [_evt(f"2026-0{i + 1}-01T00:00:00Z", f"evt-{i}") for i in range(9)]
+    all_events.append(_evt("2026-10-01T00:00:00Z", "evt-9"))
+    current = {"revision": 1, "gaps": [_gap_with_history("g-trim", all_events)]}
+
+    # Agent only sees last 5 (the trim); decides to compact everything before June
+    watermark = "2026-05-31T23:59:59Z"
+    agent_view = all_events[-5:]  # entries 5-9
+    proposed = {
+        "gaps": [_gap_with_history("g-trim", agent_view)],
+        "_compactions": [
+            {"gap_id": "g-trim", "history_watermark": watermark}
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-trim")
+    result_ts = {e["ts"] for e in gap_result["history"]}
+
+    # Entries with ts <= watermark are excluded
+    for evt in all_events:
+        if evt["ts"] <= watermark:
+            assert evt["ts"] not in result_ts, f"{evt['ts']} should be compacted"
+        else:
+            assert evt["ts"] in result_ts, f"{evt['ts']} should survive"
+
+
+def test_past_moves_compacted_at_persisted():
+    """past_moves_compacted_at is stored on the gap for observability."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+        "_compactions": [
+            {"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    assert any(e.get("past_moves_watermark") for e in diff.get("gaps_history_compacted", []))
+
+
+def test_compaction_directive_unknown_gap_is_noop():
+    """_compactions referencing a nonexistent gap_id is silently ignored."""
+    current = {"revision": 1, "gaps": [{"id": "g-real", "name": "real"}]}
+    proposed = {
+        "gaps": [{"id": "g-real", "name": "real"}],
+        "_compactions": [
+            {"gap_id": "g-nonexistent", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    # No events recorded, no crash
+    assert "gaps_history_compacted" not in diff
+    gap = next(g for g in new_raw["gaps"] if g["id"] == "g-real")
+    assert "history_compacted_at" not in gap
+
+
+def test_gap_watermark_fields_default_none_byte_identical():
+    """apply_agent_update output strips None watermark fields from gaps so the
+    stored bytes of clean models are identical to before the fields existed."""
+    import json as _json
+
+    model = Gap(id="g-1", name="test")
+    assert model.history_compacted_at is None
+    assert model.past_moves_compacted_at is None
+
+    # Via apply_agent_update, the output should not carry the watermark keys
+    current = {"revision": 1, "gaps": [{"id": "g-1", "name": "test"}]}
+    proposed = {"gaps": [{"id": "g-1", "name": "test"}]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_out = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    dumped = _json.dumps(gap_out)
+    assert "history_compacted_at" not in dumped
+    assert "past_moves_compacted_at" not in dumped

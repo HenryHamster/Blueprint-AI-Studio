@@ -61,6 +61,7 @@ from app.strategic_completion import (
     spawn_title_is_redundant,
     _spawn_retirement_memos,
     _strategic_event_completion_summary,
+    _compute_model_gc_telemetry,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -13607,3 +13608,112 @@ async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
         f"Operator goal must not be clobbered; got {version2.goal!r}"
     )
     assert version2.goal_editor_info == "[operator:op@example.com]"
+
+
+# ── _compute_model_gc_telemetry ───────────────────────────────────────────────
+
+
+def test_compute_model_gc_telemetry_basic_fields():
+    """cycle_metadata model_gc_telemetry has all required fields with non-None values."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": "testing"},
+            "capabilities": [
+                {"name": "cap1", "status": "working"},
+                {"name": "cap2", "status": "working"},
+            ],
+            "gaps": [
+                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
+            ],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 80000,
+                "trimmed": [],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["model_bytes"] is not None
+    assert result["model_bytes"] > 0
+    assert result["capability_count"] == 2
+    assert result["gap_count"] == 1
+    assert result["model_size_status"] in ("healthy", "growing", "large", "oversized")
+    assert result["directions_dropped_count"] == 0
+    assert result["problem_model_truncated"] is False
+
+
+def test_compute_model_gc_telemetry_detects_directions_dropped():
+    """directions_dropped_count > 0 when directions_summary appears in dropped."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 119000,
+                "trimmed": [],
+                "dropped": [{"key": "directions_summary", "reason": "exceeds remaining budget"}],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["directions_dropped_count"] == 1
+    assert result["problem_model_truncated"] is False
+
+
+def test_compute_model_gc_telemetry_detects_problem_model_truncated():
+    """problem_model_truncated is True when problem_model appears in trimmed."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 100000,
+                "trimmed": [{"key": "problem_model", "kind": "floored"}],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["problem_model_truncated"] is True
+    assert result["directions_dropped_count"] == 0
