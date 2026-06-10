@@ -1055,6 +1055,31 @@ describe('handleReview — verdict file parsing', () => {
     expect(String(status.logs)).toContain('"verdict":"APPROVE"');
   });
 
+  it('includes reviewed_head_sha from git rev-parse HEAD in the augmented verdict JSON', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      '{"verdict":"REQUEST_CHANGES","feedback":"a bug"}',
+    );
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    });
+    // Simulate git rev-parse HEAD returning a SHA after clone.
+    vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc123def456789';
+      return '';
+    });
+
+    await handleReview(
+      'task-head-sha', basePayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; reviewed_head_sha?: string };
+    expect(verdictJson.reviewed_head_sha).toBe('abc123def456789');
+    expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
+  });
+
   it('passes review taskType, scope, and direction_id to formatProjectContext', async () => {
     const promptMod = await import('../prompt.js');
     vi.mocked(promptMod.formatProjectContext).mockClear();

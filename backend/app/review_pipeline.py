@@ -490,6 +490,13 @@ SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
 # the strategic agent (or operator) decide whether to spawn an infra fix.
 SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
 
+# Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
+# with an infra failure_category and the failure is younger than this many minutes,
+# a review spawn is deferred so the fix can be requeued (rather than producing a
+# stale verdict on unchanged code). Outside the window or with budget exhausted,
+# review spawns proceed normally.
+_STALE_HEAD_MID_RETRY_GRACE_MINUTES = 20
+
 _PIPELINE_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -1086,6 +1093,96 @@ def build_merge_conflict_fix_prompt(
     return prompt
 
 
+async def _check_fix_mid_retry_defer(
+    source_task: Task,
+    session: AsyncSession,
+    pr_number: int,
+    resolved_original_id: str,
+    is_rollup_source: bool,
+) -> bool:
+    """True if a same-PR fix is FAILED/CANCELLED with an infra failure_category
+    within the grace window AND still has retry budget, so a review spawn should
+    be deferred rather than producing a verdict on unchanged code.
+
+    Outside the grace window or with budget exhausted, returns False so the
+    review spawn proceeds and the chain cannot wedge forever.
+    Best-effort: a lookup error always returns False (fail-open for review spawns).
+    """
+    from app.failure_classification import INFRA_CLASSES
+    from app.reaper_sweeps import _BLOCKED_OPTIMISTIC_RETRY_CAP
+
+    cutoff = _utcnow() - timedelta(minutes=_STALE_HEAD_MID_RETRY_GRACE_MINUTES)
+    try:
+        # Push updated_at and pr_number filters into SQL to avoid a full project
+        # table scan on long-lived projects. pr_number is matched Python-side via
+        # first_payload because the JSONB expression index (ix_task_payloads_pr_number)
+        # is on the payloads column; updated_at has a plain B-tree index.
+        dialect_name = resolve_dialect_name(session)
+        if dialect_name == "sqlite":
+            pr_number_match = (
+                func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
+            )
+            type_match = func.json_extract(Task.payloads, "$[0].type") == "fix"
+        else:
+            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
+            type_match = Task.payloads[0]["type"].as_string() == "fix"
+
+        candidates = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.context,
+                            Task.payloads,
+                            Task.updated_at,
+                        )
+                    )
+                    .where(
+                        Task.project_id == source_task.project_id,
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                        Task.updated_at >= cutoff,
+                        pr_number_match,
+                        type_match,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for t in candidates:
+            fp = t.first_payload
+            if not is_rollup_source and (
+                fp.get("original_task_id") or ""
+            ) != resolved_original_id:
+                continue
+            ctx = t.context or {}
+            fc = ctx.get("failure_category")
+            if fc not in INFRA_CLASSES:
+                continue
+            # Budget check differs by terminal state:
+            # - FAILED: retried by the resurrection sweep (cap=1 via _resurrection_count
+            #   in reaper_infra_recovery.py). Budget exhausted when _resurrection_count >= 1.
+            # - CANCELLED: retried by the blocked-optimistic requeue path (cap via
+            #   _BLOCKED_OPTIMISTIC_RETRY_CAP / _blocked_optimistic_retries).
+            if t.status == TaskStatus.FAILED:
+                if int(ctx.get("_resurrection_count", 0)) >= 1:
+                    continue
+            else:
+                if int(ctx.get("_blocked_optimistic_retries", 0)) >= _BLOCKED_OPTIMISTIC_RETRY_CAP:
+                    continue
+            return True
+    except Exception:
+        logger.debug(
+            "[PIPELINE] _check_fix_mid_retry_defer lookup failed for "
+            f"PR #{pr_number} — allowing review spawn",
+            exc_info=True,
+        )
+    return False
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -1354,6 +1451,27 @@ async def _spawn_pipeline_task(
         # replacement task in the same transaction.
         await session.flush()
 
+    # Mid-retry defer: when spawning a review, treat the chain as busy if a
+    # same-PR fix is FAILED/CANCELLED with an infra failure_category within the
+    # grace window AND still has retry budget remaining — the fix will be requeued
+    # by the reaper, and a review against the unchanged head would only produce a
+    # stale verdict that burns a cap slot. Outside the window or with budget
+    # exhausted, proceed; the chain cannot wedge forever.
+    if task_type == "review" and await _check_fix_mid_retry_defer(
+        source_task, session, pr_number, resolved_original_id, is_rollup_source
+    ):
+        logger.info(
+            f"[PIPELINE] Deferring review spawn for PR #{pr_number} — "
+            f"same-PR fix is in mid-retry infra-failure grace window"
+        )
+        source_task.latest_status_message = (
+            f"Review deferred for PR #{pr_number} — "
+            f"fix in mid-retry (infra failure, within grace window)"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_DEFERRED)
+        session.add(source_task)
+        return (None, False)
+
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains.
     # Excludes archived tasks (manual iteration-cap reset path) and infra-class
     # failures: a task that died in VM provisioning / rate limit / agent timeout
@@ -1604,6 +1722,12 @@ async def _spawn_pipeline_task(
             fc = (t.context or {}).get("failure_category")
             if fc in INFRA_CLASSES:
                 return False
+        # Stale-head discards: a review that ran against an older head than the
+        # live PR head is discarded and a fresh review respawned. Counting it
+        # toward the cap would penalise the chain for a verdict it couldn't
+        # act on.
+        if (t.context or {}).get("_review_stale_head"):
+            return False
         return True
 
     pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))

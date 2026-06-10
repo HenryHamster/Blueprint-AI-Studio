@@ -2452,6 +2452,7 @@ async def _process_post_commit(
                 verdict_parsed = False
                 verdict_unparseable = False
                 review_was_parallelized = False
+                reviewed_head_sha: str = ""
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -2474,6 +2475,9 @@ async def _process_post_commit(
                                 ][:25]
                             review_was_parallelized = bool(
                                 vj.get("review_was_parallelized", False)
+                            )
+                            reviewed_head_sha = str(
+                                vj.get("reviewed_head_sha") or ""
                             )
                             verdict_parsed = True
                             logger.info(
@@ -4533,6 +4537,7 @@ async def _process_post_commit(
 
                     ci_errors_text = ""
                     ci_check: dict | None = None
+                    head_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
@@ -4554,6 +4559,72 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}",
                             exc_info=True,
                         )
+
+                    # Stale-head guard: the review ran against an older PR head than
+                    # the current one. Discard the verdict and respawn a fresh review
+                    # so the fix isn't guided by findings on code that's already changed.
+                    # Backward compat: old verdicts without reviewed_head_sha are treated
+                    # as current-head (no action).
+                    if reviewed_head_sha and head_sha and reviewed_head_sha != head_sha:
+                        _stale_discard_count = int(
+                            (task.context or {}).get("stale_head_consecutive_discards", 0)
+                        )
+                        if _stale_discard_count < 2:
+                            # Discard: mark this review as stale, respawn fresh review.
+                            # _review_stale_head: underscore-prefix so it is NOT propagated
+                            # to the fresh review task (only exempts THIS discarded review
+                            # from the iteration cap). stale_head_consecutive_discards has
+                            # no underscore so it IS propagated, letting the fresh review
+                            # inherit the running count and eventually accept on the 2nd hit.
+                            task.context = {
+                                **(task.context or {}),
+                                "stale_head_consecutive_discards": _stale_discard_count + 1,
+                                "_review_stale_head": True,
+                            }
+                            flag_modified(task, "context")
+                            task.status = TaskStatus.COMPLETED
+                            task.latest_status_message = (
+                                f"Stale-head review discarded for PR #{pr_number} "
+                                f"(reviewed {reviewed_head_sha[:8]}, "
+                                f"head is now {head_sha[:8]}) — respawning fresh review"
+                            )
+                            session.add(task)
+                            logger.warning(
+                                f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
+                                f"discarded (reviewed={reviewed_head_sha[:8]}, "
+                                f"live={head_sha[:8]}) — respawning review "
+                                f"(discard #{_stale_discard_count + 1})"
+                            )
+                            fresh_review, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                            )
+                            if fresh_review:
+                                logger.info(
+                                    f"[REVIEW PIPELINE] Spawned fresh review "
+                                    f"{fresh_review.id} for PR #{pr_number} "
+                                    f"after stale-head discard"
+                                )
+                            await session.commit()
+                            return {"status": "accepted"}
+                        else:
+                            # 2nd consecutive stale-head: accept verdict, annotate it.
+                            _stale_note = (
+                                f"_(Reviewer judged head {reviewed_head_sha[:8]}; "
+                                f"PR head is now {head_sha[:8]}.)_\n\n"
+                            )
+                            feedback = _stale_note + feedback
+                            logger.warning(
+                                f"[REVIEW PIPELINE] PR #{pr_number}: 2nd consecutive "
+                                f"stale-head discard — accepting verdict with annotation "
+                                f"(reviewed={reviewed_head_sha[:8]}, live={head_sha[:8]})"
+                            )
+
                     # CI vs reviewer build-gate disagreement detector. When the
                     # reviewer flags build/lint complaints but CI shows the
                     # corresponding job GREEN, the issue is almost always a

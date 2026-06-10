@@ -11499,8 +11499,6 @@ async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, 
     from app.shared_state import runtime_config
 
     project = await _make_db_project(db_session)
-    # Rollup original task: _is_rollup_review=True makes it recognisable by
-    # _pr_is_preservable_on_cap and _is_rollup_chain_source.
     original_task = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
@@ -12511,3 +12509,305 @@ async def test_reviewer_model_carried_forward_in_fix_spawn(db_session, mocker):
     spawned_loop = (result.context or {}).get("review_loop", {})
     # Fix spawn carries reviewer_model forward for the next review to find
     assert spawned_loop.get("reviewer_model") == "claude-pinned-abc"
+
+
+# ── Stale-head cap exemption ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stale_head_reviews_dont_count_toward_global_cap(db_session, mocker):
+    """Review tasks completed with _review_stale_head=True in their context were
+    discarded because their verdict was against an older head — they did no useful
+    review work and must not consume iteration budget."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9901,
+                "branch": "feat/stale",
+                "base_branch": "main",
+            }
+        ],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+
+    # 12 review tasks marked stale-head (cap is 10 for small scope — would block
+    # if counted). All are COMPLETED.
+    for _ in range(12):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 9901,
+                    "branch": "feat/stale",
+                    "base_branch": "main",
+                }
+            ],
+            context={"_review_stale_head": True},
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9901,
+        branch="feat/stale",
+        base_branch="main",
+        fix_prompt="Fix",
+    )
+    assert result is not None, "Stale-head review tasks must not count toward the cap"
+    assert result.status == TaskStatus.QUEUED
+
+
+# ── Mid-retry defer ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_mid_retry_defer_defers_review_when_fix_infra_failed_in_grace_window(
+    db_session, mocker
+):
+    """When a same-PR fix is FAILED with an infra failure_category within the 20-min
+    grace window AND has retry budget remaining (resurrection not yet spent), spawning
+    a review must be deferred so the fix can be resurrected first."""
+    from app.review_pipeline import SPAWN_REASON_DEFERRED
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A fix that died of AGENT_TIMEOUT within the grace window, resurrection not yet spent.
+    failed_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=5),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9902,
+                "branch": "feat/mid-retry",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "failure_category": "AGENT_TIMEOUT",
+            "_resurrection_count": 0,
+            "review_loop": {"original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(failed_fix)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9902,
+                "branch": "feat/mid-retry",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9902,
+        branch="feat/mid-retry",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None, "Review spawn must be deferred during fix mid-retry grace window"
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
+
+
+@pytest.mark.asyncio
+async def test_mid_retry_defer_allows_review_when_fix_outside_grace_window(
+    db_session, mocker
+):
+    """Outside the 20-min grace window the review spawn proceeds — no deadlock."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Fix failed >20 min ago — outside the grace window (filtered out by SQL updated_at check).
+    old_failed_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=25),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9903,
+                "branch": "feat/old-fail",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "failure_category": "AGENT_TIMEOUT",
+            "_resurrection_count": 0,
+            "review_loop": {"original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(old_failed_fix)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9903,
+                "branch": "feat/old-fail",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9903,
+        branch="feat/old-fail",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is not None, "Review spawn must proceed when fix failure is outside grace window"
+    assert created is True
+
+
+@pytest.mark.asyncio
+async def test_mid_retry_defer_allows_review_when_budget_exhausted(db_session, mocker):
+    """When the fix's resurrection budget is exhausted (_resurrection_count >= 1),
+    the review spawn proceeds — no deadlock."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Fix failed within grace window but resurrection budget exhausted (_resurrection_count >= 1).
+    exhausted_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=5),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9904,
+                "branch": "feat/exhausted",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "failure_category": "AGENT_TIMEOUT",
+            "_resurrection_count": 1,  # budget spent (cap is 1)
+            "review_loop": {"original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(exhausted_fix)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9904,
+                "branch": "feat/exhausted",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9904,
+        branch="feat/exhausted",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is not None, "Review spawn must proceed when fix resurrection budget is exhausted"
+    assert created is True

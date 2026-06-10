@@ -8900,3 +8900,286 @@ async def test_second_opinion_inherited_record_does_not_clobber_verdict(
     assert REVIEW_SECOND_OPINION_PARKED_KEY not in (review_task.context or {}), (
         "the consumed parked snapshot must not linger after reconciliation"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stale-head guard (verdict-time head pin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _run_stale_head_branch(
+    tl_db, mocker, *, reviewed_head_sha: str, live_head_sha: str, prior_discard_count: int = 0
+):
+    """Drive _process_post_commit through a REQUEST_CHANGES verdict that carries
+    ``reviewed_head_sha``.  Returns (captured_spawn_calls, review_task) where
+    ``captured_spawn_calls`` is a list of (args, kwargs) tuples recorded when
+    ``_spawn_pipeline_task`` was invoked.
+
+    ``reviewed_head_sha`` is the SHA baked into the verdict JSON.
+    ``live_head_sha``     is the SHA that get_pull_request returns as the live PR head.
+    ``prior_discard_count`` seeds ``stale_head_consecutive_discards`` on the review task context.
+    """
+    captured_spawn_calls: list[tuple] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_spawn_calls.append((args, kwargs))
+        return (None, False)
+
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock, return_value={"merged": True})
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": live_head_sha, "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "failed_logs": "", "details": []},
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    ctx: dict = {
+        "review_loop": {
+            "pr_number": 7070,
+            "branch": "feat/x",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+            "iteration": 1,
+        },
+    }
+    if prior_discard_count:
+        ctx["stale_head_consecutive_discards"] = prior_discard_count
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7070,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=ctx,
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Found a real bug.",
+        "issues": [{"description": "Real bug", "severity": "major"}],
+        "reviewed_head_sha": reviewed_head_sha,
+    })
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7070",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    await session.refresh(review_task)
+    return captured_spawn_calls, review_task
+
+
+@pytest.mark.asyncio
+async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker):
+    """When the verdict carries a reviewed_head_sha that differs from the live PR head,
+    the pipeline must NOT spawn a fix (stale guidance), must spawn a fresh REVIEW,
+    must set _review_stale_head=True on the task context, and must increment
+    stale_head_consecutive_discards to 1.  This is the first discard path."""
+    calls, review_task = await _run_stale_head_branch(
+        tl_db, mocker,
+        reviewed_head_sha="oldsha0000000",
+        live_head_sha="newsha1111111",
+    )
+
+    # Exactly one spawn call, and it must be for a "review" (not a "fix").
+    assert len(calls) == 1, f"Expected 1 spawn call, got {len(calls)}"
+    spawned_task_type = calls[0][0][1]  # positional arg[1] = task_type
+    assert spawned_task_type == "review", (
+        f"Stale-head discard must respawn a review, got {spawned_task_type!r}"
+    )
+
+    # Context flags.
+    ctx = review_task.context or {}
+    assert ctx.get("_review_stale_head") is True, "_review_stale_head must be set"
+    assert ctx.get("stale_head_consecutive_discards") == 1, "stale_head_consecutive_discards must be 1"
+
+
+@pytest.mark.asyncio
+async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(tl_db, mocker):
+    """On the 2nd consecutive stale-head discard (stale_head_consecutive_discards already 2),
+    the verdict is accepted (a fix IS spawned) and the feedback is annotated with
+    the head-mismatch note instead of discarding."""
+    calls, _review_task = await _run_stale_head_branch(
+        tl_db, mocker,
+        reviewed_head_sha="oldsha0000000",
+        live_head_sha="newsha1111111",
+        prior_discard_count=2,
+    )
+
+    # A fix must have been spawned (verdict accepted despite stale head).
+    fix_calls = [c for c in calls if c[0][1] == "fix"]
+    assert fix_calls, "2nd consecutive stale-head discard must accept verdict and spawn a fix"
+
+    # No review respawn (the verdict was accepted, not discarded).
+    review_respawn_calls = [c for c in calls if c[0][1] == "review"]
+    assert not review_respawn_calls, "2nd consecutive discard must not respawn a review"
+
+
+@pytest.mark.asyncio
+async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
+    """Old verdicts without reviewed_head_sha must behave exactly as before:
+    REQUEST_CHANGES spawns a fix without any stale-head guard firing."""
+    captured_spawn_calls: list[tuple] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_spawn_calls.append((args, kwargs))
+        return (None, False)
+
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_gate_enabled": False},
+    )
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock, return_value={"merged": True})
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "anylivesha", "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "failed_logs": "", "details": []},
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7071,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "review_loop": {
+                "pr_number": 7071,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+
+    # Old verdict without reviewed_head_sha.
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Found a bug.",
+        "issues": [{"description": "Real bug", "severity": "major"}],
+    })
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7071",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    await session.refresh(review_task)
+
+    # Must behave as before: a fix spawned, no stale-head flag.
+    fix_calls = [c for c in captured_spawn_calls if c[0][1] == "fix"]
+    assert fix_calls, "Old verdict without reviewed_head_sha must still spawn a fix"
+    assert not (review_task.context or {}).get("_review_stale_head"), (
+        "_review_stale_head must not be set when reviewed_head_sha is absent"
+    )

@@ -326,6 +326,11 @@ export async function handleReview(
   } catch (e) {
     sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(e)}\n`);
   }
+  // Pin the head SHA this review runs against so the backend can detect stale verdicts.
+  let reviewedHeadSha = '';
+  try {
+    reviewedHeadSha = git(['rev-parse', 'HEAD']).trim();
+  } catch { /* best-effort */ }
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
@@ -587,6 +592,9 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
     }
     if (parallelReviewInjected) {
       augmented.review_was_parallelized = true;
+    }
+    if (reviewedHeadSha && !augmented.reviewed_head_sha) {
+      augmented.reviewed_head_sha = reviewedHeadSha;
     }
     return JSON.stringify(augmented);
   }
