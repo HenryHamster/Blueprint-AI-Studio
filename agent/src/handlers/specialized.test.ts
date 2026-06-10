@@ -135,7 +135,7 @@ import {
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
-  git, listOpenPullRequestsForBranch,
+  git, listOpenPullRequestsForBranch, sendLog,
 } from '../index.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -848,6 +848,30 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     expect(call.logs).not.toBe(JSON.stringify(JSON.parse(BAD_VERDICT_ARRAY)));
     // The status must still be COMPLETED (exitCode was 0).
     expect(call.status).toBe('COMPLETED');
+  });
+
+  it('adversarial_grader unrecognized verdict on first attempt triggers warning not silent fail', async () => {
+    // First attempt returns parseable JSON but with an unrecognized verdict string.
+    // repairStructuredOutput will see it as parseable (retry===null) — the vocabulary
+    // gate must still fire and log a warning instead of silently fail-closing the finding.
+    const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"still holds at HEAD"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // No repair re-ask: the first-attempt JSON was structurally parseable.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+
+    // A warning must have been logged — not a silent fail.
+    const warnCall = vi.mocked(sendLog).mock.calls.find(
+      ([, msg]) => typeof msg === 'string' && msg.includes('[WARNING]') && msg.includes('unrecognized'),
+    );
+    expect(warnCall).toBeDefined();
+
+    // Status is COMPLETED (exitCode was 0) and the raw output is passed through.
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('agree');
   });
 });
 

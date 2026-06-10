@@ -805,6 +805,11 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
       // A focused re-ask succeeded with recognized verdicts — post the repaired array.
       challengeLogs = sanitize(JSON.stringify(repaired.value));
     } else {
+      // First attempt was parseable but has unrecognized verdict strings — warn so the
+      // miss is observable instead of silently producing a fail-closed backend outcome.
+      if (repaired.retry === null && repaired.value !== null && !hasOnlyRecognizedVerdicts(repaired.value)) {
+        sendLog(ws, `[WARNING] adversarial_grader: first-attempt verdict array contains unrecognized verdict strings — backend will fail-close these findings as verdict_unrecognized.\n`);
+      }
       // First attempt was already parseable (retry===null), repair failed, or
       // exitCode!==0 — pass raw output through unchanged.
       challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
