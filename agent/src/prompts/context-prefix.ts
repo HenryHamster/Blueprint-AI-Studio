@@ -237,9 +237,10 @@ export function formatProjectVision(vision: Record<string, unknown> | undefined)
 // constraints), so calling this here too would double-render the same payload.
 // Returns '' when the payload is absent or empty so no bare header is emitted.
 // Render the repo_overview block shipped by the backend at claim time.
-// Shows tech stack, directory layout, first steps, and a freshness signal when
-// available. Presence-gated: returns '' when any required field is absent so the
-// prompt is byte-identical for projects that never ran bootstrap.
+// Shows the required overview fields, optional bootstrap-enriched fields, and
+// freshness/provenance signals when available. Presence-gated: returns '' when
+// any required field is absent so the prompt is byte-identical for projects that
+// never ran bootstrap.
 export function formatRepoOverview(overview: unknown): string {
   if (!overview || typeof overview !== 'object') return '';
   const o = overview as Record<string, unknown>;
@@ -251,8 +252,29 @@ export function formatRepoOverview(overview: unknown): string {
   lines.push(`**Tech stack:** ${techStack}`);
   lines.push(`**Directory layout:** ${dirLayout}`);
   lines.push(`**First steps:** ${firstSteps}`);
+  const entryPoints = typeof o.entry_points === 'string' ? o.entry_points.trim() : '';
+  if (entryPoints) lines.push(`**Entry points:** ${entryPoints}`);
+  const testLayout = typeof o.test_layout === 'string' ? o.test_layout.trim() : '';
+  if (testLayout) lines.push(`**Test layout:** ${testLayout}`);
+  const keyConventions = typeof o.key_conventions === 'string' ? o.key_conventions.trim() : '';
+  if (keyConventions) lines.push(`**Key conventions:** ${keyConventions}`);
+  const environmentRequirements = typeof o.environment_requirements === 'string' ? o.environment_requirements.trim() : '';
+  if (environmentRequirements) lines.push(`**Environment:** ${environmentRequirements}`);
   const completedAt = typeof o.bootstrap_completed_at === 'string' ? o.bootstrap_completed_at.trim() : '';
   if (completedAt) lines.push(`**Bootstrapped:** ${completedAt}`);
+  const provenance = o.provenance && typeof o.provenance === 'object'
+    ? o.provenance as Record<string, unknown>
+    : undefined;
+  const refreshedAt = strVal(provenance?.refreshed_at);
+  const sourceBranch = strVal(provenance?.source_branch);
+  const sourceRevision = strVal(provenance?.source_revision);
+  if (refreshedAt || sourceBranch || sourceRevision) {
+    const parts: string[] = [];
+    if (refreshedAt) parts.push(`refreshed ${refreshedAt}`);
+    if (sourceBranch) parts.push(`branch ${sourceBranch}`);
+    if (sourceRevision) parts.push(`revision ${sourceRevision}`);
+    lines.push(`**Provenance:** ${parts.join('; ')}`);
+  }
   lines.push('');
   return lines.join('\n') + '\n';
 }

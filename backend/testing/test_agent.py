@@ -2085,24 +2085,56 @@ async def test_claim_response_includes_writeback_endpoint_when_directories_prese
     )
 
 
+def _valid_repo_overview_doc() -> dict:
+    return {
+        "repo_overview": {
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "backend/ frontend/",
+            "first_steps_summary": "pip install && npm install",
+            "entry_points": "backend/app/main.py; admin-ui/src/App.tsx",
+            "test_layout": "backend/testing/ and agent/src/**/*.test.ts",
+            "key_conventions": "FastAPI routers live under backend/app/routers",
+            "environment_requirements": "Python 3.12 and Node 20",
+            "provenance": {
+                "refreshed_at": "2026-01-15T10:01:00Z",
+                "source_branch": "main",
+                "source_revision": "abc1234",
+            },
+        }
+    }
+
+
 @pytest.mark.asyncio
-async def test_agent_claim_includes_repo_overview_for_downstream_task(
-    client: AsyncClient, db_session
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "create",
+        "research",
+        "plan",
+        "design",
+        "debug",
+        "investigate",
+        "security_audit",
+        "perf",
+        "self_audit",
+        "release_audit",
+        "release_audit_challenge",
+        "smoketest",
+        "design_doc_update",
+        "strategic_review",
+    ],
+)
+async def test_agent_claim_includes_repo_overview_for_repo_reading_tasks(
+    client: AsyncClient, db_session, task_type
 ):
-    """Claim response includes repo_overview with provenance when design_doc has it."""
+    """Claim response includes repo_overview for repo-reading launch contexts."""
     project = Project(
         name="Repo Overview Test",
         user_id="test-user-123",
         github_owner="acme",
         github_repo="myapp",
         build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
-        design_doc={
-            "repo_overview": {
-                "tech_stack": "Python, FastAPI",
-                "directory_layout": "backend/ frontend/",
-                "first_steps_summary": "pip install && npm install",
-            }
-        },
+        design_doc=_valid_repo_overview_doc(),
     )
     db_session.add(project)
     await db_session.commit()
@@ -2110,7 +2142,7 @@ async def test_agent_claim_includes_repo_overview_for_downstream_task(
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "add a feature"}],
+        payloads=[{"type": task_type, "prompt": "inspect the repo"}],
         vm_instance_id="agent-vm-repo-overview-1",
     )
     db_session.add(task)
@@ -2127,7 +2159,16 @@ async def test_agent_claim_includes_repo_overview_for_downstream_task(
     assert ro["tech_stack"] == "Python, FastAPI"
     assert ro["directory_layout"] == "backend/ frontend/"
     assert ro["first_steps_summary"] == "pip install && npm install"
+    assert ro["entry_points"] == "backend/app/main.py; admin-ui/src/App.tsx"
+    assert ro["test_layout"] == "backend/testing/ and agent/src/**/*.test.ts"
+    assert ro["key_conventions"] == "FastAPI routers live under backend/app/routers"
+    assert ro["environment_requirements"] == "Python 3.12 and Node 20"
     assert ro["bootstrap_completed_at"] == "2026-01-15T10:00:00Z"
+    assert ro["provenance"] == {
+        "refreshed_at": "2026-01-15T10:01:00Z",
+        "source_branch": "main",
+        "source_revision": "abc1234",
+    }
 
 
 @pytest.mark.asyncio
@@ -2162,18 +2203,18 @@ async def test_agent_claim_omits_repo_overview_when_absent(
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_omits_repo_overview_for_repo_bootstrap_task(
+async def test_agent_claim_omits_repo_overview_when_required_fields_invalid(
     client: AsyncClient, db_session
 ):
-    """Claim response omits repo_overview for repo_bootstrap tasks (only downstream tasks get it)."""
+    """Invalid/partial repo_overview remains absence-gated from claim response."""
     project = Project(
-        name="Bootstrap Task Test",
+        name="Invalid Repo Overview Test",
         user_id="test-user-123",
         build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
         design_doc={
             "repo_overview": {
                 "tech_stack": "Python",
-                "directory_layout": "src/",
+                "directory_layout": "",
                 "first_steps_summary": "pip install",
             }
         },
@@ -2184,7 +2225,39 @@ async def test_agent_claim_omits_repo_overview_for_repo_bootstrap_task(
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        payloads=[{"type": "research", "prompt": "inspect the repo"}],
+        vm_instance_id="agent-vm-invalid-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-invalid-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["repo_bootstrap", "web_research"])
+async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
+    client: AsyncClient, db_session, task_type
+):
+    """Claim response omits repo_overview for task types that should not use it."""
+    project = Project(
+        name="Bootstrap Task Test",
+        user_id="test-user-123",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "bootstrap"}],
         vm_instance_id="agent-vm-bootstrap-1",
     )
     db_session.add(task)

@@ -770,6 +770,10 @@ class RepoBootstrapOverview(BaseModel):
     tech_stack: str
     directory_layout: str
     first_steps_summary: str
+    entry_points: str | None = None
+    test_layout: str | None = None
+    key_conventions: str | None = None
+    environment_requirements: str | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -12,10 +12,36 @@ from app.auth import create_agent_token
 from app.main import app
 from app.models import Project, ProjectStatus, Task, TaskHistory, TaskStatus
 from app.auth import get_current_user, require_admin
+from app.payload_schemas import RepoBootstrapOverview
 
 TEST_USER_ID = "test-user-bootstrap-123"
 # The conftest's override_get_current_user returns this user_id for HTTP clients.
 _HTTP_CLIENT_USER_ID = "test-user-123"
+
+
+def test_repo_bootstrap_overview_optional_fields_survive_model_dump():
+    overview = RepoBootstrapOverview(
+        tech_stack="TypeScript, FastAPI, Postgres",
+        directory_layout="agent/ for runner, backend/ for API",
+        first_steps_summary="Install deps, run build, run tests",
+        entry_points="agent/src/index.ts and backend/app/main.py",
+        test_layout="backend/testing for pytest; agent/src/*.test.ts for vitest",
+        key_conventions="Conventional commits and feature branches",
+        environment_requirements="Node 22, Python 3.12, DATABASE_URL in .env",
+        unexpected_field="must be ignored",
+    )
+
+    dumped = overview.model_dump()
+    assert dumped == {
+        "tech_stack": "TypeScript, FastAPI, Postgres",
+        "directory_layout": "agent/ for runner, backend/ for API",
+        "first_steps_summary": "Install deps, run build, run tests",
+        "entry_points": "agent/src/index.ts and backend/app/main.py",
+        "test_layout": "backend/testing for pytest; agent/src/*.test.ts for vitest",
+        "key_conventions": "Conventional commits and feature branches",
+        "environment_requirements": "Node 22, Python 3.12, DATABASE_URL in .env",
+    }
+    assert "unexpected_field" not in dumped
 
 
 @pytest.fixture(autouse=True)

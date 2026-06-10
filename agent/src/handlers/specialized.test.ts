@@ -133,6 +133,7 @@ import {
   handleMigrate,
   handleSelfAudit,
   resolveMigrationLayout,
+  isRepoBootstrapOverview,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
@@ -1757,11 +1758,34 @@ describe('specialized handler task-specific content contracts', () => {
 
   // ── handleRepoBootstrap contract ────────────────────────────────────────
   describe('handleRepoBootstrap', () => {
+    it('accepts a repo overview with all seven fields', () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript, FastAPI, Postgres',
+        directory_layout: 'agent/ for the runner, backend/ for the API',
+        first_steps_summary: 'Install deps, run the build, then run tests',
+        entry_points: 'agent/src/index.ts and backend/app/main.py',
+        test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
+        key_conventions: 'Conventional commits and feature branches',
+        environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
+      };
+
+      expect(isRepoBootstrapOverview(repoOverview)).toBe(true);
+      if (!isRepoBootstrapOverview(repoOverview)) throw new Error('expected repo overview');
+      expect(repoOverview.entry_points).toBe('agent/src/index.ts and backend/app/main.py');
+      expect(repoOverview.test_layout).toBe('backend/testing for pytest; agent/src/*.test.ts for vitest');
+      expect(repoOverview.key_conventions).toBe('Conventional commits and feature branches');
+      expect(repoOverview.environment_requirements).toBe('Node 22, Python 3.12, DATABASE_URL in .env');
+    });
+
     it('persists a valid repo overview unchanged', async () => {
       const repoOverview = {
         tech_stack: 'TypeScript, FastAPI, Postgres',
         directory_layout: 'agent/ for the runner, backend/ for the API',
         first_steps_summary: 'Install deps, run the build, then run tests',
+        entry_points: 'agent/src/index.ts and backend/app/main.py',
+        test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
+        key_conventions: 'Conventional commits and feature branches',
+        environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
       };
       vi.mocked(readHandlerOutput).mockReturnValue(repoOverview);
       vi.mocked(runClaudeCode).mockResolvedValue({
@@ -1776,6 +1800,23 @@ describe('specialized handler task-specific content contracts', () => {
       expect(call.status).toBe('COMPLETED');
       expect(call.repo_overview).toEqual(repoOverview);
       expect(call.logs).toBe(JSON.stringify(repoOverview));
+    });
+
+    it('repo_bootstrap prompt requests all seven repo overview fields', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('"tech_stack"');
+      expect(p).toContain('"directory_layout"');
+      expect(p).toContain('"first_steps_summary"');
+      expect(p).toContain('"entry_points"');
+      expect(p).toContain('if discoverable: main executable(s) or server entry files');
+      expect(p).toContain('"test_layout"');
+      expect(p).toContain('if discoverable: test directory structure and how to run subsets');
+      expect(p).toContain('"key_conventions"');
+      expect(p).toContain('if discoverable: branch naming, commit style, PR conventions');
+      expect(p).toContain('"environment_requirements"');
+      expect(p).toContain('if discoverable: required env vars, runtime versions, .env.example notes');
     });
 
     it('repo_bootstrap prompt includes playbook seeding guidance', async () => {

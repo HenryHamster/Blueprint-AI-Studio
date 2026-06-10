@@ -39,10 +39,14 @@ function provisionFetchHelper(taskId: string, task: Record<string, unknown>): st
   return buildFetchGuidance(PLAN_FETCH_VERBS);
 }
 
-function isRepoBootstrapOverview(value: unknown): value is {
+export function isRepoBootstrapOverview(value: unknown): value is {
   tech_stack: string;
   directory_layout: string;
   first_steps_summary: string;
+  entry_points?: string;
+  test_layout?: string;
+  key_conventions?: string;
+  environment_requirements?: string;
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -1016,7 +1020,11 @@ Also read any detected build/CI manifests you find.
    {
      "tech_stack": "programming language(s), key frameworks, dependency manager",
      "directory_layout": "brief description of top-level dirs and their purpose",
-     "first_steps_summary": "how to clone, install deps, run build, run tests"
+     "first_steps_summary": "how to clone, install deps, run build, run tests",
+     "entry_points": "if discoverable: main executable(s) or server entry files",
+     "test_layout": "if discoverable: test directory structure and how to run subsets",
+     "key_conventions": "if discoverable: branch naming, commit style, PR conventions",
+     "environment_requirements": "if discoverable: required env vars, runtime versions, .env.example notes"
    }
    \`\`\`
    The file must contain ONLY the JSON object, no markdown wrapping.

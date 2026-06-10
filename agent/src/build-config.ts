@@ -62,9 +62,11 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     const confirmedTestCmd = dir.confirmed_test_cmd;
     const confirmedBuildCmd = dir.confirmed_build_cmd;
     const confirmedInstallCmd = dir.confirmed_install_cmd;
+    const confirmedLintCmd = dir.confirmed_lint_cmd;
     if (typeof confirmedTestCmd === 'string') entry.confirmed_test_cmd = confirmedTestCmd;
     if (typeof confirmedBuildCmd === 'string') entry.confirmed_build_cmd = confirmedBuildCmd;
     if (typeof confirmedInstallCmd === 'string') entry.confirmed_install_cmd = confirmedInstallCmd;
+    if (typeof confirmedLintCmd === 'string') entry.confirmed_lint_cmd = confirmedLintCmd;
     if (dir.commands_stale === true) entry.commands_stale = true;
     directories.push(entry);
   }

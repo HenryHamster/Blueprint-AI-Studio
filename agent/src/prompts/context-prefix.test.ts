@@ -373,14 +373,30 @@ describe('buildContextPrefix self-review calibration', () => {
         tech_stack: 'Python, FastAPI, React',
         directory_layout: 'backend/ agent/ admin-ui/',
         first_steps_summary: 'Run pip install and npm install',
+        entry_points: 'backend/app/main.py; agent/src/index.ts',
+        test_layout: 'backend/testing/ and agent/src/**/*.test.ts',
+        key_conventions: 'Use shared prompt helpers from prompt.ts',
+        environment_requirements: 'Python 3.12 and Node 20',
         bootstrap_completed_at: '2026-01-15T10:00:00Z',
+        provenance: {
+          refreshed_at: '2026-01-15T10:01:00Z',
+          source_branch: 'main',
+          source_revision: 'abc1234',
+        },
       },
     });
     expect(prefix).toContain('## Repo Overview');
     expect(prefix).toContain('**Tech stack:** Python, FastAPI, React');
     expect(prefix).toContain('**Directory layout:** backend/ agent/ admin-ui/');
     expect(prefix).toContain('**First steps:** Run pip install and npm install');
+    expect(prefix).toContain('**Entry points:** backend/app/main.py; agent/src/index.ts');
+    expect(prefix).toContain('**Test layout:** backend/testing/ and agent/src/**/*.test.ts');
+    expect(prefix).toContain('**Key conventions:** Use shared prompt helpers from prompt.ts');
+    expect(prefix).toContain('**Environment:** Python 3.12 and Node 20');
     expect(prefix).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
+    expect(prefix).toContain(
+      '**Provenance:** refreshed 2026-01-15T10:01:00Z; branch main; revision abc1234',
+    );
   });
 
   it('omits ## Repo Overview when repo_overview is absent', () => {
@@ -412,5 +428,68 @@ describe('buildContextPrefix self-review calibration', () => {
     });
     expect(prefix).toContain('## Repo Overview');
     expect(prefix).not.toContain('**Bootstrapped:**');
+    // optional-field labels must not appear when the fields are absent
+    expect(prefix).not.toContain('**Entry points:**');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+    expect(prefix).not.toContain('**Environment:**');
+  });
+
+  it('renders optional repo_overview fields when present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Python, FastAPI, React',
+        directory_layout: 'backend/ agent/ admin-ui/',
+        first_steps_summary: 'Run pip install and npm install',
+        entry_points: 'backend/app/main.py, admin-ui/src/App.tsx',
+        test_layout: 'backend/testing/, agent/src/**/*.test.ts',
+        key_conventions: 'async/await everywhere; functional React components',
+        environment_requirements: 'Python 3.11, Node 20, Postgres 15',
+        bootstrap_completed_at: '2026-01-15T10:00:00Z',
+      },
+    });
+    expect(prefix).toContain('**Entry points:** backend/app/main.py, admin-ui/src/App.tsx');
+    expect(prefix).toContain('**Test layout:** backend/testing/, agent/src/**/*.test.ts');
+    expect(prefix).toContain('**Key conventions:** async/await everywhere; functional React components');
+    expect(prefix).toContain('**Environment:** Python 3.11, Node 20, Postgres 15');
+    // optional fields render after required fields and before the bootstrapped timestamp
+    expect(prefix.indexOf('**First steps:**')).toBeLessThan(prefix.indexOf('**Entry points:**'));
+    expect(prefix.indexOf('**Environment:**')).toBeLessThan(prefix.indexOf('**Bootstrapped:**'));
+  });
+
+  it('renders only the present optional repo_overview fields in a mixed payload', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Go',
+        directory_layout: 'cmd/ internal/',
+        first_steps_summary: 'go build ./...',
+        entry_points: 'cmd/server/main.go',
+        // test_layout and key_conventions absent
+        environment_requirements: 'Go 1.22',
+      },
+    });
+    expect(prefix).toContain('**Entry points:** cmd/server/main.go');
+    expect(prefix).toContain('**Environment:** Go 1.22');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+  });
+
+  it('omits optional repo overview fields and provenance when absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      repo_overview: {
+        tech_stack: 'TypeScript, Node',
+        directory_layout: 'src/ tests/',
+        first_steps_summary: 'npm install && npm test',
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).not.toContain('**Entry points:**');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+    expect(prefix).not.toContain('**Environment requirements:**');
+    expect(prefix).not.toContain('**Provenance:**');
   });
 });

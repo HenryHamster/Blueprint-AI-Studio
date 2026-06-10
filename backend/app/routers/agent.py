@@ -3514,12 +3514,17 @@ async def claim_task(
     else:
         response["build_config"] = {}
 
-    # Inject repo_overview for downstream code-change and review tasks so agents
-    # know the tech stack and layout discovered during repo_bootstrap without
-    # re-discovering it from scratch. Omitted entirely when absent so the claim
-    # shape is byte-identical for projects that never ran bootstrap.
+    # Inject repo_overview for repo-reading code-change, review, and analysis
+    # tasks so agents know the tech stack and layout discovered during
+    # repo_bootstrap without re-discovering it from scratch. Omitted entirely
+    # when absent so the claim shape is byte-identical for projects that never
+    # ran bootstrap.
     _REPO_OVERVIEW_TASK_TYPES = {
-        "create", "fix", "refactor", "migrate", "qa", "docs", "review"
+        "create", "fix", "refactor", "migrate", "qa", "docs", "review",
+        "research", "plan", "design", "debug", "investigate",
+        "security_audit", "perf",
+        "self_audit", "release_audit", "release_audit_challenge",
+        "smoketest", "design_doc_update", "strategic_review",
     }
     if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
         _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
@@ -3545,6 +3550,17 @@ async def claim_task(
             )
             if _bootstrap_completed_at:
                 _repo_overview["bootstrap_completed_at"] = _bootstrap_completed_at
+            _provenance = _raw_overview.get("provenance")
+            if isinstance(_provenance, dict):
+                _repo_provenance = {
+                    k: v
+                    for k, v in _provenance.items()
+                    if k in {"refreshed_at", "source_branch", "source_revision"}
+                    and isinstance(v, str)
+                    and v.strip()
+                }
+                if _repo_provenance:
+                    _repo_overview["provenance"] = _repo_provenance
             response["repo_overview"] = _repo_overview
 
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
