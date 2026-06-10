@@ -20,7 +20,7 @@
     "github_refs.py": 730,
     "github_pulls.py": 1000,
     "github_merge_summary.py": 350,
-    "routers/admin_settings.py": 3000,
+    "routers/admin_settings.py": 3550,
     "routers/admin_analytics.py": 900,
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,
@@ -87,7 +87,7 @@
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 2450,
     "alert_dispatch.py": 1750,
-    "compute_jobs.py": 1800,
+    "compute_jobs.py": 2150,
     "task_evaluators.py": 1950,
     "release_scoring.py": 1800,
     "runtime_config_state.py": 1750

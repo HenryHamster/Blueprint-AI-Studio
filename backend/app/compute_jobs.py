@@ -256,6 +256,10 @@ async def create_compute_job(
                 await session.refresh(existing)
             return existing
         raise ValueError("task already has an active compute job")
+    await _check_project_compute_job_concurrency_cap(
+        session,
+        project_id=locked_task.project_id,
+    )
     await _check_project_spend_ceiling(
         session,
         project_id=locked_task.project_id,
@@ -482,6 +486,44 @@ async def _check_project_spend_ceiling(
                 "rolling_spend_usd": rolling,
                 "requested_cap_usd": requested_cap_usd,
                 "ceiling_usd": ceiling_usd,
+            }
+        )
+
+
+async def _check_project_compute_job_concurrency_cap(
+    session,
+    *,
+    project_id: uuid.UUID,
+) -> None:
+    """Raise ComputeLaunchPreconditionFailed when the project is at its compute-job cap.
+
+    Counts active ComputeJob rows for the project and rejects a new launch when
+    the count is at or above the configured cap. The check is skipped when no cap
+    is configured for the project (absent or zero in
+    ``max_concurrent_compute_jobs_by_project``).
+    """
+    from app.runtime_config_state import resolve_project_compute_job_concurrency_cap
+
+    cap = resolve_project_compute_job_concurrency_cap(project_id)
+    if cap is None:
+        return
+    count_result = await session.execute(
+        select(func.count()).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
+        )
+    )
+    active_count = int(count_result.scalar_one() or 0)
+    if active_count >= cap:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "compute_job_concurrency_limit_exceeded",
+                "message": (
+                    f"project already has {active_count} active compute job(s); "
+                    f"configured cap is {cap}"
+                ),
+                "active_count": active_count,
+                "cap": cap,
             }
         )
 

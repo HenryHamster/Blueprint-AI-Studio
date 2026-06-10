@@ -110,6 +110,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_active_directions",
         "max_autonomous_tasks_per_hour",
         "max_concurrent_auto_remediations",
+        "max_concurrent_compute_jobs_by_project",
         "max_concurrent_tasks_by_project",
         "max_concurrent_vms",
         "max_global_autonomous_tasks_per_hour",
@@ -438,6 +439,13 @@ async def get_settings(
             str(k): int(v)
             for k, v in (
                 _runtime_config.get("max_concurrent_tasks_by_project") or {}
+            ).items()
+            if v and int(v) > 0
+        },
+        "max_concurrent_compute_jobs_by_project": {
+            str(k): int(v)
+            for k, v in (
+                _runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
             ).items()
             if v and int(v) > 0
         },
@@ -1135,6 +1143,50 @@ async def _apply_settings(
             if ival > 0:
                 cleaned_proj_caps[sid] = ival
         _runtime_config["max_concurrent_tasks_by_project"] = cleaned_proj_caps
+    if "max_concurrent_compute_jobs_by_project" in payload:
+        raw = payload["max_concurrent_compute_jobs_by_project"]
+        # Per-project concurrent compute-job cap: a mapping of project-id strings
+        # to positive integers in 0..50. An empty map removes all caps. A zero
+        # or absent entry for a project means no cap for that project.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_concurrent_compute_jobs_by_project must be a mapping of "
+                    "project-id strings to integers"
+                ),
+            )
+        cleaned_job_caps: dict[str, int] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_concurrent_compute_jobs_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_compute_jobs_by_project[{sid}] must be an integer"
+                    ),
+                )
+            if not (0 <= ival <= 50):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_compute_jobs_by_project[{sid}] must be "
+                        "between 0 and 50"
+                    ),
+                )
+            if ival > 0:
+                cleaned_job_caps[sid] = ival
+        _runtime_config["max_concurrent_compute_jobs_by_project"] = cleaned_job_caps
     if "warm_pool_target_size_by_project" in payload:
         raw = payload["warm_pool_target_size_by_project"]
         # Per-project IDLE target overrides: a mapping of project-id strings to
@@ -2401,6 +2453,15 @@ async def _apply_settings(
                         str(k): int(v)
                         for k, v in (
                             _runtime_config.get("max_concurrent_tasks_by_project") or {}
+                        ).items()
+                        if v and int(v) > 0
+                    },
+                    "max_concurrent_compute_jobs_by_project": {
+                        str(k): int(v)
+                        for k, v in (
+                            _runtime_config.get(
+                                "max_concurrent_compute_jobs_by_project"
+                            ) or {}
                         ).items()
                         if v and int(v) > 0
                     },

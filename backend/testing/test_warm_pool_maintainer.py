@@ -44,6 +44,7 @@ from app.warm_pool import (
 )
 from app.warm_pool_maintainer import (
     evaluate_pool_cost_guard,
+    evaluate_project_pool_cost_guard,
     reconcile_project_pool,
     retire_and_delete_pool_vm,
     run_pool_maintainer_cycle,
@@ -1857,3 +1858,191 @@ async def test_idle_reaper_recycles_pre_promotion_member(
     )
     assert retired == 1
     assert await db_session.get(PoolVm, member.id) is None
+
+
+# ---------------------------------------------------------------------------
+# Per-project cost guard: targeted drain without collateral damage
+# ---------------------------------------------------------------------------
+
+
+async def _make_dispatched_task(
+    db_session, project, warm_pool_hit: bool, *, minutes_ago: int = 5
+):
+    """A terminal task dispatched recently. ``warm_pool_hit`` sets the timing origin."""
+    from app.warm_pool import WARM_POOL_ORIGIN
+
+    timing = {"warm_start": warm_pool_hit}
+    if warm_pool_hit:
+        timing["warm_claim_origin"] = WARM_POOL_ORIGIN
+    task = Task(
+        project_id=project.id,
+        title="dispatched",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+        status=TaskStatus.COMPLETED,
+        context={"_timing": timing},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task.vm_dispatched_at = _utcnow() - timedelta(minutes=minutes_ago)
+    db_session.add(task)
+    await db_session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_per_project_guard_drains_only_failing_project(
+    db_session, warm_pool_on, mocker
+):
+    """A project with high idle cost and low hit rate has its pool drained
+    independently while a co-tenant project with good hit rate is unaffected.
+
+    Project A: all dispatches are warm-pool hits (hit rate 100% — guard off).
+    Project B: no warm-pool hits, high idle cost (hit rate 0% — guard engages).
+    Only B's idle member should be drained; A's must survive."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        side_effect=lambda session, pid, cutoff: (
+            {"total": 5.0, "by_account": {}}  # both projects have $5 idle
+        ),
+    )
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 20
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 5
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 1.0
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+
+    project_a = await _make_project(db_session, name="Guard A")
+    project_b = await _make_project(db_session, name="Guard B")
+
+    # Project A: 10 warm-pool hits → 100% hit rate → guard stays off.
+    for _ in range(10):
+        await _make_dispatched_task(db_session, project_a, warm_pool_hit=True)
+    idle_a = await _register(db_session, project_a, "agent-vm-guard-a", PoolVmState.IDLE)
+    idle_a.idle_since = _utcnow() - timedelta(seconds=300)
+    db_session.add(idle_a)
+
+    # Project B: 10 cold dispatches, no hits → 0% hit rate + $5 idle → guard engages.
+    for _ in range(10):
+        await _make_dispatched_task(db_session, project_b, warm_pool_hit=False)
+    idle_b = await _register(db_session, project_b, "agent-vm-guard-b", PoolVmState.IDLE)
+    idle_b.idle_since = _utcnow() - timedelta(seconds=300)
+    db_session.add(idle_b)
+    await db_session.commit()
+
+    async def _no_provision(session, project_id, **kw):
+        return False
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        session_factory=_factory_for(db_session),
+    )
+
+    # Project A (healthy) survives; Project B (low hit rate) is drained.
+    assert await db_session.get(PoolVm, idle_a.id) is not None, (
+        "project A's idle member must NOT be drained (guard is off for it)"
+    )
+    assert await db_session.get(PoolVm, idle_b.id) is None, (
+        "project B's idle member must be drained (guard engaged for it)"
+    )
+    assert totals["drained"] == 1
+
+
+@pytest.mark.asyncio
+async def test_per_project_guard_does_not_drain_on_insufficient_dispatches(
+    db_session, warm_pool_on, mocker
+):
+    """A project with low hit rate but fewer than min_dispatches dispatches is NOT
+    drained — thin-sample protection mirrors the fleet guard's behavior."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total": 5.0, "by_account": {}},
+    )
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 20
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 20  # need 20
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 1.0
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+
+    project = await _make_project(db_session, name="Thin Sample")
+    # Only 3 cold dispatches — below the min_dispatches floor.
+    for _ in range(3):
+        await _make_dispatched_task(db_session, project, warm_pool_hit=False)
+    idle = await _register(db_session, project, "agent-vm-thin", PoolVmState.IDLE)
+    idle.idle_since = _utcnow() - timedelta(seconds=300)
+    db_session.add(idle)
+    await db_session.commit()
+
+    guard = await evaluate_project_pool_cost_guard(
+        db_session, project.id, runtime_config=_runtime_config
+    )
+    assert guard["engaged"] is False, (
+        "guard must not engage on a thin sample (< min_dispatches)"
+    )
+    assert guard["total_dispatches"] == 3
+    assert await db_session.get(PoolVm, idle.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_fleet_guard_still_drains_all_as_safety_valve(
+    db_session, warm_pool_on, mocker
+):
+    """When the fleet-level guard engages, ALL projects drain regardless of
+    individual per-project hit rates — it acts as a global safety valve."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 20
+
+    project_a = await _make_project(db_session, name="Fleet A")
+    project_b = await _make_project(db_session, name="Fleet B")
+    idle_a = await _register(db_session, project_a, "agent-vm-fleet-a", PoolVmState.IDLE)
+    idle_a.idle_since = _utcnow() - timedelta(seconds=300)
+    idle_b = await _register(db_session, project_b, "agent-vm-fleet-b", PoolVmState.IDLE)
+    idle_b.idle_since = _utcnow() - timedelta(seconds=300)
+    db_session.add_all([idle_a, idle_b])
+    await db_session.commit()
+
+    # Patch the fleet-level guard to engage unconditionally.
+    mocker.patch(
+        "app.warm_pool_maintainer.evaluate_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "engaged": True,
+            "reason": "fleet guard engaged for test",
+            "hit_rate": 0.0,
+            "total_dispatches": 100,
+            "raw_hit_rate": 0.0,
+            "raw_total_dispatches": 100,
+            "idle_cost_usd": 10.0,
+            "min_hit_rate": 0.10,
+            "min_idle_cost_usd": 1.0,
+            "window_hours": 24,
+        },
+    )
+
+    async def _no_provision(session, project_id, **kw):
+        return False
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        session_factory=_factory_for(db_session),
+    )
+
+    # Fleet guard engaged → both projects drained, even though per-project hit
+    # rates were not individually evaluated.
+    assert await db_session.get(PoolVm, idle_a.id) is None, (
+        "project A must be drained when fleet guard engages"
+    )
+    assert await db_session.get(PoolVm, idle_b.id) is None, (
+        "project B must be drained when fleet guard engages"
+    )
+    assert totals["drained"] == 2

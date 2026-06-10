@@ -689,6 +689,14 @@ runtime_config: Dict = {
     # Values are clamped to 1..50; 0 or absent means no cap for that project.
     # Set via /api/admin/settings. Read by resolve_project_concurrency_cap.
     "max_concurrent_tasks_by_project": {},
+    # Per-project concurrent compute-job cap ({project_id: int}). OPTIONAL — an
+    # EMPTY map (the default) means NO per-project cap, preserving today's behavior.
+    # A non-zero entry bounds how many concurrent active ComputeJob rows a project
+    # may have simultaneously. Launch is rejected (ComputeLaunchPreconditionFailed)
+    # when the project is at or above its cap. 0 or absent means no cap.
+    # Values are clamped to 1..50. Set via /api/admin/settings.
+    # Read by resolve_project_compute_job_concurrency_cap.
+    "max_concurrent_compute_jobs_by_project": {},
     # Hard ceiling on concurrent live (PROVISIONING/IDLE/LEASED) pool members
     # fleet-wide. The maintainer never provisions past this even if every
     # project is below its target — a dedicated pool budget distinct from the
@@ -1316,6 +1324,28 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             if ival > 0:
                                 normalized_caps[sid] = max(1, min(50, ival))
                         _set("max_concurrent_tasks_by_project", normalized_caps)
+                if "max_concurrent_compute_jobs_by_project" in config_json:
+                    # Persisted per-project concurrent compute-job cap. Same
+                    # normalization as max_concurrent_tasks_by_project: keys are
+                    # trimmed non-empty project-id strings, values clamped to 1..50,
+                    # and 0-or-below entries are excluded (absent key = no cap).
+                    raw_job_caps = config_json["max_concurrent_compute_jobs_by_project"]
+                    if isinstance(raw_job_caps, dict):
+                        normalized_job_caps: dict[str, int] = {}
+                        for proj_key, proj_val in raw_job_caps.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            if ival > 0:
+                                normalized_job_caps[sid] = max(1, min(50, ival))
+                        _set(
+                            "max_concurrent_compute_jobs_by_project",
+                            normalized_job_caps,
+                        )
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -1517,6 +1547,28 @@ def resolve_project_concurrency_cap(project_id) -> int | None:
     pattern.
     """
     raw = runtime_config.get("max_concurrent_tasks_by_project") or {}
+    if not isinstance(raw, dict):
+        return None
+    sid = str(project_id)
+    val = raw.get(sid)
+    if val is None:
+        return None
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None
+
+
+def resolve_project_compute_job_concurrency_cap(project_id) -> int | None:
+    """Return the per-project concurrent compute-job cap, or None if no cap is set.
+
+    Reads from ``max_concurrent_compute_jobs_by_project`` in runtime_config.  An
+    absent or zero entry means no cap — returns None so create_compute_job skips
+    the check for unconfigured projects (behavior-preserving). Mirrors
+    :func:`resolve_project_concurrency_cap` for the compute-job lane.
+    """
+    raw = runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
     if not isinstance(raw, dict):
         return None
     sid = str(project_id)

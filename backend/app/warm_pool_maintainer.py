@@ -151,6 +151,44 @@ def _demand_window_minutes(runtime_config) -> int:
 _COST_GUARD_ALERT_TITLE = "Warm pool cost guard engaged: idle spend not amortized"
 
 
+async def _compute_project_pool_hit_rate(
+    session, project_id: uuid.UUID, cutoff: datetime
+) -> dict:
+    """DB-derived warm-pool hit rate for one project within the rolling window.
+
+    Queries Task rows with ``vm_dispatched_at >= cutoff`` for the given project.
+    Counts rows whose ``context['_timing']['warm_claim_origin']`` equals
+    ``WARM_POOL_ORIGIN`` as pool hits; total dispatched tasks as the denominator.
+    Returns ``{"hits": int, "total_dispatches": int, "hit_rate": float | None}``
+    where ``hit_rate`` is None when there are no dispatches in the window.
+    """
+    from app.warm_pool import WARM_POOL_ORIGIN
+
+    tasks = list(
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.vm_dispatched_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = len(tasks)
+    hits = 0
+    for task in tasks:
+        timing = (task.context or {}).get("_timing") or {}
+        if timing.get("warm_claim_origin") == WARM_POOL_ORIGIN:
+            hits += 1
+    return {
+        "hits": hits,
+        "total_dispatches": total,
+        "hit_rate": (hits / total) if total > 0 else None,
+    }
+
+
 def _cost_guard_config(runtime_config) -> dict:
     """Thresholds for the cost-aware auto-drain guard (safe defaults).
 
@@ -257,6 +295,59 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
         # Rolling window the idle_cost_usd was computed over (same window as the
         # dispatch funnel). Additive — lets the panel label the windowed figure
         # so it cannot be misread as lifetime idle spend.
+        "window_hours": cfg["window_hours"],
+    }
+
+
+async def evaluate_project_pool_cost_guard(
+    session, project_id: uuid.UUID, *, runtime_config
+) -> dict:
+    """Per-project warm-pool cost guard: same logic as the fleet guard, scoped to one project.
+
+    Uses ``_compute_windowed_idle_cost(session, project_id, cutoff)`` for
+    per-project idle cost and ``_compute_project_pool_hit_rate`` for a
+    DB-derived warm-pool hit rate. Engages when ALL hold over the rolling window:
+    enough dispatches to trust the rate (``min_dispatches``), a hit rate below
+    the floor, and idle cost above the materiality floor. Returns the same shape
+    dict as ``evaluate_pool_cost_guard`` so callers can use either.
+
+    Called once per project per maintainer tick, only when the fleet-level guard
+    has NOT already engaged (the fleet guard acts as a global safety valve; when
+    it fires, all projects drain without individual evaluation).
+    """
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
+
+    cfg = _cost_guard_config(runtime_config)
+    _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
+    idle_cost = (await _compute_windowed_idle_cost(session, project_id, _guard_cutoff))["total"]
+    funnel = await _compute_project_pool_hit_rate(session, project_id, _guard_cutoff)
+    hit_rate = funnel["hit_rate"]
+    total = funnel["total_dispatches"]
+
+    engaged = (
+        cfg["enabled"]
+        and total >= cfg["min_dispatches"]
+        and hit_rate is not None
+        and hit_rate < cfg["min_hit_rate"]
+        and idle_cost >= cfg["min_idle_cost_usd"]
+    )
+    reason = None
+    if engaged:
+        reason = (
+            f"Project pool hit rate {hit_rate:.1%} is below the "
+            f"{cfg['min_hit_rate']:.0%} floor over {cfg['window_hours']}h "
+            f"({total} dispatches) while idle spend is ${idle_cost:.2f} "
+            f"— draining idle members and pausing provisioning until the hit rate "
+            f"recovers."
+        )
+    return {
+        "engaged": engaged,
+        "reason": reason,
+        "hit_rate": hit_rate,
+        "total_dispatches": total,
+        "idle_cost_usd": idle_cost,
+        "min_hit_rate": cfg["min_hit_rate"],
+        "min_idle_cost_usd": cfg["min_idle_cost_usd"],
         "window_hours": cfg["window_hours"],
     }
 
@@ -943,14 +1034,16 @@ async def run_pool_maintainer_cycle(
     pool_max = _pool_max_vms(runtime_config)
 
     async with session_factory() as session:
-        # Cost-aware auto-drain guard: evaluated ONCE per tick from the live pool
-        # idle-cost + lease-hit signals. When engaged, every project's reconcile
-        # forces target 0 (drain idle) and pauses provisioning until the hit rate
-        # recovers — protecting cost-per-PR while reuse is still low.
-        guard = await evaluate_pool_cost_guard(session, runtime_config=runtime_config)
-        cost_guard_engaged = guard["engaged"]
-        if cost_guard_engaged:
-            logger.warning("[WARM-POOL] cost guard engaged: %s", guard["reason"])
+        # Fleet-level cost guard: global safety valve evaluated ONCE per tick.
+        # When the fleet-wide eligible hit rate is catastrophic and fleet-wide
+        # idle spend is extreme, ALL projects drain regardless of individual
+        # performance. In the normal case (fleet guard disengaged) each project
+        # is evaluated independently by evaluate_project_pool_cost_guard so a
+        # single poorly-performing project does not drain productive neighbors.
+        fleet_guard = await evaluate_pool_cost_guard(session, runtime_config=runtime_config)
+        fleet_guard_engaged = fleet_guard["engaged"]
+        if fleet_guard_engaged:
+            logger.warning("[WARM-POOL] fleet cost guard engaged: %s", fleet_guard["reason"])
         # Reconcile the UNION of (a) projects that already have live pool members
         # and (b) demand-active projects with no members yet. (b) is what lets a
         # pool actually FORM: a demand-active zero-member project flows through
@@ -988,6 +1081,24 @@ async def run_pool_maintainer_cycle(
 
         for project_id in project_ids:
             try:
+                # Per-project cost guard: when the fleet guard is already engaged
+                # every project drains (global safety valve). Otherwise evaluate
+                # each project independently so only the failing project is drained.
+                if fleet_guard_engaged:
+                    cost_guard_engaged = True
+                    active_guard_reason = fleet_guard["reason"]
+                else:
+                    per_guard = await evaluate_project_pool_cost_guard(
+                        session, project_id, runtime_config=runtime_config
+                    )
+                    cost_guard_engaged = per_guard["engaged"]
+                    active_guard_reason = per_guard.get("reason")
+                    if cost_guard_engaged:
+                        logger.warning(
+                            "[WARM-POOL] per-project cost guard engaged for %s: %s",
+                            project_id,
+                            active_guard_reason,
+                        )
                 summary = await reconcile_project_pool(
                     session,
                     project_id,
@@ -999,9 +1110,9 @@ async def run_pool_maintainer_cycle(
                     suppressed=suppressed,
                     cost_guard_engaged=cost_guard_engaged,
                 )
-                if cost_guard_engaged:
+                if cost_guard_engaged and active_guard_reason:
                     await _maybe_emit_cost_guard_alert(
-                        session, project_id, guard["reason"]
+                        session, project_id, active_guard_reason
                     )
             except Exception:
                 await session.rollback()

@@ -7780,3 +7780,179 @@ async def test_create_compute_job_ceiling_counts_active_inflight_spend(db_sessio
     detail = exc_info.value.detail
     assert detail["error"] == "project_spend_ceiling_exceeded"
     assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+
+
+# ---------------------------------------------------------------------------
+# Per-project compute-job concurrency cap tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_active_compute_job(db_session, *, project_id) -> ComputeJob:
+    """Helper: insert an active (RUNNING) ComputeJob for the given project."""
+    job = ComputeJob(
+        project_id=project_id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.RUNNING,
+        accrued_cost_usd=0.0,
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_compute_job_concurrency_cap_blocks_at_cap(db_session):
+    """Project at its configured cap → launch raises compute_job_concurrency_limit_exceeded."""
+    from app.shared_state import runtime_config
+
+    project = Project(name="Cap Blocks At Cap", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Insert 2 active jobs so the project is AT cap=2.
+    await _make_active_compute_job(db_session, project_id=project.id)
+    await _make_active_compute_job(db_session, project_id=project.id)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+    runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 2}
+    try:
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="echo cap-test",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+    finally:
+        runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "compute_job_concurrency_limit_exceeded"
+    assert detail["active_count"] == 2
+    assert detail["cap"] == 2
+
+
+@pytest.mark.asyncio
+async def test_compute_job_concurrency_cap_allows_under_cap(db_session):
+    """Project under its configured cap → launch succeeds."""
+    from app.shared_state import runtime_config
+
+    project = Project(name="Cap Allows Under Cap", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Insert 1 active job; cap is 2 → under cap.
+    await _make_active_compute_job(db_session, project_id=project.id)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+    runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 2}
+    try:
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo under-cap",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+    finally:
+        runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    assert job is not None
+    assert job.project_id == project.id
+
+
+@pytest.mark.asyncio
+async def test_compute_job_concurrency_cap_no_cap_configured(db_session):
+    """No cap entry for the project → launch succeeds regardless of active count."""
+    from app.shared_state import runtime_config
+
+    project = Project(name="Cap No Cap Configured", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Insert many active jobs; no cap configured → should not block.
+    for _ in range(5):
+        await _make_active_compute_job(db_session, project_id=project.id)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+    # Ensure no entry for this project.
+    runtime_config["max_concurrent_compute_jobs_by_project"] = {}
+    try:
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo no-cap",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+    finally:
+        runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    assert job is not None
+
+
+@pytest.mark.asyncio
+async def test_compute_job_concurrency_cap_per_project_isolation(db_session):
+    """Project A at cap does not block Project B's launch."""
+    from app.shared_state import runtime_config
+
+    project_a = Project(name="Cap Isolation A", user_id="test-user")
+    project_b = Project(name="Cap Isolation B", user_id="test-user")
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    # Project A is at cap=1 with 1 active job.
+    await _make_active_compute_job(db_session, project_id=project_a.id)
+
+    task_b = Task(project_id=project_b.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+    runtime_config["max_concurrent_compute_jobs_by_project"] = {
+        str(project_a.id): 1,
+    }
+    try:
+        # Project B has no cap and no active jobs → should succeed.
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task_b,
+            command="echo project-b",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+    finally:
+        runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    assert job is not None
+    assert job.project_id == project_b.id
