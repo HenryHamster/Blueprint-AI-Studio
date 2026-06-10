@@ -209,11 +209,17 @@ export function reconcileEntry(
   if (!presentSet.has(status)) return entry;
 
   const paths = extractEntryPaths(entry);
-  // File-level: downgrade only when EVERY referenced path is gone. A partial hit
-  // means the code partially exists, so the present-status claim is plausible.
-  if (paths.length > 0) {
-    const missing = paths.filter((p) => !fs.existsSync(path.join(root, p)));
-    if (missing.length === paths.length) {
+  // Glob patterns (*, ?, [, ], {, }) are never expanded by fs.existsSync — the
+  // literal string never resolves to a real path so they always count as absent
+  // and cause false downgrades. Only concrete (non-glob) paths may confirm absence.
+  const concretePaths = paths.filter((p) => !/[*?[\]{]/.test(p));
+  // File-level: downgrade only when EVERY concrete referenced path is gone. A
+  // partial hit means the code partially exists, so the present-status claim is
+  // plausible. If concretePaths is empty (all modules are globs) there is no
+  // confirmed-absence evidence — skip the check entirely.
+  if (concretePaths.length > 0) {
+    const missing = concretePaths.filter((p) => !fs.existsSync(path.join(root, p)));
+    if (missing.length === concretePaths.length) {
       return downgradeEntry(
         entry,
         kind,

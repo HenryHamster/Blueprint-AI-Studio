@@ -68,6 +68,13 @@ _FILE_PATH_RE = re.compile(
     r"\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b"
 )
 
+# Regex used by self-healing recovery to extract the original status from a
+# grounding warning written before grounding_prior_status was added (legacy).
+_CLAIMED_STATUS_RE = re.compile(r"\bclaimed\s+(\w+)\b")
+
+# Marker appended to the text field of a grounded entry; stripped during recovery.
+_RECONCILED_MARKER_RE = re.compile(r"\s*\[reconciled:[^\]]*\]")
+
 
 def _playbook_archive_max() -> int:
     from app.shared_state import runtime_config as _rc
@@ -140,6 +147,25 @@ _PRESENT_CAPABILITY_STATUSES = frozenset({"working", "partial"})
 _MODULE_SYMBOL_SUFFIX_RE = re.compile(r"^(.+\.\w+):[A-Za-z_]\w*$")
 
 
+def _get_prior_grounding_status(value: dict) -> str | None:
+    """Return the pre-downgrade status for a grounding-downgraded entry.
+
+    Prefers the machine-readable ``grounding_prior_status`` field written by the
+    current sweep; falls back to parsing ``claimed <status>`` from the
+    ``presence_warning`` text for legacy entries downgraded before that field was
+    introduced.
+    """
+    prior = value.get("grounding_prior_status")
+    if isinstance(prior, str) and prior:
+        return prior
+    warning = value.get("presence_warning", "")
+    if isinstance(warning, str):
+        m = _CLAIMED_STATUS_RE.search(warning)
+        if m:
+            return m.group(1)
+    return None
+
+
 def _extract_entry_paths(entry: dict) -> list[str]:
     """Collect unique file-path pointers for a design-doc system/capability.
 
@@ -164,6 +190,11 @@ def _extract_entry_paths(entry: dict) -> list[str]:
     if text_parts:
         paths.extend(_FILE_PATH_RE.findall("\n".join(text_parts)))
     return list(dict.fromkeys(paths))
+
+
+def _is_glob_path(path: str) -> bool:
+    """Return True for literal glob patterns that must not confirm absence."""
+    return any(ch in path for ch in "*?[]{}")
 
 
 def _absent_symbol_in_present_file(entry: dict, repo_root: str) -> str | None:
@@ -227,6 +258,60 @@ def _absent_symbol_in_present_file(entry: dict, repo_root: str) -> str | None:
     return None
 
 
+def _present_symbol_in_present_file(entry: dict, repo_root: str) -> bool | None:
+    """Return True when a cited symbol is confirmed present in a local file.
+
+    False means at least one present file was read and the cited symbol was
+    unambiguously absent. None means no cited symbol could be confirmed present
+    or absent because every read was indeterminate.
+    """
+    from app.source_ref_validation import (
+        _parse_path_symbol_refs,
+        _symbol_definition_regex,
+    )
+
+    texts: list[str] = []
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        texts.extend(m for m in modules if isinstance(m, str) and m)
+    texts.extend(
+        entry[key]
+        for key in ("notes", "description")
+        if isinstance(entry.get(key), str) and entry[key]
+    )
+
+    seen: set = set()
+    any_absent = False
+    any_indeterminate = False
+    for text in texts:
+        for path, symbol in _parse_path_symbol_refs(text):
+            if (path, symbol) in seen:
+                continue
+            seen.add((path, symbol))
+            if _is_glob_path(path):
+                any_indeterminate = True
+                continue
+            full = os.path.join(repo_root, path)
+            if not os.path.isfile(full):
+                any_indeterminate = True
+                continue
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                any_indeterminate = True
+                continue
+            if _symbol_definition_regex(symbol).search(content):
+                return True
+            any_absent = True
+
+    if any_absent:
+        return False
+    if any_indeterminate:
+        return None
+    return None
+
+
 def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
     """Ground design-doc ``systems/*`` and ``capabilities/*`` against the tree.
 
@@ -277,12 +362,14 @@ def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
             continue
 
         paths = _extract_entry_paths(value)
+        concrete_paths = [path for path in paths if not _is_glob_path(path)]
 
         # File-level absence: downgrade only when EVERY referenced path is gone.
         # No pointer at all → absence of a path is NOT evidence of absent code; a
         # partial hit means the code partially exists, so the claim is plausible.
-        file_absent = bool(paths) and all(
-            not os.path.exists(os.path.join(repo_root, path)) for path in paths
+        file_absent = bool(concrete_paths) and all(
+            not os.path.exists(os.path.join(repo_root, path))
+            for path in concrete_paths
         )
 
         # Symbol-level absence: a cited symbol is gone even though its file still
@@ -300,7 +387,7 @@ def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
                 f"claimed {status} but all referenced module file(s) are absent "
                 f"on the integration branch — treat as missing"
             )
-            detail = f"all referenced paths absent: {paths}"
+            detail = f"all referenced paths absent: {concrete_paths}"
         else:
             warning = (
                 f"claimed {status} but cited symbol '{absent_symbol}' is absent on "
@@ -308,8 +395,17 @@ def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
             )
             detail = f"cited symbol absent: {absent_symbol}"
         entry = dict(value)
+        entry["grounding_prior_status"] = status
         entry["status"] = "missing"
         entry["presence_warning"] = warning
+        # Append a strippable marker for human-visible confirmation that this
+        # entry was grounded; stripped during self-healing recovery.
+        _marker_field = "description" if key.startswith("systems/") else "notes"
+        existing_text = entry.get(_marker_field) or ""
+        marker = f"[reconciled: {warning}]"
+        entry[_marker_field] = (
+            f"{existing_text} {marker}".lstrip() if existing_text else marker
+        )
         doc[key] = entry
         updated = True
         logger.debug(
@@ -429,6 +525,67 @@ async def _absent_symbol_in_repo_branch(
             )
             if defined is False:
                 return f"{path}:{symbol}"
+    return None
+
+
+async def _present_symbol_in_repo_branch(
+    entry: dict,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return True when a cited symbol is confirmed present on the branch.
+
+    False means at least one present file was checked and the cited symbol was
+    unambiguously absent. None means no cited symbol could be confirmed present
+    or absent because every read was indeterminate.
+    """
+    from app.source_ref_validation import (
+        _parse_path_symbol_refs,
+        _symbol_defined_in_repo_branch,
+    )
+
+    texts: list[str] = []
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        texts.extend(m for m in modules if isinstance(m, str) and m)
+    texts.extend(
+        entry[key]
+        for key in ("notes", "description")
+        if isinstance(entry.get(key), str) and entry[key]
+    )
+
+    seen: set = set()
+    any_absent = False
+    any_indeterminate = False
+    for text in texts:
+        for path, symbol in _parse_path_symbol_refs(text):
+            if (path, symbol) in seen:
+                continue
+            seen.add((path, symbol))
+            defined = await _symbol_defined_in_repo_branch(
+                path,
+                symbol,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+            if defined is True:
+                return True
+            if defined is False:
+                any_absent = True
+            else:
+                any_indeterminate = True
+
+    if any_absent:
+        return False
+    if any_indeterminate:
+        return None
     return None
 
 
@@ -622,8 +779,15 @@ async def ground_design_doc_systems_branch_aware(
             )
             detail = f"cited symbol absent: {absent_symbol}"
         entry = dict(value)
+        entry["grounding_prior_status"] = status
         entry["status"] = "missing"
         entry["presence_warning"] = warning
+        _marker_field = "description" if key.startswith("systems/") else "notes"
+        existing_text = entry.get(_marker_field) or ""
+        marker = f"[reconciled: {warning}]"
+        entry[_marker_field] = (
+            f"{existing_text} {marker}".lstrip() if existing_text else marker
+        )
         doc[key] = entry
         updated = True
         logger.debug(
@@ -637,6 +801,194 @@ async def ground_design_doc_systems_branch_aware(
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "design-doc-grounding"
+        doc["_meta"] = meta
+
+    return doc
+
+
+def recover_grounding_downgrades(doc: dict, repo_root: str) -> dict:
+    """Inverse pass of :func:`ground_design_doc_systems`: restore falsely-downgraded entries.
+
+    Examines ``status=missing`` entries that carry a ``presence_warning`` (set by
+    the grounding sweep). For each such entry, if at least one referenced backing
+    path is CONFIRMED present on disk the entry is restored: its prior status is
+    reinstated, ``presence_warning`` and ``grounding_prior_status`` are cleared,
+    and any ``[reconciled: ...]`` marker is stripped from text fields.
+
+    Conservative tri-state semantics throughout: only a confirmed presence
+    (``os.path.exists`` returning True) triggers recovery. Indeterminate states
+    (no checkout, unreadable file) leave the entry untouched.
+
+    For symbol-level downgrades (warning contains "cited symbol") the cited symbol
+    must additionally be confirmed defined in its file before restoring.
+
+    Authored-missing entries (no ``presence_warning``) are never touched.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return doc
+
+    updated = False
+    for key, value in doc.items():
+        if not isinstance(value, dict):
+            continue
+        if not (key.startswith("systems/") or key.startswith("capabilities/")):
+            continue
+        if value.get("status") != "missing":
+            continue
+        presence_warning = value.get("presence_warning")
+        if not presence_warning:
+            continue
+        prior_status = _get_prior_grounding_status(value)
+        if not prior_status:
+            continue
+
+        paths = _extract_entry_paths(value)
+        if not paths:
+            continue
+
+        is_symbol_downgrade = "cited symbol" in str(presence_warning)
+        if is_symbol_downgrade:
+            confirmed_recovery = (
+                _present_symbol_in_present_file(value, repo_root) is True
+            )
+        else:
+            confirmed_recovery = any(
+                os.path.exists(os.path.join(repo_root, p)) for p in paths
+            )
+
+        if not confirmed_recovery:
+            continue
+
+        entry = dict(value)
+        entry["status"] = prior_status
+        entry.pop("presence_warning", None)
+        entry.pop("grounding_prior_status", None)
+        for text_field in ("description", "notes"):
+            if isinstance(entry.get(text_field), str):
+                cleaned = _RECONCILED_MARKER_RE.sub("", entry[text_field]).rstrip()
+                if cleaned:
+                    entry[text_field] = cleaned
+                else:
+                    del entry[text_field]
+        doc[key] = entry
+        updated = True
+        logger.debug(
+            "[DESIGN-DOC] Recovered '%s' to %s (confirmed present on disk)",
+            key,
+            prior_status,
+        )
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "design-doc-grounding-recovery"
+        doc["_meta"] = meta
+
+    return doc
+
+
+async def recover_grounding_downgrades_branch_aware(
+    doc: dict,
+    *,
+    repo_root: str | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Branch-aware sibling of :func:`recover_grounding_downgrades`.
+
+    Restores falsely-downgraded ``status=missing`` entries by checking whether
+    backing paths are CONFIRMED present on the integration branch via the GitHub
+    contents API. Falls back to the synchronous local-disk recovery when GitHub
+    credentials do not resolve.
+
+    Conservative: only a confirmed presence (``True`` from
+    ``_file_exists_in_repo_branch``) triggers recovery; indeterminate results
+    (``None``, e.g. rate limit / API outage) leave the entry untouched.
+    """
+    use_repo_branch = all([token, owner, repo, branch])
+    if not use_repo_branch:
+        return recover_grounding_downgrades(doc, repo_root or "")
+
+    from app.source_ref_validation import _file_exists_in_repo_branch
+
+    updated = False
+    for key, value in doc.items():
+        if not isinstance(value, dict):
+            continue
+        if not (key.startswith("systems/") or key.startswith("capabilities/")):
+            continue
+        if value.get("status") != "missing":
+            continue
+        presence_warning = value.get("presence_warning")
+        if not presence_warning:
+            continue
+        prior_status = _get_prior_grounding_status(value)
+        if not prior_status:
+            continue
+
+        paths = _extract_entry_paths(value)
+        if not paths:
+            continue
+
+        is_symbol_downgrade = "cited symbol" in str(presence_warning)
+        if is_symbol_downgrade:
+            confirmed_recovery = (
+                await _present_symbol_in_repo_branch(
+                    value,
+                    token=str(token),
+                    owner=str(owner),
+                    repo=str(repo),
+                    branch=str(branch),
+                    project_id=project_id,
+                )
+                is True
+            )
+        else:
+            confirmed_recovery = False
+            for path in paths:
+                exists = await _file_exists_in_repo_branch(
+                    path,
+                    token=str(token),
+                    owner=str(owner),
+                    repo=str(repo),
+                    branch=str(branch),
+                    project_id=project_id,
+                )
+                if exists is True:
+                    confirmed_recovery = True
+                    break
+
+        if not confirmed_recovery:
+            continue
+
+        entry = dict(value)
+        entry["status"] = prior_status
+        entry.pop("presence_warning", None)
+        entry.pop("grounding_prior_status", None)
+        for text_field in ("description", "notes"):
+            if isinstance(entry.get(text_field), str):
+                cleaned = _RECONCILED_MARKER_RE.sub("", entry[text_field]).rstrip()
+                if cleaned:
+                    entry[text_field] = cleaned
+                else:
+                    del entry[text_field]
+        doc[key] = entry
+        updated = True
+        logger.debug(
+            "[DESIGN-DOC] Recovered '%s' to %s on branch (confirmed present)",
+            key,
+            prior_status,
+        )
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "design-doc-grounding-recovery"
         doc["_meta"] = meta
 
     return doc

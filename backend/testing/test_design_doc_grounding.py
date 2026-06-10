@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 from app.playbook_learning import (
     ground_design_doc_systems,
     ground_design_doc_systems_branch_aware,
+    recover_grounding_downgrades,
+    recover_grounding_downgrades_branch_aware,
 )
 
 
@@ -293,3 +295,153 @@ def test_grounding_is_idempotent(tmp_path):
     second = ground_design_doc_systems(first, repo_root)
     # Already "missing" → falls out of the present-status set, no further change.
     assert second["_meta"]["revision"] == rev_after_first
+
+
+# ---------------------------------------------------------------------------
+# Self-healing recovery tests
+# ---------------------------------------------------------------------------
+
+
+def test_downgrade_preserves_grounding_prior_status(tmp_path):
+    """Downgrade stores the original status in grounding_prior_status."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/auth"]["grounding_prior_status"] == "mature"
+
+
+def test_downgrade_appends_reconciled_marker(tmp_path):
+    """Downgrade appends a [reconciled: ...] marker to the appropriate text field."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    # systems/* → description field
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": "Auth module.",
+            "modules": ["backend/app/gone.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert "[reconciled:" in result["systems/auth"]["description"]
+    assert "Auth module." in result["systems/auth"]["description"]
+    assert "[reconciled:" in result["capabilities/retries"]["notes"]
+
+
+def test_recover_restores_when_path_returns(tmp_path):
+    """Round-trip: downgrade then recover restores status and clears fields."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": "Auth subsystem.",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+
+    # Restore the file.
+    gone = tmp_path / "backend" / "app" / "gone.py"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    gone.write_text("# restored")
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    recovered = doc["systems/auth"]
+    assert recovered["status"] == "mature"
+    assert "presence_warning" not in recovered
+    assert "grounding_prior_status" not in recovered
+    assert "[reconciled:" not in recovered.get("description", "")
+    assert "Auth subsystem." in recovered.get("description", "")
+    assert doc["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_recover_no_op_when_still_absent(tmp_path):
+    """Recovery is a no-op when all referenced paths are still absent."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    rev_after_downgrade = doc["_meta"]["revision"]
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+    assert doc["_meta"]["revision"] == rev_after_downgrade
+
+
+def test_recover_no_op_without_grounding_prior_status(tmp_path):
+    """Authored-missing entries (no presence_warning) are never touched by recovery."""
+    repo_root = _make_repo(tmp_path, "backend/app/auth.py")
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+        }
+    }
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+    assert "_meta" not in doc
+
+
+def test_recover_branch_aware_restores(monkeypatch):
+    """Branch-aware recovery restores when _file_exists_in_repo_branch returns True."""
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=True),
+    )
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": "claimed mature but all referenced module file(s) are absent on the integration branch — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert result["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in result["systems/auth"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_downgrade_then_recover_idempotent(tmp_path):
+    """Two consecutive recover calls on a restored entry leave the state unchanged."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+
+    gone = tmp_path / "backend" / "app" / "gone.py"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    gone.write_text("# restored")
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    rev_after_first_recover = doc["_meta"]["revision"]
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    # Entry now has status=mature (not missing) → recovery skips it.
+    assert doc["systems/auth"]["status"] == "mature"
+    assert doc["_meta"]["revision"] == rev_after_first_recover

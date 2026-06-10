@@ -2151,6 +2151,7 @@ async def claim_task(
                                 check_and_flag_stale_refs_branch_aware,
                                 ground_design_doc_systems_branch_aware,
                                 mark_branch_grounding_done,
+                                recover_grounding_downgrades_branch_aware,
                             )
 
                             if branch_grounding_due(doc):
@@ -2170,6 +2171,9 @@ async def claim_task(
                                     )
                                 )
                                 doc = await check_and_flag_stale_refs_branch_aware(
+                                    doc, repo_root=repo_root, **verification_kwargs
+                                )
+                                doc = await recover_grounding_downgrades_branch_aware(
                                     doc, repo_root=repo_root, **verification_kwargs
                                 )
                                 doc = await ground_design_doc_systems_branch_aware(
