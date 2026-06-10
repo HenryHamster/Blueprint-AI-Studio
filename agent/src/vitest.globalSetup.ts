@@ -1,9 +1,10 @@
 /**
  * Vitest globalSetup: guard against tests mutating real VM git state.
  *
- * Snapshots the git hooks and origin URL for the default AGENT_WORKSPACE
- * (/tmp/workspace) before any tests run, then asserts byte-identical state
- * after the suite completes. Fails loudly naming exactly what changed.
+ * Snapshots the full .git/config, all hook files, and worktree status
+ * for the default AGENT_WORKSPACE (/tmp/workspace) before any tests run,
+ * then asserts byte-identical state after the suite completes. Fails loudly
+ * naming exactly what changed.
  *
  * The guard intentionally passes when read-only hooks legitimately pre-exist
  * (dispatch installs them before the suite starts) — it only fails when the
@@ -14,23 +15,46 @@ import fs from 'fs';
 import path from 'path';
 
 const WATCH_WORKSPACE = '/tmp/workspace';
-const BLOCKED_HOOKS = ['pre-commit', 'pre-push'] as const;
 
-interface GitState {
+export interface GitState {
   originUrl: string | null;
+  gitConfigContent: string | null;
   hooks: Record<string, string | null>;
+  worktreeStatus: string;
 }
 
-function captureGitState(workspace: string): GitState | null {
-  const hooksDir = path.join(workspace, '.git', 'hooks');
+function readAllHooks(hooksDir: string): Record<string, string | null> {
   const hooks: Record<string, string | null> = {};
-  for (const hook of BLOCKED_HOOKS) {
-    const hookPath = path.join(hooksDir, hook);
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(hooksDir, { withFileTypes: true });
+  } catch {
+    return hooks;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const hookPath = path.join(hooksDir, entry.name);
     try {
-      hooks[hook] = fs.readFileSync(hookPath, 'utf-8');
+      hooks[entry.name] = fs.readFileSync(hookPath, 'utf-8');
     } catch {
-      hooks[hook] = null;
+      hooks[entry.name] = null;
     }
+  }
+  return hooks;
+}
+
+export function captureGitState(workspace: string): GitState | null {
+  const gitDir = path.join(workspace, '.git');
+  if (!fs.existsSync(gitDir)) return null;
+
+  const hooksDir = path.join(gitDir, 'hooks');
+  const hooks = readAllHooks(hooksDir);
+
+  let gitConfigContent: string | null = null;
+  try {
+    gitConfigContent = fs.readFileSync(path.join(gitDir, 'config'), 'utf-8');
+  } catch {
+    gitConfigContent = null;
   }
 
   let originUrl: string | null = null;
@@ -44,7 +68,133 @@ function captureGitState(workspace: string): GitState | null {
     originUrl = null;
   }
 
-  return { originUrl, hooks };
+  let worktreeStatus = '';
+  try {
+    worktreeStatus = execSync('git status --porcelain=v1', {
+      cwd: workspace,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    worktreeStatus = '';
+  }
+
+  return { originUrl, gitConfigContent, hooks, worktreeStatus };
+}
+
+export function diffAndRestore(
+  before: GitState,
+  after: GitState,
+  workspace: string,
+): string[] {
+  const mutations: string[] = [];
+  const gitDir = path.join(workspace, '.git');
+  const hooksDir = path.join(gitDir, 'hooks');
+
+  if (before.gitConfigContent !== after.gitConfigContent) {
+    mutations.push(
+      `.git/config was MODIFIED by the test suite`,
+    );
+  }
+
+  if (before.originUrl !== after.originUrl) {
+    mutations.push(
+      `git remote origin URL changed:\n` +
+      `  before: ${before.originUrl ?? '(none)'}\n` +
+      `  after:  ${after.originUrl ?? '(none)'}`,
+    );
+  }
+
+  const allHookNames = new Set([
+    ...Object.keys(before.hooks),
+    ...Object.keys(after.hooks),
+  ]);
+  for (const hook of allHookNames) {
+    const beforeContent = before.hooks[hook] ?? null;
+    const afterContent = after.hooks[hook] ?? null;
+    if (beforeContent === afterContent) continue;
+    const hookPath = path.join(hooksDir, hook);
+    if (beforeContent === null) {
+      mutations.push(`${hookPath} was CREATED by the test suite`);
+    } else if (afterContent === null) {
+      mutations.push(`${hookPath} was DELETED by the test suite`);
+    } else {
+      mutations.push(`${hookPath} was MODIFIED by the test suite`);
+    }
+  }
+
+  if (before.worktreeStatus !== after.worktreeStatus) {
+    const beforeLines = new Set(before.worktreeStatus.split('\n').filter(Boolean));
+    const afterLines = after.worktreeStatus.split('\n').filter(Boolean);
+    const newLines = afterLines.filter(l => !beforeLines.has(l));
+    if (newLines.length > 0) {
+      mutations.push(
+        `worktree stray files created by the test suite:\n` +
+        newLines.map(l => `  ${l}`).join('\n'),
+      );
+    } else {
+      mutations.push(`worktree status changed:\n  before: ${before.worktreeStatus.trim()}\n  after: ${after.worktreeStatus.trim()}`);
+    }
+  }
+
+  if (mutations.length === 0) return mutations;
+
+  const restoreErrors: string[] = [];
+
+  // Restore .git/config if it changed.
+  if (before.gitConfigContent !== after.gitConfigContent && before.gitConfigContent !== null) {
+    try {
+      fs.writeFileSync(path.join(gitDir, 'config'), before.gitConfigContent, { mode: 0o644 });
+    } catch (err) {
+      restoreErrors.push(`Failed to restore .git/config: ${(err as Error).message}`);
+    }
+  }
+
+  // Restore hooks to their original state.
+  for (const hook of allHookNames) {
+    const hookPath = path.join(hooksDir, hook);
+    const beforeContent = before.hooks[hook] ?? null;
+    const afterContent = after.hooks[hook] ?? null;
+    if (beforeContent === afterContent) continue;
+    try {
+      if (beforeContent === null) {
+        try { fs.unlinkSync(hookPath); } catch { /* already absent */ }
+      } else {
+        fs.writeFileSync(hookPath, beforeContent, { mode: 0o755 });
+      }
+    } catch (err) {
+      restoreErrors.push(`Failed to restore ${hookPath}: ${(err as Error).message}`);
+    }
+  }
+
+  // Restore origin URL if it changed.
+  if (before.originUrl !== after.originUrl && before.originUrl !== null) {
+    try {
+      execSync(`git remote set-url origin "${before.originUrl}"`, {
+        cwd: workspace,
+        stdio: 'ignore',
+      });
+    } catch (err) {
+      restoreErrors.push(`Failed to restore origin URL: ${(err as Error).message}`);
+    }
+  }
+
+  // Delete stray files created by the suite (safe — they weren't tracked before).
+  if (before.worktreeStatus !== after.worktreeStatus) {
+    const beforeLines = new Set(before.worktreeStatus.split('\n').filter(Boolean));
+    const afterLines = after.worktreeStatus.split('\n').filter(Boolean);
+    for (const line of afterLines) {
+      if (beforeLines.has(line)) continue;
+      // porcelain=v1: "XY path" or "XY orig -> path" — untracked lines start with "??"
+      const match = line.match(/^\?\? (.+)$/);
+      if (match) {
+        const strayPath = path.join(workspace, match[1]);
+        try { fs.rmSync(strayPath, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  return mutations;
 }
 
 export function setup(): (() => void) | undefined {
@@ -56,86 +206,29 @@ export function setup(): (() => void) | undefined {
     return undefined;
   }
 
-  return () => {
-    if (!beforeState) return;
+  if (!beforeState) return undefined;
 
-    let afterState: GitState;
+  const capturedBefore: GitState = beforeState;
+
+  return () => {
+    let afterState: GitState | null;
     try {
-      afterState = captureGitState(WATCH_WORKSPACE) as GitState;
+      afterState = captureGitState(WATCH_WORKSPACE);
     } catch {
       return;
     }
 
-    const mutations: string[] = [];
+    if (!afterState) return;
 
-    if (beforeState.originUrl !== afterState.originUrl) {
-      mutations.push(
-        `git remote origin URL changed:\n` +
-        `  before: ${beforeState.originUrl ?? '(none)'}\n` +
-        `  after:  ${afterState.originUrl ?? '(none)'}`,
-      );
-    }
-
-    for (const hook of BLOCKED_HOOKS) {
-      const before = beforeState.hooks[hook];
-      const after = afterState.hooks[hook];
-      if (before === after) continue;
-      const hookPath = `${WATCH_WORKSPACE}/.git/hooks/${hook}`;
-      if (before === null) {
-        mutations.push(`${hookPath} was CREATED by the test suite`);
-      } else if (after === null) {
-        mutations.push(`${hookPath} was DELETED by the test suite`);
-      } else {
-        mutations.push(`${hookPath} was MODIFIED by the test suite`);
-      }
-    }
+    const mutations = diffAndRestore(capturedBefore, afterState, WATCH_WORKSPACE);
 
     if (mutations.length > 0) {
-      const restoreErrors: string[] = [];
-
-      // Restore hooks to their original state.
-      for (const hook of BLOCKED_HOOKS) {
-        const hookPath = path.join(WATCH_WORKSPACE, '.git', 'hooks', hook);
-        const beforeContent = beforeState.hooks[hook];
-        try {
-          if (beforeContent === null) {
-            // Hook was not present before; delete it if it exists now.
-            try {
-              fs.unlinkSync(hookPath);
-            } catch {
-              // Already absent, which is the desired state.
-            }
-          } else {
-            // Hook existed before; restore its content.
-            fs.writeFileSync(hookPath, beforeContent, { mode: 0o755 });
-          }
-        } catch (err) {
-          restoreErrors.push(`Failed to restore ${hookPath}: ${(err as Error).message}`);
-        }
-      }
-
-      // Restore origin URL if it changed.
-      if (beforeState.originUrl !== afterState.originUrl && beforeState.originUrl !== null) {
-        try {
-          execSync(`git remote set-url origin "${beforeState.originUrl}"`, {
-            cwd: WATCH_WORKSPACE,
-            stdio: 'ignore',
-          });
-        } catch (err) {
-          restoreErrors.push(`Failed to restore origin URL: ${(err as Error).message}`);
-        }
-      }
-
-      // Throw the mutation error, optionally noting any restore failures.
       const errorMsg =
         `[workspace-guard] Test suite mutated real VM git state in ${WATCH_WORKSPACE}:\n` +
         mutations.map(m => `  - ${m}`).join('\n') +
         '\n\nA test is running a subprocess against the real workspace instead of an\n' +
         'isolated temp dir. Fix: pass AGENT_WORKSPACE pointing to a mkdtempSync\n' +
-        'dir in the subprocess invocation.' +
-        (restoreErrors.length > 0
-          ? '\n\nRestore attempts (best-effort):\n' + restoreErrors.map(e => `  - ${e}`).join('\n')
-          : '\n\nState has been restored.');
+        'dir in the subprocess invocation.';
       throw new Error(errorMsg);
     }
   };
