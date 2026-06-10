@@ -760,6 +760,16 @@ class RepoBootstrapPayload(BasePayload):
     is_first_bootstrap: bool = True
 
 
+class RepoBootstrapOverview(BaseModel):
+    """Structured repo-overview payload returned by repo_bootstrap completions."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tech_stack: str
+    directory_layout: str
+    first_steps_summary: str
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------

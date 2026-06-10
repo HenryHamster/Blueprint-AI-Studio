@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.payload_schemas import RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
     NEED_LABEL_MAX_LEN,
@@ -175,6 +176,10 @@ class AgentStatusPayload(BaseModel):
     # Kept as Dict[str, Any] so agent_status.py can store it directly in the
     # task.context JSON column without an extra .model_dump() call.
     self_review_outcome: Dict[str, Any] | None = None
+    # Structured repo_bootstrap overview returned in the terminal COMPLETED
+    # payload. Persisted into task.context so the completion handler can write
+    # it into project.design_doc under the durable repo_overview section.
+    repo_overview: RepoBootstrapOverview | None = None
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
     analysis_plan: str | None = Field(None, max_length=5000)
@@ -709,6 +714,10 @@ class BuildConfig(BaseModel):
     # spend meets or exceeds this value. None = disabled (today's behavior).
     # Operator-created tasks are never blocked — this is a soft autonomous-only gate.
     daily_spend_ceiling_usd: float | None = Field(None, gt=0)
+    # Explicit degraded marker stamped when repo_bootstrap completed without a
+    # structured overview. Preserved through build_config validation so routine
+    # saves do not erase the truth.
+    bootstrap_degraded_reason: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

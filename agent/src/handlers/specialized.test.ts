@@ -129,6 +129,7 @@ import {
   handleDebug,
   handlePerf,
   handleInvestigate,
+  handleRepoBootstrap,
   handleMigrate,
   handleSelfAudit,
   resolveMigrationLayout,
@@ -1751,6 +1752,49 @@ describe('specialized handler task-specific content contracts', () => {
       await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
       const p = vi.mocked(runClaudeCode).mock.calls[0][0];
       expect(p).not.toContain('Citation-provenance notice');
+    });
+  });
+
+  // ── handleRepoBootstrap contract ────────────────────────────────────────
+  describe('handleRepoBootstrap', () => {
+    it('persists a valid repo overview unchanged', async () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript, FastAPI, Postgres',
+        directory_layout: 'agent/ for the runner, backend/ for the API',
+        first_steps_summary: 'Install deps, run the build, then run tests',
+      };
+      vi.mocked(readHandlerOutput).mockReturnValue(repoOverview);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.status).toBe('COMPLETED');
+      expect(call.repo_overview).toEqual(repoOverview);
+      expect(call.logs).toBe(JSON.stringify(repoOverview));
+    });
+
+    it.each([
+      ['partial object', { tech_stack: 'TypeScript', directory_layout: 'agent/' }],
+      ['array output', ['TypeScript', 'agent/', 'tests']],
+    ] as const)('drops invalid bootstrap overview %s', async (_label, invalidOverview) => {
+      vi.mocked(readHandlerOutput).mockReturnValue(invalidOverview as never);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.status).toBe('COMPLETED');
+      expect(call.repo_overview).toBeUndefined();
+      expect(call.logs).toBe('bootstrap transcript tail');
     });
   });
 

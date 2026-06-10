@@ -7,6 +7,7 @@ import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
+import { BootstrapStatusPanel } from './BootstrapStatusPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, cancelProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
@@ -877,6 +878,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
             </div>
           )}
           {selectedProject && <CapabilityEvidencePanel project={selectedProject} />}
+          {selectedProject && <BootstrapStatusPanel project={selectedProject} tasks={tasks} />}
           {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} onLaunchCompute={onLaunchCompute} />}
         </>
       )}

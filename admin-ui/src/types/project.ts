@@ -58,6 +58,9 @@ export interface BuildConfig {
   max_parallel_research?: number | null;
   max_total_research?: number | null;
   max_autonomous_tasks_per_hour?: number | null;
+  /** ISO timestamp stamped when a repo_bootstrap task finishes successfully.
+   *  Absent/null means bootstrap has not yet completed. */
+  bootstrap_completed_at?: string | null;
 }
 
 export interface StagingBranchPrefixesConfig {

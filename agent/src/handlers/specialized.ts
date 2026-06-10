@@ -39,6 +39,18 @@ function provisionFetchHelper(taskId: string, task: Record<string, unknown>): st
   return buildFetchGuidance(PLAN_FETCH_VERBS);
 }
 
+function isRepoBootstrapOverview(value: unknown): value is {
+  tech_stack: string;
+  directory_layout: string;
+  first_steps_summary: string;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.tech_stack === 'string'
+    && typeof record.directory_layout === 'string'
+    && typeof record.first_steps_summary === 'string';
+}
+
 // ── Migration layout resolution ──────────────────────────────────────────────
 // Blueprint's database layout (`backend/alembic/versions/`, `app/models/`,
 // `app/main.py:EXPECTED_SCHEMA_REVISION`) is the DEFAULT. A second repo can
@@ -981,13 +993,16 @@ export async function handleRepoBootstrap(
   const writebackEndpoint = typeof bootstrapGuidance?.build_config_writeback_endpoint === 'string'
     ? bootstrapGuidance.build_config_writeback_endpoint
     : 'PATCH /api/agent/projects/{project_id}/build-config/commands';
+  const completionPayloadField = typeof bootstrapGuidance?.completion_payload_field === 'string'
+    ? bootstrapGuidance.completion_payload_field
+    : 'repo_overview';
 
   const claudeMdContent = readClaudeMd();
   const claudeMdSection = claudeMdContent ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
 
   const bootstrapPrompt = `${contextSection}You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
 
-Your goal: read the repository structure, understand the tech stack and build system, confirm working build/test commands, and seed a design doc section so the first strategic cycle starts with grounded repo knowledge.
+Your goal: read the repository structure, understand the tech stack and build system, confirm working build/test commands, and write a repo overview so the first strategic cycle starts with grounded repo knowledge.
 
 ## Files to read
 Read as many of these as exist:
@@ -996,16 +1011,22 @@ Read as many of these as exist:
 Also read any detected build/CI manifests you find.
 
 ## What to produce
-1. **Design doc section**: Write section \`_repo_overview\` to the project design doc using the write_design_doc_section tool with these fields:
-   - tech_stack: programming language(s), key frameworks, dependency manager
-   - directory_layout: brief description of top-level dirs and their purpose
-   - first_steps_summary: how to clone, install deps, run build, run tests
+1. **Repo overview**: Write the following JSON object to \`/tmp/bootstrap_overview_${taskId}.json\` (NOT inside the repository):
+   \`\`\`json
+   {
+     "tech_stack": "programming language(s), key frameworks, dependency manager",
+     "directory_layout": "brief description of top-level dirs and their purpose",
+     "first_steps_summary": "how to clone, install deps, run build, run tests"
+   }
+   \`\`\`
+   The file must contain ONLY the JSON object, no markdown wrapping.
+   Also include the same object in your terminal COMPLETED status payload as \`${completionPayloadField}\`.
 
 2. **Confirm build/test commands**: Attempt to run the detected build and test commands. If they succeed, write them back using:
    \`${writebackEndpoint}\`
    with the confirmed commands per directory.
 
-3. **Status**: After completing both steps, post COMPLETED status. If you cannot read the repo or run commands, post your findings and complete with whatever you found.
+3. **Status**: After completing both steps, post COMPLETED status with \`${completionPayloadField}\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
 
 ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
 
@@ -1017,14 +1038,20 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
     bootstrapPrompt, ws, statusRef, model, effort, disallowedTools
   );
 
-  const summary = allOutput ? allOutput.slice(-500) : 'Bootstrap complete';
   const rateLimitDetected = matchesRateLimit(allOutput || '');
+  const parsedBootstrapOverview = exitCode === 0 ? readHandlerOutput(taskId, 'bootstrap_overview', ws) : null;
+  const bootstrapOverview = isRepoBootstrapOverview(parsedBootstrapOverview) ? parsedBootstrapOverview : null;
+  const logs = bootstrapOverview !== null
+    ? sanitize(JSON.stringify(bootstrapOverview))
+    : sanitize(allOutput ? allOutput.slice(-500) : 'Bootstrap complete');
+
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0
       ? { artifact_type: 'ERROR_LOG', failure_category: rateLimitDetected ? 'rate_limited' : 'claude_code_failed' }
-      : { artifact_type: 'BOOTSTRAP_REPORT' }),
-    logs: sanitize(summary),
+      : {}),
+    ...(bootstrapOverview !== null ? { repo_overview: bootstrapOverview } : {}),
+    logs,
   });
 }

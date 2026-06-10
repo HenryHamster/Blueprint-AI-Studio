@@ -87,7 +87,7 @@ from app.payload_schemas import read_acceptance_evidence, validate_internal_payl
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
-from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_locking import project_lock, with_design_doc_locked, with_directions_locked
 from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
@@ -3759,39 +3759,82 @@ async def _handle_design_doc_completion(
 async def _handle_repo_bootstrap_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
-    """Handle repo_bootstrap task completion: stamp bootstrap_completed_at on build_config.
+    """Handle repo_bootstrap task completion: persist repo overview and stamp build_config.
 
-    Called when a repo_bootstrap task reaches a terminal COMPLETED state. Marks
-    the project's build_config with the completion timestamp so the strategic spawn
-    gate knows bootstrap has finished and implementation tasks may proceed.
+    Called when a repo_bootstrap task reaches a terminal COMPLETED state.
+
+    If the agent produced a repo overview JSON (tech_stack / directory_layout /
+    first_steps_summary) — delivered via the structured completion payload and
+    mirrored into task.context["repo_overview"] — it is persisted into
+    project.design_doc["repo_overview"] so the first strategic cycle can
+    consume it via _design_doc_index / _agent_view_design_doc. A clean success
+    also stamps bootstrap_completed_at on build_config.
+
+    If no parseable overview is present (degraded path), the handler records
+    bootstrap_degraded_reason in build_config instead of silently claiming
+    clean success. Either path marks the task terminal so the strategic spawn
+    gate can proceed (the gate only defers while bootstrap is IN_PROGRESS/QUEUED).
     """
-    project = await session.get(Project, task.project_id)
-    if project is None:
-        logger.warning(
-            "[BOOTSTRAP] Project %s not found for bootstrap task %s — skipping",
-            task.project_id,
-            task.id,
-        )
-        return
+    _OVERVIEW_KEYS = ("tech_stack", "directory_layout", "first_steps_summary")
+    overview: dict[str, str] | None = None
+    ctx_overview = (task.context or {}).get("repo_overview")
+    if isinstance(ctx_overview, dict) and any(k in ctx_overview for k in _OVERVIEW_KEYS):
+        overview = {k: str(ctx_overview.get(k, "")) for k in _OVERVIEW_KEYS}
+    elif logs:
+        try:
+            parsed = json.loads(logs)
+            if isinstance(parsed, dict) and any(k in parsed for k in _OVERVIEW_KEYS):
+                overview = {k: str(parsed.get(k, "")) for k in _OVERVIEW_KEYS}
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    build_config = dict(project.build_config or {})
-    if build_config.get("bootstrap_completed_at"):
-        logger.info(
-            "[BOOTSTRAP] bootstrap_completed_at already set for project %s — skipping",
-            task.project_id,
-        )
-        return
+    async with project_lock(session, task.project_id, skip_locked=False) as project:
+        if project is None:
+            logger.warning(
+                "[BOOTSTRAP] Project %s not found for bootstrap task %s — skipping",
+                task.project_id,
+                task.id,
+            )
+            return
 
-    build_config["bootstrap_completed_at"] = _utcnow().isoformat()
-    project.build_config = build_config
-    flag_modified(project, "build_config")
-    session.add(project)
-    await session.commit()
-    logger.info(
-        "[BOOTSTRAP] Stamped bootstrap_completed_at for project %s (task %s)",
-        task.project_id,
-        task.id,
-    )
+        build_config = dict(project.build_config or {})
+
+        if overview:
+            def _mutate_design_doc(doc: Dict[str, Any]) -> None:
+                existing_overview = doc.get("repo_overview")
+                if existing_overview != overview:
+                    meta = dict(doc.get("_meta") or {"revision": 0})
+                    doc["repo_overview"] = overview
+                    meta["revision"] = meta.get("revision", 0) + 1
+                    meta["last_updated"] = _utcnow().isoformat()
+                    doc["_meta"] = meta
+
+            session.expire(project, ["design_doc"])
+            await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
+
+            if not build_config.get("bootstrap_completed_at"):
+                build_config["bootstrap_completed_at"] = _utcnow().isoformat()
+            build_config.pop("bootstrap_degraded_reason", None)
+            logger.info(
+                "[BOOTSTRAP] Persisted repo_overview and stamped bootstrap_completed_at "
+                "for project %s (task %s)",
+                task.project_id,
+                task.id,
+            )
+        else:
+            if not build_config.get("bootstrap_completed_at"):
+                build_config["bootstrap_degraded_reason"] = "overview_missing"
+                logger.warning(
+                    "[BOOTSTRAP] No repo_overview in completion payload for project %s "
+                    "(task %s) — recording degraded marker",
+                    task.project_id,
+                    task.id,
+                )
+
+        project.build_config = build_config
+        flag_modified(project, "build_config")
+        session.add(project)
+        await session.commit()
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

@@ -43,6 +43,7 @@ import logging
 from typing import Any, Literal
 
 from app import github
+from app.claim_task_helpers import is_commands_stale
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,20 @@ def proceed_on_no_checks(project, branch: str | None) -> bool:
     return not requires_ci_checks(project)
 
 
+def _effective_test_cmd(d: dict) -> str:
+    """Return the effective test command for a single directory entry.
+
+    A FRESH (non-stale) agent-confirmed command takes precedence over the
+    detected ``test_cmd``.  A stale or absent confirmation falls back to
+    ``test_cmd``.  Returns an empty string when neither is set.
+    """
+    if not is_commands_stale(d.get("commands_confirmed_at")):
+        confirmed = str(d.get("confirmed_test_cmd") or "").strip()
+        if confirmed:
+            return confirmed
+    return str(d.get("test_cmd") or "").strip()
+
+
 def has_detectable_tests(project) -> bool:
     """Whether the project's stored ``build_config`` carries a runnable test
     command — i.e. the no-CI merge gate has a suite the ``verify_tests`` agent
@@ -109,20 +124,21 @@ def has_detectable_tests(project) -> bool:
 
     Onboarding (and the auto re-detect path) populate
     ``build_config.directories[].test_cmd`` for each detected manifest
-    directory.  This only answers 'is ANY non-empty ``test_cmd`` present'; the
-    agent's ``detectTestRunners`` does the authoritative resolution at run time
-    and reports ``detected=false`` if nothing is actually runnable, at which
-    point the gate falls back to proceed-without-checks.  A near-empty /
-    greenfield repo with no manifests has no directories (or empty
-    ``test_cmd``) and returns False here, so it keeps today's immediate-pass
-    behavior.
+    directory.  A FRESH (non-stale) agent-confirmed ``confirmed_test_cmd``
+    also counts — an agent that discovers a working command after detection
+    found none upgrades the project from 'unverified' to 'tests_gated'.
+    This only answers 'is ANY non-empty effective command present'; the
+    agent's ``detectTestRunners`` does the authoritative resolution at run
+    time and reports ``detected=false`` if nothing is actually runnable.  A
+    near-empty / greenfield repo with no manifests (or empty commands) returns
+    False here, so it keeps today's immediate-pass behavior.
     """
     if project is None:
         return False
     build_config = getattr(project, "build_config", None) or {}
     directories = build_config.get("directories") or []
     for d in directories:
-        if isinstance(d, dict) and str(d.get("test_cmd") or "").strip():
+        if isinstance(d, dict) and _effective_test_cmd(d):
             return True
     return False
 
@@ -172,7 +188,7 @@ def compute_merge_verification_verdict(project) -> dict[str, Any]:
         for d in directories:
             if not isinstance(d, dict):
                 continue
-            test_cmd = str(d.get("test_cmd") or "").strip()
+            test_cmd = _effective_test_cmd(d)
             if not test_cmd:
                 continue
             test_commands.append(

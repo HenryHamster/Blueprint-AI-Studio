@@ -2302,6 +2302,40 @@ export async function fetchComputeJobs(
   return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
 }
 
+export interface BuildConfigCommandEntry {
+  path: string | null;
+  type: string | null;
+  detected_test_cmd: string | null;
+  detected_build_cmd: string | null;
+  detected_install_cmd: string | null;
+  confirmed_test_cmd: string | null;
+  confirmed_build_cmd: string | null;
+  confirmed_install_cmd: string | null;
+  commands_confirmed_at: string | null;
+  confirming_task_id: string | null;
+  commands_stale: boolean;
+}
+
+export interface BuildConfigCommandsResponse {
+  project_id: string;
+  directories: BuildConfigCommandEntry[];
+}
+
+export async function fetchBuildConfigCommands(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<BuildConfigCommandsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/build-config/commands`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch build config commands: ${res.status}`);
+  return res.json() as Promise<BuildConfigCommandsResponse>;
+}
+
 export async function killComputeJob(jobId: string): Promise<ComputeJob> {
   const res = await apiFetch(
     `/api/admin/compute-jobs/${encodeURIComponent(jobId)}/kill`,

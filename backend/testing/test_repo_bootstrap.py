@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.auth import create_agent_token
 from app.main import app
 from app.models import Project, ProjectStatus, Task, TaskStatus
 from app.auth import get_current_user, require_admin
@@ -353,7 +354,8 @@ class TestRepoBootstrapCompletionStamp:
 
     @pytest.mark.asyncio
     async def test_bootstrap_completion_stamps_completed_at(self, db_session):
-        """Completing a repo_bootstrap task stamps bootstrap_completed_at in build_config."""
+        """Completing a repo_bootstrap task with a valid overview stamps bootstrap_completed_at."""
+        import json as _json
         from app.task_completion import _handle_repo_bootstrap_completion
 
         project = Project(
@@ -382,11 +384,16 @@ class TestRepoBootstrapCompletionStamp:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        overview_logs = _json.dumps({
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "backend/ — FastAPI app; admin-ui/ — React UI",
+            "first_steps_summary": "pip install -r requirements.txt && pytest",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
 
         await db_session.refresh(project)
         assert (project.build_config or {}).get("bootstrap_completed_at") is not None, (
-            "bootstrap_completed_at must be set after _handle_repo_bootstrap_completion"
+            "bootstrap_completed_at must be set after _handle_repo_bootstrap_completion with a valid overview"
         )
 
     @pytest.mark.asyncio
@@ -430,3 +437,268 @@ class TestRepoBootstrapCompletionStamp:
         assert (project.build_config or {}).get("bootstrap_completed_at") == "2026-01-01T00:00:00", (
             "Existing bootstrap_completed_at must not be overwritten"
         )
+
+
+class TestRepoBootstrapDesignDocPersistence:
+    """Tests for design_doc persistence via the completion handler."""
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_with_overview_persists_design_doc_section(self, db_session):
+        """Completing a bootstrap with a valid overview persists it to design_doc['repo_overview']
+        and makes it visible in the strategic design-doc index (_design_doc_index /
+        _agent_view_design_doc) — the same surface the first strategic cycle consumes.
+        bootstrap_completed_at is stamped clean and no degraded_reason is set."""
+        import json as _json
+        from app.task_completion import _handle_repo_bootstrap_completion
+        from app.strategic_spawning import _design_doc_index, _agent_view_design_doc
+
+        project = Project(
+            name="acme/with-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="with-overview",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/with-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        overview_logs = _json.dumps({
+            "tech_stack": "Python 3.12, FastAPI, SQLAlchemy",
+            "directory_layout": "backend/ — API; admin-ui/ — React frontend",
+            "first_steps_summary": "cd backend && pip install -r requirements.txt && pytest",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+
+        await db_session.refresh(project)
+
+        # 1. Section present in design_doc under the non-'_'-prefixed key.
+        assert "repo_overview" in (project.design_doc or {}), (
+            "design_doc['repo_overview'] must be present after completion with overview"
+        )
+        stored = (project.design_doc or {})["repo_overview"]
+        assert stored["tech_stack"] == "Python 3.12, FastAPI, SQLAlchemy"
+        assert stored["directory_layout"] == "backend/ — API; admin-ui/ — React frontend"
+        assert stored["first_steps_summary"] == "cd backend && pip install -r requirements.txt && pytest"
+
+        # 2. Section visible in _agent_view_design_doc (agent-facing view, drops '_'-keys).
+        agent_view = _agent_view_design_doc(project.design_doc)
+        assert "repo_overview" in agent_view, (
+            "repo_overview must appear in _agent_view_design_doc (the agent-facing design doc view)"
+        )
+        # Internal keys should be stripped from the agent view
+        assert "_meta" not in agent_view
+
+        # 3. Section visible in _design_doc_index (strategic index consumed by first cycle).
+        index = _design_doc_index(agent_view)
+        section_keys = [e["key"] for e in index.get("sections", [])]
+        assert "repo_overview" in section_keys, (
+            "repo_overview must appear in _design_doc_index — the strategic cycle's navigation surface"
+        )
+
+        # 4. Clean success: bootstrap_completed_at stamped, no degraded_reason.
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_completed_at") is not None, (
+            "bootstrap_completed_at must be set on clean success"
+        )
+        assert "bootstrap_degraded_reason" not in bc, (
+            "bootstrap_degraded_reason must not be set on clean success"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_without_overview_records_degraded_marker(self, db_session):
+        """Completing a bootstrap with no parseable overview records bootstrap_degraded_reason
+        in build_config (explicit degraded marker, not silent clean success) and does NOT
+        create a spurious design_doc section."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = Project(
+            name="acme/no-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="no-overview",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/no-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        # Empty logs: no parseable overview in the completion payload.
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+
+        await db_session.refresh(project)
+
+        # 1. Degraded marker recorded — not silent clean success.
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_degraded_reason") == "overview_missing", (
+            "bootstrap_degraded_reason must be 'overview_missing' when no overview was produced"
+        )
+
+        # 2. No clean bootstrap_completed_at on the degraded path.
+        assert bc.get("bootstrap_completed_at") is None, (
+            "bootstrap_completed_at must NOT be set on the degraded (no-overview) path"
+        )
+
+        # 3. No spurious design_doc section created.
+        assert "repo_overview" not in (project.design_doc or {}), (
+            "design_doc must not contain 'repo_overview' when no overview was produced"
+        )
+
+
+class TestRepoBootstrapCompletionSeam:
+    @pytest.mark.asyncio
+    async def test_completed_bootstrap_with_overview_posts_payload_and_persists_section(
+        self, client: AsyncClient, db_session
+    ):
+        import json as _json
+
+        project = Project(
+            name="acme/status-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="status-overview",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/status-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(task)
+
+        token = create_agent_token(
+            str(task.id),
+            task.vm_instance_id or "",
+            task_type="repo_bootstrap",
+            project_id=str(project.id),
+        )
+        payload = {
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "repo_overview": {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "backend/ API; agent/ worker",
+                "first_steps_summary": "pip install -r requirements.txt && pytest",
+            },
+            "logs": _json.dumps({"note": "bootstrap finished"}),
+        }
+        resp = await client.post(
+            "/api/agent/status",
+            json=payload,
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        assert (project.design_doc or {}).get("repo_overview") == {
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "backend/ API; agent/ worker",
+            "first_steps_summary": "pip install -r requirements.txt && pytest",
+        }
+
+        from app.strategic_spawning import _agent_view_design_doc, _design_doc_index
+
+        agent_view = _agent_view_design_doc(project.design_doc)
+        assert "repo_overview" in agent_view
+        section_keys = [e["key"] for e in _design_doc_index(agent_view).get("sections", [])]
+        assert "repo_overview" in section_keys
+
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_completed_at") is not None
+        assert "bootstrap_degraded_reason" not in bc
+
+    @pytest.mark.asyncio
+    async def test_completed_bootstrap_without_overview_records_degraded_marker(
+        self, client: AsyncClient, db_session
+    ):
+        project = Project(
+            name="acme/status-degraded",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="status-degraded",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/status-degraded",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(task)
+
+        token = create_agent_token(
+            str(task.id),
+            task.vm_instance_id or "",
+            task_type="repo_bootstrap",
+            project_id=str(project.id),
+        )
+        payload = {
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "bootstrap finished without structured overview",
+        }
+        resp = await client.post(
+            "/api/agent/status",
+            json=payload,
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_degraded_reason") == "overview_missing"
+        assert bc.get("bootstrap_completed_at") is None
+        assert "repo_overview" not in (project.design_doc or {})

@@ -60,6 +60,7 @@ export {
 } from './prompts/code-change-helpers.js';
 import { excludeAgentHelpers, isBlueprintSelfRepo } from './prompts/code-change-helpers.js';
 import { isPytestCmd } from './prompts/check-helper.js';
+import { effectiveTestCmd, effectiveBuildCmd } from './utils/test-runners.js';
 export { excludeAgentHelpers };
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
@@ -206,8 +207,10 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   // 'create'/'refactor' hints: reference actual build/test commands
   const testCmds: string[] = [];
   for (const dir of dirs) {
-    if (dir.test_cmd) testCmds.push(`${dir.path}: \`${dir.test_cmd}\``);
-    else if (dir.build_cmd) testCmds.push(`${dir.path}: \`${dir.build_cmd}\``);
+    const testCmd = effectiveTestCmd(dir);
+    const buildCmd = effectiveBuildCmd(dir);
+    if (testCmd) testCmds.push(`${dir.path}: \`${testCmd}\``);
+    else if (buildCmd) testCmds.push(`${dir.path}: \`${buildCmd}\``);
   }
   if (testCmds.length > 0) {
     const cmdsText = testCmds.join(', ');
@@ -1269,20 +1272,22 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
   const dirs = buildConfig.directories ?? [];
   const dirParts = dirs.map(d => {
     const path = d.path.replace(/\/$/, '');
-    const cmds = [d.lint_cmd, d.build_cmd].filter((c): c is string => !!c);
+    const cmds = [d.lint_cmd, effectiveBuildCmd(d)].filter((c): c is string => !!c);
     return cmds.length
       ? `\`${path}/\` (${cmds.map(c => `\`${c}\``).join(', ')})`
       : `\`${path}/\``;
   });
   const dirList = dirParts.length ? dirParts.join(', ') : 'the configured project directories';
   const testParts = dirs
-    .filter(d => d.test_cmd)
-    .map(d => `\`${d.path.replace(/\/$/, '')}/\` (\`${d.test_cmd}\`)`);
+    .map(d => ({ path: d.path, cmd: effectiveTestCmd(d) }))
+    .filter((x): x is { path: string; cmd: string } => !!x.cmd)
+    .map(x => `\`${x.path.replace(/\/$/, '')}/\` (\`${x.cmd}\`)`);
   const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
   // Mirrors buildPytestGateInner in prompts/check-helper.ts: a pytest-style
   // test command gets the honest gate (sanctioned-harness preference +
   // GATE-ENVIRONMENT fallback), so tell the agent what that note means.
-  const hasPytestGate = dirs.some(d => !!d.test_cmd && isPytestCmd(d.test_cmd));
+  const effectiveTestCmds = dirs.map(d => effectiveTestCmd(d)).filter((c): c is string => !!c);
+  const hasPytestGate = effectiveTestCmds.some(c => isPytestCmd(c));
   const pytestGateNote = hasPytestGate
     ? `  A pytest-style test command runs honestly: \`./check test\` prefers the
   project's Docker test harness (\`scripts/test-<dir>.sh\`) when Docker can

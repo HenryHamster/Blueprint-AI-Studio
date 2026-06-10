@@ -12,6 +12,20 @@ from app.models import Project, Task, TaskStatus
 
 
 # ---------------------------------------------------------------------------
+# Helper: simple project stub for ci_resolution unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_project(build_config):
+    class _Stub:
+        pass
+
+    p = _Stub()
+    p.build_config = build_config
+    return p
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: staleness helper
 # ---------------------------------------------------------------------------
 
@@ -225,7 +239,8 @@ async def test_write_back_sets_timestamp_and_task_id(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_write_back_unknown_path_returns_404(client: AsyncClient, db_session):
+async def test_write_back_unknown_path_creates_new_entry(client: AsyncClient, db_session):
+    """An unknown directory path with a non-empty confirmed command creates a new entry."""
     project = Project(
         name="Unknown Path Test",
         user_id="test-user-123",
@@ -256,7 +271,20 @@ async def test_write_back_unknown_path_returns_404(client: AsyncClient, db_sessi
         },
         headers={"x-agent-token": token},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "nonexistent/dir" in data["updated_paths"]
+
+    await db_session.refresh(project)
+    dirs = project.build_config["directories"]
+    # Original entry preserved, new entry appended
+    assert len(dirs) == 2
+    new_entry = next(d for d in dirs if d.get("path") == "nonexistent/dir")
+    assert new_entry["confirmed_test_cmd"] == "pytest"
+    assert new_entry["confirming_task_id"] == str(task.id)
+    assert new_entry["commands_confirmed_at"] == data["commands_confirmed_at"]
+    # Detected test_cmd must NOT be set on a freshly-created entry
+    assert "test_cmd" not in new_entry
 
 
 @pytest.mark.asyncio
@@ -434,3 +462,210 @@ async def test_admin_get_build_config_commands_not_found(
         f"/api/admin/projects/{uuid.uuid4()}/build-config/commands"
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: ci_resolution confirmed-command precedence
+# ---------------------------------------------------------------------------
+
+
+def test_has_detectable_tests_fresh_confirmed_no_detected():
+    """A fresh confirmed_test_cmd with no test_cmd still counts as detectable."""
+    from app.ci_resolution import has_detectable_tests
+
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+    project = _make_project(
+        {
+            "directories": [
+                {
+                    "path": ".",
+                    "confirmed_test_cmd": "pytest -x",
+                    "commands_confirmed_at": recent,
+                }
+            ]
+        }
+    )
+    assert has_detectable_tests(project) is True
+
+
+def test_has_detectable_tests_stale_confirmed_no_detected():
+    """A stale confirmed_test_cmd with no test_cmd is NOT detectable."""
+    from app.ci_resolution import has_detectable_tests
+
+    old = (datetime.now(tz=timezone.utc) - timedelta(days=35)).isoformat()
+    project = _make_project(
+        {
+            "directories": [
+                {
+                    "path": ".",
+                    "confirmed_test_cmd": "pytest -x",
+                    "commands_confirmed_at": old,
+                }
+            ]
+        }
+    )
+    assert has_detectable_tests(project) is False
+
+
+def test_has_detectable_tests_stale_confirmed_with_detected():
+    """A stale confirmed command but a present test_cmd still returns True (falls back to detected)."""
+    from app.ci_resolution import has_detectable_tests
+
+    old = (datetime.now(tz=timezone.utc) - timedelta(days=35)).isoformat()
+    project = _make_project(
+        {
+            "directories": [
+                {
+                    "path": ".",
+                    "test_cmd": "pytest",
+                    "confirmed_test_cmd": "pytest --different",
+                    "commands_confirmed_at": old,
+                }
+            ]
+        }
+    )
+    assert has_detectable_tests(project) is True
+
+
+def test_compute_merge_verdict_fresh_confirmed_cmd():
+    """A fresh confirmed_test_cmd with no test_cmd → tests_gated with confirmed cmd."""
+    from app.ci_resolution import compute_merge_verification_verdict
+
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {
+                    "path": ".",
+                    "confirmed_test_cmd": "pytest -x",
+                    "commands_confirmed_at": recent,
+                }
+            ],
+        }
+    )
+    result = compute_merge_verification_verdict(project)
+    assert result["state"] == "tests_gated"
+    assert len(result["test_commands"]) == 1
+    assert result["test_commands"][0]["test_cmd"] == "pytest -x"
+
+
+def test_compute_merge_verdict_fresh_confirmed_overrides_detected():
+    """A fresh confirmed_test_cmd takes precedence over a different detected test_cmd."""
+    from app.ci_resolution import compute_merge_verification_verdict
+
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {
+                    "path": ".",
+                    "test_cmd": "pytest-old",
+                    "confirmed_test_cmd": "pytest -x --tb=short",
+                    "commands_confirmed_at": recent,
+                }
+            ],
+        }
+    )
+    result = compute_merge_verification_verdict(project)
+    assert result["state"] == "tests_gated"
+    assert result["test_commands"][0]["test_cmd"] == "pytest -x --tb=short"
+
+
+def test_compute_merge_verdict_stale_confirmed_uses_detected():
+    """A stale confirmed_test_cmd falls back to the detected test_cmd."""
+    from app.ci_resolution import compute_merge_verification_verdict
+
+    old = (datetime.now(tz=timezone.utc) - timedelta(days=35)).isoformat()
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {
+                    "path": ".",
+                    "test_cmd": "pytest",
+                    "confirmed_test_cmd": "pytest --stale",
+                    "commands_confirmed_at": old,
+                }
+            ],
+        }
+    )
+    result = compute_merge_verification_verdict(project)
+    assert result["state"] == "tests_gated"
+    assert result["test_commands"][0]["test_cmd"] == "pytest"
+
+
+def test_empty_detection_confirmed_command_flips_verdict_to_tests_gated():
+    """Headline gate-flip: project with NO detected directories but a fresh confirmed
+    command gets verdict=tests_gated, and has_detectable_tests returns True."""
+    from app.ci_resolution import compute_merge_verification_verdict, has_detectable_tests
+
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=2)).isoformat()
+    # Simulate a project whose initial detection found no directories at all
+    # but a repo_bootstrap agent later confirmed a working test command via
+    # the write-back endpoint (which now creates a new entry).
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {
+                    "path": ".",
+                    "confirmed_test_cmd": "pytest tests/",
+                    "commands_confirmed_at": recent,
+                    "confirming_task_id": "bootstrap-task-abc",
+                }
+            ],
+        }
+    )
+    assert has_detectable_tests(project) is True
+    result = compute_merge_verification_verdict(project)
+    assert result["state"] == "tests_gated"
+    assert result["test_commands"][0]["test_cmd"] == "pytest tests/"
+    assert result["test_commands"][0]["path"] == "."
+
+
+@pytest.mark.asyncio
+async def test_write_back_empty_confirmed_cmd_unknown_path_skipped(
+    client: AsyncClient, db_session
+):
+    """An unknown path with ALL empty confirmed commands is silently skipped (no new entry)."""
+    project = Project(
+        name="Empty Confirmed Cmd Test",
+        user_id="test-user-123",
+        build_config={
+            "directories": [{"path": ".", "type": "python", "test_cmd": "pytest"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-empty-1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-empty-1")
+    resp = await client.patch(
+        f"/api/agent/projects/{project.id}/build-config/commands",
+        json={
+            "task_id": str(task.id),
+            "entries": [{"path": "new/dir", "confirmed_test_cmd": None}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # No path was updated since confirmed cmd was empty
+    assert "new/dir" not in data["updated_paths"]
+
+    await db_session.refresh(project)
+    dirs = project.build_config["directories"]
+    # No new directory was created
+    assert len(dirs) == 1

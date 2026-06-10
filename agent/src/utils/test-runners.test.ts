@@ -19,8 +19,9 @@ import {
   MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
   buildAcceptanceTestRunner, classifyAcceptanceTestRun,
+  effectiveTestCmd, effectiveBuildCmd, effectiveInstallCmd,
 } from './test-runners.js';
-import type { BuildConfig, TestRunner } from './test-runners.js';
+import type { BuildConfig, TestRunner, DirectoryConfig } from './test-runners.js';
 
 // We test detectTestRunners in isolation.  fs.existsSync and fs.readFileSync
 // are mocked per-test so the real filesystem is never consulted.
@@ -175,6 +176,154 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
 vi.mock('child_process', () => ({
   execSync: vi.fn(() => ''),
 }));
+
+// ── effectiveTestCmd / effectiveBuildCmd / effectiveInstallCmd helpers ──────
+
+describe('effectiveTestCmd', () => {
+  it('returns confirmed_test_cmd when non-empty and commands_stale is false', () => {
+    const dir: DirectoryConfig = { path: 'backend', type: 'python', test_cmd: 'pytest', confirmed_test_cmd: 'python3 -m pytest -x', commands_stale: false };
+    expect(effectiveTestCmd(dir)).toBe('python3 -m pytest -x');
+  });
+
+  it('returns confirmed_test_cmd when commands_stale is undefined', () => {
+    const dir: DirectoryConfig = { path: 'backend', type: 'python', test_cmd: 'pytest', confirmed_test_cmd: 'python3 -m pytest -x' };
+    expect(effectiveTestCmd(dir)).toBe('python3 -m pytest -x');
+  });
+
+  it('falls back to test_cmd when commands_stale is true', () => {
+    const dir: DirectoryConfig = { path: 'backend', type: 'python', test_cmd: 'pytest', confirmed_test_cmd: 'python3 -m pytest -x', commands_stale: true };
+    expect(effectiveTestCmd(dir)).toBe('pytest');
+  });
+
+  it('falls back to test_cmd when confirmed_test_cmd is empty string', () => {
+    const dir: DirectoryConfig = { path: 'backend', type: 'python', test_cmd: 'pytest', confirmed_test_cmd: '' };
+    expect(effectiveTestCmd(dir)).toBe('pytest');
+  });
+
+  it('returns undefined when neither confirmed nor detected command exists', () => {
+    const dir: DirectoryConfig = { path: 'backend', type: 'python' };
+    expect(effectiveTestCmd(dir)).toBeUndefined();
+  });
+});
+
+describe('effectiveBuildCmd', () => {
+  it('returns confirmed_build_cmd when non-empty and not stale', () => {
+    const dir: DirectoryConfig = { path: 'app', type: 'node', build_cmd: 'npm run build', confirmed_build_cmd: 'npm run build:prod', commands_stale: false };
+    expect(effectiveBuildCmd(dir)).toBe('npm run build:prod');
+  });
+
+  it('falls back to build_cmd when commands_stale is true', () => {
+    const dir: DirectoryConfig = { path: 'app', type: 'node', build_cmd: 'npm run build', confirmed_build_cmd: 'npm run build:prod', commands_stale: true };
+    expect(effectiveBuildCmd(dir)).toBe('npm run build');
+  });
+
+  it('falls back to build_cmd when confirmed_build_cmd is empty string', () => {
+    const dir: DirectoryConfig = { path: 'app', type: 'node', build_cmd: 'npm run build', confirmed_build_cmd: '' };
+    expect(effectiveBuildCmd(dir)).toBe('npm run build');
+  });
+});
+
+describe('effectiveInstallCmd', () => {
+  it('returns confirmed_install_cmd when non-empty and not stale', () => {
+    const dir: DirectoryConfig = { path: 'app', type: 'node', install_cmd: 'npm install', confirmed_install_cmd: 'npm ci', commands_stale: false };
+    expect(effectiveInstallCmd(dir)).toBe('npm ci');
+  });
+
+  it('falls back to install_cmd when commands_stale is true', () => {
+    const dir: DirectoryConfig = { path: 'app', type: 'node', install_cmd: 'npm install', confirmed_install_cmd: 'npm ci', commands_stale: true };
+    expect(effectiveInstallCmd(dir)).toBe('npm install');
+  });
+});
+
+describe('detectTestRunners — confirmed command precedence', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('uses confirmed_test_cmd when fresh (commands_stale=false)', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'backend',
+        type: 'python',
+        test_cmd: 'pytest',
+        confirmed_test_cmd: 'python3 -m pytest -x -q',
+        commands_stale: false,
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+  });
+
+  it('falls back to test_cmd when commands_stale=true', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'backend',
+        type: 'python',
+        test_cmd: 'pytest',
+        confirmed_test_cmd: 'python3 -m pytest -x -q',
+        commands_stale: true,
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('pytest');
+  });
+
+  it('uses confirmed_install_cmd when fresh', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'backend',
+        type: 'python',
+        test_cmd: 'pytest',
+        install_cmd: 'pip install -r requirements.txt',
+        confirmed_test_cmd: 'pytest',
+        confirmed_install_cmd: 'pip install -r requirements-confirmed.txt',
+        commands_stale: false,
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].installCmd).toBe('pip install -r requirements-confirmed.txt');
+  });
+
+  it('falls back to install_cmd when commands_stale=true', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'backend',
+        type: 'python',
+        test_cmd: 'pytest',
+        install_cmd: 'pip install -r requirements.txt',
+        confirmed_install_cmd: 'pip install -r requirements-confirmed.txt',
+        commands_stale: true,
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].installCmd).toBe('pip install -r requirements.txt');
+  });
+
+  it('backward compat: directory with no confirmed fields behaves exactly as before', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'backend',
+        type: 'python',
+        test_cmd: 'pytest -x',
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('pytest');
+    expect(runners[0].args).toEqual(['-x']);
+  });
+});
 
 describe('detectTestRunners — bare pytest guard (C19)', () => {
   beforeEach(() => {

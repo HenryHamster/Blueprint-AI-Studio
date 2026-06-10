@@ -3515,8 +3515,10 @@ async def claim_task(
         response["build_config"] = {}
 
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
-    # for the agent to read README/manifests, seed design doc sections, and
-    # write back confirmed build/test commands.
+    # for the agent to read README/manifests, produce a repo overview payload,
+    # and write back confirmed build/test commands.
+    # The overview is returned as repo_overview in the terminal completion payload
+    # and persisted server-side by the completion handler into design_doc["repo_overview"].
     if task_type == "repo_bootstrap":
         _bootstrap_payload = _claimed_first_payload or {}
         response["bootstrap_guidance"] = {
@@ -3527,20 +3529,22 @@ async def claim_task(
                 "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
                 ".github/workflows/*.yml",
             ],
-            "design_doc_section": "_repo_overview",
+            "design_doc_section": "repo_overview",
             "design_doc_section_fields": [
                 "tech_stack",
                 "directory_layout",
                 "first_steps_summary",
             ],
+            "completion_payload_field": "repo_overview",
             "build_config_writeback_endpoint": (
                 f"PATCH /api/agent/projects/{_claimed_project_id}/build-config/commands"
             ),
             "completion_steps": [
                 "Read listed files to understand project structure",
-                "Write design doc section '_repo_overview' with tech_stack, directory_layout, first_steps_summary",
+                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary",
                 "Confirm working build/test commands by running them",
                 "Write confirmed commands back via the build_config_writeback_endpoint",
+                "Post COMPLETED with repo_overview in the completion payload",
             ],
             "github_owner": _bootstrap_payload.get("github_owner", ""),
             "github_repo": _bootstrap_payload.get("github_repo", ""),
@@ -4653,12 +4657,34 @@ async def agent_write_back_build_config_commands(
     for entry in payload.entries:
         norm = _normalize_dir_path(entry.path)
         if norm not in index_by_path:
-            # Unknown path — skip rather than create synthetic entries from
-            # unverified agent input.
-            raise HTTPException(
-                status_code=404,
-                detail=f"Directory path not found in build config: {entry.path!r}",
+            # Unknown path — create a new directory entry when the agent has
+            # confirmed a non-empty command.  This is the empty-detection case
+            # where bootstrap discovers a real test command but detection found
+            # no directories. Only confirmed_* fields are written; detected
+            # test_cmd/build_cmd/install_cmd stay absent on the new entry.
+            has_confirmed = any(
+                v is not None and str(v).strip()
+                for v in (
+                    entry.confirmed_test_cmd,
+                    entry.confirmed_build_cmd,
+                    entry.confirmed_install_cmd,
+                )
             )
+            if not has_confirmed:
+                continue
+            new_entry: dict = {"path": norm}
+            if entry.confirmed_test_cmd is not None:
+                new_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
+            if entry.confirmed_build_cmd is not None:
+                new_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
+            if entry.confirmed_install_cmd is not None:
+                new_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+            new_entry["commands_confirmed_at"] = now_iso
+            new_entry["confirming_task_id"] = task_id_str
+            index_by_path[norm] = len(directories)
+            directories.append(new_entry)
+            updated_paths.append(norm)
+            continue
         idx = index_by_path[norm]
         dir_entry = directories[idx]
         if entry.confirmed_test_cmd is not None:

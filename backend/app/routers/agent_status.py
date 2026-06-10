@@ -1114,6 +1114,14 @@ async def update_agent_status(
         ctx["reproduce_verdict"] = payload.reproduce_verdict.model_dump()
         task.context = ctx
         flag_modified(task, "context")
+    if (task.first_payload or {}).get("type") == "repo_bootstrap":
+        ctx = dict(task.context or {})
+        if payload.repo_overview is not None:
+            ctx["repo_overview"] = payload.repo_overview.model_dump()
+        else:
+            ctx.pop("repo_overview", None)
+        task.context = ctx
+        flag_modified(task, "context")
     if payload.file_change_details:
         ctx = dict(task.context or {})
         ctx["_file_change_details"] = payload.file_change_details[:50]
