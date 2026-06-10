@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     annotate_capability_proof_status,
+    carry_proof_records_for_consolidation,
     enrich_problem_model_capability_proofs,
     record_capability_proof,
     should_record_capability_proof,
@@ -395,3 +396,114 @@ class TestCapabilityProofViews:
         assert enriched["capabilities"][0]["proof_records"][0]["proof_ref"] == "art-123"
         assert enriched["capabilities"][1]["proof_status"] == "unproven"
         assert "proof_records" not in enriched["capabilities"][1]
+
+
+# ── carry_proof_records_for_consolidation ─────────────────────────────────────
+
+
+def _make_proof_entry(task_id: str, proof_ref: str = "test_foo.py") -> dict:
+    return {
+        "task_id": task_id,
+        "proved_at": "2026-06-01T00:00:00",
+        "proof_kind": "named_test",
+        "proof_ref": proof_ref,
+        "commit_sha": "abc",
+    }
+
+
+class TestCarryProofRecordsForConsolidation:
+    def test_consolidation_carries_proof_records_to_survivor(self):
+        """Absorbed entries are merged onto the survivor and their keys removed."""
+        proof_records = {
+            "survivor-cap": [_make_proof_entry("task-s1")],
+            "old-cap-a": [_make_proof_entry("task-a1"), _make_proof_entry("task-a2")],
+            "old-cap-b": [_make_proof_entry("task-b1")],
+        }
+        consolidated = [
+            {"survivor": "survivor-cap", "absorbed": ["old-cap-a", "old-cap-b"]}
+        ]
+
+        result = carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        # Absorbed keys removed.
+        assert "old-cap-a" not in result
+        assert "old-cap-b" not in result
+        # Survivor now holds merged entries.
+        assert "survivor-cap" in result
+        task_ids = {e["task_id"] for e in result["survivor-cap"]}
+        assert task_ids == {"task-s1", "task-a1", "task-a2", "task-b1"}
+
+    def test_consolidation_deduplicates_by_task_id(self):
+        """A task_id that proved both absorbed and survivor appears only once."""
+        shared_id = "task-shared"
+        proof_records = {
+            "survivor-cap": [_make_proof_entry(shared_id, "survivor_test.py")],
+            "old-cap": [_make_proof_entry(shared_id, "absorbed_test.py")],
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        entries = result["survivor-cap"]
+        assert len(entries) == 1
+        # The survivor's existing entry is kept (not replaced by absorbed duplicate).
+        assert entries[0]["proof_ref"] == "survivor_test.py"
+
+    def test_consolidation_cap_at_max_entries(self):
+        """Merged list is bounded at _MAX_PROOF_ENTRIES_PER_CAPABILITY."""
+        survivor_entries = [_make_proof_entry(f"s-{i}") for i in range(7)]
+        absorbed_entries = [_make_proof_entry(f"a-{i}") for i in range(6)]
+        proof_records = {
+            "survivor-cap": survivor_entries,
+            "old-cap": absorbed_entries,
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        assert len(result["survivor-cap"]) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+
+    def test_no_consolidation_leaves_records_unchanged(self):
+        """An empty consolidation list must not touch the proof records."""
+        proof_records = {
+            "cap-a": [_make_proof_entry("task-1")],
+            "cap-b": [_make_proof_entry("task-2")],
+        }
+        result = carry_proof_records_for_consolidation([], proof_records)
+        assert result is proof_records  # same object — no copy needed
+
+    def test_annotate_reports_survivor_proven_after_carry_through(self):
+        """After carry-through, annotate_capability_proof_status sees survivor proven."""
+        proof_records = {
+            "old-cap": [_make_proof_entry("task-proof-1")],
+        }
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap"]}]
+        merged = carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        vocab = [{"name": "new-cap", "status": "working"}]
+        annotated = annotate_capability_proof_status(vocab, merged)
+        assert annotated[0]["proof_status"] == "proven"
+
+    def test_survivor_without_prior_entries_gets_absorbed_entries(self):
+        """Survivor key is created when it had no prior proof records."""
+        proof_records = {
+            "old-cap": [_make_proof_entry("task-x")],
+        }
+        consolidated = [{"survivor": "new-survivor", "absorbed": ["old-cap"]}]
+
+        result = carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        assert "old-cap" not in result
+        assert result["new-survivor"][0]["task_id"] == "task-x"
+
+    def test_input_dict_not_mutated(self):
+        """The function returns a new dict; the original is unchanged."""
+        proof_records = {
+            "old-cap": [_make_proof_entry("task-1")],
+        }
+        original_keys = set(proof_records.keys())
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap"]}]
+
+        carry_proof_records_for_consolidation(consolidated, proof_records)
+
+        assert set(proof_records.keys()) == original_keys

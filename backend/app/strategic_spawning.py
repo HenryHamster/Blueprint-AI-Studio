@@ -1299,6 +1299,22 @@ _RECON_LIST_CAP = 12
 _RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
+# Name-length threshold for the long-name hygiene signal in prune candidates.
+# Capability/gap names longer than this are flagged as advisory cleanup targets.
+_CAPABILITY_LONG_NAME_THRESHOLD = 80
+# Salient keyword buckets for domain-based grouping of live capability names.
+# When 2+ capabilities share a bucket, they are advisory merge candidates.
+# Keys are human-readable bucket labels; values are lowercase substrings to
+# match against the capability name (first matching bucket wins).
+_CAPABILITY_DOMAIN_KEYWORD_BUCKETS: dict[str, list[str]] = {
+    "strategic": ["strategic"],
+    "task": ["task"],
+    "operator": ["operator"],
+    "research": ["research"],
+    "capability": ["capability"],
+    "compute": ["compute"],
+    "ci": ["pipeline", "release", "deploy"],
+}
 
 # GitHub-ancestry verification (in _build_recent_interventions) runs OUTSIDE any
 # DB transaction and is bounded so it can never approach the 60s
@@ -1785,7 +1801,98 @@ def _build_prune_candidates(
                 }
             )
 
-    if not resolved_gaps and not absent_capabilities and not expired_holds:
+    # 4. Ungroundable capabilities: no backing_paths, no source, no verification.
+    # These are unverifiable claims that have never been grounded — different from
+    # absent_capabilities which requires the grounded check to have run and found
+    # the code missing. Advisory: ground/consolidate or add backing_paths.
+    ungroundable_capabilities: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        backing = cap.get("backing_paths")
+        if backing:  # non-empty list means grounded
+            continue
+        if cap.get("source"):  # claimed provenance present
+            continue
+        if cap.get("verification") is not None:  # already checked
+            continue
+        ungroundable_capabilities.append(
+            {"name": _label(cap.get("name")), "status": cap.get("status")}
+        )
+
+    # 5. Domain merge groups: keyword-bucket grouping of live capability names.
+    # Capabilities in the same bucket are advisory consolidation candidates.
+    _domain_buckets: dict[str, list[str]] = {}
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = str(cap.get("name") or "")
+        if not raw_name:
+            continue
+        lower_name = raw_name.lower()
+        for bucket, keywords in _CAPABILITY_DOMAIN_KEYWORD_BUCKETS.items():
+            if any(kw in lower_name for kw in keywords):
+                _domain_buckets.setdefault(bucket, []).append(_label(raw_name))
+                break  # first matching bucket wins
+    domain_merge_groups: list[dict] = [
+        {"bucket": bucket, "names": names}
+        for bucket, names in _domain_buckets.items()
+        if len(names) >= 2
+    ]
+
+    # 6. Heavy gaps: top-N active gaps by serialized history weight (compaction targets).
+    # Only gaps with non-empty history are included — empty-history gaps need no compaction.
+    _gap_sizes: list[tuple[int, dict]] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        history = g.get("history") or []
+        if not isinstance(history, list) or len(history) == 0:
+            continue
+        approx_bytes = len(json.dumps(history))
+        _gap_sizes.append(
+            (
+                approx_bytes,
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": _label(g.get("name")),
+                    "history_entry_count": len(history),
+                    "approx_bytes": approx_bytes,
+                },
+            )
+        )
+    _gap_sizes.sort(key=lambda x: x[0], reverse=True)
+    heavy_gaps: list[dict] = [item for _, item in _gap_sizes[:_RECON_LIST_CAP]]
+
+    # 7. Long names: capabilities and gaps whose names exceed the threshold.
+    # Oversized names inflate every payload that ships the capability vocabulary.
+    long_names: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = str(cap.get("name") or "")
+        if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
+            long_names.append(
+                {"kind": "capability", "name": _label(raw_name), "length": len(raw_name)}
+            )
+    for g in gaps:
+        if not isinstance(g, dict):
+            continue
+        raw_name = str(g.get("name") or "")
+        if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
+            long_names.append(
+                {"kind": "gap", "name": _label(raw_name), "length": len(raw_name)}
+            )
+
+    if (
+        not resolved_gaps
+        and not absent_capabilities
+        and not expired_holds
+        and not ungroundable_capabilities
+        and not domain_merge_groups
+        and not heavy_gaps
+        and not long_names
+    ):
         return None
 
     def _cap(items: list) -> tuple[list, int]:
@@ -1796,17 +1903,27 @@ def _build_prune_candidates(
     capped_resolved, _ = _cap(resolved_gaps)
     capped_absent, _ = _cap(absent_capabilities)
     capped_holds, _ = _cap(expired_holds)
+    capped_ungroundable, _ = _cap(ungroundable_capabilities)
+    capped_long_names, _ = _cap(long_names)
 
     return {
         "model_size_status": status,
         "resolved_gaps": capped_resolved,
         "absent_capabilities": capped_absent,
         "expired_holds": capped_holds,
+        "ungroundable_capabilities": capped_ungroundable,
+        "domain_merge_groups": domain_merge_groups,
+        "heavy_gaps": heavy_gaps,
+        "long_names": capped_long_names,
         "counts": {
             # True totals (uncapped) so the renderer can say "+N more".
             "resolved_gaps": len(resolved_gaps),
             "absent_capabilities": len(absent_capabilities),
             "expired_holds": len(expired_holds),
+            "ungroundable_capabilities": len(ungroundable_capabilities),
+            "domain_merge_groups": len(domain_merge_groups),
+            "heavy_gaps": len(heavy_gaps),
+            "long_names": len(long_names),
         },
     }
 
@@ -2216,9 +2333,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # no summarize_fn — it should only drop under genuine budget exhaustion.
     "model_health": {"priority": "high"},
     # Concrete cleanup candidates surfaced only when the model is large/oversized.
-    # Medium priority with no summarize_fn: already capped at build time, so the
-    # packer drops it whole under budget rather than trimming. Advisory.
-    "prune_candidates": {"priority": "medium"},
+    # High priority so the block survives the same payload pressure that triggered
+    # the large/oversized status — a medium-priority block would be dropped under
+    # the exact budget conditions where the candidates are most actionable.
+    "prune_candidates": {"priority": "high"},
     # Compact index of all playbook keys — survives budget pressure so the
     # strategist always knows what operational knowledge exists and can fetch
     # entries on demand via `./fetch playbook <key>`. High priority to persist

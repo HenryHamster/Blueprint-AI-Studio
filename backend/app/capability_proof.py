@@ -29,6 +29,7 @@ from app.capability_registry import (
 # capability_registry leaf so every spawn path shares ONE implementation.
 __all__ = [
     "annotate_capability_proof_status",
+    "carry_proof_records_for_consolidation",
     "enrich_problem_model_capability_proofs",
     "record_capability_proof",
     "should_record_capability_proof",
@@ -231,3 +232,67 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
         )
 
     return recorded
+
+
+def carry_proof_records_for_consolidation(
+    capabilities_consolidated: list[dict[str, Any]],
+    proof_records: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge absorbed capability proof entries into the survivor's key.
+
+    For each {survivor, absorbed[...]} consolidation event, all proof entries
+    keyed under absorbed names are merged into the survivor's list, deduped by
+    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted), and
+    the absorbed keys are removed.
+
+    Returns a NEW dict — does not mutate the input.  Callers are responsible for
+    flag_modified on the JSONB column after assigning the result.
+    """
+    if not capabilities_consolidated or not isinstance(proof_records, dict):
+        return proof_records
+
+    result = dict(proof_records)
+    for event in capabilities_consolidated:
+        if not isinstance(event, dict):
+            continue
+        survivor = event.get("survivor")
+        absorbed_names = event.get("absorbed") or []
+        if not survivor or not absorbed_names:
+            continue
+        survivor_norm = normalize_capability_name(survivor)
+        if not survivor_norm:
+            continue
+
+        merged: list[dict[str, Any]] = list(result.get(survivor_norm) or [])
+        seen_task_ids: set[str] = {e.get("task_id", "") for e in merged}
+
+        for abs_name in absorbed_names:
+            abs_norm = normalize_capability_name(abs_name)
+            if not abs_norm:
+                continue
+            for entry in result.get(abs_norm) or []:
+                if not isinstance(entry, dict):
+                    continue
+                tid = entry.get("task_id", "")
+                if tid not in seen_task_ids:
+                    merged.append(entry)
+                    seen_task_ids.add(tid)
+            result.pop(abs_norm, None)
+
+        if len(merged) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+            merged = merged[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+
+        if merged:
+            result[survivor_norm] = merged
+        else:
+            result.pop(survivor_norm, None)
+
+        logger.info(
+            "[CAPABILITY_PROOF] consolidation carry-through: survivor=%s absorbed=%s"
+            " merged_count=%d",
+            survivor_norm,
+            absorbed_names,
+            len(merged),
+        )
+
+    return result

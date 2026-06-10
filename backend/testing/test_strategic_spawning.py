@@ -9225,6 +9225,197 @@ class TestBuildPruneCandidates:
         assert len(out["resolved_gaps"]) == _RECON_LIST_CAP
         assert out["counts"]["resolved_gaps"] == _RECON_LIST_CAP + 4
 
+    def test_surfaces_ungroundable_capabilities(self):
+        """Capabilities with no backing_paths, no source, no verification appear
+        in ungroundable_capabilities; a capability with backing_paths is excluded."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                # No backing_paths, no source, no verification → ungroundable.
+                {"name": "ungrounded-cap", "status": "planned"},
+                # Has backing_paths → NOT ungroundable.
+                {"name": "grounded-cap", "status": "working",
+                 "backing_paths": ["backend/app/foo.py"]},
+                # Has source → NOT ungroundable (even without backing_paths).
+                {"name": "sourced-cap", "status": "working",
+                 "source": "documentation"},
+                # Has verification → NOT ungroundable.
+                {"name": "verified-cap", "status": "working",
+                 "verification": {"effective_status": "working"}},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        names = [c["name"] for c in out["ungroundable_capabilities"]]
+        assert names == ["ungrounded-cap"]
+        assert out["counts"]["ungroundable_capabilities"] == 1
+
+    def test_prune_candidates_names_ungrounded_capabilities(self):
+        """Acceptance gate: ungroundable caps surface and counts are correct."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "no-ground-cap", "status": "working"},
+                {"name": "another-no-ground", "status": "planned"},
+                # excluded
+                {"name": "grounded", "status": "working",
+                 "backing_paths": ["path/to/file.py"]},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        names = [c["name"] for c in out["ungroundable_capabilities"]]
+        assert "no-ground-cap" in names
+        assert "another-no-ground" in names
+        assert "grounded" not in names
+        assert out["counts"]["ungroundable_capabilities"] == 2
+
+    def test_does_not_surface_cap_with_source_as_ungroundable(self):
+        """A capability with a source field is NOT ungroundable even without
+        backing_paths or verification."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "cap-with-source", "status": "working",
+                 "source": "design_doc"},
+            ],
+        }
+        # source is present → not in ungroundable_capabilities → only candidate class
+        # available is none → returns None.
+        assert _build_prune_candidates(
+            pm, [], self._LARGE, "2026-06-04T00:00:00+00:00"
+        ) is None
+
+    def test_domain_merge_groups_keyword_bucketing(self):
+        """Capabilities sharing a keyword bucket form a merge group."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "strategic-planning-cap", "status": "working"},
+                {"name": "strategic-review-cap", "status": "working"},
+                {"name": "strategic-spawning-cap", "status": "working"},
+                # different bucket — no match
+                {"name": "compute-scheduler", "status": "working"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        groups = {g["bucket"]: g["names"] for g in out["domain_merge_groups"]}
+        assert "strategic" in groups
+        assert len(groups["strategic"]) == 3
+        # compute bucket: only one entry → no group
+        assert "compute" not in groups
+
+    def test_domain_merge_groups_no_groups_when_singletons(self):
+        """When each keyword bucket has at most one capability, no merge groups are emitted."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "strategic-review-cap", "status": "working"},
+                {"name": "task-runner", "status": "working"},
+                {"name": "operator-admin", "status": "working"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        # Each bucket has exactly one entry → no domain_merge_groups.
+        # But long_names/ungroundable/heavy may fire — check domain_merge_groups specifically.
+        if out is not None:
+            assert out["domain_merge_groups"] == []
+            assert out["counts"]["domain_merge_groups"] == 0
+
+    def test_heavy_gaps_ranked_by_history_size(self):
+        """Active gaps are ranked largest-first by serialized history weight."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        def _history(n: int) -> list:
+            return [{"event": f"entry-{i}", "ts": f"2026-0{i+1}-01"} for i in range(n)]
+
+        pm = {
+            "gaps": [
+                {"id": "g-small", "name": "small gap", "status": "active",
+                 "history": _history(2)},
+                {"id": "g-large", "name": "large gap", "status": "active",
+                 "history": _history(10)},
+                {"id": "g-medium", "name": "medium gap", "status": "active",
+                 "history": _history(5)},
+                # archived gap — not included in heavy_gaps
+                {"id": "g-arch", "name": "archived gap", "status": "archived",
+                 "history": _history(20)},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        ids = [g["gap_id"] for g in out["heavy_gaps"]]
+        assert ids[0] == "g-large"
+        assert ids[1] == "g-medium"
+        assert ids[2] == "g-small"
+        assert "g-arch" not in ids
+        assert out["counts"]["heavy_gaps"] == 3
+
+    def test_long_names_capabilities_and_gaps(self):
+        """Names exceeding 80 chars appear in long_names; shorter names are excluded."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        long_cap = "a" * 81
+        long_gap = "b" * 90
+        short_cap = "short-cap"
+        short_gap = "short-gap"
+
+        pm = {
+            "capabilities": [
+                {"name": long_cap, "status": "working"},
+                {"name": short_cap, "status": "working"},
+            ],
+            "gaps": [
+                {"id": "g-long", "name": long_gap, "status": "active"},
+                {"id": "g-short", "name": short_gap, "status": "active"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        kinds_and_names = [(e["kind"], e["name"]) for e in out["long_names"]]
+        long_entries = {name for _, name in kinds_and_names}
+        assert long_cap[:120] in long_entries
+        assert long_gap[:120] in long_entries
+        assert short_cap not in long_entries
+        assert short_gap not in long_entries
+        assert out["counts"]["long_names"] == 2
+        for e in out["long_names"]:
+            assert e["length"] > 80
+
+    def test_counts_includes_new_candidate_classes(self):
+        """counts dict carries totals for all 7 candidate classes."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                # ungroundable
+                {"name": "no-ground", "status": "planned"},
+                # absent
+                {"name": "ghost", "status": "working",
+                 "verification": {"effective_status": "absent"}},
+            ],
+            "gaps": [
+                # resolved
+                {"id": "g1", "name": "g1", "status": "active",
+                 "active_moves": ["d-ret"]},
+            ],
+        }
+        directions = [{"id": "d-ret", "status": "retired"}]
+        out = _build_prune_candidates(pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        for key in (
+            "resolved_gaps", "absent_capabilities", "expired_holds",
+            "ungroundable_capabilities", "domain_merge_groups",
+            "heavy_gaps", "long_names",
+        ):
+            assert key in out["counts"], f"counts missing key: {key}"
+
 
 # ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
 #

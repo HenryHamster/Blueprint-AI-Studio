@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
-from app.capability_trial_verdict import record_trial_verdict
+from app.capability_proof import carry_proof_records_for_consolidation
+from app.capability_trial_verdict import (
+    carry_adoption_verdicts_for_consolidation,
+    record_trial_verdict,
+)
 from app.database import get_session
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
@@ -2153,6 +2157,22 @@ async def strategic_operation(
             ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
+        # Carry proof records and adoption verdicts onto survivor keys when a
+        # capability consolidation occurred in this write.
+        _consolidated = pm_diff.get("capabilities_consolidated")
+        if _consolidated:
+            if not isinstance(getattr(project, "capability_proof_records", None), dict):
+                project.capability_proof_records = {}
+            project.capability_proof_records = carry_proof_records_for_consolidation(
+                _consolidated, project.capability_proof_records
+            )
+            flag_modified(project, "capability_proof_records")
+            if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+                project.capability_adoption_verdicts = {}
+            project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
+                _consolidated, project.capability_adoption_verdicts
+            )
+            flag_modified(project, "capability_adoption_verdicts")
         session.add(project)
         # Remember the agent's pre-merge operator-owned proposal so a subsequent
         # same-cycle write reconciles against it (see baseline resolution above).

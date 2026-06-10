@@ -14,6 +14,7 @@ Covers:
 from unittest.mock import MagicMock, patch
 
 from app.capability_trial_verdict import (
+    carry_adoption_verdicts_for_consolidation,
     evaluate_trial_verdict,
     get_effective_holdback_fraction,
     get_trial_definitions,
@@ -903,3 +904,115 @@ class TestArmComposition:
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_data"
+
+
+# ── carry_adoption_verdicts_for_consolidation ─────────────────────────────────
+
+
+class TestCarryAdoptionVerdictsForConsolidation:
+    def _adopt_entry(self) -> dict:
+        return {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 38}
+
+    def _reject_entry(self) -> dict:
+        return {"verdict": "reject", "lift": -0.05, "n_with": 35, "n_without": 33}
+
+    def _continue_entry(self, reason: str = "insufficient_data") -> dict:
+        return {"verdict": "continue-trial", "verdict_reason": reason, "lift": None, "n_with": 5, "n_without": 3}
+
+    def _strategic_entry(self) -> dict:
+        return {"verdict": "adopt", "evidence_source": "strategic_review"}
+
+    def test_absorbed_adopt_verdict_carried_to_unset_survivor(self):
+        """An absorbed adopt verdict is written to the survivor when it has none."""
+        verdicts = {"old-cap": self._adopt_entry()}
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert "old-cap" not in result
+        assert result["new-cap"]["verdict"] == "adopt"
+
+    def test_absorbed_reject_verdict_carried_to_unset_survivor(self):
+        verdicts = {"old-cap": self._reject_entry()}
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert result["new-cap"]["verdict"] == "reject"
+
+    def test_absorbed_continue_trial_does_not_overwrite_decided_survivor(self):
+        """A continue-trial verdict from an absorbed cap must not downgrade a decided survivor."""
+        verdicts = {
+            "survivor-cap": self._adopt_entry(),
+            "old-cap": self._continue_entry(),
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert "old-cap" not in result
+        assert result["survivor-cap"]["verdict"] == "adopt"
+
+    def test_absorbed_adopt_does_not_overwrite_existing_decided_survivor(self):
+        """An absorbed adopt must not clobber a survivor that already has adopt."""
+        survivor_entry = {"verdict": "adopt", "lift": 0.12, "n_with": 60, "n_without": 55}
+        verdicts = {
+            "survivor-cap": survivor_entry,
+            "old-cap": self._adopt_entry(),
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        # Survivor entry unchanged (not replaced by absorbed one).
+        assert result["survivor-cap"]["n_with"] == 60
+
+    def test_absorbed_does_not_overwrite_strategist_declared_survivor(self):
+        """A strategist-declared verdict on the survivor is protected."""
+        verdicts = {
+            "survivor-cap": self._strategic_entry(),
+            "old-cap": self._adopt_entry(),
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert result["survivor-cap"]["evidence_source"] == "strategic_review"
+
+    def test_higher_priority_absorbed_wins_over_lower(self):
+        """When multiple absorbed caps exist, the decided one wins over continue-trial."""
+        verdicts = {
+            "old-cap-a": self._continue_entry(),
+            "old-cap-b": self._adopt_entry(),
+        }
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap-a", "old-cap-b"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert result["new-cap"]["verdict"] == "adopt"
+
+    def test_no_consolidation_leaves_verdicts_unchanged(self):
+        verdicts = {"cap-a": self._adopt_entry()}
+        result = carry_adoption_verdicts_for_consolidation([], verdicts)
+        assert result is verdicts  # same object
+
+    def test_absorbed_keys_removed_even_when_survivor_keeps_own_verdict(self):
+        verdicts = {
+            "survivor-cap": self._adopt_entry(),
+            "old-cap": self._reject_entry(),
+        }
+        consolidated = [{"survivor": "survivor-cap", "absorbed": ["old-cap"]}]
+
+        result = carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert "old-cap" not in result
+        assert "survivor-cap" in result
+
+    def test_input_dict_not_mutated(self):
+        verdicts = {"old-cap": self._adopt_entry()}
+        original_keys = set(verdicts.keys())
+        consolidated = [{"survivor": "new-cap", "absorbed": ["old-cap"]}]
+
+        carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
+
+        assert set(verdicts.keys()) == original_keys

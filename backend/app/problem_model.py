@@ -136,6 +136,25 @@ class Capability(BaseModel):
     absent/unverified, mixed presence as partial. Mirrors the design-doc
     ``systems/<id>.modules`` verification."""
 
+    absorbs: list[str] = Field(default_factory=list)
+    """Old capability names this (surviving or newly-merged) capability absorbed
+    during a strategist consolidation. Optional and default-empty so every
+    stored model and older agent payload validates unchanged.
+
+    Consolidating overlapping capabilities is destructive today: a capability
+    name is an exact-match key for prerequisite resolution
+    (``working_capability_names``), the off-registry advisory known-set
+    (``registry_capability_names``), and durable proof/verdict records. Deleting
+    the old names (via ``_deletions.capabilities``) while declaring them here on
+    the survivor keeps those old names *resolving* — ``working_capability_names``
+    and ``registry_capability_names`` fold an absorbed name into their output so
+    a prerequisite that referenced it stays satisfied — WITHOUT re-rendering the
+    absorbed names into the agent-facing vocabulary
+    (``registry_capability_vocabulary`` reports survivor names only), which is
+    how the consolidation actually shrinks the payload. The write path strips
+    this key when empty so a model with no consolidation serializes
+    byte-identically to before the field existed."""
+
 
 # ---------------------------------------------------------------------------
 # Gaps
@@ -1042,6 +1061,8 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append("intent updated")
     if caps := diff.get("capabilities_changed"):
         parts.append(f"{len(caps)} capability status changes")
+    if consolidated := diff.get("capabilities_consolidated"):
+        parts.append(f"consolidated {len(consolidated)} capability group(s)")
     if evicted := diff.get("archived_gaps_evicted"):
         parts.append(f"GC evicted {len(evicted)} archived gap(s)")
     if trimmed := diff.get("rejected_agent_edits_trimmed"):
@@ -1468,7 +1489,7 @@ def _upsert_by_key(
 # genuine clear of a field the agent actually SAW (no floor, or this field not
 # stripped) still applies — empty is not blindly treated as keep.
 _GAP_FLOOR_FIELDS = ("description", "evidence", "active_moves")
-_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source")
+_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source", "absorbs")
 _FRICTION_FLOOR_FIELDS = (
     "description",
     "seen_in",
@@ -1721,6 +1742,23 @@ def apply_agent_update(
         if removed:
             diff[diff_key] = removed
 
+    # Surface a capability consolidation: a surviving capability whose ``absorbs``
+    # lists names deleted in THIS write (via ``_deletions.capabilities``) merged
+    # those old capabilities into itself. Recorded only when an actual
+    # consolidation occurred (a survivor absorbs at least one just-deleted name),
+    # so the no-consolidation path leaves the diff untouched.
+    deleted_cap_names = set(_as_str_list(deletions, "capabilities"))
+    if deleted_cap_names:
+        consolidated: list[dict[str, Any]] = []
+        for cap in proposed.capabilities:
+            absorbed = [name for name in cap.absorbs if name in deleted_cap_names]
+            if absorbed:
+                consolidated.append(
+                    {"survivor": cap.name, "absorbed": sorted(absorbed)}
+                )
+        if consolidated:
+            diff["capabilities_consolidated"] = consolidated
+
     archive_closed_gaps(proposed)
 
     # Carry the durable rejected-agent-edits ledger forward and append any new
@@ -1749,5 +1787,13 @@ def apply_agent_update(
     # no-baseline path: only surface the ledger key when it carries entries.
     if not result.get(REJECTED_AGENT_EDITS_KEY):
         result.pop(REJECTED_AGENT_EDITS_KEY, None)
+    # ``absorbs`` is a default-empty list, so model_dump() emits ``"absorbs": []``
+    # on EVERY capability — which would change the stored bytes of every existing
+    # model. Strip it from any capability that absorbed nothing so a write with no
+    # consolidation stays byte-identical to before the field existed; only a
+    # genuine consolidation (a survivor with a non-empty ``absorbs``) carries it.
+    for cap in result.get("capabilities") or []:
+        if isinstance(cap, dict) and not cap.get("absorbs"):
+            cap.pop("absorbs", None)
 
     return result, diff

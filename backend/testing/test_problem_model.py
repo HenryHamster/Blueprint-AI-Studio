@@ -3030,3 +3030,229 @@ def test_model_size_signal_byte_dimension_is_part_of_worst_wins():
     # Byte information is always present
     assert "serialized_bytes" in sig_many
     assert sig_many["serialized_bytes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Alias-aware capability consolidation
+# ---------------------------------------------------------------------------
+
+
+def test_capability_absorbs_defaults_empty_and_old_payload_validates():
+    """A capability with no ``absorbs`` parses with an empty list, so every
+    stored model and older agent payload remains valid."""
+    cap = Capability(name="ci-pipeline", status="working")
+    assert cap.absorbs == []
+    # Old-shape payload (no absorbs key) validates unchanged.
+    restored = Capability.model_validate(
+        {"name": "ci-pipeline", "status": "working"}
+    )
+    assert restored.absorbs == []
+
+
+def test_capability_consolidation_resolves_absorbed_prereq():
+    """End-to-end (the exact pair the blocked-resume matcher uses): a
+    consolidation write — ``_deletions.capabilities`` removing several old names
+    plus a working survivor that declares them in ``absorbs`` — makes each old
+    name resolve through ``working_capability_names`` +
+    ``registry_satisfies_capability_need``."""
+    from app.capability_registry import (
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+
+    current = {
+        "revision": 1,
+        "capabilities": [
+            {"name": "ci-poll", "status": "working"},
+            {"name": "ci-resolve", "status": "working"},
+            {"name": "ci-fix-spawn", "status": "working"},
+        ],
+    }
+    # Strategist consolidates the three CI capabilities into one survivor that
+    # absorbs them, deleting the old names in the same write.
+    proposed = {
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve", "ci-fix-spawn"],
+            },
+        ],
+        "_deletions": {"capabilities": ["ci-poll", "ci-resolve", "ci-fix-spawn"]},
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # The durable model now holds only the survivor.
+    names = [c["name"] for c in new_raw["capabilities"]]
+    assert names == ["ci-pipeline"]
+
+    # working_capability_names folds the absorbed aliases in alongside the
+    # survivor's own name.
+    working = working_capability_names(new_raw)
+    assert working == {"ci-pipeline", "ci-poll", "ci-resolve", "ci-fix-spawn"}
+
+    # Each absorbed old name resolves as satisfied-by-the-codebase through the
+    # exact helper pair the blocked-resume matcher uses.
+    for old_name in ("ci-poll", "ci-resolve", "ci-fix-spawn"):
+        assert registry_satisfies_capability_need(
+            {"kind": "capability", "ref": old_name}, working
+        )
+    # The survivor's own name resolves too.
+    assert registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "ci-pipeline"}, working
+    )
+
+
+def test_consolidation_shrinks_vocabulary_but_not_known_set():
+    """The rendered ``registry_capability_vocabulary`` SHRINKS (absorbed names
+    absent) while ``registry_capability_names`` (advisory known-set) still
+    contains them — the two readers deliberately diverge."""
+    from app.capability_registry import (
+        registry_capability_names,
+        registry_capability_vocabulary,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="ci-pipeline",
+                status="working",
+                absorbs=["ci-poll", "ci-resolve"],
+            ),
+            Capability(name="auth", status="working"),
+        ]
+    )
+
+    vocab_names = [entry["name"] for entry in registry_capability_vocabulary(model)]
+    # Vocabulary is survivor-only: absorbed names do NOT re-appear.
+    assert vocab_names == ["ci-pipeline", "auth"]
+    assert "ci-poll" not in vocab_names
+    assert "ci-resolve" not in vocab_names
+
+    # Advisory known-set folds the absorbed aliases back in.
+    known = registry_capability_names(model)
+    assert "ci-poll" in known
+    assert "ci-resolve" in known
+    assert "ci-pipeline" in known
+    assert "auth" in known
+    # The known-set is strictly larger than the vocabulary by exactly the
+    # absorbed aliases.
+    assert set(known) - set(vocab_names) == {"ci-poll", "ci-resolve"}
+
+
+def test_consolidation_recorded_in_revision_log_diff():
+    """A consolidation is recorded as ``capabilities_consolidated`` in the diff
+    and surfaced in the revision-log summary."""
+    current = {
+        "revision": 4,
+        "capabilities": [
+            {"name": "ci-poll", "status": "working"},
+            {"name": "ci-resolve", "status": "working"},
+        ],
+    }
+    proposed = {
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve"],
+            },
+        ],
+        "_deletions": {"capabilities": ["ci-poll", "ci-resolve"]},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    assert diff["capabilities_consolidated"] == [
+        {"survivor": "ci-pipeline", "absorbed": ["ci-poll", "ci-resolve"]}
+    ]
+    # And it is folded into the appended revision-log entry.
+    last_entry = new_raw["revision_log"][-1]
+    assert last_entry["changes"]["capabilities_consolidated"] == [
+        {"survivor": "ci-pipeline", "absorbed": ["ci-poll", "ci-resolve"]}
+    ]
+    assert "consolidated 1 capability group(s)" in last_entry["summary"]
+
+
+def test_no_consolidation_write_is_byte_identical():
+    """A no-consolidation write is BYTE-IDENTICAL to today: the round-trip
+    model_dump emits no ``absorbs`` key when every capability absorbed
+    nothing."""
+    current = {
+        "revision": 2,
+        "capabilities": [
+            {"name": "auth", "status": "working", "notes": "stable"},
+            {"name": "billing", "status": "partial"},
+        ],
+    }
+    # A plain status-bump write that performs no consolidation.
+    proposed = {
+        "capabilities": [
+            {"name": "auth", "status": "working", "notes": "stable"},
+            {"name": "billing", "status": "working"},
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # No capability dict carries an ``absorbs`` key — output is byte-identical
+    # to the pre-field behavior.
+    for cap in new_raw["capabilities"]:
+        assert "absorbs" not in cap
+    assert "capabilities_consolidated" not in diff
+    # The whole serialized blob carries no ``absorbs`` token at all.
+    import json as _json
+
+    assert "absorbs" not in _json.dumps(new_raw)
+
+
+def test_absorbed_name_not_flagged_off_registry():
+    """An absorbed name is NOT flagged by ``off_registry_capability_refs`` when
+    passed the alias-aware known-set."""
+    from app.capability_registry import (
+        off_registry_capability_refs,
+        registry_capability_names,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="ci-pipeline",
+                status="working",
+                absorbs=["ci-poll", "ci-resolve"],
+            ),
+        ]
+    )
+    known = registry_capability_names(model)
+
+    # A prerequisite still naming the absorbed old capability is treated as
+    # known (not off-registry), exactly as before consolidation.
+    flagged = off_registry_capability_refs(
+        ["ci-poll", "Ci Resolve", "never-declared"], known
+    )
+    assert "ci-poll" not in flagged
+    # Normalization still applies on the ref side.
+    assert "Ci Resolve" not in flagged
+    # A genuinely unknown ref is still flagged.
+    assert flagged == ["never-declared"]
+
+
+def test_absorbs_floor_field_not_wiped_by_skeleton_resubmit():
+    """``absorbs`` is in _CAP_FLOOR_FIELDS, so a resubmitted skeleton capability
+    (seen floored) does not silently wipe a durable ``absorbs`` list."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve"],
+            },
+        ],
+    }
+    # Agent saw a skeletonized capabilities section and echoes the floor marker
+    # back; it resubmits only name+status (absorbs blank because it never saw it).
+    proposed = {
+        "capabilities": [{"name": "ci-pipeline", "status": "working"}],
+        "_agent_view_floor_applied": {"summarized_capabilities": 1},
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    assert new_raw["capabilities"][0]["absorbs"] == ["ci-poll", "ci-resolve"]

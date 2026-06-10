@@ -3420,6 +3420,25 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Updated problem_model for project {project.id} "
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                 )
+                # Carry proof records and adoption verdicts onto survivor keys
+                # when a capability consolidation occurred in this write.
+                _consolidated = pm_diff.get("capabilities_consolidated") if pm_diff else None
+                if _consolidated:
+                    from app.capability_proof import carry_proof_records_for_consolidation
+                    from app.capability_trial_verdict import carry_adoption_verdicts_for_consolidation
+
+                    if not isinstance(getattr(project, "capability_proof_records", None), dict):
+                        project.capability_proof_records = {}
+                    project.capability_proof_records = carry_proof_records_for_consolidation(
+                        _consolidated, project.capability_proof_records
+                    )
+                    flag_modified(project, "capability_proof_records")
+                    if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+                        project.capability_adoption_verdicts = {}
+                    project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
+                        _consolidated, project.capability_adoption_verdicts
+                    )
+                    flag_modified(project, "capability_adoption_verdicts")
                 try:
                     from app import release_version as _rv
 

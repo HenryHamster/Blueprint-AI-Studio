@@ -288,6 +288,88 @@ def get_trial_verdicts(project: Any) -> dict[str, Any]:
     return {}
 
 
+def carry_adoption_verdicts_for_consolidation(
+    capabilities_consolidated: list[dict],
+    adoption_verdicts: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge absorbed capability adoption verdicts onto the survivor's key.
+
+    For each {survivor, absorbed[...]} consolidation event, the highest-priority
+    absorbed verdict (adopt/reject > strategist-declared > continue-trial) is
+    written to the survivor key ONLY when the survivor has no existing decided
+    verdict (adopt/reject) and no strategist-declared verdict.  Absorbed keys are
+    removed regardless.
+
+    Returns a NEW dict — does not mutate the input.  Callers are responsible for
+    flag_modified on the JSONB column after assigning the result.
+    """
+    if not capabilities_consolidated or not isinstance(adoption_verdicts, dict):
+        return adoption_verdicts
+
+    # Priority rank: decided (adopt/reject) > strategist-declared > continue-trial
+    def _verdict_priority(entry: dict) -> int:
+        if not isinstance(entry, dict):
+            return -1
+        verdict = entry.get("verdict")
+        if verdict in ("adopt", "reject"):
+            return 2
+        if entry.get("evidence_source") == "strategic_review":
+            return 1
+        return 0
+
+    result = dict(adoption_verdicts)
+    for event in capabilities_consolidated:
+        if not isinstance(event, dict):
+            continue
+        survivor = event.get("survivor")
+        absorbed_names = event.get("absorbed") or []
+        if not survivor or not absorbed_names:
+            continue
+
+        # Collect the best absorbed verdict.
+        best_absorbed: dict | None = None
+        for abs_name in absorbed_names:
+            abs_entry = result.get(abs_name)
+            if abs_entry is None:
+                abs_entry = adoption_verdicts.get(abs_name)
+            if not isinstance(abs_entry, dict):
+                continue
+            if best_absorbed is None or _verdict_priority(abs_entry) > _verdict_priority(best_absorbed):
+                best_absorbed = abs_entry
+
+        # Drop absorbed keys.
+        for abs_name in absorbed_names:
+            result.pop(abs_name, None)
+
+        if best_absorbed is None:
+            continue
+
+        # Only write to survivor when it has no existing decided/strategist verdict.
+        survivor_entry = result.get(survivor)
+        if isinstance(survivor_entry, dict):
+            sv = survivor_entry.get("verdict")
+            ss = survivor_entry.get("evidence_source")
+            if sv in ("adopt", "reject") or ss == "strategic_review":
+                logger.info(
+                    "[CAPABILITY_TRIAL] consolidation carry-through skipped: "
+                    "survivor=%s already has decided verdict %r",
+                    survivor,
+                    sv,
+                )
+                continue
+
+        result[survivor] = best_absorbed
+        logger.info(
+            "[CAPABILITY_TRIAL] consolidation carry-through: survivor=%s "
+            "absorbed=%s carried_verdict=%r",
+            survivor,
+            absorbed_names,
+            best_absorbed.get("verdict"),
+        )
+
+    return result
+
+
 def get_effective_holdback_fraction(
     verdicts: Any,
     cap_name: str,
