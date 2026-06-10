@@ -3045,6 +3045,7 @@ class TestSafeguardMergeGateChallenge:
         self, db_session
     ):
         """A high finding rejected by the challenge releases the merge gate."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
         from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
 
@@ -3072,6 +3073,7 @@ class TestSafeguardMergeGateChallenge:
                 "line_number": 7,
             }
         ]
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
@@ -3153,6 +3155,7 @@ class TestSafeguardMergeGateChallenge:
         self, db_session
     ):
         """A finding downgraded below critical/high by the challenge releases the gate."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
         from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
 
@@ -3180,6 +3183,7 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)

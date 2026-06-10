@@ -128,9 +128,9 @@ runtime_config: Dict = {
     in ("1", "true", "yes"),
     # Graduated rollout mode for the safeguard merge-gate challenge.
     # Mirrors strategic_retirement_challenge_gate_mode.
-    #   "off"     — (default) no challenge; gate held unconditionally on any
-    #               critical/high finding. Preserves today's behavior exactly.
-    #   "observe" — shadow/observe mode: the challenge is spawned and its verdict
+    #   "off"     — no challenge; gate held unconditionally on any
+    #               critical/high finding. Preserves pre-v9 behavior exactly.
+    #   "observe" — (default) shadow/observe mode: the challenge is spawned and its verdict
     #               is recorded on the safeguard task as
     #               ``safeguard_observe_verdict``, but the gate is NEVER released
     #               by the verdict. Lets operators measure the false-positive rate
@@ -141,11 +141,11 @@ runtime_config: Dict = {
     #               Fail-closed: if the challenge errors or times out the gate
     #               stays closed.
     "safeguard_challenge_gate_mode": os.getenv(
-        "SAFEGUARD_CHALLENGE_GATE_MODE", "off"
+        "SAFEGUARD_CHALLENGE_GATE_MODE", "observe"
     ).lower()
-    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "off").lower()
+    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "observe").lower()
     in ("off", "observe", "enforce")
-    else "off",
+    else "observe",
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined

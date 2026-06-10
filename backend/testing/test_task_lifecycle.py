@@ -7685,6 +7685,8 @@ async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
         logs='{"outcome": "rejected", "reasoning": "false positive confirmed"}',
     )
 
+    import app.shared_state as shared_state
+    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
     await session.refresh(safeguard)
@@ -7729,6 +7731,8 @@ async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
         logs='{"outcome": "confirmed", "reasoning": "genuine SQL injection"}',
     )
 
+    import app.shared_state as shared_state
+    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
     await session.refresh(safeguard)
@@ -7767,6 +7771,8 @@ async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
         logs=None,
     )
 
+    import app.shared_state as shared_state
+    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
     await session.refresh(safeguard)

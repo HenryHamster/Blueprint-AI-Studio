@@ -1325,7 +1325,7 @@ async def _maybe_release_safeguard_gate(
         return
 
     _gate_mode = str(
-        _runtime_config.get("safeguard_challenge_gate_mode", "off") or "off"
+        _runtime_config.get("safeguard_challenge_gate_mode", "observe") or "observe"
     ).lower()
 
     if has_blocker:
