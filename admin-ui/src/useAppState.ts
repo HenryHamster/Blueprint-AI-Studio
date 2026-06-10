@@ -222,6 +222,7 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    resourceEnvelopeData, resourceEnvelopeLoading, resourceEnvelopeError, handleUpdateResourceEnvelope,
     integrationBranchData, handleUpdateIntegrationBranch,
     promotionTargetData, handleUpdatePromotionTarget,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
@@ -619,6 +620,7 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    resourceEnvelopeData, resourceEnvelopeLoading, resourceEnvelopeError, handleUpdateResourceEnvelope,
     integrationBranchData, handleUpdateIntegrationBranch,
     promotionTargetData, handleUpdatePromotionTarget,
     // Max plan accounts

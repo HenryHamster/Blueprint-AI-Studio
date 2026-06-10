@@ -6,6 +6,7 @@ import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProviderSettingsPanel } from './ProviderSettingsPanel';
 import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
+import { ProjectResourceEnvelopeSection } from './ProjectResourceEnvelopeSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
@@ -20,6 +21,8 @@ import type {
   IssueImplementationConfig,
   IssueImplementationConfigUpdate,
   AutoReviewConfig,
+  ProjectResourceEnvelopeResponse,
+  ResourceEnvelopeConfig,
 } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
@@ -220,6 +223,10 @@ export interface SettingsSectionRouterProps {
   onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  resourceEnvelopeData: ProjectResourceEnvelopeResponse | null;
+  resourceEnvelopeLoading: boolean;
+  resourceEnvelopeError: string | null;
+  onUpdateResourceEnvelope: (patch: Partial<ResourceEnvelopeConfig>) => Promise<void>;
   integrationBranchData: { integration_branch: string; is_default: boolean } | null;
   onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
   promotionTargetData: { promotion_target: string; is_default: boolean } | null;
@@ -421,6 +428,18 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           config={props.autoReviewConfig}
           canSave={props.selectedProjectRole === 'owner'}
           onSave={props.onUpdateAutoReviewConfig}
+        />
+      );
+    case 'resource-envelope':
+      return (
+        <ProjectResourceEnvelopeSection
+          githubOwner={props.selectedProjectOwner}
+          githubRepo={props.selectedProjectRepo}
+          data={props.resourceEnvelopeData}
+          loading={props.resourceEnvelopeLoading}
+          error={props.resourceEnvelopeError}
+          canSave={props.selectedProjectRole === 'owner'}
+          onSave={props.onUpdateResourceEnvelope}
         />
       );
     case 'auto-remediation':

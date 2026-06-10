@@ -6,7 +6,7 @@ import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig, ProjectResourceEnvelopeResponse, ResourceEnvelopeConfig } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 
@@ -193,6 +193,10 @@ export interface HeaderBarProps {
   onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  resourceEnvelopeData: ProjectResourceEnvelopeResponse | null;
+  resourceEnvelopeLoading: boolean;
+  resourceEnvelopeError: string | null;
+  onUpdateResourceEnvelope: (patch: Partial<ResourceEnvelopeConfig>) => Promise<void>;
   integrationBranchData: { integration_branch: string; is_default: boolean } | null;
   onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
   promotionTargetData: { promotion_target: string; is_default: boolean } | null;
@@ -603,6 +607,10 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}
           autoReviewConfig={props.autoReviewConfig}
           onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
+          resourceEnvelopeData={props.resourceEnvelopeData}
+          resourceEnvelopeLoading={props.resourceEnvelopeLoading}
+          resourceEnvelopeError={props.resourceEnvelopeError}
+          onUpdateResourceEnvelope={props.onUpdateResourceEnvelope}
           integrationBranchData={props.integrationBranchData}
           onUpdateIntegrationBranch={props.onUpdateIntegrationBranch}
           promotionTargetData={props.promotionTargetData}

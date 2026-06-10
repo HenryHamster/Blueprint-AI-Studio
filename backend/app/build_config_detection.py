@@ -97,6 +97,11 @@ def apply_operator_build_config_overrides(
     ):
         if _cap_key in existing:
             detected[_cap_key] = existing[_cap_key]
+    # Per-project resource envelope (concurrent-VM caps and spend ceilings) is
+    # operator-owned and never emitted by repo detection; carry it forward so
+    # re-detect does not silently drop an operator-set envelope.
+    if "resource_envelope" in existing:
+        detected["resource_envelope"] = existing["resource_envelope"]
 
     # Merge per-directory agent-confirmed command fields back onto re-detected
     # directories.  These are written by the agent write-back endpoint and are

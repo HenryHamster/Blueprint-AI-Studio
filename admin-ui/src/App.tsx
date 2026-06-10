@@ -720,6 +720,10 @@ export default function App() {
         onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}
         autoReviewConfig={s.autoReviewConfig}
         onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
+        resourceEnvelopeData={s.resourceEnvelopeData}
+        resourceEnvelopeLoading={s.resourceEnvelopeLoading}
+        resourceEnvelopeError={s.resourceEnvelopeError}
+        onUpdateResourceEnvelope={s.handleUpdateResourceEnvelope}
         integrationBranchData={s.integrationBranchData}
         onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
         promotionTargetData={s.promotionTargetData}

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { SettingsSectionRouter } from './SettingsSectionRouter';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig, ProjectResourceEnvelopeResponse, ResourceEnvelopeConfig } from '../types/project';
 import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogOut, Bell, Wrench, Tag, HelpCircle, FileDown } from 'lucide-react';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
@@ -171,6 +171,10 @@ interface SettingsDropdownProps {
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  resourceEnvelopeData: ProjectResourceEnvelopeResponse | null;
+  resourceEnvelopeLoading: boolean;
+  resourceEnvelopeError: string | null;
+  onUpdateResourceEnvelope: (patch: Partial<ResourceEnvelopeConfig>) => Promise<void>;
   // Integration branch config (project-scoped)
   integrationBranchData: { integration_branch: string; is_default: boolean } | null;
   onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
@@ -181,7 +185,7 @@ interface SettingsDropdownProps {
 
 
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'integration-branch' | 'promotion-target';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'integration-branch' | 'promotion-target';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -193,6 +197,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
   { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
+  { id: 'resource-envelope', label: 'Resource Envelope', icon: Server, projectOnly: true },
   { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
   { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
   { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
@@ -346,6 +351,10 @@ export function SettingsDropdown({
   selectedProjectRole,
   autoReviewConfig,
   onUpdateAutoReviewConfig,
+  resourceEnvelopeData,
+  resourceEnvelopeLoading,
+  resourceEnvelopeError,
+  onUpdateResourceEnvelope,
   integrationBranchData,
   onUpdateIntegrationBranch,
   promotionTargetData,
@@ -616,6 +625,10 @@ export function SettingsDropdown({
                   onUpdateIssueImplementationConfig={onUpdateIssueImplementationConfig}
                   autoReviewConfig={autoReviewConfig}
                   onUpdateAutoReviewConfig={onUpdateAutoReviewConfig}
+                  resourceEnvelopeData={resourceEnvelopeData}
+                  resourceEnvelopeLoading={resourceEnvelopeLoading}
+                  resourceEnvelopeError={resourceEnvelopeError}
+                  onUpdateResourceEnvelope={onUpdateResourceEnvelope}
                   integrationBranchData={integrationBranchData}
                   onUpdateIntegrationBranch={onUpdateIntegrationBranch}
                   promotionTargetData={promotionTargetData}

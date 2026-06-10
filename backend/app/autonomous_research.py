@@ -66,6 +66,11 @@ from app.capability_registry import (
     registry_capability_names,
     registry_capability_vocabulary,
 )
+from app.resource_envelope import (
+    get_project_recent_spend_usd,
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -110,6 +115,27 @@ def _direction_in_refractory(d: dict, now: datetime) -> bool:
         return datetime.fromisoformat(refractory_until) > now
     except (ValueError, TypeError):
         return False
+
+
+async def _project_spend_ceiling_spawn_defer_reason(
+    project: Project, session: AsyncSession
+) -> str | None:
+    """Return a spawn deferral reason when the project spend ceiling is reached."""
+    spend_ceiling = resolve_project_spend_ceiling(project)
+    if spend_ceiling is None:
+        return None
+    spend_window_days = resolve_project_spend_window_days(project)
+    recent_spend = await get_project_recent_spend_usd(
+        session,
+        project_id=project.id,
+        window_days=spend_window_days,
+    )
+    if recent_spend >= spend_ceiling:
+        return (
+            f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
+            f"in the last {spend_window_days} day(s)"
+        )
+    return None
 
 
 # Sentinel segment for undirected (cross-cutting) research claims — undirected
@@ -502,6 +528,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # the steering is still delivered on a later tick once accounts recover.
         await _maybe_notify_operator_refresh_deferred(
             project, session, "paused while no model accounts are available"
+        )
+        return
+    spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
+        project, session
+    )
+    if spend_defer_reason:
+        logger.info(
+            "[AUTONOMOUS] Skipping research spawn for project %s — %s",
+            project.id,
+            spend_defer_reason,
+        )
+        await _maybe_notify_operator_refresh_deferred(
+            project, session, "paused while the project spend ceiling is reached"
         )
         return
     # Guard: circuit breaker must allow spawning
@@ -2403,6 +2442,17 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             f"[AUTONOMOUS] Unknown task_type '{task_type}' in _spawn_periodic_task, skipping"
         )
         return
+    spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
+        project, session
+    )
+    if spend_defer_reason:
+        logger.info(
+            "[AUTONOMOUS] Skipping periodic task spawn (type=%s) for project %s — %s",
+            task_type,
+            project.id,
+            spend_defer_reason,
+        )
+        return
 
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
@@ -2775,7 +2825,20 @@ async def _check_idle_research():
 
                 # Spawn the working residual-fingerprint create-fix lane for any
                 # recurring failure pattern that warrants a targeted fix.
-                await _spawn_residual_fingerprint_remediation(project, session)
+                # Guard with the same spend-ceiling check used by _spawn_research_task
+                # and _spawn_periodic_task so an over-budget project cannot spawn new
+                # work through this lane either.
+                _residual_defer_reason = (
+                    await _project_spend_ceiling_spawn_defer_reason(project, session)
+                )
+                if _residual_defer_reason:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping residual remediation spawn for project %s — %s",
+                        project.id,
+                        _residual_defer_reason,
+                    )
+                else:
+                    await _spawn_residual_fingerprint_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)

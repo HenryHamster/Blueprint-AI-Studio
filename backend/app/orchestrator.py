@@ -65,6 +65,12 @@ from app.models import (
     bank_task_current_attempt,
     with_task_attempt_banking,
 )
+from app.resource_envelope import (
+    get_project_recent_spend_usd,
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
+    resolve_project_vm_cap,
+)
 from app.orchestrator_filters import (
     filter_file_conflicts,
     filter_rollup_conflicts,
@@ -706,6 +712,114 @@ BLOCKED_CONFLICT_LIGHT_COLUMNS = (
     # (same trap as parent_task_id above; see reference_load_only_lazy_load_trap).
     Task.payloads,
 )
+
+
+async def _project_resource_dispatch_defer_message(
+    session: AsyncSession,
+    task: Task,
+    project_active_counts: dict[uuid.UUID, int],
+    *,
+    project_cache: dict[uuid.UUID, Project | None] | None = None,
+    spend_cache: dict[uuid.UUID, tuple[float, float, int]] | None = None,
+) -> str | None:
+    """Return an operator-readable resource-envelope deferral reason, if any."""
+    if project_cache is not None and task.project_id in project_cache:
+        project = project_cache[task.project_id]
+    else:
+        project = await session.get(Project, task.project_id)
+        if project_cache is not None:
+            project_cache[task.project_id] = project
+    if project is None:
+        return "Waiting for project resource envelope check — project record unavailable"
+
+    vm_cap = resolve_project_vm_cap(project)
+    if vm_cap is not None:
+        active_for_project = project_active_counts.get(task.project_id, 0)
+        if active_for_project >= vm_cap:
+            return (
+                "Waiting for project VM capacity — "
+                f"{active_for_project}/{vm_cap} project VM slots are already in use"
+            )
+
+    spend_ceiling = resolve_project_spend_ceiling(project)
+    if spend_ceiling is None:
+        return None
+
+    spend_window_days = resolve_project_spend_window_days(project)
+    if spend_cache is not None and task.project_id in spend_cache:
+        recent_spend, spend_ceiling, spend_window_days = spend_cache[task.project_id]
+    else:
+        recent_spend = await get_project_recent_spend_usd(
+            session,
+            project_id=task.project_id,
+            window_days=spend_window_days,
+        )
+        if spend_cache is not None:
+            spend_cache[task.project_id] = (
+                recent_spend,
+                spend_ceiling,
+                spend_window_days,
+            )
+    if recent_spend >= spend_ceiling:
+        return (
+            "Waiting for project spend budget — "
+            f"${recent_spend:.2f}/${spend_ceiling:.2f} spent in the last "
+            f"{spend_window_days} day(s)"
+        )
+    return None
+
+
+async def _filter_project_resource_dispatch_eligible(
+    session: AsyncSession,
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    project_active_counts: dict[uuid.UUID, int],
+    broadcast_to_project,
+) -> list[uuid.UUID]:
+    """Drop resource-deferred tasks before the global slot slice."""
+    task_by_id = {task.id: task for task in candidate_tasks}
+    projected_counts = dict(project_active_counts)
+    project_cache: dict[uuid.UUID, Project | None] = {}
+    spend_cache: dict[uuid.UUID, tuple[float, float, int]] = {}
+    filtered: list[uuid.UUID] = []
+
+    for task_id in eligible_ids:
+        task = task_by_id.get(task_id)
+        if task is None:
+            continue
+        defer_msg = await _project_resource_dispatch_defer_message(
+            session,
+            task,
+            projected_counts,
+            project_cache=project_cache,
+            spend_cache=spend_cache,
+        )
+        if defer_msg:
+            logger.info(
+                "[ORCHESTRATOR] Deferring task %s for project %s before slot slice: %s",
+                task.id,
+                task.project_id,
+                defer_msg,
+            )
+            if task.latest_status_message != defer_msg:
+                task.latest_status_message = defer_msg
+                session.add(task)
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(task.id),
+                        "status": task.status,
+                        "message": defer_msg,
+                    },
+                )
+            continue
+        filtered.append(task_id)
+        projected_counts[task.project_id] = projected_counts.get(task.project_id, 0) + 1
+
+    if session.dirty:
+        await session.commit()
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -1637,6 +1751,11 @@ async def orchestrator_worker():
 
                 # Enforce concurrency limit
                 active_count = len(active_tasks_result)
+                project_active_counts: dict[uuid.UUID, int] = {}
+                for _active_task in active_tasks_result:
+                    project_active_counts[_active_task.project_id] = (
+                        project_active_counts.get(_active_task.project_id, 0) + 1
+                    )
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
                 # Warm-pool slot accounting: a pre-provisioned idle pool VM is a
@@ -1986,8 +2105,24 @@ async def orchestrator_worker():
                 # — Task.status / latest_status_message setters trigger event
                 # listeners that read status_log, which raises MissingGreenlet
                 # if it's a deferred-loaded attribute (no async session bound).
-                candidate_stmt = (
-                    select(Task)
+                #
+                # Per-project candidate cap: fetch at most `per_project_cap`
+                # candidates per project via a ROW_NUMBER() window function
+                # subquery. Without this, a single at-cap project that owns
+                # many high-priority QUEUED tasks can fill the entire batch and
+                # starve tasks from under-cap projects that sit just beyond the
+                # limit — the resource-envelope filter then defers every
+                # candidate and no other project dispatches that cycle.
+                _per_project_cap = max(slots_available * 2, 20)
+                _rn_col = _func.row_number().over(
+                    partition_by=Task.project_id,
+                    order_by=[
+                        Task.priority.desc().nullslast(),
+                        Task.created_at.asc(),
+                    ],
+                ).label("row_num")
+                _cand_id_sq = (
+                    select(Task.id, _rn_col)
                     # Exclude tasks owned by an archived OR paused project — both
                     # halt new dispatch of the project's QUEUED work. Pause is a
                     # first-class persisted switch distinct from terminal status
@@ -2007,6 +2142,17 @@ async def orchestrator_worker():
                             )
                         ),
                     )
+                    .subquery()
+                )
+                candidate_stmt = (
+                    select(Task)
+                    .where(
+                        Task.id.in_(
+                            select(_cand_id_sq.c.id).where(
+                                _cand_id_sq.c.row_num <= _per_project_cap
+                            )
+                        )
+                    )
                     # CANDIDATE_LIGHT_COLUMNS drops heavy JSONB but carries every
                     # column a Step-2.5 filter reads on a candidate (status_log,
                     # parent_task_id, title, ...). Excluding any of them makes the
@@ -2015,8 +2161,7 @@ async def orchestrator_worker():
                     # constant's docstring and reference_load_only_event_listeners.md.
                     .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
                     .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
-                    .limit(max(slots_available * 2, 50))
-                )  # Fetch extra; NULL priority = lowest
+                )
                 candidate_tasks = (
                     (await session.execute(candidate_stmt)).scalars().all()
                 )
@@ -2613,6 +2758,14 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, _runtime_config, slots_available
                 )
 
+                eligible_ids = await _filter_project_resource_dispatch_eligible(
+                    session,
+                    eligible_ids,
+                    candidate_tasks,
+                    project_active_counts,
+                    broadcast_to_project,
+                )
+
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 
@@ -2841,6 +2994,30 @@ async def orchestrator_worker():
                         continue
                     if task.requires_approval:
                         await session.rollback()
+                        continue
+                    resource_defer_msg = await _project_resource_dispatch_defer_message(
+                        session, task, project_active_counts
+                    )
+                    if resource_defer_msg:
+                        logger.info(
+                            "[ORCHESTRATOR] Deferring task %s for project %s: %s",
+                            task.id,
+                            task.project_id,
+                            resource_defer_msg,
+                        )
+                        if task.latest_status_message != resource_defer_msg:
+                            task.latest_status_message = resource_defer_msg
+                            session.add(task)
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(task.id),
+                                    "status": task.status,
+                                    "message": resource_defer_msg,
+                                },
+                            )
+                        await session.commit()
                         continue
 
                     # Phase 2c: warm-VM continuity skip-provision branch.
@@ -3501,6 +3678,9 @@ async def orchestrator_worker():
                     try:
                         await session.commit()
                         # active_tasks already pre-incremented in select_max_plan_account()
+                        project_active_counts[task.project_id] = (
+                            project_active_counts.get(task.project_id, 0) + 1
+                        )
                         logger.info(
                             f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM"
                         )

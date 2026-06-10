@@ -168,6 +168,10 @@ describe('SettingsDropdown — viewport regression', () => {
             selectedProjectRole="owner"
             autoReviewConfig={null}
             onUpdateAutoReviewConfig={async () => {}}
+            resourceEnvelopeData={null}
+            resourceEnvelopeLoading={false}
+            resourceEnvelopeError={null}
+            onUpdateResourceEnvelope={async () => {}}
           />
         );
       });
@@ -326,6 +330,10 @@ describe('SettingsDropdown — viewport regression', () => {
             selectedProjectRole="owner"
             autoReviewConfig={null}
             onUpdateAutoReviewConfig={async () => {}}
+            resourceEnvelopeData={null}
+            resourceEnvelopeLoading={false}
+            resourceEnvelopeError={null}
+            onUpdateResourceEnvelope={async () => {}}
           />
         );
       });
@@ -484,6 +492,10 @@ describe('SettingsDropdown — viewport regression', () => {
             selectedProjectRole="owner"
             autoReviewConfig={null}
             onUpdateAutoReviewConfig={async () => {}}
+            resourceEnvelopeData={null}
+            resourceEnvelopeLoading={false}
+            resourceEnvelopeError={null}
+            onUpdateResourceEnvelope={async () => {}}
           />
         );
       });

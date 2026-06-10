@@ -613,6 +613,23 @@ class MigrationConfig(BaseModel):
     schema_revision_const: str | None = None
 
 
+class ResourceEnvelope(BaseModel):
+    """Per-project resource bounds for concurrent VM caps and spend ceilings.
+
+    All fields are optional; ``null``/absent means unlimited (inherit global
+    behavior).  Validated as a nested object inside ``BuildConfig`` under the
+    ``resource_envelope`` key so operators can set it via the project PATCH path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    # Maximum concurrent agent-VM tasks allowed for this project.
+    max_concurrent_vms: int | None = Field(None, ge=1)
+    # Spend ceiling in USD over the rolling window (spend_window_days).
+    spend_ceiling_usd: float | None = Field(None, gt=0)
+    # Rolling window length in days for spend aggregation. Default 30.
+    spend_window_days: int = Field(30, ge=1)
+
+
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
 
@@ -710,6 +727,11 @@ class BuildConfig(BaseModel):
     # has not yet run or has not completed. The strategic spawn gate checks this
     # to defer implementation tasks until the bootstrap has grounded repo knowledge.
     bootstrap_completed_at: str | None = None
+    # Per-project resource envelope controlling concurrent VM caps and spend
+    # ceilings.  None/absent means unlimited (inherit global behavior).
+    # Validated by ResourceEnvelope; carried across re-detect by
+    # ``apply_operator_build_config_overrides``.
+    resource_envelope: "ResourceEnvelope | None" = None
     # Per-project 24h rolling-window spend ceiling. When set, autonomous spawning
     # is paused (and a deduped operator alert emitted) once the project's window
     # spend meets or exceeds this value. None = disabled (today's behavior).

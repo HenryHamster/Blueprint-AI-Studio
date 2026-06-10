@@ -2,7 +2,13 @@ import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
-import type { BuildConfig, MergeGateRuntime, MergeVerificationVerdict } from './types/project';
+import type {
+  BuildConfig,
+  MergeGateRuntime,
+  MergeVerificationVerdict,
+  ProjectResourceEnvelopeResponse,
+  ResourceEnvelopeConfig,
+} from './types/project';
 import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
@@ -241,6 +247,41 @@ export async function createComputeExperiment(
     const data = await res.json().catch(() => ({}));
     const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
     throw new Error(msg);
+  }
+  return res.json();
+}
+
+export type ResourceEnvelopePatch = Partial<ResourceEnvelopeConfig>;
+
+export async function fetchProjectResourceEnvelope(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectResourceEnvelopeResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/resource-envelope`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to fetch resource envelope: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateProjectResourceEnvelope(
+  projectId: string,
+  patch: ResourceEnvelopePatch,
+): Promise<ProjectResourceEnvelopeResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/resource-envelope`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to save resource envelope: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to save resource envelope: ${res.status}`);
   }
   return res.json();
 }

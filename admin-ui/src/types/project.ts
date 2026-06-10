@@ -28,6 +28,12 @@ export interface BuildConfigDirectory {
   test_cmd?: string;
 }
 
+export interface ResourceEnvelopeConfig {
+  max_concurrent_vms?: number | null;
+  spend_ceiling_usd?: number | null;
+  spend_window_days?: number;
+}
+
 export interface BuildConfig {
   language?: string | null;
   directories?: BuildConfigDirectory[];
@@ -58,6 +64,7 @@ export interface BuildConfig {
   max_parallel_research?: number | null;
   max_total_research?: number | null;
   max_autonomous_tasks_per_hour?: number | null;
+  resource_envelope?: ResourceEnvelopeConfig | null;
   /** ISO timestamp stamped when a repo_bootstrap task finishes successfully.
    *  Absent/null means bootstrap has not yet completed. */
   bootstrap_completed_at?: string | null;
@@ -165,6 +172,12 @@ export interface CapabilityAdoptionVerdict {
     adopt_lift?: number;
     reject_lift?: number;
   };
+}
+
+export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig {
+  project_id: string;
+  active_vm_count: number;
+  recent_spend_usd: number;
 }
 
 export interface RepoOverview {

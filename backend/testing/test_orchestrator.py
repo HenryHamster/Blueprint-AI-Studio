@@ -3777,6 +3777,10 @@ class TestWarmVMSkipProvision:
         import app.orchestrator as _orch_module
         import app.pipeline_health_state as _pipeline_state
 
+        if not hasattr(asyncio, "timeout"):
+            import async_timeout
+
+            mocker.patch("asyncio.timeout", async_timeout.timeout, create=True)
         mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
         with contextlib.suppress(asyncio.CancelledError):
             await _orch_module.orchestrator_worker()
@@ -5016,6 +5020,252 @@ class TestWarmVMSkipProvision:
             assert row.status == TaskStatus.PROVISIONING, (
                 f"Resumed project's task must be dispatched, got {row.status}"
             )
+
+    @pytest.mark.asyncio
+    async def test_project_vm_cap_defers_only_capped_project(
+        self, orch_warm_db, mocker
+    ):
+        """A project at its VM cap stays QUEUED while another project dispatches."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                capped = make_project(
+                    name="At Cap",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                open_project = make_project(
+                    name="Under Cap",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add_all([capped, open_project])
+                await session.commit()
+                await session.refresh(capped)
+                await session.refresh(open_project)
+
+                now = self._naive_utcnow()
+                session.add(
+                    make_task(
+                        project_id=capped.id,
+                        status=TaskStatus.IN_PROGRESS,
+                        payloads=[{"type": "fix", "prompt": "active"}],
+                        created_at=now - timedelta(minutes=10),
+                    )
+                )
+                capped_queued = make_task(
+                    project_id=capped.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    context={},
+                    created_at=now - timedelta(minutes=5),
+                )
+                open_queued = make_task(
+                    project_id=open_project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    context={},
+                    created_at=now - timedelta(minutes=4),
+                )
+                session.add_all([capped_queued, open_queued])
+                await session.commit()
+                await session.refresh(capped_queued)
+                await session.refresh(open_queued)
+                capped_task_id = capped_queued.id
+                open_task_id = open_queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            capped_row = (
+                (await verify.execute(_select(Task).where(Task.id == capped_task_id)))
+                .scalars()
+                .one()
+            )
+            open_row = (
+                (await verify.execute(_select(Task).where(Task.id == open_task_id)))
+                .scalars()
+                .one()
+            )
+            assert capped_row.status == TaskStatus.QUEUED
+            assert "project VM capacity" in (capped_row.latest_status_message or "")
+            assert open_row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_project_spend_ceiling_defers_dispatch(
+        self, orch_warm_db, mocker
+    ):
+        """A project over its spend ceiling keeps queued work undispatched."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        spend_mock = mocker.patch(
+            "app.orchestrator.get_project_recent_spend_usd",
+            new_callable=AsyncMock,
+            return_value=12.0,
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Spend Capped",
+                    user_id=_TEST_USER,
+                    build_config={
+                        "resource_envelope": {
+                            "spend_ceiling_usd": 10.0,
+                            "spend_window_days": 7,
+                        }
+                    },
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    context={},
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        prov_mock.assert_not_called()
+        spend_mock.assert_awaited_once()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.QUEUED
+            assert "project spend budget" in (row.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_no_resource_envelope_dispatches_under_global_gate(
+        self, orch_warm_db, mocker
+    ):
+        """Projects without envelopes keep the previous global-slot behavior."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="No Envelope", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    context={},
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
     async def test_pool_dispatch_cold_fall_through_records_funnel(
