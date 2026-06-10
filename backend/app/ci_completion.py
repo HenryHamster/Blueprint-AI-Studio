@@ -569,6 +569,17 @@ async def _attempt_merge_with_retry_and_escalation(
                             source_task=task,
                             terminal_merge=_terminal_rollup_merge,
                         )
+                        # A merged PR is convergence by definition — release any
+                        # stale stuck/standoff/repeat-fingerprint approval hold
+                        # so the flag neither lingers on a terminal task nor
+                        # 2h-FAILs an EVALUATING parent whose work just landed.
+                        from app.review_loop_convergence import (
+                            clear_review_escalation_approval_gate,
+                        )
+
+                        clear_review_escalation_approval_gate(
+                            orig, resolved_by=f"pr_{ci_pr_number}_merged"
+                        )
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):

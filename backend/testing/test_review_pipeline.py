@@ -11171,3 +11171,94 @@ async def test_already_merged_skip_leaves_rollup_parent_evaluating(db_session, m
         "A rollup-chain source must NOT be force-completed by the already-merged "
         f"skip; got {rollup_parent.status}"
     )
+
+
+# ── clear_review_escalation_approval_gate (stale stuck-hold release) ──────────
+
+
+def _escalation_gated_task(kind="stuck", **ctx_extra):
+    ctx = {
+        "review_loop_terminal_outcome": {
+            "kind": kind,
+            "reason": kind,
+            "pr_number": 9179,
+            "iterations": 4,
+            "recorded_at": "2026-06-09T23:29:15",
+        },
+        "_approval_set_at": "2026-06-09T23:29:15.375394",
+        **ctx_extra,
+    }
+    return make_task(
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context=ctx,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+    )
+
+
+def test_clear_gate_releases_stuck_hold_and_stamps_resolution():
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    task = _escalation_gated_task(kind="stuck")
+    assert clear_review_escalation_approval_gate(task, resolved_by="pr_9179_merged")
+    assert task.requires_approval is False
+    # The timer baseline must not survive — a later unrelated hold starts fresh.
+    assert "_approval_set_at" not in task.context
+    outcome = task.context["review_loop_terminal_outcome"]
+    assert outcome["resolved"] is True
+    assert outcome["resolved_by"] == "pr_9179_merged"
+    assert outcome["resolved_at"]
+    # The original breadcrumb survives for downstream aggregation.
+    assert outcome["kind"] == "stuck"
+    assert outcome["iterations"] == 4
+
+
+@pytest.mark.parametrize("kind", ["standoff", "repeat_fingerprint_halt"])
+def test_clear_gate_releases_other_resolvable_escalation_kinds(kind):
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    task = _escalation_gated_task(kind=kind)
+    assert clear_review_escalation_approval_gate(task, resolved_by="review_approve_pr_9179")
+    assert task.requires_approval is False
+
+
+def test_clear_gate_never_touches_a_spend_budget_hold():
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+    from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
+
+    task = _escalation_gated_task(
+        kind="stuck", approval_hold_reason=SPEND_BUDGET_APPROVAL_HOLD_REASON
+    )
+    assert not clear_review_escalation_approval_gate(task, resolved_by="pr_merged")
+    assert task.requires_approval is True
+    assert task.context.get("_approval_set_at")
+
+
+def test_clear_gate_never_touches_holds_without_a_resolvable_breadcrumb():
+    """Branch-safety / risk-approval holds carry no stuck/standoff terminal
+    outcome — the release must leave them alone. cap_exhausted closed the PR
+    (terminal), so it is deliberately not resolvable either."""
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    no_outcome = make_task(
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": "2026-06-09T23:29:15"},
+        payloads=[{"type": "research", "prompt": "p"}],
+    )
+    assert not clear_review_escalation_approval_gate(no_outcome, resolved_by="x")
+    assert no_outcome.requires_approval is True
+
+    capped = _escalation_gated_task(kind="cap_exhausted")
+    assert not clear_review_escalation_approval_gate(capped, resolved_by="x")
+    assert capped.requires_approval is True
+
+
+def test_clear_gate_noop_when_gate_not_set():
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    task = _escalation_gated_task(kind="stuck")
+    task.requires_approval = False
+    ctx_before = dict(task.context)
+    assert not clear_review_escalation_approval_gate(task, resolved_by="x")
+    assert task.context == ctx_before

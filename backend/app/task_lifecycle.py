@@ -2970,6 +2970,19 @@ async def _process_post_commit(
                                         "review_loop": _orig_loop,
                                     }
                                     flag_modified(_orig, "context")
+                                    # An APPROVE on this chain resolves a stale
+                                    # stuck/standoff/repeat-fingerprint hold —
+                                    # release it while the row lock is already
+                                    # held, or the recovery sweep's 2h approval
+                                    # timer FAILs the parent under live work.
+                                    from app.review_loop_convergence import (
+                                        clear_review_escalation_approval_gate,
+                                    )
+
+                                    clear_review_escalation_approval_gate(
+                                        _orig,
+                                        resolved_by=f"review_approve_pr_{pr_number}",
+                                    )
                                     session.add(_orig)
                                     task.status = TaskStatus.COMPLETED
                                     task.latest_status_message = f"Review approved for rollup PR #{pr_number} — handed off to CI gate"

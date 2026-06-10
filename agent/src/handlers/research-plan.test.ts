@@ -107,6 +107,7 @@ import {
   buildCapabilityVerificationSection,
   buildAvailableCapabilitiesSection,
   CAPABILITY_DECLARATION_DOC,
+  normalizePlanSubtaskTypes,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -3231,5 +3232,80 @@ describe('handlePlan structured-output self-repair', () => {
     expect(payload.status).toBe('COMPLETED');
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+});
+
+describe('normalizePlanSubtaskTypes', () => {
+  it('coerces an off-vocabulary "fix" type to "create" and preserves every other field', () => {
+    const plan = {
+      subtasks: [
+        {
+          title: 'fix: glob refs read as indeterminate not absent',
+          prompt: 'Fix the glob resolution.',
+          type: 'fix',
+          depends_on_indices: [],
+          related_files: ['backend/app/design_docs.py'],
+          risk: 'low',
+        },
+        {
+          title: 'feat: recover downgrades',
+          prompt: 'Build on the fix.',
+          type: 'create',
+          depends_on_indices: [0],
+        },
+      ],
+    };
+    const logs: string[] = [];
+    const out = JSON.parse(normalizePlanSubtaskTypes(JSON.stringify(plan), (m) => logs.push(m)));
+    expect(out.subtasks[0].type).toBe('create');
+    expect(out.subtasks[0].title).toBe('fix: glob refs read as indeterminate not absent');
+    expect(out.subtasks[0].related_files).toEqual(['backend/app/design_docs.py']);
+    expect(out.subtasks[1]).toEqual(plan.subtasks[1]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('"fix"');
+    expect(logs[0]).toContain('create');
+  });
+
+  it('returns the input string unchanged when every type is in the vocabulary', () => {
+    const json = JSON.stringify({
+      subtasks: [
+        { title: 'feat: a', type: 'create' },
+        { title: 'refactor: b', type: 'refactor' },
+        { title: 'migrate: c', type: 'migrate' },
+        { title: 'qa: d', type: 'qa' },
+        { title: 'design: e', type: 'design' },
+        { title: 'research: f', type: 'web_research' },
+        { title: 'measure: g', type: 'compute_experiment' },
+      ],
+    });
+    const log = vi.fn();
+    expect(normalizePlanSubtaskTypes(json, log)).toBe(json);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('leaves an absent/null type untouched (backend defaults it to create)', () => {
+    const json = JSON.stringify({
+      subtasks: [{ title: 'feat: no type' }, { title: 'feat: null type', type: null }],
+    });
+    expect(normalizePlanSubtaskTypes(json)).toBe(json);
+  });
+
+  it('coerces a non-string type value to "create"', () => {
+    const out = JSON.parse(
+      normalizePlanSubtaskTypes(JSON.stringify({ subtasks: [{ title: 't', type: 7 }] }))
+    );
+    expect(out.subtasks[0].type).toBe('create');
+  });
+
+  it('passes non-JSON input through untouched (raw-output fallback path)', () => {
+    const raw = 'agent exploration transcript, no JSON here';
+    expect(normalizePlanSubtaskTypes(raw)).toBe(raw);
+  });
+
+  it('passes JSON without a subtasks array through untouched (no-op sentinel etc.)', () => {
+    const noOp = JSON.stringify({ subtasks: [], no_op_reason: 'work already present in app/config.py and shared_state.py' });
+    expect(normalizePlanSubtaskTypes(noOp)).toBe(noOp);
+    const weird = JSON.stringify({ findings: [] });
+    expect(normalizePlanSubtaskTypes(weird)).toBe(weird);
   });
 });

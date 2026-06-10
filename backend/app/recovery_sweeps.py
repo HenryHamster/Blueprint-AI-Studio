@@ -200,6 +200,56 @@ async def _chain_has_active_pipeline_work(
     return False
 
 
+async def _approval_gate_chain_busy(parent: Task, session) -> bool:
+    """True if this parent's review-fix chain still has NON-TERMINAL child work
+    for the chain's PR — including EVALUATING children (a fix task parked in
+    CI-wait), which :func:`_chain_has_active_pipeline_work` deliberately
+    excludes from its liveness definition.
+
+    Used ONLY to defer the approval-gate timeout (and bounded there by
+    ``APPROVAL_GATE_DEFER_WINDOW_HOURS``), never to defer a kill cascade, so
+    the generous activity definition is safe: the worst case of a false "busy"
+    is a few extra hours of waiting before the unchanged FAILED terminalization.
+    """
+    rl = (parent.context or {}).get("review_loop", {}) or {}
+    pr_number = rl.get("pr_number")
+    if not pr_number:
+        return False
+    try:
+        children = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == parent.id,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for child in children:
+            fp = child.first_payload
+            if fp.get("type") not in ("review", "fix"):
+                continue
+            if fp.get("pr_number") == pr_number:
+                return True
+    except Exception:
+        logger.debug(
+            f"[EVAL TIMEOUT] Failed to check approval-gate chain children for "
+            f"task {str(parent.id)[:8]}",
+            exc_info=True,
+        )
+    return False
+
+
 async def _chain_has_recoverable_failed_work(parent: Task, session) -> bool:
     """True if the chain has FAILED tasks with infra-class failure_category.
 
@@ -802,6 +852,15 @@ async def _check_evaluating_timeouts(progress_cb=None):
     # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
     # to approve/deny independent of the configured wall-clock.
     APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
+    # Bounded defer window for the approval-gate timeout while the chain is
+    # STILL actively working the PR (live review/fix children, or a fix parked
+    # in CI-wait). A stuck/standoff escalation flags the parent but does NOT
+    # stop the loop — FAILing the parent at the bare 2h mark while its own fix
+    # chain is mid-flight orphans that work and strands the rollup (research
+    # 6506582b / PR #9179, 2026-06-09). Mirrors CI_BACKSTOP_DEFER_WINDOW_HOURS;
+    # beyond 2h + this window the original unconditional timeout applies, so a
+    # genuinely wedged chain still terminates.
+    APPROVAL_GATE_DEFER_WINDOW_HOURS = 6
     # Deliberate spend/budget approval holds (requires_approval=True AND
     # context.approval_hold_reason == "spend_budget") get their OWN longer,
     # operator-configurable window and resolve to a CLEAN NON-FAILURE CANCELLED
@@ -1544,6 +1603,39 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         continue
 
                     if approval_elapsed > APPROVAL_GATE_FAIL_SECONDS:
+                        # Defer (bounded) while the chain is still actively
+                        # working the PR: live review/fix children, or a fix
+                        # parked in CI-wait. The two other backstops in this
+                        # sweep already consult the chain before terminalizing;
+                        # the approval gate was the one that did not.
+                        if (
+                            approval_elapsed
+                            <= APPROVAL_GATE_FAIL_SECONDS
+                            + APPROVAL_GATE_DEFER_WINDOW_HOURS * 3600
+                        ):
+                            _approval_chain_busy = False
+                            try:
+                                _approval_chain_busy = (
+                                    await services._chain_has_active_pipeline_work(
+                                        task, session
+                                    )
+                                    or await _approval_gate_chain_busy(task, session)
+                                )
+                            except Exception:
+                                logger.debug(
+                                    f"[EVAL TIMEOUT] Approval-gate chain check "
+                                    f"failed for {str(task.id)[:8]}",
+                                    exc_info=True,
+                                )
+                            if _approval_chain_busy:
+                                logger.info(
+                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
+                                    f"the approval-gate window but its review/fix "
+                                    f"chain is still working the PR — deferring "
+                                    f"(hard ceiling "
+                                    f"{round(APPROVAL_GATE_FAIL_SECONDS / 3600 + APPROVAL_GATE_DEFER_WINDOW_HOURS, 1)}h)"
+                                )
+                                continue
                         hours = round(approval_elapsed / 3600, 1)
                         logger.error(
                             f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been "
