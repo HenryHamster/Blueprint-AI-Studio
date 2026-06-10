@@ -934,7 +934,10 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
 
     Strips full history arrays down to a 3-point tail per axis so the agent
     can read a trend without dragging months of weekly history through the
-    payload budget.
+    payload budget. Also forwards format_compliance and agent_timeout_rate
+    blocks (current/baseline/drift_pct only, no history) so the strategist
+    can answer 'is self-repair working?' and 'is the timeout rate improving?'
+    without a separate fetch.
     """
     if not snapshot:
         return {}
@@ -951,11 +954,37 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "drift_pct": data.get("drift_pct"),
             "history_tail": history[-_EFFICIENCY_SNAPSHOT_HISTORY_TAIL:],
         }
-    return {
+    result: dict = {
         "axes": trimmed_axes,
         "baseline_captured_at": snapshot.get("baseline_captured_at"),
         "last_snapshot_at": snapshot.get("last_snapshot_at"),
     }
+    raw_fc = snapshot.get("format_compliance") or {}
+    if raw_fc:
+        fc_trimmed: dict = {}
+        for rate_key in ("format_compliance_rate", "self_repair_success_rate"):
+            rate_data = raw_fc.get(rate_key)
+            if isinstance(rate_data, dict):
+                fc_trimmed[rate_key] = {
+                    "current": rate_data.get("current"),
+                    "baseline": rate_data.get("baseline"),
+                    "drift_pct": rate_data.get("drift_pct"),
+                }
+        if fc_trimmed:
+            result["format_compliance"] = fc_trimmed
+    raw_atr = snapshot.get("agent_timeout_rate") or {}
+    if raw_atr:
+        overall = raw_atr.get("overall") or {}
+        result["agent_timeout_rate"] = {
+            "overall": {
+                "current": overall.get("current"),
+                "baseline": overall.get("baseline"),
+                "drift_pct": overall.get("drift_pct"),
+            },
+            "dominant_subtype": raw_atr.get("dominant_subtype"),
+            "dominant_share": raw_atr.get("dominant_share"),
+        }
+    return result
 
 
 def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:

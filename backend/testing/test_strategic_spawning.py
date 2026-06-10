@@ -11738,3 +11738,91 @@ def test_summarize_memo_citations_non_dict_entries_preserved():
     memos = [{"task_id": "t1", "summary_excerpt": "ok"}, "not-a-dict"]
     result = _summarize_memo_citations(memos)
     assert result[1] == "not-a-dict"
+
+
+# ---------------------------------------------------------------------------
+# _summarize_efficiency_snapshot — format_compliance and agent_timeout_rate
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_efficiency_snapshot_includes_format_compliance():
+    """format_compliance is forwarded with current/baseline/drift_pct only (no history)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "format_compliance": {
+            "format_compliance_rate": {
+                "current": 0.92,
+                "baseline": 0.88,
+                "drift_pct": 4.5,
+                "history": [{"captured_at": "2026-04-01", "value": 0.85}],
+            },
+            "self_repair_success_rate": {
+                "current": 0.75,
+                "baseline": 0.70,
+                "drift_pct": 7.1,
+                "history": [],
+            },
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "format_compliance" in result
+    fc = result["format_compliance"]
+    assert "format_compliance_rate" in fc
+    assert fc["format_compliance_rate"] == {"current": 0.92, "baseline": 0.88, "drift_pct": 4.5}
+    assert "history" not in fc["format_compliance_rate"]
+    assert "self_repair_success_rate" in fc
+    assert fc["self_repair_success_rate"]["current"] == 0.75
+
+
+def test_summarize_efficiency_snapshot_includes_agent_timeout_rate():
+    """agent_timeout_rate overall + dominant fields are forwarded (no history)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "agent_timeout_rate": {
+            "overall": {
+                "current": 0.08,
+                "baseline": 0.06,
+                "drift_pct": 33.3,
+                "history": [{"captured_at": "2026-04-01", "value": 0.07}],
+            },
+            "by_subtype": {"context_limit": {"current": 0.05}},
+            "dominant_subtype": "context_limit",
+            "dominant_share": "62%",
+            "denominator": 100,
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "agent_timeout_rate" in result
+    atr = result["agent_timeout_rate"]
+    assert atr["overall"] == {"current": 0.08, "baseline": 0.06, "drift_pct": 33.3}
+    assert "history" not in atr["overall"]
+    assert atr["dominant_subtype"] == "context_limit"
+    assert atr["dominant_share"] == "62%"
+    assert "by_subtype" not in atr
+    assert "denominator" not in atr
+
+
+def test_summarize_efficiency_snapshot_omits_blocks_when_absent():
+    """format_compliance and agent_timeout_rate keys are absent when raw snapshot lacks them."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "format_compliance" not in result
+    assert "agent_timeout_rate" not in result
+
+
+def test_summarize_efficiency_snapshot_empty_returns_empty():
+    """Empty/None snapshot returns empty dict."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    assert _summarize_efficiency_snapshot({}) == {}
+    assert _summarize_efficiency_snapshot(None) == {}  # type: ignore[arg-type]

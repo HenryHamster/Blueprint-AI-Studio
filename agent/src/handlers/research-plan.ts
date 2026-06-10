@@ -1033,6 +1033,8 @@ export function resolveMemoHandles(
 export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): string {
   const AXIS_LABELS: Record<string, string> = {
     cost_per_merged_pr: 'Cost/merged PR (USD)',
+    llm_cost_per_merged_pr: 'LLM cost/merged PR (USD)',
+    agent_timeout_rate: 'Agent timeout rate',
     vm_cold_start_p50_ms: 'VM cold-start p50 (ms)',
     vm_reuse_rate: 'VM reuse rate',
     median_api_calls_per_task: 'Median API calls/task',
@@ -1085,6 +1087,43 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
       '_Fleet slot utilization is the share of max-plan account slots in use (now + short trailing average) across the whole fleet. Chronically low utilization WITH verified non-clashing backlog means throughput is being left on the table — parallelize existing work or open more non-clashing directions. But distinguish idle headroom from cooled accounts (shown only when present): cooldowns are a rate-limit problem, not a reason to manufacture work. Near capacity is healthy, not a deficit._',
     );
   }
+
+  const fc = snap.format_compliance && typeof snap.format_compliance === 'object'
+    ? snap.format_compliance as Record<string, unknown>
+    : null;
+  if (fc) {
+    const fmtRate = (key: string): string => {
+      const r = fc[key] as Record<string, unknown> | undefined;
+      if (!r || typeof r !== 'object') return 'n/a';
+      return `${fmt(r.current)} (baseline ${fmt(r.baseline)}, drift ${fmtDrift(r.drift_pct)})`;
+    };
+    lines.push('');
+    lines.push('**Format compliance:**');
+    lines.push(`  format_compliance_rate: ${fmtRate('format_compliance_rate')}`);
+    lines.push(`  self_repair_success_rate: ${fmtRate('self_repair_success_rate')}`);
+  }
+
+  const atr = snap.agent_timeout_rate && typeof snap.agent_timeout_rate === 'object'
+    ? snap.agent_timeout_rate as Record<string, unknown>
+    : null;
+  if (atr) {
+    const overall = atr.overall && typeof atr.overall === 'object'
+      ? atr.overall as Record<string, unknown>
+      : null;
+    const overallStr = overall
+      ? `${fmt(overall.current)} (baseline ${fmt(overall.baseline)}, drift ${fmtDrift(overall.drift_pct)})`
+      : 'n/a';
+    const rawSubtype = atr.dominant_subtype;
+    const dominantSubtype = typeof rawSubtype === 'string' || typeof rawSubtype === 'number' ? String(rawSubtype) : null;
+    const rawShare = atr.dominant_share;
+    const dominantShare = typeof rawShare === 'string' || typeof rawShare === 'number' ? String(rawShare) : null;
+    const dominantStr = dominantSubtype
+      ? ` — dominant: ${dominantSubtype}${dominantShare != null ? ` (${dominantShare})` : ''}`
+      : '';
+    lines.push('');
+    lines.push(`**Agent timeout rate:** ${overallStr}${dominantStr}`);
+  }
+
   return lines.join('\n') + '\n';
 }
 

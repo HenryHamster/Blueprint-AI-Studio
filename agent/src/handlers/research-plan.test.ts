@@ -2199,6 +2199,87 @@ describe('buildEfficiencySnapshotSection', () => {
     const result = buildEfficiencySnapshotSection(snapshot);
     expect(result).not.toContain('throughput is being left on the table');
   });
+
+  it('renders format_compliance block when present', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      format_compliance: {
+        format_compliance_rate: { current: 0.92, baseline: 0.88, drift_pct: 4.5 },
+        self_repair_success_rate: { current: 0.75, baseline: 0.70, drift_pct: 7.1 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Format compliance');
+    expect(result).toContain('format_compliance_rate');
+    expect(result).toContain('0.92');
+    expect(result).toContain('baseline 0.88');
+    expect(result).toContain('+4.5%');
+    expect(result).toContain('self_repair_success_rate');
+    expect(result).toContain('0.75');
+    expect(result).toContain('+7.1%');
+  });
+
+  it('omits format_compliance block when absent', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Format compliance');
+    expect(result).not.toContain('format_compliance_rate');
+  });
+
+  it('renders agent_timeout_rate block with dominant_subtype when present', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      agent_timeout_rate: {
+        overall: { current: 0.08, baseline: 0.06, drift_pct: 33.3 },
+        dominant_subtype: 'context_limit',
+        dominant_share: '52%',
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Agent timeout rate');
+    expect(result).toContain('0.08');
+    expect(result).toContain('baseline 0.06');
+    expect(result).toContain('+33.3%');
+    expect(result).toContain('dominant: context_limit');
+    expect(result).toContain('52%');
+  });
+
+  it('omits agent_timeout_rate block when absent', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Agent timeout rate');
+  });
+
+  it('renders agent_timeout_rate without dominant subtype when dominant_subtype is null', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      agent_timeout_rate: {
+        overall: { current: 0.05, baseline: 0.05, drift_pct: 0.0 },
+        dominant_subtype: null,
+        dominant_share: null,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Agent timeout rate');
+    expect(result).toContain('0.05');
+    expect(result).not.toContain('dominant:');
+  });
+
+  it('renders llm_cost_per_merged_pr with a proper label', () => {
+    const snapshot = {
+      axes: {
+        llm_cost_per_merged_pr: { current: 0.85, baseline: 0.66, drift_pct: 28.8 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('LLM cost/merged PR');
+    expect(result).toContain('0.85');
+    expect(result).toContain('+28.8%');
+  });
 });
 
 describe('Strategic executor set-retirement-critiques verification', () => {
