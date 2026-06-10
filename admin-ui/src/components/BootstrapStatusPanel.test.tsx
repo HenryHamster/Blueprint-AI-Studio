@@ -94,6 +94,20 @@ describe('BootstrapStatusPanel', () => {
     expect(screen.getByRole('button', { name: /retry bootstrap/i })).toBeTruthy();
   });
 
+  test('does not offer bootstrap retry for empty repos', () => {
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { repo_is_empty: true } })}
+        tasks={[]}
+      />
+    );
+
+    expect(screen.getByText(/Empty repository/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /retry bootstrap/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /refresh bootstrap/i })).toBeNull();
+    expect(fetchBuildConfigCommands).not.toHaveBeenCalled();
+  });
+
   test('renders pending banner when repo_bootstrap task is IN_PROGRESS and hides retry', async () => {
     fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
     render(

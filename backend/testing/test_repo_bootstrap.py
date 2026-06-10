@@ -921,6 +921,67 @@ class TestRepoBootstrapCompletionSeam:
         assert bc.get("bootstrap_completed_at") is None
         assert "repo_overview" not in (project.design_doc or {})
 
+    @pytest.mark.asyncio
+    async def test_partial_bootstrap_overview_logs_mark_degraded_not_completed(
+        self, db_session
+    ):
+        """Completing a bootstrap with a partial overview (missing or empty required fields)
+        records bootstrap_degraded_reason in build_config and does NOT set bootstrap_completed_at.
+
+        A complete overview requires all three fields (tech_stack, directory_layout,
+        first_steps_summary) to be present and non-empty. Partial overviews should be
+        treated the same as missing overviews."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = Project(
+            name="acme/partial-overview",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="partial-overview",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/partial-overview",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap", "integration_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        # Test case: overview missing directory_layout (incomplete)
+        import json
+        logs = json.dumps({
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "",  # Empty required field
+            "first_steps_summary": "pip install && pytest",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task, logs, db_session)
+
+        await db_session.refresh(project)
+
+        # Should be treated as degraded (missing/empty required field)
+        bc = project.build_config or {}
+        assert bc.get("bootstrap_degraded_reason") == "overview_missing", (
+            "bootstrap_degraded_reason must be 'overview_missing' for partial overview"
+        )
+        assert bc.get("bootstrap_completed_at") is None, (
+            "bootstrap_completed_at must NOT be set when required overview field is empty"
+        )
+        assert "repo_overview" not in (project.design_doc or {}), (
+            "design_doc must not contain 'repo_overview' when overview is partial/incomplete"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Recovery path: spawn_bootstrap_task helper

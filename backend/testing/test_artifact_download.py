@@ -20,6 +20,8 @@ from httpx import AsyncClient
 
 from app import storage
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobStatus,
     Project,
@@ -177,6 +179,54 @@ async def _make_compute_job(session, project, task):
     return job
 
 
+async def _make_compute_job_no_result(session, project, task):
+    """Compute job with neither result_reference nor artifact_id."""
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def _make_compute_job_with_artifact(session, project, task):
+    """Compute job whose terminal output is recorded via a linked Artifact row."""
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.SCREENSHOT,
+        storage_uri=None,  # filled in after job id is known
+    )
+    session.add(artifact)
+    await session.flush()
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        artifact_id=artifact.id,
+    )
+    session.add(job)
+    await session.flush()
+
+    artifact.storage_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/output.tar.gz"
+    )
+    session.add(artifact)
+    await session.commit()
+    await session.refresh(job)
+    await session.refresh(artifact)
+    return job, artifact
+
+
 def _mock_signing(mocker, *, url="https://signed.example/download", raises=None):
     client = mocker.patch("app.storage.storage.Client")
     blob = client.return_value.bucket.return_value.blob.return_value
@@ -324,3 +374,71 @@ async def test_resolve_download_url_storage_failure_503(
         params={"storage_uri": uri, "project_id": str(project.id)},
     )
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_compute_job_download_rejects_unlinked_prefix_object(
+    client: AsyncClient, db_session, mocker
+):
+    """A URI under compute-jobs/<job_id>/ that is NOT the recorded
+    result_reference is rejected as 404 even when the caller has project
+    membership — unknown siblings are indistinguishable from not found."""
+    sign = _mock_signing(mocker, url="https://signed.example/should-not-reach")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    # A sibling object under the same job prefix that was never recorded as
+    # the terminal output.
+    sibling_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/secret.bin"
+    assert sibling_uri != job.result_reference
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": sibling_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_compute_job_artifact_storage_uri_ok(
+    client: AsyncClient, db_session, mocker
+):
+    """When the job's terminal output is recorded via artifact_id, requesting
+    the artifact's storage_uri must succeed."""
+    _mock_signing(mocker, url="https://signed.example/artifact-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job, artifact = await _make_compute_job_with_artifact(db_session, project, task)
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": artifact.storage_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/artifact-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_compute_job_no_result_reference_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A job with no result_reference and no artifact_id: any URI under its
+    prefix is rejected as 404."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job_no_result(db_session, project, task)
+
+    uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/bundle.tar.gz"
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()

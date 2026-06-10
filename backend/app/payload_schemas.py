@@ -412,6 +412,8 @@ class StrategicReviewPayload(_SystemPopulated):
     conversation_thread: list[dict[str, Any]] | None = None
     project_name: str | None = None
     research_mode: str | None = None
+    is_self_repo: bool | None = None
+    enable_self_improvement: bool | None = None
     # Optional, agent-emitted prioritization mode hint. Allowed canonical
     # values: 'audit' | 'fundamentals' | 'ship' | 'pause'. Validated softly:
     # the field is just a string so unknown values still parse, but

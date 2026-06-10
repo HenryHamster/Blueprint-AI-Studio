@@ -361,6 +361,60 @@ describe('handleStrategic problem_model recovery framing', () => {
   });
 });
 
+describe('handleStrategic self-repo prompt framing', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('external_project_enable_self_improvement_does_not_render_self_repo_wording', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'External Project',
+      is_self_repo: false,
+      enable_self_improvement: true,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-ext-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(false);
+    const block = String(capturedThinkerParams?.selfImprovementBlock);
+    expect(block).toContain('# Project improvement');
+    expect(block).toContain('eligible for agent-proposed improvement work');
+    expect(block).not.toContain('# Self-improvement');
+    expect(block).not.toContain('your own prompts, schemas, tools, and');
+    expect(block).not.toContain('point of self-repo');
+  });
+
+  it('true self-repo preserves self-improvement wording', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      is_self_repo: true,
+      enable_self_improvement: true,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-self-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(true);
+    const block = String(capturedThinkerParams?.selfImprovementBlock);
+    expect(block).toContain('# Self-improvement');
+    expect(block).toContain('your own prompts, schemas, tools, and');
+    expect(block).toContain('point of self-repo');
+    expect(block).not.toContain('# Project improvement');
+  });
+
+  it('self-repo identity does not enable improvement mode by itself', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      is_self_repo: true,
+      enable_self_improvement: false,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-self-no-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(true);
+    expect(capturedThinkerParams?.selfImprovementBlock).toBe('');
+  });
+});
+
 describe('handleStrategic executor prompt: atomic staged create-direction', () => {
   it('documents create-direction with "staged": true as a single atomic op (no create-then-stage)', async () => {
     vi.mocked(runClaudeCode).mockClear();

@@ -15,11 +15,13 @@ interface Props {
   tasks: Task[];
 }
 
-type BootstrapState = 'pending' | 'completed' | 'degraded' | 'retryable' | 'none';
+type BootstrapState = 'pending' | 'completed' | 'degraded' | 'retryable' | 'empty' | 'none';
 type RetryOutcome = Pick<BootstrapRetryResponse, 'state' | 'task_id' | 'reason'>;
 
 function deriveBootstrapState(project: Project, tasks: Task[]): BootstrapState {
   if (project.is_self_repo) return 'none';
+  if (project.build_config?.repo_is_empty) return 'empty';
+
   const completedAt = project.build_config?.bootstrap_completed_at;
   if (completedAt) return 'completed';
 
@@ -111,7 +113,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
   }, [project.id]);
 
   useEffect(() => {
-    if (state === 'none') return;
+    if (state === 'none' || state === 'empty') return;
     const controller = new AbortController();
     fetchBuildConfigCommands(project.id, controller.signal)
       .then((res: BuildConfigCommandsResponse) => {
@@ -197,6 +199,9 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
           {displayState === 'retryable' && (
             <Clock className="w-4 h-4 text-amber-400 shrink-0" />
           )}
+          {displayState === 'empty' && (
+            <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+          )}
           <div>
             <div className="text-[11px] font-bold text-neutral-300 uppercase tracking-widest">
               Bootstrap
@@ -244,6 +249,11 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
             {displayState === 'retryable' && (
               <div className="text-[11px] text-amber-300">
                 Bootstrap has not run yet — retry will enqueue the first-cycle bootstrap
+              </div>
+            )}
+            {displayState === 'empty' && (
+              <div className="text-[11px] text-emerald-400">
+                Empty repository — bootstrap will start after initial project files land
               </div>
             )}
           </div>

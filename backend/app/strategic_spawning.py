@@ -2153,6 +2153,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "research_mode": {"priority": "critical"},
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
+    "is_self_repo": {"priority": "critical"},
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
@@ -5447,6 +5448,7 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            "is_self_repo": bool(project.is_self_repo),
             "enable_self_improvement": project.enable_self_improvement,
             # Trim-proof authoritative direction counts + operator ceiling. Both
             # are ``critical`` so the agent's direction views always anchor on the

@@ -61,6 +61,8 @@ export interface BuildConfig {
   /** ISO timestamp stamped when a repo_bootstrap task finishes successfully.
    *  Absent/null means bootstrap has not yet completed. */
   bootstrap_completed_at?: string | null;
+  /** True when detection determined the repository has no committed content yet. */
+  repo_is_empty?: boolean;
   /** Reason string stamped when a repo_bootstrap task completes but without
    *  fully succeeding (e.g. partial failure). When set and bootstrap_completed_at
    *  is absent, the project bootstrap is in a degraded state. */

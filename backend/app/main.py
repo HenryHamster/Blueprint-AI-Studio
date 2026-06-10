@@ -1302,6 +1302,21 @@ async def resolve_artifact_download_url(
         if job.project_id != project_id:
             raise HTTPException(status_code=404, detail="Artifact not found")
 
+        # Project membership is necessary but not sufficient for compute-job
+        # URIs. Only the recorded terminal outputs are allowed; unknown siblings
+        # under the same prefix are indistinguishable from "not found".
+        allowed_uris: set[str] = set()
+        if job.result_reference:
+            allowed_uris.add(job.result_reference)
+        if job.artifact_id is not None:
+            from app.models import Artifact  # noqa: PLC0415
+
+            artifact = await session.get(Artifact, job.artifact_id)
+            if artifact is not None and artifact.storage_uri:
+                allowed_uris.add(artifact.storage_uri)
+        if storage_uri not in allowed_uris:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+
     # 3. Sign. Validation already passed, so any failure here is a storage
     # outage, not a bad reference.
     try:

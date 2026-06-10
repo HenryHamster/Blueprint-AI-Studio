@@ -257,6 +257,141 @@ async def test_compute_downstream_artifact_rejects_transient_result_reference(
 
 
 @pytest.mark.asyncio
+async def test_compute_downstream_artifact_requires_durable_output_normal_mode(
+    db_session, _quiet_compute_io
+):
+    """Normal mode + downstream_artifact acceptance evidence + transient result →
+    FAILED. Declaring a downstream_artifact means the completed compute result
+    must be durably delivered, not just measured."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    transient_ref = "https://signed.example.com/jobs/abc/result.json?token=xyz"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=transient_ref),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+    assert task.status == TaskStatus.FAILED
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "artifact-delivery"
+    assert "require_durable_artifact" in gate["reason"]
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "transient"
+    assert (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_compute_downstream_artifact_passes_with_durable_output_normal_mode(
+    db_session, _quiet_compute_io
+):
+    """Normal mode + downstream_artifact acceptance evidence + gs:// result →
+    COMPLETED and delivers the artifact pointer to queued dependents."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "acceptance_evidence": {
+                "kind": "downstream_artifact",
+                "artifact_id": "experiment-result-bundle",
+            },
+        }
+    ]
+    dependent = Task(
+        project_id=task.project_id,
+        title="feat: consume experiment bundle",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(task)
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    gs_uri = "gs://blueprint-agent-artifacts/compute-jobs/downstream-result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=gs_uri),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    await db_session.refresh(dependent)
+    assert task.status == TaskStatus.COMPLETED
+    assert "evaluation_gate" not in task.context
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is True
+    assert delivery["durability"] == "durable"
+    prereqs = (dependent.context or {}).get(ARTIFACT_PREREQUISITES_KEY)
+    assert prereqs and prereqs[0]["logical_key"] == "experiment-result-bundle"
+
+
+@pytest.mark.asyncio
 async def test_deliver_artifact_no_partial_commit_on_scan_failure(
     db_session, _quiet_compute_io
 ):

@@ -1659,10 +1659,10 @@ async def test_spawn_design_doc_update_proceeds_when_bootstrap_completed(db_sess
 async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_self_repo(
     db_session,
 ):
-    """enable_self_improvement in the strategic payload is driven by build_config, not is_self_repo.
+    """Strategic payload ships repo identity separately from improvement mode.
 
-    is_self_repo=True without the explicit flag → False.
-    build_config={"enable_self_improvement": True} regardless of is_self_repo → True.
+    is_self_repo is the actual project identity. enable_self_improvement is
+    driven by build_config and may be true for an external project.
     """
     # Self-repo without explicit flag → False
     project_self_no_flag = _make_project(
@@ -1681,6 +1681,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
         select(Task).where(Task.project_id == project_self_no_flag.id)
     )
     task_self = result.scalars().one()
+    assert task_self.payloads[0]["is_self_repo"] is True
     assert task_self.payloads[0]["enable_self_improvement"] is False
 
     # Non-self-repo with explicit flag → True
@@ -1700,6 +1701,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
         select(Task).where(Task.project_id == project_flag.id)
     )
     task_flag = result2.scalars().one()
+    assert task_flag.payloads[0]["is_self_repo"] is False
     assert task_flag.payloads[0]["enable_self_improvement"] is True
 
 
@@ -4947,6 +4949,7 @@ async def test_direction_counts_survive_problem_model_floor_pressure(db_session)
         "research_mode": "strategic",
         "project_name": "P",
         "base_branch": "main",
+        "is_self_repo": False,
         "enable_self_improvement": False,
         "vision": {"purpose": "x"},
         "problem_model": {"gaps": [{"id": f"g{i}", "d": "y" * 200} for i in range(40)]},
@@ -4961,6 +4964,7 @@ async def test_direction_counts_survive_problem_model_floor_pressure(db_session)
     assert packed["direction_counts"]["active"] == 7, (
         "direction_counts must ship verbatim under maximum budget pressure"
     )
+    assert packed["is_self_repo"] is False
     assert packed["max_active_directions"] == 15
     meta = packed["_packer_meta"]
     affected = {e["key"] for e in meta["trimmed"]} | {e["key"] for e in meta["dropped"]}

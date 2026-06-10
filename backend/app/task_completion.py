@@ -2555,6 +2555,14 @@ async def _handle_compute_experiment_completion(
         task.context = crit_context
         flag_modified(task, "context")
 
+    acceptance_evidence = read_acceptance_evidence(task.first_payload)
+    requires_durable_artifact = bool(
+        (task.first_payload or {}).get("require_durable_artifact")
+    ) or (
+        acceptance_evidence is not None
+        and acceptance_evidence.kind == "downstream_artifact"
+    )
+
     prerequisite_mode = (
         (task.context or {}).get(COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY)
         == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
@@ -2592,18 +2600,12 @@ async def _handle_compute_experiment_completion(
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
         delivery = compute_result["artifact_delivery"]
-        # Tier-2 strict gate, prerequisite mode: a prerequisite that explicitly
-        # requested require_durable_artifact, or that declares downstream_artifact
-        # acceptance evidence (implying it must hand a durable artifact to its
-        # dependent), must NOT complete as satisfied unless a durable artifact was
-        # actually delivered. Mirrors the normal-mode gate at the Tier-2 block
-        # below. Ordinary prerequisites (no flag, no downstream_artifact evidence)
-        # stay fail-soft and complete on measurement alone.
-        evidence = read_acceptance_evidence(task.first_payload)
-        require_durable = bool(
-            (task.first_payload or {}).get("require_durable_artifact")
-        ) or (evidence is not None and evidence.kind == "downstream_artifact")
-        if require_durable and not delivery["delivered"]:
+        # Tier-2 strict gate: explicit require_durable_artifact and
+        # downstream_artifact acceptance evidence both require a durable
+        # artifact delivery before the task may complete. Ordinary
+        # prerequisites (no flag, no downstream_artifact evidence) stay
+        # fail-soft and complete on measurement alone.
+        if requires_durable_artifact and not delivery["delivered"]:
             miss_reason = (
                 f"require_durable_artifact: no durable artifact delivered "
                 f"(durability={delivery['durability']})"
@@ -2669,7 +2671,6 @@ async def _handle_compute_experiment_completion(
     measurement = _extract_compute_measurement(logs)
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
-    require_durable = bool((task.first_payload or {}).get("require_durable_artifact"))
     if measurement is not None:
         outcome, cost = measurement
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
@@ -2682,8 +2683,9 @@ async def _handle_compute_experiment_completion(
         plan_output["compute_result"] = compute_result
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
-        # Tier 2: opt-in strict gate — fail if no durable artifact delivered.
-        if require_durable and not delivery["delivered"]:
+        # Tier 2: strict gate — fail if the task declared it needs a durable
+        # artifact, either explicitly or via downstream_artifact evidence.
+        if requires_durable_artifact and not delivery["delivered"]:
             miss_reason = (
                 f"require_durable_artifact: no durable artifact delivered "
                 f"(durability={delivery['durability']})"
@@ -3838,14 +3840,22 @@ async def _handle_repo_bootstrap_completion(
                 result[k] = v
         return result
 
+    def _is_overview_complete(src: dict[str, Any]) -> bool:
+        """Check if overview has all required fields present and non-empty."""
+        for key in _OVERVIEW_KEYS:
+            value = src.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return False
+        return True
+
     ctx_overview = (task.context or {}).get("repo_overview")
-    if isinstance(ctx_overview, dict) and any(k in ctx_overview for k in _OVERVIEW_KEYS):
+    if isinstance(ctx_overview, dict) and _is_overview_complete(ctx_overview):
         overview = _build_overview(ctx_overview)
         source_revision = _extract_revision(ctx_overview)
     elif logs:
         try:
             parsed = json.loads(logs)
-            if isinstance(parsed, dict) and any(k in parsed for k in _OVERVIEW_KEYS):
+            if isinstance(parsed, dict) and _is_overview_complete(parsed):
                 overview = _build_overview(parsed)
                 source_revision = _extract_revision(parsed)
         except (json.JSONDecodeError, TypeError):

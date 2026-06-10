@@ -410,7 +410,7 @@ export async function handleStrategic(
     const selfReflectionEntries = Array.isArray(payload.self_reflection_log)
       ? payload.self_reflection_log as Array<Record<string, unknown>>
       : [];
-    const isSelfRepo = payload.enable_self_improvement === true;
+    const isSelfRepo = payload.is_self_repo === true;
 
     const renderRunningUpdateDoc = (doc: string): string => {
       if (!doc.trim()) {
@@ -551,7 +551,7 @@ export async function handleStrategic(
 
     const pastRetirementCritiquesSection = formatPastRetirementCritiques(payload.past_retirement_critiques);
 
-    const selfImprovementBlock = payload.enable_self_improvement === true ? `
+    const selfImprovementBlock = payload.enable_self_improvement === true && isSelfRepo ? `
 
 # Self-improvement
 
@@ -565,7 +565,23 @@ propose a direction that modifies the code governing your behavior.
 Cite the reflection entries via \`source.type=self_reflection\`.
 
 You don't need user permission to improve yourself — that's the whole
-point of self-repo. Just do it and tell the user in whats_changed.` : '';
+point of self-repo. Just do it and tell the user in whats_changed.`
+      : payload.enable_self_improvement === true ? `
+
+# Project improvement
+
+This project's codebase is eligible for agent-proposed improvement work. When
+you notice recurring project friction — missing context, unclear workflows,
+schema friction, or automation gaps — treat it as a project gap. Name it.
+
+Look at "What you previously said was hard" above. If the same theme appears in
+2+ reflections and it points to this project's product or developer experience,
+open a gap and propose a direction that improves this project. Cite the
+reflection entries via \`source.type=self_reflection\`.
+
+Keep the framing project-specific: do not assume this repository contains the
+agent runtime itself, and do not describe the work as modifying your own
+prompts, schemas, tools, or orchestration.` : '';
 
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
