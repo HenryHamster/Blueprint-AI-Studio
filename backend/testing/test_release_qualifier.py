@@ -8985,6 +8985,203 @@ async def test_maybe_finalize_already_finalized_version_returns_none(db_session)
     # Status must not have changed — still dry_run.
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+async def _seed_pending_qualification_with_challenge(
+    db_session,
+    project,
+    version,
+    *,
+    audit_status: TaskStatus = TaskStatus.COMPLETED,
+    smoke_status: TaskStatus = TaskStatus.COMPLETED,
+    challenge_status: TaskStatus = TaskStatus.COMPLETED,
+    started_at: str | None = None,
+) -> tuple[Task, Task, Task]:
+    """Like _seed_pending_qualification but also creates a challenge child task
+    and stamps challenge_task_id in last_qualification."""
+    from app.time_utils import _utcnow
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-child",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-child-ch",
+        status=audit_status,
+        context={"release_version_id": str(version.id)},
+    )
+    smoke_task = Task(
+        project_id=project.id,
+        title="smoke-child",
+        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        vm_instance_id="vm-smoke-child-ch",
+        status=smoke_status,
+        context={"release_version_id": str(version.id)},
+    )
+    challenge_task = Task(
+        project_id=project.id,
+        title="challenge-child",
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        vm_instance_id="vm-challenge-child",
+        status=challenge_status,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    db_session.add(challenge_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+    await db_session.refresh(challenge_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": started_at or _utcnow().isoformat(),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+        "challenge_task_id": str(challenge_task.id),
+        "audit_challenge_task_id": str(challenge_task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return audit_task, smoke_task, challenge_task
+
+
+@pytest.mark.asyncio
+async def test_required_children_terminal_waits_for_release_audit_challenge(db_session):
+    """_required_children_terminal returns False when audit and smoketest are
+    terminal but challenge_task_id is present and its child is still IN_PROGRESS.
+    Finalize must not fire until the challenge child is also terminal."""
+    from app import shared_state
+    from app.release_qualifier import _required_children_terminal
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    # audit + smoke COMPLETED, challenge still IN_PROGRESS.
+    _audit_task, _smoke_task, _challenge_task = (
+        await _seed_pending_qualification_with_challenge(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            challenge_status=TaskStatus.IN_PROGRESS,
+        )
+    )
+
+    result = await _required_children_terminal(db_session, version)
+
+    assert result is False, (
+        "finalize-gate must return False while challenge child is IN_PROGRESS"
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_children_terminal_true_when_all_three_terminal(db_session):
+    """_required_children_terminal returns True only when audit, smoketest, AND
+    challenge children are all in terminal states."""
+    from app import shared_state
+    from app.release_qualifier import _required_children_terminal
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    # All three terminal.
+    await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        challenge_status=TaskStatus.COMPLETED,
+    )
+
+    result = await _required_children_terminal(db_session, version)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_challenge_child_non_terminal_returns_none(db_session):
+    """maybe_finalize_qualification returns None and does NOT finalize when
+    audit and smoketest are terminal but the challenge child is still running."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    audit_task, _smoke_task, _challenge_task = (
+        await _seed_pending_qualification_with_challenge(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            challenge_status=TaskStatus.IN_PROGRESS,
+        )
+    )
+
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is None
+
+    # Version must still be pending — finalize must NOT have run.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_qualification_in_flight_true_when_challenge_non_terminal(db_session):
+    """_qualification_in_flight returns True when audit+smoke are terminal but
+    the challenge child is still IN_PROGRESS — the qualification is still active."""
+    from app.release_qualifier import _qualification_in_flight
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        challenge_status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await _qualification_in_flight(db_session, version)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_qualification_in_flight_false_when_all_three_terminal(db_session):
+    """_qualification_in_flight returns False when ALL three children (audit,
+    smoketest, challenge) are terminal — the qualification is eligible for a
+    fresh run, not blocked by a prior in-flight execution."""
+    from app.release_qualifier import _qualification_in_flight
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        challenge_status=TaskStatus.COMPLETED,
+    )
+
+    result = await _qualification_in_flight(db_session, version)
+
+    assert result is False
+
+
 
 
 # ===========================================================================
