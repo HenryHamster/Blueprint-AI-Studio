@@ -108,19 +108,40 @@ def record_trial_verdict(
 ) -> None:
     """Upsert a trial verdict entry for ``cap_name`` into ``project.capability_adoption_verdicts``.
 
-    The new entry SUPERSEDES any prior entry for the same capability — one durable
-    verdict per capability, newest wins.  Callers must flush/commit the session
-    after this call.
+    A decided verdict (``adopt`` or ``reject``) is only superseded by another decided
+    verdict or an explicit strategist re-declaration.  A ``continue-trial`` write
+    (insufficient data or ambiguous lift) must never downgrade a decided verdict:
+    once ``adopt`` sets holdback to 0.0, the without-arm cannot repopulate, so the
+    system cannot re-derive that verdict from live data.  Reverting to ``continue-trial``
+    silently re-enables a rejected capability or silently reopens the holdback on an
+    adopted one.
+
+    Callers must flush/commit the session after this call.
     """
     if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
         project.capability_adoption_verdicts = {}
 
     prior = project.capability_adoption_verdicts.get(cap_name)
+    prior_verdict = (prior or {}).get("verdict")
+    new_verdict = entry.get("verdict")
+
+    if (
+        prior_verdict in ("adopt", "reject")
+        and new_verdict == "continue-trial"
+        and entry.get("evidence_source") != "strategic_review"
+    ):
+        logger.info(
+            "[CAPABILITY_TRIAL] skipping continue-trial write for %s — "
+            "decided verdict %r is standing (insufficient-data evaluation cannot "
+            "self-revert a decision; explicit strategist re-declaration required)",
+            cap_name,
+            prior_verdict,
+        )
+        return
+
     project.capability_adoption_verdicts[cap_name] = entry
     flag_modified(project, "capability_adoption_verdicts")
 
-    prior_verdict = (prior or {}).get("verdict")
-    new_verdict = entry.get("verdict")
     if prior_verdict and prior_verdict != new_verdict:
         logger.info(
             "[CAPABILITY_TRIAL] verdict transition for %s: %s → %s "

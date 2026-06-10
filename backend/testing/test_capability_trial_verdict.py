@@ -6,6 +6,8 @@ Covers:
   - evaluate_trial_verdict: None lift → continue-trial
   - evaluate_trial_verdict: configurable thresholds respected
   - record_trial_verdict: upserts and supersedes prior verdict
+  - record_trial_verdict: decided verdicts cannot be self-reverted by continue-trial
+  - record_trial_verdict: decided → decided transitions still supersede normally
   - get_trial_verdicts: returns empty dict when column is absent/None
 """
 
@@ -166,6 +168,7 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"] == entry
 
     def test_supersedes_prior_verdict(self):
+        # continue-trial → adopt is an allowed upward transition
         project = _make_project()
         prior = {"verdict": "continue-trial", "lift": 0.01, "n_with": 10, "n_without": 10}
         project.capability_adoption_verdicts = {"repo_map": prior}
@@ -176,6 +179,160 @@ class TestRecordTrialVerdict:
 
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.07
+
+    def test_continue_trial_does_not_overwrite_adopt(self):
+        project = _make_project()
+        decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        insufficient = {"verdict": "continue-trial", "lift": None, "n_with": 3, "n_without": 2}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", insufficient)
+
+        # Decided verdict preserved; flag_modified not called (no write happened)
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
+        mock_flag.assert_not_called()
+
+    def test_continue_trial_does_not_overwrite_reject(self):
+        project = _make_project()
+        decided = {"verdict": "reject", "lift": -0.08, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        insufficient = {"verdict": "continue-trial", "lift": 0.0, "n_with": 5, "n_without": 0}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", insufficient)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        mock_flag.assert_not_called()
+
+    def test_decided_verdict_survives_insufficient_data_reevaluation(self):
+        """Acceptance test: adopt persists when the periodic evaluator returns continue-trial.
+
+        After adoption, holdback goes to 0.0 and no without-arm tasks accrue.
+        Once pre-decision tasks age out of the window the evaluator sees n_without=0
+        and must return continue-trial.  That continue-trial must not self-revert the adopt.
+        """
+        from app.capability_trial_verdict import evaluate_trial_verdict
+
+        project = _make_project()
+        # Record the initial adoption decision
+        adopt_entry = evaluate_trial_verdict(
+            lift=0.07, n_with=40, n_without=40,
+            evaluated_at="2026-06-01T00:00:00",
+        )
+        assert adopt_entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", adopt_entry)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+
+        # Simulate periodic digest re-evaluation after window rolls: without-arm dried up
+        reevaluation = evaluate_trial_verdict(
+            lift=None, n_with=0, n_without=0,
+            evaluated_at="2026-06-09T00:00:00",
+        )
+        assert reevaluation["verdict"] == "continue-trial"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", reevaluation)
+
+        # The adopt must survive the insufficient-data reevaluation
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.07
+        mock_flag.assert_not_called()
+
+    def test_adopt_still_overwrites_reject(self):
+        # decided → decided transitions must still work (reversal with full evidence)
+        project = _make_project()
+        prior = {"verdict": "reject", "lift": -0.05, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        reversal = {"verdict": "adopt", "lift": 0.08, "n_with": 50, "n_without": 50, "evidence_source": "strategic_review"}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", reversal)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        mock_flag.assert_called_once()
+
+    def test_reject_still_overwrites_adopt(self):
+        project = _make_project()
+        prior = {"verdict": "adopt", "lift": 0.07, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        reversal = {"verdict": "reject", "lift": -0.06, "n_with": 50, "n_without": 50}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", reversal)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        mock_flag.assert_called_once()
+
+    def test_strategic_review_continue_trial_reopens_decided_verdict(self):
+        """Strategist re-declaration with continue-trial must override a decided verdict.
+
+        The strategist is the one actor authorised to deliberately reopen a trial
+        (e.g. to resume default holdback after an erroneous adoption).  When
+        evidence_source='strategic_review', the guard must not block the write.
+        """
+        project = _make_project()
+        decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        strategic_reopen = {
+            "verdict": "continue-trial",
+            "evidence_source": "strategic_review",
+            "rationale": "re-opening trial for more data",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", strategic_reopen)
+
+        # Strategic re-declaration must supersede the prior decided verdict
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+        mock_flag.assert_called_once()
+
+    def test_strategic_review_continue_trial_reopens_reject(self):
+        """Same re-open semantics apply when prior verdict is reject."""
+        project = _make_project()
+        decided = {"verdict": "reject", "lift": -0.08, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        strategic_reopen = {
+            "verdict": "continue-trial",
+            "evidence_source": "strategic_review",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", strategic_reopen)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        mock_flag.assert_called_once()
+
+    def test_non_strategic_continue_trial_still_blocked_after_decide(self):
+        """Auto-evaluation continue-trial (no evidence_source) must still be blocked."""
+        project = _make_project()
+        decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        auto_eval = {"verdict": "continue-trial", "lift": None, "n_with": 0, "n_without": 0}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", auto_eval)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        mock_flag.assert_not_called()
+
+    def test_continue_trial_overwrites_prior_continue_trial(self):
+        # Normal trial progression: continue-trial updates are allowed
+        project = _make_project()
+        prior = {"verdict": "continue-trial", "lift": 0.01, "n_with": 10, "n_without": 10}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        newer = {"verdict": "continue-trial", "lift": 0.02, "n_with": 20, "n_without": 20}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", newer)
+
+        assert project.capability_adoption_verdicts["repo_map"]["n_with"] == 20
+        mock_flag.assert_called_once()
 
     def test_initializes_column_when_none(self):
         project = MagicMock()
