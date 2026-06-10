@@ -3004,6 +3004,72 @@ class TestKnowledgeFindingRouting:
         assert child.first_payload["type"] == "design"
 
     @_pytest.mark.asyncio
+    async def test_design_child_available_capabilities_carry_proof_status(
+        self, db_session, mocker
+    ):
+        """The vocabulary-rendering child payload (design/plan/research) ships
+        available_capabilities annotated with proof_status so the child can
+        distinguish proven from working-but-unproven capabilities."""
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        project, direction, task = await _grader_project_and_task(
+            db_session, "d-know-ds02"
+        )
+        # Registry declares two capabilities; only one has a durable proof record.
+        project.problem_model = {
+            "intent": {"purpose": "test"},
+            "capabilities": [
+                {"name": "auth-core", "status": "working"},
+                {"name": "fraud-detect", "status": "working"},
+            ],
+        }
+        project.capability_proof_records = {
+            "auth-core": [{"proof_kind": "named_test", "commit_sha": "abc123"}],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        finding = _make_finding(
+            title="Design the ingestion pipeline",
+            direction_id="d-know-ds02",
+            finding_type="design",
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        for path, value in (
+            ("app.research_completion.resolve_branch_verification_context", {}),
+            ("app.research_completion.resolve_head_commit", None),
+            ("app.research_completion.cited_paths_changed_since", False),
+            ("app.research_completion._summarize_ungrounded_claims_grounded", None),
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=value))
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        child = next(c for c in children if c.title == finding["title"])
+        caps = child.first_payload.get("available_capabilities")
+        assert isinstance(caps, list) and caps, "available_capabilities should ship"
+        by_name = {c["name"]: c for c in caps}
+        assert by_name["auth-core"]["proof_status"] == "proven"
+        assert by_name["fraud-detect"]["proof_status"] == "unproven"
+
+    @_pytest.mark.asyncio
     async def test_large_scope_web_research_finding_not_routed_to_plan(
         self, db_session, mocker
     ):

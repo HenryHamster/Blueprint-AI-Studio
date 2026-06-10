@@ -93,6 +93,39 @@ def registry_capability_vocabulary(problem_model: object) -> list[dict]:
     return vocab
 
 
+def annotate_capability_proof_status(
+    vocab: list[dict], proof_records: dict | None
+) -> list[dict]:
+    """Annotate each capability vocab entry with its durable proof status.
+
+    Adds a ``proof_status`` field to each entry:
+      - ``"proven"`` when ``proof_records`` contains at least one proof entry
+        for that capability (evidence-grounded, machine-checked).
+      - ``"unproven"`` otherwise (mere claim, no verified evidence yet).
+
+    Input ``vocab`` is not mutated — a shallow copy of each entry is returned.
+    Fail-open: unexpected shapes pass through unchanged. Shared by every spawn
+    path (strategic, design, research, plan/finding) so all four prompt
+    surfaces ship the SAME proven/unproven annotation alongside ``status``.
+    """
+    if not isinstance(vocab, list):
+        return vocab
+    records = proof_records if isinstance(proof_records, dict) else {}
+    annotated: list[dict] = []
+    for entry in vocab:
+        if not isinstance(entry, dict):
+            annotated.append(entry)
+            continue
+        entry2 = dict(entry)
+        cap_name = entry2.get("name")
+        if isinstance(cap_name, str) and records.get(cap_name):
+            entry2["proof_status"] = "proven"
+        else:
+            entry2["proof_status"] = "unproven"
+        annotated.append(entry2)
+    return annotated
+
+
 def working_capability_names(problem_model: object) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 

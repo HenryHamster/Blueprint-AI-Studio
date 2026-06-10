@@ -12839,3 +12839,42 @@ async def test_research_payload_omits_demand_when_none(db_session):
     assert "missing_capability_demand" not in payload
     assert "Missing-foundation demand" not in (payload.get("prompt_suffix") or "")
     validate_internal_payload(dict(payload), "test_research_no_demand")
+
+
+@pytest.mark.asyncio
+async def test_research_payload_available_capabilities_carry_proof_status(db_session):
+    """The research payload's available_capabilities entries carry the durable
+    proof_status axis (proven vs unproven) so the research agent can distinguish
+    proven from working-but-unproven capabilities when declaring refs."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research3", "Active research lane")]
+    )
+    # Registry declares two capabilities; only one has a durable proof record.
+    project.problem_model = {
+        "intent": {"purpose": "test"},
+        "capabilities": [
+            {"name": "auth-core", "status": "working"},
+            {"name": "fraud-detect", "status": "working"},
+        ],
+    }
+    project.capability_proof_records = {
+        "auth-core": [{"proof_kind": "named_test", "commit_sha": "abc123"}],
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+
+    caps = payload.get("available_capabilities")
+    assert isinstance(caps, list) and caps, "available_capabilities should be present"
+    by_name = {c["name"]: c for c in caps}
+    assert by_name["auth-core"]["proof_status"] == "proven"
+    assert by_name["fraud-detect"]["proof_status"] == "unproven"
+    validate_internal_payload(dict(payload), "test_research_proof_status")

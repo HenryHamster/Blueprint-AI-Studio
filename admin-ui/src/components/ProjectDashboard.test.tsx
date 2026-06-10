@@ -295,6 +295,106 @@ describe('ProjectDashboard', () => {
     expect(badge).toHaveAttribute('title', expect.stringContaining('most common: no runnable test command could be detected'));
   });
 
+  it('renders capability proof and adoption evidence for selected project', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const { container } = render(
+      <ProjectDashboard
+        projects={[makeProject({
+          capability_proof_summary: {
+            'repo-map-navigation': {
+              proof_count: 3,
+              latest_proof_kind: 'merge-test',
+              latest_proved_at: '2026-06-09T12:00:00Z',
+              latest_commit_sha: 'abc1234',
+            },
+          },
+          capability_adoption_verdicts: {
+            'repo-map-navigation': {
+              verdict: 'adopt',
+              lift: 0.123,
+              n_with: 18,
+              n_without: 17,
+              evaluated_at: '2026-06-09T13:30:00Z',
+              thresholds: {
+                min_n_per_arm: 12,
+                adopt_lift: 0.08,
+                reject_lift: -0.04,
+              },
+            },
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Capability Evidence')).toBeInTheDocument();
+    expect(screen.getByText('repo-map-navigation')).toBeInTheDocument();
+    expect(container).toHaveTextContent('3 proofs');
+    expect(container).toHaveTextContent('Kind merge-test');
+    expect(container).toHaveTextContent(/Jun 9.*12:00:00/);
+    expect(container).toHaveTextContent('SHA abc1234');
+    expect(screen.getByText('adopt')).toBeInTheDocument();
+    expect(container).toHaveTextContent('Lift +0.123');
+    expect(container).toHaveTextContent('Samples 18 with / 17 without');
+    expect(container).toHaveTextContent('Thresholds: min n/arm 12 · adopt 0.08 · reject -0.04');
+  });
+
+  it('shows no proof yet for verdict-only capability evidence', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const { container } = render(
+      <ProjectDashboard
+        projects={[makeProject({
+          capability_proof_summary: {},
+          capability_adoption_verdicts: {
+            'prompt-upgrade': {
+              verdict: 'continue-trial',
+              lift: null,
+              n_with: 4,
+              n_without: 5,
+              thresholds: { min_n_per_arm: 10 },
+            },
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('prompt-upgrade')).toBeInTheDocument();
+    expect(screen.getByText('no proof yet')).toBeInTheDocument();
+    expect(screen.getByText('continue-trial')).toBeInTheDocument();
+    expect(container).toHaveTextContent('Samples 4 with / 5 without');
+  });
+
+  it('shows no active/adjudicated trial for proof-only capability evidence', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          capability_proof_summary: {
+            'structured-output-repair': {
+              proof_count: 1,
+              latest_proof_kind: 'review-fix',
+              latest_proved_at: '2026-06-08T09:15:00Z',
+              latest_commit_sha: 'def5678',
+            },
+          },
+          capability_adoption_verdicts: {},
+        })]}
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('structured-output-repair')).toBeInTheDocument();
+    expect(screen.getByText('1 proof')).toBeInTheDocument();
+    expect(screen.getAllByText('no active/adjudicated trial').length).toBeGreaterThanOrEqual(1);
+  });
+
   it('leaves the badge tooltip unchanged for a legacy runtime with no summary', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(

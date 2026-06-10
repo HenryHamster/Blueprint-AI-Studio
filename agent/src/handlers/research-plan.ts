@@ -1302,18 +1302,31 @@ export function buildCapabilityVerificationSection(
 export function buildAvailableCapabilitiesSection(caps: unknown): string {
   if (!Array.isArray(caps) || caps.length === 0) return '';
   const lines: string[] = [];
+  let anyProofStatus = false;
   for (const c of caps) {
     if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
     const rec = c as Record<string, unknown>;
     const name = strVal(rec.name);
     if (!name) continue;
     const status = strVal(rec.status);
-    lines.push(status ? `- \`${name}\` (${status})` : `- \`${name}\``);
+    // proof_status is the SECOND, durable axis (proven / unproven) the strategist
+    // records at merge time — independent of the declared status. Render it
+    // alongside status when present so a working-but-unproven capability reads
+    // differently from a proven one. Absent-field callers render exactly as
+    // before (back-compat: `(working)` / `(planned)` / bare name).
+    const proofStatus = strVal(rec.proof_status);
+    if (proofStatus) anyProofStatus = true;
+    const qualifiers = [status, proofStatus].filter(Boolean);
+    lines.push(qualifiers.length ? `- \`${name}\` (${qualifiers.join(', ')})` : `- \`${name}\``);
   }
   if (lines.length === 0) return '';
+  const legend = anyProofStatus
+    ? 'Each entry shows its declared `status` (working / partial / planned) and, when known, its durable `proof_status` (proven / unproven). `proven` means evidence-grounded proof records exist; `working, unproven` means the registry declares it working but no proof has been recorded yet — prefer proven capabilities when a prerequisite must be reliable, and treat unproven ones as claims still awaiting verification.'
+    : null;
   return [
     '# AVAILABLE CAPABILITIES (shared vocabulary)',
     'These are the project\'s canonical capability names — the strategist-curated registry (`problem_model.capabilities`). It is the SHARED VOCABULARY for cross-lane prerequisites: when you declare a `prerequisite` capability ref OR a `provides_capability` stamp, DRAW THE NAME FROM THIS LIST so producers and consumers converge on the SAME string (the matcher is EXACT, never fuzzy). Propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed here.',
+    ...(legend ? [legend] : []),
     ...lines,
   ].join('\n') + '\n\n';
 }

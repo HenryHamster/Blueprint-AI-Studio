@@ -79,6 +79,7 @@ from app.task_evaluators import (
     spawn_finding_challenge,
 )
 from app.capability_registry import (
+    annotate_capability_proof_status,
     off_registry_capability_refs,
     registry_capability_names,
     registry_capability_vocabulary,
@@ -1975,8 +1976,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # The agent-facing capability vocabulary (canonical name + status) surfaced
     # into read-only planning/knowledge child payloads below so producers and
     # consumers draw declared capabilities from the SAME shared namespace.
-    _registry_vocab = registry_capability_vocabulary(
-        getattr(project_obj, "problem_model", None)
+    _registry_vocab = annotate_capability_proof_status(
+        registry_capability_vocabulary(
+            getattr(project_obj, "problem_model", None)
+        ),
+        getattr(project_obj, "capability_proof_records", None),
     )
     _annotate_capability_declarations(findings, _registry_names)
 

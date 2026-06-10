@@ -715,6 +715,68 @@ class TestGetProject:
         assert "env_vars" not in data["build_config"]
         assert data["build_config"].get("node_version") == "20"
 
+    @pytest.mark.asyncio
+    async def test_detail_includes_capability_proof_summary_and_adoption_verdicts(
+        self, client: AsyncClient, db_session
+    ):
+        """Project detail returns proof summaries and durable trial verdicts."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Capability Evidence Detail")
+        project.capability_proof_records = {
+            "repo-map-navigation": [
+                {
+                    "proof_kind": "initial-claim",
+                    "proved_at": "2026-06-08T10:00:00Z",
+                    "commit_sha": "1111111",
+                },
+                {
+                    "proof_kind": "merge-test",
+                    "proved_at": "2026-06-09T12:00:00Z",
+                    "commit_sha": "abc1234",
+                },
+            ],
+        }
+        project.capability_adoption_verdicts = {
+            "repo-map-navigation": {
+                "verdict": "adopt",
+                "lift": 0.123,
+                "n_with": 18,
+                "n_without": 17,
+                "thresholds": {
+                    "min_n_per_arm": 12,
+                    "adopt_lift": 0.08,
+                    "reject_lift": -0.04,
+                },
+            }
+        }
+        flag_modified(project, "capability_proof_records")
+        flag_modified(project, "capability_adoption_verdicts")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["capability_proof_summary"]["repo-map-navigation"] == {
+            "proof_count": 2,
+            "latest_proof_kind": "merge-test",
+            "latest_proved_at": "2026-06-09T12:00:00Z",
+            "latest_commit_sha": "abc1234",
+        }
+        assert data["capability_adoption_verdicts"]["repo-map-navigation"] == {
+            "verdict": "adopt",
+            "lift": 0.123,
+            "n_with": 18,
+            "n_without": 17,
+            "thresholds": {
+                "min_n_per_arm": 12,
+                "adopt_lift": 0.08,
+                "reject_lift": -0.04,
+            },
+        }
+
 
 class TestUpdateProject:
     @pytest.mark.asyncio

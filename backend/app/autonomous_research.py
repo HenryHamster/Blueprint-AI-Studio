@@ -60,6 +60,7 @@ from app.capability_demand import (
     missing_demand_prompt_hint,
 )
 from app.capability_registry import (
+    annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -1865,8 +1866,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # refs from the SAME shared namespace consumers draw from. Additive and
         # optional: omitted on the empty path, older agents ignore it and still
         # validate.
-        _available_capabilities = registry_capability_vocabulary(
-            project.problem_model
+        _available_capabilities = annotate_capability_proof_status(
+            registry_capability_vocabulary(project.problem_model),
+            getattr(project, "capability_proof_records", None),
         )
         if _available_capabilities:
             research_payload["available_capabilities"] = _available_capabilities

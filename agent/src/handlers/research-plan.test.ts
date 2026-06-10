@@ -1202,6 +1202,42 @@ describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
     // No status parens for the status-less entry on its own line.
     expect(section).toMatch(/- `auth-core`\n/);
   });
+
+  it('renders proof_status alongside status across proven / unproven / partial / planned', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working', proof_status: 'proven' },
+      { name: 'fraud-detect', status: 'working', proof_status: 'unproven' },
+      { name: 'risk-scoring', status: 'partial', proof_status: 'unproven' },
+      { name: 'seeded-eval-harness', status: 'planned', proof_status: 'unproven' },
+    ]);
+    // proven renders as the lone second qualifier next to its declared status.
+    expect(section).toContain('`payment-core` (working, proven)');
+    // working-but-unproven is visibly distinct from proven.
+    expect(section).toContain('`fraud-detect` (working, unproven)');
+    expect(section).toContain('`risk-scoring` (partial, unproven)');
+    expect(section).toContain('`seeded-eval-harness` (planned, unproven)');
+    // A one-line legend distinguishing the two axes is present.
+    expect(section).toContain('proof_status');
+    expect(section).toMatch(/evidence-grounded proof records exist/);
+  });
+
+  it('renders proof_status without a declared status as the sole qualifier', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'audit-gate', proof_status: 'proven' },
+    ]);
+    expect(section).toContain('`audit-gate` (proven)');
+  });
+
+  it('omits the proof legend and renders status-only when no entry carries proof_status', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working' },
+      { name: 'seeded-eval-harness', status: 'planned' },
+    ]);
+    // Back-compat: status-only rendering is unchanged when proof_status is absent.
+    expect(section).toContain('`payment-core` (working)');
+    expect(section).toContain('`seeded-eval-harness` (planned)');
+    expect(section).not.toContain('proof_status');
+  });
 });
 
 describe('CAPABILITY_DECLARATION_DOC (uniform across task types)', () => {

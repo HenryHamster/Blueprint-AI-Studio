@@ -45,6 +45,7 @@ from app.capability_demand import (
 )
 from app.capability_trial_verdict import get_trial_verdicts
 from app.capability_registry import (
+    annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -782,35 +783,11 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
     return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
-def _annotate_capability_proof_status(
-    vocab: list[dict], proof_records: dict | None
-) -> list[dict]:
-    """Annotate each capability vocab entry with its durable proof status.
-
-    Adds a ``proof_status`` field to each entry:
-      - ``"proven"`` when ``proof_records`` contains at least one proof entry
-        for that capability (evidence-grounded, machine-checked).
-      - ``"unproven"`` otherwise (mere claim, no verified evidence yet).
-
-    Input ``vocab`` is not mutated — a shallow copy of each entry is returned.
-    Fail-open: unexpected shapes pass through unchanged.
-    """
-    if not isinstance(vocab, list):
-        return vocab
-    records = proof_records if isinstance(proof_records, dict) else {}
-    annotated: list[dict] = []
-    for entry in vocab:
-        if not isinstance(entry, dict):
-            annotated.append(entry)
-            continue
-        entry2 = dict(entry)
-        cap_name = entry2.get("name")
-        if isinstance(cap_name, str) and records.get(cap_name):
-            entry2["proof_status"] = "proven"
-        else:
-            entry2["proof_status"] = "unproven"
-        annotated.append(entry2)
-    return annotated
+# Back-compat alias: the proof-status annotation now lives in the IO-free
+# capability_registry leaf so every spawn path (strategic, design, research,
+# plan/finding) can call it without importing this module. The two call sites
+# below and the existing test import keep using this name.
+_annotate_capability_proof_status = annotate_capability_proof_status
 
 
 async def _verify_capability_backing_paths(

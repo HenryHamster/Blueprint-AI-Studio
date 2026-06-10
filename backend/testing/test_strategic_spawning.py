@@ -8402,6 +8402,15 @@ class TestAnnotateCapabilityProofStatus:
         assert _annotate_capability_proof_status(None, {}) is None  # type: ignore[arg-type]
         assert _annotate_capability_proof_status("invalid", {}) == "invalid"  # type: ignore[arg-type]
 
+    def test_alias_is_shared_registry_public_fn(self):
+        # The annotation body now lives in the IO-free capability_registry leaf
+        # so every spawn path (strategic, design, research, plan) can call it;
+        # the module-local name is a back-compat alias for the same function.
+        from app.capability_registry import annotate_capability_proof_status
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        assert _annotate_capability_proof_status is annotate_capability_proof_status
+
 
 # ── _verify_capability_backing_paths: advisory capability verification ────────
 
