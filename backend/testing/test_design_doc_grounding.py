@@ -5,8 +5,10 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from app.playbook_learning import (
+    branch_grounding_due,
     ground_design_doc_systems,
     ground_design_doc_systems_branch_aware,
+    mark_branch_grounding_done,
     recover_grounding_downgrades,
     recover_grounding_downgrades_branch_aware,
 )
@@ -445,3 +447,74 @@ def test_downgrade_then_recover_idempotent(tmp_path):
     # Entry now has status=mature (not missing) → recovery skips it.
     assert doc["systems/auth"]["status"] == "mature"
     assert doc["_meta"]["revision"] == rev_after_first_recover
+
+
+def test_recovery_runs_when_cooldown_not_elapsed(monkeypatch):
+    """Recovery fires on every claim regardless of the 6h downgrade cooldown.
+
+    Simulates the path in agent.py where recover_grounding_downgrades_branch_aware
+    is called unconditionally before the branch_grounding_due guard.  Even when
+    the cooldown has NOT elapsed (branch_grounding_due returns False), recovery
+    should restore a falsely-downgraded entry and ground_design_doc_systems_branch_aware
+    must NOT be called.
+    """
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=True),
+    )
+
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": (
+                "claimed mature but all referenced module file(s) are absent on the"
+                " integration branch — treat as missing"
+            ),
+            "grounding_prior_status": "mature",
+        }
+    }
+    # Stamp the cooldown so branch_grounding_due returns False.
+    mark_branch_grounding_done(doc)
+    assert not branch_grounding_due(doc), "precondition: cooldown window active"
+
+    # Recovery should still fire and restore the entry.
+    recovered = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+
+    assert recovered["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in recovered["systems/auth"]
+    assert recovered["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+    # The full downgrade sweep (ground_design_doc_systems_branch_aware) must
+    # NOT have been called — it stays behind the cooldown guard.
+    sweep_called = False
+
+    async def _mock_sweep(d, **kw):
+        nonlocal sweep_called
+        sweep_called = True
+        return d
+
+    monkeypatch.setattr(
+        "app.playbook_storage.ground_design_doc_systems_branch_aware",
+        _mock_sweep,
+    )
+    # Confirm: with the cooldown still active, calling only the recovery
+    # function leaves sweep_called False.
+    asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert not sweep_called, "downgrade sweep must not run when cooldown is active"

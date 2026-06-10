@@ -2153,27 +2153,31 @@ async def claim_task(
                                 mark_branch_grounding_done,
                                 recover_grounding_downgrades_branch_aware,
                             )
+                            from app.source_ref_validation import (
+                                resolve_branch_verification_context,
+                            )
 
+                            repo_root: str = (
+                                _shared_state.runtime_config.get(
+                                    "playbook_repo_root", ""
+                                )
+                                or ""
+                            )
+                            verification_kwargs = (
+                                await resolve_branch_verification_context(
+                                    session, _pb_proj
+                                )
+                            )
+                            # Recovery runs unconditionally — only scans entries
+                            # already in the 'missing' state with a prior_status,
+                            # so its GitHub API cost is much lower than the full
+                            # downgrade sweep. False-missing markers should clear
+                            # on the next claim, not wait for the 6h cooldown.
+                            doc = await recover_grounding_downgrades_branch_aware(
+                                doc, repo_root=repo_root, **verification_kwargs
+                            )
                             if branch_grounding_due(doc):
-                                from app.source_ref_validation import (
-                                    resolve_branch_verification_context,
-                                )
-
-                                repo_root: str = (
-                                    _shared_state.runtime_config.get(
-                                        "playbook_repo_root", ""
-                                    )
-                                    or ""
-                                )
-                                verification_kwargs = (
-                                    await resolve_branch_verification_context(
-                                        session, _pb_proj
-                                    )
-                                )
                                 doc = await check_and_flag_stale_refs_branch_aware(
-                                    doc, repo_root=repo_root, **verification_kwargs
-                                )
-                                doc = await recover_grounding_downgrades_branch_aware(
                                     doc, repo_root=repo_root, **verification_kwargs
                                 )
                                 doc = await ground_design_doc_systems_branch_aware(
