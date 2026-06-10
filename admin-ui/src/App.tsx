@@ -25,6 +25,7 @@ import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import { TaskLaunchFAB } from './components/TaskLaunchFAB';
+import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
@@ -771,6 +772,10 @@ export default function App() {
               s.addToast('Could not load task — it may have been deleted', 'error');
             });
           }
+        }}
+        onLaunchCompute={() => {
+          s.setComputeExperiment(defaultComputeExperimentForm());
+          s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
         }}
         onProjectDeleted={(projectId) => {
           if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);

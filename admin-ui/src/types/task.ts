@@ -183,7 +183,12 @@ export interface Task {
       title?: string;
       deferred_reason?: string;
       adversarial_gate_reason?: string | null;
+      adversarial_challenger_task_id?: string | null;
     }>;
+    // Bounded provenance for the last adversarial challenger — written by
+    // _resolve_quality_grader_completion in task_lifecycle.py when the adversarial
+    // grader completes or fails.
+    adversarial_gate_diagnostic?: AdversarialGateDiagnostic | null;
     research_spawn_gate_challenged_count?: number;
     research_spawn_gate_refuted_count?: number;
     research_spawn_gate_survived_count?: number;
@@ -245,6 +250,27 @@ export interface FixLoopAttempt {
   source?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
+}
+
+/**
+ * Bounded provenance recorded on the source research task after an adversarial
+ * challenger returns (or fails). Lets operators root-cause absent verdicts
+ * (stale serving image vs malformed/crashed grader) without storing raw logs.
+ * All VM identity fields are optional — they are absent when the grader ran on
+ * a local/subprocess worker that never sent a heartbeat.
+ */
+export interface AdversarialGateDiagnostic {
+  challenger_task_id: string;
+  completion_state: 'completed' | 'failed';
+  challenged_count: number;
+  parse_state?: 'ok' | 'challenger_failed' | 'empty_logs' | 'no_json_array' | 'invalid_json' | 'no_hash_matches';
+  parse_cause?: string | null;
+  parsed_verdict_count: number;
+  unresolved_count: number;
+  vm_image_name?: string | null;
+  vm_image_build_ts?: number | null;
+  vm_runtime_fingerprint?: string | null;
+  vm_source_sha?: string | null;
 }
 
 /**

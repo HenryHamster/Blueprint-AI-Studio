@@ -1886,6 +1886,7 @@ async def _persist_compute_knowledge_document(
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "release_evidence": stored_verdict.get("release_evidence"),
+        "analysis_fallback_reason": stored_verdict.get("fallback_reason"),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")

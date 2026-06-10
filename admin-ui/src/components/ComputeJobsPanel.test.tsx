@@ -399,10 +399,26 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('compute job already terminal: cannot kill');
   });
 
-  test('renders nothing when there are no jobs', async () => {
+  test('renders an empty compute workbench when there are no jobs', async () => {
     fetchComputeJobs.mockResolvedValue([]);
-    const { container } = render(<ComputeJobsPanel projectId="proj-1" />);
-    await waitFor(() => expect(fetchComputeJobs).toHaveBeenCalled());
-    await waitFor(() => expect(container.textContent).not.toContain('Compute jobs'));
+    const { findByText, queryByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByRole('button', { name: 'Launch compute experiment' })).toBeNull();
+  });
+
+  test('renders a launch action in the empty compute workbench when provided', async () => {
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={vi.fn()} />);
+    await findByText('No compute jobs');
+    expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
+  });
+
+  test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
+    const onLaunchCompute = vi.fn();
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={onLaunchCompute} />);
+    const launchButton = await findByRole('button', { name: 'Launch compute experiment' });
+    await act(async () => { launchButton.click(); });
+    expect(onLaunchCompute).toHaveBeenCalledTimes(1);
   });
 });

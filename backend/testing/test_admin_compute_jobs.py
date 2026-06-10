@@ -47,6 +47,7 @@ async def _make_job(
     status=ComputeJobStatus.RUNNING,
     title="compute_experiment task",
     with_artifact=False,
+    polling_metadata=None,
 ):
     task = Task(
         project_id=project.id,
@@ -78,6 +79,7 @@ async def _make_job(
         accrued_cost_usd=0.5,
         result_reference="https://storage.example.com/jobs/job-1/result.json",
         artifact_id=artifact.id if artifact else None,
+        polling_metadata=polling_metadata or {},
     )
     session.add(job)
     await session.commit()
@@ -90,6 +92,13 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session)
     await _add_member(db_session, project.id, "viewer")
     _task, job, _artifact = await _make_job(db_session, project)
+    job.polling_metadata = {
+        "zone": "us-central1-a",
+        "operation": "op-123",
+        "command": "python launch.py --secret",
+    }
+    db_session.add(job)
+    await db_session.commit()
 
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
     assert resp.status_code == 200
@@ -102,6 +111,7 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     # A job with only a raw result_reference and no linked Artifact must expose
     # the descriptor explicitly as null so operators can tell the two apart.
     assert jobs[0]["artifact"] is None
+    assert "command" not in jobs[0]["polling_metadata"]
 
 
 @pytest.mark.asyncio
@@ -203,16 +213,35 @@ async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
 
 
 @pytest.mark.asyncio
-async def test_kill_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+async def test_kill_compute_job_viewer_returns_404(client: AsyncClient, db_session):
+    """Viewers must not be able to confirm job existence via a 403 response (IDOR)."""
     project = await _make_project(db_session, name="Viewer Only")
     await _add_member(db_session, project.id, "viewer")
     _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
-    assert resp.status_code == 403
-    # Job remains active — the forbidden kill must not have mutated it.
+    # Must be 404, not 403, so job existence is not leaked to callers without kill rights.
+    assert resp.status_code == 404
+    # Job remains active — the unauthorized kill must not have mutated it.
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_kill_cross_project_job_returns_404(client: AsyncClient, db_session):
+    """A member of project A must get 404 (not 403) when killing project B's job.
+
+    The response must be indistinguishable from a missing job to prevent IDOR.
+    """
+    project_a = await _make_project(db_session, name="Project A")
+    await _add_member(db_session, project_a.id, "member")
+
+    project_b = await _make_project(db_session, name="Project B")
+    # Deliberately no membership in project_b for the test user.
+    _task_b, job_b, _artifact_b = await _make_job(db_session, project_b)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job_b.id}/kill")
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -285,10 +314,7 @@ async def test_list_compute_jobs_redacts_launch_secrets(client: AsyncClient, db_
     assert "command" not in pm
     assert "cwd" not in pm
 
-    # Env keys are preserved but values are redacted.
-    assert set(pm["env"].keys()) == {"SECRET_TOKEN", "ANOTHER_VAR"}
-    assert pm["env"]["SECRET_TOKEN"] == "[REDACTED]"
-    assert pm["env"]["ANOTHER_VAR"] == "[REDACTED]"
+    assert "env" not in pm
 
     # Operator-useful keys must survive redaction.
     assert pm["live_release_evidence"] == {"version": "v8", "metrics": {"cpm": 1.23}}
@@ -318,8 +344,33 @@ async def test_kill_compute_job_redacts_launch_secrets(client: AsyncClient, db_s
 
     assert "command" not in pm
     assert "cwd" not in pm
-    assert pm["env"] == {"API_KEY": "[REDACTED]"}
+    assert "env" not in pm
     assert pm["live_release_evidence"] == {"version": "v8"}
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_strips_non_dict_env_payload(
+    client: AsyncClient, db_session
+):
+    """Operator list must drop env entirely even if the payload shape is odd."""
+    project = await _make_project(db_session, name="Non Dict Env")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "env": "PATH=/workspace/bin",
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    metadata = resp.json()["compute_jobs"][0]["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
 
 
 @pytest.mark.asyncio
@@ -349,3 +400,56 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     body = resp.json()["compute_job"]
     assert body["status"] == ComputeJobStatus.CANCELLED.value
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
+
+
+_SENSITIVE_POLLING_METADATA = {
+    "env": {"SECRET_KEY": "mysecret", "DATABASE_URL": "postgres://..."},
+    "command": "python3 run_experiment.py --flag",
+    "cwd": "/home/agent/workspace",
+    "status_message": "running",
+    "result_metrics": {"accuracy": 0.95},
+}
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_strips_sensitive_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """List endpoint must not expose env, command, or cwd in polling_metadata."""
+    project = await _make_project(db_session, name="Sensitive List")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job, _artifact = await _make_job(
+        db_session, project, polling_metadata=_SENSITIVE_POLLING_METADATA
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    job_data = resp.json()["compute_jobs"][0]
+    metadata = job_data["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
+    # Non-sensitive fields are preserved
+    assert metadata.get("status_message") == "running"
+    assert metadata.get("result_metrics") == {"accuracy": 0.95}
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_strips_sensitive_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """Kill endpoint must not expose env, command, or cwd in polling_metadata."""
+    project = await _make_project(db_session, name="Sensitive Kill")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(
+        db_session, project, polling_metadata=_SENSITIVE_POLLING_METADATA
+    )
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+    assert resp.status_code == 200
+    metadata = resp.json()["compute_job"]["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
+    # Non-sensitive fields survive (result_metrics is not mutated by the kill path)
+    assert metadata.get("result_metrics") == {"accuracy": 0.95}

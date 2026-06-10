@@ -1593,6 +1593,15 @@ _IDEMPOTENCY_INDEX_ACTIVE_STATUSES = (
 )
 
 
+def _is_active_idempotency_integrity_error(exc: IntegrityError) -> bool:
+    """Return True for the active idempotency partial-index collision."""
+    message = str(exc)
+    return (
+        "ux_task_active_idempotency_key" in message
+        or "UNIQUE constraint failed: task.idempotency_key" in message
+    )
+
+
 async def _commit_or_handle_duplicate_spawn(
     session: AsyncSession, task: Task, *, stage: str
 ) -> bool:
@@ -1643,7 +1652,7 @@ async def _commit_or_handle_duplicate_spawn(
     try:
         await session.commit()
     except IntegrityError as _dup_exc:
-        if "ux_task_active_idempotency_key" not in str(_dup_exc):
+        if not _is_active_idempotency_integrity_error(_dup_exc):
             raise
         await session.rollback()
         # ``populate_existing`` (not refresh()) so any rolled-back in-memory
@@ -1693,7 +1702,7 @@ async def _commit_or_handle_duplicate_spawn(
             try:
                 await session.commit()
             except IntegrityError as _retry_exc:
-                if "ux_task_active_idempotency_key" not in str(_retry_exc):
+                if not _is_active_idempotency_integrity_error(_retry_exc):
                     raise
                 # Still colliding: some other key in the batch is genuinely
                 # duplicated — fall through to the duplicate disposition.
@@ -4486,6 +4495,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # reason + clear the internal verdict keys so the finding re-enters the next
     # cycle clean.
     _adv_deferred_stamped = []
+    # Carry challenger task ID from the diagnostic so operators can connect a
+    # missing-verdict deferral to its challenger task without opening each one.
+    _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
+    _adv_challenger_id = str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
         # Re-key the finding_hash the SAME way adversarial verdicts are keyed
@@ -4501,6 +4514,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _adf_stamped.pop("_adversarial_verdict_explicit", None)
         if _gate_reason:
             _adf_stamped["adversarial_gate_reason"] = _gate_reason
+        if _adv_challenger_id:
+            _adf_stamped["adversarial_challenger_task_id"] = _adv_challenger_id
         _adv_deferred_stamped.append(_adf_stamped)
 
     _all_deferred = (

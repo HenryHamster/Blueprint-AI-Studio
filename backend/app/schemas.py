@@ -418,6 +418,26 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
     return data
 
 
+_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset({"env", "command", "cwd"})
+
+
+def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
+    """Return a JSON-ready compute-job response with launch-spec fields redacted.
+
+    Strips ``env``, ``command``, and ``cwd`` from ``polling_metadata`` before
+    returning so operator-facing endpoints never expose internal launch material
+    that may contain secrets or internal paths. The agent-facing endpoints use
+    ``serialize_compute_job_response`` directly — agents own their job and need
+    the full metadata.
+    """
+    data = serialize_compute_job_response(job)
+    metadata = data.get("polling_metadata")
+    if isinstance(metadata, dict):
+        for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
+            metadata.pop(key, None)
+    return data
+
+
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID

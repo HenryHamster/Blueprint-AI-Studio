@@ -2476,6 +2476,9 @@ export interface KnowledgeDocument {
   knowledge_acceptance_evidence?: boolean;
   compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
   compute_acceptance_reason?: string;
+  /** Concrete compute-analysis fallback cause mirrored from the backend verdict.
+   *  Present only for measured-only compute_experiment docs that fell back. */
+  analysis_fallback_reason?: string | null;
   /** Durable origin provenance (backend `serialize_origin_provenance`): whether the
    *  producing task came from a research finding, and the second-opinion decision that
    *  allowed or rejected its dispatch. Absent on older backend responses — treat a

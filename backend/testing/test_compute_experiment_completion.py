@@ -50,6 +50,7 @@ from app.models import (
     Project,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    SourceKind,
     Task,
     TaskStatus,
 )
@@ -1822,9 +1823,11 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     detail = serialize_knowledge_document(doc, include_body=True)
     assert detail["knowledge_acceptance_evidence"] is True
     assert detail["compute_acceptance_grade"] == "acceptance"
+    assert detail["analysis_fallback_reason"] is None
     index = await build_knowledge_index(db_session, task.project_id)
     assert index[0]["knowledge_acceptance_evidence"] is True
     assert index[0]["compute_acceptance_grade"] == "acceptance"
+    assert index[0]["analysis_fallback_reason"] is None
     substance = await fetch_knowledge_substance_index(db_session, task.project_id)
     assert substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is True
     assert substance[0].forward_quality_verdict["compute_acceptance_grade"] == "acceptance"
@@ -1857,6 +1860,9 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     )
     assert deterministic_detail["knowledge_acceptance_evidence"] is False
     assert deterministic_detail["compute_acceptance_grade"] == "measured_only"
+    assert deterministic_detail["analysis_fallback_reason"] is None
+    deterministic_index = await build_knowledge_index(db_session, deterministic_task.project_id)
+    assert deterministic_index[0]["analysis_fallback_reason"] is None
     deterministic_substance = await fetch_knowledge_substance_index(
         db_session, deterministic_task.project_id
     )
@@ -1872,6 +1878,21 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         deterministic_task.plan_output["knowledge_document"]["compute_acceptance_grade"]
         == "measured_only"
     )
+    assert deterministic_task.plan_output["knowledge_document"]["analysis_fallback_reason"] is None
+    non_compute_doc = KnowledgeDocument(
+        project_id=task.project_id,
+        source_task_id=task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Design note",
+        summary="Design summary",
+        body="Design body",
+        topic="design",
+        tags=[],
+        source_citations=[],
+        forward_quality_verdict={"passed": True, "reason": "ok", "strategy": "forward-quality"},
+    )
+    non_compute_detail = serialize_knowledge_document(non_compute_doc, include_body=True)
+    assert non_compute_detail["analysis_fallback_reason"] is None
     assert evaluate_task_outcome(deterministic_task).status == "neutral"
 
 

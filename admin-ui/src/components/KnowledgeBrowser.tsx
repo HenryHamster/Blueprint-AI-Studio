@@ -91,6 +91,14 @@ const ACCEPTANCE_REASON_LABELS: Record<string, string> = {
   no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
 };
 
+const ANALYSIS_FALLBACK_REASON_LABELS: Record<string, string> = {
+  'precondition-not-met': 'LLM credentials missing — analysis skipped',
+  'analysis-disabled': 'LLM analysis disabled',
+  'no-evidence': 'No durable artifacts/metrics to analyze',
+  'llm-error': 'LLM analysis failed',
+  'citations-ungrounded': 'Analysis citations did not ground',
+};
+
 /**
  * Acceptance-grade badge for compute_experiment knowledge documents. The backend
  * (classify_knowledge_acceptance) is the single source of truth: it grades a
@@ -102,12 +110,23 @@ const ACCEPTANCE_REASON_LABELS: Record<string, string> = {
  * docs persisted before the grade existed, so measured-only/fallback docs stay
  * visible in normal search and source-kind filtering — this only labels them.
  */
-function AcceptanceGradeBadge({ doc }: { doc: Pick<KnowledgeDocument, 'source_kind' | 'compute_acceptance_grade' | 'compute_acceptance_reason'> }) {
+function AcceptanceGradeBadge({
+  doc,
+}: {
+  doc: Pick<
+    KnowledgeDocument,
+    'source_kind' | 'compute_acceptance_grade' | 'compute_acceptance_reason' | 'analysis_fallback_reason'
+  >;
+}) {
   if (doc.source_kind !== 'compute_experiment') return null;
   const grade = doc.compute_acceptance_grade;
   if (grade !== 'acceptance' && grade !== 'measured_only') return null;
   const isAcceptance = grade === 'acceptance';
   const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
+  const fallbackReason = grade === 'measured_only' && typeof doc.analysis_fallback_reason === 'string'
+    ? doc.analysis_fallback_reason
+    : undefined;
+  const fallbackLabel = fallbackReason ? ANALYSIS_FALLBACK_REASON_LABELS[fallbackReason] : undefined;
   const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
     ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
   const label = isAcceptance ? 'Acceptance' : 'Measured only';
@@ -115,12 +134,19 @@ function AcceptanceGradeBadge({ doc }: { doc: Pick<KnowledgeDocument, 'source_ki
     ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
     : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
   return (
-    <span
-      className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
-      title={tooltip}
-    >
-      {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
-      {label}
+    <span className="inline-flex items-center gap-1 flex-wrap">
+      <span
+        className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+        title={fallbackLabel ? `${tooltip} · ${fallbackLabel}` : tooltip}
+      >
+        {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
+        {label}
+      </span>
+      {fallbackLabel && (
+        <span className="text-[9px] text-amber-200/80 leading-tight max-w-[14rem] break-words">
+          {fallbackLabel}
+        </span>
+      )}
     </span>
   );
 }

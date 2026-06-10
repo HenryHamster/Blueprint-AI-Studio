@@ -23,6 +23,7 @@ interface ProjectDashboardProps {
   onNewProject?: () => void;
   onOpenSetupGuide?: (projectId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
+  onLaunchCompute?: () => void;
   /** Called after a project is successfully deleted, so the parent can refetch
    *  the project list and clear any selection pointing at the removed project. */
   onProjectDeleted?: (projectId: string) => void;
@@ -210,7 +211,7 @@ function CapabilityEvidencePanel({ project }: { project: Project }) {
   );
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onNavigateToTask, onProjectDeleted, onProjectReset, onProjectCancelled, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onNavigateToTask, onLaunchCompute, onProjectDeleted, onProjectReset, onProjectCancelled, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -876,7 +877,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
             </div>
           )}
           {selectedProject && <CapabilityEvidencePanel project={selectedProject} />}
-          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} />}
+          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} onLaunchCompute={onLaunchCompute} />}
         </>
       )}
 

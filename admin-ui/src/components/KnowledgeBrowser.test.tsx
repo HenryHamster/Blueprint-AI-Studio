@@ -58,6 +58,7 @@ const measuredOnlyComputeDoc = {
   knowledge_acceptance_evidence: false,
   compute_acceptance_grade: 'measured_only',
   compute_acceptance_reason: 'analysis_mode_not_llm',
+  analysis_fallback_reason: 'precondition-not-met',
   forward_quality_verdict: {
     passed: true,
     reason: 'Deterministic fallback persisted as measured knowledge.',
@@ -530,14 +531,30 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     // Each card carries its own acceptance-grade badge alongside the 'Compute' source badge.
     expect(acceptanceCard && findBadge(acceptanceCard, 'Acceptance')).toBeTruthy();
     expect(acceptanceCard?.textContent).toContain('Compute');
+    expect(acceptanceCard?.textContent).not.toContain('LLM credentials missing');
     expect(measuredCard && findBadge(measuredCard, 'Measured only')).toBeTruthy();
     expect(measuredCard?.textContent).toContain('Compute');
+    expect(measuredCard?.textContent).toContain('LLM credentials missing — analysis skipped');
 
     // Open the acceptance-grade document — its badge also renders in the detail meta row.
     if (!acceptanceCard) throw new Error('expected acceptance compute card');
     await act(async () => { (acceptanceCard as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     expect(findBadge(host as HTMLDivElement, 'Acceptance')).toBeTruthy();
+
+    // Return to the list so the measured-only row can be clicked from a live DOM node.
+    await renderList([computeDoc, measuredOnlyComputeDoc]);
+
+    // Open the measured-only document and verify the concrete fallback cause shows up.
+    const measuredCardAgain = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU fallback summary'),
+    );
+    if (!measuredCardAgain) throw new Error('expected measured compute card');
+    await act(async () => { (measuredCardAgain as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const detailText = (host as HTMLDivElement).textContent ?? '';
+    expect(detailText).toContain('Measured only');
+    expect(detailText).toContain('LLM credentials missing — analysis skipped');
   });
 
   test('non-acceptance grade is absent for documents without the compute grade', async () => {

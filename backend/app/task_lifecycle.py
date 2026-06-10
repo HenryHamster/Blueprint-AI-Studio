@@ -398,6 +398,12 @@ async def _resolve_quality_grader_completion(
     """
     from app.task_evaluators import (
         ADVERSARIAL_GATE_VERDICT_KEY,
+        ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        ADVERSARIAL_PARSE_OK,
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
         parse_adversarial_finding_verdicts,
@@ -489,6 +495,39 @@ async def _resolve_quality_grader_completion(
                 "[GRADER] Failed to attach adversarial grader runtime provenance",
                 exc_info=True,
             )
+        # Bounded operator diagnostic so absent verdicts can be root-caused
+        # (stale serving image vs malformed/no grader output) without reading
+        # raw logs. Written unconditionally so the parent task always carries
+        # challenger provenance after re-entry. Mirrors the provenance already
+        # attached to gate_record (None when the grader VM is unknown).
+        _parse_causes = {
+            ADVERSARIAL_PARSE_OK: "parsed explicit verdict(s) from grader output",
+            ADVERSARIAL_PARSE_CHALLENGER_FAILED: (
+                "challenger task failed before producing verdicts"
+            ),
+            ADVERSARIAL_PARSE_EMPTY_LOGS: "grader posted no output",
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY: (
+                "no JSON array with hash/verdict found in grader output"
+            ),
+            ADVERSARIAL_PARSE_INVALID_JSON: "candidate JSON array failed to decode",
+            ADVERSARIAL_PARSE_NO_HASH_MATCHES: (
+                "JSON array contained no known finding hashes"
+            ),
+        }
+        _diag_explicit = sum(1 for v in finding_verdicts.values() if v.get("explicit"))
+        ctx["adversarial_gate_diagnostic"] = {
+            "challenger_task_id": str(grader.id),
+            "completion_state": "completed" if completed else "failed",
+            "challenged_count": len(all_hashes),
+            "parse_state": parse_outcome,
+            "parse_cause": _parse_causes.get(parse_outcome, parse_outcome),
+            "parsed_verdict_count": _diag_explicit,
+            "unresolved_count": len(finding_verdicts) - _diag_explicit,
+            "vm_image_name": gate_record.get("grader_agent_image_name"),
+            "vm_image_build_ts": gate_record.get("grader_agent_image_build_ts"),
+            "vm_runtime_fingerprint": gate_record.get("grader_agent_runtime_fingerprint"),
+            "vm_source_sha": gate_record.get("grader_agent_source_sha"),
+        }
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
         grader.latest_status_message = (

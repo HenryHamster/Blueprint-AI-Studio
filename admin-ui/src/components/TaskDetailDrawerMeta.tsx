@@ -12,7 +12,7 @@ import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
-import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
+import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import {
@@ -23,6 +23,14 @@ import {
 } from '../utils/mergeTestVerdict';
 
 const WIDE_FINISHED_WINDOW_MINUTES = 10_080;
+
+const ANALYSIS_FALLBACK_REASON_LABELS: Record<string, string> = {
+  'precondition-not-met': 'LLM credentials missing — analysis skipped',
+  'analysis-disabled': 'LLM analysis disabled',
+  'no-evidence': 'No durable artifacts/metrics to analyze',
+  'llm-error': 'LLM analysis failed',
+  'citations-ungrounded': 'Analysis citations did not ground',
+};
 
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -385,6 +393,74 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
   );
 }
 
+function AdversarialGateDiagnosticSection({ diag, onNavigateToTask }: { diag: AdversarialGateDiagnostic; onNavigateToTask?: (id: string) => void }) {
+  const stateClass = diag.completion_state === 'completed'
+    ? 'bg-neutral-800/60 text-neutral-300'
+    : 'bg-red-900/30 text-red-400';
+  const parseStateLabel = diag.parse_state ? diag.parse_state.replace(/_/g, ' ') : 'unknown';
+  return (
+    <>
+      <SectionHeader>Adversarial Gate Diagnostic</SectionHeader>
+      <DetailRow label="Challenger">
+        {onNavigateToTask ? (
+          <button onClick={() => onNavigateToTask(diag.challenger_task_id)} className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline">{diag.challenger_task_id}</button>
+        ) : (
+          <CopyableId value={diag.challenger_task_id} />
+        )}
+      </DetailRow>
+      <DetailRow label="State">
+        <span className={`text-xs px-1.5 py-0.5 rounded ${stateClass}`}>{diag.completion_state}</span>
+      </DetailRow>
+      <DetailRow label="Parse">
+        <span className="inline-flex flex-col gap-0.5">
+          <span className="text-sm text-neutral-300">{parseStateLabel}</span>
+          {diag.parse_cause && <span className="text-xs text-neutral-500" title={diag.parse_cause}>{diag.parse_cause}</span>}
+        </span>
+      </DetailRow>
+      <DetailRow label="Challenged">
+        <span className="text-sm">{diag.challenged_count} finding{diag.challenged_count !== 1 ? 's' : ''}</span>
+      </DetailRow>
+      {diag.unresolved_count > 0 && (
+        <DetailRow label="Unresolved">
+          <span className="text-xs px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400">{diag.unresolved_count} no verdict</span>
+        </DetailRow>
+      )}
+      {diag.parsed_verdict_count > 0 && (
+        <DetailRow label="Parsed">
+          <span className="text-sm text-neutral-400">{diag.parsed_verdict_count} explicit</span>
+        </DetailRow>
+      )}
+      {diag.vm_image_name && (
+        <DetailRow label="VM Image">
+          <span className="font-mono text-xs text-neutral-400 break-all">{diag.vm_image_name}</span>
+        </DetailRow>
+      )}
+      {diag.vm_image_build_ts != null && (
+        <DetailRow label="VM Build">
+          <span
+            className="font-mono text-xs text-neutral-400"
+            title={new Date(diag.vm_image_build_ts * 1000).toISOString()}
+          >
+            {formatAbsolute(diag.vm_image_build_ts * 1000)}
+          </span>
+        </DetailRow>
+      )}
+      {diag.vm_runtime_fingerprint && (
+        <DetailRow label="Runtime Fingerprint">
+          <span className="font-mono text-xs text-neutral-400" title={diag.vm_runtime_fingerprint}>
+            {diag.vm_runtime_fingerprint.slice(0, 12)}
+          </span>
+        </DetailRow>
+      )}
+      {diag.vm_source_sha && (
+        <DetailRow label="Source SHA">
+          <span className="font-mono text-xs text-neutral-400" title={diag.vm_source_sha}>{diag.vm_source_sha.slice(0, 12)}</span>
+        </DetailRow>
+      )}
+    </>
+  );
+}
+
 function BlockedNeedSection({ need, tasks, onNavigateToTask }: { need: Record<string, unknown> | undefined; tasks?: Task[]; onNavigateToTask?: (id: string) => void }) {
   if (!need) return null;
   const kind = need.kind as string | undefined;
@@ -431,6 +507,7 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
     forward_quality_verdict?: { passed?: boolean; reason?: string } | null;
     compute_acceptance_grade?: string | null;
     compute_acceptance_reason?: string;
+    analysis_fallback_reason?: string | null;
   } | undefined;
   const [expanded, setExpanded] = useState(false);
   const [body, setBody] = useState<string | null>(null);
@@ -489,18 +566,29 @@ function KnowledgeDocumentSection({ task }: { task: Task }) {
               no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
             };
             const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
+            const fallbackReason = !isAcceptance && typeof doc.analysis_fallback_reason === 'string'
+              ? doc.analysis_fallback_reason
+              : undefined;
+            const fallbackLabel = fallbackReason ? ANALYSIS_FALLBACK_REASON_LABELS[fallbackReason] : undefined;
             const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
               ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
             const cls = isAcceptance
               ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
               : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
             return (
-              <span
-                className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
-                title={tooltip}
-              >
-                {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
-                {isAcceptance ? 'Acceptance' : 'Measured only'}
+              <span className="inline-flex items-center gap-1 flex-wrap">
+                <span
+                  className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+                  title={fallbackLabel ? `${tooltip} · ${fallbackLabel}` : tooltip}
+                >
+                  {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
+                  {isAcceptance ? 'Acceptance' : 'Measured only'}
+                </span>
+                {fallbackLabel && (
+                  <span className="text-[10px] text-amber-200/80 leading-tight break-words max-w-[18rem]">
+                    {fallbackLabel}
+                  </span>
+                )}
               </span>
             );
           })()}
@@ -813,6 +901,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
+      {task.context?.adversarial_gate_diagnostic && (
+        <AdversarialGateDiagnosticSection diag={task.context.adversarial_gate_diagnostic as AdversarialGateDiagnostic} onNavigateToTask={onNavigateToTask} />
+      )}
       <TaskComputeJobsSection task={task} />
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm break-all min-w-0">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && (

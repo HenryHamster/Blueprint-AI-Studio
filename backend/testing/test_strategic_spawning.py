@@ -634,6 +634,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "topic",
         "direction_id",
         "source_kind",
+        "analysis_fallback_reason",
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",

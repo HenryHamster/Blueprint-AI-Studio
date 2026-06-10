@@ -9295,3 +9295,210 @@ class TestSelfClaimCollisionRecovery:
         assert children == []
         # Parent re-populated from its DB row: the rolled-back flip is gone.
         assert parent.status == TaskStatus.COMPLETED
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_records_unresolved_challenge_diagnostics(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: adversarial grader completion writes bounded diagnostics to source context.
+
+    When an adversarial grader completes with some hashes missing from its output
+    (unresolved), _resolve_quality_grader_completion must write an
+    adversarial_gate_diagnostic dict to the source task's context with provenance
+    fields:
+     - challenger_task_id / completion_state
+     - challenged_count / parsed_verdict_count / unresolved_count
+     - vm identity fields (None when grader has no heartbeat record)
+
+    Deferred findings from an unresolved verdict must carry adversarial_challenger_task_id
+    so operators can connect the missing verdict to its challenger task.
+
+    Exercises production code in task_lifecycle._resolve_quality_grader_completion and
+    research_completion._handle_research_completion.
+    """
+    from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-diag01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    # Two high-stakes findings: grader will return an explicit verdict for the
+    # first but nothing for the second, producing one unresolved outcome.
+    hs_verdicted = _high_stakes_finding(direction["id"], "Finding with verdict")
+    hs_unresolved = _high_stakes_finding(direction["id"], "Finding with no verdict")
+    fhash_verdicted = _finding_hash(
+        hs_verdicted["title"],
+        hs_verdicted.get("description", "") or hs_verdicted.get("prompt", ""),
+    )
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs_verdicted, hs_unresolved],
+    )
+
+    # Phase 1: park the task awaiting the adversarial grader.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.EVALUATING, "task must park awaiting adversarial verdict"
+
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+    grader = graders[0]
+
+    # Phase 2: grader returns a FAIL verdict for the first hash only;
+    # the second hash is absent → fail-closed unresolved.
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            '[{"hash": "'
+            + fhash_verdicted
+            + '", "verdict": "fail", "reason": "premise wrong"}]'
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
+    await db_session.refresh(task)
+
+    # adversarial_gate_diagnostic must be written to the source task context.
+    diag = (task.context or {}).get("adversarial_gate_diagnostic")
+    assert diag is not None, "adversarial_gate_diagnostic must be written to source context"
+    assert diag["challenger_task_id"] == str(grader.id), "challenger_task_id must be grader id"
+    assert diag["completion_state"] == "completed", "completion_state must be 'completed'"
+    assert diag["challenged_count"] == 2, "challenged_count must match all_hashes length"
+    assert diag["parse_state"] == "ok", "parsed verdicts must be classified"
+    # One explicit verdict parsed, one unresolved (absent from grader output).
+    assert diag["parsed_verdict_count"] == 1, "one explicit verdict was parsed"
+    assert diag["unresolved_count"] == 1, "one hash had no verdict → unresolved"
+    # VM identity is None for test graders that never sent a heartbeat.
+    assert diag["vm_image_name"] is None
+    assert diag["vm_runtime_fingerprint"] is None
+    assert diag["vm_source_sha"] is None
+
+    # Both findings must be deferred (explicit fail + fail-closed unresolved).
+    deferred = (task.context or {}).get("deferred_findings", [])
+    deferred_titles = {d.get("title") for d in deferred}
+    assert hs_verdicted["title"] in deferred_titles, "explicitly failed finding must be deferred"
+    assert hs_unresolved["title"] in deferred_titles, "unresolved finding must be deferred"
+
+    # Deferred findings must carry the challenger task id for operator traceability.
+    for d in deferred:
+        if d.get("title") in {hs_verdicted["title"], hs_unresolved["title"]}:
+            assert d.get("adversarial_challenger_task_id") == str(grader.id), (
+                f"deferred finding '{d.get('title')}' must carry adversarial_challenger_task_id"
+            )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
+    db_session, mocker
+):
+    """The diagnostic must fall back to the durable PoolVm row after cache loss."""
+    from app.models import PoolVmState
+    from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from app.warm_pool import register_pool_vm
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-adv-diag02")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs_verdicted = _high_stakes_finding(direction["id"], "Finding with verdict")
+    hs_unresolved = _high_stakes_finding(direction["id"], "Finding with no verdict")
+    fhash_verdicted = _finding_hash(
+        hs_verdicted["title"],
+        hs_verdicted.get("description", "") or hs_verdicted.get("prompt", ""),
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs_verdicted, hs_unresolved],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id, _Task.id != task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert grader is not None
+
+    vm_id = "agent-vm-adversarial-diag"
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id=vm_id,
+        project_id=_project.id,
+        state=PoolVmState.LEASED,
+    )
+    member.agent_image_name = "blueprint-agent-v9"
+    member.agent_image_build_ts = 1749417600
+    member.agent_runtime_fingerprint = "b" * 64
+    member.agent_source_sha = "fedcba9876543210"
+    await db_session.commit()
+
+    grader.vm_instance_id = vm_id
+    db_session.add(grader)
+    await db_session.commit()
+
+    mocker.patch("app.compute.get_vm_image", return_value=(None, None))
+    mocker.patch("app.compute.get_vm_runtime_fingerprint", return_value=None)
+    mocker.patch("app.compute.get_vm_source_sha", return_value=None)
+
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs=(
+            '[{"hash": "'
+            + fhash_verdicted
+            + '", "verdict": "fail", "reason": "premise wrong"}]'
+        ),
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
+    await db_session.refresh(task)
+
+    diag = (task.context or {}).get("adversarial_gate_diagnostic")
+    assert diag is not None
+    assert diag["vm_image_name"] == "blueprint-agent-v9"
+    assert diag["vm_image_build_ts"] == 1749417600
+    assert diag["vm_runtime_fingerprint"] == "b" * 64
+    assert diag["vm_source_sha"] == "fedcba9876543210"
+
+    verdict = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
+    assert verdict["grader_agent_image_name"] == "blueprint-agent-v9"
+    assert verdict["grader_agent_image_build_ts"] == 1749417600
+    assert verdict["grader_agent_runtime_fingerprint"] == "b" * 64
+    assert verdict["grader_agent_source_sha"] == "fedcba9876543210"

@@ -1434,13 +1434,15 @@ describe('DetailsTab — Compute Experiment Contract', () => {
           source_kind: 'compute_experiment',
           compute_acceptance_grade: 'measured_only',
           compute_acceptance_reason: 'analysis_mode_not_llm',
+          analysis_fallback_reason: 'precondition-not-met',
         },
       },
     });
     render(<DetailsTab task={task} />);
     const badge = screen.getByText('Measured only');
     expect(badge).toBeInTheDocument();
-    expect(badge.closest('[title]')?.getAttribute('title')).toContain('Deterministic fallback');
+    expect(badge.closest('[title]')?.getAttribute('title')).toContain('LLM credentials missing');
+    expect(screen.getByText('LLM credentials missing — analysis skipped')).toBeInTheDocument();
   });
 
   it('does not show acceptance grade badge for non-compute documents', () => {
@@ -1459,5 +1461,40 @@ describe('DetailsTab — Compute Experiment Contract', () => {
     expect(screen.getByText('Knowledge Document')).toBeInTheDocument();
     expect(screen.queryByText('Acceptance')).toBeNull();
     expect(screen.queryByText('Measured only')).toBeNull();
+  });
+});
+
+describe('DetailsTab — adversarial gate diagnostic', () => {
+  afterEach(() => cleanup());
+
+  it('renders parse state and runtime provenance fields', () => {
+    const vmImageBuildTs = 1749168000;
+    const vmRuntimeFingerprint = 'runtime-fingerprint-abcdef1234567890';
+    const task = makeTask({
+      context: {
+        adversarial_gate_diagnostic: {
+          challenger_task_id: 'grader-task-1',
+          completion_state: 'completed',
+          challenged_count: 2,
+          parse_state: 'no_hash_matches',
+          parse_cause: 'JSON array contained no known finding hashes',
+          parsed_verdict_count: 0,
+          unresolved_count: 2,
+          vm_image_name: 'blueprint/grader:2026-06-05',
+          vm_image_build_ts: vmImageBuildTs,
+          vm_runtime_fingerprint: vmRuntimeFingerprint,
+          vm_source_sha: '0123456789abcdef0123456789abcdef01234567',
+        },
+      },
+    });
+
+    render(<DetailsTab task={task} />);
+
+    expect(screen.getByText('Adversarial Gate Diagnostic')).toBeInTheDocument();
+    expect(screen.getByText('no hash matches')).toBeInTheDocument();
+    expect(screen.getByText('JSON array contained no known finding hashes')).toBeInTheDocument();
+    expect(screen.getByTitle(new Date(vmImageBuildTs * 1000).toISOString())).toBeInTheDocument();
+    expect(screen.getByTitle(vmRuntimeFingerprint)).toBeInTheDocument();
+    expect(screen.getByText('runtime-fing')).toBeInTheDocument();
   });
 });

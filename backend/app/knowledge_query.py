@@ -297,6 +297,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         if isinstance(doc.forward_quality_verdict, dict)
         else {}
     )
+    analysis_fallback_reason = (
+        verdict.get("fallback_reason")
+        if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+        else None
+    )
     out = {
         "id": str(doc.id),
         "title": doc.title,
@@ -310,6 +315,7 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
         "forward_quality_verdict": doc.forward_quality_verdict,
+        "analysis_fallback_reason": analysis_fallback_reason,
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
@@ -492,6 +498,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         forward_quality_verdict=doc.forward_quality_verdict,
         source_citations=doc.source_citations,
     )
+    verdict = (
+        doc.forward_quality_verdict
+        if isinstance(doc.forward_quality_verdict, dict)
+        else {}
+    )
     return {
         "id": str(doc.id),
         "title": doc.title,
@@ -499,6 +510,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "topic": doc.topic,
         "direction_id": doc.direction_id,
         "source_kind": doc.source_kind,
+        "analysis_fallback_reason": (
+            verdict.get("fallback_reason")
+            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+            else None
+        ),
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "origin_provenance": serialize_origin_provenance(doc),

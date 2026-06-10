@@ -2251,6 +2251,7 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "topic",
         "direction_id",
         "source_kind",
+        "analysis_fallback_reason",
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
