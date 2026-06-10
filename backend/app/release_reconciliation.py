@@ -376,6 +376,169 @@ async def _reconcile_if_promotion_failed_landed(
             return False
 
 
+async def _reconcile_if_not_promoted_but_pr_merged(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Reconcile an open version recorded as not_promoted/ci_unresolved whose PR merged.
+
+    Incident 2026-06-09: a transient DB error rolled back the promotion_pending
+    marker write after a release PR was created and auto-merge was armed on
+    GitHub. A subsequent finalize saw no promotion_pending, re-evaluated CI as
+    ci_unresolved (a transient state, not a hard failure), and recorded
+    not_promoted — even though the PR merged 15 seconds later.
+
+    For every open version whose last_qualification shows
+    status=="not_promoted" AND blocker=="ci_unresolved", checks whether the
+    candidate is already reachable from the promotion target. If it is, the PR
+    merged and the not_promoted record is incorrect — drive the version to
+    _record_promotion_success. Hard blockers (ci_not_green, migration collision,
+    audit quality) are intentionally left alone.
+
+    Follows the same pattern as _reconcile_if_promotion_failed_landed.
+    Returns True iff the version was reconciled to promoted.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "not_promoted":
+                return False
+            # Only reconcile the transient ci_unresolved class.  Hard blockers
+            # (ci_not_green, migration_identity_collision, audit quality, etc.)
+            # represent a genuine scoring failure — never reconcile as success.
+            if qual.get("blocker") != "ci_unresolved":
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            base_record = dict(qual)
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+
+            # Single-branch repo guard — mirrors promote().
+            integration_branch, promotion_target = _lts_branch_names(project)
+            if integration_branch == promotion_target:
+                logger.debug(
+                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: v%d "
+                    "integration branch (%s) is the promotion target — single-branch "
+                    "repo, LTS inactive; nothing to reconcile",
+                    version.version_number,
+                    promotion_target,
+                )
+                return False
+
+            # Release the row lock before GitHub I/O.
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                    "failed to release row lock for v%d — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                        "rollback failed for v%d after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            if not await _candidate_already_on_main(
+                token, owner, repo, candidate_sha, version, project=project
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                "candidate %s for v%d is on main despite not_promoted/ci_unresolved "
+                "record — reconciling as promoted",
+                candidate_sha[:8],
+                version.version_number,
+            )
+            promoted_sha: str | None = None
+            try:
+                promoted_sha = await github.get_branch_sha(
+                    token,
+                    owner,
+                    repo,
+                    promotion_target,
+                    project_id=str(version.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — using candidate_sha",
+                    promotion_target,
+                    version.version_number,
+                    exc,
+                )
+
+            result = await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                pr_url=_idempotent_pr_url(base_record),
+                token=token,
+                owner=owner,
+                repo=repo,
+                promoted_sha=promoted_sha,
+                already_landed=True,
+                lock_released=True,
+            )
+            await session.commit()
+            return result.get("status") == "promoted" and not result.get(
+                "already_promoted"
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
 async def _reconcile_if_pending_auto_merge_landed(
     version_id: uuid.UUID,
     *,

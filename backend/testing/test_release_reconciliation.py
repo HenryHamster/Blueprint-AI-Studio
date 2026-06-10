@@ -25,6 +25,7 @@ from app import release_version as rv
 from app.models import Project
 from app.release_reconciliation import (
     _promotion_pending_timeout_seconds,
+    _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
@@ -1175,6 +1176,129 @@ async def test_reconcile_promotion_pending_timeout_never_touches_main(db_session
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "promotion_pending_timeout"
     assert "promotion_pending" not in version.last_qualification
+
+
+# ===========================================================================
+# Incident 2026-06-09: not_promoted/ci_unresolved reconciliation net.
+#
+# A transient DB error can roll back the promotion_pending marker write after
+# a release PR is created and auto-merge is armed.  The subsequent finalize
+# sweep sees no promotion_pending, re-evaluates CI as ci_unresolved (transient,
+# not a hard failure), and records not_promoted — even though the PR merged
+# moments later.  _reconcile_if_not_promoted_but_pr_merged catches this.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_reconcile_not_promoted_ci_unresolved_candidate_on_main_reconciles(
+    db_session, mocker
+):
+    """_reconcile_if_not_promoted_but_pr_merged: a version recorded as
+    not_promoted/ci_unresolved whose candidate is already on main reconciles
+    to promoted (regression: incident 2026-06-09 desync)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.88,
+        "pr_url": "https://github.com/acme/widget/pull/7",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+    # The original confidence score must survive into the reconciled record.
+    assert version.last_qualification["confidence"] == pytest.approx(0.88)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_not_promoted_hard_blocker_is_inert(db_session, mocker):
+    """_reconcile_if_not_promoted_but_pr_merged: a hard blocker (ci_not_green)
+    is NOT reconciled — hard blockers represent a genuine scoring failure, not
+    a transient miss that could mask a real failure."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+        "candidate_sha": "abcd" * 10,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["blocker"] == "ci_not_green"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_not_promoted_skips_single_branch(db_session, mocker):
+    """_reconcile_if_not_promoted_but_pr_merged: on a single-branch repo (LTS
+    inactive) the reconciler is inert — no GitHub I/O, version untouched."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="main", promotion_target="main"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": "abcd" * 10,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
 
 
 # ===========================================================================

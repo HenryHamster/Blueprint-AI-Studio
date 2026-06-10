@@ -100,12 +100,12 @@ from app.release_promotion import (
     # do ``from app.release_qualifier import promote`` keep working). The
     # implementations live in release_promotion.py; noqa pins them so a
     # ruff --fix sweep can't drop them as "unused" and silently break callers.
-    _candidate_already_on_main,  # noqa: F401 — tests access via rq.*
-    _idempotent_pr_url,  # noqa: F401 — tests access via rq.*
+    _candidate_already_on_main,
+    _idempotent_pr_url,
     _lts_branch_names,
     _notify_operator,
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
-    _record_promotion_success,  # noqa: F401 — tests access via rq.*
+    _record_promotion_success,
     _record_qualification_verdict,
     _relock_version_for_promotion_write,  # noqa: F401 — tests access via rq.*
     _resolve_github_with_session,
@@ -113,6 +113,7 @@ from app.release_promotion import (
 )
 from app.release_reconciliation import (
     _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
+    _reconcile_if_not_promoted_but_pr_merged,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_pending_timed_out,  # noqa: F401 — re-exported for back-compat
@@ -1704,6 +1705,147 @@ async def _compute_acceptance_window_aggregate(
     }
 
 
+async def _guard_ci_unresolved_promotion_in_flight(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    base_record: dict[str, Any],
+    token: str,
+    owner: str,
+    repo: str,
+    project: Any,
+) -> dict[str, Any] | None:
+    """Guard: before writing not_promoted for ci_unresolved, check for in-flight.
+
+    Incident 2026-06-09: a transient DB error rolled back the promotion_pending
+    marker write after a release PR was created and auto-merge was armed. A
+    subsequent sweep re-evaluated CI as ci_unresolved (transient, not red) and
+    wrote not_promoted — clobbering a promotion in flight.
+
+    This guard runs UNDER the version row lock (caller holds it from
+    _finalize_locked_version) before the not_promoted write. GitHub I/O here is
+    quick (ancestry + open-PR fetch), consistent with _resolve_ci_at_finalize's
+    existing pattern of doing brief API calls under the lock.
+
+    (a) Candidate already on main — the PR merged while promotion_pending was
+        being committed and the commit rolled back. Record success instead.
+    (b) Open release PR still exists — auto-merge is armed or pending CI.
+        Restore the promotion_pending sub-state so the reaper can confirm the
+        merge later rather than writing a spurious not_promoted.
+
+    Returns a result dict if the guard handled the situation (caller should
+    return early), or None to proceed with the normal not_promoted write.
+    """
+    if not candidate_sha:
+        return None
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    if integration_branch == promotion_target:
+        logger.debug(
+            "[RELEASE_QUALIFIER] ci_unresolved guard: v%d integration branch "
+            "(%s) is the promotion target — single-branch repo, LTS inactive; "
+            "nothing to guard",
+            version.version_number,
+            promotion_target,
+        )
+        return None
+
+    if await _candidate_already_on_main(
+        token, owner, repo, candidate_sha, version, project=project
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] ci_unresolved guard: candidate %s for v%d is "
+            "already on main — recording promotion success instead of not_promoted",
+            candidate_sha[:8],
+            version.version_number,
+        )
+        promoted_sha: str | None = None
+        try:
+            promoted_sha = await github.get_branch_sha(
+                token, owner, repo, promotion_target
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RELEASE_QUALIFIER] ci_unresolved guard: could not resolve %s "
+                "HEAD SHA for v%d (%s) — using candidate_sha as promoted_sha",
+                promotion_target,
+                version.version_number,
+                exc,
+            )
+        return await _record_promotion_success(
+            session,
+            version,
+            candidate_sha,
+            base_record,
+            pr_url=_idempotent_pr_url(base_record),
+            token=token,
+            owner=owner,
+            repo=repo,
+            promoted_sha=promoted_sha,
+            already_landed=True,
+            lock_released=False,
+        )
+
+    # Candidate not yet on main — check whether the release PR is still open
+    # (auto-merge armed, PR CI still pending). If so, restore promotion_pending
+    # so the reaper confirms the merge rather than recording a spurious miss.
+    release_branch = f"release-v{version.version_number}"
+    try:
+        open_prs = await github.get_open_pull_requests(
+            token, owner, repo, base=promotion_target
+        )
+        open_release_pr = next(
+            (
+                pr
+                for pr in open_prs
+                if (pr.get("head") or {}).get("ref") == release_branch
+            ),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[RELEASE_QUALIFIER] ci_unresolved guard: could not check for open "
+            "release PR for v%d (%s) — proceeding with not_promoted",
+            version.version_number,
+            exc,
+        )
+        return None
+
+    if open_release_pr is None:
+        return None
+
+    pr_number = open_release_pr.get("number")
+    pr_url = open_release_pr.get("html_url") or _idempotent_pr_url(base_record)
+    auto_merge_enabled = open_release_pr.get("auto_merge") is not None
+    logger.info(
+        "[RELEASE_QUALIFIER] ci_unresolved guard: open release PR #%s for v%d "
+        "found — restoring promotion_pending instead of writing not_promoted "
+        "(auto_merge=%s)",
+        pr_number,
+        version.version_number,
+        auto_merge_enabled,
+    )
+    q = dict(version.last_qualification or {})
+    q.update(base_record)
+    q["status"] = "pending"
+    q["promotion_pending"] = {
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "auto_merge_enabled": auto_merge_enabled,
+        "enabled_at": _utcnow().isoformat(),
+        "restored_by_ci_unresolved_guard": True,
+    }
+    version.last_qualification = q
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    return {
+        "status": "pending_auto_merge",
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "auto_merge_enabled": auto_merge_enabled,
+    }
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -2333,6 +2475,33 @@ async def _finalize_qualification(
 
     # --- Decide -------------------------------------------------------------
     if not composite["promote"]:
+        # Monotonic ledger guard (incident 2026-06-09): a ci_unresolved blocker
+        # is transient — CI was pending or unresolvable, not red. Before writing
+        # not_promoted for this reason, verify the candidate is not already on
+        # main and that there is no open release PR whose auto-merge is still
+        # armed. Either condition means a promotion is in flight and this not_promoted
+        # would be a spurious miss.
+        if composite.get("blocker") == "ci_unresolved":
+            _guard_project = await session.get(Project, version.project_id)
+            if _guard_project is not None:
+                _guard_resolved = await _resolve_github_with_session(
+                    session, _guard_project
+                )
+                if _guard_resolved is not None:
+                    _gtoken, _gowner, _grepo = _guard_resolved
+                    _guard_result = await _guard_ci_unresolved_promotion_in_flight(
+                        session,
+                        version,
+                        candidate_sha,
+                        base_record,
+                        _gtoken,
+                        _gowner,
+                        _grepo,
+                        _guard_project,
+                    )
+                    if _guard_result is not None:
+                        return _guard_result
+
         # Below threshold (or a hard blocker fired): keep the version open and
         # send it back to stabilize so the next strategic cycle targets the
         # blocker.  A failed qualifier only ever blocks — which is safe.

@@ -30,6 +30,7 @@ from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
     _reconcile_if_deploy_failed_recovered,
+    _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
@@ -406,6 +407,34 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(promotion_failed candidate landed on main)",
+                version_id,
+            )
+
+    # Reconcile open versions recorded as not_promoted/ci_unresolved whose
+    # release PR actually merged. Incident 2026-06-09: a transient DB error
+    # rolled back the promotion_pending marker, a subsequent finalize saw
+    # ci_unresolved (transient, not red) and recorded not_promoted, but the PR
+    # merged 15 s later. This loop is the safety net for that class of ledger
+    # desync. Only ci_unresolved is reconciled — hard blockers (ci_not_green,
+    # migration collision, audit quality) are left untouched.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: not_promoted/ci_unresolved reconcile "
+                "check failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(not_promoted/ci_unresolved candidate found on main)",
                 version_id,
             )
 

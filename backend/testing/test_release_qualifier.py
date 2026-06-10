@@ -19976,3 +19976,195 @@ async def test_finalize_records_acceptance_window_counts_in_verdict_sub_scores(
     assert sub_scores["acceptance_window_total"] == 2
     assert sub_scores["acceptance_window_verified"] == 1
     assert sub_scores["acceptance_window_fraction"] == pytest.approx(0.5)
+
+
+# ===========================================================================
+# _guard_ci_unresolved_promotion_in_flight — incident 2026-06-09 monotonic
+# ledger guard.
+#
+# When _finalize_qualification would write not_promoted for a ci_unresolved
+# blocker (transient — CI was pending, not red), this guard checks GitHub
+# state first. If the candidate is already on main the PR merged while the
+# promotion_pending commit was rolling back — record success instead. If an
+# open release PR still exists, restore promotion_pending so the reaper
+# confirms the merge. Only if neither condition holds does the caller proceed
+# with not_promoted.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_guard_ci_unresolved_no_candidate_sha_returns_none(db_session, mocker):
+    """Guard is a no-op (returns None) when candidate_sha is absent — no
+    GitHub I/O should occur."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    result = await rq._guard_ci_unresolved_promotion_in_flight(
+        db_session, version, None, {}, "tok", "acme", "widget", project
+    )
+
+    assert result is None
+    is_ancestor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guard_ci_unresolved_single_branch_is_inert_before_ancestry(
+    db_session, mocker
+):
+    """Single-branch repos must not let same-branch ancestry look promoted.
+
+    When integration_branch == promotion_target, the candidate is already
+    reachable from that branch by construction. The ci_unresolved guard must
+    return None before any GitHub ancestry/open-PR checks so the caller can
+    preserve the normal not_promoted path instead of recording promotion
+    success for a release PR that never existed.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+        phase="stabilize",
+    )
+    candidate_sha = "singlebr" * 5
+    base_record = {"candidate_sha": candidate_sha, "confidence": 0.70}
+
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+    open_prs = mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+
+    result = await rq._guard_ci_unresolved_promotion_in_flight(
+        db_session,
+        version,
+        candidate_sha,
+        base_record,
+        "tok",
+        "acme",
+        "custom",
+        project,
+    )
+
+    assert result is None
+    is_ancestor.assert_not_called()
+    open_prs.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification is None
+
+
+@pytest.mark.asyncio
+async def test_guard_ci_unresolved_candidate_already_on_main_records_promoted(
+    db_session, mocker
+):
+    """Guard: when is_ancestor_of confirms the candidate is already reachable
+    from the promotion target, _record_promotion_success is called instead of
+    letting the caller write not_promoted. Regression: incident 2026-06-09."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="mainsha0" * 5),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "abcd" * 10
+    base_record = {
+        "candidate_sha": candidate_sha,
+        "confidence": 0.91,
+        "pr_url": "https://github.com/acme/widget/pull/5",
+    }
+
+    result = await rq._guard_ci_unresolved_promotion_in_flight(
+        db_session, version, candidate_sha, base_record,
+        "tok", "acme", "widget", project,
+    )
+    await db_session.commit()
+
+    assert result is not None
+    # Guard intercepted — this would have been a spurious not_promoted write.
+    assert result.get("status") == "promoted"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_guard_ci_unresolved_open_pr_restores_promotion_pending(
+    db_session, mocker
+):
+    """Guard: when the candidate is NOT yet on main but an open release PR
+    exists (auto-merge armed), restores promotion_pending so the reaper can
+    confirm the merge. The caller must NOT write not_promoted."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "html_url": "https://github.com/acme/widget/pull/42",
+                    "head": {"ref": "release-v1"},
+                    "auto_merge": {"enabled_by": "bot"},
+                }
+            ]
+        ),
+    )
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "beef" * 10
+    base_record = {"candidate_sha": candidate_sha, "confidence": 0.90}
+
+    result = await rq._guard_ci_unresolved_promotion_in_flight(
+        db_session, version, candidate_sha, base_record,
+        "tok", "acme", "widget", project,
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result.get("status") == "pending_auto_merge"
+    assert result.get("pr_number") == 42
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    pend = version.last_qualification.get("promotion_pending", {})
+    assert pend.get("pr_number") == 42
+    assert pend.get("restored_by_ci_unresolved_guard") is True
+
+
+@pytest.mark.asyncio
+async def test_guard_ci_unresolved_no_open_pr_returns_none(db_session, mocker):
+    """Guard: candidate is not on main AND no open release PR exists — guard
+    returns None and the caller proceeds with the normal not_promoted write."""
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "cafe" * 10
+    base_record = {"candidate_sha": candidate_sha, "confidence": 0.70}
+
+    result = await rq._guard_ci_unresolved_promotion_in_flight(
+        db_session, version, candidate_sha, base_record,
+        "tok", "acme", "widget", project,
+    )
+
+    assert result is None
