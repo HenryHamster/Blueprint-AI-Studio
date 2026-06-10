@@ -3937,6 +3937,25 @@ async def _spawn_strategic_review(
         if mode_hint_lines
         else None
     )
+    spawn_gate_hint_lines = []
+    for stat_entry in direction_stats:
+        spawn_gate_metrics = stat_entry.get("spawn_gate_metrics") or {}
+        exhaustion_count = int(spawn_gate_metrics.get("exhaustion_count") or 0)
+        if exhaustion_count <= 0:
+            continue
+        direction_label = f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        spawn_gate_hint_lines.append(
+            f"- {direction_label} — Spawn-gate grader note: wholesale retry exhausted {exhaustion_count} time(s); repeated grader non-response in this direction looks infrastructural rather than like a real finding refutation."
+        )
+    if spawn_gate_hint_lines:
+        spawn_gate_block = "\n".join(
+            ["Spawn-gate grader notes for this cycle:", *spawn_gate_hint_lines]
+        )
+        prompt_suffix = (
+            f"{prompt_suffix}\n{spawn_gate_block}"
+            if prompt_suffix
+            else spawn_gate_block
+        )
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic
     # agent avoids re-proposing similar work the user already declined.

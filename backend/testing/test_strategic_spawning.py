@@ -1950,6 +1950,7 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
                         "research_spawn_gate_challenged_merged": 2,
                         "research_spawn_gate_unchallenged_spawned": 4,
                         "research_spawn_gate_unchallenged_merged": 3,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
                     }
                 ],
             }
@@ -1982,8 +1983,13 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
             "reason": "manifest cap",
         }
     ]
+    assert sgm["exhaustion_count"] == 1
     assert sgm["challenged_merge_rate"] == round(2 / 3, 3)
     assert sgm["unchallenged_merge_rate"] == round(3 / 4, 3)
+    suffix = payload.get("prompt_suffix", "")
+    assert "Spawn-gate grader notes for this cycle:" in suffix
+    assert "wholesale retry exhausted 1 time(s)" in suffix
+    assert "repeated grader non-response" in suffix
 
 
 @pytest.mark.asyncio

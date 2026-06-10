@@ -6827,6 +6827,7 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
                         "research_spawn_gate_unchallenged_spawned": 3,
                         "research_spawn_gate_unchallenged_merged": 1,
                         "research_spawn_gate_unchallenged_merge_rate": 0.333,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
                         "research_spawn_gate_parse_outcome": "no_hash_matches",
                         "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
                         "research_spawn_gate_manifest_excluded_fail_closed_samples": [
@@ -6875,7 +6876,100 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
     ]
     assert gate["challenged_merge_rate"] == 0.5
     assert gate["unchallenged_merge_rate"] == 0.333
+    assert gate["exhaustion_count"] == 1
     assert gate["parse_outcome_distribution"] == {"no_hash_matches": 1}
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_exposes_adversarial_give_up(
+    client: AsyncClient, db_session
+):
+    """Digest direction_progress includes adversarial give-up counts and samples."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-give-up",
+                "text": "Give-up direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-give-up-1",
+                        "tasks_created": 1,
+                        "research_spawn_gate_adversarial_give_up_count": 3,
+                        "research_spawn_gate_adversarial_give_up_samples": [
+                            {"title": "Abandoned finding A", "direction_id": "dir-give-up"},
+                            {"title": "Abandoned finding B"},
+                        ],
+                    },
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-give-up-2",
+                        "tasks_created": 1,
+                        "research_spawn_gate_adversarial_give_up_count": 1,
+                        "research_spawn_gate_adversarial_give_up_samples": [
+                            {"title": "Abandoned finding C"},
+                        ],
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-give-up"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-give-up")
+    gate = dp["research_spawn_gate"]
+    assert gate is not None
+    # Counts sum across both history entries.
+    assert gate["adversarial_give_up_count"] == 4
+    samples = gate["adversarial_give_up_samples"]
+    sample_titles = [s["title"] for s in samples]
+    assert "Abandoned finding A" in sample_titles
+    assert "Abandoned finding B" in sample_titles
+    assert "Abandoned finding C" in sample_titles
+    assert len(samples) == len({s["title"] for s in samples}), "samples must be deduped"
+
+
+@pytest.mark.asyncio
+async def test_digest_spawn_gate_aggregate_give_up_count_alone_produces_non_none(
+    client: AsyncClient, db_session
+):
+    """A direction with only adversarial give-up activity produces a non-None aggregate."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {
+            "research_spawn_gate_adversarial_give_up_count": 2,
+            "research_spawn_gate_adversarial_give_up_samples": [
+                {"title": "Discarded finding X"},
+            ],
+        }
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    assert result["adversarial_give_up_count"] == 2
+    assert result["adversarial_give_up_samples"] == [{"title": "Discarded finding X"}]
+    # Other counters are zero when no other spawn-gate activity occurred.
+    assert result["challenged"] == 0
+    assert result["refuted"] == 0
+    assert result["survived"] == 0
 
 
 @pytest.mark.asyncio

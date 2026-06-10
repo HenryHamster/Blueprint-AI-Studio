@@ -638,6 +638,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_unresolved_count": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (decision-quality breakdown: unresolved/no-verdict slice of refuted)"
     },
+    "research_spawn_gate_wholesale_retry_exhausted": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (wholesale grader retry-exhaustion count / infrastructure-failure signal)"
+    },
     "research_spawn_gate_refuted_reasons": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (compact deduped sample of refuted/unresolved challenger reasons for a degraded-gate signal)"
     },
@@ -649,6 +652,12 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "research_spawn_gate_manifest_excluded_fail_closed_samples": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (compact samples of high-stakes findings excluded from the bounded adversarial manifest)"
+    },
+    "research_spawn_gate_adversarial_give_up_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (count of findings permanently discarded after 3 consecutive adversarial-gate deferrals)"
+    },
+    "research_spawn_gate_adversarial_give_up_samples": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (compact samples of finding titles permanently discarded by adversarial-gate give-up)"
     },
     "research_spawn_gate_challenged_spawned": {
         "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
@@ -782,6 +791,9 @@ async def _update_direction_research_outcomes(
     spawn_gate_unresolved_count = int(
         research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
     )
+    spawn_gate_wholesale_retry_exhausted = bool(
+        research_task_ctx.get("research_spawn_gate_wholesale_retry_exhausted")
+    )
     spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
     spawn_gate_manifest_excluded_count = int(
         research_task_ctx.get(
@@ -827,6 +839,31 @@ async def _update_direction_research_outcomes(
         ):
             _seen_spawn_gate_reasons.add(_sg_reason)
             spawn_gate_refuted_reasons.append(_sg_reason)
+    # Adversarial give-up: findings permanently discarded after 3 consecutive
+    # adversarial-gate deferrals (finding_structural_give_up.by_reason.adversarial_gate).
+    _give_up = research_task_ctx.get("finding_structural_give_up") or {}
+    spawn_gate_adversarial_give_up_count = int(
+        (_give_up.get("by_reason") or {}).get("adversarial_gate", 0)
+    )
+    spawn_gate_adversarial_give_up_samples: list[dict] = []
+    _seen_adversarial_give_up: set[str] = set()
+    for _gu_sample in _give_up.get("sample") or []:
+        if not isinstance(_gu_sample, dict):
+            continue
+        if _gu_sample.get("reason") != "adversarial_gate":
+            continue
+        _title = str(_gu_sample.get("title") or "")[:120]
+        if (
+            _title
+            and _title not in _seen_adversarial_give_up
+            and len(spawn_gate_adversarial_give_up_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        ):
+            _seen_adversarial_give_up.add(_title)
+            _gu_entry: dict = {"title": _title}
+            _dir_id = _gu_sample.get("direction_id")
+            if _dir_id:
+                _gu_entry["direction_id"] = str(_dir_id)
+            spawn_gate_adversarial_give_up_samples.append(_gu_entry)
 
     def _apply_spawn_gate_parent_metrics() -> None:
         # Keep these as direct entry[...] writes so the manifest guard can
@@ -845,6 +882,9 @@ async def _update_direction_research_outcomes(
         entry["research_spawn_gate_unresolved_count"] = (
             spawn_gate_unresolved_count
         )
+        entry["research_spawn_gate_wholesale_retry_exhausted"] = (
+            spawn_gate_wholesale_retry_exhausted
+        )
         if spawn_gate_refuted_reasons:
             entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
         if spawn_gate_parse_outcome:
@@ -855,6 +895,15 @@ async def _update_direction_research_outcomes(
             )
             entry["research_spawn_gate_manifest_excluded_fail_closed_samples"] = (
                 spawn_gate_manifest_excluded_samples
+            )
+        # Adversarial give-up: permanently discarded findings (separate bucket
+        # from regular refuted/survived; additive, does not change legacy counters).
+        entry["research_spawn_gate_adversarial_give_up_count"] = (
+            spawn_gate_adversarial_give_up_count
+        )
+        if spawn_gate_adversarial_give_up_samples:
+            entry["research_spawn_gate_adversarial_give_up_samples"] = (
+                spawn_gate_adversarial_give_up_samples
             )
 
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)

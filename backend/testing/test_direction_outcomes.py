@@ -225,6 +225,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
         "research_spawn_gate_explicit_pass_count": 1,
         "research_spawn_gate_fail_open_count": 0,
         "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
         "research_spawn_gate_refuted_reasons": ["fail-closed: no verdict"],
     }
     project.directions = [_make_direction(direction_id, research_task_id)]
@@ -245,6 +246,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
     assert entry["research_spawn_gate_explicit_pass_count"] == 1
     assert entry["research_spawn_gate_fail_open_count"] == 0
     assert entry["research_spawn_gate_unresolved_count"] == 1
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is True
     assert entry["research_spawn_gate_refuted_reasons"] == [
         "fail-closed: no verdict"
     ]
@@ -5338,11 +5340,17 @@ async def test_per_direction_format_metrics_have_a_consumer_or_are_retired(
     # Verify manifest entries have been promoted from pending to consumer.
     fc_entry = RESEARCH_HISTORY_METRIC_MANIFEST["format_compliance_rate"]
     sr_entry = RESEARCH_HISTORY_METRIC_MANIFEST["self_repair_success_rate"]
+    sg_entry = RESEARCH_HISTORY_METRIC_MANIFEST[
+        "research_spawn_gate_wholesale_retry_exhausted"
+    ]
     assert "consumer" in fc_entry, (
         "format_compliance_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
     )
     assert "consumer" in sr_entry, (
         "self_repair_success_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
+    )
+    assert "consumer" in sg_entry, (
+        "research_spawn_gate_wholesale_retry_exhausted must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
     )
 
     # Functional check: verify the fields are correctly computed and stored.
@@ -5585,3 +5593,94 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     assert "no_hash_matches" in reasons
     assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
     assert len(reasons) <= 5
+
+
+@pytest.mark.asyncio
+async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
+    db_session: AsyncSession,
+):
+    """Adversarial give-up events from finding_structural_give_up roll into history.
+
+    When a research task's context carries a finding_structural_give_up dict with
+    by_reason.adversarial_gate > 0, the count must appear in the research_history
+    entry as research_spawn_gate_adversarial_give_up_count and the adversarial-gate
+    filtered sample must appear as research_spawn_gate_adversarial_give_up_samples.
+    Non-adversarial-gate samples must NOT be included in the samples list.
+    """
+    direction_id = "d-adversarial-give-up"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 0,
+        "research_spawn_gate_refuted_count": 0,
+        "research_spawn_gate_survived_count": 0,
+        "research_spawn_gate_explicit_pass_count": 0,
+        "research_spawn_gate_fail_open_count": 0,
+        "research_spawn_gate_unresolved_count": 0,
+        "finding_structural_give_up": {
+            "at": "2026-06-10T00:00:00",
+            "total": 3,
+            "by_reason": {
+                "adversarial_gate": 2,
+                "manifest_excluded": 1,
+            },
+            "by_direction": {direction_id: 3},
+            "sample": [
+                {
+                    "title": "Adversarial-killed finding A",
+                    "reason": "adversarial_gate",
+                    "direction_id": direction_id,
+                },
+                {
+                    "title": "Adversarial-killed finding B",
+                    "reason": "adversarial_gate",
+                    "direction_id": direction_id,
+                },
+                {
+                    "title": "Manifest-excluded finding C",
+                    "reason": "manifest_excluded",
+                    "direction_id": direction_id,
+                },
+            ],
+        },
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="surviving-task",
+        context={"direction_id": direction_id},
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Adversarial give-up count reflects only the adversarial_gate bucket.
+    assert entry["research_spawn_gate_adversarial_give_up_count"] == 2
+
+    # Samples contain only adversarial-gate entries (manifest_excluded is filtered out).
+    samples = entry.get("research_spawn_gate_adversarial_give_up_samples", [])
+    assert len(samples) == 2
+    titles = [s["title"] for s in samples]
+    assert "Adversarial-killed finding A" in titles
+    assert "Adversarial-killed finding B" in titles
+    assert "Manifest-excluded finding C" not in titles
+
+    # Give-up count is a separate bucket — legacy refuted/survived counters unchanged.
+    assert entry["research_spawn_gate_refuted_count"] == 0
+    assert entry["research_spawn_gate_survived_count"] == 0
