@@ -71,6 +71,101 @@ describe('buildContextPrefix', () => {
     expect(prefix).not.toContain('## Existing knowledge documents');
   });
 
+  it('renders acceptance-grade badge for accepted compute_experiment entry', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-1',
+            title: 'GPU accuracy benchmark',
+            summary: 'Accuracy reached 0.93 >= 0.9 threshold.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'acceptance',
+            compute_acceptance_reason: 'llm_artifact_cited',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-1] GPU accuracy benchmark');
+    expect(prefix).toContain('[acceptance]');
+    expect(prefix).not.toContain('[measured_only');
+  });
+
+  it('renders measured-only badge with reason for deterministic compute entry', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-2',
+            title: 'Deterministic compute result',
+            summary: 'Outcome recorded without LLM analysis.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'analysis_mode_not_llm',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-2] Deterministic compute result');
+    expect(prefix).toContain('[measured_only: analysis_mode_not_llm]');
+    expect(prefix).not.toContain('[acceptance]');
+  });
+
+  it('renders analysis-unavailable badge when unavailable_cause is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-3',
+            title: 'Compute run with missing grounding',
+            summary: 'Analysis was not available for this run.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'missing_grounding_probe',
+            unavailable_cause: 'grounding_probe_absent',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-3] Compute run with missing grounding');
+    expect(prefix).toContain('[analysis_unavailable: grounding_probe_absent]');
+    expect(prefix).not.toContain('[measured_only:');
+    expect(prefix).not.toContain('[acceptance]');
+  });
+
+  it('omits grade badge for non-compute knowledge entries', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-web-1',
+            title: 'OAuth flow research',
+            summary: 'Web research on OAuth device flow.',
+            topic: 'auth',
+            source_kind: 'web_research',
+            compute_acceptance_grade: null,
+            compute_acceptance_reason: 'non_compute_forward_quality_gate',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-web-1] OAuth flow research');
+    expect(prefix).not.toContain('[acceptance]');
+    expect(prefix).not.toContain('[measured_only');
+    expect(prefix).not.toContain('[analysis_unavailable');
+  });
+
   it('renders the acceptance-evidence section when context.acceptance_evidence is present', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'create' }],

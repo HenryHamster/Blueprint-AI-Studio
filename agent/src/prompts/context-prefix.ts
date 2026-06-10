@@ -330,7 +330,22 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
-      kdLines.push(`- [${id}] ${title}${metaSuffix}`);
+      let gradeBadge = '';
+      if (sourceKind === 'compute_experiment') {
+        const grade = strVal(entry.compute_acceptance_grade);
+        const unavailableCause = strVal(entry.unavailable_cause);
+        const acceptanceReason = strVal(entry.compute_acceptance_reason);
+        if (grade === 'acceptance') {
+          gradeBadge = ' [acceptance]';
+        } else if (unavailableCause) {
+          gradeBadge = ` [analysis_unavailable: ${unavailableCause}]`;
+        } else if (acceptanceReason) {
+          gradeBadge = ` [measured_only: ${acceptanceReason}]`;
+        } else {
+          gradeBadge = ' [measured_only]';
+        }
+      }
+      kdLines.push(`- [${id}] ${title}${metaSuffix}${gradeBadge}`);
       const summary = strVal(entry.summary);
       if (summary) kdLines.push(`  ${summary}`);
     }

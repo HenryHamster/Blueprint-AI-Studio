@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Mapping
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -3087,32 +3087,61 @@ async def compute_project_window_spend_usd(
     Includes both terminal and in-flight tasks so the figure reflects
     real recent spend. Primary use case: the per-project spend ceiling gate
     in autonomous_research.
+
+    A task is counted when its VM span overlaps the window — i.e. the task
+    has a vm_provisioned_at AND is either still running (no vm_stopped_at) or
+    stopped after the window cutoff. Long-running tasks that started before the
+    window boundary but are still in-flight or only stopped inside the window
+    are therefore included, closing the bypass hole for the spend ceiling gate.
+    LLM-only tasks (no vm_provisioned_at) are captured via a fallback on
+    created_at so existing LLM token cost behaviour is preserved.
     """
     cutoff = _utcnow() - timedelta(hours=window_hours)
     stmt = (
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.created_at >= cutoff,
+            or_(
+                # VM span overlaps the window: has a VM and either still running
+                # or stopped after the window cutoff.
+                Task.vm_provisioned_at.isnot(None)
+                & (
+                    Task.vm_stopped_at.is_(None)
+                    | (Task.vm_stopped_at >= cutoff)
+                ),
+                # LLM-only tasks (no VM span): fall back to created_at so token
+                # cost is still captured for tasks that never provisioned a VM.
+                Task.vm_provisioned_at.is_(None) & (Task.created_at >= cutoff),
+            ),
         )
         .options(
             load_only(
                 Task.id,
+                Task.status,
                 Task.context,
                 Task.vm_spot,
                 Task.vm_machine_type,
                 Task.vm_provisioned_at,
                 Task.vm_stopped_at,
+                Task.vm_runtime_cost_banked_db,
+                Task.attempt_history_db,
                 Task.api_call_summary,
                 Task.provider,
                 Task.model,
+                Task.llm_input_tokens_banked_db,
+                Task.llm_output_tokens_banked_db,
+                Task.llm_call_count_banked_db,
             )
         )
     )
+    now = _utcnow()
     tasks = list((await session.execute(stmt)).scalars().all())
     total = 0.0
     for t in tasks:
-        total += get_task_total_vm_cost_usd(t)
+        # In-flight tasks have no vm_stopped_at; estimate cost up to now so
+        # long-running tasks cannot bypass the spend ceiling.
+        stopped_at = now if (t.vm_provisioned_at and not t.vm_stopped_at) else None
+        total += get_task_total_vm_cost_usd(t, stopped_at=stopped_at)
         input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
         if input_tokens or output_tokens:
             key = ((t.provider or "").lower(), (t.model or "").lower())

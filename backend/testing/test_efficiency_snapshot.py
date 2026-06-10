@@ -4785,3 +4785,231 @@ async def test_compute_project_window_spend_usd_zero_for_empty_project(db_sessio
 
     total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
     assert total == 0.0
+
+
+# ---------------------------------------------------------------------------
+# VM span overlap tests — acceptance requirement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_overlapping_vm_spans(db_session):
+    """Acceptance test: tasks whose VM spans overlap the window must be counted even
+    when they started before the window boundary.
+
+    Covers three overlap shapes:
+      1. Started before window, stopped inside window (boundary-crosser).
+      2. Started before window, still in-flight (no vm_stopped_at).
+      3. Started and stopped inside window (normal case — must still work).
+
+    A fully-outside task (stopped before cutoff) must NOT be counted.
+    """
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # 1. Boundary-crosser: started 30h ago, stopped 2h ago (overlaps window).
+    boundary_start = now - timedelta(hours=30)
+    boundary_stop = now - timedelta(hours=2)
+    boundary_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=boundary_start,
+        vm_stopped_at=boundary_stop,
+        vm_spot=False,
+    )
+    db_session.add(boundary_task)
+
+    # 2. In-flight: started 30h ago, no vm_stopped_at (still running).
+    inflight_start = now - timedelta(hours=30)
+    inflight_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=inflight_start,
+        vm_stopped_at=None,
+        vm_spot=False,
+    )
+    db_session.add(inflight_task)
+
+    # 3. Normal in-window task: started 1h ago, stopped just now.
+    normal_start = now - timedelta(hours=1)
+    normal_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=normal_start,
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    db_session.add(normal_task)
+
+    # 4. Fully-outside task: started 48h ago, stopped 26h ago (before cutoff).
+    outside_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=now - timedelta(hours=48),
+        vm_stopped_at=now - timedelta(hours=26),
+        vm_spot=False,
+    )
+    db_session.add(outside_task)
+
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    # Compute expected costs for the 3 overlapping tasks only.
+    boundary_cost = (boundary_stop - boundary_start).total_seconds() * ON_DEMAND_RATE
+    # In-flight cost uses (now - inflight_start); use a generous tolerance.
+    inflight_cost = (now - inflight_start).total_seconds() * ON_DEMAND_RATE
+    normal_cost = (now - normal_start).total_seconds() * ON_DEMAND_RATE
+    # Fully-outside task contributes 0.
+    expected_min = round(boundary_cost + normal_cost, 6)
+
+    assert total > 0.0, "expected non-zero spend from overlapping tasks"
+    # Boundary-crosser and normal task are always deterministic; in-flight adds
+    # a small time-dependent component — assert total is at least the two
+    # deterministic costs and within a generous upper bound.
+    assert total >= expected_min, (
+        f"expected total >= {expected_min} (boundary + normal); got {total}"
+    )
+    assert total < round(
+        boundary_cost + inflight_cost + normal_cost + 60 * ON_DEMAND_RATE, 6
+    ), "total unexpectedly large — outside task may have been included"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_task_started_before_window(
+    db_session,
+):
+    """A task whose VM started before the window but stopped inside must be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    start = now - timedelta(hours=30)
+    stop = now - timedelta(hours=2)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=start,
+            vm_stopped_at=stop,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    expected = round((stop - start).total_seconds() * ON_DEMAND_RATE, 6)
+    assert total == pytest.approx(expected, rel=1e-4), (
+        f"boundary-crossing task cost should be {expected}, got {total}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_inflight_task_started_before_window(
+    db_session,
+):
+    """An in-flight task with vm_provisioned_at before the window must be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    start = now - timedelta(hours=30)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_provisioned_at=start,
+            vm_stopped_at=None,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    # In-flight tasks accrue cost up to now; must be positive.
+    assert total > 0.0, "in-flight task started before window must contribute spend"
+    # Sanity: cost should be roughly start-to-now seconds * rate (within 1 min slack).
+    max_expected = round((now - start + timedelta(minutes=1)).total_seconds() * ON_DEMAND_RATE, 6)
+    assert total <= max_expected
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_excludes_fully_outside_task(db_session):
+    """A task whose VM span ended before the window cutoff must NOT be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(hours=48),
+            vm_stopped_at=now - timedelta(hours=26),
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    assert total == 0.0, f"fully-outside task must not contribute spend; got {total}"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_llm_only_task_in_window_still_counted(
+    db_session,
+):
+    """LLM-only task (no vm_provisioned_at) created inside the window is still counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=None,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            created_at=now,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(1000 * in_rate + 500 * out_rate, 6)
+    assert total == expected, f"LLM-only in-window task should contribute {expected}; got {total}"

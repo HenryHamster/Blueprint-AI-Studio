@@ -2255,11 +2255,15 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "compute_acceptance_reason",
+        "unavailable_cause",
         "origin_provenance",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
     assert entry["compute_acceptance_grade"] is None  # non-compute doc
+    assert entry["compute_acceptance_reason"] == "non_compute_forward_quality_gate"
+    assert entry["unavailable_cause"] is None
     assert entry["origin_provenance"]["origin_state"] == "legacy_unknown"
     assert entry["origin_provenance"]["challenge_state"] == "legacy_unknown"
     assert entry["title"] == "Doc A"

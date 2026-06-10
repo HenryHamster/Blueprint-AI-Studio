@@ -1827,6 +1827,7 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     index = await build_knowledge_index(db_session, task.project_id)
     assert index[0]["knowledge_acceptance_evidence"] is True
     assert index[0]["compute_acceptance_grade"] == "acceptance"
+    assert index[0]["compute_acceptance_reason"] == "llm_artifact_cited"
     assert index[0]["analysis_fallback_reason"] is None
     substance = await fetch_knowledge_substance_index(db_session, task.project_id)
     assert substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is True
@@ -1862,6 +1863,7 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert deterministic_detail["compute_acceptance_grade"] == "measured_only"
     assert deterministic_detail["analysis_fallback_reason"] is None
     deterministic_index = await build_knowledge_index(db_session, deterministic_task.project_id)
+    assert deterministic_index[0]["compute_acceptance_reason"] == "analysis_mode_not_llm"
     assert deterministic_index[0]["analysis_fallback_reason"] is None
     deterministic_substance = await fetch_knowledge_substance_index(
         db_session, deterministic_task.project_id

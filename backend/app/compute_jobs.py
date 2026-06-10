@@ -256,6 +256,11 @@ async def create_compute_job(
                 await session.refresh(existing)
             return existing
         raise ValueError("task already has an active compute job")
+    await _check_project_spend_ceiling(
+        session,
+        project_id=locked_task.project_id,
+        requested_cap_usd=capped_spend,
+    )
     deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
@@ -432,6 +437,53 @@ async def _resolve_live_release_evidence(
             }
         )
     return evidence
+
+
+async def _check_project_spend_ceiling(
+    session,
+    *,
+    project_id: uuid.UUID,
+    requested_cap_usd: float,
+) -> None:
+    """Raise ComputeLaunchPreconditionFailed when launching would breach the project ceiling.
+
+    Computes rolling spend as settled terminal-job costs in the last 24 h plus
+    in-flight accrued costs across all active jobs for this project. If that
+    total plus the requested cap would exceed the configured
+    ``daily_spend_ceiling_usd``, the launch is rejected before any row is
+    written. The check is skipped when no ceiling is configured.
+    """
+    project = await session.get(Project, project_id)
+    ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
+    if not ceiling_usd:
+        return
+    ceiling_usd = float(ceiling_usd)
+    since = _utcnow() - timedelta(hours=24)
+    settled = await get_recent_terminal_compute_spend_usd(
+        session, project_id=project_id, since=since
+    )
+    inflight_result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.accrued_cost_usd), 0.0)).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
+        )
+    )
+    inflight = float(inflight_result.scalar_one() or 0.0)
+    rolling = settled + inflight
+    if rolling + requested_cap_usd > ceiling_usd:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "project_spend_ceiling_exceeded",
+                "message": (
+                    f"project rolling 24h compute spend ${rolling:.4f} plus requested "
+                    f"cap ${requested_cap_usd:.4f} would exceed configured ceiling "
+                    f"${ceiling_usd:.4f}"
+                ),
+                "rolling_spend_usd": rolling,
+                "requested_cap_usd": requested_cap_usd,
+                "ceiling_usd": ceiling_usd,
+            }
+        )
 
 
 async def _lock_task_for_compute_job(session, task_id: uuid.UUID | None) -> Task | None:

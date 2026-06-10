@@ -7563,3 +7563,220 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
     assert len(alerts_c) == 1, (
         f"dedup guard must prevent a second alert, got {len(alerts_c)}"
     )
+
+
+# ── Project spend ceiling tests ───────────────────────────────────────────────
+
+
+def _make_project_with_ceiling(ceiling_usd: float) -> Project:
+    return Project(
+        name=f"Ceiling Project {ceiling_usd}",
+        user_id="test-user",
+        build_config={"daily_spend_ceiling_usd": ceiling_usd},
+    )
+
+
+async def _make_terminal_job(
+    db_session, *, project_id, final_cost_usd: float
+) -> ComputeJob:
+    """Helper: insert a SUCCEEDED job with final_cost_usd completed 1 h ago."""
+    job = ComputeJob(
+        project_id=project_id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=final_cost_usd,
+        accrued_cost_usd=final_cost_usd,
+        completed_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_respects_project_daily_spend_ceiling(db_session):
+    """Ceiling set, rolling settled spend + requested cap > ceiling → blocked."""
+    project = _make_project_with_ceiling(5.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Settled spend: $4.50 in the last 24 h.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=4.50)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Requesting $1.00 cap: 4.50 + 1.00 = 5.50 > 5.00 → should raise.
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo ceiling",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    assert detail["ceiling_usd"] == pytest.approx(5.0)
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+    assert detail["requested_cap_usd"] == pytest.approx(1.0)
+
+    # No job row should have been created.
+    jobs = (await db_session.execute(select(ComputeJob).where(
+        ComputeJob.project_id == project.id,
+        ComputeJob.status.in_([
+            ComputeJobStatus.QUEUED, ComputeJobStatus.STARTING,
+            ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING,
+        ]),
+    ))).scalars().all()
+    assert jobs == [], "no compute job should be created when ceiling is exceeded"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_allows_when_under_budget(db_session):
+    """Ceiling set, rolling spend + cap is within the ceiling → job created."""
+    project = _make_project_with_ceiling(10.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Settled spend: $4.00.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=4.00)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # 4.00 + 1.00 = 5.00 < 10.00 → allowed.
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo under budget",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_idempotent_reuse_ignores_ceiling(db_session):
+    """Fingerprint-matching reuse returns the existing job even when over budget."""
+    project = _make_project_with_ceiling(1.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First launch succeeds before any spend is recorded.
+    first = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo idempotent ceiling",
+        machine_type="e2-standard-2",
+        spend_cap_usd=0.50,
+        deadline_seconds=300,
+    )
+
+    # Now push settled spend over the ceiling.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=0.90)
+
+    # Same fingerprint: the existing job is reused — ceiling check is skipped.
+    second = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo idempotent ceiling",
+        machine_type="e2-standard-2",
+        spend_cap_usd=0.50,
+        deadline_seconds=300,
+    )
+
+    assert first.id == second.id, "idempotent reuse must return the same job"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_no_ceiling_configured(db_session):
+    """No daily_spend_ceiling_usd → job is always created without spend checks."""
+    project = Project(name="No Ceiling Project", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Large settled spend; no ceiling configured so it should not block.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=9999.0)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo no ceiling",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_counts_active_inflight_spend(db_session):
+    """In-flight (active) job accrued costs push total over ceiling → blocked."""
+    project = _make_project_with_ceiling(5.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # An existing in-flight job with $4.50 accrued cost (not yet terminal).
+    running_task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(running_task)
+    await db_session.commit()
+    await db_session.refresh(running_task)
+
+    inflight = ComputeJob(
+        project_id=project.id,
+        task_id=running_task.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.RUNNING,
+        accrued_cost_usd=4.50,
+        final_cost_usd=None,
+    )
+    db_session.add(inflight)
+    await db_session.commit()
+
+    # New task wants to launch a $1.00 job: 0 settled + 4.50 inflight + 1.00 > 5.00.
+    new_task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(new_task)
+    await db_session.commit()
+    await db_session.refresh(new_task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            new_task,
+            command="echo inflight ceiling",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)

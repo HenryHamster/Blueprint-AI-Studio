@@ -638,6 +638,8 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "compute_acceptance_reason",
+        "unavailable_cause",
         "origin_provenance",
     }
 

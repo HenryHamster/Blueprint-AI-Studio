@@ -518,6 +518,12 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         ),
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
+        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
+        "unavailable_cause": (
+            verdict.get("unavailable_cause")
+            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+            else None
+        ),
         "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
