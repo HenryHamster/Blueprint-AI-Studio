@@ -1429,11 +1429,15 @@ async def test_requeue_limit_respects_mixed_terminal_child_sets(
 
 
 @pytest.mark.asyncio
-async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
+async def test_requeue_terminal_all_non_death_cancelled_single(tl_db, mocker):
     """All-children-terminal path: a parent whose ONLY unsucceeded child is a
-    non-genuine cancel (cascade/replaced-by-retry) finalizes FAILED immediately —
-    not parked EVALUATING forever — with an accurate message and NO direction
-    health penalty / failure alert."""
+    non-death cancel (_replaced_by_task_id — work continues under the clone)
+    finalizes CANCELLED immediately — not parked EVALUATING forever — with a
+    clear message and NO direction-health penalty / failure alert.
+
+    _replaced_by_task_id is recognized by is_non_death_cancellation; the
+    all_non_death_cancelled verdict fires before genuine_failures can count it,
+    preventing a false FAILED + AGENT_TIMEOUT."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     failure_alert = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -1460,14 +1464,15 @@ async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
 
     assert result == 0
     await session.refresh(parent)
-    assert parent.status == TaskStatus.FAILED
-    assert "superseded/cancelled" in (parent.latest_status_message or "")
-    assert "nothing to roll up" in (parent.latest_status_message or "")
-    # Accurate, non-confabulated category — SCOPE_EMPTY, not AGENT_TIMEOUT.
-    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    # Non-death cancel → CANCELLED, not FAILED.
+    assert parent.status == TaskStatus.CANCELLED
+    assert "deliberately shelved or superseded" in (parent.latest_status_message or "")
+    assert "not a failure" in (parent.latest_status_message or "")
+    # No failure category stored — this is not a failure.
+    assert parent.context.get("failure_category") is None
     # Budget untouched — nothing was retried.
     assert parent.context.get("_requeue_count") == 0
-    # Non-genuine cancels → no direction-health ding and no failure alert.
+    # Non-death cancels → no direction-health ding and no failure alert.
     record_failure.assert_not_called()
     failure_alert.assert_not_awaited()
 
@@ -1521,10 +1526,13 @@ async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(tl_db, 
 
 
 @pytest.mark.asyncio
-async def test_requeue_limit_all_non_genuine_cancelled_terminates_failed(tl_db, mocker):
+async def test_requeue_limit_all_non_death_cancelled_terminates_cancelled(tl_db, mocker):
     """Requeue-LIMIT path: parent at the cap whose only unsucceeded child is a
-    non-genuine cancel terminates FAILED (kept in lockstep with the
-    all-children-terminal path) without a direction-health ding."""
+    non-death cancel terminates CANCELLED (kept in lockstep with the
+    all-children-terminal path) without a direction-health ding.
+
+    _replaced_by_task_id satisfies is_non_death_cancellation so the
+    all_non_death_cancelled verdict fires and the parent is CANCELLED, not FAILED."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     record_failure = mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
     session, _ = tl_db
@@ -1548,9 +1556,10 @@ async def test_requeue_limit_all_non_genuine_cancelled_terminates_failed(tl_db, 
 
     assert result == 0
     await session.refresh(parent)
-    assert parent.status == TaskStatus.FAILED
-    assert "superseded/cancelled" in (parent.latest_status_message or "")
-    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    # Non-death cancel → CANCELLED, not FAILED.
+    assert parent.status == TaskStatus.CANCELLED
+    assert "deliberately shelved or superseded" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") is None
     record_failure.assert_not_called()
 
 
