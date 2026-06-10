@@ -681,6 +681,31 @@ async def _resolve_review_second_opinion(
         )
         return
 
+    # Idempotence guard: resolution must run exactly once per challenge. The
+    # challenger's post-commit can legitimately re-fire after the first pass
+    # has consumed the parked verdict — an agent HTTP retry or the
+    # post_commit_pending sweep replays it while the first pass is still in
+    # (or died during) the slow re-dispatch below, and the replay payload
+    # carries no logs. Without this guard the replay falls into the
+    # fail-closed branch and OVERWRITES the real reconciliation with a
+    # "challenge unresolved — manual review required" escalation (observed
+    # fleet-wide on PRs #9303/#9308/#9319, 2026-06-10). The first pass pops
+    # AWAITING and writes the reconciliation record under the review row's
+    # FOR UPDATE lock, so under our own lock those keys are authoritative:
+    # either one says the challenge is already resolved — no-op.
+    _review_ctx = review.context or {}
+    if (
+        REVIEW_SECOND_OPINION_RECONCILIATION_KEY in _review_ctx
+        or REVIEW_SECOND_OPINION_AWAITING_KEY not in _review_ctx
+    ):
+        await session.commit()
+        logger.info(
+            "[REVIEW SECOND-OPINION] Challenge %s for review %s already resolved — ignoring replayed terminal status",
+            challenger.id,
+            review.id,
+        )
+        return
+
     parked = (review.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
     primary_verdict = parked.get("verdict") or "REQUEST_CHANGES"
     primary_issues = parked.get("issues") or []
