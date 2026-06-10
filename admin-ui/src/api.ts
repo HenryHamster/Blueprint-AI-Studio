@@ -1033,6 +1033,34 @@ export interface EfficiencyAxis {
   history: EfficiencyHistoryPoint[];
 }
 
+export interface EfficiencyDriftAxis {
+  current: number | null;
+  baseline: number | null;
+  drift_pct: number | null;
+  history?: EfficiencyHistoryPoint[];
+}
+
+export interface FormatComplianceResponse {
+  format_compliance_rate: EfficiencyDriftAxis;
+  self_repair_success_rate: EfficiencyDriftAxis;
+  tasks_measured: number | null;
+  well_formed_tasks: number | null;
+  format_error_total: number | null;
+  repair_attempts: number | null;
+  repair_successes: number | null;
+}
+
+export interface AgentTimeoutRateResponse {
+  overall: EfficiencyDriftAxis;
+  by_subtype: Record<string, { current: number | null; baseline: number | null; drift_pct: number | null }>;
+  dominant_subtype: string | null;
+  dominant_share: number | null;
+  denominator: number | null;
+  denominator_definition: string | null;
+  timeout_count: number | null;
+  window_days: number | null;
+}
+
 // Per-project warm-pool payoff verdict: a single synthesized answer to "did
 // enabling the pool produce a measured reuse lift WITHOUT a cost regression?",
 // folded from the pool-origin warm-start share + dispatch-funnel hit rate (lift)
@@ -1077,6 +1105,9 @@ export interface EfficiencyAxesResponse {
   // reuse number read. Optional/nullable — older backends omit it, and the
   // backend returns null when there were no warm starts to attribute.
   warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
+  // Optional nested blocks surfaced by the backend for the operator dashboard.
+  format_compliance?: FormatComplianceResponse;
+  agent_timeout_rate?: AgentTimeoutRateResponse;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

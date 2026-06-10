@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint } from '../api';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import {
@@ -225,20 +225,13 @@ interface EfficiencyAxisDef {
   favorableDirection: 'lower' | 'higher';
 }
 
-// Backend returns history[] per axis; api.ts EfficiencyAxis adds this field in cluster 4/4.
-interface EfficiencyAxisLocal {
-  current: number | null;
-  baseline: number | null;
-  drift_pct: number | null;
-  history?: Array<{ captured_at: string; value: number | null }>;
+interface EfficiencyAxisLocal extends EfficiencyAxis {
   baseline_seeded_at?: string | null;
   baseline_seed_snapshot_at?: string | null;
 }
 
-interface EfficiencyAxesLocal {
+interface EfficiencyAxesLocal extends EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxisLocal>;
-  baseline_captured_at: string | null;
-  last_snapshot_at: string | null;
   vm_cold_start_breakdown?: Record<string, number | null> | null;
   // Per-origin warm-start split (pool/backlog/chain) + pool-origin share,
   // rendered beneath the aggregate vm_reuse_rate axis so the contaminated
@@ -314,7 +307,7 @@ function ColdStartBreakdown({ breakdown }: { breakdown: Record<string, number | 
 }
 
 function AxisSparkline({ history, favorableDirection }: {
-  history: Array<{ captured_at: string; value: number | null }>;
+  history: EfficiencyHistoryPoint[];
   favorableDirection: 'lower' | 'higher';
 }) {
   const points = history
@@ -349,6 +342,36 @@ function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'h
   if (driftPct === null) return 'text-neutral-500';
   const isImproving = (favorableDirection === 'lower' && driftPct < 0) || (favorableDirection === 'higher' && driftPct > 0);
   return isImproving ? 'text-emerald-400' : 'text-red-400';
+}
+
+function formatAxisDisplay(axis: Pick<EfficiencyAxis, 'current' | 'baseline' | 'drift_pct'>, unit: string, favorableDirection: 'lower' | 'higher', percent = false) {
+  const driftColor = getDriftColor(axis.drift_pct, favorableDirection);
+  const driftArrow = axis.drift_pct === null ? '—' : (axis.drift_pct < 0 ? '↓' : '↑');
+  const toDisplayValue = (value: number | null) => {
+    if (value === null) return '—';
+    const numeric = percent ? value * 100 : value;
+    return `${numeric.toFixed(1)}${unit}`;
+  };
+  return {
+    current: toDisplayValue(axis.current),
+    baseline: toDisplayValue(axis.baseline),
+    driftColor,
+    driftDisplay: axis.drift_pct === null ? '—' : `${driftArrow} ${Math.abs(axis.drift_pct).toFixed(1)}%`,
+  };
+}
+
+function NestedAxisLine({ label, axis, unit, favorableDirection, percent = false }: { label: string; axis: Pick<EfficiencyAxis, 'current' | 'baseline' | 'drift_pct'>; unit: string; favorableDirection: 'lower' | 'higher'; percent?: boolean; }) {
+  const { current, baseline, driftColor, driftDisplay } = formatAxisDisplay(axis, unit, favorableDirection, percent);
+  return (
+    <div className="flex items-center justify-between gap-3 text-[10px]">
+      <span className="text-neutral-500">{label}</span>
+      <div className="flex items-center gap-3 text-neutral-300 font-mono">
+        <span>{current}</span>
+        <span className="text-neutral-500">baseline: {baseline}</span>
+        <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
+      </div>
+    </div>
+  );
 }
 
 function EfficiencyWidget({ projectId }: { projectId: string }) {
@@ -399,10 +422,8 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
       {EFFICIENCY_AXES.map((axisDef) => {
         const axisData = data.axes[axisDef.key];
         if (!axisData) return null;
-        const { current, baseline, drift_pct } = axisData;
-        const driftColor = getDriftColor(drift_pct, axisDef.favorableDirection);
-        const driftArrow = drift_pct === null ? '—' : (drift_pct < 0 ? '↓' : '↑');
-        const driftDisplay = drift_pct === null ? '—' : `${driftArrow} ${Math.abs(drift_pct).toFixed(1)}%`;
+        const { current, baseline } = axisData;
+        const { driftColor, driftDisplay } = formatAxisDisplay(axisData, axisDef.unit, axisDef.favorableDirection);
         const { baseline_seeded_at, baseline_seed_snapshot_at } = axisData;
         const reseedDate = baseline_seeded_at && baseline_seeded_at !== data.baseline_captured_at
           ? baseline_seeded_at
@@ -442,6 +463,60 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         );
       })}
+      {data.format_compliance && (
+        <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4">
+            <span className="text-neutral-400">Format compliance</span>
+            <div className="space-y-1 min-w-0">
+              <NestedAxisLine
+                label="format_compliance_rate"
+                axis={data.format_compliance.format_compliance_rate}
+                unit="%"
+                favorableDirection="higher"
+                percent
+              />
+              <NestedAxisLine
+                label="self_repair_success_rate"
+                axis={data.format_compliance.self_repair_success_rate}
+                unit="%"
+                favorableDirection="higher"
+                percent
+              />
+            </div>
+          </div>
+          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+            <span>tasks measured: {data.format_compliance.tasks_measured ?? '—'}</span>
+            <span>well formed: {data.format_compliance.well_formed_tasks ?? '—'}</span>
+            <span>format errors: {data.format_compliance.format_error_total ?? '—'}</span>
+            <span>repairs: {data.format_compliance.repair_attempts ?? '—'}</span>
+            <span>successes: {data.format_compliance.repair_successes ?? '—'}</span>
+          </div>
+        </div>
+      )}
+      {data.agent_timeout_rate && (
+        <div data-testid="agent-timeout-rate-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4">
+            <span className="text-neutral-400">Agent timeout rate</span>
+            <div className="space-y-1 min-w-0">
+              <NestedAxisLine
+                label="overall"
+                axis={data.agent_timeout_rate.overall}
+                unit="%"
+                favorableDirection="lower"
+                percent
+              />
+              <div className="text-[10px] text-neutral-500 text-right font-mono">
+                dominant subtype: {data.agent_timeout_rate.dominant_subtype ?? '—'}
+              </div>
+            </div>
+          </div>
+          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+            <span>share: {data.agent_timeout_rate.dominant_share != null ? `${(data.agent_timeout_rate.dominant_share * 100).toFixed(0)}%` : '—'}</span>
+            <span>timeouts: {data.agent_timeout_rate.timeout_count ?? '—'}</span>
+            <span>denominator: {data.agent_timeout_rate.denominator ?? '—'}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
