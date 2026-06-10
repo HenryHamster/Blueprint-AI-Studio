@@ -1385,3 +1385,41 @@ async def get_autonomous_status(
         )
 
     return {"projects": result}
+
+
+@router.post("/projects/{project_id}/bootstrap/retry")
+@limiter.limit("5/minute")
+async def retry_project_bootstrap(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enqueue a recovery repo_bootstrap task for a degraded or never-bootstrapped project.
+
+    Returns a JSON body with ``state`` describing the outcome:
+    - ``spawned`` — a new task was created; ``task_id`` is present.
+    - ``already_active`` — a bootstrap task is already running; no duplicate created.
+    - ``already_completed`` — bootstrap_completed_at is set; no task created.
+    - ``not_eligible`` — project is a self-repo or empty-repo; not bootstrappable.
+    """
+    from app.repo_bootstrap import spawn_bootstrap_task
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    result = await spawn_bootstrap_task(
+        project,
+        session,
+        is_first_bootstrap=False,
+        spawn_reason="operator_retry",
+    )
+    if result.outcome == "spawned":
+        await session.commit()
+
+    return {
+        "state": result.outcome,
+        "task_id": result.task_id,
+        "reason": result.reason,
+    }

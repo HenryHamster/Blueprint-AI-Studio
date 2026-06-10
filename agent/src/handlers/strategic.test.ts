@@ -246,6 +246,26 @@ describe('renderDesignDocIndexOverview', () => {
     expect(out).toContain('`systems/ghost`');
     expect(out).toContain('all referenced module file(s) are absent');
   });
+
+  it('renders repo_overview inline bootstrap fields (tech_stack, directory_layout, first_steps)', () => {
+    const out = renderDesignDocIndexOverview({
+      sections: [
+        {
+          key: 'repo_overview',
+          tech_stack: 'TypeScript, Node.js, Vitest',
+          directory_layout: 'agent/ — worker; backend/ — API',
+          first_steps_summary: 'cd agent && npm install && npm test',
+        },
+      ],
+    });
+    expect(out).toContain('`repo_overview`');
+    expect(out).toContain('tech_stack: TypeScript, Node.js, Vitest');
+    expect(out).toContain('directory_layout: agent/ — worker; backend/ — API');
+    expect(out).toContain('first_steps: cd agent && npm install && npm test');
+    // Should appear under Other sections (not systems/capabilities).
+    expect(out).toContain('### Other sections');
+    expect(out).not.toContain('### Systems');
+  });
 });
 
 describe('renderStrategicPromptSuffix', () => {

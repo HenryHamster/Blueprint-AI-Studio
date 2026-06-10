@@ -3594,3 +3594,65 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 )
     except Exception:
         logger.exception("[SIDECAR-RECOVERY] Stranded-sidecar sweep failed")
+
+
+# ── Bootstrap recovery sweep ───────────────────────────────────────────────────
+
+_BOOTSTRAP_SWEEP_BATCH_SIZE = 20
+
+
+async def _sweep_bootstrap_recovery() -> None:
+    """Enqueue one repo_bootstrap task for each eligible unbootstrapped project.
+
+    Eligible projects are: external (not is_self_repo), non-empty
+    (repo_is_empty falsy), no bootstrap_completed_at, and no currently-active
+    (QUEUED/PROVISIONING/IN_PROGRESS) repo_bootstrap task.
+
+    The sweep is bounded and idempotent: the shared spawn_bootstrap_task helper
+    refuses to create a duplicate when one is already active, so repeated ticks
+    never pile up duplicate tasks.
+    """
+    from app.models import Project
+    from app.repo_bootstrap import spawn_bootstrap_task
+
+    try:
+        async with services.AsyncSessionLocal() as session:
+            # Filter ineligible projects IN the query so the LIMIT caps spawnable
+            # candidates, not the raw project set. Completed projects accumulate
+            # unboundedly over time; applying the limit before filtering them out
+            # would starve genuinely-eligible (degraded/failed/never-bootstrapped)
+            # projects as the completed set grows past the batch size.
+            #
+            # bootstrap_completed_at: absent key or null → IS NULL → eligible.
+            # repo_is_empty: absent key or 'false' → coalesce to 'false' → != 'true' → eligible.
+            # ORDER BY id gives consistent ordering so new projects aren't missed.
+            result = await session.execute(
+                select(Project).where(
+                    Project.is_self_repo.is_(False),
+                    Project.archived.is_(False),
+                    Project.build_config['bootstrap_completed_at'].as_string().is_(None),
+                    func.coalesce(
+                        Project.build_config['repo_is_empty'].as_string(), 'false'
+                    ) != 'true',
+                ).order_by(Project.id).limit(_BOOTSTRAP_SWEEP_BATCH_SIZE)
+            )
+            candidates = result.scalars().all()
+
+            spawned = 0
+            for project in candidates:
+                spawn_result = await spawn_bootstrap_task(
+                    project,
+                    session,
+                    is_first_bootstrap=False,
+                    spawn_reason="recovery_sweep",
+                )
+                if spawn_result.outcome == "spawned":
+                    spawned += 1
+
+            if spawned:
+                await session.commit()
+                logger.info(
+                    "[BOOTSTRAP-RECOVERY] Enqueued %d recovery bootstrap task(s)", spawned
+                )
+    except Exception:
+        logger.exception("[BOOTSTRAP-RECOVERY] Bootstrap recovery sweep failed")

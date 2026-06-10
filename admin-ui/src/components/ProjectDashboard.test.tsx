@@ -26,6 +26,7 @@ vi.mock('../api', async () => {
     archiveProject: vi.fn(async () => ({ message: 'archived', archived: true })),
     unarchiveProject: vi.fn(async () => ({ message: 'unarchived', archived: false })),
     fetchArchivedProjects: vi.fn(async () => []),
+    fetchBuildConfigCommands: vi.fn(async () => ({ project_id: 'proj-1', directories: [] })),
   };
 });
 
@@ -114,7 +115,7 @@ describe('ProjectDashboard', () => {
     expect(screen.getByText('1 evaluating')).toBeInTheDocument();
     expect(screen.getAllByText('1 failed')).toHaveLength(2);
     expect(screen.getByText('1 done')).toBeInTheDocument();
-    expect(screen.getByText('Bootstrap')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Bootstrap' })).toBeInTheDocument();
     expect(screen.getByTitle('Complete project setup')).toBeInTheDocument();
     expect(screen.getByTitle('Project Members')).toBeInTheDocument();
     expect(screen.getByTitle('Add new project')).toBeInTheDocument();

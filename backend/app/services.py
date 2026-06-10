@@ -629,4 +629,5 @@ from app.recovery_sweeps import (  # noqa: F401
     _recover_childless_evaluating_without_marker,
     _recover_orphaned_tasks,
     _sweep_stranded_sidecar_sources,
+    _sweep_bootstrap_recovery,
 )

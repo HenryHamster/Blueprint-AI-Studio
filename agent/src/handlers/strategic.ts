@@ -154,6 +154,16 @@ export function renderDesignDocIndexOverview(index: Record<string, unknown> | un
     let line = parts.join(' ');
     if (modules.length > 0) line += `\n  - modules: ${modules.join(', ')}`;
     if (warning) line += `\n  - ⚠ ${warning}`;
+    // repo_overview carries inline bootstrap context so the first strategic
+    // cycle has repo orientation without a fetch round-trip.
+    if (key === 'repo_overview') {
+      const techStack = strVal(entry.tech_stack);
+      const dirLayout = strVal(entry.directory_layout);
+      const firstSteps = strVal(entry.first_steps_summary);
+      if (techStack) line += `\n  - tech_stack: ${techStack}`;
+      if (dirLayout) line += `\n  - directory_layout: ${dirLayout}`;
+      if (firstSteps) line += `\n  - first_steps: ${firstSteps}`;
+    }
 
     if (key.startsWith('systems/')) systems.push(line);
     else if (key.startsWith('capabilities/')) capabilities.push(line);

@@ -954,51 +954,27 @@ async def onboard_project(
     # Auto-spawn a repo_bootstrap task for non-self-repo, non-empty projects
     # that have not already been bootstrapped. This runs once before the first
     # strategic cycle to seed design doc sections and confirm build/test commands.
-    if (
-        not project.is_self_repo
-        and not (project.build_config or {}).get("repo_is_empty")
-        and not (project.build_config or {}).get("bootstrap_completed_at")
-    ):
-        try:
-            import uuid as _uuid
-            from app.models import Task, TaskStatus, TaskHistory
+    try:
+        from app.repo_bootstrap import spawn_bootstrap_task
 
-            _bootstrap_payload = {
-                "type": "repo_bootstrap",
-                "github_owner": project.github_owner or "",
-                "github_repo": project.github_repo or "",
-                "integration_branch": project.integration_branch or default_branch or "",
-                "is_first_bootstrap": True,
-            }
-            _bootstrap_task = Task(
-                project_id=project.id,
-                title=f"Bootstrap: {project.name}",
-                description="First-cycle repo bootstrap: read project structure, confirm build/test commands, seed design context",
-                payloads=[_bootstrap_payload],
-                vm_instance_id=f"agent-vm-{_uuid.uuid4().hex}",
-                status=TaskStatus.QUEUED,
-                created_by="ORCHESTRATOR",
-                context={"bootstrap_reason": "first_cycle"},
-            )
-            session.add(_bootstrap_task)
-            await session.flush()
-            _bootstrap_history = TaskHistory(
-                task_id=_bootstrap_task.id,
-                action="SPAWNED",
-                details={"spawned_by": "ONBOARDING", "reason": "first_cycle_bootstrap"},
-            )
-            session.add(_bootstrap_history)
+        _result = await spawn_bootstrap_task(
+            project,
+            session,
+            is_first_bootstrap=True,
+            spawn_reason="first_cycle",
+        )
+        if _result.outcome == "spawned":
             await session.commit()
             logger.info(
                 "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
-                _bootstrap_task.id,
+                _result.task_id,
                 project.id,
             )
-        except Exception:
-            logger.exception(
-                "[ONBOARD] Failed to spawn repo_bootstrap task for project %s — continuing",
-                project.id,
-            )
+    except Exception:
+        logger.exception(
+            "[ONBOARD] Failed to spawn repo_bootstrap task for project %s — continuing",
+            project.id,
+        )
 
     response["project_id"] = str(project.id)
     response["build_config"] = project.build_config or build_config or {}

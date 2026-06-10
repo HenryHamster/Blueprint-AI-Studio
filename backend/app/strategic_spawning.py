@@ -236,6 +236,10 @@ def _agent_view_design_doc(doc: dict | None) -> dict:
 # the underlying design doc grows. The agent pulls full content on demand via
 # ``POST /api/agent/design-doc`` (op:get).
 _DESIGN_DOC_INDEX_SUMMARY_CHARS = 200
+# Per-field char cap for repo_overview inline fields (tech_stack,
+# directory_layout, first_steps_summary). Enough to orient the first strategic
+# cycle without unbounding the index on verbose bootstrap output.
+_REPO_OVERVIEW_INLINE_CHARS = 300
 # Cap on backing module paths carried per systems/capabilities entry so a
 # pathological entry with hundreds of modules cannot unbound the index. The
 # declared paths are kept (capped) so the agent-side reconciliation over the
@@ -326,6 +330,19 @@ def _design_doc_index(doc: dict | None) -> dict:
             warning = value.get("presence_warning")
             if isinstance(warning, str) and warning.strip():
                 entry["presence_warning"] = warning
+        elif isinstance(value, dict) and key == "repo_overview":
+            # repo_overview is a first-class bootstrap section: carry tech_stack,
+            # directory_layout, and first_steps_summary inline so the first
+            # strategic cycle has actual repo context without a fetch round-trip.
+            for field in ("tech_stack", "directory_layout", "first_steps_summary"):
+                raw = value.get(field)
+                if isinstance(raw, str) and raw.strip():
+                    collapsed = " ".join(raw.split())
+                    entry[field] = (
+                        collapsed[: _REPO_OVERVIEW_INLINE_CHARS - 1].rstrip() + "…"
+                        if len(collapsed) > _REPO_OVERVIEW_INLINE_CHARS
+                        else collapsed
+                    )
         entries.append(entry)
     return {"sections": entries}
 

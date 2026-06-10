@@ -1987,6 +1987,28 @@ export async function resetProject(
   return res.json();
 }
 
+export interface BootstrapRetryResponse {
+  state: 'spawned' | 'already_active' | 'already_completed' | 'not_eligible';
+  task_id?: string | null;
+  reason?: string | null;
+  [key: string]: unknown;
+}
+
+export async function retryProjectBootstrap(
+  projectId: string,
+): Promise<BootstrapRetryResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/bootstrap/retry`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to retry bootstrap: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to retry bootstrap: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Owner-only project cancel. Marks the project terminal, cancels all active
  * tasks, and tears down their VMs. Idempotent on the server: already-terminal
