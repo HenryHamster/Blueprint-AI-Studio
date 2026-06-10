@@ -30,6 +30,13 @@ from app.shared_state import (
     get_project_integration_branch,
     get_project_promotion_target,
 )
+from app.review_heuristics import (
+    LANE_ARBITRATION,
+    LANE_CI,
+    LANE_CONFLICT,
+    LANE_REVIEW_CONVERGENCE,
+    classify_iteration_lane,
+)
 
 # Re-export for test and internal use (single source of truth is vm_cost_rates)
 ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
@@ -80,6 +87,13 @@ _TASK_COST_WINDOW_MS: Dict[str, int] = {
     "24h": 24 * 60 * 60 * 1000,
     "all": 0,
 }
+_LANE_DIAG_LANES = (
+    LANE_CONFLICT,
+    LANE_CI,
+    LANE_ARBITRATION,
+    LANE_REVIEW_CONVERGENCE,
+)
+_LANE_DIAG_FIX_TYPES = {"create", "fix"}
 
 router = APIRouter(
     prefix="/api/admin",
@@ -132,9 +146,8 @@ def _compute_direction_auto_pause_stats(
                     reason_counts[reason[:120]] += 1
             elif milestone == "auto-retired":
                 cur_retired += 1
-        elif ts >= prev_window_start:
-            if milestone == "auto-paused":
-                prev_paused += 1
+        elif ts >= prev_window_start and milestone == "auto-paused":
+            prev_paused += 1
 
     # Recovery proxy: paused directions in window that were not auto-retired in window.
     # Negative values are clamped — retirements can reference directions paused earlier.
@@ -240,6 +253,122 @@ def _task_estimated_cost_usd(task: Task) -> float | None:
         return None
     rate = get_vm_rate_per_second(machine_type=task.vm_machine_type, spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
+
+
+def _percentile(values: List[float], fraction: float) -> float:
+    ordered = sorted(values)
+    return (
+        float(ordered[min(len(ordered) - 1, int(fraction * len(ordered)))])
+        if ordered
+        else 0.0
+    )
+
+
+def _review_loop_pr_number(task: Task) -> str | None:
+    review_loop = (task.context or {}).get("review_loop") or {}
+    pr_number = review_loop.get("pr_number")
+    if pr_number is None:
+        return None
+    pr_key = str(pr_number).strip()
+    return pr_key or None
+
+
+def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, Any]:
+    lane_counts_by_pr: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: dict.fromkeys(_LANE_DIAG_LANES, 0)
+    )
+    relay_counts: Dict[str, int] = dict.fromkeys(_LANE_DIAG_LANES, 0)
+    pr_phase: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "task_count": 0,
+            "review_seconds": 0.0,
+            "fix_seconds": 0.0,
+            "first_created_at": None,
+            "last_completed_at": None,
+        }
+    )
+
+    for task in tasks:
+        pr_number = _review_loop_pr_number(task)
+        if not pr_number:
+            continue
+        lane = classify_iteration_lane(task)
+        if lane not in lane_counts_by_pr[pr_number]:
+            lane = LANE_REVIEW_CONVERGENCE
+        lane_counts_by_pr[pr_number][lane] += 1
+
+        review_loop = (task.context or {}).get("review_loop") or {}
+        payload_type = str((task.first_payload or {}).get("type") or "create")
+        if payload_type in _LANE_DIAG_FIX_TYPES and review_loop.get("fix_reason"):
+            relay_counts[lane] += 1
+
+        completed_at = _derive_completed_at(task)
+        phase = pr_phase[pr_number]
+        phase["task_count"] += 1
+        if (
+            phase["first_created_at"] is None
+            or task.created_at < phase["first_created_at"]
+        ):
+            phase["first_created_at"] = task.created_at
+        if (
+            phase["last_completed_at"] is None
+            or completed_at > phase["last_completed_at"]
+        ):
+            phase["last_completed_at"] = completed_at
+
+        if task.started_at:
+            active_seconds = max((completed_at - task.started_at).total_seconds(), 0.0)
+            if payload_type == "review":
+                phase["review_seconds"] += active_seconds
+            elif payload_type in _LANE_DIAG_FIX_TYPES:
+                phase["fix_seconds"] += active_seconds
+
+    lane_distribution: Dict[str, Dict[str, Any]] = {}
+    for lane in _LANE_DIAG_LANES:
+        per_pr_counts = [counts[lane] for counts in lane_counts_by_pr.values()]
+        lane_distribution[lane] = {
+            "p50_iterations": _percentile(per_pr_counts, 0.5),
+            "p90_iterations": _percentile(per_pr_counts, 0.9),
+            "max_iterations": max(per_pr_counts) if per_pr_counts else 0,
+            "task_count": sum(per_pr_counts),
+            "pr_count": sum(1 for count in per_pr_counts if count > 0),
+        }
+
+    per_pr_breakdown: List[Dict[str, Any]] = []
+    for pr_number, phase in pr_phase.items():
+        review_seconds = phase["review_seconds"]
+        fix_seconds = phase["fix_seconds"]
+        active_seconds = review_seconds + fix_seconds
+        first_created_at = phase["first_created_at"]
+        last_completed_at = phase["last_completed_at"]
+        elapsed_seconds = (
+            max((last_completed_at - first_created_at).total_seconds(), 0.0)
+            if first_created_at and last_completed_at
+            else 0.0
+        )
+        gap_seconds = max(elapsed_seconds - active_seconds, 0.0)
+        total_seconds = active_seconds + gap_seconds
+        per_pr_breakdown.append(
+            {
+                "pr_number": pr_number,
+                "task_count": phase["task_count"],
+                "review_seconds": review_seconds,
+                "fix_seconds": fix_seconds,
+                "gap_seconds": gap_seconds,
+                "total_seconds": total_seconds,
+            }
+        )
+
+    per_pr_breakdown.sort(key=lambda row: (-row["total_seconds"], row["pr_number"]))
+    return {
+        "lane_iteration_distribution": lane_distribution,
+        "per_pr_phase_breakdown": per_pr_breakdown[:pr_breakdown_limit],
+        "relay_counts_by_lane": relay_counts,
+        "pr_count": len(pr_phase),
+        "task_count": sum(phase["task_count"] for phase in pr_phase.values()),
+        "pr_breakdown_limit": pr_breakdown_limit,
+        "pr_breakdown_truncated": len(per_pr_breakdown) > pr_breakdown_limit,
+    }
 
 
 @router.get("/task-cost-breakdown")
@@ -398,6 +527,63 @@ async def get_task_cost_breakdown(
         "direction_breakdown": direction_breakdown,
         "top_tasks": top_tasks,
     }
+
+
+@router.get("/lane-diag")
+async def get_lane_diag(
+    project_id: uuid.UUID | None = Query(None),
+    max_tasks: int = Query(5000, ge=1, le=20000),
+    pr_breakdown_limit: int = Query(100, ge=1, le=250),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return lane diagnostics for recent completed review/fix pipeline tasks."""
+    cutoff = _utcnow() - timedelta(days=7)
+    filters = [
+        Task.status == TaskStatus.COMPLETED,
+    ]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.created_at,
+                        Task.started_at,
+                        Task.status_log,
+                        Task.payloads,
+                        Task.context,
+                    )
+                )
+                .where(*filters)
+                .order_by(Task.created_at.desc())
+                .limit(max_tasks)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scoped_tasks = [
+        task
+        for task in tasks
+        if _review_loop_pr_number(task) and _derive_completed_at(task) >= cutoff
+    ]
+    diag = _compute_lane_diag(scoped_tasks, pr_breakdown_limit)
+    diag.update(
+        {
+            "project_id": str(project_id) if project_id else None,
+            "window_days": 7,
+            "window_start": cutoff.isoformat(),
+            "max_tasks": max_tasks,
+            "truncated": len(tasks) >= max_tasks,
+        }
+    )
+    return diag
 
 
 @router.get("/task-duration-stats")
@@ -792,7 +978,10 @@ async def get_open_prs(
         pr_number = gh_pr.get("number")
         pr_url = gh_pr.get("html_url", "")
         linked = list(pr_task_map.get(pr_number, {}).values())
-        linked.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
+        linked.sort(
+            key=lambda t: t.created_at or datetime.min.replace(tzinfo=None),
+            reverse=True,
+        )
         tasks_payload = [
             {
                 "task_id": str(t.id),
