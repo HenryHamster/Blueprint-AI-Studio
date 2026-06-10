@@ -2308,7 +2308,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_fail_open_count = 0
     _spawn_gate_unresolved_count = 0
     _spawn_gate_refuted_reasons: list[str] = []
+    _spawn_gate_parse_outcome = None
     if _adversarial_verdict_raw is not None:
+        _spawn_gate_parse_outcome = _adversarial_verdict_raw.get("parse_outcome")
         _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
@@ -2367,6 +2369,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _explicit = bool(_verdict_obj.get("explicit", True))
             if not _passed:
                 _f["_adversarial_verdict"] = "fail"
+                if not _explicit:
+                    _unresolved_reason = (
+                        _verdict_obj.get("unresolved_reason")
+                        if isinstance(_verdict_obj, dict)
+                        else None
+                    )
+                    _reason = str(
+                        _unresolved_reason
+                        or _reason
+                        or "fail-closed: no verdict returned for this finding"
+                    )
             _f["_adversarial_verdict_reason"] = _reason
             _f["_adversarial_verdict_explicit"] = _explicit
         # Bound counters to findings that were actually in the challenge manifest.
@@ -4518,6 +4531,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ctx["research_spawn_gate_unresolved_count"] = _spawn_gate_unresolved_count
             if _spawn_gate_refuted_reasons:
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons
+            if _spawn_gate_parse_outcome:
+                ctx["research_spawn_gate_parse_outcome"] = _spawn_gate_parse_outcome
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)

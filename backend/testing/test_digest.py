@@ -6827,6 +6827,7 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
                         "research_spawn_gate_unchallenged_spawned": 3,
                         "research_spawn_gate_unchallenged_merged": 1,
                         "research_spawn_gate_unchallenged_merge_rate": 0.333,
+                        "research_spawn_gate_parse_outcome": "no_hash_matches",
                     }
                 ],
             }
@@ -6858,6 +6859,7 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
     assert gate["survived_count"] == 1
     assert gate["challenged_merge_rate"] == 0.5
     assert gate["unchallenged_merge_rate"] == 0.333
+    assert gate["parse_outcome_distribution"] == {"no_hash_matches": 1}
 
 
 @pytest.mark.asyncio

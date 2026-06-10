@@ -585,6 +585,9 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   const challengedDenom = `${sg.challenged_merged ?? 0}/${sg.challenged_spawned ?? 0}`;
                   const unchallengedDenom = `${sg.unchallenged_merged ?? 0}/${sg.unchallenged_spawned ?? 0}`;
                   const reasons = (sg.refuted_reasons ?? []).filter(Boolean);
+                  const parseOutcomeEntries = Object.entries(sg.parse_outcome_distribution ?? {})
+                    .filter(([, count]) => typeof count === 'number' && count > 0)
+                    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
                   return (
                     <span className="text-[9px] text-neutral-500 flex flex-col gap-0.5">
                       <span>
@@ -596,6 +599,11 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                       {reasons.length > 0 && (
                         <span className="text-neutral-600 italic" title={reasons.join('\n')}>
                           refuted/unresolved reasons: {reasons.slice(0, 3).join('; ')}{reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}
+                        </span>
+                      )}
+                      {parseOutcomeEntries.length > 0 && (
+                        <span className="text-neutral-600" title={parseOutcomeEntries.map(([k, v]) => `${k}: ${v}`).join('\n')}>
+                          parse outcomes: {parseOutcomeEntries.map(([k, v]) => `${k} ${v}`).join(' · ')}
                         </span>
                       )}
                     </span>

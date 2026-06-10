@@ -143,6 +143,7 @@ import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -778,6 +779,24 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('records research_spawn_adversarial_challenge schema label on format miss, repair attempt, and repair success', async () => {
+    // First call: clean exit but only prose — triggers repair.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no json array here', lastResultText: '' });
+    // Second call (repair): valid verdict array.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // All three telemetry calls must carry the research-spawn-specific schema label,
+    // not the release-audit 'audit_challenge' label.
+    expectCalledWith(recordFormatMiss, expect.any(String), 'research_spawn_adversarial_challenge');
+    expectCalledWith(recordFormatRepairAttempt, 'research_spawn_adversarial_challenge');
+    expectCalledWith(recordFormatRepairSuccess, 'research_spawn_adversarial_challenge');
+    // Confirm the repair path succeeded and the result was posted.
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
   });
 });
 

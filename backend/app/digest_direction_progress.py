@@ -115,6 +115,7 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
     unchallenged_merged = 0
     refuted_reasons: List[str] = []
     _seen_reasons: set[str] = set()
+    parse_outcome_distribution: dict[str, int] = {}
     for entry in history or []:
         challenged += entry.get("research_spawn_gate_challenged_count") or 0
         refuted += entry.get("research_spawn_gate_refuted_count") or 0
@@ -135,6 +136,13 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
             ):
                 _seen_reasons.add(_r)
                 refuted_reasons.append(_r)
+        _parse_outcome = str(
+            entry.get("research_spawn_gate_parse_outcome") or ""
+        ).strip()
+        if _parse_outcome:
+            parse_outcome_distribution[_parse_outcome] = (
+                parse_outcome_distribution.get(_parse_outcome, 0) + 1
+            )
     if not any([challenged, refuted, survived, challenged_spawned, unchallenged_spawned]):
         return None
     challenged_merge_rate = (
@@ -160,6 +168,7 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         "challenged_merge_rate": challenged_merge_rate,
         "unchallenged_merge_rate": unchallenged_merge_rate,
         "refuted_reasons": refuted_reasons,
+        "parse_outcome_distribution": parse_outcome_distribution or None,
     }
 
 
@@ -318,6 +327,7 @@ async def compute_direction_progress(
         spawn_gate_unchallenged_merged = 0
         spawn_gate_refuted_reasons: List[str] = []
         _spawn_gate_seen_reasons: set[str] = set()
+        spawn_gate_parse_outcome_distribution: dict[str, int] = {}
         for entry in d.get("research_history") or []:
             try:
                 entry_ts = _coerce_naive_utc(
@@ -494,6 +504,15 @@ async def compute_direction_progress(
                     ):
                         _spawn_gate_seen_reasons.add(_sg_reason)
                         spawn_gate_refuted_reasons.append(_sg_reason)
+                _spawn_gate_parse_outcome = str(
+                    entry.get("research_spawn_gate_parse_outcome") or ""
+                ).strip()
+                if _spawn_gate_parse_outcome:
+                    spawn_gate_parse_outcome_distribution[
+                        _spawn_gate_parse_outcome
+                    ] = spawn_gate_parse_outcome_distribution.get(
+                        _spawn_gate_parse_outcome, 0
+                    ) + 1
                 spawn_gate_challenged_spawned += (
                     entry.get("research_spawn_gate_challenged_spawned") or 0
                 )
@@ -861,6 +880,9 @@ async def compute_direction_progress(
             "unchallenged_merged": spawn_gate_unchallenged_merged,
             "unchallenged_merge_rate": spawn_gate_unchallenged_merge_rate,
             "refuted_reasons": spawn_gate_refuted_reasons,
+            "parse_outcome_distribution": (
+                spawn_gate_parse_outcome_distribution or None
+            ),
         }
         # Drop the reasons sample from the all-zero test so a cycle with only an
         # (empty) sample still collapses to None — gate emptiness is decided by

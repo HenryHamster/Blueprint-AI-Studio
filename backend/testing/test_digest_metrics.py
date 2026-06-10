@@ -4881,6 +4881,88 @@ def test_compute_format_compliance_metrics_by_type_trend():
     assert fix["trend"] is None
 
 
+def test_format_compliance_metrics_by_schema_aggregation():
+    """Tasks with per-schema maps produce correctly merged by_schema in the block."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+                "format_miss_by_schema": {"ResearchPlan": 1},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 2},
+                "format_repair_successes_by_schema": {"ResearchPlan": 1},
+            },
+        ),
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 0,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                "format_miss_by_schema": {"StructuredVerdict": 0},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 1, "StructuredVerdict": 1},
+                "format_repair_successes_by_schema": {"ResearchPlan": 1, "StructuredVerdict": 1},
+            },
+        ),
+    ]
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+
+    assert overall["tasks_measured"] == 2
+    by_schema = overall["by_schema"]
+
+    assert by_schema["ResearchPlan"]["format_miss"] == 1
+    assert by_schema["ResearchPlan"]["repair_attempts"] == 3
+    assert by_schema["ResearchPlan"]["repair_successes"] == 2
+
+    assert by_schema["StructuredVerdict"]["format_miss"] == 0
+    assert by_schema["StructuredVerdict"]["repair_attempts"] == 1
+    assert by_schema["StructuredVerdict"]["repair_successes"] == 1
+
+
+def test_format_compliance_metrics_mixed_old_new_agents():
+    """Tasks with and without by-schema maps both contribute to scalar totals
+    but only new-agent tasks contribute to by_schema."""
+    old_agent_task = _fc_task(
+        "create",
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 0,
+            # No per-schema maps (old agent)
+        },
+    )
+    new_agent_task = _fc_task(
+        "create",
+        {
+            "format_error_total": 0,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+            "format_miss_by_schema": {},
+            "format_repair_attempts_by_schema": {"ResearchPlan": 1},
+            "format_repair_successes_by_schema": {"ResearchPlan": 1},
+        },
+    )
+    result = compute_format_compliance_metrics([old_agent_task, new_agent_task])
+    overall = result["overall"]
+
+    # Both tasks contribute to scalar totals.
+    assert overall["tasks_measured"] == 2
+    assert overall["repair_attempts"] == 2
+    assert overall["repair_successes"] == 1
+
+    # Only new-agent task contributes to by_schema.
+    by_schema = overall["by_schema"]
+    assert "ResearchPlan" in by_schema
+    assert by_schema["ResearchPlan"]["repair_attempts"] == 1
+
+    # Empty by_schema when no tasks carry per-schema data.
+    result_old_only = compute_format_compliance_metrics([old_agent_task])
+    assert result_old_only["overall"]["by_schema"] == {}
+
+
 # ── Park/wake operational health (feat: surface park/wake health) ────────────
 
 

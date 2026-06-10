@@ -641,6 +641,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_refuted_reasons": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (compact deduped sample of refuted/unresolved challenger reasons for a degraded-gate signal)"
     },
+    "research_spawn_gate_parse_outcome": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (machine-readable adversarial parse classification for unresolved cycles)"
+    },
     "research_spawn_gate_challenged_spawned": {
         "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
     },
@@ -773,6 +776,7 @@ async def _update_direction_research_outcomes(
     spawn_gate_unresolved_count = int(
         research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
     )
+    spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
     # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
     spawn_gate_refuted_reasons: list[str] = []
     _seen_spawn_gate_reasons: set[str] = set()
@@ -805,6 +809,8 @@ async def _update_direction_research_outcomes(
         )
         if spawn_gate_refuted_reasons:
             entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
+        if spawn_gate_parse_outcome:
+            entry["research_spawn_gate_parse_outcome"] = spawn_gate_parse_outcome
 
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()

@@ -171,6 +171,10 @@ describe('DirectionProgressSection spawn gate', () => {
             unchallenged_merged: 4,
             unchallenged_merge_rate: 0.40,
             refuted_reasons: ['stale: defect absent on HEAD', 'over-claimed impact'],
+            parse_outcome_distribution: {
+              challenger_failed: 1,
+              no_hash_matches: 2,
+            },
           },
         })]}
       />,
@@ -193,6 +197,9 @@ describe('DirectionProgressSection spawn gate', () => {
     const reasons = screen.getByText(/refuted\/unresolved reasons:/);
     expect(reasons.textContent).toContain('stale: defect absent on HEAD');
     expect(reasons.textContent).toContain('over-claimed impact');
+    const parseOutcomes = screen.getByText(/parse outcomes:/);
+    expect(parseOutcomes.textContent).toContain('no_hash_matches 2');
+    expect(parseOutcomes.textContent).toContain('challenger_failed 1');
   });
 
   it('renders the strategist (bare-key) aggregate spelling as well', () => {

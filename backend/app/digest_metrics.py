@@ -289,12 +289,19 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     is the extraction layer's count of unparseable FINAL outputs (a "format miss");
     a task is *well-formed* when that count is zero. Self-repair counts are the
     focused re-ask attempts after a miss and how many of them parsed.
+
+    ``by_schema`` in the returned block aggregates per-schema repair attempts and
+    successes across tasks. Tasks from older agents that lack per-schema maps
+    contribute to the scalar totals but not to ``by_schema``.
     """
     measured = 0
     well_formed = 0
     error_total = 0
     repair_attempts = 0
     repair_successes = 0
+    miss_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
     for t in tasks:
         summary = getattr(t, "format_compliance_summary", None)
         if not isinstance(summary, dict):
@@ -308,6 +315,21 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         repair_successes += s
         if e == 0:
             well_formed += 1
+        for schema, count in (summary.get("format_miss_by_schema") or {}).items():
+            miss_by_schema[str(schema)] += int(count)
+        for schema, count in (summary.get("format_repair_attempts_by_schema") or {}).items():
+            repair_attempts_by_schema[str(schema)] += int(count)
+        for schema, count in (summary.get("format_repair_successes_by_schema") or {}).items():
+            repair_successes_by_schema[str(schema)] += int(count)
+    all_schemas = set(miss_by_schema) | set(repair_attempts_by_schema) | set(repair_successes_by_schema)
+    by_schema = {
+        schema: {
+            "format_miss": miss_by_schema.get(schema, 0),
+            "repair_attempts": repair_attempts_by_schema.get(schema, 0),
+            "repair_successes": repair_successes_by_schema.get(schema, 0),
+        }
+        for schema in sorted(all_schemas)
+    }
     return {
         "tasks_measured": measured,
         "well_formed_tasks": well_formed,
@@ -324,6 +346,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         "self_repair_success_rate": round(repair_successes / repair_attempts, 3)
         if repair_attempts
         else None,
+        "by_schema": by_schema,
     }
 
 

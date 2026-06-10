@@ -101,6 +101,7 @@ export type SchemaLabel =
   | 'memo'
   | 'audit'
   | 'audit_challenge'
+  | 'research_spawn_adversarial_challenge'
   | 'design'
   | 'research_plan'
   | 'web_research'

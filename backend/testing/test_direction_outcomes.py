@@ -5498,9 +5498,10 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
         "research_spawn_gate_explicit_pass_count": 1,
         "research_spawn_gate_fail_open_count": 1,
         "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_parse_outcome": "no_hash_matches",
         "research_spawn_gate_refuted_reasons": [
             "stale premise",
-            "fail-closed: no verdict returned for this finding",
+            "no_hash_matches",
             # Duplicate is deduped by the producer; assert resilience anyway.
             "stale premise",
         ],
@@ -5554,6 +5555,7 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     assert entry["research_spawn_gate_explicit_pass_count"] == 1
     assert entry["research_spawn_gate_fail_open_count"] == 1
     assert entry["research_spawn_gate_unresolved_count"] == 1
+    assert entry["research_spawn_gate_parse_outcome"] == "no_hash_matches"
     # Denominators / sample sizes preserved (merge rates travel with them).
     assert entry["research_spawn_gate_challenged_spawned"] == 1
     assert entry["research_spawn_gate_challenged_merged"] == 1
@@ -5564,6 +5566,6 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     # Compact reasons sample rolled up, deduped, and capped.
     reasons = entry["research_spawn_gate_refuted_reasons"]
     assert "stale premise" in reasons
-    assert any("fail-closed" in r for r in reasons)
+    assert "no_hash_matches" in reasons
     assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
     assert len(reasons) <= 5

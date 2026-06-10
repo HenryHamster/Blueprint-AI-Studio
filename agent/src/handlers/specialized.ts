@@ -782,7 +782,7 @@ Return ONLY the JSON array. Each element must have "hash", "verdict", and "reaso
       effort,
       disallowedTools,
       retryStatus: 'Repairing adversarial challenge verdict array...',
-      schemaLabel: 'audit_challenge',
+      schemaLabel: 'research_spawn_adversarial_challenge',
     });
     let challengeLogs: string;
     if (repaired.value !== null && repaired.retry !== null) {

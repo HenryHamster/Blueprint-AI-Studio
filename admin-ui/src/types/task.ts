@@ -277,6 +277,8 @@ export interface ResearchSpawnGateAggregate {
   // a degraded-gate signal the strategist/operator can act on without opening
   // individual tasks.
   refuted_reasons?: string[];
+  // Compact parse-outcome histogram rolled up from research cycle records.
+  parse_outcome_distribution?: Record<string, number>;
 }
 
 /** Discriminated union of spawn-gate outcomes for a research-derived child task. */

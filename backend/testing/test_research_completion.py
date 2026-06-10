@@ -7896,12 +7896,20 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
                     "reason": "stale premise",
                     "explicit": True,
                 },
-                # high_unresolved is intentionally absent → fail-closed unresolved.
+                # Unresolved finding carries the parser's classification instead of
+                # collapsing to the generic fail-closed string.
+                unresolved_hash: {
+                    "passed": False,
+                    "reason": "fail-closed: no verdict returned for this finding",
+                    "explicit": False,
+                    "unresolved_reason": "no_hash_matches",
+                },
             },
             "grader_task_id": "test-grader-breakdown-001",
+            "parse_outcome": "no_hash_matches",
         },
         # All four high-stakes findings were in the challenge manifest; the
-        # absent one (unresolved) must be treated as challenged-but-no-verdict.
+        # unresolved one must be treated as challenged-but-no-verdict.
         "_adversarial_challenged_hashes": [
             pass_hash,
             failopen_hash,
@@ -7929,6 +7937,7 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
     assert ctx.get("research_spawn_gate_explicit_pass_count") == 1
     assert ctx.get("research_spawn_gate_fail_open_count") == 1
     assert ctx.get("research_spawn_gate_unresolved_count") == 1
+    assert ctx.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
     # explicit_pass + fail_open == survived; unresolved <= refuted.
     assert (
         ctx["research_spawn_gate_explicit_pass_count"]
@@ -7936,10 +7945,10 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
         == ctx["research_spawn_gate_survived_count"]
     )
     # Compact reasons sample captures both the explicit refutation and the
-    # fail-closed (unresolved) reason, deduped.
+    # parser-classified unresolved reason, deduped.
     reasons = ctx.get("research_spawn_gate_refuted_reasons") or []
     assert "stale premise" in reasons
-    assert any("fail-closed" in r for r in reasons)
+    assert "no_hash_matches" in reasons
     assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
     assert len(reasons) <= 5
 
@@ -7953,6 +7962,10 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
     assert (
         deferred_by_title[high_unresolved["title"]].get("finding_hash")
         == unresolved_hash
+    )
+    assert (
+        deferred_by_title[high_unresolved["title"]].get("adversarial_gate_reason")
+        == "no_hash_matches"
     )
 
 

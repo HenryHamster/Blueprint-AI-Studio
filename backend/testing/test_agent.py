@@ -16424,6 +16424,104 @@ async def test_heartbeat_persists_format_compliance_summary(
     assert task.api_call_summary is None
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_persists_format_compliance_with_by_schema_maps(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with all 7 format-compliance fields (including 3 per-schema maps)
+    persists correctly into Task.format_compliance_summary."""
+    project = Project(name="Format Compliance By Schema", user_id="test-user-schema")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-schema-maps",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-schema-maps")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 1},
+            "format_error_total": 1,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_miss_by_schema": {"ResearchPlan": 1},
+            "format_repair_attempts_by_schema": {"ResearchPlan": 2},
+            "format_repair_successes_by_schema": {"ResearchPlan": 1},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_miss_by_reason"] == {"unbalanced_json": 1}
+    assert summary["format_error_total"] == 1
+    assert summary["format_repair_attempts"] == 2
+    assert summary["format_repair_successes"] == 1
+    assert summary["format_miss_by_schema"] == {"ResearchPlan": 1}
+    assert summary["format_repair_attempts_by_schema"] == {"ResearchPlan": 2}
+    assert summary["format_repair_successes_by_schema"] == {"ResearchPlan": 1}
+    assert "last_updated_at" in summary
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_backward_compat_no_by_schema(
+    client: AsyncClient, db_session
+):
+    """Heartbeat omitting per-schema maps (older agent) still succeeds and does
+    not corrupt the existing fields or prevent persistence."""
+    project = Project(name="Format Compliance Compat", user_id="test-user-compat")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-compat",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compat")
+    # Older-style heartbeat: only scalar and by-reason fields, no by-schema maps.
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"truncated": 1},
+            "format_error_total": 1,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_error_total"] == 1
+    assert summary["format_miss_by_reason"] == {"truncated": 1}
+    # By-schema maps are present but empty (not missing) for older agents.
+    assert summary["format_miss_by_schema"] == {}
+    assert summary["format_repair_attempts_by_schema"] == {}
+    assert summary["format_repair_successes_by_schema"] == {}
+
+
 # ===========================================================================
 # Release-qualifier finalization from EVERY terminal path (automain/LTS)
 #
