@@ -903,6 +903,28 @@ async def get_recent_terminal_compute_spend_usd(
     return float(result.scalar_one() or 0.0)
 
 
+async def get_active_compute_job_accrued_spend_usd(
+    session,
+    *,
+    project_id: uuid.UUID,
+) -> float:
+    """Sum ``accrued_cost_usd`` over active (non-terminal) compute jobs for a project.
+
+    In-flight jobs accumulate real spend before reaching a terminal status and
+    recording ``final_cost_usd``.  Including them closes the gap between
+    money-spent and money-reported in the daily cost ceiling check.  No date
+    filter: a job that started yesterday is still spending today, so its full
+    accrued cost belongs in today's ceiling total.
+    """
+    result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.accrued_cost_usd), 0.0)).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
+        )
+    )
+    return float(result.scalar_one() or 0.0)
+
+
 async def active_compute_job_vm_ids(session) -> set[str]:
     """External ids of non-terminal compute jobs.
 

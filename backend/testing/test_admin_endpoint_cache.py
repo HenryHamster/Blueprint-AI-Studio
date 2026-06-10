@@ -26,6 +26,7 @@ from app.routers import admin_pool_accounts as _admin_pool_accounts
 from app.routers.admin_health import get_health_overview  # noqa: F401  (route registered)
 from app.routers.admin_pool_accounts import get_account_health_summary  # noqa: F401
 from app.digest_cache import get_digest_cache
+from app.shared_state import runtime_config as _runtime_config
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +68,101 @@ async def test_health_overview_caches_repeated_calls_within_ttl(
     for key, value in expected.items():
         assert body1[key] == value
     assert spy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
+    client: AsyncClient, db_session
+):
+    """The live endpoint exposes per-project pool-guard state alongside the
+    legacy fleet-wide fields, and a second poll within the TTL returns the same
+    cached payload."""
+    from datetime import timedelta
+
+    from app.models import PoolVm, PoolVmState, Project, Task, TaskStatus, _utcnow
+
+    fresh_cache = DigestCache(default_ttl=60.0)
+    app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
+
+    bad = Project(name="Health Guard Bad", user_id="health-guard-user")
+    good = Project(name="Health Guard Good", user_id="health-guard-user")
+    db_session.add_all([bad, good])
+    await db_session.commit()
+    await db_session.refresh(bad)
+    await db_session.refresh(good)
+
+    db_session.add_all(
+        [
+            PoolVm(
+                vm_instance_id="vm-guard-bad",
+                project_id=bad.id,
+                state=PoolVmState.IDLE,
+                idle_since=_utcnow() - timedelta(hours=2),
+            ),
+            PoolVm(
+                vm_instance_id="vm-guard-good",
+                project_id=good.id,
+                state=PoolVmState.IDLE,
+                idle_since=_utcnow() - timedelta(minutes=5),
+            ),
+        ]
+    )
+    # The per-project guard derives its hit rate from dispatched Task rows:
+    # two recent cold dispatches (no warm_claim_origin in context._timing) for
+    # the bad project → hit rate 0.0 below the floor → guard engages. The good
+    # project has no dispatches in the window → hit rate None → disengaged.
+    db_session.add_all(
+        [
+            Task(
+                project_id=bad.id,
+                payloads=[{"type": "create", "prompt": "guard cold dispatch"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_dispatched_at=_utcnow() - timedelta(minutes=10),
+            ),
+            Task(
+                project_id=bad.id,
+                payloads=[{"type": "create", "prompt": "guard cold dispatch"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_dispatched_at=_utcnow() - timedelta(minutes=5),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    old_guard_config = {
+        key: _runtime_config.get(key)
+        for key in (
+            "warm_pool_cost_guard_min_dispatches",
+            "warm_pool_cost_guard_min_hit_rate",
+            "warm_pool_cost_guard_min_idle_cost_usd",
+        )
+    }
+    _runtime_config.update(
+        {
+            "warm_pool_cost_guard_min_dispatches": 2,
+            "warm_pool_cost_guard_min_hit_rate": 0.75,
+            "warm_pool_cost_guard_min_idle_cost_usd": 0.0,
+        }
+    )
+
+    try:
+        r1 = await client.get("/api/admin/warm-vm-state")
+        r2 = await client.get("/api/admin/warm-vm-state")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+        _runtime_config.update(old_guard_config)
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json() == r2.json()
+    pool = r1.json()["pool_metrics"]
+    assert "cost_guard" in pool
+    assert "cost_guard_by_project" in pool
+    guard_by_project = pool["cost_guard_by_project"]
+    assert guard_by_project[str(bad.id)]["engaged"] is True
+    assert guard_by_project[str(good.id)]["engaged"] is False
 
 
 @pytest.mark.asyncio

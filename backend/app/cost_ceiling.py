@@ -88,12 +88,34 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     # Off-VM compute jobs accrue their own durable spend ledger. Fold today's
     # settled (terminal, costed) compute-job spend into the daily total so the
     # ceiling reflects total project spend, not just agent-VM runtime.
-    from app.compute_jobs import get_recent_terminal_compute_spend_usd
+    from app.compute_jobs import (
+        get_recent_terminal_compute_spend_usd,
+        get_active_compute_job_accrued_spend_usd,
+    )
 
     compute_total = await get_recent_terminal_compute_spend_usd(
         session, project_id=task.project_id, since=today_start
     )
-    daily_total = vm_total + compute_total
+    # In-flight (non-terminal) compute jobs accumulate real spend before reaching
+    # a terminal status. Include their accrued cost so the ceiling fires as soon
+    # as the running total (including uncommitted compute spend) breaches the cap.
+    inflight_compute_total = await get_active_compute_job_accrued_spend_usd(
+        session, project_id=task.project_id
+    )
+    # Warm-pool idle VMs accumulate cost even when no task is running. Include
+    # the project's current pool idle spend so the ceiling accounts for total
+    # platform cost, not just active task spend.
+    pool_idle_total = 0.0
+    try:
+        from app.efficiency_snapshot import _compute_windowed_idle_cost
+
+        pool_idle_result = await _compute_windowed_idle_cost(
+            session, task.project_id, today_start
+        )
+        pool_idle_total = float(pool_idle_result.get("total") or 0.0)
+    except Exception:  # noqa: BLE001 — best-effort; never block the ceiling check
+        pool_idle_total = 0.0
+    daily_total = vm_total + compute_total + inflight_compute_total + pool_idle_total
 
     if daily_total <= ceiling:
         return
@@ -123,7 +145,9 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         title=alert_title,
         message=(
             f"Daily total spend ${daily_total:.2f} exceeds ceiling ${ceiling:.2f} "
-            f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})."
+            f"(VM ${vm_total:.2f} + settled compute ${compute_total:.2f} "
+            f"+ inflight compute ${inflight_compute_total:.2f} "
+            f"+ pool idle ${pool_idle_total:.2f})."
         ),
     )
     session.add(alert)
@@ -135,7 +159,9 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     logger.warning(
         f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
         f"total ${daily_total:.2f} > ${ceiling:.2f} "
-        f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})"
+        f"(VM ${vm_total:.2f} + settled compute ${compute_total:.2f} "
+        f"+ inflight compute ${inflight_compute_total:.2f} "
+        f"+ pool idle ${pool_idle_total:.2f})"
     )
     try:
         from app.notification_dispatch import dispatch_external_notification
@@ -207,6 +233,8 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                     "daily_total_usd": round(daily_total, 2),
                     "daily_vm_cost_usd": round(vm_total, 2),
                     "daily_compute_cost_usd": round(compute_total, 2),
+                    "daily_inflight_compute_cost_usd": round(inflight_compute_total, 2),
+                    "daily_pool_idle_cost_usd": round(pool_idle_total, 2),
                     "ceiling_usd": round(ceiling, 2),
                     "direction_text": direction_text[:200],
                     "cost_by_failure_class": cost_by_failure_class,
@@ -214,5 +242,5 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
             )
         )
         del _budget_future  # fire-and-forget; stored to satisfy RUF006
-    except Exception as _ne:
+    except Exception as _ne:  # noqa: BLE001 — best-effort notify; never block the ceiling
         logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
