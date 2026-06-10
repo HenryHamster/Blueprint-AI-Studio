@@ -72,6 +72,7 @@ from app.failure_classification import (
     persist_authoritative_verdict,
     persist_failure_category,
     RATE_LIMIT,
+    DEAD_AUTH,
     _stuck_llm_call_no_progress,
     _persist_stuck_call_reclassification,
 )
@@ -1051,6 +1052,7 @@ async def reaper_service():
         db_account_was_rate_limited,
         db_pool_wide_rate_limit_cooldown,
         disable_account_model,
+        disable_account_for_auth,
         get_task_llm_account_id,
         get_task_rate_limit_scope,
         _extract_task_model,
@@ -1775,10 +1777,10 @@ async def reaper_service():
                         max_provision_retries = _runtime_config["max_provision_retries"]
                         can_retry = False
 
-                        # Rate-limited tasks: requeue without burning retry budget.
-                        # Delegate to classify_failure so the reaper path applies the same
-                        # Anthropic-529/GitHub-429 guards as the agent-status path, and
-                        # matches real Claude rate-limit strings only (RATE_LIMIT_PATTERNS).
+                        # Rate-limited / dead-auth tasks: requeue without burning retry
+                        # budget. Delegate to classify_failure so the reaper path applies
+                        # the same Anthropic-529/GitHub-429 guards as the agent-status
+                        # path, and matches real Claude rate-limit strings only.
                         combined_logs = (
                             ((task.context or {}).get("last_error") or "")
                             + "\n"
@@ -1788,14 +1790,13 @@ async def reaper_service():
                                 else ""
                             )
                         )
-                        is_rate_limited = (
-                            classify_failure(
-                                task,
-                                logs=combined_logs,
-                                at_time=task.last_heartbeat,
-                            )
-                            == "RATE_LIMIT"
+                        _failure_class_for_reaper = classify_failure(
+                            task,
+                            logs=combined_logs,
+                            at_time=task.last_heartbeat,
                         )
+                        is_rate_limited = _failure_class_for_reaper == "RATE_LIMIT"
+                        is_dead_auth = _failure_class_for_reaper == DEAD_AUTH
 
                         # ── EXTERNAL I/O BLOCK (no row lock held) ─────────────────
                         # Production 2026-05-04: this block previously ran with the
@@ -1893,7 +1894,9 @@ async def reaper_service():
                         # durable DB state before the account-disable I/O step so all
                         # reaper deaths get the same cross-instance treatment that
                         # agent_status.py already applies on the agent-reported path.
-                        if not is_rate_limited and not is_spot_preemption:
+                        # Skip DB rate-limit fallback when dead-auth is already
+                        # confirmed — the account needs a hard-disable, not a cooldown.
+                        if not is_rate_limited and not is_dead_auth and not is_spot_preemption:
                             _db_rl_acct = get_task_llm_account_id(fresh_task)
                             _at_time_rl = (
                                 fresh_task.last_heartbeat or fresh_task.started_at
@@ -1974,6 +1977,44 @@ async def reaper_service():
                                             f"[REAPER] disable_account_model retry also failed for "
                                             f"{rl_acct_id}/{rl_model}: {_disable_err2}. "
                                             "Account remains active in pool — tight re-selection loop risk."
+                                        )
+
+                        # 2b. Dead-auth account hard-disable I/O.
+                        # Called only when is_dead_auth AND not is_spot_preemption.
+                        # Uses disable_account_for_auth (permanent hard-disable, no
+                        # auto-recover) rather than disable_account_model (cooldown).
+                        da_acct_id: str | None = None
+                        if is_dead_auth and not is_spot_preemption:
+                            da_acct_id = get_task_llm_account_id(task)
+                            if da_acct_id:
+                                _da_pattern = (task.context or {}).get(
+                                    "dead_auth_matched_pattern", "dead_oauth_session"
+                                )
+                                _da_reason = f"dead-auth: {_da_pattern}"
+                                logger.warning(
+                                    "[REAPER] Task %s dead-auth (account=%s pattern=%r) — "
+                                    "hard-disabling account fleet-wide; requeuing onto different account",
+                                    task.id,
+                                    da_acct_id,
+                                    _da_pattern,
+                                )
+                                try:
+                                    await disable_account_for_auth(da_acct_id, _da_reason)
+                                except Exception as _da_err:  # noqa: BLE001
+                                    logger.warning(
+                                        "[REAPER] disable_account_for_auth failed for %s: %s; retrying in 1s",
+                                        da_acct_id,
+                                        _da_err,
+                                    )
+                                    await asyncio.sleep(1)
+                                    try:
+                                        await disable_account_for_auth(da_acct_id, _da_reason)
+                                    except Exception as _da_err2:  # noqa: BLE001
+                                        logger.error(  # noqa: TRY400
+                                            "[REAPER] disable_account_for_auth retry also failed for %s: %s. "
+                                            "Account remains active — dead-auth re-selection risk.",
+                                            da_acct_id,
+                                            _da_err2,
                                         )
 
                         # 3. Provision-failure serial capture I/O (GCP serial console).
@@ -2157,6 +2198,49 @@ async def reaper_service():
                                 vm_id=fresh_task.vm_instance_id,
                                 zone=prov_zone_for_status,
                             )
+                        elif is_dead_auth:
+                            # disable_account_for_auth (permanent hard-disable) was already
+                            # invoked in the unlocked I/O block above; da_acct_id captured
+                            # there. Requeue once onto a different account — no retry budget
+                            # consumed (DEAD_AUTH is an INFRA class).
+                            bank_task_current_attempt(task, stopped_at=_utcnow())
+                            task.status = TaskStatus.QUEUED
+                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                            task.last_heartbeat = None
+                            task.started_at = None
+                            task.latest_status_message = (
+                                "Dead OAuth session — account hard-disabled; "
+                                "requeued onto different account"
+                            )
+                            da_ctx = dict(task.context or {})
+                            if da_acct_id:
+                                blacklisted = list(
+                                    da_ctx.get("blacklisted_accounts") or []
+                                )
+                                if da_acct_id not in blacklisted:
+                                    blacklisted.append(da_acct_id)
+                                    record_pipeline_event(
+                                        "account_blacklisted",
+                                        task_id=str(task.id),
+                                        vm_id=fresh_task.vm_instance_id,
+                                        zone=(task.context or {}).get("provision_zone"),
+                                        account_id=da_acct_id,
+                                    )
+                                da_ctx["blacklisted_accounts"] = blacklisted
+                            _copy_analysis_artifacts_to_previous(da_ctx)
+                            da_ctx = clear_task_llm_runtime_context(da_ctx)
+                            da_ctx.pop("_slot_released", None)
+                            task.retry_after_until = None
+                            da_ctx.pop("provision_failures", None)
+                            task.context = da_ctx
+                            persist_authoritative_verdict(task, DEAD_AUTH)
+                            session.add(task)
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                            )
+                            continue
                         elif is_rate_limited:
                             # disable_account_model was already invoked (with retry+sleep)
                             # in the unlocked I/O block above; rl_acct_id and rl_model

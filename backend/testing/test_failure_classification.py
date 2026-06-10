@@ -2513,3 +2513,191 @@ class TestParkWakeFailureClassRegistration:
             normalize_agent_failure_category("park_wake_stranded", task)
             == PARK_WAKE_STRANDED
         )
+
+
+class TestDeadAuthClassification:
+    """Dead OAuth sessions must route to DEAD_AUTH (budget-exempt, auto-disable)
+    rather than RATE_LIMIT (transient cooldown) or CODE_ERROR (burns retry slot).
+
+    Observed 2026-06-10: OpenAI Codex accounts with terminated sessions were
+    misclassified as RATE_LIMIT, burning 1–3 attempts per new task until
+    blacklisted_accounts eventually routed around the dead account.
+    """
+
+    @staticmethod
+    def _openai_oauth_report(**overrides) -> dict:
+        report = {
+            "schema": 1,
+            "provider": "openai",
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": None,
+            "duration_ms": 20000,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "",
+            "last_stream_event": "system",
+        }
+        report.update(overrides)
+        return report
+
+    @staticmethod
+    def _anthropic_oauth_report(**overrides) -> dict:
+        report = {
+            "schema": 1,
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": None,
+            "duration_ms": 20000,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "",
+            "last_stream_event": "system",
+        }
+        report.update(overrides)
+        return report
+
+    def _dead_auth_task(self, report: dict, category: str = "claude_code_failed") -> "Task":
+        ctx: dict = {
+            "failure_category": category,
+            AGENT_ERROR_REPORT_CONTEXT_KEY: report,
+            "llm_provider": report.get("provider", "openai"),
+            "llm_auth_mode": report.get("auth_mode", "oauth"),
+        }
+        t = _task("Claude subprocess exited with code 1", ctx)
+        t.api_call_summary = None
+        return t
+
+    # ── OpenAI OAUTH dead-auth signatures ──────────────────────────────────
+
+    def test_app_session_terminated_classifies_dead_auth(self):
+        report = self._openai_oauth_report(
+            stderr_tail="Error: app_session_terminated\nYour session has ended."
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+        assert classify_failure(t) == DEAD_AUTH
+        assert t.context.get("dead_auth_matched_pattern") == "app_session_terminated"
+
+    def test_token_invalidated_classifies_dead_auth(self):
+        report = self._openai_oauth_report(
+            stderr_tail="token_invalidated: access token has been revoked by admin"
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+        assert classify_failure(t) == DEAD_AUTH
+        assert t.context.get("dead_auth_matched_pattern") == "token_invalidated"
+
+    def test_session_ended_message_classifies_dead_auth(self):
+        report = self._openai_oauth_report(
+            stderr_tail="Your session has ended. Please log in again."
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+        assert classify_failure(t) == DEAD_AUTH
+
+    # ── Anthropic OAUTH dead-auth signatures ───────────────────────────────
+
+    def test_anthropic_oauth_org_not_allowed_classifies_dead_auth(self):
+        report = self._anthropic_oauth_report(
+            stderr_tail="oauth_org_not_allowed: organization has disabled Claude Code OAuth"
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+        assert classify_failure(t) == DEAD_AUTH
+        assert t.context.get("dead_auth_matched_pattern") == "oauth_org_not_allowed"
+
+    def test_anthropic_token_refresh_failed_classifies_rate_limit(self):
+        # token_refresh_failed is treated as transient (not a terminal dead-auth signal),
+        # so it falls through to RATE_LIMIT and does NOT set dead_auth_matched_pattern.
+        report = self._anthropic_oauth_report(
+            stderr_tail="token_refresh_failed: permanent 401 from token endpoint"
+        )
+        t = self._dead_auth_task(report)
+        assert classify_failure(t) == RATE_LIMIT
+        assert "dead_auth_matched_pattern" not in t.context
+
+    # ── Disambiguation: must NOT classify as dead-auth ─────────────────────
+
+    def test_plain_rate_limit_stays_rate_limit(self):
+        # Ordinary rate-limit death (no dead-auth pattern in stderr) must stay RATE_LIMIT.
+        report = self._openai_oauth_report(
+            stderr_tail="Rate limit reached for gpt-5.4-mini"
+        )
+        t = self._dead_auth_task(report)
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_model_output_seen_prevents_dead_auth(self):
+        # If the model produced output before dying, the CLI passed auth —
+        # can't be a dead session; must stay RATE_LIMIT.
+        report = self._openai_oauth_report(
+            stderr_tail="app_session_terminated",
+            model_output_seen=True,
+        )
+        t = self._dead_auth_task(report)
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_api_key_auth_mode_no_dead_auth(self):
+        # API-key auth has no OAuth session to die; dead-auth patterns must not fire.
+        report = {
+            "schema": 1,
+            "provider": "openai",
+            "auth_mode": "api_key",
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "app_session_terminated",
+        }
+        ctx = {
+            "failure_category": "claude_code_failed",
+            AGENT_ERROR_REPORT_CONTEXT_KEY: report,
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+        }
+        t = _task("agent died", ctx)
+        t.api_call_summary = None
+        # API-key has no dead_auth_patterns, so falls through to RATE_LIMIT
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_no_report_no_dead_auth(self):
+        # Without an error report (old agents) there's no stderr_tail to check —
+        # must not classify as dead-auth.
+        ctx = {
+            "failure_category": "claude_code_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task("app_session_terminated in logs", ctx)
+        t.api_call_summary = None
+        # Text-only fallback can't distinguish dead-auth; stays RATE_LIMIT or
+        # CODE_ERROR depending on whether the text matches a rate-limit pattern.
+        result = classify_failure(t)
+        from app.failure_classification import DEAD_AUTH
+        assert result != DEAD_AUTH
+
+    # ── Classification metadata ─────────────────────────────────────────────
+
+    def test_dead_auth_is_infra_class(self):
+        from app.failure_classification import DEAD_AUTH, INFRA_CLASSES, ALL_FAILURE_CLASSES
+        assert DEAD_AUTH in INFRA_CLASSES
+        assert DEAD_AUTH in ALL_FAILURE_CLASSES
+
+    def test_dead_auth_via_normalize(self):
+        # The agent-status write boundary (normalize_agent_failure_category) must
+        # also route to DEAD_AUTH when the error report has the signature.
+        from app.failure_classification import DEAD_AUTH
+        report = self._openai_oauth_report(
+            stderr_tail="app_session_terminated\nYour session has ended."
+        )
+        ctx = {
+            AGENT_ERROR_REPORT_CONTEXT_KEY: report,
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task("Claude subprocess exited with code 1", ctx)
+        t.api_call_summary = None
+        assert normalize_agent_failure_category("claude_code_failed", t) == DEAD_AUTH

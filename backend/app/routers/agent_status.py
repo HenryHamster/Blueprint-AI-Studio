@@ -1527,6 +1527,7 @@ async def update_agent_status(
                     return {"status": "blocked", "task_id": str(task.id)}
 
                 from app.failure_classification import (
+                    DEAD_AUTH,
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
                     NO_PROGRESS_TIMEOUT,
@@ -1969,6 +1970,98 @@ async def update_agent_status(
                             old_vm_id_rl, reason="rate_limit_requeue"
                         )
                         return {"status": "accepted"}
+                elif failure_class == DEAD_AUTH:
+                    # Dead OAuth/API session: permanently disable the account fleet-wide
+                    # and requeue once onto a different account without burning the retry
+                    # budget (DEAD_AUTH is in INFRA_CLASSES — a provider-infra event, not
+                    # a code defect). The operator must re-authenticate to re-enable.
+                    da_acct_id = get_task_llm_account_id(task)
+                    if da_acct_id:
+                        await release_max_plan_account(da_acct_id)
+                        task.context = {**(task.context or {}), "_slot_released": True}
+
+                    _da_pattern = (task.context or {}).get(
+                        "dead_auth_matched_pattern", "dead_oauth_session"
+                    )
+                    _da_reason = f"dead-auth: {_da_pattern}"
+                    logger.warning(
+                        "[AGENT STATUS] Task %s DEAD_AUTH (account=%s pattern=%r) — "
+                        "hard-disabling account fleet-wide; requeuing onto different account",
+                        task.id,
+                        da_acct_id,
+                        _da_pattern,
+                    )
+                    if da_acct_id:
+                        try:
+                            newly_disabled = await disable_account_for_auth(
+                                da_acct_id, _da_reason
+                            )
+                        except Exception as _da_err:
+                            newly_disabled = False
+                            logger.warning(
+                                "[AGENT STATUS] disable_account_for_auth failed for %s: %s",
+                                da_acct_id,
+                                _da_err,
+                            )
+                        if newly_disabled:
+                            try:
+                                from app.notification_dispatch import (
+                                    post_failure_alert_message,
+                                )
+
+                                await post_failure_alert_message(
+                                    session,
+                                    task.project_id,
+                                    "LLM account auto-disabled: dead auth session "
+                                    f"({_da_pattern}). Re-authenticate and re-enable the account.",
+                                    task.id,
+                                )
+                            except Exception as _notify_err:
+                                logger.warning(
+                                    "[NOTIFY] Failed to post dead-auth alert: %s",
+                                    _notify_err,
+                                )
+                                with contextlib.suppress(Exception):
+                                    await session.rollback()
+
+                    # Blacklist the disabled account so this task's next attempt
+                    # picks a different account.
+                    ctx = dict(task.context or {})
+                    if da_acct_id:
+                        blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                        if da_acct_id not in blacklisted:
+                            blacklisted.append(da_acct_id)
+                        ctx["blacklisted_accounts"] = blacklisted
+
+                    old_vm_id_da = task.vm_instance_id
+                    now_da = _utcnow()
+                    bank_task_current_attempt(task, stopped_at=now_da)
+                    ctx = with_task_attempt_banking(task, ctx)
+                    ctx.pop("_slot_released", None)
+                    ctx.pop("provision_failures", None)
+                    task.context = ctx
+                    task.status = TaskStatus.QUEUED
+                    task.retry_after_until = None
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    task.last_heartbeat = None
+                    task.started_at = None
+                    task.latest_status_message = "Dead auth session — requeued onto different account"
+                    from app.routers.agent import _terminated_task_ids
+
+                    _terminated_task_ids.pop(str(task.id), None)
+                    session.add(task)
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                    )
+                    logger.info(
+                        "[AGENT STATUS] Task %s DEAD_AUTH — requeued without burning retry",
+                        task.id,
+                    )
+                    await _ensure_vm_deleted(old_vm_id_da, reason="dead_auth_requeue")
+                    return {"status": "accepted"}
         except Exception as e:
             logger.error(
                 f"[STATUS] Exception during result recording for task {_task_id_str}: {e!r}",

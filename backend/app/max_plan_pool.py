@@ -1073,7 +1073,7 @@ _QUARANTINE_COOLDOWN_SECONDS = (
 _REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
-_QUARANTINE_ELIGIBLE_CLASSES = frozenset({"RATE_LIMIT", "PROVISION_FAILURE"})
+_QUARANTINE_ELIGIBLE_CLASSES = frozenset({"RATE_LIMIT", "PROVISION_FAILURE", "DEAD_AUTH"})
 
 
 def _serialize_disabled_model_info(info: dict) -> dict:

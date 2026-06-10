@@ -248,6 +248,15 @@ VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 PARK_WAKE_TIMEOUT = "park_wake_timeout"
 PARK_WAKE_STRANDED = "park_wake_stranded"
 
+# Account's OAuth session was permanently terminated (user logged out, admin
+# revoked OAuth, session TTL expired) — unrecoverable without operator re-auth.
+# Distinct from RATE_LIMIT (transient throttle) and CODE_ERROR (work defect):
+# the provider auth layer is dead and retrying hits the same 401 every time.
+# On detection: fleet-wide hard-disable the account (operator must re-auth to
+# re-enable) and requeue the task once onto a different account. Budget-exempt
+# (INFRA_CLASSES) so failed attempts don't consume the task's retry budget.
+DEAD_AUTH = "DEAD_AUTH"
+
 # Context key stamped on a co-deferred dependent task's context. When a research
 # cycle decomposes findings, a dependent finding whose prerequisite was deferred
 # in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
@@ -438,6 +447,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         NO_PROGRESS_TIMEOUT,
         PARK_WAKE_TIMEOUT,
         PARK_WAKE_STRANDED,
+        DEAD_AUTH,
     }
 )
 
@@ -445,6 +455,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
 ALL_FAILURE_CLASSES: tuple[str, ...] = (
     CODE_ERROR,
     RATE_LIMIT,
+    DEAD_AUTH,
     EXTERNAL_API,
     PROVISION_FAILURE,
     MIGRATION_ERROR,
@@ -1176,21 +1187,86 @@ def _error_report_provider_death_signal(report: dict) -> str | None:
         return None
 
 
+def _task_dead_auth_patterns(task: "Task") -> tuple[str, ...]:
+    """Return provider dead-auth patterns for the task, or () on any failure."""
+    from app.providers.registry import get_provider
+
+    provider, auth_mode = _resolve_task_provider_auth(task)
+    if provider is None or auth_mode is None:
+        return ()
+    try:
+        return get_provider(provider).dead_auth_patterns(auth_mode)
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] dead_auth_patterns failed for provider=%s auth_mode=%s",
+            provider,
+            auth_mode,
+        )
+        return ()
+
+
+def _check_dead_auth_from_stderr(task: "Task", report: dict) -> str | None:
+    """Return the matched dead-auth pattern from the report's stderr_tail, or None.
+
+    Only fires when the report shows startup-death (no model output) — a CLI
+    that produced model output before dying authenticated successfully, so its
+    death can't be a dead OAuth session.
+    """
+    try:
+        if bool(report.get("model_output_seen")):
+            return None
+        stderr_tail = report.get("stderr_tail")
+        if not isinstance(stderr_tail, str) or not stderr_tail:
+            return None
+        patterns = _task_dead_auth_patterns(task)
+        if not patterns:
+            return None
+        lowered = stderr_tail.lower()
+        for pattern in patterns:
+            if pattern and pattern in lowered:
+                return pattern
+        return None
+    except Exception:
+        return None
+
+
+def _persist_dead_auth_context(task: "Task", matched_pattern: str) -> None:
+    """Persist dead-auth classification metadata onto task.context."""
+    try:
+        ctx = dict(task.context or {})
+        ctx["dead_auth_matched_pattern"] = matched_pattern
+        task.context = ctx
+    except Exception:
+        logger.exception("[FAILURE_CLASS] Failed to persist dead_auth context")
+
+
 def _agent_error_report_reclass(task: "Task") -> str | None:
     """Consume the structured agent error report as the primary signal for a
     generic CODE_ERROR-labelled failure.
 
-    Returns RATE_LIMIT (and persists the reclassification breadcrumb +
-    rate_limit_kind for cooldown bookkeeping) when the report proves a
-    provider-layer death; returns None when no report exists or the report
-    shows a completed run. Callers must fall back to the text heuristics ONLY
-    when no report exists (old agents)."""
+    Returns DEAD_AUTH when the startup-death signal has a provider-declared
+    dead-auth signature (permanent — auto-disable the account). Returns
+    RATE_LIMIT (and persists the reclassification breadcrumb + rate_limit_kind
+    for cooldown bookkeeping) for other provider-layer deaths. Returns None
+    when no report exists or the report shows a completed run. Callers must
+    fall back to the text heuristics ONLY when no report exists (old agents)."""
     report = get_agent_error_report(task)
     if report is None:
         return None
     signal = _error_report_provider_death_signal(report)
     if signal is None:
         return None
+    # Dead-auth check before rate-limit — a dead OAuth session is permanent
+    # (operator must re-auth); a rate limit is transient. Misclassifying
+    # permanent as transient burns attempts on an account that keeps dying.
+    # Only startup-death can be dead-auth (model never produced output means
+    # the CLI never passed auth; stream-cuts and provider-error signals happen
+    # AFTER auth succeeds).
+    if signal == "error_report_startup_death":
+        dead_auth_pattern = _check_dead_auth_from_stderr(task, report)
+        if dead_auth_pattern:
+            _persist_dead_auth_context(task, dead_auth_pattern)
+            return DEAD_AUTH
     _persist_stuck_call_reclassification(task, signal)
     return RATE_LIMIT
 
@@ -1750,6 +1826,13 @@ def classify_failure_with_confidence(
         if report is not None:
             report_signal = _error_report_provider_death_signal(report)
             if report_signal:
+                if report_signal == "error_report_startup_death":
+                    dead_auth_pattern = _check_dead_auth_from_stderr(task, report)
+                    if dead_auth_pattern:
+                        _persist_dead_auth_context(task, dead_auth_pattern)
+                        return FailureClassification(
+                            failure_class=DEAD_AUTH, confidence=0.9
+                        )
                 _persist_stuck_call_reclassification(task, report_signal)
                 return FailureClassification(failure_class=RATE_LIMIT, confidence=0.9)
         else:

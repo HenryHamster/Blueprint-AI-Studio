@@ -78,7 +78,7 @@
     "models.py": 4800,
     "shared_state.py": 2850,
     "strategic_spawning.py": 6450,
-    "failure_classification.py": 2400,
+    "failure_classification.py": 2850,
     "notification_dispatch.py": 2700,
     "ci_completion.py": 2200,
     "routers/admin_debug.py": 1850,

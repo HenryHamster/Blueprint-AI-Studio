@@ -196,6 +196,18 @@ class LLMProvider(ABC):
     def quota_exhausted_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         return ()
 
+    def dead_auth_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        """Substrings (lowercased) that unambiguously identify a permanently dead
+        OAuth session in provider CLI stderr output.
+
+        Matching any of these auto-disables the account fleet-wide and requires
+        operator re-auth. Only declare strings that appear EXCLUSIVELY when the
+        auth is irrecoverably broken — never for transient 401s or short-lived
+        refresh failures. Default is empty (no dead-auth detection); providers
+        with OAuth support override this.
+        """
+        return ()
+
     def classify_rate_limit_signal(
         self, auth_mode: LLMAuthMode, text: str
     ) -> RateLimitSignal | None:

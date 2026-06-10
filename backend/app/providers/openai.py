@@ -81,6 +81,17 @@ _OAUTH_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
     "manage or purchase credits",
 )
 
+# Substrings in Codex CLI stderr that prove the ChatGPT OAuth session has been
+# permanently terminated (user logged out elsewhere, admin revoked OAuth, session
+# TTL expired). Matching any of these auto-disables the account fleet-wide until
+# an operator re-runs `codex login`. Must remain narrow — only strings that
+# appear EXCLUSIVELY on unrecoverable auth death, never on transient 401s.
+_OAUTH_DEAD_AUTH_PATTERNS: tuple[str, ...] = (
+    "app_session_terminated",
+    "token_invalidated",
+    "your session has ended. please log in again",
+)
+
 _DEFAULT_TIER_MODELS = {
     # Maps onto the current Codex CLI picker inventory. opus uses the
     # flagship gpt-5.4 (which absorbs gpt-5.3-codex's coding capability
@@ -173,6 +184,12 @@ class OpenAIProvider(LLMProvider):
         if auth_mode == LLMAuthMode.OAUTH:
             return _OAUTH_QUOTA_EXHAUSTED_PATTERNS
         return _API_KEY_QUOTA_EXHAUSTED_PATTERNS
+
+    def dead_auth_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode == LLMAuthMode.OAUTH:
+            return _OAUTH_DEAD_AUTH_PATTERNS
+        return ()
 
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)

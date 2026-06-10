@@ -40,6 +40,7 @@ _KNOWN_FAILURE_CATEGORIES = frozenset(
         "AGENT_TIMEOUT",
         "EXTERNAL_API",
         "RATE_LIMIT",
+        "DEAD_AUTH",
         "rejected in review",
     }
 )

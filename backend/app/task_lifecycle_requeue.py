@@ -601,12 +601,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if prev_model:
             clone_ctx["_previous_model"] = prev_model
 
-        # RATE_LIMIT: propagate the quarantine so the clone can't re-select the
-        # same account before its cooldown elapses. agent_status.py already put
-        # the failed account in child_ctx["blacklisted_accounts"] — re-applying
-        # it here closes the gap where _ctx_keys_to_strip would otherwise clear
+        # RATE_LIMIT / DEAD_AUTH: propagate the quarantine so the clone can't
+        # re-select the same account. agent_status.py / reaper already put the
+        # failed account in child_ctx["blacklisted_accounts"] — re-applying it
+        # here closes the gap where _ctx_keys_to_strip would otherwise clear
         # the list and the clone starts with a blank slate.
-        if failure_class == "RATE_LIMIT":
+        if failure_class in ("RATE_LIMIT", "DEAD_AUTH"):
             rl_acct_id = child_ctx.get("llm_account_id") or child_ctx.get(
                 "max_plan_account_id"
             )
@@ -616,8 +616,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     prior_bl.append(rl_acct_id)
                 clone_ctx["blacklisted_accounts"] = prior_bl
                 logger.info(
-                    "[REQUEUE] RATE_LIMIT on account %s — propagating blacklist to clone "
+                    "[REQUEUE] %s on account %s — propagating blacklist to clone "
                     "(total blocked: %d)",
+                    failure_class,
                     rl_acct_id[:8],
                     len(prior_bl),
                 )
